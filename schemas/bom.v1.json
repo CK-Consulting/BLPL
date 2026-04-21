@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hdm-pipeline/schemas/bom.v1.json",
+  "title": "BOM v1",
+  "description": "Stage 1 output and checked-in source of truth. Resolved components with MPN, manufacturer, package, and library hints.",
+  "type": "object",
+  "required": ["project_id", "schema_version", "rows"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {"type": "string"},
+    "schema_version": {"const": 1},
+    "rows": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/bom_row"}
+    }
+  },
+  "$defs": {
+    "bom_row": {
+      "type": "object",
+      "required": ["local_id", "mpn", "package"],
+      "additionalProperties": false,
+      "properties": {
+        "local_id": {"type": "string", "description": "Stable ID matching design_artifact component local_id."},
+        "refdes": {"type": "string", "description": "KiCad-style reference designator (U1, J2, etc.). Assigned deterministically in Stage 4 if absent."},
+        "mpn": {"type": "string"},
+        "manufacturer": {"type": "string"},
+        "lcsc": {"type": "string", "description": "LCSC part number for JLCPCB assembly, if known."},
+        "package": {"type": "string", "description": "Canonical package descriptor, e.g., 'BGA-484_19x19mm_P0.8mm', 'QFN-48-1EP_7x7mm_P0.5mm'."},
+        "pin_count": {"type": "integer", "minimum": 1},
+        "datasheet_url": {"type": "string", "format": "uri"},
+        "description": {"type": "string"},
+        "role": {"type": "string"},
+        "symbol_hint": {"type": "string", "description": "Suggested KiCad library symbol, 'LibName:SymbolName' form."},
+        "footprint_hint": {"type": "string", "description": "Suggested KiCad footprint, 'LibName:FootprintName' form."},
+        "model_3d_hint": {"type": "string"},
+        "pin_map": {
+          "type": "object",
+          "description": "Resolved mapping of logical signal name to physical pin number, written by Stage 3's classifier or provided by hand. Logical keys are the names used in nets.json (e.g. 'VBUS', 'GND', 'TX1+/RX1-'); values are physical pin numbers as they appear in the KiCad symbol/footprint (e.g. 'A4', '1').",
+          "additionalProperties": {"type": "string"}
+        },
+        "pin_map_source": {
+          "type": "string",
+          "enum": ["passive_identity", "connector_lookup", "small_signal_3pin", "user_provided", "design_artifact"],
+          "description": "Audit trail: where the pin_map came from. passive_identity = auto-generated from 2-pin passive classification. connector_lookup = Stage 3 matched a generic connector and derived the map from the library symbol's pin names. user_provided = filled in by the user via the interactive prompt."
+        },
+        "alternates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["mpn"],
+            "additionalProperties": false,
+            "properties": {
+              "mpn": {"type": "string"},
+              "manufacturer": {"type": "string"},
+              "lcsc": {"type": "string"}
+            }
+          }
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "Stage 1 resolution confidence. Rows <0.9 flagged for human review."},
+        "notes": {"type": "string"}
+      }
+    }
+  }
+}

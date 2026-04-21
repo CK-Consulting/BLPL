@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hdm-pipeline/schemas/design_artifact.v1.json",
+  "title": "Design Artifact v1",
+  "description": "Stage 0 output. Entities extracted from Markdown before MPN resolution.",
+  "type": "object",
+  "required": ["project_id", "schema_version", "components", "connectors", "subsystems", "raw_nets"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {"type": "string"},
+    "schema_version": {"const": 1},
+    "source_files": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Relative paths to the Markdown files this artifact was extracted from."
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["local_id", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "local_id": {"type": "string", "description": "Stable ID within the project (e.g. 'U1', 'ZYNQ_MPSOC')."},
+          "description": {"type": "string"},
+          "role": {"type": "string"},
+          "package_hint": {"type": "string"},
+          "pin_count_hint": {"type": "integer", "minimum": 1},
+          "manufacturer_hint": {"type": "string"},
+          "part_hint": {"type": "string", "description": "Approximate MPN from Markdown; resolved in Stage 1."},
+          "source_ref": {"$ref": "#/$defs/source_ref"}
+        }
+      }
+    },
+    "connectors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["local_id", "pins"],
+        "additionalProperties": false,
+        "properties": {
+          "local_id": {"type": "string"},
+          "description": {"type": "string"},
+          "pitch_mm": {"type": "number"},
+          "pin_count": {"type": "integer", "minimum": 1},
+          "pins": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["pin", "signal"],
+              "additionalProperties": false,
+              "properties": {
+                "pin": {"type": "string"},
+                "signal": {"type": "string"},
+                "voltage": {"type": "string"},
+                "function": {"type": "string"}
+              }
+            }
+          },
+          "source_ref": {"$ref": "#/$defs/source_ref"}
+        }
+      }
+    },
+    "subsystems": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "member_local_ids": {"type": "array", "items": {"type": "string"}},
+          "notes": {"type": "string"},
+          "source_ref": {"$ref": "#/$defs/source_ref"}
+        }
+      }
+    },
+    "raw_nets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "members"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "class_hint": {"type": "string"},
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["local_id", "pin"],
+              "additionalProperties": false,
+              "properties": {
+                "local_id": {"type": "string"},
+                "pin": {"type": "string"}
+              }
+            }
+          },
+          "source_ref": {"$ref": "#/$defs/source_ref"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "source_ref": {
+      "type": "object",
+      "required": ["file"],
+      "additionalProperties": false,
+      "properties": {
+        "file": {"type": "string"},
+        "line_start": {"type": "integer", "minimum": 1},
+        "line_end": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

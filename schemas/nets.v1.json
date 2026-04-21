@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hdm-pipeline/schemas/nets.v1.json",
+  "title": "Nets v1",
+  "description": "Stage 4 output and checked-in source of truth. Logical nets with class assignment and (refdes, pin) membership.",
+  "type": "object",
+  "required": ["project_id", "schema_version", "nets"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {"type": "string"},
+    "schema_version": {"const": 1},
+    "nets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "class", "members"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "class": {"type": "string", "description": "Net class name; must match a class defined in the project stackup/YAML-HDM."},
+          "diff_pair_of": {"type": "string", "description": "Name of the complementary net if this is half of a differential pair."},
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["refdes", "pin"],
+              "additionalProperties": false,
+              "properties": {
+                "refdes": {"type": "string"},
+                "pin": {"type": "string"}
+              }
+            }
+          },
+          "source_refs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["file"],
+              "additionalProperties": false,
+              "properties": {
+                "file": {"type": "string"},
+                "line_start": {"type": "integer", "minimum": 1},
+                "line_end": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

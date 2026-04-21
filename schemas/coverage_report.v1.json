@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hdm-pipeline/schemas/coverage_report.v1.json",
+  "title": "Coverage Report v1",
+  "description": "Stage 2 output. For each BOM row, the symbol/footprint/3D match status against the KiCad library submodules.",
+  "type": "object",
+  "required": ["project_id", "schema_version", "generated_at", "library_roots", "rows", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {"type": "string"},
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "library_roots": {
+      "type": "object",
+      "required": ["symbols", "footprints"],
+      "additionalProperties": false,
+      "properties": {
+        "symbols": {"type": "string"},
+        "footprints": {"type": "string"},
+        "packages3d": {"type": "string"}
+      }
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["local_id", "mpn", "status", "symbol_match", "footprint_match"],
+        "additionalProperties": false,
+        "properties": {
+          "local_id": {"type": "string"},
+          "mpn": {"type": "string"},
+          "status": {
+            "type": "string",
+            "enum": ["hit", "needs_variant", "miss"],
+            "description": "hit: both symbol+footprint resolved exactly. needs_variant: one or both resolved only by fuzzy match. miss: one or both unresolvable."
+          },
+          "symbol_match": {
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "required": ["lib", "name", "match_type"],
+                "additionalProperties": false,
+                "properties": {
+                  "lib": {"type": "string"},
+                  "name": {"type": "string"},
+                  "path": {"type": "string"},
+                  "match_type": {"type": "string", "enum": ["exact", "fuzzy"]},
+                  "score": {"type": "number", "minimum": 0, "maximum": 1}
+                }
+              }
+            ]
+          },
+          "footprint_match": {
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "required": ["lib", "name", "match_type"],
+                "additionalProperties": false,
+                "properties": {
+                  "lib": {"type": "string"},
+                  "name": {"type": "string"},
+                  "path": {"type": "string"},
+                  "match_type": {"type": "string", "enum": ["exact", "fuzzy"]},
+                  "score": {"type": "number", "minimum": 0, "maximum": 1}
+                }
+              }
+            ]
+          },
+          "model_3d_match": {
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "required": ["path"],
+                "additionalProperties": false,
+                "properties": {
+                  "path": {"type": "string"}
+                }
+              }
+            ]
+          },
+          "notes": {"type": "string"}
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total", "hit", "needs_variant", "miss"],
+      "additionalProperties": false,
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "hit": {"type": "integer", "minimum": 0},
+        "needs_variant": {"type": "integer", "minimum": 0},
+        "miss": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

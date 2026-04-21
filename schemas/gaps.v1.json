@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hdm-pipeline/schemas/gaps.v1.json",
+  "title": "Gaps v1",
+  "description": "Stage 3 output. For each coverage gap, either a record of what was auto-generated or an actionable prompt asking the user to provide a file.",
+  "type": "object",
+  "required": ["project_id", "schema_version", "generated_at", "gaps"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {"type": "string"},
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["local_id", "mpn", "kind", "status", "auto_generated", "user_prompt"],
+        "additionalProperties": false,
+        "properties": {
+          "local_id": {"type": "string"},
+          "mpn": {"type": "string"},
+          "kind": {"type": "string", "enum": ["symbol", "footprint", "3d_model", "pin_map"]},
+          "status": {"type": "string", "enum": ["miss", "needs_variant", "resolved"]},
+          "auto_generated": {"type": "boolean"},
+          "generated_path": {"type": "string", "description": "Relative path to the generated file, if auto_generated."},
+          "user_prompt": {"type": "string", "description": "Actionable one-liner telling the user what to provide and where."},
+          "suggested_input_path": {"type": "string", "description": "Relative path under projects/<proj>/inputs/ where the user should drop their file."},
+          "notes": {"type": "string"},
+          "pin_map_resolution": {
+            "type": "object",
+            "description": "Audit record for kind=pin_map gaps. Captures how Stage 3 resolved the mapping (or why it could not).",
+            "additionalProperties": false,
+            "properties": {
+              "source": {"type": "string", "enum": ["passive_identity", "connector_lookup", "small_signal_3pin", "specific_needs_user"]},
+              "lib_symbol": {"type": "string"},
+              "lib_footprint": {"type": "string"},
+              "pin_map": {"type": "object", "additionalProperties": {"type": "string"}},
+              "reason": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

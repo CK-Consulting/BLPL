@@ -1,0 +1,23 @@
+{
+  "$schema": "https://go.kicad.org/pcm/schemas/v1",
+  "name": "HDM to KiCad",
+  "description": "Build a KiCad PCB from an HDM (Hardware Description Manifest) YAML file. Places footprints, assigns nets, and emits a board outline based on the HDM's project.dimensions. Schematic generation stays on the HDM pipeline's standalone emitter.",
+  "description_full": "Companion plugin to the HDM → KiCad pipeline (hardware/hdm-to-kicad-pipeline). The pipeline turns Markdown design docs into an HDM YAML file; this plugin consumes that YAML from inside KiCad's PCB editor (or via KiCad's bundled Python interpreter) and materialises it as a .kicad_pcb — using pcbnew's Python API for geometry and net assignment, so KiCad's own validation passes cleanly.",
+  "identifier": "com.shaunchokshi.hdm_to_kicad",
+  "type": "plugin",
+  "author": {
+    "name": "Shaun Chokshi",
+    "contact": {
+      "github": "https://github.com/shaunchokshi"
+    }
+  },
+  "license": "MIT",
+  "resources": {},
+  "versions": [
+    {
+      "version": "0.1.0",
+      "status": "development",
+      "kicad_version": "10.0"
+    }
+  ]
+}

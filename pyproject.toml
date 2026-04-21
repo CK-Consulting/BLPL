@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blpl"
+version = "0.2.0"
+description = "Board Layer Pipe Line — markdown-to-KiCad hardware design pipeline."
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+    "jsonschema>=4.21",
+    "markdown-it-py>=3.0",
+]
+
+[project.optional-dependencies]
+llm-anthropic = ["anthropic>=0.39"]
+llm-openai = ["openai>=1.0"]
+llm-ollama = ["ollama>=0.3"]
+all-llm = ["anthropic>=0.39", "openai>=1.0", "ollama>=0.3"]
+webapp = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "watchfiles>=0.22"]
+dev = ["pytest>=7.4", "rich>=13.0"]
+
+[project.scripts]
+blpl = "blpl.core.cli:main"
+# Back-compat alias for anything still using the old name.
+hdm-pipeline = "blpl.core.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["blpl*"]
+exclude = ["tests*", "kicad-*", "schemas*", "docs*", "ui*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.setuptools.package-data]
+"blpl.skills" = ["hardware-design/SKILL.md"]
+"blpl.plugin_kicad" = ["metadata.json", "version.txt"]
