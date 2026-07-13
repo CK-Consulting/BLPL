@@ -30,10 +30,21 @@ from . import (
     stage5_emit_yaml_hdm,
     stage6_compile_kicad,
     stage7_validate,
+    stage8_review,
 )
 
 
-_STAGE_ORDER = ["stage0", "stage1", "stage2", "stage3", "stage4", "stage5", "stage6", "stage7"]
+_STAGE_ORDER = [
+    "stage0",
+    "stage1",
+    "stage2",
+    "stage3",
+    "stage4",
+    "stage5",
+    "stage6",
+    "stage7",
+    "stage8",
+]
 
 
 # Three levels up from blpl/core/cli.py lands us at board-layer-pipe-line/,
@@ -504,6 +515,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
             rc = _attempt("stage7", lambda: _cmd_stage7(base))
             if rc != 0 and not args.continue_on_error:
                 return rc
+        elif stage == "stage8":
+            ns = argparse.Namespace(**vars(base), no_emc=False)
+            rc = _attempt("stage8", lambda: _cmd_stage8(ns))
+            if rc != 0 and not args.continue_on_error:
+                return rc
     return 0
 
 
@@ -552,6 +568,44 @@ def _cmd_stage7(args: argparse.Namespace) -> int:
     cov_label = "skipped" if cov.get("skipped") else f"{cov.get('hit',0)} hit / {cov.get('miss',0)} miss"
     print(f"stage7: {status}  klc={klc_label}  erc={erc_label}  drc={drc_label}  coverage={cov_label}")
     print(f"        wrote {pipeline_dir / 'validation_report.json'}")
+    return 0 if report["ok"] else 1
+
+
+def _cmd_stage8(args: argparse.Namespace) -> int:
+    proj = _project_dir(args)
+    pipeline_dir = proj / ".pipeline"
+    # Same "most recent timestamped compile wins" rule as stage7.
+    pcb_candidates = sorted(pipeline_dir.glob("*.kicad_pcb"), reverse=True)
+    sch_candidates = sorted(pipeline_dir.glob("*.kicad_sch"), reverse=True)
+    pcb = pcb_candidates[0] if pcb_candidates else None
+    sch = sch_candidates[0] if sch_candidates else None
+    if pcb is None and sch is None:
+        print(
+            f"error: no emitted KiCad files in {pipeline_dir} — run stage6 first",
+            file=sys.stderr,
+        )
+        return 2
+
+    report = stage8_review.run(
+        proj,
+        sch_path=sch,
+        pcb_path=pcb,
+        emc=not args.no_emc,
+    )
+    if report.get("skipped"):
+        print(f"stage8: skipped — {report['reason']}")
+        return 0
+
+    s = report["summary"]
+    status = "PASS" if report["ok"] else "FAIL"
+    print(
+        f"stage8: {status}  emitter={s['emitter']}  design={s['design']}  expected={s['expected']}"
+    )
+    for d in report["emitter_defects"]:
+        rule = d.get("rule_id") or d.get("check")
+        print(f"        [emitter] {rule}: {d['summary']}")
+    print(f"        wrote {pipeline_dir / 'review.md'}")
+    # Emitter defects gate; design issues are the user's to triage.
     return 0 if report["ok"] else 1
 
 
@@ -638,7 +692,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--project-dir", required=True)
     p.set_defaults(func=_cmd_stage7)
 
-    p = sub.add_parser("run", help="Run the full pipeline end-to-end (stages 0–7).")
+    p = sub.add_parser(
+        "stage8",
+        help="Design review (kicad-happy): schematic + PCB + EMC analysis, write review_report.json.",
+    )
+    p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--no-emc",
+        action="store_true",
+        help="Skip the EMC rule pass (the slowest analyzer).",
+    )
+    p.set_defaults(func=_cmd_stage8)
+
+    p = sub.add_parser("run", help="Run the full pipeline end-to-end (stages 0–8).")
     p.add_argument("--project-dir", required=True)
     p.add_argument(
         "--from",
@@ -650,9 +716,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--to",
         dest="end_stage",
-        default="stage7",
+        default="stage8",
         choices=_STAGE_ORDER,
-        help="Stage to stop after (default: stage7).",
+        help="Stage to stop after (default: stage8).",
     )
     p.add_argument(
         "--stage0",

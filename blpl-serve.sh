@@ -35,7 +35,7 @@ readenv() {
 _evalBg() {
     eval "$@" &>/dev/null & disown;
 }
-source ${HOME}/projects/blpl/.venv/activate
+source ${HOME}/projects/blpl/.venv/bin/activate
 
 cmd="blpl serve"
 _evalBg "${cmd}";

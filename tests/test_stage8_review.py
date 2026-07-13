@@ -1,0 +1,120 @@
+"""Unit tests for blpl.core.stage8_review.
+
+The kicad-happy analyzers are stubbed here so these tests don't depend on the
+submodule being checked out. What we're actually testing is the part BLPL owns:
+provenance classification — deciding whether a finding on a generated board
+indicts the emitter, the design, or neither.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from blpl.core import stage8_review as s8
+
+
+def _bom(rows: list[dict]) -> dict:
+    return {"project_id": "proj", "schema_version": 1, "rows": rows}
+
+
+def _finding(rule_id: str, severity: str = "error", summary: str = "x") -> dict:
+    return {"rule_id": rule_id, "severity": severity, "summary": summary}
+
+
+def test_skips_cleanly_when_kicad_happy_absent(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(s8, "_find_kicad_happy", lambda: None)
+    report = s8.run(tmp_path)
+    assert report["skipped"] is True
+    # A missing reviewer must not fail the pipeline — same contract as stage7.
+    assert report["ok"] is True
+    assert (tmp_path / ".pipeline" / "review_report.json").exists()
+
+
+def test_mpn_dropped_detected_when_bom_has_mpns_but_schematic_does_not() -> None:
+    bom = _bom([{"local_id": "U1", "mpn": "TPS65086RSMR", "package": "QFN-48"}])
+    sch = {"statistics": {"total_components": 1}, "bom_lock": {"components_with_mpn": 0}}
+    checks = s8._emitter_crosschecks(bom, sch, {})
+    assert [c["check"] for c in checks] == ["mpn_dropped"]
+    assert checks[0]["owner"] == "emitter/sch.py"
+
+
+def test_no_mpn_defect_when_emitter_preserved_them() -> None:
+    bom = _bom([{"local_id": "U1", "mpn": "TPS65086RSMR", "package": "QFN-48"}])
+    sch = {"statistics": {"total_components": 1}, "bom_lock": {"components_with_mpn": 1}}
+    assert s8._emitter_crosschecks(bom, sch, {}) == []
+
+
+def test_component_leakage_between_bom_and_emitted_files() -> None:
+    bom = _bom([{"local_id": f"U{i}", "mpn": "M", "package": "P"} for i in range(15)])
+    sch = {"statistics": {"total_components": 12}, "bom_lock": {"components_with_mpn": 15}}
+    pcb = {"footprints": [{} for _ in range(6)]}
+    checks = {c["check"] for c in s8._emitter_crosschecks(bom, sch, pcb)}
+    assert checks == {"symbol_leakage", "footprint_leakage"}
+
+
+def test_schematic_pcb_disagreement_is_always_an_emitter_defect() -> None:
+    # Both files come from one hdm.yaml, so they cannot legitimately disagree.
+    for rule in ("XV-001", "XV-002"):
+        provenance, owner = s8._classify(_finding(rule), {})
+        assert provenance == "emitter", rule
+        assert owner
+
+
+def test_unrouted_nets_are_expected_not_failures() -> None:
+    # BLPL has no autorouter; reporting these as errors would be pure noise.
+    provenance, _ = s8._classify(_finding("RT-001"), {})
+    assert provenance == "expected"
+
+
+def test_sourcing_blocker_is_a_design_issue_when_the_bom_never_had_mpns() -> None:
+    # SS-001 only indicts the emitter if there were MPNs available to lose.
+    provenance, _ = s8._classify(_finding("SS-001"), {})
+    assert provenance == "design"
+
+    provenance, owner = s8._classify(_finding("SS-001"), {"mpn_dropped": True})
+    assert provenance == "emitter"
+    assert owner == "emitter/sch.py"
+
+
+def test_genuine_electrical_finding_is_a_design_issue() -> None:
+    provenance, owner = s8._classify(_finding("DC-002"), {})
+    assert provenance == "design"
+    assert owner is None
+
+
+def test_emitter_defects_gate_but_design_issues_do_not(tmp_path: Path, monkeypatch) -> None:
+    """`ok` reflects pipeline correctness, not design quality.
+
+    A board with real electrical problems still means the *emitter* did its job.
+    Those are the user's to triage; only emitter defects gate the pipeline.
+    """
+    pipeline = tmp_path / ".pipeline"
+    pipeline.mkdir(parents=True)
+    (pipeline / "bom.json").write_text(
+        json.dumps(_bom([{"local_id": "U1", "mpn": "M", "package": "P"}]))
+    )
+    sch = tmp_path / "b.kicad_sch"
+    sch.write_text("(kicad_sch)")
+
+    fake = tmp_path / "kh"
+    monkeypatch.setattr(s8, "_find_kicad_happy", lambda: fake)
+
+    def _fake_run(script: Path, args: list[str], out_path: Path) -> dict:
+        # One real design problem, one known limitation. No emitter defects:
+        # the single BOM row was emitted as one symbol, with its MPN intact.
+        payload = {
+            "statistics": {"total_components": 1},
+            "bom_lock": {"components_with_mpn": 1},
+            "findings": [_finding("DC-002"), _finding("RT-001")],
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload))
+        return {"ok": True, "skipped": False, "exit_code": 0, "report_json": str(out_path)}
+
+    monkeypatch.setattr(s8, "_run_analyzer", _fake_run)
+
+    report = s8.run(tmp_path, sch_path=sch, pcb_path=None)
+    assert report["summary"] == {"emitter": 0, "design": 1, "expected": 1}
+    assert report["ok"] is True
+    assert "DC-002" in (pipeline / "review.md").read_text()
