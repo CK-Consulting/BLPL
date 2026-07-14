@@ -202,6 +202,18 @@ def emit(
             "value": row["mpn"],
             "placement": _default_placement(i, len(rows), board_dim),
         }
+        # Sourcing fields. bom.json has carried these all along and the HDM threw
+        # them away, so every emitted board had an MPN coverage of zero and could
+        # not be quoted, ordered, or fabbed. `value` is not an MPN — it is what
+        # gets printed on the silkscreen.
+        for hdm_key, row_key in (
+            ("mpn", "mpn"),
+            ("manufacturer", "manufacturer"),
+            ("datasheet", "datasheet_url"),
+            ("description", "description"),
+        ):
+            if row.get(row_key):
+                comp[hdm_key] = str(row[row_key])
         fp = _best_footprint(row, coverage_row)
         sym = _best_symbol(row, coverage_row)
 

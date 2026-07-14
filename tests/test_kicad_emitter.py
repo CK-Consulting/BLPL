@@ -84,23 +84,26 @@ def test_load_footprint_raises_on_miss() -> None:
         loaders.load_footprint("Nonexistent_Lib:Nonexistent_Name", _FOOTPRINTS_ROOT)
 
 
-def test_load_symbol_shell_strips_graphics() -> None:
-    shell = loaders.load_symbol_shell("Connector:Barrel_Jack", _SYMBOLS_ROOT)
-    # The shell's name atom is the "Lib:Name" form.
-    assert sexpr.unquote(shell[1]) == "Connector:Barrel_Jack"
-    # And the nested unit symbol (the sub-symbol carrying pins/graphics) is dropped.
-    nested_units = [c for c in shell if isinstance(c, list) and sexpr.head(c) == "symbol"]
-    assert nested_units == []
-    # Properties are retained, but their *value* atom (the 3rd token) is blanked.
-    props = sexpr.find_all(shell, "property")
-    assert len(props) > 0
-    for p in props:
-        assert p[2] == '""'
+def test_lib_symbols_carry_the_whole_symbol_including_pins() -> None:
+    """lib_symbols is a cache, not a stub — and KiCad reads pin positions from it.
 
+    This used to emit a "shell" with the sub-symbols stripped, believing KiCad
+    re-resolved geometry from the installed library. It does not. A symbol with no
+    sub-symbols is a symbol with NO PINS, so nothing on the sheet could connect to
+    anything: dev.04 came out with 134 wires dangling in mid-air and every net
+    label unattached, while looking completely normal.
+    """
+    sym = loaders.load_symbol_def("Connector:Barrel_Jack", _SYMBOLS_ROOT)
+    assert sexpr.unquote(sym[1]) == "Connector:Barrel_Jack"
 
-# ---------------------------------------------------------------------------
-# pcb
-# ---------------------------------------------------------------------------
+    nested = [c for c in sym if isinstance(c, list) and sexpr.head(c) == "symbol"]
+    assert nested, "sub-symbols (pins + body) must be carried through"
+    pins = [p for unit in nested for p in sexpr.find_all(unit, "pin")]
+    assert pins, "a symbol with no pins cannot connect to anything"
+
+    # Library default property values are kept; the instance overrides what it needs.
+    props = sexpr.find_all(sym, "property")
+    assert any(sexpr.unquote(str(pr[2])) for pr in props if len(pr) >= 3)
 
 
 def test_pcb_emit_has_v10_header() -> None:
@@ -200,10 +203,17 @@ def test_sch_emit_includes_lib_symbols_and_component_instance() -> None:
     assert '"Reference" "J1"' in out
 
 
-def test_sch_emit_has_global_labels_for_each_net() -> None:
+def test_sch_emits_no_global_label_palette() -> None:
+    """The palette of every net name is gone, and must stay gone.
+
+    It was emitted as an editing convenience and cost 193 dangling labels, 117
+    collisions with the per-pin labels of the same name, and — because entries
+    were spaced tighter than their own text — overlapping labels that shorted
+    unrelated nets together in the netlist. Each pin carries its own label.
+    """
     out = sch.emit(_minimal_hdm(), symbols_root=_SYMBOLS_ROOT)
-    assert '(global_label "VIN"' in out
-    assert '(global_label "GND"' in out
+    assert "(global_label" not in out
+    assert '(label "VIN"' in out and '(label "GND"' in out
 
 
 def test_sch_write_roundtrips(tmp_path: Path) -> None:

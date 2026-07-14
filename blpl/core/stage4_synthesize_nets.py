@@ -22,6 +22,11 @@ from . import schema
 _CLASS_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(GND|AGND|DGND|PGND|VSS)\b"), "Power_Bulk"),
     (re.compile(r"^(VCC|VDD|V_|VIN|VBUS|PVDD)"), "Power_Bulk"),
+    # Battery, system, and domain-qualified rails. Missing these is not cosmetic:
+    # an unclassified rail lands in Default and gets a 0.2mm signal trace, so
+    # dev.04's battery rail was being routed as if it carried a logic signal.
+    (re.compile(r"^(VBAT|VSYS|VPH|VMOT|VBACKUP|VRTC|VSTORE)"), "Power_Bulk"),
+    (re.compile(r"^(AVCC|DVCC|AVDD|DVDD|IOVDD|VDDIO)"), "Power_Bulk"),
     (re.compile(r"^(3V3|5V|12V|1V8|1V2|0V85|2V5)"), "Power_Bulk"),
     (re.compile(r"^\d+(\.\d+)?V(\b|$)"), "Power_Bulk"),  # "3.3V", "5V", "1.8V"
     (re.compile(r"^USB3_|^SS_[RT]X[+\-PN]?$"), "USB3_Diff_90Ohm"),

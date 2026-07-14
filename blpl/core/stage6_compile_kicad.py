@@ -8,6 +8,8 @@ that match the schematic labels, project JSON third to tie the pair together.
 
 from __future__ import annotations
 
+import json
+
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,5 +70,15 @@ def run(
     _sch.write(hdm, sch_path, symbols_root=Path(symbols_root))
     _pcb.write(hdm, pcb_path, footprints_root=Path(footprints_root))
     _pro.write(hdm, pro_path)
+
+    # What the emitter did that the emitted files cannot show. kicad-happy's rail
+    # audit reads a net map that excludes PWR_FLAG pins and then asks whether a
+    # PWR_FLAG is on the net — so it can never see one, and reports every flagged
+    # rail as unsourced. Record the truth here rather than patch the analyzer.
+    (output_dir / "emitter_report.json").write_text(
+        json.dumps({"pwr_flag_nets": _sch.flagged_nets(hdm, symbols_root=Path(symbols_root))},
+                   indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     return {"sch": sch_path, "pcb": pcb_path, "pro": pro_path, "base": base_name}

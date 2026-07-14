@@ -31,14 +31,23 @@ def load_footprint(ref: str, footprints_root: Path) -> sexpr.Sexp:
     return sexpr.parse(path.read_text(encoding="utf-8"))
 
 
-def load_symbol_shell(ref: str, symbols_root: Path) -> sexpr.Sexp:
-    """Return a *shell* form of the referenced symbol suitable for embedding
-    in a schematic's ``(lib_symbols ...)`` block.
+def load_symbol_def(ref: str, symbols_root: Path) -> sexpr.Sexp:
+    """Return the full symbol definition, for a schematic's ``(lib_symbols ...)``.
 
-    KiCad's own writer emits these with the pin/body geometry stripped —
-    fields remain (empty property blocks) so the layout in the editor is
-    stable, but the graphics are re-resolved from the installed library at
-    open-time.
+    ``lib_symbols`` is a *cache*: KiCad embeds each symbol whole — pins, body
+    graphics, default property values — so a schematic opens correctly on a
+    machine that does not have the libraries installed. It is also where KiCad
+    reads pin positions from when it works out what is connected to what.
+
+    This used to emit a "shell" with the sub-symbols dropped, on the belief that
+    KiCad re-resolved geometry from the installed library at open time. It does
+    not. A symbol with its sub-symbols stripped is a symbol with **no pins**, so
+    every BLPL schematic was one where nothing could connect to anything: 134
+    wires dangling in mid-air, every net label unattached, and every symbol
+    reported as not matching its library. The board looked right and was empty.
+
+    The only edit is the name: ``"R"`` becomes ``"Device:R"``, the qualified form
+    a schematic refers to.
     """
     lib, name = split_ref(ref)
     path = Path(symbols_root) / f"{lib}.kicad_symdir" / f"{name}.kicad_sym"
@@ -46,58 +55,37 @@ def load_symbol_shell(ref: str, symbols_root: Path) -> sexpr.Sexp:
         raise LibraryMiss(f"symbol {ref} not found at {path}")
     parsed = sexpr.parse(path.read_text(encoding="utf-8"))
     # The .kicad_sym file is wrapped in (kicad_symbol_lib ...) with one inner
-    # (symbol ...) node. Find the first one and rewrite its name to the
-    # "Lib:Name" form that schematics expect.
+    # (symbol ...) node.
     inner = sexpr.find(parsed, "symbol")
     if inner is None:
         raise LibraryMiss(f"no (symbol ...) block inside {path}")
-    shell = _to_shell(inner, f'"{lib}:{name}"')
-    return shell
-
-
-def _to_shell(symbol_node: list, qualified_name: str) -> list:
-    """Produce an empty-shell copy of a symbol definition.
-
-    Drops any nested (symbol "NAME_0_1" ...) sub-symbols that carry the actual
-    graphics and pins; retains top-level scalar flags and empty property blocks
-    so schematic-editor metadata stays consistent.
-    """
-    out: list = ["symbol", qualified_name]
-    for child in symbol_node[2:]:  # skip "symbol" head and the original quoted name
-        if not isinstance(child, list):
-            out.append(child)
-            continue
-        tag = sexpr.head(child)
-        if tag == "symbol":
-            # Drop nested sub-symbols (unit graphics).
-            continue
-        if tag == "property":
-            # A normal property is ["property", '"Name"', '"Value"', ...] and we
-            # blank the value at index 2.
-            #
-            # KiCad 10 also has *private* properties — library notes carried on the
-            # symbol — and those are ["property", "private", '"Name"', '"Value"', ...].
-            # The bare `private` token shifts everything by one, so blanking index 2
-            # wipes the *name* instead of the value and emits (property private "" ...).
-            # An empty property name is invalid: KiCad rejects the entire schematic
-            # with a bare "Failed to load schematic" and no hint as to which symbol.
-            #
-            # These are just annotations, so carry them through untouched.
-            if len(child) >= 2 and child[1] == "private":
-                out.append(child)
-                continue
-            if len(child) >= 3 and isinstance(child[2], str):
-                kept = list(child)
-                kept[2] = '""'
-                out.append(kept)
-                continue
-        out.append(child)
+    out: list = ["symbol", f'"{lib}:{name}"', *inner[2:]]
     return out
+
+
+# Retained: the old name says "shell", which is exactly the mistake above.
+load_symbol_shell = load_symbol_def
 
 
 def extract_pads(footprint_node: sexpr.Sexp) -> list[sexpr.Node]:
     """Return the list of ``(pad ...)`` children of a parsed footprint."""
     return sexpr.find_all(footprint_node, "pad")
+
+
+def symbol_extents(ref: str, symbols_root: Path) -> tuple[float, float]:
+    """Return the symbol's (width, height) in mm, from its pins.
+
+    Needed because the schematic laid components out on a fixed 50.8mm grid,
+    which is smaller than a 30-pin connector is tall. Symbols overlapped, their
+    pins and wires landed on top of each other, and KiCad — correctly — read the
+    overlap as a connection. Unrelated nets were shorting together on the sheet.
+    """
+    pins = load_symbol_pins(ref, symbols_root)
+    if not pins:
+        return (10.16, 10.16)
+    xs = [p["x"] for p in pins]
+    ys = [p["y"] for p in pins]
+    return (max(xs) - min(xs), max(ys) - min(ys))
 
 
 def load_symbol_pins(ref: str, symbols_root: Path) -> list[dict]:
@@ -157,10 +145,15 @@ def load_symbol_pins(ref: str, symbols_root: Path) -> list[dict]:
         name_value = ""
         if name_node is not None and len(name_node) >= 2 and isinstance(name_node[1], str):
             name_value = sexpr.unquote(name_node[1])
+        # (pin power_in line (at ...) ...) — the electrical type is the first atom
+        # after the head. It is what decides whether a rail is driven: a net of
+        # nothing but power_in pins is what ERC means by "power pin not driven".
+        etype = pin_node[1] if len(pin_node) >= 2 and isinstance(pin_node[1], str) else ""
         records.append(
             {
                 "number": sexpr.unquote(number_node[1]),
                 "name": name_value,
+                "etype": etype,
                 "x": px,
                 "y": py,
                 "rot": pr,

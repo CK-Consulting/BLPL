@@ -39,13 +39,13 @@ def test_private_property_keeps_its_name() -> None:
         assert name != "", f"private property emitted with an empty name: {prop[:4]}"
 
 
-def test_normal_property_values_are_still_blanked() -> None:
-    """The blanking itself is correct — a shell carries fields, not values."""
-    shell = _shell("Device:C")
-    named = [p for p in _properties(shell) if not (len(p) >= 2 and p[1] == "private")]
+def test_library_default_property_values_survive() -> None:
+    """Values are no longer blanked: KiCad's own lib_symbols cache keeps them,
+    and the symbol instance carries the overrides that matter."""
+    sym = _shell("Device:C")
+    named = [p for p in _properties(sym) if not (len(p) >= 2 and p[1] == "private")]
     assert named
-    for prop in named:
-        assert sexpr.unquote(str(prop[2])) == "", f"value not blanked: {prop[:3]}"
+    assert any(sexpr.unquote(str(p[2])) for p in named), "all property values were blanked"
 
 
 def test_derived_symbol_reports_its_parent() -> None:

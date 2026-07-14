@@ -165,3 +165,21 @@ def test_a_placeholder_part_blocks_fabrication() -> None:
 
 def test_a_board_with_no_placeholders_reports_none() -> None:
     assert s8._placeholder_check({"components": {"R1": {}, "C1": {}}}) == []
+
+
+def test_rs001_is_excused_only_on_a_rail_we_actually_flagged() -> None:
+    """kicad-happy cannot see a PWR_FLAG, so it reports every flagged rail as
+    unsourced. Excusing RS-001 outright would hide a genuinely unsourced rail —
+    the excuse has to be evidence-based, net by net."""
+    flagged = s8._classify(
+        {"rule_id": "RS-001", "nets": ["VCC_3V3"]}, {}, {"VCC_3V3", "GND"}
+    )
+    assert flagged[0] == "expected"
+
+    unflagged = s8._classify(
+        {"rule_id": "RS-001", "nets": ["VDD_UNSOURCED"]}, {}, {"VCC_3V3", "GND"}
+    )
+    assert unflagged[0] == "emitter", "a rail with no PWR_FLAG must still be reported"
+
+    # And with no evidence file at all, nothing is excused.
+    assert s8._classify({"rule_id": "RS-001", "nets": ["VCC_3V3"]}, {}, set())[0] == "emitter"

@@ -80,6 +80,11 @@ _EMITTER_RULES: dict[str, tuple[str, str]] = {
 # Known BLPL limitations. Real findings, but not actionable until the roadmap
 # catches up — surfacing them as failures would make the report untrustworthy.
 _EXPECTED_RULES: dict[str, str] = {
+    "RS-001": (
+        "Reported on a rail BLPL put a PWR_FLAG on. kicad-happy excludes PWR_FLAG pins "
+        "from its net map and then looks for one in it, so it cannot see the flag. "
+        "KiCad's own ERC reports no undriven power pin on these rails."
+    ),
     "RT-001": "BLPL has no autorouter (roadmap phase 5); every net is unrouted by construction.",
     "TE-001": "BLPL does not synthesize test points.",
     "LC-007": "Lifecycle audit is opt-in (needs network + distributor API keys).",
@@ -150,16 +155,30 @@ def _load(path: str | None) -> dict:
         return {}
 
 
-def _classify(finding: dict, emitter_evidence: dict) -> tuple[str, str | None]:
+def _classify(
+    finding: dict, emitter_evidence: dict, pwr_flag_nets: set[str] | None = None
+) -> tuple[str, str | None]:
     """Return (provenance, owner) for one analyzer finding."""
     rule = finding.get("rule_id", "")
-    if rule in _EXPECTED_RULES:
+    # RS-001 is conditional (below): a rail we flagged is excused, a rail we did
+    # not is a real unsourced rail and must stay an error. Everything else in
+    # _EXPECTED_RULES is unconditional.
+    if rule in _EXPECTED_RULES and rule != "RS-001":
         return "expected", None
     if rule in _EMITTER_RULES:
         owner, _ = _EMITTER_RULES[rule]
         # SS-001 only indicts the emitter if the BOM actually had MPNs to lose.
         if rule == "SS-001" and not emitter_evidence.get("mpn_dropped"):
             return "design", None
+        # RS-001 on a rail we DID flag is an upstream false positive, not a defect.
+        # kicad-happy builds its net map with PWR_FLAG pins deliberately excluded
+        # ("it's an ERC marker, not a real connection") and its rail audit then asks
+        # whether any pin on the net belongs to a #FLG component — which that net map
+        # can never contain. So it reports every flagged rail as unsourced. KiCad's
+        # own ERC agrees with us: zero power_pin_not_driven on these rails.
+        if rule == "RS-001" and pwr_flag_nets:
+            if set(finding.get("nets") or []) & pwr_flag_nets:
+                return "expected", None
         return "emitter", owner
     return "design", None
 
@@ -455,6 +474,11 @@ def run(
     hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {} if hdm_path.exists() else {}
     placeholders = _placeholder_check(hdm)
 
+    emitter_report_path = pipeline_dir / "emitter_report.json"
+    pwr_flag_nets: set[str] = set()
+    if emitter_report_path.exists():
+        pwr_flag_nets = set(schema.load_json(emitter_report_path).get("pwr_flag_nets", []))
+
     crosschecks = _stage1_crosscheck(design_artifact, bom)
     crosschecks += _emitter_crosschecks(bom, sch_json, pcb_json)
     emitter_evidence = {c["check"]: True for c in crosschecks}
@@ -467,7 +491,7 @@ def run(
     for source in ("schematic", "pcb", "cross", "emc"):
         data = _load(analyzers.get(source, {}).get("report_json"))
         for f in data.get("findings", []):
-            provenance, owner = _classify(f, emitter_evidence)
+            provenance, owner = _classify(f, emitter_evidence, pwr_flag_nets)
             record = {
                 "source": source,
                 "rule_id": f.get("rule_id"),
