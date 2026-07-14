@@ -178,8 +178,17 @@ def dump_top(node: Sexp) -> str:
 
 
 def quote(s: str) -> str:
-    """Wrap ``s`` as a KiCad quoted string atom, escaping embedded quotes/backslashes."""
-    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    """Wrap ``s`` as a KiCad quoted string atom, escaping quotes/backslashes/newlines.
+
+    A raw newline inside a quoted atom makes the file unparseable — KiCad rejects
+    the whole schematic with "Failed to load". Multi-line text (a ``(text ...)``
+    block on a sheet) must carry its line breaks as the two-character escape.
+    """
+    escaped = (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
     return f'"{escaped}"'
 
 

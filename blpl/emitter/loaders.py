@@ -72,9 +72,21 @@ def _to_shell(symbol_node: list, qualified_name: str) -> list:
             # Drop nested sub-symbols (unit graphics).
             continue
         if tag == "property":
-            # Keep the property as-is but clear its value (second atom after "property").
+            # A normal property is ["property", '"Name"', '"Value"', ...] and we
+            # blank the value at index 2.
+            #
+            # KiCad 10 also has *private* properties — library notes carried on the
+            # symbol — and those are ["property", "private", '"Name"', '"Value"', ...].
+            # The bare `private` token shifts everything by one, so blanking index 2
+            # wipes the *name* instead of the value and emits (property private "" ...).
+            # An empty property name is invalid: KiCad rejects the entire schematic
+            # with a bare "Failed to load schematic" and no hint as to which symbol.
+            #
+            # These are just annotations, so carry them through untouched.
+            if len(child) >= 2 and child[1] == "private":
+                out.append(child)
+                continue
             if len(child) >= 3 and isinstance(child[2], str):
-                # ["property", '"Value"', '"SOMETHING"', ...] -> clear the value atom.
                 kept = list(child)
                 kept[2] = '""'
                 out.append(kept)
