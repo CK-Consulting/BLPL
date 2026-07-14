@@ -118,3 +118,19 @@ def test_emitter_defects_gate_but_design_issues_do_not(tmp_path: Path, monkeypat
     assert report["summary"] == {"emitter": 0, "design": 1, "expected": 1}
     assert report["ok"] is True
     assert "DC-002" in (pipeline / "review.md").read_text()
+
+
+def test_stage1_component_loss_is_detected() -> None:
+    """Stage 0 is deterministic, so a shorter BOM means Stage 1 lost components."""
+    da = {"components": [{"local_id": f"U{i}"} for i in range(46)]}
+    bom = _bom([{"local_id": f"U{i}", "mpn": "M", "package": "P"} for i in range(13)])
+    checks = s8._stage1_crosscheck(da, bom)
+    assert [c["check"] for c in checks] == ["stage1_component_loss"]
+    assert "33 were dropped" in checks[0]["summary"]
+
+
+def test_no_loss_reported_when_stage1_kept_everything() -> None:
+    da = {"components": [{"local_id": "U1"}, {"local_id": "U2"}]}
+    bom = _bom([{"local_id": "U1", "mpn": "M", "package": "P"},
+                {"local_id": "U2", "mpn": "M", "package": "P"}])
+    assert s8._stage1_crosscheck(da, bom) == []

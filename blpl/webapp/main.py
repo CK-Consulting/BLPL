@@ -212,7 +212,7 @@ _VALID_STAGES = {
     "stage1", "stage1-synthesize-connectors",
     "stage2", "stage3", "stage4", "stage5",
     "stage6", "stage6-plugin", "stage7", "stage8",
-    "resolve-pin-map",
+    "resolve-pin-map", "doctor",
 }
 
 

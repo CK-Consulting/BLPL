@@ -11,6 +11,7 @@ Subcommands wired:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -32,6 +33,9 @@ from . import (
     stage7_validate,
     stage8_review,
 )
+from . import doctor as _doctor
+from . import symbol_resolution
+from . import init_project as _init
 
 
 _STAGE_ORDER = [
@@ -397,7 +401,13 @@ def _cmd_stage5(args: argparse.Namespace) -> int:
         da_path = proj / ".pipeline" / "design_artifact.llm.json"
     bom_path = proj / ".pipeline" / "bom.json"
     nets_path = proj / ".pipeline" / "nets.json"
-    proj_cfg = proj / ".pipeline" / "project.yaml"
+    # project.yaml is hand-authored (or `blpl init`-generated) config, not a
+    # build artifact — so it belongs beside the design markdown where it gets
+    # committed, not in .pipeline/ which is generated and gitignored. Prefer the
+    # durable location; fall back to the legacy one so existing projects keep working.
+    proj_cfg = proj / "project.yaml"
+    if not proj_cfg.exists():
+        proj_cfg = proj / ".pipeline" / "project.yaml"
     coverage = proj / ".pipeline" / "coverage_report.json"
 
     for p, label in [(da_path, "design_artifact"), (bom_path, "bom"), (nets_path, "nets")]:
@@ -414,12 +424,35 @@ def _cmd_stage5(args: argparse.Namespace) -> int:
             project_config_path=proj_cfg,
             output_path=out,
             coverage_path=coverage if coverage.exists() else None,
+            project_dir=proj,
+            stock_symbols_root=stage6_compile_kicad._DEFAULT_SYMBOLS,
         )
     except stage5_emit_yaml_hdm.MissingProjectConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     print(f"stage5: emitted HDM with {len(hdm.get('components', {}))} components, {len(hdm.get('nets', {}))} nets")
     print(f"        wrote {out}")
+
+    # A placeholder that slips by unnoticed is how you fab a board with the wrong
+    # part on it. Make it impossible to miss at the console, not just in a file.
+    placeholders = {
+        refdes: comp
+        for refdes, comp in hdm.get("components", {}).items()
+        if comp.get("needs_manual_symbol")
+    }
+    if placeholders:
+        report = out.parent / "manual_symbols_required.md"
+        print()
+        print(f"  ***  {len(placeholders)} COMPONENT(S) HAVE NO REAL SYMBOL  ***")
+        print("       A generic placeholder was emitted so the board still opens.")
+        print("       The placeholder is NOT the part. DO NOT FABRICATE THIS BOARD.")
+        print()
+        for refdes, comp in sorted(placeholders.items()):
+            print(f"       {refdes:<14} wanted {comp.get('requested_symbol')!r} — does not exist")
+        print()
+        print(f"       Draw them, save into {proj / symbol_resolution.CUSTOM_LIB_DIRNAME / 'symbols'},")
+        print(f"       and re-run stage5. Details: {report}")
+        print()
     return 0
 
 
@@ -571,6 +604,34 @@ def _cmd_stage7(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def _cmd_init(args: argparse.Namespace) -> int:
+    proj = _project_dir(args)
+    try:
+        target, result = _init.write_config(proj, force=args.force)
+    except FileExistsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"init: wrote {target}")
+    for f in result.found:
+        print(f"        from your markdown: {f}")
+    for d in result.defaulted:
+        # Never let a made-up number pass as one the user wrote.
+        print(f"        (default, check it): {d}")
+    return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    proj = _project_dir(args)
+    report = _doctor.run(proj)
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(_doctor.render_text(report))
+    # Errors mean Stage 0 will drop or mangle real design data.
+    return 0 if report.ok else 1
+
+
 def _cmd_stage8(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
     pipeline_dir = proj / ".pipeline"
@@ -691,6 +752,22 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("stage7", help="Run KLC + DRC + coverage validation, write validation_report.json.")
     p.add_argument("--project-dir", required=True)
     p.set_defaults(func=_cmd_stage7)
+
+    p = sub.add_parser(
+        "init",
+        help="Generate project.yaml from the design markdown (identity/stackup/net-class tables).",
+    )
+    p.add_argument("--project-dir", required=True)
+    p.add_argument("--force", action="store_true", help="Overwrite an existing project.yaml.")
+    p.set_defaults(func=_cmd_init)
+
+    p = sub.add_parser(
+        "doctor",
+        help="Preflight: report what Stage 0 would silently discard. Run this first.",
+    )
+    p.add_argument("--project-dir", required=True)
+    p.add_argument("--json", action="store_true", help="Emit the report as JSON.")
+    p.set_defaults(func=_cmd_doctor)
 
     p = sub.add_parser(
         "stage8",

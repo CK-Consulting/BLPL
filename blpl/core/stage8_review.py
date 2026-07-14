@@ -162,6 +162,46 @@ def _classify(finding: dict, emitter_evidence: dict) -> tuple[str, str | None]:
     return "design", None
 
 
+def _stage1_crosscheck(design_artifact: dict, bom: dict) -> list[dict]:
+    """Did Stage 1 keep every component Stage 0 found?
+
+    Stage 0 is deterministic — if it read 46 components out of the markdown, then
+    46 components are what the user wrote. Stage 1 resolves those through an LLM,
+    and an LLM that returns a short list produces a quietly smaller board rather
+    than an error. That failure is invisible downstream: the emitter faithfully
+    emits whatever survived, so the board looks *correct*, just missing a third of
+    the design. Compare the two counts and say so.
+    """
+    checks: list[dict] = []
+    da_ids = {c.get("local_id") for c in design_artifact.get("components", []) if c.get("local_id")}
+    bom_ids = {r.get("local_id") for r in bom.get("rows", []) if r.get("local_id")}
+    if not da_ids:
+        return checks
+
+    lost = sorted(da_ids - bom_ids)
+    if lost:
+        shown = ", ".join(lost[:12]) + (f", … (+{len(lost) - 12} more)" if len(lost) > 12 else "")
+        checks.append(
+            {
+                "check": "stage1_component_loss",
+                "severity": "error",
+                "owner": "core/stage1_resolve_bom.py",
+                "summary": (
+                    f"Stage 0 parsed {len(da_ids)} components from the markdown but only "
+                    f"{len(bom_ids)} reached the BOM — {len(lost)} were dropped: {shown}"
+                ),
+                "recommendation": (
+                    "Stage 1's LLM resolution returned fewer rows than it was given and the "
+                    "pipeline accepted it silently. Stage 1 should assert that every input "
+                    "local_id appears in its output, and fail loudly (or fall back to a "
+                    "deterministic row) rather than shipping a board missing a third of its "
+                    "components."
+                ),
+            }
+        )
+    return checks
+
+
 def _emitter_crosschecks(bom: dict, sch: dict, pcb: dict) -> list[dict]:
     """Compare what the BOM promised against what the emitter actually wrote.
 
@@ -345,7 +385,12 @@ def run(
     # Emitter cross-checks need the BOM the board was generated from.
     bom_path = pipeline_dir / "bom.json"
     bom = schema.load_json(bom_path) if bom_path.exists() else {}
-    crosschecks = _emitter_crosschecks(bom, sch_json, pcb_json)
+
+    da_path = pipeline_dir / "design_artifact.deterministic.json"
+    design_artifact = schema.load_json(da_path) if da_path.exists() else {}
+
+    crosschecks = _stage1_crosscheck(design_artifact, bom)
+    crosschecks += _emitter_crosschecks(bom, sch_json, pcb_json)
     emitter_evidence = {c["check"]: True for c in crosschecks}
 
     # Partition every analyzer finding by provenance.

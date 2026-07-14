@@ -2,6 +2,7 @@ import { createSignal, For, Show, type Component } from "solid-js";
 import { runStage } from "../api";
 
 const STAGES = [
+  "doctor",
   "stage0-det",
   "stage0-llm",
   "stage1",
@@ -13,6 +14,7 @@ const STAGES = [
   "stage6",
   "stage6-plugin",
   "stage7",
+  "stage8",
 ];
 
 type Props = { projectId: string };
