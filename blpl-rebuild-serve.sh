@@ -36,7 +36,9 @@ _evalBg() {
     eval "$@" &>/dev/null & disown;
 }
 source ${HOME}/projects/blpl/.venv/bin/activate
-readenv
+uv pip install -e ".[webapp]"              # fastapi + uvicorn backend
+cd ui && npm install && npm run build
+readenv      # SolidJS frontend → blpl/webapp/static/
 cmd="blpl serve"
 _evalBg "${cmd}";
 
