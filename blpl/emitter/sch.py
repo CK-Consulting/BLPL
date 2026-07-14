@@ -69,6 +69,8 @@ def _component_instance(
     y: float,
     project_name: str,
     schematic_uuid: str,
+    description: str = "",
+    requested_symbol: str = "",
 ) -> sexpr.Node:
     return [
         "symbol",
@@ -86,7 +88,21 @@ def _component_instance(
         _default_property("Value", value, x, y + 10),
         _default_property("Footprint", footprint, x, y + 15, hidden=True),
         _default_property("Datasheet", "", x, y, hidden=True),
-        _default_property("Description", "", x, y, hidden=True),
+        _default_property("Description", description, x, y, hidden=True),
+        # Visible, on the symbol, in KiCad and in any browser viewer. A placeholder
+        # you can't see is a placeholder that gets fabricated.
+        *(
+            [
+                _default_property(
+                    "BLPL_PLACEHOLDER",
+                    f"NOT A REAL SYMBOL — draw {requested_symbol} manually",
+                    x,
+                    y + 20,
+                )
+            ]
+            if requested_symbol
+            else []
+        ),
         [
             "instances",
             [
@@ -100,6 +116,28 @@ def _component_instance(
                 ],
             ],
         ],
+    ]
+
+
+def _extends_of(shell: sexpr.Sexp) -> str | None:
+    """The parent symbol name in a derived symbol's ``(extends "Parent")``, if any."""
+    if not isinstance(shell, list):
+        return None
+    for child in shell:
+        if isinstance(child, list) and len(child) >= 2 and child[0] == "extends":
+            return sexpr.unquote(str(child[1]))
+    return None
+
+
+def _warning_text(message: str, x: float, y: float) -> sexpr.Node:
+    """A free text block on the schematic sheet, for things the user must not miss."""
+    return [
+        "text",
+        sexpr.quote(message),
+        ["exclude_from_sim", "no"],
+        ["at", _mm(x), _mm(y), "0"],
+        ["effects", ["font", ["size", "3", "3"], ["bold", "yes"]], ["justify", "left"]],
+        ["uuid", _new_uuid()],
     ]
 
 
@@ -239,12 +277,49 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
             lib_ids.append(ref)
 
     lib_symbols_children: list[sexpr.Sexp] = ["lib_symbols"]
+    missing: list[str] = []
+    emitted: set[str] = set()
+
+    def _add(ref: str) -> None:
+        """Emit a symbol shell, pulling in any parent it derives from.
+
+        KiCad has derived symbols: a shell can carry (extends "Parent"), and the
+        parent supplies the pins and body. Copying only the child produces a
+        schematic that references a base symbol which isn't in the file, and KiCad
+        rejects the whole thing with a bare "Failed to load schematic". So follow
+        the extends chain and bring the parents along.
+        """
+        if ref in emitted:
+            return
+        shell = loaders.load_symbol_shell(ref, symbols_root)
+        parent = _extends_of(shell)
+        if parent:
+            lib, _, _ = ref.partition(":")
+            _add(f"{lib}:{parent}")  # parent must appear before the child
+        emitted.add(ref)
+        lib_symbols_children.append(deepcopy(shell))
+
     for ref in lib_ids:
         try:
-            shell = loaders.load_symbol_shell(ref, symbols_root)
+            _add(ref)
         except loaders.LibraryMiss:
+            # Swallowing this used to be silent, which produced a schematic whose
+            # symbol instances carry a lib_id with no matching lib_symbols entry.
+            # KiCad and every browser viewer choke on that — they try to resolve
+            # the reference, find nothing, and hang or bail. A board that cannot
+            # be opened is worse than one that fails to build, so say so.
+            missing.append(ref)
             continue
-        lib_symbols_children.append(deepcopy(shell))
+
+    if missing:
+        raise loaders.LibraryMiss(
+            f"{len(missing)} symbol(s) could not be loaded from {symbols_root}: "
+            f"{', '.join(missing[:8])}"
+            + (f", … (+{len(missing) - 8} more)" if len(missing) > 8 else "")
+            + ". Emitting them anyway would produce a schematic with dangling lib_ids "
+            "that no viewer can open. Check that the symbol libraries are present and "
+            "that Stage 1/2 resolved these names to symbols that actually exist."
+        )
 
     node: sexpr.Node = [
         "kicad_sch",
@@ -256,6 +331,30 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
         _title_block(project),
         lib_symbols_children,
     ]
+
+    # A banner drawn on the sheet itself. Every other warning lives in a log file
+    # or a report someone has to go and read; this one is unavoidable the moment
+    # the board is opened — in KiCad, or in the browser viewer.
+    placeholders = sorted(
+        refdes for refdes, c in components.items() if c.get("needs_manual_symbol")
+    )
+    if placeholders:
+        shown = ", ".join(placeholders[:10]) + (
+            f" (+{len(placeholders) - 10} more)" if len(placeholders) > 10 else ""
+        )
+        node.append(
+            _warning_text(
+                f"*** {len(placeholders)} PLACEHOLDER SYMBOL(S) — DO NOT FABRICATE THIS BOARD ***\n"
+                f"{shown}\n"
+                "These parts have NO REAL SYMBOL. Generic stand-ins were emitted so the "
+                "board would open.\n"
+                "Draw the real symbols, save them into the project's libraries/symbols/ "
+                "directory, then re-run stage5.\n"
+                "Details: .pipeline/manual_symbols_required.md",
+                x=20.0,
+                y=20.0,
+            )
+        )
 
     # Global labels (net palette).
     net_names = [n for n in nets.keys() if n]
@@ -273,6 +372,7 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
             # flag a lib_id mismatch otherwise. The user can add it after editing
             # bom.json and re-running the pipeline.
             continue
+        placeholder = bool(comp.get("needs_manual_symbol"))
         node.append(
             _component_instance(
                 refdes=refdes,
@@ -283,6 +383,12 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
                 y=y,
                 project_name=project_name,
                 schematic_uuid=schematic_uuid,
+                description=(
+                    "PLACEHOLDER SYMBOL — this is not the real part."
+                    if placeholder
+                    else ""
+                ),
+                requested_symbol=str(comp.get("requested_symbol", "")) if placeholder else "",
             )
         )
 

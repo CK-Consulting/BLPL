@@ -84,7 +84,7 @@ def _nets() -> dict:
 
 
 def test_emit_produces_yaml_to_kicad_compatible_structure() -> None:
-    hdm = s5.emit(_bom(), _nets(), _design_artifact(), _project_config())
+    hdm, _ = s5.emit(_bom(), _nets(), _design_artifact(), _project_config())
     # Top-level keys match what yaml_to_kicad.py expects.
     assert set(hdm.keys()) >= {"project", "net_classes", "boundaries", "components", "nets"}
     # Component structure.
@@ -118,14 +118,14 @@ def test_coverage_match_overrides_bom_hints() -> None:
     }
     schema.validate("coverage_report", coverage)
 
-    hdm = s5.emit(_bom(), _nets(), _design_artifact(), _project_config(), coverage=coverage)
+    hdm, _ = s5.emit(_bom(), _nets(), _design_artifact(), _project_config(), coverage=coverage)
     # Coverage-confirmed names should win over bom hints.
     assert hdm["components"]["J1"]["lib_symbol"] == "Connector:Barrel_Jack_Switch"
     assert hdm["components"]["J1"]["footprint"] == "Connector_BarrelJack:BarrelJack_CUI_PJ-079BH_Horizontal"
 
 
 def test_pin_map_generated_for_connectors() -> None:
-    hdm = s5.emit(_bom(), _nets(), _design_artifact(), _project_config())
+    hdm, _ = s5.emit(_bom(), _nets(), _design_artifact(), _project_config())
     assert hdm["components"]["J1"]["pin_map"] == {"VIN": "1", "GND": "2"}
 
 

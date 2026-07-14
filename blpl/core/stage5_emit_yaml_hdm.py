@@ -19,7 +19,7 @@ from typing import Any
 
 import yaml
 
-from . import schema
+from . import schema, symbol_resolution
 
 
 _PROJECT_YAML_TEMPLATE = """\
@@ -171,13 +171,24 @@ def emit(
     design_artifact: dict,
     project_config: dict,
     coverage: dict | None = None,
-) -> dict:
-    """Return an HDM dict matching the existing yaml_to_kicad.py schema."""
+    *,
+    project_dir: Path | None = None,
+    stock_symbols_root: Path | None = None,
+) -> tuple[dict, dict]:
+    """Return (HDM dict, symbol resolutions).
+
+    Every ``lib_symbol`` is checked against the real libraries before it reaches
+    the emitter. Stage 1 hands us LLM-invented symbol names that do not exist, and
+    emitting one produces a schematic KiCad cannot open. Anything unresolvable is
+    swapped for a pin-count-correct placeholder and flagged — see
+    ``symbol_resolution``.
+    """
     schema.validate("bom", bom)
     schema.validate("nets", nets)
     schema.validate("design_artifact", design_artifact)
 
     cov_by_id = _index_coverage(coverage)
+    resolutions: dict[str, symbol_resolution.Resolution] = {}
 
     board_dim = tuple(project_config.get("project", {}).get("dimensions", [100, 80]))
     components_out: dict[str, Any] = {}
@@ -193,7 +204,22 @@ def emit(
         if fp:
             comp["footprint"] = fp
         sym = _best_symbol(row, coverage_row)
-        if sym:
+        if project_dir is not None and stock_symbols_root is not None:
+            res = symbol_resolution.resolve(
+                sym,
+                project_dir=project_dir,
+                stock_root=stock_symbols_root,
+                pin_count=row.get("pin_count"),
+            )
+            resolutions[refdes] = res
+            comp["lib_symbol"] = res.ref
+            comp["symbol_source"] = res.source
+            if res.needs_manual_symbol:
+                # Carried into the HDM so every downstream consumer — the emitter,
+                # Stage 8, anyone reading hdm.yaml — can see this is not a real part.
+                comp["needs_manual_symbol"] = True
+                comp["requested_symbol"] = res.requested
+        elif sym:
             comp["lib_symbol"] = sym
         if row.get("role"):
             comp["role"] = row["role"]
@@ -215,7 +241,7 @@ def emit(
             hdm[key] = project_config[key]
     hdm["components"] = components_out
     hdm["nets"] = nets_out
-    return hdm
+    return hdm, resolutions
 
 
 def run(
@@ -225,6 +251,9 @@ def run(
     project_config_path: Path,
     output_path: Path,
     coverage_path: Path | None = None,
+    *,
+    project_dir: Path | None = None,
+    stock_symbols_root: Path | None = None,
 ) -> dict:
     """Emit hdm.yaml. Raises MissingProjectConfigError if project.yaml is not present."""
     bom = schema.load_json(bom_path)
@@ -232,7 +261,24 @@ def run(
     design_artifact = schema.load_json(design_artifact_path)
     project_config = ensure_project_config(project_config_path, design_artifact["project_id"])
     coverage = schema.load_json(coverage_path) if coverage_path and coverage_path.exists() else None
-    hdm = emit(bom, nets, design_artifact, project_config, coverage)
+    hdm, resolutions = emit(
+        bom,
+        nets,
+        design_artifact,
+        project_config,
+        coverage,
+        project_dir=project_dir,
+        stock_symbols_root=stock_symbols_root,
+    )
+
+    # The "you must draw these yourself" report. Written every run — including when
+    # it is empty — so its absence never reads as "nothing to worry about".
+    if project_dir is not None:
+        (output_path.parent / "manual_symbols_required.md").write_text(
+            symbol_resolution.render_manual_symbols_md(resolutions, project_dir),
+            encoding="utf-8",
+        )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w") as f:
         yaml.safe_dump(hdm, f, sort_keys=False)
