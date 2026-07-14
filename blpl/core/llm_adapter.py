@@ -35,10 +35,18 @@ class LLMAdapter(Protocol):
 
 
 _DEFAULT_MODELS = {
-    "anthropic": "claude-opus-4-7",
+    "anthropic": "claude-opus-4-8",
     "openai": "gpt-4o-2024-08-06",
     "ollama": "llama3.3",
 }
+
+# Structured BOM output runs ~250 tokens per component, so a 46-component board
+# needs ~12k. The old 8192 cap silently truncated those responses.
+_DEFAULT_MAX_TOKENS = 16384
+
+
+class TruncatedResponse(RuntimeError):
+    """The model hit its output limit mid-response, so the result is incomplete."""
 
 
 def get_adapter(provider: str | None = None, model: str | None = None) -> LLMAdapter:
@@ -71,7 +79,12 @@ class _AnthropicAdapter:
         self.model = model
 
     def complete_json(
-        self, system: str, user: str, output_schema: dict, model: str | None = None
+        self,
+        system: str,
+        user: str,
+        output_schema: dict,
+        model: str | None = None,
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
     ) -> dict:
         import anthropic  # lazy import; optional dep
 
@@ -84,12 +97,26 @@ class _AnthropicAdapter:
         }
         resp = client.messages.create(
             model=model or self.model,
-            max_tokens=8192,
+            max_tokens=max_tokens,
             system=system,
             tools=[tool],
             tool_choice={"type": "tool", "name": tool_name},
             messages=[{"role": "user", "content": user}],
         )
+
+        # A tool call cut off at the token limit still arrives as a tool_use
+        # block — just with truncated JSON, which the SDK hands back as a
+        # partial (often empty) dict. Taking that at face value is how Stage 1
+        # silently produced an empty BOM from a 46-component design. Truncation
+        # is a failure, so treat it as one.
+        if resp.stop_reason == "max_tokens":
+            raise TruncatedResponse(
+                f"{model or self.model} hit the {max_tokens}-token output limit "
+                f"({resp.usage.output_tokens} emitted) and its response was cut off "
+                "mid-structured-output. The result is incomplete and must not be used. "
+                "Raise max_tokens, or split the request into smaller batches."
+            )
+
         for block in resp.content:
             if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == tool_name:
                 return block.input  # type: ignore[return-value]

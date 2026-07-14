@@ -73,8 +73,18 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _build_user_prompt(design_artifact: dict) -> str:
-    comps = design_artifact.get("components", [])
+class ComponentsDropped(RuntimeError):
+    """The LLM returned fewer components than it was given."""
+
+
+# One component costs ~250 output tokens once every field is filled in. Keeping
+# batches small bounds each response well under the model's output limit, so a
+# large board can never silently truncate the way a single 46-component call did.
+_BATCH_SIZE = 12
+
+
+def _build_user_prompt(design_artifact: dict, components: list[dict] | None = None) -> str:
+    comps = design_artifact.get("components", []) if components is None else components
     lines = [f"Project: {design_artifact['project_id']}", f"Components to resolve ({len(comps)}):\n"]
     for c in comps:
         hints = []
@@ -111,12 +121,57 @@ def resolve(
     schema.validate("design_artifact", design_artifact)
     if adapter is None:
         adapter = llm_adapter.get_adapter()
-    raw = adapter.complete_json(
-        system=_SYSTEM_PROMPT,
-        user=_build_user_prompt(design_artifact),
-        output_schema=_LLM_OUTPUT_SCHEMA,
-    )
-    bom = _post_process(raw, project_id=design_artifact["project_id"])
+
+    components = design_artifact.get("components", [])
+    rows: list[dict] = []
+
+    # Batch, rather than asking for all 46 components in one response. This is
+    # not just a token-budget nicety: an over-long response gets cut off
+    # mid-tool-call, and a truncated structured output deserialises to an empty
+    # row list. That is exactly how a 46-component design silently became a
+    # 0-component BOM.
+    for start in range(0, len(components), _BATCH_SIZE):
+        batch = components[start : start + _BATCH_SIZE]
+        raw = adapter.complete_json(
+            system=_SYSTEM_PROMPT,
+            user=_build_user_prompt(design_artifact, batch),
+            output_schema=_LLM_OUTPUT_SCHEMA,
+        )
+        rows.extend(raw.get("rows", []))
+
+    # Stage 0 is deterministic: if it read 46 components out of the markdown then
+    # 46 components is ground truth. Anything missing here was lost by the model,
+    # never by the design. Give the stragglers one focused retry, then refuse to
+    # continue — a board quietly missing a third of its parts is far worse than a
+    # pipeline that stops and says so.
+    expected = {c["local_id"] for c in components}
+    got = {r.get("local_id") for r in rows}
+    missing = expected - got
+
+    if missing:
+        retry = [c for c in components if c["local_id"] in missing]
+        raw = adapter.complete_json(
+            system=_SYSTEM_PROMPT,
+            user=_build_user_prompt(design_artifact, retry),
+            output_schema=_LLM_OUTPUT_SCHEMA,
+        )
+        rows.extend(raw.get("rows", []))
+        still_missing = missing - {r.get("local_id") for r in rows}
+        if still_missing:
+            listed = ", ".join(sorted(still_missing)[:10])
+            raise ComponentsDropped(
+                f"Stage 1 resolved {len(got)} of {len(expected)} components; "
+                f"{len(still_missing)} never came back even after a retry: {listed}"
+                + (" …" if len(still_missing) > 10 else "")
+                + ". These are in your design markdown but would be absent from the "
+                "board. Fix the resolution rather than emitting an incomplete BOM."
+            )
+
+    # Drop anything hallucinated that wasn't asked for — the BOM must mirror the
+    # design, not extend it.
+    rows = [r for r in rows if r.get("local_id") in expected]
+
+    bom = _post_process({"rows": rows}, project_id=design_artifact["project_id"])
     if synthesize_connectors:
         existing_ids = {r["local_id"] for r in bom["rows"]}
         bom["rows"].extend(
