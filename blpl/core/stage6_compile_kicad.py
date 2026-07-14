@@ -17,9 +17,14 @@ import yaml
 from blpl.emitter import pcb as _pcb, pro as _pro, sch as _sch
 
 
-_PIPELINE_ROOT = Path(__file__).resolve().parent.parent
-_DEFAULT_SYMBOLS = _PIPELINE_ROOT / "kicad-symbols"
-_DEFAULT_FOOTPRINTS = _PIPELINE_ROOT / "kicad-footprints"
+# This file is blpl/core/stage6_compile_kicad.py, so the repo root is three
+# levels up. It was parent.parent (= blpl/), which pointed the library roots at
+# blpl/kicad-symbols — a path that has never existed. Every symbol and footprint
+# lookup therefore missed, silently, and the emitter shipped boards with dangling
+# lib_ids and no footprints.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_SYMBOLS = _REPO_ROOT / "kicad-symbols"
+_DEFAULT_FOOTPRINTS = _REPO_ROOT / "kicad-footprints"
 
 
 def _sanitize_filename(name: str) -> str:

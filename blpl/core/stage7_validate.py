@@ -26,8 +26,12 @@ from pathlib import Path
 from . import schema
 
 
-_PIPELINE_ROOT = Path(__file__).resolve().parent.parent
-_CHECK_SYMBOL_PY = _PIPELINE_ROOT / "kicad-library-utils" / "klc-check" / "check_symbol.py"
+# Three levels up: blpl/core/stage7_validate.py -> blpl/ -> board-layer-pipe-line/.
+# This was parent.parent, so it looked for blpl/kicad-library-utils, which does
+# not exist — meaning the KLC check has been reporting "skipped, tool not found"
+# on every run since it was written, while the overall report still said ok.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CHECK_SYMBOL_PY = _REPO_ROOT / "kicad-library-utils" / "klc-check" / "check_symbol.py"
 
 
 def _find_kicad_cli() -> str | None:
