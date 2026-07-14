@@ -216,7 +216,7 @@ do not exist (`Sensor_Motion:ICM-42670-P`, `RF_GPS:LC76G`). Those components get
 **generic placeholder** so the board still opens — but the placeholder is *not the
 part*, and the board must not be fabricated until it's replaced.
 
-Check `.pipeline/manual_symbols_required.md` after every run: it lists exactly which
+Check `.pipeline/manual_library_work.md` after every run: it lists exactly which
 symbols are missing and what to name them. Draw them, drop them in `symbols/`, and
 re-run `blpl stage5 && blpl stage6` — the placeholder disappears on its own.
 """

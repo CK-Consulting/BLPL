@@ -273,16 +273,20 @@ def build(
     for seg in _edge_cuts_rect(width, height):
         node.append(seg)
 
-    # Footprints.
+    # Footprints. A component with no loadable footprint used to be skipped
+    # silently, so the board simply came out missing parts and nothing said so.
+    # Stage 5 now resolves every footprint against the real libraries and
+    # substitutes a placeholder when it can't, so reaching here with an
+    # unloadable reference means the pipeline is broken, not the design.
     auto_index = 0
     for refdes, comp in components.items():
         fp_ref = comp.get("footprint")
         if not fp_ref or ":" not in fp_ref:
-            continue
-        try:
-            fp_node = loaders.load_footprint(fp_ref, footprints_root)
-        except loaders.LibraryMiss:
-            continue
+            raise loaders.LibraryMiss(
+                f"{refdes} has no footprint reference ({fp_ref!r}). Stage 5 should have "
+                "substituted a placeholder; run stage5 with a footprint library root."
+            )
+        fp_node = loaders.load_footprint(fp_ref, footprints_root)
         fp_node = deepcopy(fp_node)  # don't mutate the library copy
 
         # Library .kicad_mod files identify themselves by bare footprint name; a
@@ -313,6 +317,27 @@ def build(
         _set_reference_and_value(fp_node, refdes, str(comp.get("value", refdes)))
         _replace_uuid(fp_node)
 
+        if comp.get("needs_manual_footprint"):
+            # The land pattern under this part is a stand-in, not the real one.
+            # Say so on the footprint itself, so it survives being opened in
+            # KiCad by someone who never read the report.
+            fp_node.append(
+                [
+                    "property",
+                    '"BLPL_PLACEHOLDER"',
+                    sexpr.quote(
+                        f"NOT THE REAL FOOTPRINT — wanted "
+                        f"{comp.get('requested_footprint', '(none)')}"
+                    ),
+                    ["at", "0", "0", "0"],
+                    ["unlocked", "yes"],
+                    ["layer", '"F.Fab"'],
+                    ["hide", "yes"],
+                    ["uuid", _new_uuid()],
+                    ["effects", ["font", ["size", "1", "1"], ["thickness", "0.15"]]],
+                ]
+            )
+
         for pad_node in loaders.extract_pads(fp_node):
             if len(pad_node) < 2 or not isinstance(pad_node[1], str):
                 continue
@@ -325,7 +350,35 @@ def build(
 
         node.append(fp_node)
 
+    placeholders = sorted(r for r, c in components.items() if c.get("needs_manual_footprint"))
+    if placeholders:
+        node.append(_placeholder_banner(placeholders, width, height))
+
     return node
+
+
+def _placeholder_banner(refdes_list: list[str], width: float, height: float) -> sexpr.Node:
+    """A warning printed on the board's silkscreen, above the outline.
+
+    Deliberately on F.SilkS rather than a comment layer: a placeholder footprint is
+    the wrong land pattern in copper, and this has to be visible in every render and
+    every fab preview, not just to someone who thought to turn a layer on.
+    """
+    shown = ", ".join(refdes_list[:12]) + (" …" if len(refdes_list) > 12 else "")
+    return [
+        "gr_text",
+        sexpr.quote(
+            f"*** {len(refdes_list)} PLACEHOLDER FOOTPRINT(S) — DO NOT FABRICATE ***\n"
+            f"{shown}\n"
+            "These land patterns are 2.54mm headers standing in for parts whose real "
+            "footprints do not exist.\n"
+            "Draw them into libraries/footprints/, then re-run stage5."
+        ),
+        ["at", f"{_ORIGIN_X:.3f}", f"{_ORIGIN_Y - 8.0:.3f}", "0"],
+        ["layer", '"F.SilkS"'],
+        ["uuid", _new_uuid()],
+        ["effects", ["font", ["size", "2", "2"], ["thickness", "0.3"], ["bold", "yes"]], ["justify", "left"]],
+    ]
 
 
 def _default_setup() -> sexpr.Node:

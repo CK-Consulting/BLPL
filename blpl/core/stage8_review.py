@@ -36,6 +36,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 from . import schema
 
 _PIPELINE_ROOT = Path(__file__).resolve().parent.parent
@@ -267,6 +269,44 @@ def _emitter_crosschecks(bom: dict, sch: dict, pcb: dict) -> list[dict]:
     return checks
 
 
+def _placeholder_check(hdm: dict) -> list[dict]:
+    """Components whose symbol or footprint is a stand-in, not the real part.
+
+    Stage 5 substitutes these so the board still opens and renders — which is
+    exactly what makes them dangerous. This is the last gate before someone
+    treats the output as fabricable, so it is an error, not a warning.
+    """
+    out: list[dict] = []
+    for refdes, comp in sorted((hdm.get("components") or {}).items()):
+        if comp.get("needs_manual_footprint"):
+            out.append(
+                {
+                    "check": "placeholder_footprint",
+                    "severity": "error",
+                    "refdes": refdes,
+                    "summary": (
+                        f"{refdes}: no real footprint exists for "
+                        f"{comp.get('requested_footprint', '(none)')!r} — a 2.54mm header "
+                        f"is standing in for it. This land pattern is wrong copper."
+                    ),
+                }
+            )
+        if comp.get("needs_manual_symbol"):
+            out.append(
+                {
+                    "check": "placeholder_symbol",
+                    "severity": "error",
+                    "refdes": refdes,
+                    "summary": (
+                        f"{refdes}: no real symbol exists for "
+                        f"{comp.get('requested_symbol', '(none)')!r} — a generic connector "
+                        f"is standing in for it."
+                    ),
+                }
+            )
+    return out
+
+
 def _render_markdown(report: dict) -> str:
     lines = ["# Stage 8 — Design Review", ""]
     counts = report["summary"]
@@ -276,6 +316,28 @@ def _render_markdown(report: dict) -> str:
         f"{counts['expected']} expected (known BLPL limitations)"
     )
     lines.append("")
+
+    if report.get("placeholders"):
+        ph = report["placeholders"]
+        fps = [p for p in ph if p["check"] == "placeholder_footprint"]
+        syms = [p for p in ph if p["check"] == "placeholder_symbol"]
+        lines += [
+            "## DO NOT FABRICATE THIS BOARD",
+            "",
+            f"{len(fps)} component(s) carry a **placeholder footprint** and "
+            f"{len(syms)} carry a **placeholder symbol**. Stage 5 substituted generic "
+            "stand-ins because the real library parts do not exist, so the board opens, "
+            "routes, and renders while being wrong.",
+            "",
+        ]
+        for p in ph:
+            lines.append(f"- **{p['refdes']}** — {p['summary']}")
+        lines += [
+            "",
+            "Draw the real parts into the project's `libraries/` directory and re-run stage5.",
+            "See `.pipeline/manual_library_work.md`.",
+            "",
+        ]
 
     if report["emitter_defects"]:
         lines += [
@@ -389,6 +451,10 @@ def run(
     da_path = pipeline_dir / "design_artifact.deterministic.json"
     design_artifact = schema.load_json(da_path) if da_path.exists() else {}
 
+    hdm_path = pipeline_dir / "hdm.yaml"
+    hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {} if hdm_path.exists() else {}
+    placeholders = _placeholder_check(hdm)
+
     crosschecks = _stage1_crosscheck(design_artifact, bom)
     crosschecks += _emitter_crosschecks(bom, sch_json, pcb_json)
     emitter_evidence = {c["check"]: True for c in crosschecks}
@@ -436,16 +502,20 @@ def run(
     design_issues.sort(key=lambda d: _SEV.get(d["severity"], 3))
 
     report = {
-        # A board is not "ok" if the pipeline mis-emitted it. Design issues are
-        # the user's to triage; emitter defects are ours, and they gate.
-        "ok": not emitter_defects,
+        # A board is not "ok" if the pipeline mis-emitted it, and it is certainly
+        # not ok if parts of it are stand-ins. Emitter defects are ours to fix and
+        # they gate; so do placeholders, which are the last thing standing between
+        # a generated board and a fab house. Design issues are the user's to triage.
+        "ok": not emitter_defects and not placeholders,
         "skipped": False,
         "kicad_happy": str(base),
         "summary": {
             "emitter": len(emitter_defects),
             "design": len(design_issues),
             "expected": sum(expected_counts.values()),
+            "placeholders": len(placeholders),
         },
+        "placeholders": placeholders,
         "emitter_defects": emitter_defects,
         "design_issues": design_issues,
         "expected": expected,

@@ -350,7 +350,7 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
                 "board would open.\n"
                 "Draw the real symbols, save them into the project's libraries/symbols/ "
                 "directory, then re-run stage5.\n"
-                "Details: .pipeline/manual_symbols_required.md",
+                "Details: .pipeline/manual_library_work.md",
                 x=20.0,
                 y=20.0,
             )

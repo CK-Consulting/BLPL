@@ -174,8 +174,9 @@ def emit(
     *,
     project_dir: Path | None = None,
     stock_symbols_root: Path | None = None,
-) -> tuple[dict, dict]:
-    """Return (HDM dict, symbol resolutions).
+    stock_footprints_root: Path | None = None,
+) -> tuple[dict, dict, dict]:
+    """Return (HDM dict, symbol resolutions, footprint resolutions).
 
     Every ``lib_symbol`` is checked against the real libraries before it reaches
     the emitter. Stage 1 hands us LLM-invented symbol names that do not exist, and
@@ -189,6 +190,7 @@ def emit(
 
     cov_by_id = _index_coverage(coverage)
     resolutions: dict[str, symbol_resolution.Resolution] = {}
+    footprint_resolutions: dict[str, symbol_resolution.Resolution] = {}
 
     board_dim = tuple(project_config.get("project", {}).get("dimensions", [100, 80]))
     components_out: dict[str, Any] = {}
@@ -201,9 +203,8 @@ def emit(
             "placement": _default_placement(i, len(rows), board_dim),
         }
         fp = _best_footprint(row, coverage_row)
-        if fp:
-            comp["footprint"] = fp
         sym = _best_symbol(row, coverage_row)
+
         if project_dir is not None and stock_symbols_root is not None:
             res = symbol_resolution.resolve(
                 sym,
@@ -221,6 +222,22 @@ def emit(
                 comp["requested_symbol"] = res.requested
         elif sym:
             comp["lib_symbol"] = sym
+
+        if project_dir is not None and stock_footprints_root is not None:
+            fres = symbol_resolution.resolve_footprint(
+                fp,
+                project_dir=project_dir,
+                stock_root=stock_footprints_root,
+                pin_count=row.get("pin_count"),
+            )
+            footprint_resolutions[refdes] = fres
+            comp["footprint"] = fres.ref
+            comp["footprint_source"] = fres.source
+            if fres.needs_manual_symbol:
+                comp["needs_manual_footprint"] = True
+                comp["requested_footprint"] = fres.requested
+        elif fp:
+            comp["footprint"] = fp
         if row.get("role"):
             comp["role"] = row["role"]
         pin_map = _pin_map_for(row["local_id"], design_artifact, bom_row=row)
@@ -241,7 +258,7 @@ def emit(
             hdm[key] = project_config[key]
     hdm["components"] = components_out
     hdm["nets"] = nets_out
-    return hdm, resolutions
+    return hdm, resolutions, footprint_resolutions
 
 
 def run(
@@ -254,6 +271,7 @@ def run(
     *,
     project_dir: Path | None = None,
     stock_symbols_root: Path | None = None,
+    stock_footprints_root: Path | None = None,
 ) -> dict:
     """Emit hdm.yaml. Raises MissingProjectConfigError if project.yaml is not present."""
     bom = schema.load_json(bom_path)
@@ -261,7 +279,7 @@ def run(
     design_artifact = schema.load_json(design_artifact_path)
     project_config = ensure_project_config(project_config_path, design_artifact["project_id"])
     coverage = schema.load_json(coverage_path) if coverage_path and coverage_path.exists() else None
-    hdm, resolutions = emit(
+    hdm, resolutions, footprint_resolutions = emit(
         bom,
         nets,
         design_artifact,
@@ -269,13 +287,16 @@ def run(
         coverage,
         project_dir=project_dir,
         stock_symbols_root=stock_symbols_root,
+        stock_footprints_root=stock_footprints_root,
     )
 
     # The "you must draw these yourself" report. Written every run — including when
     # it is empty — so its absence never reads as "nothing to worry about".
     if project_dir is not None:
-        (output_path.parent / "manual_symbols_required.md").write_text(
-            symbol_resolution.render_manual_symbols_md(resolutions, project_dir),
+        (output_path.parent / "manual_library_work.md").write_text(
+            symbol_resolution.render_manual_symbols_md(
+                resolutions, project_dir, footprint_resolutions
+            ),
             encoding="utf-8",
         )
 

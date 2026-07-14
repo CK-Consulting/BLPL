@@ -115,7 +115,7 @@ def test_emitter_defects_gate_but_design_issues_do_not(tmp_path: Path, monkeypat
     monkeypatch.setattr(s8, "_run_analyzer", _fake_run)
 
     report = s8.run(tmp_path, sch_path=sch, pcb_path=None)
-    assert report["summary"] == {"emitter": 0, "design": 1, "expected": 1}
+    assert report["summary"] == {"emitter": 0, "design": 1, "expected": 1, "placeholders": 0}
     assert report["ok"] is True
     assert "DC-002" in (pipeline / "review.md").read_text()
 
@@ -134,3 +134,34 @@ def test_no_loss_reported_when_stage1_kept_everything() -> None:
     bom = _bom([{"local_id": "U1", "mpn": "M", "package": "P"},
                 {"local_id": "U2", "mpn": "M", "package": "P"}])
     assert s8._stage1_crosscheck(da, bom) == []
+
+
+def test_a_placeholder_part_blocks_fabrication() -> None:
+    """The last gate before someone treats generated output as fabricable.
+
+    Stage 5 substitutes generic stand-ins for parts it can't find so the board
+    still opens and renders — which is precisely what makes them dangerous. A
+    board with a 2.54mm header standing in for a QFN is not "ok" at any severity
+    below error.
+    """
+    hdm = {
+        "components": {
+            "U_IMU": {
+                "needs_manual_footprint": True,
+                "requested_footprint": "Sensor_Motion:InvenSense_QFN-14",
+                "needs_manual_symbol": True,
+                "requested_symbol": "Sensor_Motion:ICM-42670-P",
+            },
+            "R1": {},
+        }
+    }
+    found = s8._placeholder_check(hdm)
+    kinds = {f["check"] for f in found}
+    assert kinds == {"placeholder_footprint", "placeholder_symbol"}
+    assert all(f["severity"] == "error" for f in found)
+    assert all(f["refdes"] == "U_IMU" for f in found)
+    assert "wrong copper" in next(f for f in found if f["check"] == "placeholder_footprint")["summary"]
+
+
+def test_a_board_with_no_placeholders_reports_none() -> None:
+    assert s8._placeholder_check({"components": {"R1": {}, "C1": {}}}) == []

@@ -20,7 +20,7 @@ The placeholder is the dangerous part. A placeholder that looks like a real part
 is how you fab a board with the wrong footprint on it. So it is marked at every
 level it can be marked at — the BOM row, the HDM, a property on the symbol in the
 schematic itself, a warning block drawn on the schematic sheet, a dedicated
-`manual_symbols_required.md` artifact, and a hard error in Stage 8. It should be
+`manual_library_work.md` artifact, and a hard error in Stage 8. It should be
 impossible to look at any output of this pipeline and not know.
 """
 
@@ -77,6 +77,71 @@ def _exists_in(root: Path, lib: str, name: str) -> bool:
     return False
 
 
+def footprint_search_path(project_dir: Path, stock_root: Path) -> list[tuple[Path, str]]:
+    """Footprint library roots, highest priority first."""
+    project_dir = Path(project_dir)
+    return [
+        (project_dir / CUSTOM_LIB_DIRNAME / "footprints", CUSTOM),
+        (project_dir / GENERATED_LIB_DIRNAME / "footprints", GENERATED),
+        (Path(stock_root), STOCK),
+    ]
+
+
+def _footprint_exists_in(root: Path, lib: str, name: str) -> bool:
+    return (root / f"{lib}.pretty" / f"{name}.kicad_mod").is_file()
+
+
+def placeholder_footprint_for(pin_count: int | None) -> str:
+    """A stock through-hole header with the right number of pads.
+
+    Pad *count* is what matters: it has to match the symbol's pin count or the
+    netlist won't attach. A 2.54mm header is also unmistakably not a QFN or a
+    BGA — nobody glances at one and assumes the footprint is right. That is the
+    point. A placeholder that looks plausible is how a board gets fabricated with
+    the wrong land pattern under a part.
+    """
+    n = pin_count if pin_count and 1 <= pin_count <= 40 else 2
+    return f"Connector_PinHeader_2.54mm:PinHeader_1x{n:02d}_P2.54mm_Vertical"
+
+
+def resolve_footprint(
+    requested: str | None,
+    *,
+    project_dir: Path,
+    stock_root: Path,
+    pin_count: int | None = None,
+) -> Resolution:
+    """Resolve one footprint reference, substituting a placeholder if it isn't real.
+
+    Stage 1 hallucinates footprint names exactly the way it hallucinates symbol
+    names — and the PCB is the file that becomes copper, so an unchecked footprint
+    is the more dangerous of the two. The emitter used to silently skip any
+    footprint it couldn't load, which is why boards came out with components simply
+    missing rather than wrong.
+    """
+    if not requested or ":" not in requested:
+        ref = placeholder_footprint_for(pin_count)
+        return Resolution(
+            ref=ref,
+            source=PLACEHOLDER,
+            requested=requested or "(none)",
+            reason="no footprint was resolved for this component",
+        )
+
+    lib, _, name = requested.partition(":")
+    for root, source in footprint_search_path(project_dir, stock_root):
+        if root.is_dir() and _footprint_exists_in(root, lib, name):
+            return Resolution(ref=requested, source=source, requested=requested)
+
+    ref = placeholder_footprint_for(pin_count)
+    return Resolution(
+        ref=ref,
+        source=PLACEHOLDER,
+        requested=requested,
+        reason=f"{requested} does not exist in any footprint library",
+    )
+
+
 def placeholder_for(pin_count: int | None) -> str:
     """A generic symbol with the right number of pins.
 
@@ -119,46 +184,84 @@ def resolve(
     )
 
 
-def render_manual_symbols_md(resolutions: dict[str, Resolution], project_dir: Path) -> str:
-    """The 'you must draw these yourself' report."""
-    placeholders = {r: res for r, res in resolutions.items() if res.needs_manual_symbol}
-    custom_dir = Path(project_dir) / CUSTOM_LIB_DIRNAME / "symbols"
+def render_manual_symbols_md(
+    resolutions: dict[str, Resolution],
+    project_dir: Path,
+    footprint_resolutions: dict[str, Resolution] | None = None,
+) -> str:
+    """The 'you must draw these yourself' report, for symbols and footprints."""
+    footprint_resolutions = footprint_resolutions or {}
+    sym_bad = {r: res for r, res in resolutions.items() if res.needs_manual_symbol}
+    fp_bad = {r: res for r, res in footprint_resolutions.items() if res.needs_manual_symbol}
+    custom = Path(project_dir) / CUSTOM_LIB_DIRNAME
 
-    if not placeholders:
-        return "# Manual symbols required\n\nNone — every component resolved to a real symbol.\n"
+    if not sym_bad and not fp_bad:
+        return (
+            "# Manual library work required\n\n"
+            "None — every component resolved to a real symbol and a real footprint.\n"
+        )
 
     lines = [
-        "# Manual symbols required",
+        "# Manual library work required",
         "",
-        f"**{len(placeholders)} component(s) have NO REAL SYMBOL.** They were emitted with a",
-        "generic placeholder so the board is still viewable and routable — but the placeholder",
-        "is *not the part*. Its pins are generic and its footprint association is meaningless.",
+        "> ## DO NOT FABRICATE THIS BOARD",
+        ">",
+        f"> **{len(sym_bad)} component(s) have no real symbol** and "
+        f"**{len(fp_bad)} have no real footprint.**",
+        "> Generic placeholders were emitted so the board still opens, routes, and renders —",
+        "> but a placeholder is *not the part*.",
         "",
-        "> **Do not fabricate this board until every symbol below is replaced.**",
+        "A wrong **symbol** gives you a wrong schematic. A wrong **footprint** gives you a",
+        "board with the wrong land pattern etched into copper, and you don't find out until",
+        "the parts don't fit. The footprint list is the one to take seriously.",
         "",
-        "## What to do",
-        "",
-        f"1. Draw each symbol in KiCad's Symbol Editor.",
-        f"2. Save it into `{custom_dir}` as `<Library>.kicad_symdir/<Name>.kicad_sym`",
-        "   (or a flat `<Library>.kicad_sym`). That directory is searched **first**, ahead of",
-        "   both the auto-generated symbols and KiCad's stock libraries — so your work always wins.",
-        "3. Re-run `blpl stage5 && blpl stage6`. The placeholder disappears automatically.",
-        "",
-        "## Missing symbols",
-        "",
-        "| Refdes | Requested symbol | Placeholder emitted | Why |",
-        "|---|---|---|---|",
     ]
-    for refdes, res in sorted(placeholders.items()):
-        lines.append(f"| `{refdes}` | `{res.requested}` | `{res.ref}` | {res.reason} |")
+
+    if fp_bad:
+        lines += [
+            "## Missing footprints",
+            "",
+            "| Refdes | Requested footprint | Placeholder emitted | Why |",
+            "|---|---|---|---|",
+        ]
+        for refdes, res in sorted(fp_bad.items()):
+            lines.append(f"| `{refdes}` | `{res.requested}` | `{res.ref}` | {res.reason} |")
+        lines += [
+            "",
+            f"Draw each in KiCad's Footprint Editor and save into",
+            f"`{custom / 'footprints'}` as `<Library>.pretty/<Name>.kicad_mod`.",
+            "",
+        ]
+
+    if sym_bad:
+        lines += [
+            "## Missing symbols",
+            "",
+            "| Refdes | Requested symbol | Placeholder emitted | Why |",
+            "|---|---|---|---|",
+        ]
+        for refdes, res in sorted(sym_bad.items()):
+            lines.append(f"| `{refdes}` | `{res.requested}` | `{res.ref}` | {res.reason} |")
+        lines += [
+            "",
+            f"Draw each in KiCad's Symbol Editor and save into",
+            f"`{custom / 'symbols'}` as `<Library>.kicad_symdir/<Name>.kicad_sym`",
+            "(or a flat `<Library>.kicad_sym`).",
+            "",
+        ]
 
     lines += [
+        "## Then",
+        "",
+        f"`{custom}` is searched **first** — ahead of the Stage 3 auto-generated libraries and",
+        "ahead of KiCad's stock libraries — so anything you hand-author always beats a guess.",
+        "Re-run `blpl stage5 && blpl stage6` and the placeholders disappear on their own.",
         "",
         "## Why these are missing",
         "",
-        "Stage 1 asks an LLM for a KiCad library symbol name, and it will invent plausible",
-        "ones that do not exist. Every name above was checked against your custom libraries,",
-        "the Stage 3 generated symbols, and KiCad's stock libraries, and found in none of them.",
+        "Stage 1 asks an LLM for KiCad library names, and it will confidently invent plausible",
+        "ones that do not exist. Every name above was checked against your custom libraries, the",
+        "Stage 3 generated libraries, and KiCad's stock libraries, and found in none of them.",
         "",
     ]
     return "\n".join(lines)

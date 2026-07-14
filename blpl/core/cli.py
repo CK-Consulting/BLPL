@@ -426,6 +426,7 @@ def _cmd_stage5(args: argparse.Namespace) -> int:
             coverage_path=coverage if coverage.exists() else None,
             project_dir=proj,
             stock_symbols_root=stage6_compile_kicad._DEFAULT_SYMBOLS,
+            stock_footprints_root=stage6_compile_kicad._DEFAULT_FOOTPRINTS,
         )
     except stage5_emit_yaml_hdm.MissingProjectConfigError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -435,23 +436,37 @@ def _cmd_stage5(args: argparse.Namespace) -> int:
 
     # A placeholder that slips by unnoticed is how you fab a board with the wrong
     # part on it. Make it impossible to miss at the console, not just in a file.
-    placeholders = {
-        refdes: comp
-        for refdes, comp in hdm.get("components", {}).items()
-        if comp.get("needs_manual_symbol")
-    }
-    if placeholders:
-        report = out.parent / "manual_symbols_required.md"
+    comps = hdm.get("components", {})
+    report = out.parent / "manual_library_work.md"
+    custom = proj / symbol_resolution.CUSTOM_LIB_DIRNAME
+
+    bad_fp = {r: c for r, c in comps.items() if c.get("needs_manual_footprint")}
+    if bad_fp:
         print()
-        print(f"  ***  {len(placeholders)} COMPONENT(S) HAVE NO REAL SYMBOL  ***")
+        print(f"  ***  {len(bad_fp)} COMPONENT(S) HAVE NO REAL FOOTPRINT  ***")
+        print("       A pad-count-correct 2.54mm header was emitted in their place.")
+        print("       A wrong footprint is copper. DO NOT FABRICATE THIS BOARD.")
+        print()
+        for refdes, comp in sorted(bad_fp.items()):
+            print(f"       {refdes:<14} wanted {comp.get('requested_footprint')!r} — does not exist")
+        print()
+        print(f"       Draw them, save into {custom / 'footprints'} as <Lib>.pretty/<Name>.kicad_mod.")
+
+    bad_sym = {r: c for r, c in comps.items() if c.get("needs_manual_symbol")}
+    if bad_sym:
+        print()
+        print(f"  ***  {len(bad_sym)} COMPONENT(S) HAVE NO REAL SYMBOL  ***")
         print("       A generic placeholder was emitted so the board still opens.")
-        print("       The placeholder is NOT the part. DO NOT FABRICATE THIS BOARD.")
+        print("       The placeholder is NOT the part.")
         print()
-        for refdes, comp in sorted(placeholders.items()):
+        for refdes, comp in sorted(bad_sym.items()):
             print(f"       {refdes:<14} wanted {comp.get('requested_symbol')!r} — does not exist")
         print()
-        print(f"       Draw them, save into {proj / symbol_resolution.CUSTOM_LIB_DIRNAME / 'symbols'},")
-        print(f"       and re-run stage5. Details: {report}")
+        print(f"       Draw them, save into {custom / 'symbols'}.")
+
+    if bad_fp or bad_sym:
+        print()
+        print(f"       Re-run stage5 once they exist. Details: {report}")
         print()
     return 0
 
@@ -660,13 +675,18 @@ def _cmd_stage8(args: argparse.Namespace) -> int:
     s = report["summary"]
     status = "PASS" if report["ok"] else "FAIL"
     print(
-        f"stage8: {status}  emitter={s['emitter']}  design={s['design']}  expected={s['expected']}"
+        f"stage8: {status}  emitter={s['emitter']}  design={s['design']}  "
+        f"expected={s['expected']}  placeholders={s.get('placeholders', 0)}"
     )
     for d in report["emitter_defects"]:
         rule = d.get("rule_id") or d.get("check")
         print(f"        [emitter] {rule}: {d['summary']}")
+    if report.get("placeholders"):
+        print("        [placeholder] DO NOT FABRICATE — parts of this board are stand-ins:")
+        for d in report["placeholders"]:
+            print(f"        [placeholder] {d['summary']}")
     print(f"        wrote {pipeline_dir / 'review.md'}")
-    # Emitter defects gate; design issues are the user's to triage.
+    # Emitter defects and placeholders gate; design issues are the user's to triage.
     return 0 if report["ok"] else 1
 
 
