@@ -1,0 +1,38 @@
+# Run BLPL as a hosted app.
+#
+# The point of hosting: KiCad lives here, not on your laptop. Sit down at any
+# workstation, open a browser, and the toolchain is byte-identical — no local
+# KiCad install to update, no mac-vs-linux path mismatches.
+services:
+  backend:
+    build:
+      # Context is board-layer-pipe-line/ so the image can pull in blpl/ and
+      # kicad-happy/ alongside the app.
+      context: ..
+      dockerfile: app/backend/Dockerfile
+    container_name: blpl-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - BLPL_PROJECTS_ROOT=/app/projects
+      - BLPL_KICAD_HAPPY=/app/kicad-happy
+      # Stage 1 resolves MPNs with an LLM. Passed through from the host for now;
+      # a real secret store lands with auth.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      # Your designs. This is the only stateful thing in the system.
+      - ${BLPL_PROJECTS:-./data/projects}:/app/projects
+      # 3D model libraries, so `kicad-cli pcb export glb --subst-models` can
+      # substitute real component models. This is the *only* reason Huaqiu ship
+      # a forked kicad:full image — mounting the official libraries gets us the
+      # same capability off the official KiCad, with no fork to audit.
+      - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: blpl-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend

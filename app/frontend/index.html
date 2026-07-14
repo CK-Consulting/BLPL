@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BLPL</title>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!--
+      ecad-viewer resolves these as bare module specifiers at runtime, so they
+      must be declared here rather than bundled by Vite. glyph-full is the
+      stroke-font atlas KiCad text rendering needs; three backs the 3D tab.
+    -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/three/three.module.js",
+          "three/addons/": "/three/addons/",
+          "3d-viewer": "/3d-viewer.js",
+          "glyph-full": "/glyph-full.js"
+        }
+      }
+    </script>
+    <script type="module" src="/ecad-viewer.js"></script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

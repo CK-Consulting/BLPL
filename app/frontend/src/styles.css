@@ -1,0 +1,21 @@
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; color: #e6e6e6; background: #14161a; }
+.app { display: flex; flex-direction: column; height: 100vh; }
+header { display: flex; align-items: center; gap: .6rem; padding: .6rem 1rem; border-bottom: 1px solid #2a2e36; background: #191c22; }
+header .sep { color: #555; }
+header .kicad { margin-left: auto; color: #7d8590; font-size: 12px; }
+main { display: flex; flex: 1; min-height: 0; }
+aside { width: 380px; padding: 1rem; border-right: 1px solid #2a2e36; overflow: auto; }
+.viewer { flex: 1; min-width: 0; background: #0f1115; }
+.panel { display: flex; flex-direction: column; gap: .6rem; }
+.row { display: flex; align-items: center; gap: .5rem; }
+select, button { background: #22262e; color: #e6e6e6; border: 1px solid #343a44; border-radius: 6px; padding: .35rem .6rem; font: inherit; }
+button { cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+.badge { padding: .1rem .45rem; border-radius: 999px; font-size: 12px; }
+.badge.ok { background: #16351f; color: #6ee7a0; }
+.badge.fail { background: #3a1a1d; color: #ff8b8b; }
+.log { margin: 0; padding: .7rem; background: #0f1115; border: 1px solid #2a2e36; border-radius: 6px; font: 12px/1.45 ui-monospace, monospace; white-space: pre-wrap; max-height: 60vh; overflow: auto; }
+.empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #7d8590; gap: .4rem; }
+.hint { font-size: 12px; }
+code { background: #22262e; padding: .1rem .3rem; border-radius: 4px; }

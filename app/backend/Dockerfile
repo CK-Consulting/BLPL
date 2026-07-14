@@ -1,0 +1,49 @@
+# The backend image IS a KiCad image. That is the load-bearing decision here:
+# kicad-cli ships in the container, so no workstation ever needs KiCad installed
+# or updated, and every machine you sit at renders and exports identically.
+#
+# Official upstream image, deliberately. Huaqiu-Electronics publish a kicad:full
+# with 3D models baked in, but it is built from a fork whose default branch is
+# release/9.0 with no documented divergence from upstream — and we emit KiCad 10
+# files. We take the official 10.0.0 image and mount the 3D model libraries we
+# already vendor instead, which gets `pcb export glb --subst-models` working
+# without inheriting an unaudited fork.
+FROM kicad/kicad:10.0.0
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-pip python3-venv git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# A venv, not --break-system-packages: the KiCad image's system Python owns
+# pcbnew, and we would rather not fight it over dependency versions.
+ENV VIRTUAL_ENV=/opt/blpl-venv
+RUN python3 -m venv --system-site-packages $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+COPY app/backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# BLPL itself (stages 0-8) plus the review analyzers. Build context is the
+# board-layer-pipe-line/ root so both are reachable.
+COPY pyproject.toml README.md /app/
+COPY blpl /app/blpl
+COPY schemas /app/schemas
+COPY kicad-happy /app/kicad-happy
+RUN pip install --no-cache-dir -e /app
+
+COPY app/backend/app /app/app
+
+ENV BLPL_PROJECTS_ROOT=/app/projects \
+    BLPL_KICAD_HAPPY=/app/kicad-happy \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+# One worker on purpose. Stage runs stream over SSE from an in-process
+# subprocess; adding workers without a shared job store just makes streams land
+# on the wrong process.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

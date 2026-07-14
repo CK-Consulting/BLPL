@@ -1,0 +1,346 @@
+# BLPL as an application — architecture plan
+
+Status: proposal. Nothing here is built yet.
+
+## What "app-ified" means, concretely
+
+Today BLPL is a CLI with a thin web veneer. Running it requires you to know things
+that live nowhere in the product:
+
+| Friction today | Where it lives now |
+|---|---|
+| `BLPL_WORKSPACE` must point at a directory tree | env var |
+| `ANTHROPIC_API_KEY` must be exported | `.env`, plaintext, repo-adjacent |
+| Provider + model chosen per-invocation | `--llm-provider` / `--llm-model` / `HDM_LLM_*` |
+| A project must *already* contain `.blpl/` | filesystem convention, undocumented |
+| `project.yaml` must be hand-authored or Stage 5 halts | template dumped on failure |
+| No user identity at all | — |
+
+The goal is that a user launches one command (or one app icon), lands in a browser,
+creates a profile, pastes their API keys once, points at a directory, clicks
+**Initialize project**, and never sets an environment variable. Everything above
+becomes a screen.
+
+## The core idea: three layers of state, with a hard rule about which is which
+
+The tension in the brief — "declarative plaintext config like nix" *and* "SQLite for
+settings, keys, prefs, projects" — resolves cleanly once you split state by *kind*
+rather than by *sensitivity*:
+
+```
+┌─ blpl.toml ────────────── declarative, plaintext, git-friendly, reproducible
+│    statements of INTENT: which models, which library roots, which net-class
+│    defaults, which directories are allowed. Anyone can read it. Committing it
+│    to a repo is a feature. The settings UI is an EDITOR over this file — the
+│    file stays the source of truth, never the DB.
+│
+├─ blpl.db (SQLite) ─────── identity, secrets, and facts about what happened
+│    things that CANNOT be declarative: who you are, your encrypted API keys,
+│    which projects you registered, run history. Copying this file to another
+│    machine should not leak anything.
+│
+└─ session memory ───────── the decrypted data-encryption key. Never on disk.
+     Dies on restart. Restart ⇒ vault relocks.
+```
+
+The rule: **if it's a statement of intent, it goes in the TOML. If it's an identity,
+a secret, or a historical fact, it goes in the DB.** Settings are intent, so they
+live in the file — which is exactly the nix-like property worth having: the whole
+configuration is inspectable, diffable, and reproducible from a text file, and the
+GUI is a convenience over it rather than a replacement for it.
+
+A corollary worth enforcing in code: **the config loader must reject anything in
+`blpl.toml` that looks like a secret.** Making it structurally impossible to paste
+an API key into the plaintext file is worth more than any amount of documentation.
+
+### Config cascade
+
+```
+/etc/blpl/blpl.toml            (system, optional)
+  ← ~/.config/blpl/blpl.toml   (user — what the settings UI writes)
+    ← <project>/.blpl/blpl.toml (project overrides, committed with the design)
+```
+
+Deep-merged, later wins. Env vars remain the lowest-priority fallback so headless
+and CI runs keep working unchanged.
+
+The settings UI should show the **effective merged value and which layer it came
+from**. "Why is this model set to X?" is the question a cascading config always
+raises, and answering it in the UI is cheap.
+
+## Identity and secrets
+
+Decision: **passphrase-derived, per user.** This is the only option that survives
+the eventual move to a network-exposed server, and it means a stolen `blpl.db` is
+inert.
+
+### Key hierarchy
+
+Do not encrypt secrets directly with the passphrase-derived key — wrap a random
+data key instead, so changing a passphrase re-wraps one 32-byte blob rather than
+re-encrypting every secret.
+
+```
+passphrase ──Argon2id(salt, t=3, m=64MiB, p=4)──▶ KEK (32B, never stored)
+                                                   │
+                              AES-256-GCM unwrap   ▼
+                                                  DEK (32B, random per user)
+                                                   │
+                              AES-256-GCM          ▼
+                                            each secret ciphertext
+                                            AAD = f"{user_id}:{provider}"
+```
+
+The AAD binds a ciphertext to its owner and provider slot, so a row cannot be
+copied from one user (or one provider field) to another and still decrypt.
+
+Authentication uses a **separate** Argon2id verifier — never the KEK, and never a
+hash derived from it.
+
+### Schema
+
+```sql
+users(
+  id INTEGER PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  kdf_salt BLOB NOT NULL,
+  kdf_params TEXT NOT NULL,      -- json; lets us raise cost later per-user
+  verifier TEXT NOT NULL,        -- argon2 PHC string, for login only
+  wrapped_dek BLOB NOT NULL,
+  dek_nonce BLOB NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+secrets(
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,        -- 'anthropic' | 'openai' | 'digikey' | ...
+  ciphertext BLOB NOT NULL,
+  nonce BLOB NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, provider)
+);
+
+projects(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,            -- absolute; replaces the BLPL_WORKSPACE scan
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (user_id, path)
+);
+
+runs(
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  stage TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  exit_code INTEGER,
+  summary TEXT                   -- json; e.g. stage8's {emitter, design, expected}
+);
+```
+
+Sessions are deliberately **not** a table. A session is `{user_id, dek, expires}` in
+server memory keyed by an opaque token in an HttpOnly cookie. The DEK never reaches
+the browser and never touches disk; a server restart therefore relocks the vault,
+which is the correct and honest behavior.
+
+Dependencies: `argon2-cffi`, `cryptography`. Both are small, well-maintained, and
+already ubiquitous.
+
+### The locked-vault problem (be honest about it)
+
+A locked vault cannot run an LLM stage. That is the price of real encryption at
+rest, and it has three consequences worth designing for now rather than discovering
+later:
+
+1. **Headless/CI/cron runs.** Keep the env-var path alive as the lowest-priority
+   fallback. `ANTHROPIC_API_KEY` in the environment continues to work for the CLI.
+   Do not make the DB the only source of keys.
+2. **Local convenience.** Offer an opt-in cache of the DEK in the OS keychain
+   (`keyring`), so a single-user desktop install doesn't prompt constantly. Opt-in,
+   clearly labelled, off by default.
+3. **Clear failure.** A stage needing a key with the vault locked must return a
+   specific `409 vault_locked` that the UI turns into an unlock prompt — not a
+   generic 500, and not a silent fall back to an unkeyed provider.
+
+## LLM routing — declarative, per task class
+
+The brief asks for "a prioritization model for which LLM to use and for
+fallbacks/extra work." That is a routing policy, and it belongs in the TOML:
+
+```toml
+[llm]
+default_chain = ["anthropic/claude-opus-4-8", "anthropic/claude-sonnet-5"]
+
+[llm.tasks]
+# Stage 0 is a mechanical markdown re-read — cheap model is fine.
+stage0            = ["anthropic/claude-haiku-4-5"]
+# Stage 1 resolves MPN → package → library hints. Hallucinated footprints are a
+# known, expensive failure mode here; spend the tokens.
+stage1            = ["anthropic/claude-opus-4-8", "anthropic/claude-sonnet-5"]
+# Datasheet extraction reads PDF pages — must be a vision-capable model.
+datasheet_extract = ["anthropic/claude-sonnet-5"]
+```
+
+`get_adapter()` in `blpl/core/llm_adapter.py` is already the single choke point;
+it grows a `task=` argument, resolves the chain from config, and pulls the key from
+the vault (falling back to env).
+
+**What triggers a fallback matters more than the chain itself:**
+
+| Condition | Behavior |
+|---|---|
+| Timeout, transport error, 429, 5xx | Advance to next model in chain |
+| 401 / 403 (bad or missing key) | **Fail loudly.** Never silently downgrade — the user needs to fix the key, and a fallback would hide it |
+| Schema-validation failure on structured output | Retry *same* model N times, then advance. A different model rarely fixes a malformed-JSON problem, and quietly escalating to a pricier model on every schema hiccup is how bills explode |
+
+That third row is the one that gets built wrong by default.
+
+Note: `_DEFAULT_MODELS` currently pins `claude-opus-4-7`, a generation behind. The
+config migration is a natural moment to fix it.
+
+## Project lifecycle — killing `BLPL_WORKSPACE`
+
+**The browser cannot hand the backend a directory path.** The File System Access API
+yields an opaque handle, not a path, and the backend must run
+`blpl stage6 --project-dir <path>` as a subprocess. So the directory picker is
+**server-side**: the backend enumerates directories under configured roots and
+returns real paths. `FilesystemSandbox` in `blpl/webapp/references.py` already
+implements the allow/deny logic to build on.
+
+New routes:
+
+```
+GET  /api/fs/roots                     → workspace roots from config
+GET  /api/fs/list?path=…               → sandboxed directory listing
+POST /api/projects                     → initialize + register
+```
+
+`POST /api/projects` is the **init wizard's** endpoint. It takes name, board_id,
+dimensions, stackup, and net classes; creates `.blpl/` and `.pipeline/`; and writes
+`project.yaml` — reusing the template generator that `stage5_emit_yaml_hdm.py`
+already dumps on failure. Today that template appears only *after* the pipeline has
+halted, which is exactly backwards. Generating it up front removes the single most
+confusing halt in the pipeline.
+
+Project discovery then reads the `projects` table instead of scanning the filesystem
+under an env var, and `BLPL_WORKSPACE` is deleted.
+
+## The input doctor — the highest-value screen in the app
+
+This directly attacks the original complaint: *"it is not clear exactly what inputs
+it will accept."*
+
+Stage 0 is deterministic and **silently discards** anything it doesn't recognize.
+That silence is the actual usability bug. A `blpl doctor --project-dir <p>` command
+(plus a UI panel) should run Stage 0's classifier in dry-run mode and report what it
+*would* drop, before anything runs:
+
+- Tables classified `other` and discarded. On `dev.04` this silently swallows the
+  overview's **Project identity / Stackup / Net classes** tables — the user writes
+  them, and the pipeline ignores them.
+- Pinout headings that don't anchor. **The documented contract and the parser
+  disagree**, which is the single worst thing an input contract can do. The regex is
+  `^#+\s*[\d.]*\s*(J[\w_]*\d*)[:\s(]` — the refdes must come *immediately* after the
+  heading marker, and must start with `J`. Verified against real headings:
+
+  | Heading | Result |
+  |---|---|
+  | `## J_USB_C Pinout` | ✅ matches |
+  | `## J2: nRF FFC` | ✅ matches |
+  | `## 3.1 J_HALOW (u.FL)` | ✅ matches |
+  | `## Connector J_USB_C — USB-C receptacle (24-pin)` | ❌ **silently dropped** |
+  | `## Connector J1 - barrel` | ❌ **silently dropped** |
+  | `## U_GNSS (LC76G-PA) pinout` | ❌ **silently dropped** (not a `J` refdes) |
+
+  The two dropped `Connector …` forms are **the exact form `SKILL.md` tells the user
+  to write** ("`## Connector J_USB_C — USB-C receptacle` … both work"). They do not.
+  A user following the documentation to the letter gets their pinout table thrown on
+  the floor with no error. This alone probably explains a large share of the
+  "confusing multi-file back-and-forth."
+
+  Two separate fixes are needed: correct the regex (allow a leading word like
+  `Connector`, and allow non-`J` refdes such as `U_GNSS`), and make Stage 0 *report*
+  unanchored pinout tables instead of discarding them.
+- Grouped pin ranges (`| 1-5 | Power |`) that break pin mapping.
+- Duplicate signal names silently collapsing into one net (the `Reserved` /`NC` trap).
+- `footprint_hint` strings that don't exist on disk under `kicad-footprints/`.
+- Specific parts (FPGA/MCU/PMIC) with no `pin_map`, which *will* halt Stage 3.
+
+Every one of these is cheap to detect and currently costs the user a full pipeline
+run plus a confusing artifact-diff to discover. This is the feature that makes BLPL
+feel like a product. **I would ship it before the settings UI.**
+
+## Security debt that must be paid *before* the vault, not after
+
+The current webapp has no auth, which is defensible while it holds nothing worth
+stealing. The moment it holds encrypted API keys, several existing shortcuts become
+real vulnerabilities. These are pre-existing, and each is small — but they must land
+with (or before) Phase C, not after:
+
+1. **Path traversal in the SPA fallback.** `main.py`'s catch-all does
+   `target = _STATIC_DIR / full_path` and tests `.exists()` without normalizing `..`
+   segments. Today it leaks static files; with a DB in the tree it is worse. Resolve
+   and assert the path stays under `_STATIC_DIR`.
+2. **`PUT /references` never validates through the sandbox.** A user-submitted
+   reference list is written to `.blpl/references.json` unchecked — and references
+   are precisely what *widens* `FilesystemSandbox`'s allowlist. That is a
+   privilege-escalation path into the sandbox itself. Validate on write.
+3. **The sandbox's `_created_paths` is always empty.** `_sandbox_for` constructs a
+   fresh `FilesystemSandbox` per request, so creation-tracking and session state
+   reset every call, making `check_delete`'s "only delete what you created" rule
+   vacuous. Either persist the set or drop the pretense.
+4. **No CSRF protection on mutating routes.** Irrelevant without cookies; the moment
+   Phase C introduces a session cookie, a page in another tab can drive this API.
+   Use `SameSite=Strict` and a CSRF token on state-changing requests.
+5. **The SSE stage runner leaks subprocesses.** Client abort cancels only the read;
+   the child keeps running. Bind the process lifetime to the request.
+
+Point 2 is the one I would not ship without: it turns a user-editable JSON file into
+a sandbox-policy override.
+
+## UI screens (SolidJS, existing `ui/` — 511 LOC, all additive)
+
+| Screen | Purpose |
+|---|---|
+| First-run / profile create | username + passphrase; creates DEK |
+| Unlock | passphrase → session; shown whenever vault is locked |
+| Settings → Providers | API keys per provider; write-only fields, "configured ✓" not the value |
+| Settings → Models | task→chain routing; edits `~/.config/blpl/blpl.toml` |
+| Settings → Effective config | merged view + which layer each value came from |
+| Projects | list from DB; **New project** → directory browser → init wizard |
+| Project → Preflight | the input doctor, run before any stage |
+| Project → Stages | existing SSE runner, plus Stage 8 |
+| Project → Review | render `review.md` — emitter defects vs design issues vs expected |
+
+## Phasing
+
+Each phase is independently shippable and leaves the CLI working.
+
+| Phase | Scope | Why here |
+|---|---|---|
+| **A. Input doctor** | `blpl doctor` + preflight panel; fix the heading regex | Highest value/effort ratio in the whole plan; needs none of the below |
+| **B. Config layer** | `blpl.toml` cascade, loader, secret-rejecting validator, `blpl config` | Everything else reads config |
+| **B½. Security debt** | The 5 items above | Must precede the vault, not follow it |
+| **C. Identity + vault** | SQLite, Argon2id/AES-GCM, auth routes, `get_adapter(task=)` reads vault | The security core |
+| **D. Settings + unlock UI** | Provider keys, model routing, effective-config view | Makes B and C usable |
+| **E. Project init** | Server-side dir browser, init wizard, `project.yaml` generation; delete `BLPL_WORKSPACE` | Depends on config roots (B) |
+| **F. Review + history** | Stage 8 view, `runs` table | Payoff from the work already done |
+| **G. Packaging** | One command, no env vars, opens browser | Ties it together |
+
+Phase A is deliberately first: it is the only phase that fixes the complaint that
+started this, and it is not blocked by any of the infrastructure.
+
+## Open questions
+
+1. **Multi-user on one machine — real or aspirational?** The passphrase design
+   supports it fully, but if this is really a single-user desktop app, the login
+   step is pure friction and the keychain-cache option becomes the default path.
+   Worth deciding before building the auth UI.
+2. **Do projects belong to users, or are they shared?** The schema above scopes
+   projects per user. If two profiles should see the same board, that becomes a
+   join table.
+3. **Network exposure later.** The passphrase model already fits. Adding it needs
+   TLS, `Secure` cookies, and unlock rate-limiting. Bind to `127.0.0.1` by default
+   until then.

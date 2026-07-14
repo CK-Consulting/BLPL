@@ -1,0 +1,4 @@
+# Pinned deliberately. KiCAD-Prism leaves these unpinned against a pinned KiCad
+# image, which makes builds only half-reproducible.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
