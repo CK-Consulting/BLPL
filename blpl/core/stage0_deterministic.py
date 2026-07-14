@@ -17,7 +17,29 @@ from . import schema
 
 
 # Patterns for finding connector/component refdes in headings that precede pinout tables.
-_CONNECTOR_HEADING_RE = re.compile(r"^#+\s*[\d.]*\s*(J[\w_]*\d*)[:\s(]", re.MULTILINE)
+#
+# The old pattern was r"^#+\s*[\d.]*\s*(J[\w_]*\d*)[:\s(]", which required the refdes
+# to sit *immediately* after the heading marker and to start with J. That silently
+# dropped two things people actually write, including the form SKILL.md documents:
+#
+#   "## Connector J_USB_C — USB-C receptacle"   (leading word before the refdes)
+#   "## U_GNSS (LC76G-PA) pinout"               (a pinout for an IC, not a connector)
+#
+# A dropped pinout table produces no error — the pins simply never become nets. So
+# instead of anchoring on position, scan the heading for a refdes-shaped token.
+_HEADING_RE = re.compile(r"^#+[^\n]*", re.MULTILINE)
+
+# A refdes is a J (connector) or U (IC) followed by either a number (J2, U1) or an
+# underscore-qualified name (J_USB_C, U_GNSS). Requiring the digit-or-underscore is
+# what keeps ordinary prose out: "USB" and "Connector" are not refdes, but "U_GNSS"
+# and "J1" are.
+_REFDES_IN_HEADING_RE = re.compile(r"\b((?:J|U)(?:_[A-Za-z0-9]\w*|\d+\w*))\b")
+
+
+def refdes_in_heading(heading: str) -> str | None:
+    """Return the first refdes-shaped token in a heading line, or None."""
+    m = _REFDES_IN_HEADING_RE.search(heading)
+    return m.group(1) if m else None
 
 # Reference designator pattern on bullet lines: J2, U1, J_ETH, J_HALOW, etc.
 _REFDES_BULLET_RE = re.compile(r"\b(J[\w_]*\d+|U\d+|J_[A-Z][A-Z_]*)\b")
@@ -65,11 +87,14 @@ def _find_connector_for_table(text: str, table: _md.ParsedTable) -> str:
         return "UNKNOWN"
     tbl_offset = sum(len(line) for line in lines[: table.line_start - 1])
     best_ref = "UNKNOWN"
-    for m in _CONNECTOR_HEADING_RE.finditer(text):
-        if m.start() <= tbl_offset:
-            best_ref = m.group(1)
-        else:
+    for m in _HEADING_RE.finditer(text):
+        if m.start() > tbl_offset:
             break
+        # Headings without a refdes (e.g. "## BOM — Core Subsystem") don't reset the
+        # anchor; only a refdes-bearing heading rebinds it.
+        ref = refdes_in_heading(m.group(0))
+        if ref:
+            best_ref = ref
     return best_ref
 
 
