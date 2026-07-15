@@ -47,7 +47,22 @@ function UnlockScreen({ firstRun, onUnlocked }: { firstRun: boolean; onUnlocked:
     try {
       const path = firstRun ? "/api/auth/initialize" : "/api/auth/unlock";
       await postJSON(path, { passphrase });
-      onUnlocked();
+      // Don't just trust the 200 — verify the session cookie actually round-trips.
+      // If the server set the cookie but the browser dropped it (a Secure cookie
+      // over plain HTTP, or cookies blocked), the passphrase was "accepted" yet the
+      // next request is still locked. Say so, loudly, instead of bouncing silently.
+      const status = await getJSON<AuthStatus>("/api/auth/status");
+      if (status.unlocked) {
+        onUnlocked();
+      } else {
+        setError(
+          "The server accepted your passphrase, but your browser didn't keep the session " +
+            "cookie — so the next request is still locked. This is almost always a cookie " +
+            "being dropped: if you're on plain http://, make sure BLPL_COOKIE_SECURE is not " +
+            "enabled; if you're behind an https proxy, serve the app over https. Check that " +
+            "cookies aren't blocked for this site.",
+        );
+      }
     } catch (err) {
       setError((err as Error).message || "Could not unlock.");
     } finally {

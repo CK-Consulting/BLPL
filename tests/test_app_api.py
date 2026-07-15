@@ -290,3 +290,37 @@ def test_generated_pipeline_files_are_not_editable(client) -> None:
     # Even with a valid suffix, a path into .pipeline/ must not resolve here.
     r = client.get("/api/projects/scratch/files/.pipeline")
     assert r.status_code in (400, 404)
+
+
+# -- cookie Secure flag parsing (the footgun that dropped sessions over HTTP) --
+
+
+def test_cookie_secure_flag_parses_human_intent(client) -> None:
+    """`bool("0")` is True, which once flagged the session cookie Secure and made
+    it vanish over plain HTTP. Only an explicit truthy token may enable Secure.
+
+    Uses the `client` fixture only to get `main` imported against a tmp data root."""
+    import os
+    import app.main as main
+
+    def flag(val):
+        if val is None:
+            os.environ.pop("BLPL_COOKIE_SECURE", None)
+        else:
+            os.environ["BLPL_COOKIE_SECURE"] = val
+        return main._env_flag("BLPL_COOKIE_SECURE")
+
+    for off in ("0", "false", "no", "off", "", "  "):
+        assert flag(off) is False, f"{off!r} must be off"
+    for on in ("1", "true", "TRUE", "yes", "on"):
+        assert flag(on) is True, f"{on!r} must be on"
+    assert flag(None) is False
+    return
+    for off in ("0", "false", "no", "off", "", "  "):
+        monkeypatch.setenv("BLPL_COOKIE_SECURE", off)
+        assert main._env_flag("BLPL_COOKIE_SECURE") is False, f"{off!r} must be off"
+    for on in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("BLPL_COOKIE_SECURE", on)
+        assert main._env_flag("BLPL_COOKIE_SECURE") is True, f"{on!r} must be on"
+    monkeypatch.delenv("BLPL_COOKIE_SECURE", raising=False)
+    assert main._env_flag("BLPL_COOKIE_SECURE") is False

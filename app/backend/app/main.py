@@ -57,6 +57,20 @@ CONFIG_PATH = Path(os.environ.get("BLPL_CONFIG", str(_DATA / "blpl.toml")))
 
 _SESSION_COOKIE = "blpl_session"
 
+
+def _env_flag(name: str) -> bool:
+    """Parse a boolean environment variable the way a human means it.
+
+    ``bool(os.environ.get(name))`` is a trap: every non-empty string is truthy, so
+    ``FOO=0`` and ``FOO=false`` both come out True. That exact trap flagged the
+    session cookie Secure when someone set BLPL_COOKIE_SECURE=0 to turn it *off* —
+    and a Secure cookie is silently dropped over plain HTTP, so the session never
+    stuck and every unlock bounced straight back to the lock screen. Only an
+    explicit truthy token counts.
+    """
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 identity = Identity(store=Store(VAULT_DB))
 projects = Projects(PROJECTS_ROOT)
 
@@ -143,7 +157,7 @@ def _set_session_cookie(response: Response, token: str) -> None:
         token,
         httponly=True,
         samesite="lax",
-        secure=bool(os.environ.get("BLPL_COOKIE_SECURE")),
+        secure=_env_flag("BLPL_COOKIE_SECURE"),
         max_age=8 * 3600,
     )
 
