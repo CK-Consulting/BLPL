@@ -104,6 +104,49 @@ def test_class_assignment_for_common_variants() -> None:
     assert nets["SS_RX-"] == "USB3_Diff_90Ohm"
 
 
+def test_class_assignment_dev04_controlled_impedance() -> None:
+    """RGMII / RF_50Ohm / USB2 rules for the dev.04 unified baseboard.
+
+    These are subsystem-prefixed names; the rules must classify them without
+    disturbing the bare/anchored USB_D* -> USB3 behaviour above.
+    """
+    a = _artifact(
+        [
+            _conn(
+                "J_SOM",
+                [
+                    ("28", "SOM_RGMII_TXD0"),
+                    ("39", "SOM_RGMII_RXC"),
+                    ("26", "SOM_USB_DP"),
+                    ("27", "SOM_USB_DN"),
+                ],
+            ),
+            _conn(
+                "J_ETH_SIG",
+                [
+                    ("6", "ETH_RGMII_TXC"),
+                ],
+            ),
+            _conn(
+                "U_GNSS",
+                [
+                    ("11", "GNSS_RF_IN"),
+                    ("14", "GNSS_VDD_RF"),  # power output, must NOT become RF_50Ohm
+                ],
+            ),
+        ]
+    )
+    nets = {n["name"]: n["class"] for n in s4.synthesize(a)["nets"]}
+    assert nets["SOM_RGMII_TXD0"] == "RGMII_Diff"
+    assert nets["SOM_RGMII_RXC"] == "RGMII_Diff"
+    assert nets["ETH_RGMII_TXC"] == "RGMII_Diff"
+    assert nets["SOM_USB_DP"] == "USB2_Diff_90Ohm"
+    assert nets["SOM_USB_DN"] == "USB2_Diff_90Ohm"
+    assert nets["GNSS_RF_IN"] == "RF_50Ohm"
+    # Boundary: a "*_VDD_RF" power output is not an RF feed line.
+    assert nets["GNSS_VDD_RF"] == "Default"
+
+
 def test_diff_pair_detection_tags_both_halves() -> None:
     a = _artifact(
         [
