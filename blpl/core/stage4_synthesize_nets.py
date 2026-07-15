@@ -46,17 +46,21 @@ _CLASS_RULES: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
-_DIFF_PAIR_SUFFIXES = {
-    "P": "N",
-    "N": "P",
-    "DP": "DM",
-    "DM": "DP",
-    "TX_P": "TX_N",
-    "TX_N": "TX_P",
-    "RX_P": "RX_N",
-    "RX_N": "RX_P",
-    "+": "-",
-    "-": "+",
+# Each suffix maps to the ordered candidate complements it may pair with. A suffix can
+# have more than one valid complement spelling: USB 2.0 minus-side pins are written both
+# as _DM (USB-IF) and _DN (used by dev.04's SOM_USB_DP/DN), so _DP must try both.
+_DIFF_PAIR_SUFFIXES: dict[str, tuple[str, ...]] = {
+    "P": ("N",),
+    "N": ("P",),
+    "DP": ("DM", "DN"),
+    "DM": ("DP",),
+    "DN": ("DP",),
+    "TX_P": ("TX_N",),
+    "TX_N": ("TX_P",),
+    "RX_P": ("RX_N",),
+    "RX_N": ("RX_P",),
+    "+": ("-",),
+    "-": ("+",),
 }
 # Longer suffixes must be tried first so e.g. TX_P is preferred over P.
 _DIFF_PAIR_SUFFIX_ORDER = sorted(_DIFF_PAIR_SUFFIXES, key=len, reverse=True)
@@ -80,20 +84,25 @@ def _assign_class(name: str) -> str:
     return "Default"
 
 
-def _diff_pair_complement(name: str) -> str | None:
+def _diff_pair_complements(name: str) -> list[str]:
+    """Candidate complement net names for a diff-pair half, best-spelling first.
+
+    Returns [] if the name has no recognised diff-pair suffix. The caller keeps the
+    first candidate that actually exists among the synthesized nets.
+    """
     upper = name.upper()
     for suffix in _DIFF_PAIR_SUFFIX_ORDER:
         # Accept both _SUFFIX and SUFFIX (for + and -).
         if suffix in ("+", "-"):
             if upper.endswith(suffix):
                 base = name[: -len(suffix)]
-                return base + _DIFF_PAIR_SUFFIXES[suffix]
+                return [base + comp for comp in _DIFF_PAIR_SUFFIXES[suffix]]
         else:
             sep_suffix = f"_{suffix}"
             if upper.endswith(sep_suffix):
                 base = name[: -len(sep_suffix)]
-                return base + "_" + _DIFF_PAIR_SUFFIXES[suffix]
-    return None
+                return [base + "_" + comp for comp in _DIFF_PAIR_SUFFIXES[suffix]]
+    return []
 
 
 def _resolve_refdes(local_id: str, bom: dict | None) -> str:
@@ -148,9 +157,10 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
 
     # Diff-pair detection (bidirectional tagging).
     for name in list(nets_by_name.keys()):
-        comp = _diff_pair_complement(name)
-        if comp and comp in nets_by_name:
-            nets_by_name[name]["diff_pair_of"] = comp
+        for comp in _diff_pair_complements(name):
+            if comp in nets_by_name:
+                nets_by_name[name]["diff_pair_of"] = comp
+                break
 
     out: dict = {
         "project_id": design_artifact["project_id"],
