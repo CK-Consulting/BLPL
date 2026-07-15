@@ -1,0 +1,189 @@
+"""End-to-end API tests: the session gate, first-run setup, settings, and the
+project git flow, exercised through the real FastAPI app.
+
+The app module reads its state roots from environment variables at import time,
+so the fixture sets those to a tmp dir and imports the module fresh per test —
+each test gets an empty vault, empty config, and empty projects root.
+
+Argon2id at default cost would make setup/unlock slow; the fixture patches it to
+a cheap cost inside the imported module. The crypto path is unchanged.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import importlib
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+BACKEND = Path(__file__).resolve().parents[1] / "app" / "backend"
+sys.path.insert(0, str(BACKEND))
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("BLPL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("BLPL_PROJECTS_ROOT", str(tmp_path / "data" / "projects"))
+    monkeypatch.setenv("BLPL_VAULT_DB", str(tmp_path / "data" / "vault.db"))
+    monkeypatch.setenv("BLPL_CONFIG", str(tmp_path / "data" / "blpl.toml"))
+
+    # Cheap Argon2id for the suite — patch before importing main so the app's
+    # identity uses it. The crypto path is unchanged, only the work factor.
+    from app import vault
+    real_init = vault.init_vault
+
+    def cheap_init(passphrase):
+        params, wrapped = real_init(passphrase)
+        cheap = dataclasses.replace(params, time_cost=1, memory_kib=8, parallelism=1)
+        kek = cheap.derive(passphrase)
+        return cheap, vault._wrap_dek(kek, vault.unlock(passphrase, params, wrapped))
+
+    monkeypatch.setattr("app.vault.init_vault", cheap_init)
+
+    import app.main as main
+    importlib.reload(main)  # rebuild identity/projects against the tmp env
+
+    return TestClient(main.app)
+
+
+def _seed_remote(tmp_path: Path) -> str:
+    work = tmp_path / "seed"
+    work.mkdir()
+    for a in (["init", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *a], cwd=work, check=True, capture_output=True)
+    (work / "design.md").write_text("# design\n")
+    subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=work, check=True, capture_output=True)
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "clone", "--bare", str(work), str(bare)], check=True, capture_output=True)
+    return f"file://{bare}"
+
+
+# -- auth gate --------------------------------------------------------------
+
+
+def test_health_is_reachable_while_locked(client) -> None:
+    assert client.get("/api/health").status_code == 200
+
+
+def test_a_fresh_app_reports_uninitialized(client) -> None:
+    r = client.get("/api/auth/status")
+    assert r.json() == {"initialized": False, "unlocked": False}
+
+
+def test_the_api_is_closed_until_you_unlock(client) -> None:
+    assert client.get("/api/projects").status_code == 401
+    assert client.get("/api/settings").status_code == 401
+
+
+def test_first_run_setup_unlocks_the_session(client) -> None:
+    r = client.post("/api/auth/initialize", json={"passphrase": "correct-horse-staple"})
+    assert r.status_code == 200 and r.json()["unlocked"] is True
+    # The session cookie now opens the gate.
+    assert client.get("/api/projects").status_code == 200
+    assert client.get("/api/auth/status").json() == {"initialized": True, "unlocked": True}
+
+
+def test_setup_cannot_run_twice(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "correct-horse-staple"})
+    r = client.post("/api/auth/initialize", json={"passphrase": "another-one-two"})
+    assert r.status_code == 400
+
+
+def test_unlock_with_wrong_passphrase_is_401(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/auth/lock")
+    assert client.post("/api/auth/unlock", json={"passphrase": "wrong"}).status_code == 401
+    assert client.post("/api/auth/unlock", json={"passphrase": "the-real-one"}).status_code == 200
+
+
+def test_lock_closes_the_gate_again(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    assert client.get("/api/projects").status_code == 200
+    client.post("/api/auth/lock")
+    assert client.get("/api/projects").status_code == 401
+
+
+# -- settings ---------------------------------------------------------------
+
+
+def test_settings_shows_key_presence_never_values(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.put("/api/settings/secrets/anthropic", json={"value": "sk-ant-SECRET"})
+
+    s = client.get("/api/settings").json()
+    providers = {row["provider"] for row in s["secrets"]}
+    assert providers == {"anthropic"}
+    # The value must appear nowhere in the settings payload.
+    assert "sk-ant-SECRET" not in client.get("/api/settings").text
+
+
+def test_llm_priority_round_trips_and_rejects_nonsense(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    ok = client.put("/api/settings/llm", json={"priority": ["openai", "anthropic"], "models": {}})
+    assert ok.status_code == 200
+    assert client.get("/api/settings").json()["llm_priority"] == ["openai", "anthropic"]
+
+    bad = client.put("/api/settings/llm", json={"priority": ["made-up"], "models": {}})
+    assert bad.status_code == 400
+
+
+def test_a_deleted_key_disappears_from_settings(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.put("/api/settings/secrets/openai", json={"value": "sk-oai"})
+    client.delete("/api/settings/secrets/openai")
+    assert client.get("/api/settings").json()["secrets"] == []
+
+
+# -- projects (git-backed) --------------------------------------------------
+
+
+def test_clone_registers_a_project(tmp_path, client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    remote = _seed_remote(tmp_path)
+    r = client.post("/api/projects/clone", json={"name": "dev04", "remote": remote, "branch": "main"})
+    assert r.status_code == 200
+    listing = client.get("/api/projects").json()
+    assert any(p["id"] == "dev04" and p["is_git"] for p in listing)
+
+
+def test_git_status_reports_clean_after_clone(tmp_path, client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    remote = _seed_remote(tmp_path)
+    client.post("/api/projects/clone", json={"name": "dev04", "remote": remote, "branch": "main"})
+    st = client.get("/api/projects/dev04/git/status").json()
+    assert st["branch"] == "main" and st["dirty"] is False and st["has_remote"] is True
+
+
+def test_init_creates_a_local_project(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    r = client.post("/api/projects/init", json={"name": "scratch"})
+    assert r.status_code == 200
+    st = client.get("/api/projects/scratch/git/status").json()
+    assert st["has_remote"] is False
+
+
+def test_running_an_llm_stage_without_a_key_is_a_clear_error(tmp_path, client) -> None:
+    """Stage 1 needs a provider key. With none stored, the app must refuse up
+    front with an actionable message, not fail deep inside the subprocess."""
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    r = client.post("/api/projects/scratch/stages/stage1")
+    assert r.status_code == 400
+    assert "key" in r.json()["detail"].lower()
+
+
+def test_a_deterministic_stage_runs_without_any_key(tmp_path, client) -> None:
+    """doctor is deterministic — it must run with no provider configured. It will
+    exit non-zero on an empty project, but the request itself must stream, not 400."""
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    with client.stream("POST", "/api/projects/scratch/stages/doctor") as r:
+        assert r.status_code == 200
+        body = "".join(r.iter_text())
+    assert "event: done" in body
