@@ -5,7 +5,13 @@ header { display: flex; align-items: center; gap: .6rem; padding: .6rem 1rem; bo
 header .sep { color: #555; }
 header .kicad { margin-left: auto; color: #7d8590; font-size: 12px; }
 main { display: flex; flex: 1; min-height: 0; }
-aside { width: 380px; padding: 1rem; border-right: 1px solid #2a2e36; overflow: auto; }
+aside { flex: 0 0 auto; padding: 1rem; overflow: auto; }
+/* The drag handle between the sidebar and the viewer. A thin seam that widens its
+   hit area on hover, so it's easy to grab without stealing layout space. */
+.resizer { flex: 0 0 5px; cursor: col-resize; background: #2a2e36; position: relative; }
+.resizer:hover, body.resizing .resizer { background: #3d6fb4; }
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing * { pointer-events: none; }
 .viewer { flex: 1; min-width: 0; background: #0f1115; }
 .panel { display: flex; flex-direction: column; gap: .6rem; }
 .row { display: flex; align-items: center; gap: .5rem; }

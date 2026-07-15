@@ -5,6 +5,7 @@ import { StageRunner } from "./components/StageRunner";
 import { SettingsPanel } from "./components/Settings";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
 import { Editor } from "./components/Editor";
+import { useResizable } from "./useResizable";
 import { Project, getJSON, postJSON } from "./api";
 
 export default function App() {
@@ -21,6 +22,7 @@ function Workspace() {
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [tab, setTab] = useState<"board" | "edit">("board");
+  const sidebar = useResizable("blpl.sidebarWidth", 380);
 
   // Bumped whenever a stage finishes or a git sync lands, so the viewer
   // re-fetches a freshly emitted board. This is the loop the app exists to
@@ -80,9 +82,15 @@ function Workspace() {
         <>
           <ProjectSync projectId={selected} onChanged={bump} />
           <main>
-            <aside>
+            <aside style={{ width: sidebar.width }}>
               <StageRunner projectId={selected} onFinished={() => { bump(); refresh(); }} />
             </aside>
+            <div
+              className="resizer"
+              onMouseDown={sidebar.onMouseDown}
+              onDoubleClick={sidebar.reset}
+              title="Drag to resize · double-click to reset"
+            />
             <section className="viewer">
               <div className="tabs">
                 <button className={tab === "board" ? "on" : ""} onClick={() => setTab("board")}>
