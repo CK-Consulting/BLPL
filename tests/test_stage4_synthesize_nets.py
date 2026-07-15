@@ -196,6 +196,35 @@ def test_diff_pair_detection_dp_dn_spelling() -> None:
     assert nets["SOM_USB_DN"]["diff_pair_of"] == "SOM_USB_DP"
 
 
+def test_class_assignment_prefixed_power_rails() -> None:
+    """Subsystem-prefixed power rails classify as Power_Bulk; enable/RF-supply lines do not."""
+    a = _artifact(
+        [
+            _conn(
+                "J1",
+                [
+                    ("1", "SOM_VIN"),         # power input rail
+                    ("2", "ETH_PWR_OUT"),     # regulated DC output
+                    ("3", "GNSS_VBCKP"),      # backup power rail
+                    ("4", "CELL_USB_VBUS"),   # USB 5V rail (prefixed)
+                    ("5", "CELL_PWR_EN"),     # enable/control line -> NOT a rail
+                    ("6", "GNSS_VDD_RF"),     # internal RF supply -> stays Default
+                    ("7", "GNSS_ANT_ON"),     # antenna power-enable -> stays Default
+                ],
+            )
+        ]
+    )
+    nets = {n["name"]: n["class"] for n in s4.synthesize(a)["nets"]}
+    assert nets["SOM_VIN"] == "Power_Bulk"
+    assert nets["ETH_PWR_OUT"] == "Power_Bulk"
+    assert nets["GNSS_VBCKP"] == "Power_Bulk"
+    assert nets["CELL_USB_VBUS"] == "Power_Bulk"
+    # Boundaries: control/enable and internal-supply nets must not become Power_Bulk.
+    assert nets["CELL_PWR_EN"] == "Default"
+    assert nets["GNSS_VDD_RF"] == "Default"
+    assert nets["GNSS_ANT_ON"] == "Default"
+
+
 def test_duplicate_pins_in_a_net_are_deduped() -> None:
     a = _artifact([_conn("J1", [("1", "GND"), ("1", "GND")])])
     result = s4.synthesize(a)

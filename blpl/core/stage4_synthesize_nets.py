@@ -24,6 +24,13 @@ _CLASS_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(VCC|VDD|V_|VIN|VBUS|PVDD)"), "Power_Bulk"),
     (re.compile(r"^(3V3|5V|12V|1V8|1V2|0V85|2V5)"), "Power_Bulk"),
     (re.compile(r"^\d+(\.\d+)?V(\b|$)"), "Power_Bulk"),  # "3.3V", "5V", "1.8V"
+    # Subsystem-prefixed power rails. The anchored rules above only catch bare rail
+    # names; a rail routed through a connector is usually prefixed with its subsystem
+    # (SOM_VIN, ETH_PWR_OUT, GNSS_VBCKP, CELL_USB_VBUS) and would otherwise fall to
+    # Default. Match a curated set of unambiguous power tokens as the trailing _-word.
+    # Deliberately does NOT match enable/control lines (*_PWR_EN) — those are GPIO, not
+    # rails — nor *_VDD_RF, an internally-generated RF supply the design routes locally.
+    (re.compile(r".*_(VIN|VBUS|VBCKP|VBACKUP|PWR_IN|PWR_OUT)$"), "Power_Bulk"),
     (re.compile(r"^USB3_|^SS_[RT]X[+\-PN]?$"), "USB3_Diff_90Ohm"),
     (re.compile(r"^USB\d*_D[+\-PN]$"), "USB3_Diff_90Ohm"),
     (re.compile(r"^PCIE_"), "PCIe_Diff_85Ohm"),
