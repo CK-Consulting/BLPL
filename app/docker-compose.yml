@@ -1,8 +1,12 @@
-# Run BLPL as a hosted app.
+# Run BLPL as a hosted app on a VM you control.
 #
 # The point of hosting: KiCad lives here, not on your laptop. Sit down at any
-# workstation, open a browser, and the toolchain is byte-identical — no local
-# KiCad install to update, no mac-vs-linux path mismatches.
+# workstation, open a browser, unlock with your passphrase, and the toolchain is
+# byte-identical — no local KiCad to update, no mac-vs-linux path mismatches, and
+# your projects are already here because they are git-backed on the server.
+#
+# Bring up:   docker compose -f app/docker-compose.yml up -d --build
+# First run:  open http://<host>:8080 and set a passphrase.
 services:
   backend:
     build:
@@ -11,28 +15,39 @@ services:
       context: ..
       dockerfile: app/backend/Dockerfile
     container_name: blpl-backend
-    ports:
-      - "8000:8000"
+    restart: unless-stopped
     environment:
-      - BLPL_PROJECTS_ROOT=/app/projects
+      # One data root holds the three stateful things: the vault DB, the
+      # declarative config, and the project working copies.
+      - BLPL_DATA_ROOT=/app/data
+      - BLPL_PROJECTS_ROOT=/app/data/projects
+      - BLPL_VAULT_DB=/app/data/vault.db
+      - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
-      # Stage 1 resolves MPNs with an LLM. Passed through from the host for now;
-      # a real secret store lands with auth.
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Set to 1 when the app is served directly over https (not via a TLS-
+      # terminating reverse proxy on the same origin).
+      - BLPL_COOKIE_SECURE=${BLPL_COOKIE_SECURE:-}
     volumes:
-      # Your designs. This is the only stateful thing in the system.
-      - ${BLPL_PROJECTS:-./data/projects}:/app/projects
+      # Everything stateful — vault, config, and your git-backed designs — on one
+      # named volume so it survives rebuilds and can be backed up as a unit.
+      - blpl-data:/app/data
       # 3D model libraries, so `kicad-cli pcb export glb --subst-models` can
-      # substitute real component models. This is the *only* reason Huaqiu ship
-      # a forked kicad:full image — mounting the official libraries gets us the
-      # same capability off the official KiCad, with no fork to audit.
+      # substitute real component models off the official KiCad image.
       - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
+      # An SSH deploy key for git, if your project remotes need one. The git CLI
+      # in the container reads ~/.ssh; mount a read-only key here. Optional —
+      # local-only projects and https remotes with a token helper don't need it.
+      - ${BLPL_SSH_DIR:-./data/ssh}:/root/.ssh:ro
 
   frontend:
     build:
       context: ./frontend
     container_name: blpl-frontend
+    restart: unless-stopped
     ports:
       - "8080:80"
     depends_on:
       - backend
+
+volumes:
+  blpl-data:

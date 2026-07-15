@@ -83,8 +83,12 @@ export function DesignView({ projectId, reloadToken }: { projectId: string; relo
     let cancelled = false;
     setError(null);
 
-    fetch(`/api/projects/${projectId}/design`)
+    fetch(`/api/projects/${projectId}/design`, { credentials: "same-origin" })
       .then(async (r) => {
+        if (r.status === 401) {
+          window.location.reload();
+          throw new Error("session locked");
+        }
         if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
         return r.json();
       })

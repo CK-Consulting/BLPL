@@ -19,3 +19,54 @@ button:disabled { opacity: .5; cursor: default; }
 .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #7d8590; gap: .4rem; }
 .hint { font-size: 12px; }
 code { background: #22262e; padding: .1rem .3rem; border-radius: 4px; }
+
+/* --- header additions --- */
+header .spacer, .spacer { flex: 1; }
+header .kicad { margin-left: 0; }
+.link { background: transparent; border: none; color: #8ab4f8; padding: .2rem .4rem; }
+.link:hover:not(:disabled) { text-decoration: underline; }
+.badge.warn { background: #3a2f14; color: #f0c674; }
+
+/* --- auth gate --- */
+.gate { display: flex; align-items: center; justify-content: center; height: 100vh; }
+.gate-card { display: flex; flex-direction: column; gap: .7rem; width: 340px; padding: 2rem; background: #191c22; border: 1px solid #2a2e36; border-radius: 12px; }
+.gate-card h1 { margin: 0; letter-spacing: .05em; }
+.gate-sub { margin: 0; color: #9aa4b0; font-size: 13px; }
+.gate-card input { background: #0f1115; color: #e6e6e6; border: 1px solid #343a44; border-radius: 6px; padding: .5rem .6rem; font: inherit; }
+.gate-card button { padding: .5rem; background: #2b4a86; border-color: #396; border: 1px solid #34507f; }
+.gate-error { color: #ff8b8b; font-size: 13px; }
+.gate-hint { color: #7d8590; font-size: 12px; }
+
+/* --- git strip --- */
+.git-strip { display: flex; align-items: center; gap: .5rem; padding: .35rem 1rem; border-bottom: 1px solid #2a2e36; background: #15181d; font-size: 13px; }
+.git-branch { color: #9aa4b0; }
+.git-strip .note { max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- modal (settings, new project) --- */
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: flex-start; justify-content: center; padding-top: 6vh; z-index: 10; }
+.modal { width: 640px; max-width: 92vw; max-height: 84vh; overflow: auto; background: #191c22; border: 1px solid #2a2e36; border-radius: 12px; }
+.modal.small { width: 440px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.2rem; border-bottom: 1px solid #2a2e36; position: sticky; top: 0; background: #191c22; }
+.modal-head h2 { margin: 0; font-size: 16px; }
+.modal-body { padding: 1.2rem; display: flex; flex-direction: column; gap: 1.4rem; }
+.modal-body section { display: flex; flex-direction: column; gap: .5rem; }
+.modal-body h3 { margin: 0; font-size: 14px; }
+.muted { color: #7d8590; font-size: 12px; margin: 0; }
+.modal-body input { background: #0f1115; color: #e6e6e6; border: 1px solid #343a44; border-radius: 6px; padding: .4rem .55rem; font: inherit; }
+
+/* --- key rows --- */
+.key-row { display: grid; grid-template-columns: 130px 1fr auto auto; align-items: center; gap: .5rem; }
+.key-label { display: flex; align-items: center; gap: .4rem; }
+button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
+
+/* --- priority list --- */
+.priority { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .3rem; }
+.priority li { display: flex; align-items: center; gap: .5rem; padding: .35rem .5rem; background: #0f1115; border: 1px solid #2a2e36; border-radius: 6px; }
+.add-provider { display: flex; gap: .4rem; }
+
+/* --- segmented control --- */
+.seg { display: flex; gap: 0; }
+.seg button { border-radius: 0; }
+.seg button:first-child { border-radius: 6px 0 0 6px; }
+.seg button:last-child { border-radius: 0 6px 6px 0; }
+.seg button.on { background: #2b4a86; border-color: #34507f; }

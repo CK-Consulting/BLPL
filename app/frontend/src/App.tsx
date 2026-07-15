@@ -1,43 +1,42 @@
 import { useEffect, useState } from "react";
+import { AuthGate } from "./components/AuthGate";
 import { DesignView } from "./components/Visualizer";
 import { StageRunner } from "./components/StageRunner";
-
-type Project = {
-  id: string;
-  markdown_files: number;
-  has_schematic: boolean;
-  has_pcb: boolean;
-};
+import { SettingsPanel } from "./components/Settings";
+import { NewProject, ProjectSync } from "./components/ProjectControls";
+import { Project, getJSON, postJSON } from "./api";
 
 export default function App() {
+  return (
+    <AuthGate>
+      <Workspace />
+    </AuthGate>
+  );
+}
+
+function Workspace() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [kicad, setKicad] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
 
-  // Bumped whenever a stage finishes, so the viewer re-fetches a freshly
-  // emitted board without a manual reload. This is the loop the whole app
-  // exists to shorten: edit markdown → run → see the board.
+  // Bumped whenever a stage finishes or a git sync lands, so the viewer
+  // re-fetches a freshly emitted board. This is the loop the app exists to
+  // shorten: edit markdown → run → see the board.
   const [reloadToken, setReloadToken] = useState(0);
 
   const refresh = () =>
-    fetch("/api/projects")
-      .then((r) => r.json())
-      .then((p: Project[]) => {
-        setProjects(p);
-        setSelected((cur) => cur ?? p[0]?.id ?? null);
-      });
+    getJSON<Project[]>("/api/projects").then((p) => {
+      setProjects(p);
+      setSelected((cur) => cur ?? p[0]?.id ?? null);
+    });
 
   useEffect(() => {
     refresh();
-    fetch("/api/health")
-      .then((r) => r.json())
-      .then((h) => setKicad(h.kicad_cli));
+    getJSON<{ kicad_cli: string | null }>("/api/health").then((h) => setKicad(h.kicad_cli));
   }, []);
 
-  const onFinished = () => {
-    setReloadToken((n) => n + 1);
-    refresh();
-  };
+  const bump = () => setReloadToken((n) => n + 1);
 
   return (
     <div className="app">
@@ -55,28 +54,45 @@ export default function App() {
             </option>
           ))}
         </select>
-        {/* Which KiCad am I talking to? Answered up front, because "it renders
-            differently on my other machine" is exactly what this app exists to
-            make impossible. */}
+        <NewProject
+          onCreated={(id) => {
+            refresh().then(() => setSelected(id));
+          }}
+        />
+        <span className="spacer" />
         <span className="kicad" title="KiCad running server-side, in the container">
           {kicad ?? "kicad-cli: not found"}
         </span>
+        <button className="link" onClick={() => setShowSettings(true)}>
+          Settings
+        </button>
+        <button
+          className="link"
+          onClick={() => postJSON("/api/auth/lock", {}).then(() => window.location.reload())}
+        >
+          Lock
+        </button>
       </header>
 
       {selected ? (
-        <main>
-          <aside>
-            <StageRunner projectId={selected} onFinished={onFinished} />
-          </aside>
-          <section className="viewer">
-            <DesignView projectId={selected} reloadToken={reloadToken} />
-          </section>
-        </main>
+        <>
+          <ProjectSync projectId={selected} onChanged={bump} />
+          <main>
+            <aside>
+              <StageRunner projectId={selected} onFinished={() => { bump(); refresh(); }} />
+            </aside>
+            <section className="viewer">
+              <DesignView projectId={selected} reloadToken={reloadToken} />
+            </section>
+          </main>
+        </>
       ) : (
         <div className="empty">
-          No projects found. Mount a directory containing design markdown into the projects root.
+          No projects yet. Use <strong>+ Project</strong> to clone a git remote or start a local one.
         </div>
       )}
+
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
     </div>
   );
 }

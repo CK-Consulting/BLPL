@@ -44,9 +44,24 @@ export function StageRunner({ projectId, onFinished }: Props) {
     try {
       const res = await fetch(`/api/projects/${projectId}/stages/${stage}`, {
         method: "POST",
+        credentials: "same-origin",
         signal: ac.signal,
       });
-      if (!res.ok || !res.body) throw new Error(`stage failed to start: ${res.status}`);
+      if (res.status === 401) {
+        // Session ended mid-work — reload so the AuthGate takes over.
+        window.location.reload();
+        return;
+      }
+      if (!res.ok || !res.body) {
+        // A 400 here is the "no usable LLM provider" guard, whose detail is JSON.
+        let detail = `stage failed to start: ${res.status}`;
+        try {
+          detail = (await res.clone().json()).detail ?? detail;
+        } catch {
+          /* not JSON */
+        }
+        throw new Error(detail);
+      }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
