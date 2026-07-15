@@ -27,7 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
@@ -147,41 +147,62 @@ class ChangePassphraseBody(BaseModel):
     new_passphrase: str
 
 
-def _set_session_cookie(response: Response, token: str) -> None:
+def _cookie_secure(request: Request) -> bool:
+    """Whether the session cookie should carry the Secure flag.
+
+    Derived purely from the connection scheme — there is deliberately no manual
+    toggle. A Secure cookie is silently dropped by the browser over plain HTTP, so
+    flagging it Secure on an HTTP deploy locks the user out, and no setting can be
+    right that does that. Scheme detection is self-correcting:
+
+      - plain http  → not Secure  → the cookie is kept, the session works
+      - https       → Secure      → the cookie is kept AND protected in transit
+
+    Behind a TLS-terminating proxy the backend sees http, so the proxy must send
+    ``X-Forwarded-Proto: https`` for the flag to switch on — our nginx does, and
+    that is the one knob. A proxy that fails to forward the scheme gets a working
+    (if unmarked) cookie, which is the safe direction to fail; the fix is to
+    forward the scheme, not to force the flag on and risk the lockout.
+    """
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    proto = (forwarded.split(",")[0].strip() or request.scope.get("scheme", "http")).lower()
+    return proto == "https"
+
+
+def _set_session_cookie(response: Response, request: Request, token: str) -> None:
     # httpOnly so page JS can never read the token; SameSite=Lax so it rides
-    # normal navigation but not cross-site POSTs. Not Secure-flagged here because
-    # the deploy terminates TLS at a reverse proxy on the same origin; set
-    # BLPL_COOKIE_SECURE=1 when the app is served over https directly.
+    # normal navigation but not cross-site POSTs. Secure is decided by the
+    # connection scheme (see _cookie_secure), not a hand-set flag.
     response.set_cookie(
         _SESSION_COOKIE,
         token,
         httponly=True,
         samesite="lax",
-        secure=_env_flag("BLPL_COOKIE_SECURE"),
+        secure=_cookie_secure(request),
         max_age=8 * 3600,
     )
 
 
 @app.post("/api/auth/initialize")
-def auth_initialize(body: PassphraseBody, response: Response) -> dict:
+def auth_initialize(body: PassphraseBody, request: Request, response: Response) -> dict:
     """First-run: set the passphrase. Refused if one already exists."""
     try:
         token = identity.initialize(body.passphrase)
     except Exception as exc:  # AlreadyInitialized / ValueError
         raise HTTPException(status_code=400, detail=str(exc))
-    _set_session_cookie(response, token)
+    _set_session_cookie(response, request, token)
     return {"unlocked": True}
 
 
 @app.post("/api/auth/unlock")
-def auth_unlock(body: PassphraseBody, response: Response) -> dict:
+def auth_unlock(body: PassphraseBody, request: Request, response: Response) -> dict:
     try:
         token = identity.unlock(body.passphrase)
     except vault.WrongPassphrase:
         raise HTTPException(status_code=401, detail="wrong passphrase")
     except Exception as exc:  # NotInitialized
         raise HTTPException(status_code=400, detail=str(exc))
-    _set_session_cookie(response, token)
+    _set_session_cookie(response, request, token)
     return {"unlocked": True}
 
 

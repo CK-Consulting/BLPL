@@ -292,14 +292,12 @@ def test_generated_pipeline_files_are_not_editable(client) -> None:
     assert r.status_code in (400, 404)
 
 
-# -- cookie Secure flag parsing (the footgun that dropped sessions over HTTP) --
+# -- cookie Secure flag: the footgun that dropped sessions over HTTP ----------
 
 
-def test_cookie_secure_flag_parses_human_intent(client) -> None:
-    """`bool("0")` is True, which once flagged the session cookie Secure and made
-    it vanish over plain HTTP. Only an explicit truthy token may enable Secure.
-
-    Uses the `client` fixture only to get `main` imported against a tmp data root."""
+def test_env_flag_parses_human_intent(client) -> None:
+    """`bool("0")` is True, which is what once flagged the cookie Secure when
+    someone set BLPL_COOKIE_SECURE=0 to turn it off. Only real truthy tokens count."""
     import os
     import app.main as main
 
@@ -310,17 +308,49 @@ def test_cookie_secure_flag_parses_human_intent(client) -> None:
             os.environ["BLPL_COOKIE_SECURE"] = val
         return main._env_flag("BLPL_COOKIE_SECURE")
 
-    for off in ("0", "false", "no", "off", "", "  "):
+    for off in ("0", "false", "no", "off", "", "  ", None):
         assert flag(off) is False, f"{off!r} must be off"
     for on in ("1", "true", "TRUE", "yes", "on"):
         assert flag(on) is True, f"{on!r} must be on"
-    assert flag(None) is False
-    return
-    for off in ("0", "false", "no", "off", "", "  "):
-        monkeypatch.setenv("BLPL_COOKIE_SECURE", off)
-        assert main._env_flag("BLPL_COOKIE_SECURE") is False, f"{off!r} must be off"
-    for on in ("1", "true", "TRUE", "yes", "on"):
-        monkeypatch.setenv("BLPL_COOKIE_SECURE", on)
-        assert main._env_flag("BLPL_COOKIE_SECURE") is True, f"{on!r} must be on"
-    monkeypatch.delenv("BLPL_COOKIE_SECURE", raising=False)
-    assert main._env_flag("BLPL_COOKIE_SECURE") is False
+
+
+def test_cookie_secure_follows_the_connection_scheme(client) -> None:
+    """The real fix: Secure is decided by the scheme, not a hand-set flag — so it
+    is always right and can never lock a user out. A Secure cookie over http is
+    dropped by the browser, and there is no setup where that is correct."""
+    import os
+    import app.main as main
+    from starlette.requests import Request
+
+    os.environ.pop("BLPL_COOKIE_SECURE", None)
+
+    def req(scheme: str, xfp: str | None = None) -> Request:
+        headers = [(b"x-forwarded-proto", xfp.encode())] if xfp else []
+        return Request({"type": "http", "scheme": scheme, "headers": headers, "method": "GET"})
+
+    # Plain http, no forwarding → not Secure (the cookie must survive).
+    assert main._cookie_secure(req("http")) is False
+    # Direct https → Secure.
+    assert main._cookie_secure(req("https")) is True
+    # Behind a TLS proxy that forwards the scheme → Secure even though the hop to
+    # the backend is http.
+    assert main._cookie_secure(req("http", xfp="https")) is True
+    # A proxy forwarding http must NOT be marked Secure.
+    assert main._cookie_secure(req("http", xfp="http")) is False
+
+
+def test_no_env_var_can_force_secure_over_plain_http(client) -> None:
+    """There is deliberately no override: 'plain http' and 'https proxy that
+    forgot to forward the scheme' look identical to the backend, so honouring any
+    force-on flag would re-open the exact lockout. Setting the old env var must do
+    nothing over a visibly-http request."""
+    import os
+    import app.main as main
+    from starlette.requests import Request
+
+    os.environ["BLPL_COOKIE_SECURE"] = "1"
+    try:
+        r = Request({"type": "http", "scheme": "http", "headers": [], "method": "GET"})
+        assert main._cookie_secure(r) is False, "no env var may force Secure over http"
+    finally:
+        os.environ.pop("BLPL_COOKIE_SECURE", None)

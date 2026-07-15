@@ -26,9 +26,9 @@ services:
       - BLPL_VAULT_DB=/app/data/vault.db
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
-      # Set to 1 when the app is served directly over https (not via a TLS-
-      # terminating reverse proxy on the same origin).
-      - BLPL_COOKIE_SECURE=${BLPL_COOKIE_SECURE:-}
+      # No cookie-secure knob: the session cookie's Secure flag is derived from
+      # the request scheme (plain http → off so it works, https → on). Put TLS in
+      # front and have that proxy send X-Forwarded-Proto: https; the flag follows.
     volumes:
       # Everything stateful — vault, config, and your git-backed designs — on one
       # named volume so it survives rebuilds and can be backed up as a unit.

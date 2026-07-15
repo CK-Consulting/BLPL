@@ -28,7 +28,9 @@ Then open `http://<host>:8080` and set a passphrase on first run.
 
 Only the frontend is exposed (port 8080); it reverse-proxies `/api` to the
 backend, which is not published. Put a TLS-terminating proxy in front for real
-use, and set `BLPL_COOKIE_SECURE=1` if the app is served directly over https.
+use — the session cookie's Secure flag follows the request scheme automatically
+(off over http so the session works, on over https), so the only requirement is
+that your TLS proxy forwards `X-Forwarded-Proto: https`. There is no flag to set.
 
 ### State
 
