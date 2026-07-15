@@ -239,3 +239,54 @@ def test_a_deterministic_stage_runs_without_any_key(tmp_path, client) -> None:
         assert r.status_code == 200
         body = "".join(r.iter_text())
     assert "event: done" in body
+
+
+# -- file editing -----------------------------------------------------------
+
+
+def test_files_can_be_created_listed_read_and_updated(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+
+    # A fresh project has no editable files.
+    assert client.get("/api/projects/scratch/files").json() == []
+
+    # Create one.
+    w = client.put("/api/projects/scratch/files/overview.md", json={"content": "# Board\n"})
+    assert w.status_code == 200
+    listing = client.get("/api/projects/scratch/files").json()
+    assert [f["name"] for f in listing] == ["overview.md"]
+
+    # Read it back.
+    assert client.get("/api/projects/scratch/files/overview.md").json()["content"] == "# Board\n"
+
+    # Update it.
+    client.put("/api/projects/scratch/files/overview.md", json={"content": "# Board v2\n"})
+    assert client.get("/api/projects/scratch/files/overview.md").json()["content"] == "# Board v2\n"
+
+
+def test_only_editable_suffixes_are_allowed(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    # A .py file is not a design input.
+    assert client.put("/api/projects/scratch/files/evil.py", json={"content": "x"}).status_code == 400
+    # project.yaml (config) is editable.
+    assert client.put("/api/projects/scratch/files/project.yaml", json={"content": "project:\n"}).status_code == 200
+
+
+def test_file_names_cannot_traverse_out_of_the_project(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    for bad in ("../secret.md", "sub/dir.md", ".hidden.md"):
+        r = client.put(f"/api/projects/scratch/files/{bad}", json={"content": "x"})
+        assert r.status_code in (400, 404), f"{bad!r} should be rejected, got {r.status_code}"
+
+
+def test_generated_pipeline_files_are_not_editable(client) -> None:
+    """.pipeline/ artifacts are read-only outputs, reached through /artifacts, not
+    the editor — the editor is only for design inputs."""
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    # Even with a valid suffix, a path into .pipeline/ must not resolve here.
+    r = client.get("/api/projects/scratch/files/.pipeline")
+    assert r.status_code in (400, 404)

@@ -4,6 +4,7 @@ import { DesignView } from "./components/Visualizer";
 import { StageRunner } from "./components/StageRunner";
 import { SettingsPanel } from "./components/Settings";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
+import { Editor } from "./components/Editor";
 import { Project, getJSON, postJSON } from "./api";
 
 export default function App() {
@@ -19,6 +20,7 @@ function Workspace() {
   const [selected, setSelected] = useState<string | null>(null);
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [tab, setTab] = useState<"board" | "edit">("board");
 
   // Bumped whenever a stage finishes or a git sync lands, so the viewer
   // re-fetches a freshly emitted board. This is the loop the app exists to
@@ -82,7 +84,19 @@ function Workspace() {
               <StageRunner projectId={selected} onFinished={() => { bump(); refresh(); }} />
             </aside>
             <section className="viewer">
-              <DesignView projectId={selected} reloadToken={reloadToken} />
+              <div className="tabs">
+                <button className={tab === "board" ? "on" : ""} onClick={() => setTab("board")}>
+                  Board
+                </button>
+                <button className={tab === "edit" ? "on" : ""} onClick={() => setTab("edit")}>
+                  Edit
+                </button>
+              </div>
+              {tab === "board" ? (
+                <DesignView projectId={selected} reloadToken={reloadToken} />
+              ) : (
+                <Editor projectId={selected} onSaved={refresh} />
+              )}
             </section>
           </main>
         </>

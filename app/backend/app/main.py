@@ -370,6 +370,62 @@ def git_push(project_id: str, _: str = Depends(require_session)) -> dict:
     return {"ok": True, "output": out}
 
 
+# The files a user edits in the browser: design markdown and the project config.
+# Deliberately NOT everything — generated artifacts live in .pipeline/ and are
+# read through the artifacts endpoint, and .git is off-limits. Editing is scoped
+# to the design inputs.
+_EDITABLE_SUFFIXES = {".md", ".yaml", ".yml"}
+
+
+def _editable_file(project_id: str, name: str) -> Path:
+    """Resolve a filename to an editable file directly under the project root.
+
+    The name comes from the client, so it is held to three rules: a bare filename
+    with no path separators, an editable suffix, and — after resolving — a parent
+    that is exactly the project root. That last check is what stops ``foo/../..``
+    or a symlink from reaching outside the design inputs.
+    """
+    proj = _project_dir(project_id)
+    if "/" in name or "\\" in name or name.startswith("."):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    target = (proj / name).resolve()
+    if target.parent != proj.resolve() or target.suffix.lower() not in _EDITABLE_SUFFIXES:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    return target
+
+
+class FileBody(BaseModel):
+    content: str
+
+
+@app.get("/api/projects/{project_id}/files")
+def list_files(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+    """The editable design inputs in the project root, markdown and config."""
+    proj = _project_dir(project_id)
+    out = []
+    for f in sorted(proj.iterdir()):
+        if f.is_file() and not f.name.startswith(".") and f.suffix.lower() in _EDITABLE_SUFFIXES:
+            out.append({"name": f.name, "bytes": f.stat().st_size})
+    return out
+
+
+@app.get("/api/projects/{project_id}/files/{name}")
+def read_file(project_id: str, name: str, _: str = Depends(require_session)):
+    target = _editable_file(project_id, name)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"no file {name!r}")
+    return {"name": name, "content": target.read_text(encoding="utf-8", errors="replace")}
+
+
+@app.put("/api/projects/{project_id}/files/{name}")
+def write_file(project_id: str, name: str, body: FileBody, _: str = Depends(require_session)) -> dict:
+    """Create or overwrite an editable file. Creating is intended: a fresh project
+    is empty, and this is how the first design doc gets written."""
+    target = _editable_file(project_id, name)
+    target.write_text(body.content, encoding="utf-8")
+    return {"ok": True, "name": name, "bytes": target.stat().st_size}
+
+
 @app.get("/api/projects/{project_id}/artifacts/{name}")
 def read_artifact(project_id: str, name: str, _: str = Depends(require_session)):
     proj = _project_dir(project_id)

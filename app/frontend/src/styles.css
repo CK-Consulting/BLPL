@@ -70,3 +70,24 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .seg button:first-child { border-radius: 6px 0 0 6px; }
 .seg button:last-child { border-radius: 0 6px 6px 0; }
 .seg button.on { background: #2b4a86; border-color: #34507f; }
+
+/* --- board/edit tabs --- */
+.tabs { display: flex; gap: .3rem; padding: .4rem .6rem; border-bottom: 1px solid #2a2e36; background: #15181d; }
+.tabs button { background: transparent; border: 1px solid transparent; padding: .25rem .8rem; border-radius: 6px; color: #9aa4b0; }
+.tabs button.on { background: #22262e; color: #e6e6e6; border-color: #343a44; }
+.viewer { display: flex; flex-direction: column; }
+.viewer > .tabs { flex: 0 0 auto; }
+.viewer > *:not(.tabs) { flex: 1; min-height: 0; }
+
+/* --- editor --- */
+.editor { display: flex; height: 100%; min-height: 0; }
+.editor-files { width: 220px; border-right: 1px solid #2a2e36; overflow: auto; display: flex; flex-direction: column; background: #15181d; }
+.editor-files-head { display: flex; align-items: center; justify-content: space-between; padding: .5rem .7rem; border-bottom: 1px solid #2a2e36; font-size: 12px; color: #9aa4b0; }
+.file-item { display: flex; align-items: center; gap: .4rem; text-align: left; background: transparent; border: none; border-radius: 0; color: #cdd3da; padding: .4rem .7rem; font: inherit; }
+.file-item:hover { background: #1c2027; }
+.file-item.on { background: #22262e; color: #fff; }
+.file-item .dot { width: 7px; height: 7px; border-radius: 50%; background: #f0c674; margin-left: auto; }
+.pad { padding: .7rem; }
+.editor-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.editor-bar { display: flex; align-items: center; gap: .5rem; padding: .45rem .7rem; border-bottom: 1px solid #2a2e36; background: #15181d; }
+.editor-text { flex: 1; resize: none; border: none; outline: none; background: #0f1115; color: #e6e6e6; padding: 1rem; font: 13px/1.5 ui-monospace, SFMono-Regular, monospace; tab-size: 2; }
