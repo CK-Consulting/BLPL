@@ -28,6 +28,21 @@ _CLASS_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^USB\d*_D[+\-PN]$"), "USB3_Diff_90Ohm"),
     (re.compile(r"^PCIE_"), "PCIe_Diff_85Ohm"),
     (re.compile(r"^DDR4_"), "DDR4_Diff_90Ohm"),
+    # --- Additional controlled-impedance classes (dev.04 unified baseboard) ---
+    # RGMII: source-synchronous Ethernet MAC↔PHY bus (e.g. SOM_RGMII_TXD0, ETH_RGMII_RXC).
+    # Matched anywhere in the name because these signals are subsystem-prefixed. The class
+    # is named RGMII_Diff per the project's net-class table; RGMII itself is single-ended,
+    # so no diff-pair complement is expected. No dev.02/dev.03 net carries "RGMII", so this
+    # rule only affects boards that declare the class.
+    (re.compile(r".*RGMII"), "RGMII_Diff"),
+    # RF 50Ω feed lines, e.g. GNSS_RF_IN (and any *_RF_OUT). The underscore boundary keeps
+    # this off power nets like GNSS_VDD_RF. A bare RF_IN/RF_OUT is matched too.
+    (re.compile(r"(?:.*_)?RF_(IN|OUT)$"), "RF_50Ohm"),
+    # USB 2.0 D± pairs written with the _DP/_DN suffix AND a subsystem prefix, e.g.
+    # SOM_USB_DP / SOM_USB_DN. The required leading "_" before USB means this does NOT
+    # match the bare/anchored USB_DP or dev.02/dev.03's USB_D+/USB2_D+ forms, which stay
+    # on the USB3_Diff_90Ohm rule above — so no existing board's nets are reclassified.
+    (re.compile(r".*_USB\d*_D[PN]$"), "USB2_Diff_90Ohm"),
 ]
 
 
