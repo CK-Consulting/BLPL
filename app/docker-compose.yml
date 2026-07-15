@@ -15,6 +15,8 @@ services:
       context: ..
       dockerfile: app/backend/Dockerfile
     container_name: blpl-backend
+    networks:
+      - blpl
     restart: unless-stopped
     environment:
       # One data root holds the three stateful things: the vault DB, the
@@ -30,10 +32,10 @@ services:
     volumes:
       # Everything stateful — vault, config, and your git-backed designs — on one
       # named volume so it survives rebuilds and can be backed up as a unit.
-      - blpl-data:/app/data
+      - /opt/blpl/app/data:/app/data
       # 3D model libraries, so `kicad-cli pcb export glb --subst-models` can
       # substitute real component models off the official KiCad image.
-      - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
+      - /opt/blpl/hardware/kicad-packages3D:/usr/share/kicad/3dmodels:ro
       # An SSH deploy key for git, if your project remotes need one. The git CLI
       # in the container reads ~/.ssh; mount a read-only key here. Optional —
       # local-only projects and https remotes with a token helper don't need it.
@@ -45,9 +47,11 @@ services:
     container_name: blpl-frontend
     restart: unless-stopped
     ports:
-      - "8080:80"
+      - "1800:80"
     depends_on:
       - backend
-
-volumes:
-  blpl-data:
+    networks:
+      - blpl
+networks:
+  blpl:
+    external: true
