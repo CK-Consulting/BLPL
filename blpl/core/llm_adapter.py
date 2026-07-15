@@ -49,22 +49,93 @@ class TruncatedResponse(RuntimeError):
     """The model hit its output limit mid-response, so the result is incomplete."""
 
 
-def get_adapter(provider: str | None = None, model: str | None = None) -> LLMAdapter:
-    """Return a concrete LLMAdapter. Provider resolution order:
+class AllProvidersFailed(RuntimeError):
+    """Every provider in the fallback chain failed. Carries what each one did, so
+    the failure names five ways it could be wrong instead of one — a dead key on
+    the first provider *and* an unreachable server on the second."""
 
-    1. explicit `provider` arg
-    2. HDM_LLM_PROVIDER env var
-    3. "anthropic" default
-    """
-    provider = (provider or os.environ.get("HDM_LLM_PROVIDER") or "anthropic").lower()
-    model = model or os.environ.get("HDM_LLM_MODEL") or _DEFAULT_MODELS.get(provider)
+    def __init__(self, errors: list[tuple[str, Exception]]):
+        self.errors = errors
+        detail = "; ".join(f"{prov} → {type(e).__name__}: {e}" for prov, e in errors)
+        super().__init__(f"all {len(errors)} LLM provider(s) failed — {detail}")
+
+
+def _build_one(provider: str, model: str | None) -> LLMAdapter:
+    provider = provider.lower()
     if provider == "anthropic":
         return _AnthropicAdapter(model=model or _DEFAULT_MODELS["anthropic"])
     if provider == "openai":
         return _OpenAIAdapter(model=model or _DEFAULT_MODELS["openai"])
     if provider == "ollama":
         return _OllamaAdapter(model=model or _DEFAULT_MODELS["ollama"])
-    raise ValueError(f"unknown HDM_LLM_PROVIDER: {provider!r}")
+    raise ValueError(f"unknown LLM provider: {provider!r}")
+
+
+def get_adapter(provider: str | None = None, model: str | None = None) -> LLMAdapter:
+    """Return an LLMAdapter, honouring a configured fallback chain.
+
+    Resolution order:
+      1. explicit ``provider`` arg — always a single adapter, no fallback
+      2. ``HDM_LLM_CHAIN`` env var — a JSON list ``[{"provider","model"}, …]`` in
+         fallback order, injected by the app from your priority list + stored
+         keys. Returns a fallback adapter that tries each in turn.
+      3. ``HDM_LLM_PROVIDER`` / ``HDM_LLM_MODEL`` — a single adapter (CLI path)
+      4. "anthropic" default
+
+    Keys are never in the chain JSON — each provider's SDK reads its own env var
+    (ANTHROPIC_API_KEY, OPENAI_API_KEY). The chain only says which to try and in
+    what order.
+    """
+    if provider is None:
+        chain_json = os.environ.get("HDM_LLM_CHAIN")
+        if chain_json:
+            try:
+                chain = json.loads(chain_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"HDM_LLM_CHAIN is not valid JSON: {exc}") from exc
+            members = [_build_one(c["provider"], c.get("model")) for c in chain if c.get("provider")]
+            if members:
+                return _FallbackAdapter(members)
+
+    provider = (provider or os.environ.get("HDM_LLM_PROVIDER") or "anthropic").lower()
+    model = model or os.environ.get("HDM_LLM_MODEL") or _DEFAULT_MODELS.get(provider)
+    return _build_one(provider, model)
+
+
+class _FallbackAdapter:
+    """Tries each provider in order, moving to the next on any failure.
+
+    This is the runtime half of the app's LLM prioritisation: the resolver picks
+    the order, this walks it. A single-member chain delegates straight through and
+    raises the original exception unchanged — so the common CLI path keeps its
+    exact behaviour, including how Stage 1 sees a TruncatedResponse. Only when
+    there is genuinely more than one provider to fall back to does a failure get
+    caught and the next one tried; if they all fail, AllProvidersFailed reports
+    every one.
+    """
+
+    provider = "fallback"
+
+    def __init__(self, members: list[LLMAdapter]):
+        if not members:
+            raise ValueError("fallback chain is empty")
+        self._members = members
+        self.model = members[0].model  # for anything that inspects .model
+
+    def complete_json(
+        self, system: str, user: str, output_schema: dict, model: str | None = None
+    ) -> dict:
+        # One member: delegate transparently. No wrapping, no behaviour change.
+        if len(self._members) == 1:
+            return self._members[0].complete_json(system, user, output_schema, model)
+
+        errors: list[tuple[str, Exception]] = []
+        for member in self._members:
+            try:
+                return member.complete_json(system, user, output_schema, model)
+            except Exception as exc:  # noqa: BLE001 — any failure means "try the next provider"
+                errors.append((getattr(member, "provider", "?"), exc))
+        raise AllProvidersFailed(errors)
 
 
 # ---------------------------------------------------------------------------

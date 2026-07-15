@@ -178,6 +178,58 @@ def test_running_an_llm_stage_without_a_key_is_a_clear_error(tmp_path, client) -
     assert "key" in r.json()["detail"].lower()
 
 
+def test_an_llm_stage_injects_the_full_fallback_chain(tmp_path, client, monkeypatch) -> None:
+    """With two keys and a two-provider priority, the stage subprocess must get
+    the ordered chain plus both keys — that is what makes runtime failover work.
+
+    We intercept the subprocess launch and inspect the env it would have run with,
+    rather than actually invoking the pipeline."""
+    import app.main as main
+
+    captured: dict = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        def __init__(self):
+            self.stdout = self
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*cmd, env=None, **kw):
+        captured["env"] = env
+        return _FakeProc()
+
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
+
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.put("/api/settings/llm", json={"priority": ["anthropic", "openai"], "models": {}})
+    client.put("/api/settings/secrets/anthropic", json={"value": "sk-ant-KEY"})
+    client.put("/api/settings/secrets/openai", json={"value": "sk-oai-KEY"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+
+    with client.stream("POST", "/api/projects/scratch/stages/stage1") as r:
+        assert r.status_code == 200
+        "".join(r.iter_text())
+
+    env = captured["env"]
+    import json as _json
+    chain = _json.loads(env["HDM_LLM_CHAIN"])
+    assert [c["provider"] for c in chain] == ["anthropic", "openai"]
+    # Every provider's key is in its own SDK env var.
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-KEY"
+    assert env["OPENAI_API_KEY"] == "sk-oai-KEY"
+    # The primary is echoed for anything reading the single-provider vars.
+    assert env["HDM_LLM_PROVIDER"] == "anthropic"
+
+
 def test_a_deterministic_stage_runs_without_any_key(tmp_path, client) -> None:
     """doctor is deterministic — it must run with no provider configured. It will
     exit non-zero on an empty project, but the request itself must stream, not 400."""

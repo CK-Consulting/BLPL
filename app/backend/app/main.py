@@ -409,27 +409,36 @@ def design_sources(project_id: str, _: str = Depends(require_session)) -> dict:
 def _stage_env(token: str, stage_name: str) -> dict[str, str]:
     """The subprocess environment for a stage run.
 
-    For LLM stages, resolve the provider the config prefers *and* has a key for,
-    then inject that one key plus HDM_LLM_PROVIDER/HDM_LLM_MODEL. This is where the
-    vault meets the pipeline: the key is decrypted here, handed to the child in
-    its environment, and never written down. Deterministic stages get the base
-    environment unchanged.
+    For LLM stages, resolve the *whole* fallback chain the config prefers and has
+    keys for, inject every provider's key into its own SDK env var, and hand the
+    ordered chain to the pipeline as HDM_LLM_CHAIN. The pipeline then tries each in
+    turn, so a dead key or an unreachable provider fails over to the next instead
+    of failing the stage. This is where the vault meets the pipeline: keys are
+    decrypted here, passed in the child's environment, and never written to a
+    command line or a log. Deterministic stages get the base environment unchanged.
     """
     env = dict(os.environ)
     if stage_name not in _LLM_STAGES:
         return env
 
     cfg = _load_config()
-    primary = llm_resolver.resolve_primary(cfg, identity.providers_with_keys())
-    env["HDM_LLM_PROVIDER"] = primary.provider
-    if primary.model:
-        env["HDM_LLM_MODEL"] = primary.model
-    env_var = _PROVIDER_ENV.get(primary.provider)
-    if env_var:
-        key = identity.get_secret(token, primary.provider)
-        if key is None:
-            raise HTTPException(status_code=400, detail=f"no key stored for {primary.provider}")
-        env[env_var] = key
+    # Raises NoUsableProvider (→ 400) if nothing in the priority order has a key.
+    chain = llm_resolver.resolve_chain(cfg, identity.providers_with_keys())
+    if not chain:
+        llm_resolver.resolve_primary(cfg, identity.providers_with_keys())  # raise the good message
+
+    for rp in chain:
+        env_var = _PROVIDER_ENV.get(rp.provider)
+        if env_var:
+            key = identity.get_secret(token, rp.provider)
+            if key is not None:
+                env[env_var] = key
+
+    env["HDM_LLM_CHAIN"] = json.dumps([{"provider": rp.provider, "model": rp.model} for rp in chain])
+    # Primary echoed too, for anything (or anyone) reading the single-provider vars.
+    env["HDM_LLM_PROVIDER"] = chain[0].provider
+    if chain[0].model:
+        env["HDM_LLM_MODEL"] = chain[0].model
     return env
 
 

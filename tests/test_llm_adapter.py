@@ -14,7 +14,7 @@ from blpl.core import llm_adapter as la
 
 def test_get_adapter_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HDM_LLM_PROVIDER", raising=False)
-    with pytest.raises(ValueError, match="unknown HDM_LLM_PROVIDER"):
+    with pytest.raises(ValueError, match="unknown LLM provider"):
         la.get_adapter(provider="bogus")
 
 
