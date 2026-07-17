@@ -26,6 +26,7 @@ services:
       - BLPL_VAULT_DB=/app/data/vault.db
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # No cookie-secure knob: the session cookie's Secure flag is derived from
       # the request scheme (plain http → off so it works, https → on). Put TLS in
       # front and have that proxy send X-Forwarded-Proto: https; the flag follows.
@@ -48,8 +49,7 @@ services:
       # An SSH deploy key for git, if your project remotes need one. The git CLI
       # in the container reads ~/.ssh; mount a read-only key here. Optional —
       # local-only projects and https remotes with a token helper don't need it.
-      - ${BLPL_SSH_DIR:-./data/ssh}:/root/.ssh:ro
-
+      - /opt/blpl/app/data/ssh:/root/.ssh:ro
   frontend:
     build:
       context: ./frontend
