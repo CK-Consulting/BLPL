@@ -144,3 +144,42 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 
 /* fabrication-readiness chip in the header */
 .fab-chip { display: inline-flex; align-items: center; gap: .3rem; font-size: 12px; padding: .15rem .5rem; border-radius: 999px; background: #3a1113; color: #ff9b9b; border: 1px solid #6e2126; cursor: help; }
+
+/* --- BOM table --- */
+.bom { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.bom-bar { display: flex; align-items: center; gap: .7rem; padding: .6rem .8rem; border-bottom: 1px solid #2a2e36; }
+.bom-bar input { background: #0f1115; color: #e6e6e6; border: 1px solid #343a44; border-radius: 6px; padding: .35rem .55rem; font: inherit; min-width: 220px; }
+.bom-scroll { flex: 1; overflow: auto; }
+.bom-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.bom-table th { position: sticky; top: 0; background: #191c22; text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #2a2e36; color: #9aa4b0; font-weight: 600; white-space: nowrap; }
+.bom-table td { padding: .4rem .6rem; border-bottom: 1px solid #202329; vertical-align: top; }
+.bom-table tr:hover td { background: #17191f; }
+.bom-table .mono { font-family: ui-monospace, monospace; }
+.bom-table .small { font-size: 12px; color: #b9bfc7; }
+.conf { padding: .05rem .4rem; border-radius: 999px; font-size: 11px; }
+.conf.hi { background: #16351f; color: #6ee7a0; }
+.conf.mid { background: #3a2f14; color: #f0c674; }
+.conf.lo { background: #3a1a1d; color: #ff8b8b; }
+
+/* --- diff / changes --- */
+.diff { overflow: auto; height: 100%; padding: .8rem; display: flex; flex-direction: column; gap: .6rem; }
+.diff-summary { padding: 0 .2rem; }
+.add { color: #6ee7a0; }
+.del { color: #ff8b8b; }
+.diff-file { border: 1px solid #2a2e36; border-radius: 6px; overflow: hidden; background: #15181d; }
+.diff-file-head { display: flex; align-items: center; gap: .6rem; width: 100%; text-align: left; background: transparent; border: none; color: #e6e6e6; padding: .5rem .7rem; font: inherit; }
+.diff-file-head:hover { background: #1c2027; }
+.diff-path { background: transparent; padding: 0; }
+.status-tag { font-size: 11px; padding: .1rem .45rem; border-radius: 4px; text-transform: uppercase; letter-spacing: .03em; }
+.status-tag.modified { background: #24303f; color: #8ab4f8; }
+.status-tag.added, .status-tag.untracked { background: #16351f; color: #6ee7a0; }
+.status-tag.deleted { background: #3a1a1d; color: #ff8b8b; }
+.status-tag.renamed { background: #2f2740; color: #c9a6ff; }
+.diff-omitted { padding: .5rem .8rem; border-top: 1px solid #24262c; }
+.diff-body { margin: 0; padding: .4rem 0; border-top: 1px solid #24262c; overflow-x: auto; font: 12px/1.4 ui-monospace, monospace; }
+.dl { padding: 0 .8rem; white-space: pre; }
+.dl.add-line { background: #12251a; color: #9be7b4; }
+.dl.del-line { background: #2a1416; color: #ffb0b0; }
+.dl.hunk { color: #8ab4f8; background: #171b22; }
+.dl.meta { color: #6b7280; }
+.dl.ctx { color: #c2c8d0; }

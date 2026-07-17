@@ -6,6 +6,8 @@ import { SettingsPanel } from "./components/Settings";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
 import { Editor } from "./components/Editor";
 import { Reports } from "./components/Reports";
+import { BomTable } from "./components/BomTable";
+import { DiffView } from "./components/DiffView";
 import { useResizable } from "./useResizable";
 import { Project, getJSON, postJSON } from "./api";
 
@@ -22,7 +24,7 @@ function Workspace() {
   const [selected, setSelected] = useState<string | null>(null);
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [tab, setTab] = useState<"board" | "edit" | "reports">("board");
+  const [tab, setTab] = useState<"board" | "edit" | "bom" | "reports" | "changes">("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
 
   // Bumped whenever a stage finishes or a git sync lands, so the viewer
@@ -113,13 +115,21 @@ function Workspace() {
                 <button className={tab === "edit" ? "on" : ""} onClick={() => setTab("edit")}>
                   Edit
                 </button>
+                <button className={tab === "bom" ? "on" : ""} onClick={() => setTab("bom")}>
+                  BOM
+                </button>
                 <button className={tab === "reports" ? "on" : ""} onClick={() => setTab("reports")}>
                   Reports
+                </button>
+                <button className={tab === "changes" ? "on" : ""} onClick={() => setTab("changes")}>
+                  Changes
                 </button>
               </div>
               {tab === "board" && <DesignView projectId={selected} reloadToken={reloadToken} />}
               {tab === "edit" && <Editor projectId={selected} onSaved={refresh} />}
+              {tab === "bom" && <BomTable projectId={selected} reloadToken={reloadToken} />}
               {tab === "reports" && <Reports projectId={selected} reloadToken={reloadToken} />}
+              {tab === "changes" && <DiffView projectId={selected} reloadToken={reloadToken} />}
             </section>
           </main>
         </>

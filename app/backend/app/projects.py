@@ -135,6 +135,76 @@ class Projects:
                     behind, ahead = int(parts[0]), int(parts[1])
         return GitStatus(branch=branch, ahead=ahead, behind=behind, dirty=dirty, has_remote=has_remote)
 
+    # -- diff ----------------------------------------------------------------
+
+    def diff(
+        self, name: str, *, max_file_bytes: int = 60_000, max_total_bytes: int = 500_000
+    ) -> dict:
+        """What has changed in the working copy since the last commit.
+
+        This is the "what did that run actually do" view: after a pipeline run, the
+        generated artifacts and any edited markdown show up here as the delta from
+        HEAD. It respects .gitignore (a project that doesn't track .pipeline/ simply
+        won't see those files, which is that project's stated intent) and includes
+        untracked files as additions.
+
+        Diffs are capped: a regenerated .kicad_pcb can be enormous, and nobody
+        reads a 2MB unified diff. Per-file output over the cap, and everything once
+        the running total is blown, comes back with ``diff: null`` and a truncated
+        flag — the file still appears with its +/- counts, just not its body.
+        """
+        d = self._require(name)
+        has_head = bool(self._git_allow_fail(d, "rev-parse", "--verify", "HEAD"))
+        porcelain = self._git(d, "status", "--porcelain=v1", "-uall")
+
+        files: list[dict] = []
+        total = 0
+        for line in porcelain.splitlines():
+            if len(line) < 4:
+                continue
+            xy, path = line[:2], line[3:]
+            if " -> " in path:  # rename: report the destination
+                path = path.split(" -> ", 1)[1]
+            path = path.strip().strip('"')
+            untracked = xy == "??"
+
+            if untracked:
+                # --no-index against /dev/null renders a new file as an addition.
+                # It exits 1 (there is a difference), so capture regardless.
+                raw = self._git_capture(d, "diff", "--no-index", "--", "/dev/null", path)
+            elif has_head:
+                raw = self._git_capture(d, "diff", "HEAD", "--", path)
+            else:
+                raw = self._git_capture(d, "diff", "--cached", "--", path) or self._git_capture(
+                    d, "diff", "--", path
+                )
+
+            additions = sum(1 for ln in raw.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+            deletions = sum(1 for ln in raw.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+
+            too_big = len(raw.encode("utf-8", "replace")) > max_file_bytes
+            binary = "\x00" in raw or "Binary files" in raw
+            if too_big or binary or total >= max_total_bytes:
+                diff_text = None
+            else:
+                diff_text = raw
+                total += len(raw)
+
+            files.append(
+                {
+                    "path": path,
+                    "status": _porcelain_status(xy),
+                    "additions": additions,
+                    "deletions": deletions,
+                    "diff": diff_text,
+                    "truncated": diff_text is None,
+                    "binary": binary,
+                }
+            )
+
+        files.sort(key=lambda f: f["path"])
+        return {"clean": not files, "files": files}
+
     # -- internals -----------------------------------------------------------
 
     def _require(self, name: str) -> Path:
@@ -168,3 +238,26 @@ class Projects:
             ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False, timeout=60
         )
         return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    def _git_capture(self, cwd: Path, *args: str) -> str:
+        """Return stdout regardless of exit code. `git diff --no-index` exits 1
+        whenever there IS a difference, which for us is the normal case, so a
+        non-zero exit here is not an error."""
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False, timeout=120
+        )
+        return proc.stdout
+
+
+def _porcelain_status(xy: str) -> str:
+    """Map a two-char `git status --porcelain` code to a human word."""
+    if xy == "??":
+        return "untracked"
+    code = xy.strip()
+    if "D" in code:
+        return "deleted"
+    if "A" in code:
+        return "added"
+    if "R" in code:
+        return "renamed"
+    return "modified"

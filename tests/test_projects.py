@@ -149,3 +149,56 @@ def test_operations_on_a_non_git_dir_are_rejected(projects: Projects) -> None:
     (projects.root / "plain").mkdir()
     with pytest.raises(ProjectError, match="not a git project"):
         projects.status("plain")
+
+
+def test_diff_shows_a_modified_file_with_line_counts(tmp_path: Path, projects: Projects) -> None:
+    remote = _make_remote(tmp_path)
+    d = projects.clone("dev04", f"file://{remote}", "main")
+    (d / "design.md").write_text("# design\nnew line one\nnew line two\n")
+    res = projects.diff("dev04")
+    assert res["clean"] is False
+    f = next(f for f in res["files"] if f["path"] == "design.md")
+    assert f["status"] == "modified"
+    assert f["additions"] >= 2
+    assert "new line one" in f["diff"]
+
+
+def test_diff_shows_an_untracked_file_as_added(tmp_path: Path, projects: Projects) -> None:
+    remote = _make_remote(tmp_path)
+    d = projects.clone("dev04", f"file://{remote}", "main")
+    (d / ".pipeline").mkdir()
+    (d / ".pipeline" / "hdm.yaml").write_text("project:\n  name: x\n")
+    res = projects.diff("dev04")
+    f = next(f for f in res["files"] if f["path"].endswith("hdm.yaml"))
+    assert f["status"] == "untracked"
+    assert f["additions"] >= 2
+
+
+def test_diff_respects_gitignore(tmp_path: Path, projects: Projects) -> None:
+    """A project that doesn't track .pipeline/ must not see it in the diff."""
+    remote = _make_remote(tmp_path)
+    d = projects.clone("dev04", f"file://{remote}", "main")
+    (d / ".gitignore").write_text(".pipeline/\n")
+    (d / ".pipeline").mkdir()
+    (d / ".pipeline" / "hdm.yaml").write_text("generated\n")
+    res = projects.diff("dev04")
+    paths = [f["path"] for f in res["files"]]
+    assert not any("hdm.yaml" in p for p in paths)
+    assert ".gitignore" in paths  # the gitignore itself is a new tracked-able file
+
+
+def test_diff_caps_a_huge_file(tmp_path: Path, projects: Projects) -> None:
+    remote = _make_remote(tmp_path)
+    d = projects.clone("dev04", f"file://{remote}", "main")
+    (d / "big.kicad_pcb").write_text("x\n" * 60000)  # well over the per-file cap
+    res = projects.diff("dev04")
+    f = next(f for f in res["files"] if f["path"] == "big.kicad_pcb")
+    assert f["truncated"] is True
+    assert f["diff"] is None
+    assert f["additions"] >= 60000  # counts still reported
+
+
+def test_diff_is_clean_on_a_fresh_clone(tmp_path: Path, projects: Projects) -> None:
+    remote = _make_remote(tmp_path)
+    projects.clone("dev04", f"file://{remote}", "main")
+    assert projects.diff("dev04") == {"clean": True, "files": []}

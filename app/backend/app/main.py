@@ -410,6 +410,17 @@ def git_commit(project_id: str, body: CommitBody, _: str = Depends(require_sessi
     return {"ok": True, "committed": out is not None}
 
 
+@app.get("/api/projects/{project_id}/git/diff")
+def git_diff(project_id: str, _: str = Depends(require_session)) -> dict:
+    """What changed in the working copy since the last commit — the 'what did that
+    run do' view. Diffs are size-capped server-side."""
+    _project_dir(project_id)
+    try:
+        return projects.diff(project_id)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.post("/api/projects/{project_id}/git/pull")
 def git_pull(project_id: str, _: str = Depends(require_session)) -> dict:
     _project_dir(project_id)
