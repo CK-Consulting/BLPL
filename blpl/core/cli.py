@@ -577,7 +577,7 @@ def _cmd_stage6(args: argparse.Namespace) -> int:
     if not hdm.exists():
         print(f"error: hdm.yaml missing at {hdm} — run stage5 first", file=sys.stderr)
         return 2
-    outputs = stage6_compile_kicad.run(hdm, proj / ".pipeline")
+    outputs = stage6_compile_kicad.run(hdm, proj / ".pipeline", project_dir=proj)
     file_outputs = {k: v for k, v in outputs.items() if k != "base"}
     print(f"stage6: compiled KiCad project ({len(file_outputs)} files, base={outputs['base']})")
     for kind, path in file_outputs.items():

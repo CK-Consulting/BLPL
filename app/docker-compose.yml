@@ -36,6 +36,15 @@ services:
       # 3D model libraries, so `kicad-cli pcb export glb --subst-models` can
       # substitute real component models off the official KiCad image.
       - /opt/blpl/hardware/kicad-packages3D:/usr/share/kicad/3dmodels:ro
+      # Stock symbol/footprint libraries. The image copies blpl/schemas/kicad-happy
+      # but NOT these (they are large and versioned as submodules), and inside the
+      # container the CLI resolves its default library roots to /app/kicad-symbols
+      # and /app/kicad-footprints (parents[2] of /app/blpl/core/cli.py). Without
+      # these mounts stage5 marks every real stock symbol as a missing placeholder
+      # and stage6 cannot load even Connector_Generic. Mount the same vendored
+      # libraries the host pipeline uses, at exactly those default paths.
+      - /opt/blpl/hardware/kicad-symbols:/app/kicad-symbols:ro
+      - /opt/blpl/hardware/kicad-footprints:/app/kicad-footprints:ro
       # An SSH deploy key for git, if your project remotes need one. The git CLI
       # in the container reads ~/.ssh; mount a read-only key here. Optional —
       # local-only projects and https remotes with a token helper don't need it.

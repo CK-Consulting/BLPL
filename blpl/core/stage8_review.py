@@ -260,7 +260,15 @@ def _emitter_crosschecks(bom: dict, sch: dict, pcb: dict) -> list[dict]:
             }
         )
 
-    if sch_count and sch_count < bom_count:
+    # Guard on whether the artifact was emitted/analyzed at all (a non-empty
+    # analysis dict), NOT on the emitted count. The old `sch_count and ...` /
+    # `pcb_count and ...` guards used the count, so a count of 0 — the *worst*
+    # leakage, every symbol/footprint vanished — skipped the check and let Stage 8
+    # pass a completely empty board. But a genuinely absent artifact (no .kicad_pcb
+    # supplied → `pcb` is `{}`) must still be skipped, or we'd flag "0 footprints"
+    # on a run that never produced a PCB. `sch`/`pcb` truthiness draws exactly that
+    # line: present-but-empty fires, absent does not.
+    if sch and sch_count < bom_count:
         checks.append(
             {
                 "check": "symbol_leakage",
@@ -271,7 +279,7 @@ def _emitter_crosschecks(bom: dict, sch: dict, pcb: dict) -> list[dict]:
             }
         )
 
-    if pcb_count and pcb_count < bom_count:
+    if pcb and pcb_count < bom_count:
         checks.append(
             {
                 "check": "footprint_leakage",

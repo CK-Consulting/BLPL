@@ -53,6 +53,25 @@ def test_component_leakage_between_bom_and_emitted_files() -> None:
     assert checks == {"symbol_leakage", "footprint_leakage"}
 
 
+def test_total_emitter_loss_still_gates_when_pcb_present_but_empty() -> None:
+    # The worst leakage: every symbol and footprint vanished. A count-based guard
+    # (`sch_count and ...`) would skip both checks on 0 and pass an empty board.
+    bom = _bom([{"local_id": f"U{i}", "mpn": "M", "package": "P"} for i in range(5)])
+    sch = {"statistics": {"total_components": 0}, "bom_lock": {"components_with_mpn": 0}}
+    pcb = {"statistics": {"footprint_count": 0}, "footprints": []}
+    checks = {c["check"] for c in s8._emitter_crosschecks(bom, sch, pcb)}
+    assert checks == {"symbol_leakage", "footprint_leakage"}
+
+
+def test_no_footprint_leakage_when_no_pcb_was_emitted() -> None:
+    # An absent PCB (no .kicad_pcb supplied → empty analysis dict) must NOT be
+    # flagged as "0 footprints placed" — there was no PCB to leak from.
+    bom = _bom([{"local_id": "U1", "mpn": "M", "package": "P"}])
+    sch = {"statistics": {"total_components": 1}, "bom_lock": {"components_with_mpn": 1}}
+    checks = {c["check"] for c in s8._emitter_crosschecks(bom, sch, {})}
+    assert "footprint_leakage" not in checks
+
+
 def test_schematic_pcb_disagreement_is_always_an_emitter_defect() -> None:
     # Both files come from one hdm.yaml, so they cannot legitimately disagree.
     for rule in ("XV-001", "XV-002"):

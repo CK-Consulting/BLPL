@@ -29,6 +29,12 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # BLPL itself (stages 0-8) plus the review analyzers. Build context is the
 # board-layer-pipe-line/ root so both are reachable.
+#
+# The kicad-symbols/ and kicad-footprints/ libraries are deliberately NOT copied
+# here — they are large submodules and are bind-mounted at runtime into
+# /app/kicad-symbols and /app/kicad-footprints (the CLI's default library roots),
+# alongside the 3D models. See app/docker-compose.yml. The pipeline cannot resolve
+# stock symbols/footprints without those mounts.
 COPY pyproject.toml README.md /app/
 COPY blpl /app/blpl
 COPY schemas /app/schemas
