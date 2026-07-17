@@ -390,3 +390,38 @@ def test_pipeline_rejects_an_unknown_stage(client) -> None:
     client.post("/api/projects/init", json={"name": "scratch"})
     r = client.post("/api/projects/scratch/pipeline?from_stage=stage9&to_stage=stage9")
     assert r.status_code == 400
+
+
+# -- fabrication readiness surfaced in the project list -----------------------
+
+
+def test_project_list_flags_a_board_with_placeholders(client) -> None:
+    import json as _json, os
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+
+    # No review yet → fab is null.
+    proj = next(p for p in client.get("/api/projects").json() if p["id"] == "scratch")
+    assert proj["fab"] is None
+
+    # Drop a review_report.json that reports placeholders.
+    import app.main as main
+    pipeline = main.PROJECTS_ROOT / "scratch" / ".pipeline"
+    pipeline.mkdir(parents=True, exist_ok=True)
+    (pipeline / "review_report.json").write_text(
+        _json.dumps({"summary": {"placeholders": 3, "emitter": 0, "design": 5, "expected": 2}})
+    )
+    proj = next(p for p in client.get("/api/projects").json() if p["id"] == "scratch")
+    assert proj["fab"]["blocked"] is True
+    assert proj["fab"]["placeholders"] == 3
+
+
+def test_project_list_fab_is_null_when_review_is_unparseable(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    import app.main as main
+    pipeline = main.PROJECTS_ROOT / "scratch" / ".pipeline"
+    pipeline.mkdir(parents=True, exist_ok=True)
+    (pipeline / "review_report.json").write_text("{ not json")
+    proj = next(p for p in client.get("/api/projects").json() if p["id"] == "scratch")
+    assert proj["fab"] is None

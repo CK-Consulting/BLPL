@@ -55,10 +55,23 @@ function Workspace() {
         >
           {projects.map((p) => (
             <option key={p.id} value={p.id}>
+              {p.fab?.blocked ? "⚠ " : ""}
               {p.id} ({p.markdown_files} md{p.has_pcb ? ", board" : ""})
             </option>
           ))}
         </select>
+        {(() => {
+          const cur = projects.find((p) => p.id === selected);
+          if (!cur?.fab?.blocked) return null;
+          const bits: string[] = [];
+          if (cur.fab.placeholders) bits.push(`${cur.fab.placeholders} placeholder part(s)`);
+          if (cur.fab.emitter_defects) bits.push(`${cur.fab.emitter_defects} emitter defect(s)`);
+          return (
+            <span className="fab-chip" title={`${bits.join(", ")} — see the Reports tab`}>
+              ⚠ not fabricable
+            </span>
+          );
+        })()}
         <NewProject
           onCreated={(id) => {
             refresh().then(() => setSelected(id));

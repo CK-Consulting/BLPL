@@ -141,3 +141,6 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 
 .row.wrap { flex-wrap: wrap; }
 .row.wrap label { font-size: 12px; }
+
+/* fabrication-readiness chip in the header */
+.fab-chip { display: inline-flex; align-items: center; gap: .3rem; font-size: 12px; padding: .15rem .5rem; border-radius: 999px; background: #3a1113; color: #ff9b9b; border: 1px solid #6e2126; cursor: help; }

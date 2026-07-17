@@ -71,12 +71,19 @@ export type Settings = {
   secrets: SecretMeta[];
 };
 
+export type FabReadiness = {
+  placeholders: number;
+  emitter_defects: number;
+  blocked: boolean;
+};
+
 export type Project = {
   id: string;
   markdown_files: number;
   has_schematic: boolean;
   has_pcb: boolean;
   is_git: boolean;
+  fab: FabReadiness | null;
 };
 
 export type GitStatus = {

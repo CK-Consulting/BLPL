@@ -300,6 +300,30 @@ def _latest(pipeline_dir: Path, suffix: str) -> Path | None:
     return files[0] if files else None
 
 
+def _fab_readiness(pipeline_dir: Path) -> dict | None:
+    """A one-glance verdict from the latest Stage 8 review, or None if not run.
+
+    Surfaces the state that must never be missed — placeholder parts and emitter
+    defects — at the project level, so 'this board is not fabricable' is visible
+    without opening it. Best-effort: a missing or unparseable report is just None.
+    """
+    report = pipeline_dir / "review_report.json"
+    if not report.is_file():
+        return None
+    try:
+        data = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    s = data.get("summary") or {}
+    placeholders = int(s.get("placeholders", 0))
+    emitter = int(s.get("emitter", 0))
+    return {
+        "placeholders": placeholders,
+        "emitter_defects": emitter,
+        "blocked": placeholders > 0 or emitter > 0,
+    }
+
+
 @app.get("/api/projects")
 def list_projects(_: str = Depends(require_session)) -> list[dict]:
     if not PROJECTS_ROOT.is_dir():
@@ -316,6 +340,7 @@ def list_projects(_: str = Depends(require_session)) -> list[dict]:
                 "has_schematic": _latest(pipeline, ".kicad_sch") is not None,
                 "has_pcb": _latest(pipeline, ".kicad_pcb") is not None,
                 "is_git": (d / ".git").is_dir(),
+                "fab": _fab_readiness(pipeline),
             }
         )
     return out

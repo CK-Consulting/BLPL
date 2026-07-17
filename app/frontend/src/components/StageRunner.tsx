@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Runs pipeline work and streams its log to the screen as it happens — either a
@@ -43,6 +43,16 @@ export function StageRunner({ projectId, onFinished }: Props) {
   const [running, setRunning] = useState(false);
   const [exitCode, setExitCode] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const logRef = useRef<HTMLPreElement | null>(null);
+
+  // Follow the tail of a long pipeline run — but only if you're already near the
+  // bottom, so scrolling up to read an earlier stage isn't yanked back down.
+  useEffect(() => {
+    const el = logRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (nearBottom) el.scrollTop = el.scrollHeight;
+  }, [lines]);
 
   const run = useCallback(async () => {
     setLines([]);
@@ -156,7 +166,7 @@ export function StageRunner({ projectId, onFinished }: Props) {
       {exitCode !== null && (
         <span className={exitCode === 0 ? "badge ok" : "badge fail"}>exit {exitCode}</span>
       )}
-      {lines.length > 0 && <pre className="log">{lines.join("\n")}</pre>}
+      {lines.length > 0 && <pre className="log" ref={logRef}>{lines.join("\n")}</pre>}
     </div>
   );
 }
