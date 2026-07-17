@@ -39,7 +39,11 @@ COPY pyproject.toml README.md /app/
 COPY blpl /app/blpl
 COPY schemas /app/schemas
 COPY kicad-happy /app/kicad-happy
-RUN pip install --no-cache-dir -e /app
+# [all-llm] pulls in the anthropic/openai/ollama SDKs. The webapp lets a project
+# configure a fallback chain over any of the three, and each provider backend
+# lazy-imports its SDK — so without the extra, Stage 0/1 die with
+# ModuleNotFoundError the moment that provider is used (anthropic is the default).
+RUN pip install --no-cache-dir -e /app[all-llm]
 
 COPY app/backend/app /app/app
 

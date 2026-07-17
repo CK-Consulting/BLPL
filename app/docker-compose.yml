@@ -17,6 +17,12 @@ services:
     container_name: blpl-backend
     networks:
       - blpl
+    # Lets OLLAMA_HOST=http://host.docker.internal:11434 reach an ollama server
+    # running on the Docker host. On Linux this name is not resolvable by default;
+    # host-gateway maps it to the host. Harmless if you instead point OLLAMA_HOST
+    # at a container on the blpl network or an explicit IP.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     environment:
       # One data root holds the three stateful things: the vault DB, the
@@ -26,7 +32,19 @@ services:
       - BLPL_VAULT_DB=/app/data/vault.db
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # LLM provider credentials, so all three backends are testable from the app.
+      # For anthropic/openai the app normally injects the key it has stored in its
+      # vault (Settings UI) per stage, and that OVERRIDES whatever is passed here —
+      # so these two are a fallback/default, and a provider only enters the run
+      # chain if it has a vaulted key (or is keyless). Ollama IS keyless: it never
+      # takes a key, it needs OLLAMA_HOST pointing at a reachable server. Inside
+      # the container `localhost` is the container itself, so point it at the host
+      # (http://host.docker.internal:11434 works via the extra_hosts mapping below)
+      # or at an ollama service on the blpl network. The `:-` defaults keep
+      # compose quiet when you are only exercising one or two of the three.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OLLAMA_HOST=${OLLAMA_HOST:-}
       # No cookie-secure knob: the session cookie's Secure flag is derived from
       # the request scheme (plain http → off so it works, https → on). Put TLS in
       # front and have that proxy send X-Forwarded-Proto: https; the flag follows.
