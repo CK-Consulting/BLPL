@@ -29,24 +29,50 @@ _CLASS_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(AVCC|DVCC|AVDD|DVDD|IOVDD|VDDIO)"), "Power_Bulk"),
     (re.compile(r"^(3V3|5V|12V|1V8|1V2|0V85|2V5)"), "Power_Bulk"),
     (re.compile(r"^\d+(\.\d+)?V(\b|$)"), "Power_Bulk"),  # "3.3V", "5V", "1.8V"
+    # Subsystem-prefixed power rails. The anchored rules above only catch bare rail
+    # names; a rail routed through a connector is usually prefixed with its subsystem
+    # (SOM_VIN, ETH_PWR_OUT, GNSS_VBCKP, CELL_USB_VBUS) and would otherwise fall to
+    # Default. Match a curated set of unambiguous power tokens as the trailing _-word.
+    # Deliberately does NOT match enable/control lines (*_PWR_EN) — those are GPIO, not
+    # rails — nor *_VDD_RF, an internally-generated RF supply the design routes locally.
+    (re.compile(r".*_(VIN|VBUS|VBCKP|VBACKUP|PWR_IN|PWR_OUT)$"), "Power_Bulk"),
     (re.compile(r"^USB3_|^SS_[RT]X[+\-PN]?$"), "USB3_Diff_90Ohm"),
     (re.compile(r"^USB\d*_D[+\-PN]$"), "USB3_Diff_90Ohm"),
     (re.compile(r"^PCIE_"), "PCIe_Diff_85Ohm"),
     (re.compile(r"^DDR4_"), "DDR4_Diff_90Ohm"),
+    # --- Additional controlled-impedance classes (dev.04 unified baseboard) ---
+    # RGMII: source-synchronous Ethernet MAC↔PHY bus (e.g. SOM_RGMII_TXD0, ETH_RGMII_RXC).
+    # Matched anywhere in the name because these signals are subsystem-prefixed. The class
+    # is named RGMII_Diff per the project's net-class table; RGMII itself is single-ended,
+    # so no diff-pair complement is expected. No dev.02/dev.03 net carries "RGMII", so this
+    # rule only affects boards that declare the class.
+    (re.compile(r".*RGMII"), "RGMII_Diff"),
+    # RF 50Ω feed lines, e.g. GNSS_RF_IN (and any *_RF_OUT). The underscore boundary keeps
+    # this off power nets like GNSS_VDD_RF. A bare RF_IN/RF_OUT is matched too.
+    (re.compile(r"(?:.*_)?RF_(IN|OUT)$"), "RF_50Ohm"),
+    # USB 2.0 D± pairs written with the _DP/_DN suffix AND a subsystem prefix, e.g.
+    # SOM_USB_DP / SOM_USB_DN. The required leading "_" before USB means this does NOT
+    # match the bare/anchored USB_DP or dev.02/dev.03's USB_D+/USB2_D+ forms, which stay
+    # on the USB3_Diff_90Ohm rule above — so no existing board's nets are reclassified.
+    (re.compile(r".*_USB\d*_D[PN]$"), "USB2_Diff_90Ohm"),
 ]
 
 
-_DIFF_PAIR_SUFFIXES = {
-    "P": "N",
-    "N": "P",
-    "DP": "DM",
-    "DM": "DP",
-    "TX_P": "TX_N",
-    "TX_N": "TX_P",
-    "RX_P": "RX_N",
-    "RX_N": "RX_P",
-    "+": "-",
-    "-": "+",
+# Each suffix maps to the ordered candidate complements it may pair with. A suffix can
+# have more than one valid complement spelling: USB 2.0 minus-side pins are written both
+# as _DM (USB-IF) and _DN (used by dev.04's SOM_USB_DP/DN), so _DP must try both.
+_DIFF_PAIR_SUFFIXES: dict[str, tuple[str, ...]] = {
+    "P": ("N",),
+    "N": ("P",),
+    "DP": ("DM", "DN"),
+    "DM": ("DP",),
+    "DN": ("DP",),
+    "TX_P": ("TX_N",),
+    "TX_N": ("TX_P",),
+    "RX_P": ("RX_N",),
+    "RX_N": ("RX_P",),
+    "+": ("-",),
+    "-": ("+",),
 }
 # Longer suffixes must be tried first so e.g. TX_P is preferred over P.
 _DIFF_PAIR_SUFFIX_ORDER = sorted(_DIFF_PAIR_SUFFIXES, key=len, reverse=True)
@@ -70,20 +96,25 @@ def _assign_class(name: str) -> str:
     return "Default"
 
 
-def _diff_pair_complement(name: str) -> str | None:
+def _diff_pair_complements(name: str) -> list[str]:
+    """Candidate complement net names for a diff-pair half, best-spelling first.
+
+    Returns [] if the name has no recognised diff-pair suffix. The caller keeps the
+    first candidate that actually exists among the synthesized nets.
+    """
     upper = name.upper()
     for suffix in _DIFF_PAIR_SUFFIX_ORDER:
         # Accept both _SUFFIX and SUFFIX (for + and -).
         if suffix in ("+", "-"):
             if upper.endswith(suffix):
                 base = name[: -len(suffix)]
-                return base + _DIFF_PAIR_SUFFIXES[suffix]
+                return [base + comp for comp in _DIFF_PAIR_SUFFIXES[suffix]]
         else:
             sep_suffix = f"_{suffix}"
             if upper.endswith(sep_suffix):
                 base = name[: -len(sep_suffix)]
-                return base + "_" + _DIFF_PAIR_SUFFIXES[suffix]
-    return None
+                return [base + "_" + comp for comp in _DIFF_PAIR_SUFFIXES[suffix]]
+    return []
 
 
 def _resolve_refdes(local_id: str, bom: dict | None) -> str:
@@ -138,9 +169,10 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
 
     # Diff-pair detection (bidirectional tagging).
     for name in list(nets_by_name.keys()):
-        comp = _diff_pair_complement(name)
-        if comp and comp in nets_by_name:
-            nets_by_name[name]["diff_pair_of"] = comp
+        for comp in _diff_pair_complements(name):
+            if comp in nets_by_name:
+                nets_by_name[name]["diff_pair_of"] = comp
+                break
 
     out: dict = {
         "project_id": design_artifact["project_id"],
