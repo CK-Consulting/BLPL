@@ -354,3 +354,39 @@ def test_no_env_var_can_force_secure_over_plain_http(client) -> None:
         assert main._cookie_secure(r) is False, "no env var may force Secure over http"
     finally:
         os.environ.pop("BLPL_COOKIE_SECURE", None)
+
+
+# -- whole-pipeline runner ----------------------------------------------------
+
+
+def test_pipeline_range_streams_and_needs_no_key_when_llm_excluded(client) -> None:
+    """A stage5→8 range has no LLM stage, so it must run with no key configured —
+    it will exit non-zero on an unbuilt project, but the request itself streams."""
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    with client.stream("POST", "/api/projects/scratch/pipeline?from_stage=stage5&to_stage=stage8") as r:
+        assert r.status_code == 200
+        body = "".join(r.iter_text())
+    assert "event: done" in body
+
+
+def test_pipeline_range_including_stage1_requires_a_key(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    r = client.post("/api/projects/scratch/pipeline?from_stage=stage0&to_stage=stage8")
+    assert r.status_code == 400
+    assert "key" in r.json()["detail"].lower()
+
+
+def test_pipeline_rejects_a_backwards_range(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    r = client.post("/api/projects/scratch/pipeline?from_stage=stage8&to_stage=stage2")
+    assert r.status_code == 400
+
+
+def test_pipeline_rejects_an_unknown_stage(client) -> None:
+    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    client.post("/api/projects/init", json={"name": "scratch"})
+    r = client.post("/api/projects/scratch/pipeline?from_stage=stage9&to_stage=stage9")
+    assert r.status_code == 400

@@ -1,15 +1,16 @@
 import { useCallback, useRef, useState } from "react";
 
 /**
- * Runs a pipeline stage and streams its log to the screen as it happens.
+ * Runs pipeline work and streams its log to the screen as it happens — either a
+ * single stage, or a contiguous range of stages end-to-end.
  *
- * This is a POST that streams, so EventSource (GET-only) is out; we read the
- * body and parse SSE frames by hand. Aborting the fetch also kills the
- * server-side subprocess, because the backend tears the child down when the
- * response generator is closed.
+ * These are POSTs that stream, so EventSource (GET-only) is out; we read the body
+ * and parse SSE frames by hand. Aborting the fetch also kills the server-side
+ * subprocess, because the backend tears the child down when the response
+ * generator is closed.
  */
 
-// Ordered as you actually run them. doctor is first because it is the one that
+// Single-stage list, ordered as you actually run them. doctor is first because it
 // tells you whether the pipeline is about to silently ignore half your design.
 const STAGES = [
   "doctor",
@@ -24,10 +25,20 @@ const STAGES = [
   "stage8",
 ];
 
-type Props = { projectId: string; onFinished: (stage: string, exitCode: number) => void };
+// The stages the whole-pipeline runner spans (the CLI `run` range).
+const PIPELINE_STAGES = [
+  "stage0", "stage1", "stage2", "stage3", "stage4",
+  "stage5", "stage6", "stage7", "stage8",
+];
+
+type Props = { projectId: string; onFinished: (label: string, exitCode: number) => void };
 
 export function StageRunner({ projectId, onFinished }: Props) {
+  const [mode, setMode] = useState<"single" | "pipeline">("single");
   const [stage, setStage] = useState("doctor");
+  const [from, setFrom] = useState("stage0");
+  const [to, setTo] = useState("stage8");
+
   const [lines, setLines] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
   const [exitCode, setExitCode] = useState<number | null>(null);
@@ -41,20 +52,21 @@ export function StageRunner({ projectId, onFinished }: Props) {
     const ac = new AbortController();
     abortRef.current = ac;
 
+    const label = mode === "single" ? stage : `${from}→${to}`;
+    const url =
+      mode === "single"
+        ? `/api/projects/${projectId}/stages/${stage}`
+        : `/api/projects/${projectId}/pipeline?from_stage=${from}&to_stage=${to}`;
+
     try {
-      const res = await fetch(`/api/projects/${projectId}/stages/${stage}`, {
-        method: "POST",
-        credentials: "same-origin",
-        signal: ac.signal,
-      });
+      const res = await fetch(url, { method: "POST", credentials: "same-origin", signal: ac.signal });
       if (res.status === 401) {
-        // Session ended mid-work — reload so the AuthGate takes over.
         window.location.reload();
         return;
       }
       if (!res.ok || !res.body) {
-        // A 400 here is the "no usable LLM provider" guard, whose detail is JSON.
-        let detail = `stage failed to start: ${res.status}`;
+        // A 400 here is usually the "no usable LLM provider" guard, whose detail is JSON.
+        let detail = `run failed to start: ${res.status}`;
         try {
           detail = (await res.clone().json()).detail ?? detail;
         } catch {
@@ -72,24 +84,22 @@ export function StageRunner({ projectId, onFinished }: Props) {
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
 
-        // SSE frames are separated by a blank line.
-        const frames = buffer.split("\n\n");
+        const frames = buffer.split("\n\n"); // SSE frames are blank-line separated
         buffer = frames.pop() ?? "";
 
         for (const frame of frames) {
           let event = "message";
           let data = "";
-          for (const line of frame.split("\n")) {
-            if (line.startsWith("event:")) event = line.slice(6).trim();
-            else if (line.startsWith("data:")) data += line.slice(5).trim();
+          for (const ln of frame.split("\n")) {
+            if (ln.startsWith("event:")) event = ln.slice(6).trim();
+            else if (ln.startsWith("data:")) data += ln.slice(5).trim();
           }
           if (!data) continue;
           const payload = JSON.parse(data);
-
           if (event === "log") setLines((l) => [...l, payload.line]);
           else if (event === "done") {
             setExitCode(payload.exit_code);
-            onFinished(stage, payload.exit_code);
+            onFinished(label, payload.exit_code);
           }
         }
       }
@@ -101,26 +111,51 @@ export function StageRunner({ projectId, onFinished }: Props) {
       setRunning(false);
       abortRef.current = null;
     }
-  }, [projectId, stage, onFinished]);
+  }, [projectId, mode, stage, from, to, onFinished]);
 
   return (
     <div className="panel">
-      <div className="row">
-        <select value={stage} onChange={(e) => setStage(e.target.value)} disabled={running}>
-          {STAGES.map((s) => (
-            <option key={s} value={s}>
-              {s}
-            </option>
-          ))}
-        </select>
-        <button onClick={run} disabled={running}>
-          {running ? "Running…" : "Run"}
+      <div className="seg">
+        <button className={mode === "single" ? "on" : ""} disabled={running} onClick={() => setMode("single")}>
+          Single stage
         </button>
-        {running && <button onClick={() => abortRef.current?.abort()}>Stop</button>}
-        {exitCode !== null && (
-          <span className={exitCode === 0 ? "badge ok" : "badge fail"}>exit {exitCode}</span>
-        )}
+        <button className={mode === "pipeline" ? "on" : ""} disabled={running} onClick={() => setMode("pipeline")}>
+          Pipeline
+        </button>
       </div>
+
+      {mode === "single" ? (
+        <div className="row">
+          <select value={stage} onChange={(e) => setStage(e.target.value)} disabled={running}>
+            {STAGES.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+          <button onClick={run} disabled={running}>{running ? "Running…" : "Run"}</button>
+          {running && <button onClick={() => abortRef.current?.abort()}>Stop</button>}
+        </div>
+      ) : (
+        <div className="row wrap">
+          <label className="muted">from</label>
+          <select value={from} onChange={(e) => setFrom(e.target.value)} disabled={running}>
+            {PIPELINE_STAGES.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+          <label className="muted">to</label>
+          <select value={to} onChange={(e) => setTo(e.target.value)} disabled={running}>
+            {PIPELINE_STAGES.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+          <button onClick={run} disabled={running}>{running ? "Running…" : "Run pipeline"}</button>
+          {running && <button onClick={() => abortRef.current?.abort()}>Stop</button>}
+        </div>
+      )}
+
+      {exitCode !== null && (
+        <span className={exitCode === 0 ? "badge ok" : "badge fail"}>exit {exitCode}</span>
+      )}
       {lines.length > 0 && <pre className="log">{lines.join("\n")}</pre>}
     </div>
   );

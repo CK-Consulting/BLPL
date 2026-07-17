@@ -511,9 +511,17 @@ def _stage_env(token: str, stage_name: str) -> dict[str, str]:
     env = dict(os.environ)
     if stage_name not in _LLM_STAGES:
         return env
+    return _inject_llm_env(env, token)
 
+
+def _inject_llm_env(env: dict[str, str], token: str) -> dict[str, str]:
+    """Add the resolved LLM fallback chain and its keys to an environment.
+
+    Keys are decrypted here and passed only in the child's environment, never on a
+    command line or in a log. Raises NoUsableProvider if nothing configured has a
+    key, which the caller turns into a clear 400.
+    """
     cfg = _load_config()
-    # Raises NoUsableProvider (→ 400) if nothing in the priority order has a key.
     chain = llm_resolver.resolve_chain(cfg, identity.providers_with_keys())
     if not chain:
         llm_resolver.resolve_primary(cfg, identity.providers_with_keys())  # raise the good message
@@ -526,33 +534,23 @@ def _stage_env(token: str, stage_name: str) -> dict[str, str]:
                 env[env_var] = key
 
     env["HDM_LLM_CHAIN"] = json.dumps([{"provider": rp.provider, "model": rp.model} for rp in chain])
-    # Primary echoed too, for anything (or anyone) reading the single-provider vars.
     env["HDM_LLM_PROVIDER"] = chain[0].provider
     if chain[0].model:
         env["HDM_LLM_MODEL"] = chain[0].model
     return env
 
 
-@app.post("/api/projects/{project_id}/stages/{stage_name}")
-async def run_stage(
-    project_id: str, stage_name: str, token: str = Depends(require_session)
-) -> StreamingResponse:
-    """Run a pipeline stage, streaming its output to the browser as it happens."""
-    if stage_name not in VALID_STAGES:
-        raise HTTPException(status_code=400, detail=f"unknown stage {stage_name!r}")
-    proj = _project_dir(project_id)
+def _stream_subprocess(cmd: list[str], env: dict[str, str]) -> StreamingResponse:
+    """Run a command and stream its combined output to the browser as SSE.
 
-    try:
-        env = _stage_env(token, stage_name)
-    except llm_resolver.NoUsableProvider as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    Shared by single-stage and whole-pipeline runs. The argv is echoed in the
+    start event — safe, because keys ride in the environment, never on the
+    command line. If the client disconnects, the generator is closed and the
+    child is killed rather than left orphaned.
+    """
 
     async def events():
-        cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
-        # The env carries a decrypted key; the command line never does, so it is
-        # safe to echo the argv to the client.
         yield f"event: start\ndata: {json.dumps({'cmd': cmd})}\n\n"
-
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
         )
@@ -569,3 +567,65 @@ async def run_stage(
                 await proc.wait()
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@app.post("/api/projects/{project_id}/stages/{stage_name}")
+async def run_stage(
+    project_id: str, stage_name: str, token: str = Depends(require_session)
+) -> StreamingResponse:
+    """Run a pipeline stage, streaming its output to the browser as it happens."""
+    if stage_name not in VALID_STAGES:
+        raise HTTPException(status_code=400, detail=f"unknown stage {stage_name!r}")
+    proj = _project_dir(project_id)
+    try:
+        env = _stage_env(token, stage_name)
+    except llm_resolver.NoUsableProvider as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
+    return _stream_subprocess(cmd, env)
+
+
+# The stages the whole-pipeline runner understands, in order. The CLI `run`
+# command drives 0→8; this is the allowlist the UI's from/to must fall within.
+_PIPELINE_STAGES = [
+    "stage0", "stage1", "stage2", "stage3", "stage4",
+    "stage5", "stage6", "stage7", "stage8",
+]
+
+
+@app.post("/api/projects/{project_id}/pipeline")
+async def run_pipeline(
+    project_id: str,
+    from_stage: str = "stage0",
+    to_stage: str = "stage8",
+    token: str = Depends(require_session),
+) -> StreamingResponse:
+    """Run a contiguous range of stages end-to-end, streaming per-stage progress.
+
+    Wraps `blpl run --from … --to …`, which prints a header per stage and keeps
+    going past a failure (--continue-on-error) so one stage's error doesn't hide
+    the rest. stage1 uses an LLM, so the chain + keys are injected whenever the
+    range reaches it; a pure stage5→8 range needs no key and won't be blocked for
+    lack of one.
+    """
+    if from_stage not in _PIPELINE_STAGES or to_stage not in _PIPELINE_STAGES:
+        raise HTTPException(status_code=400, detail="from/to must be stage0…stage8")
+    if _PIPELINE_STAGES.index(from_stage) > _PIPELINE_STAGES.index(to_stage):
+        raise HTTPException(status_code=400, detail="from stage is after to stage")
+    proj = _project_dir(project_id)
+
+    env = dict(os.environ)
+    lo, hi = _PIPELINE_STAGES.index(from_stage), _PIPELINE_STAGES.index(to_stage)
+    if lo <= _PIPELINE_STAGES.index("stage1") <= hi:
+        try:
+            env = _inject_llm_env(env, token)
+        except llm_resolver.NoUsableProvider as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    cmd = [
+        sys.executable, "-m", "blpl.core.cli", "run",
+        "--project-dir", str(proj),
+        "--from", from_stage, "--to", to_stage,
+        "--continue-on-error",
+    ]
+    return _stream_subprocess(cmd, env)

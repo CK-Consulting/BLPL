@@ -138,3 +138,6 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .issue-items li { font-size: 13px; }
 .expected-list { margin: 0; padding-left: 1.2rem; color: #9aa4b0; }
 .expected-list code { color: #cdd3da; }
+
+.row.wrap { flex-wrap: wrap; }
+.row.wrap label { font-size: 12px; }
