@@ -97,3 +97,44 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .editor-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .editor-bar { display: flex; align-items: center; gap: .5rem; padding: .45rem .7rem; border-bottom: 1px solid #2a2e36; background: #15181d; }
 .editor-text { flex: 1; resize: none; border: none; outline: none; background: #0f1115; color: #e6e6e6; padding: 1rem; font: 13px/1.5 ui-monospace, SFMono-Regular, monospace; tab-size: 2; }
+
+/* --- reports tab --- */
+.reports { overflow: auto; height: 100%; padding: 1rem 1.2rem; display: flex; flex-direction: column; gap: 1.1rem; }
+.fab-banner { padding: .8rem 1rem; border-radius: 8px; line-height: 1.5; }
+.fab-banner.danger { background: #3a1113; border: 1px solid #6e2126; color: #ffd7d7; }
+.fab-banner.danger strong { color: #ff6b6b; letter-spacing: .02em; }
+.fab-banner.ok { background: #102a17; border: 1px solid #1f5130; color: #b9f0cd; }
+.report-block { display: flex; flex-direction: column; gap: .5rem; }
+.report-block h3 { margin: 0; font-size: 14px; }
+.danger-h { color: #ff8b8b; }
+.muted-h { color: #7d8590; }
+
+.check-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .6rem; }
+.check-pill { padding: .6rem .7rem; border-radius: 8px; border: 1px solid #2a2e36; background: #15181d; }
+.check-top { display: flex; align-items: center; justify-content: space-between; font-weight: 600; }
+.check-state { font-size: 12px; padding: .05rem .4rem; border-radius: 999px; }
+.check-pill.ok .check-state { background: #16351f; color: #6ee7a0; }
+.check-pill.fail .check-state { background: #3a1a1d; color: #ff8b8b; }
+.check-pill.skip .check-state { background: #24262c; color: #9aa4b0; }
+.check-sub { color: #9aa4b0; font-size: 12px; margin-top: .25rem; }
+
+.sev { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-top: .4rem; flex: 0 0 auto; }
+.sev.error { background: #ff6b6b; }
+.sev.warning { background: #f0c674; }
+.sev.info { background: #6b93d6; }
+
+.finding-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .5rem; }
+.finding-list li { display: flex; gap: .55rem; padding: .5rem .6rem; background: #15181d; border: 1px solid #2a2e36; border-radius: 6px; }
+.rec { color: #9aa4b0; font-size: 12px; margin-top: .3rem; }
+
+.issue-groups { display: flex; flex-direction: column; gap: .35rem; }
+.issue-group { border: 1px solid #2a2e36; border-radius: 6px; overflow: hidden; background: #15181d; }
+.issue-head { display: flex; align-items: center; gap: .55rem; width: 100%; text-align: left; background: transparent; border: none; color: #e6e6e6; padding: .5rem .6rem; font: inherit; }
+.issue-head:hover { background: #1c2027; }
+.issue-count { background: #24262c; color: #cdd3da; border-radius: 999px; padding: 0 .45rem; font-size: 12px; }
+.issue-preview { color: #9aa4b0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.chevron { color: #7d8590; }
+.issue-items { list-style: none; margin: 0; padding: .2rem .6rem .6rem 1.8rem; display: flex; flex-direction: column; gap: .5rem; border-top: 1px solid #24262c; }
+.issue-items li { font-size: 13px; }
+.expected-list { margin: 0; padding-left: 1.2rem; color: #9aa4b0; }
+.expected-list code { color: #cdd3da; }
