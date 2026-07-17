@@ -172,6 +172,59 @@ def test_diff_pair_detection_tags_both_halves() -> None:
     assert "diff_pair_of" not in nets["STANDALONE"]
 
 
+def test_diff_pair_detection_dp_dn_spelling() -> None:
+    """_DP pairs with _DN, not just _DM (dev.04 SOM_USB_DP/DN naming).
+
+    The USB2 classifier accepts _DP/_DN pairs, so the diff-pair detector must tag
+    both halves — the stage contract and the CLI's diff-pair count depend on it.
+    """
+    a = _artifact(
+        [
+            _conn(
+                "J_SOM",
+                [
+                    ("26", "SOM_USB_DP"),
+                    ("27", "SOM_USB_DN"),
+                ],
+            )
+        ]
+    )
+    nets = {n["name"]: n for n in s4.synthesize(a)["nets"]}
+    assert nets["SOM_USB_DP"]["class"] == "USB2_Diff_90Ohm"
+    assert nets["SOM_USB_DN"]["class"] == "USB2_Diff_90Ohm"
+    assert nets["SOM_USB_DP"]["diff_pair_of"] == "SOM_USB_DN"
+    assert nets["SOM_USB_DN"]["diff_pair_of"] == "SOM_USB_DP"
+
+
+def test_class_assignment_prefixed_power_rails() -> None:
+    """Subsystem-prefixed power rails classify as Power_Bulk; enable/RF-supply lines do not."""
+    a = _artifact(
+        [
+            _conn(
+                "J1",
+                [
+                    ("1", "SOM_VIN"),         # power input rail
+                    ("2", "ETH_PWR_OUT"),     # regulated DC output
+                    ("3", "GNSS_VBCKP"),      # backup power rail
+                    ("4", "CELL_USB_VBUS"),   # USB 5V rail (prefixed)
+                    ("5", "CELL_PWR_EN"),     # enable/control line -> NOT a rail
+                    ("6", "GNSS_VDD_RF"),     # internal RF supply -> stays Default
+                    ("7", "GNSS_ANT_ON"),     # antenna power-enable -> stays Default
+                ],
+            )
+        ]
+    )
+    nets = {n["name"]: n["class"] for n in s4.synthesize(a)["nets"]}
+    assert nets["SOM_VIN"] == "Power_Bulk"
+    assert nets["ETH_PWR_OUT"] == "Power_Bulk"
+    assert nets["GNSS_VBCKP"] == "Power_Bulk"
+    assert nets["CELL_USB_VBUS"] == "Power_Bulk"
+    # Boundaries: control/enable and internal-supply nets must not become Power_Bulk.
+    assert nets["CELL_PWR_EN"] == "Default"
+    assert nets["GNSS_VDD_RF"] == "Default"
+    assert nets["GNSS_ANT_ON"] == "Default"
+
+
 def test_duplicate_pins_in_a_net_are_deduped() -> None:
     a = _artifact([_conn("J1", [("1", "GND"), ("1", "GND")])])
     result = s4.synthesize(a)
