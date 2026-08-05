@@ -3,7 +3,7 @@
 Asserts that the kicad-ai-assistant (kcaa) MCP server still registers every
 tool BLPL's refine phase depends on. Run inside kcaa's own environment:
 
-    cd board-layer-pipe-line/kicad-ai-assistant
+    cd kicad-ai-assistant
     uv run python ../tests/kcaa_contract_check.py
 
 Exits non-zero (with the missing names) if upstream renames or drops a tool.

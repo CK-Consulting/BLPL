@@ -1,0 +1,135 @@
+name: kcaa upstream check
+
+# Keeps kicad-ai-assistant tracking its fork's main
+# (which a workflow in the fork keeps synced with upstream paul356/KiCad-AI-Assistant).
+#
+# Weekly (and on demand): advance the submodule to the fork's latest main, run
+# kcaa's own test suite plus BLPL's contract check, then open a bump PR when
+# green or an issue when red.
+# On PRs that touch the submodule: run the same checks against the pinned SHA.
+#
+# NOTE: the scheduled trigger only fires once this file is on the default branch.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC, after the fork's daily upstream sync
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - kicad-ai-assistant
+      - tests/kcaa_contract_check.py
+      - .gitmodules
+      - .github/workflows/kcaa-upstream-check.yml
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  SUBMODULE_PATH: kicad-ai-assistant
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # The repo carries many large submodules (KiCad libraries); init only kcaa.
+        with:
+          submodules: false
+
+      - name: Init kcaa submodule
+        run: git submodule update --init --depth 1 -- "$SUBMODULE_PATH"
+
+      - name: Advance submodule to fork main (scheduled/manual runs only)
+        id: advance
+        if: github.event_name != 'pull_request'
+        run: |
+          cd "$SUBMODULE_PATH"
+          old=$(git rev-parse HEAD)
+          git fetch --depth 1 origin main
+          git checkout --detach FETCH_HEAD
+          new=$(git rev-parse HEAD)
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "changed=$([ "$old" != "$new" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Submodule: $old -> $new"
+
+      - name: Install uv
+        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      # kcaa's own CI tests on 3.13 with node/jsdom available; mirror that.
+      - name: Set up Python 3.13
+        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        working-directory: kicad-ai-assistant
+        run: |
+          uv python install 3.13
+          uv python pin 3.13
+
+      - name: Install Node.js
+        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install kcaa deps
+        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        working-directory: kicad-ai-assistant
+        run: |
+          uv sync --group dev
+          npm install jsdom
+
+      - name: Run kcaa test suite
+        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        working-directory: kicad-ai-assistant
+        env:
+          KICAD_VERSION: "10"
+        run: uv run python -m pytest tests/ --tb=short -o "addopts="
+
+      - name: Run BLPL contract check
+        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        working-directory: kicad-ai-assistant
+        env:
+          KICAD_VERSION: "10"
+        run: uv run python ../tests/kcaa_contract_check.py
+
+      - name: Open bump PR
+        if: github.event_name != 'pull_request' && steps.advance.outputs.changed == 'true' && success()
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: bots/kcaa-upstream-bump
+          add-paths: kicad-ai-assistant
+          commit-message: |
+            Bump kicad-ai-assistant to latest fork main
+
+            ${{ steps.advance.outputs.old }} -> ${{ steps.advance.outputs.new }}
+            kcaa test suite and BLPL contract check passed in the triggering run.
+          title: "Bump kicad-ai-assistant submodule (upstream sync)"
+          body: |
+            Automated bump of `kicad-ai-assistant`:
+            `${{ steps.advance.outputs.old }}` → `${{ steps.advance.outputs.new }}`
+
+            kcaa's own test suite and the BLPL contract check
+            (`tests/kcaa_contract_check.py`) both passed —
+            see the [triggering run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          labels: kcaa-upstream
+
+      - name: File breakage issue
+        if: github.event_name != 'pull_request' && failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create kcaa-upstream --force --description "kicad-ai-assistant upstream tracking" --color FBCA04 || true
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          existing=$(gh issue list --label kcaa-upstream --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing: $run_url"
+          else
+            gh issue create \
+              --title "kicad-ai-assistant upstream update breaks checks" \
+              --label kcaa-upstream \
+              --body "The weekly upstream check failed — either kcaa's test suite or BLPL's contract check (\`tests/kcaa_contract_check.py\`) broke against the fork's latest main. See $run_url. The submodule pointer was NOT bumped."
+          fi

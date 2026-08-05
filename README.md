@@ -29,7 +29,7 @@ Hardware projects usually live in two disconnected worlds: narrative design docs
 ## Quick start
 
 ```bash
-# From the board-layer-pipe-line/ dir
+# From the repo root
 uv venv --python 3.11 .venv
 uv pip install -e ".[dev,all-llm]"
 blpl --help
@@ -60,7 +60,7 @@ Each stage is deterministic and idempotent; stages 0 and 1 use an LLM adapter (A
 ## Repo layout
 
 ```
-board-layer-pipe-line/
+blpl-repo-root/
     blpl/
         core/           # pipeline stages 0–7
         emitter/        # v10 KiCad .kicad_sch / .kicad_pcb / .kicad_pro writer

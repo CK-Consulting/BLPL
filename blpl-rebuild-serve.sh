@@ -1,6 +1,6 @@
 #!/bin/bash
 readenv() {
-  local filePath="${HOME}/projects/blpl/.env"
+  local filePath="${HOME}/devspace/myprojects/blpl/.env"
 
   if [ ! -f "$filePath" ]; then
     # silently be done
@@ -35,7 +35,7 @@ readenv() {
 _evalBg() {
     eval "$@" &>/dev/null & disown;
 }
-source ${HOME}/projects/blpl/.venv/bin/activate
+source ${HOME}/devspace/myprojects/blpl/.venv/bin/activate
 uv pip install -e ".[webapp]"              # fastapi + uvicorn backend
 cd ui && npm install && npm run build
 readenv      # SolidJS frontend → blpl/webapp/static/

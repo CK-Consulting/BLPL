@@ -52,7 +52,7 @@ _STAGE_ORDER = [
 
 
 # Three levels up from blpl/core/cli.py lands us at board-layer-pipe-line/,
-# where the kicad-symbols/kicad-footprints submodules live (symlinked for now).
+# where the kicad-symbols/kicad-footprints submodules live (real submodules).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_SYMBOLS = _REPO_ROOT / "kicad-symbols"
 _DEFAULT_FOOTPRINTS = _REPO_ROOT / "kicad-footprints"

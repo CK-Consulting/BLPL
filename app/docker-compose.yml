@@ -10,7 +10,7 @@
 services:
   backend:
     build:
-      # Context is board-layer-pipe-line/ so the image can pull in blpl/ and
+      # Context is the repo root so the image can pull in blpl/ and
       # kicad-happy/ alongside the app.
       context: ..
       dockerfile: app/backend/Dockerfile
@@ -51,10 +51,10 @@ services:
     volumes:
       # Everything stateful — vault, config, and your git-backed designs — on one
       # named volume so it survives rebuilds and can be backed up as a unit.
-      - /opt/blpl/app/data:/app/data
+      - ./data:/app/data
       # 3D model libraries, so `kicad-cli pcb export glb --subst-models` can
       # substitute real component models off the official KiCad image.
-      - /opt/blpl/hardware/kicad-packages3D:/usr/share/kicad/3dmodels:ro
+      - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
       # Stock symbol/footprint libraries. The image copies blpl/schemas/kicad-happy
       # but NOT these (they are large and versioned as submodules), and inside the
       # container the CLI resolves its default library roots to /app/kicad-symbols
@@ -62,12 +62,12 @@ services:
       # these mounts stage5 marks every real stock symbol as a missing placeholder
       # and stage6 cannot load even Connector_Generic. Mount the same vendored
       # libraries the host pipeline uses, at exactly those default paths.
-      - /opt/blpl/hardware/kicad-symbols:/app/kicad-symbols:ro
-      - /opt/blpl/hardware/kicad-footprints:/app/kicad-footprints:ro
+      - ../kicad-symbols:/app/kicad-symbols:ro
+      - ../kicad-footprints:/app/kicad-footprints:ro
       # An SSH deploy key for git, if your project remotes need one. The git CLI
       # in the container reads ~/.ssh; mount a read-only key here. Optional —
       # local-only projects and https remotes with a token helper don't need it.
-      - /opt/blpl/app/data/ssh:/root/.ssh:ro
+      - ./data/ssh:/root/.ssh:ro
   frontend:
     build:
       context: ./frontend

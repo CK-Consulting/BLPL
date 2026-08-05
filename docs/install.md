@@ -54,7 +54,7 @@ blpl --help
 The pipeline relies on the KiCad standard libraries for symbol/footprint lookup. They're git submodules rooted in the legacy `hardware/hdm-to-kicad-pipeline/` path and symlinked into BLPL:
 
 ```bash
-cd /path/to/workspace-root                 # e.g. .../blpl
+cd /path/to/blpl                           # the standalone BLPL repo
 git submodule update --init --recursive
 ```
 
@@ -100,7 +100,7 @@ Or pass `--kicad-python <path>` per invocation. BLPL auto-discovers several comm
 ## Run the tests
 
 ```bash
-cd board-layer-pipe-line/
+cd blpl-repo-root/
 .venv/bin/python -m pytest tests/
 ```
 
