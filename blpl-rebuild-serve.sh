@@ -32,6 +32,36 @@ readenv() {
   done < "$filePath"
 }
 
+# Platform detection
+case "$(uname -s)" in
+  Darwin)
+    export SHELL_OS='macOS'
+    _SHELL_IS_MACOS=1
+    _SHELL_IS_LINUX=0
+    ;;
+  Linux)
+    export SHELL_OS='Linux'
+    _SHELL_IS_MACOS=0
+    _SHELL_IS_LINUX=1
+    ;;
+  *)
+    export SHELL_OS='Other'
+    _SHELL_IS_MACOS=0
+    _SHELL_IS_LINUX=0
+    ;;
+esac
+
+# macOS — bundled with KiCad.app
+if [[ "$_SHELL_IS_MACOS" -eq 1 ]]; then
+    export HDM_KICAD_PYTHON=/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3
+fi
+
+
+# Linux — often /usr/lib/kicad/bin/python3
+if [[ "$_SHELL_IS_LINUX" -eq 1 ]]; then
+    export HDM_KICAD_PYTHON=/usr/lib/kicad/bin/python3
+fi
+
 _evalBg() {
     eval "$@" &>/dev/null & disown;
 }
