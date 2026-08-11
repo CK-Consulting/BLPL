@@ -32,6 +32,8 @@ readenv() {
   done < "$filePath"
 }
 
+
+
 # Platform detection
 case "$(uname -s)" in
   Darwin)
@@ -65,10 +67,28 @@ fi
 _evalBg() {
     eval "$@" &>/dev/null & disown;
 }
+
+# Kill only the process LISTENING on the blpl serve port (macOS/Linux).
+# -sTCP:LISTEN excludes clients (e.g. Vivaldi) that merely have the page open.
+# lsof -t prints only PIDs — no header, no column parsing needed.
+_kill_port() {
+    local port="${1:-7878}"
+    local pids
+    pids="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null)" || true
+    if [[ -n "$pids" ]]; then
+        # shellcheck disable=SC2086
+        kill $pids 2>/dev/null || true
+        echo "Killed listener(s) on port ${port}: ${pids}"
+    fi
+}
+
 source ${HOME}/devspace/myprojects/blpl/.venv/bin/activate
 uv pip install -e ".[webapp]"              # fastapi + uvicorn backend
-cd ui && npm install && npm run build
+cd ui && npm approve-scripts --allow-scripts-pending && npm install && npm run build
+cd ${HOME}/devspace/myprojects/blpl
 readenv      # SolidJS frontend → blpl/webapp/static/
+export BLPL_WORKSPACE=${HOME}/projects/hardware/dev.04-unified-baseboard
+_kill_port 7878
 cmd="blpl serve"
 _evalBg "${cmd}";
 
