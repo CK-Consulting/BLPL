@@ -97,14 +97,16 @@ select { background: var(--card); color: var(--fg); border: 1px solid var(--bord
 }
 .logs > div { min-height: 1em; }
 
-.artifact-layout { display: grid; grid-template-columns: 280px 1fr; gap: 1rem; }
+.artifact-layout { display: grid; grid-template-columns: 320px 1fr; gap: 1rem; }
 .artifact-names { list-style: none; padding: 0; margin: 0; border: 1px solid var(--border); border-radius: 4px; max-height: 400px; overflow-y: auto; }
 .artifact-names li { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 0.85rem; }
 .artifact-names li:last-child { border-bottom: none; }
 .artifact-names li:hover { background: var(--card); }
 .artifact-names li.selected { background: var(--card); border-left: 3px solid var(--accent); padding-left: calc(0.75rem - 3px); }
 .artifact-name { font-family: monospace; }
-.artifact-size { color: var(--muted); font-size: 0.75rem; margin-top: 2px; }
+.artifact-meta { display: flex; gap: 0.75rem; color: var(--muted); font-size: 0.75rem; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.artifact-created { font-family: monospace; }
+.artifact-size { color: var(--muted); }
 .artifact-content {
   background: #050709; padding: 0.75rem; border: 1px solid var(--border); border-radius: 4px;
   max-height: 400px; overflow: auto; font-family: "SF Mono", Menlo, monospace; font-size: 0.8rem;

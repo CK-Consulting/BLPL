@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -168,13 +169,24 @@ def put_references(project_id: str, payload: ReferenceManifestInput) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _artifact_meta(path: Path) -> dict[str, Any]:
+    """Name, size, and creation time as UTC ``YYYY-MM-DD_HHMMSSZ``."""
+    st = path.stat()
+    ts = getattr(st, "st_birthtime", None) or st.st_mtime
+    return {
+        "name": path.name,
+        "size": st.st_size,
+        "created": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d_%H%M%SZ"),
+    }
+
+
 @app.get("/api/projects/{project_id}/artifacts")
 def list_artifacts(project_id: str) -> dict:
     proj = _require_project(project_id)
     if not proj.pipeline_dir.exists():
         return {"artifacts": []}
     artifacts = [
-        {"name": p.name, "size": p.stat().st_size}
+        _artifact_meta(p)
         for p in sorted(proj.pipeline_dir.iterdir())
         if p.is_file()
     ]

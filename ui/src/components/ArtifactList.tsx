@@ -46,7 +46,10 @@ const ArtifactList: Component<Props> = (props) => {
                   onClick={() => view(a.name)}
                 >
                   <div class="artifact-name">{a.name}</div>
-                  <div class="artifact-size">{formatSize(a.size)}</div>
+                  <div class="artifact-meta">
+                    <span class="artifact-created">{a.created}</span>
+                    <span class="artifact-size">{formatSize(a.size)}</span>
+                  </div>
                 </li>
               )}
             </For>

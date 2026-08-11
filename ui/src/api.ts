@@ -52,7 +52,7 @@ export const api = {
       body: JSON.stringify({ references: refs }),
     }),
   listArtifacts: (id: string) =>
-    j<{ artifacts: { name: string; size: number }[] }>(
+    j<{ artifacts: { name: string; size: number; created: string }[] }>(
       `/api/projects/${encodeURIComponent(id)}/artifacts`,
     ),
   listConversations: (id: string) =>
