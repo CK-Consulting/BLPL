@@ -73,10 +73,15 @@ services:
       # libraries the host pipeline uses, at exactly those default paths.
       - ../kicad-symbols:/app/kicad-symbols:ro
       - ../kicad-footprints:/app/kicad-footprints:ro
+      - ../kicad-happy:/app/kicad-happy
+      - ../kicad-packages:/app/kicad-packages
+      - ../kicad-templates:/app/kicad-templates
+      - ../KiCAD-Prism:/app/kicad-prism
       # An SSH deploy key for git, if your project remotes need one. The git CLI
       # in the container reads ~/.ssh; mount a read-only key here. Optional —
       # local-only projects and https remotes with a token helper don't need it.
       - ./data/ssh:/root/.ssh:ro
+
   frontend:
     build:
       context: ./frontend
