@@ -218,3 +218,8 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .chip { background: #191c22; border: 1px solid #2a2e36; border-radius: 999px; padding: .15rem .6rem; font-size: 12px; color: #c2c8d0; }
 .chip .mono { font-family: ui-monospace, monospace; color: #8ab4f8; }
 .small { font-size: 12px; }
+/* Inside the artifact viewer the outer panel is the one scroller — the reused
+   .reports/.bom-scroll must size to content, or the flex algorithm squashes the
+   overflow:auto table to zero height to absorb the container's overflow. */
+.artifact-view .reports { height: auto; overflow: visible; }
+.artifact-view .bom-scroll { flex: none; overflow: visible; }
