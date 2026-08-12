@@ -15,7 +15,12 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
     // Same-origin in prod (nginx) and dev (Vite proxy), so the session cookie
     // rides automatically; "same-origin" is belt-and-suspenders.
     credentials: "same-origin",
-    headers: { ...(init?.body ? { "Content-Type": "application/json" } : {}), ...init?.headers },
+    // Only a string body is JSON; a FormData body must NOT get a Content-Type
+    // here, or the browser's multipart boundary never makes it onto the wire.
+    headers: {
+      ...(typeof init?.body === "string" ? { "Content-Type": "application/json" } : {}),
+      ...init?.headers,
+    },
   });
   // 401 anywhere means "you are locked out now" — surface it once, centrally.
   // The auth handshake calls are allowed to see their own 401s (wrong passphrase).
@@ -40,6 +45,12 @@ export async function postJSON<T>(path: string, body?: unknown): Promise<T> {
 
 export async function putJSON<T>(path: string, body: unknown): Promise<T> {
   const res = await request(path, { method: "PUT", body: JSON.stringify(body) });
+  if (!res.ok) throw new Error((await errorDetail(res)) || res.statusText);
+  return res.json();
+}
+
+export async function postForm<T>(path: string, form: FormData): Promise<T> {
+  const res = await request(path, { method: "POST", body: form });
   if (!res.ok) throw new Error((await errorDetail(res)) || res.statusText);
   return res.json();
 }
@@ -84,6 +95,14 @@ export type Project = {
   has_pcb: boolean;
   is_git: boolean;
   fab: FabReadiness | null;
+};
+
+export type ImportResult = {
+  ok: boolean;
+  id: string;
+  imported: number;
+  files: string[];
+  skipped: { name: string; reason: string }[];
 };
 
 export type GitStatus = {

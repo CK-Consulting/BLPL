@@ -28,7 +28,7 @@ def test_save_then_load_round_trips(tmp_path: Path) -> None:
     p = tmp_path / "blpl.toml"
     cfg = AppConfig(
         llm_priority=["openai", "anthropic", "ollama"],
-        llm_models={"anthropic": "claude-opus-4-8", "openai": "gpt-4o-2024-08-06", "ollama": "llama3.3"},
+        llm_models={"anthropic": "claude-opus-5", "openai": "gpt-4o-2024-08-06", "ollama": "llama3.3"},
         projects={"dev04": ProjectEntry(name="dev04", remote="git@github.com:me/dev04.git", branch="main")},
     )
     appconfig.save(p, cfg)

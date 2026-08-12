@@ -18,7 +18,7 @@ llm-anthropic = ["anthropic>=0.39"]
 llm-openai = ["openai>=1.0"]
 llm-ollama = ["ollama>=0.3"]
 all-llm = ["anthropic>=0.39", "openai>=1.0", "ollama>=0.3"]
-webapp = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "watchfiles>=0.22"]
+webapp = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "watchfiles>=0.22", "python-multipart>=0.0.18"]
 dev = ["pytest>=7.4", "rich>=13.0"]
 
 [project.scripts]

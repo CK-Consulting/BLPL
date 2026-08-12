@@ -23,17 +23,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import appconfig, llm_resolver, vault
+from . import appconfig, importer, llm_resolver, vault
 from .appconfig import AppConfig, ProjectEntry
 from .conversations import Conversation, list_conversations
 from .identity import Identity, Locked
@@ -411,6 +412,73 @@ def init_project(body: InitBody, _: str = Depends(require_session)) -> dict:
     cfg.projects[body.name] = ProjectEntry(name=body.name)
     appconfig.save(CONFIG_PATH, cfg)
     return {"ok": True, "id": body.name}
+
+
+@app.post("/api/projects/import")
+async def import_project(
+    name: str = Form(...),
+    files: list[UploadFile] = File(...),
+    _: str = Depends(require_session),
+) -> dict:
+    """Bring an existing design into the app from the browser: a selection of
+    files, or a single .zip of the project folder. The server creates a local
+    git working copy, writes the accepted files, and makes the import the first
+    commit — so the imported state is always recoverable. What was *not*
+    accepted comes back in ``skipped``; nothing is dropped silently.
+
+    Path rules, suffix policy, and folder flattening live in app/importer.py.
+    """
+    payloads: list[tuple[str, bytes]] = []
+    total = 0
+    for up in files:
+        data = await up.read()
+        total += len(data)
+        if total > importer.MAX_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"upload exceeds {importer.MAX_TOTAL_BYTES // (1024 * 1024)} MB",
+            )
+        payloads.append((up.filename or "", data))
+
+    try:
+        imported, skipped = importer.collect(payloads)
+    except importer.ImportRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    skipped_out = [{"name": s.name, "reason": s.reason} for s in skipped]
+    if not imported:
+        raise HTTPException(
+            status_code=400,
+            detail="nothing importable in the upload: "
+            + ("; ".join(f"{s.name} ({s.reason})" for s in skipped) or "no files"),
+        )
+
+    try:
+        dest = projects.init_local(name)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        for f in imported:
+            target = dest / f.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(f.data)
+        projects.commit_all(name, f"Import {len(imported)} files via app upload")
+    except Exception:
+        # A half-written project would show up in every listing looking real.
+        # Roll the directory back and let the error surface.
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+    cfg = _load_config()
+    cfg.projects[name] = ProjectEntry(name=name)
+    appconfig.save(CONFIG_PATH, cfg)
+    return {
+        "ok": True,
+        "id": name,
+        "imported": len(imported),
+        "files": [str(f.path) for f in imported],
+        "skipped": skipped_out,
+    }
 
 
 @app.get("/api/projects/{project_id}/git/status")

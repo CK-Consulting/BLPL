@@ -2,6 +2,8 @@
 # image, which makes builds only half-reproducible.
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
+# Multipart parsing for the project-import upload endpoint.
+python-multipart==0.0.20
 # Vault: passphrase KDF and authenticated encryption for the API-key store.
 argon2-cffi==23.1.0
 cryptography==44.0.0

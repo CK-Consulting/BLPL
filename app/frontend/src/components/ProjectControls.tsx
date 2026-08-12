@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { GitStatus, getJSON, postJSON } from "../api";
+import { GitStatus, ImportResult, getJSON, postForm, postJSON } from "../api";
 
 // The git strip: what state the server's working copy is in, and the three
 // buttons that keep it in sync with the remote you roam through — pull, commit,
@@ -71,10 +71,12 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
 
 export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
   const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState<"init" | "clone">("init");
+  const [mode, setMode] = useState<"init" | "clone" | "import">("init");
   const [name, setName] = useState("");
   const [remote, setRemote] = useState("");
   const [branch, setBranch] = useState("main");
+  const [picked, setPicked] = useState<File[]>([]);
+  const [skipped, setSkipped] = useState<ImportResult["skipped"]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -84,12 +86,28 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
     try {
       if (mode === "clone") {
         await postJSON("/api/projects/clone", { name, remote, branch });
+      } else if (mode === "import") {
+        const form = new FormData();
+        form.append("name", name);
+        // webkitRelativePath is set when a folder was selected; sending it as
+        // the filename preserves the layout so the server can flatten the
+        // common root the same way it does for a zip.
+        for (const f of picked) form.append("files", f, (f as any).webkitRelativePath || f.name);
+        const result = await postForm<ImportResult>("/api/projects/import", form);
+        if (result.skipped.length > 0) {
+          // Some files were refused — keep the modal open so the report is
+          // seen, but the project exists, so let the app switch to it.
+          setSkipped(result.skipped);
+          onCreated(name);
+          return;
+        }
       } else {
         await postJSON("/api/projects/init", { name });
       }
       setOpen(false);
       setName("");
       setRemote("");
+      setPicked([]);
       onCreated(name);
     } catch (e) {
       setError((e as Error).message);
@@ -122,6 +140,9 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
             <button className={mode === "clone" ? "on" : ""} onClick={() => setMode("clone")}>
               Clone git remote
             </button>
+            <button className={mode === "import" ? "on" : ""} onClick={() => setMode("import")}>
+              Import files
+            </button>
           </div>
           <input placeholder="Project name (e.g. dev.05)" value={name} onChange={(e) => setName(e.target.value)} />
           {mode === "clone" && (
@@ -134,9 +155,47 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
               </p>
             </>
           )}
+          {mode === "import" && (
+            <>
+              <input
+                type="file"
+                multiple
+                onChange={(e) => {
+                  setPicked(Array.from(e.target.files ?? []));
+                  setSkipped([]);
+                }}
+              />
+              <p className="muted">
+                Select your design files, or a single .zip of the project folder. The server creates a
+                git-backed working copy with the import as its first commit. Design markdown must sit at
+                the top level (a single wrapping folder is stripped automatically).
+              </p>
+              {skipped.length > 0 && (
+                <div className="gate-error">
+                  Imported, but {skipped.length} file{skipped.length > 1 ? "s were" : " was"} skipped:
+                  <ul>
+                    {skipped.map((s) => (
+                      <li key={s.name}>
+                        {s.name} — {s.reason}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </>
+          )}
           {error && <div className="gate-error">{error}</div>}
-          <button onClick={create} disabled={busy || !name || (mode === "clone" && !remote)}>
-            {busy ? "…" : mode === "clone" ? "Clone" : "Create"}
+          <button
+            onClick={create}
+            disabled={
+              busy ||
+              !name ||
+              (mode === "clone" && !remote) ||
+              // No files picked, or the import already ran and we're showing its skip report.
+              (mode === "import" && (picked.length === 0 || skipped.length > 0))
+            }
+          >
+            {busy ? "…" : mode === "clone" ? "Clone" : mode === "import" ? "Import" : "Create"}
           </button>
         </div>
       </div>

@@ -50,10 +50,15 @@ class Projects:
     def project_dir(self, name: str) -> Path:
         """Resolve a project name to a directory under the root, refusing escape.
 
-        The name reaches here from a URL or config, so ``../`` is on the table.
+        The name reaches here from a URL, a form field, or config, so ``../`` is
+        on the table. A project is one directory directly under the root — a
+        separator in the name would create (or address) a nested directory that
+        every listing then misses, so multi-component names are refused outright.
         Resolve, then prove the result is still inside the root — the same guard
         the file endpoints use, kept in one place.
         """
+        if not name or name.startswith(".") or "/" in name or "\\" in name:
+            raise ProjectError(f"invalid project name {name!r}")
         candidate = (self.root / name).resolve()
         if candidate != self.root and self.root not in candidate.parents:
             raise ProjectError(f"invalid project name {name!r}")
@@ -71,6 +76,7 @@ class Projects:
         if dest.exists():
             raise ProjectError(f"project {name!r} already exists at {dest}")
         self._git(self.root, "clone", "--branch", branch, remote, dest.name)
+        self._ensure_identity(dest)
         return dest
 
     def init_local(self, name: str) -> Path:
@@ -85,6 +91,7 @@ class Projects:
             raise ProjectError(f"project {name!r} already exists at {dest}")
         dest.mkdir(parents=True)
         self._git(dest, "init", "-b", "main")
+        self._ensure_identity(dest)
         return dest
 
     # -- sync ----------------------------------------------------------------
@@ -206,6 +213,18 @@ class Projects:
         return {"clean": not files, "files": files}
 
     # -- internals -----------------------------------------------------------
+
+    def _ensure_identity(self, project_dir: Path) -> None:
+        """Give the repo a committer identity if the environment has none.
+
+        ``git commit`` refuses to run without user.name/user.email, and the
+        deploy container has no global git config — so every server-side commit
+        would fail on a clean install. Set a repo-local identity only when
+        nothing resolves; a real configured identity (global or system) wins.
+        """
+        if not self._git_allow_fail(project_dir, "config", "user.email"):
+            self._git(project_dir, "config", "user.email", "blpl@localhost")
+            self._git(project_dir, "config", "user.name", "BLPL")
 
     def _require(self, name: str) -> Path:
         d = self.project_dir(name)
