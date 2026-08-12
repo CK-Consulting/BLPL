@@ -87,6 +87,23 @@ def _build_one(
     raise ValueError(f"unknown LLM provider: {provider!r}")
 
 
+def build_adapter(
+    kind: str,
+    model: str | None = None,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> LLMAdapter:
+    """One adapter for one endpoint, with no fallback behaviour.
+
+    ``get_adapter`` builds a chain that falls through on failure, which is right
+    when the chain means "try these in order". A review panel means "all of
+    these", and each member has to be addressable on its own — a fallback there
+    would silently review the board twice with one model.
+    """
+    return _build_one(kind, model, api_key=api_key, base_url=base_url)
+
+
 def get_adapter(provider: str | None = None, model: str | None = None) -> LLMAdapter:
     """Return an LLMAdapter, honouring a configured fallback chain.
 

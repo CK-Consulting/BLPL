@@ -1276,6 +1276,28 @@ async def run_stage(
     return _start_run(project_id, stage_name, cmd, env)
 
 
+@app.post("/api/projects/{project_id}/review-panel")
+async def run_review_panel(
+    project_id: str, token: str = Depends(require_session)
+) -> StreamingResponse:
+    """Review the board with every endpoint routed to the review_panel task.
+
+    The one place the endpoint chain means "all of these" rather than "these in
+    order": a panel of one is just a review, and the value comes from members
+    with different blind spots disagreeing.
+    """
+    proj = _project_dir(project_id)
+    try:
+        env = _inject_llm_env(dict(os.environ), token, "review_panel")
+    except llm_resolver.NoUsableProvider as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    cmd = [
+        sys.executable, "-m", "blpl.agent.dispatch", "review-panel",
+        "--project-dir", str(proj),
+    ]
+    return _start_run(project_id, "review-panel", cmd, env)
+
+
 # The stages the whole-pipeline runner understands, in order. The CLI `run`
 # command drives 0→8; this is the allowlist the UI's from/to must fall within.
 _PIPELINE_STAGES = [

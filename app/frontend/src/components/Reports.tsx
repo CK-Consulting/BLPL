@@ -32,6 +32,40 @@ type Review = {
   expected?: { rule_id: string; count: number }[];
 };
 
+// The mixture-of-experts panel. `sources` and `agreement` are the whole point:
+// a finding is worth reading differently depending on whether three models saw
+// it or one did, and neither answer means it can be hidden.
+type PanelFinding = {
+  rule_id: string;
+  severity: Sev;
+  summary: string;
+  recommendation?: string;
+  components?: string[];
+  evidence?: string;
+  sources: string[];
+  agreement: string;
+  single_source: boolean;
+  merged_summaries?: string[];
+};
+
+type Panel = {
+  skipped: boolean;
+  reason?: string;
+  generated_at: string;
+  trust_summary?: string;
+  panel: { endpoint: string; model_id: string; findings: number; error: string }[];
+  summary: {
+    panelists: number;
+    answered: number;
+    failed: number;
+    findings: number;
+    agreed: number;
+    single_source: number;
+    errors: number;
+  };
+  findings: PanelFinding[];
+};
+
 type Check = {
   ok: boolean;
   skipped: boolean;
@@ -51,6 +85,7 @@ type Validation = {
 export function Reports({ projectId, reloadToken }: { projectId: string; reloadToken: number }) {
   const [review, setReview] = useState<Review | null | "missing">(null);
   const [validation, setValidation] = useState<Validation | null | "missing">(null);
+  const [panel, setPanel] = useState<Panel | null | "missing">(null);
 
   useEffect(() => {
     const load = <T,>(name: string, set: (v: T | "missing") => void) =>
@@ -61,6 +96,8 @@ export function Reports({ projectId, reloadToken }: { projectId: string; reloadT
     setValidation(null);
     load<Review>("review_report.json", setReview);
     load<Validation>("validation_report.json", setValidation);
+    setPanel(null);
+    load<Panel>("review_panel.json", setPanel);
   }, [projectId, reloadToken]);
 
   return (
@@ -68,6 +105,7 @@ export function Reports({ projectId, reloadToken }: { projectId: string; reloadT
       <FabBanner review={review} />
       <ValidationCard validation={validation} />
       <ReviewSection review={review} />
+      <PanelSection panel={panel} />
     </div>
   );
 }
@@ -198,6 +236,59 @@ function ReviewSection({ review }: { review: Review | null | "missing" }) {
         </section>
       )}
     </>
+  );
+}
+
+function PanelSection({ panel }: { panel: Panel | null | "missing" }) {
+  if (panel === null || panel === "missing") return null;
+  if (panel.skipped)
+    return <div className="muted pad">Review panel skipped: {panel.reason}</div>;
+
+  const s = panel.summary;
+  return (
+    <section className="report-block">
+      <h3>
+        Review panel — {s.findings} finding{s.findings === 1 ? "" : "s"} from {s.answered} of{" "}
+        {s.panelists} reviewers
+      </h3>
+      <div className="panel-members">
+        {panel.panel.map((m) => (
+          <span key={m.model_id} className={`badge ${m.error ? "fail" : "ok"}`} title={m.error}>
+            {m.model_id} · {m.error ? "no answer" : `${m.findings}`}
+          </span>
+        ))}
+      </div>
+      {panel.trust_summary && <p className="muted small">{panel.trust_summary}</p>}
+      <p className="muted small">
+        {s.agreed} corroborated by more than one reviewer, {s.single_source} raised by one. A
+        single-source finding is not a weaker finding — it is usually the one the others missed.
+      </p>
+      <ul className="finding-list">
+        {panel.findings.map((f, i) => (
+          <li key={`${f.rule_id}-${i}`} className={`finding ${f.severity}`}>
+            <div className="row wrap">
+              <span className={`badge ${f.severity === "error" ? "fail" : f.severity === "warning" ? "warn" : ""}`}>
+                {f.severity}
+              </span>
+              <code>{f.rule_id}</code>
+              <span className={`badge ${f.single_source ? "" : "ok"}`} title={f.sources.join(", ")}>
+                {f.agreement}
+              </span>
+              {f.components && f.components.length > 0 && (
+                <span className="muted small mono">{f.components.join(", ")}</span>
+              )}
+            </div>
+            <div>{f.summary}</div>
+            {f.recommendation && <div className="muted small">{f.recommendation}</div>}
+            {f.evidence && <div className="muted small">evidence: {f.evidence}</div>}
+            {f.merged_summaries && f.merged_summaries.length > 0 && (
+              <div className="muted small">also reported as: {f.merged_summaries.join(" / ")}</div>
+            )}
+            <div className="muted small">{f.sources.join(", ")}</div>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

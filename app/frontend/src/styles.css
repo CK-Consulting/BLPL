@@ -296,3 +296,12 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .badge.shared { background: #22262e; color: #9aa4b0; }
 .ports { display: flex; flex-wrap: wrap; gap: .25rem; }
 .ports .port { font-size: 12px; padding: .1rem .4rem; border-radius: 4px; background: #22262e; color: #cfd6e0; }
+
+/* --- review panel --- */
+.panel-members { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .4rem; }
+/* The shared .finding-list lays its rows out horizontally; a panel finding
+   stacks summary, recommendation, evidence and attribution instead. */
+.finding-list li.finding { flex-direction: column; gap: .3rem; }
+.finding-list li.finding.error { border-left: 3px solid #ff8b8b; }
+.finding-list li.finding.warning { border-left: 3px solid #f0c674; }
+.finding-list li.finding.info { border-left: 3px solid #3d6fb4; }

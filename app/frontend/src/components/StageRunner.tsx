@@ -35,7 +35,7 @@ const PIPELINE_STAGES = [
 type Props = { projectId: string; onFinished: (label: string, exitCode: number) => void };
 
 export function StageRunner({ projectId, onFinished }: Props) {
-  const [mode, setMode] = useState<"single" | "pipeline">("single");
+  const [mode, setMode] = useState<"single" | "pipeline" | "panel">("single");
   const [stage, setStage] = useState("doctor");
   const [from, setFrom] = useState("stage0");
   const [to, setTo] = useState("stage8");
@@ -60,11 +60,14 @@ export function StageRunner({ projectId, onFinished }: Props) {
     setExitCode(null);
     setRunning(true);
 
-    const label = mode === "single" ? stage : `${from}→${to}`;
+    const label =
+      mode === "single" ? stage : mode === "panel" ? "review panel" : `${from}→${to}`;
     const url =
       mode === "single"
         ? `/api/projects/${projectId}/stages/${stage}`
-        : `/api/projects/${projectId}/pipeline?from_stage=${from}&to_stage=${to}`;
+        : mode === "panel"
+          ? `/api/projects/${projectId}/review-panel`
+          : `/api/projects/${projectId}/pipeline?from_stage=${from}&to_stage=${to}`;
 
     try {
       await readSSE(url, { method: "POST" }, (event, payload) => {
@@ -100,9 +103,24 @@ export function StageRunner({ projectId, onFinished }: Props) {
         <button className={mode === "pipeline" ? "on" : ""} disabled={running} onClick={() => setMode("pipeline")}>
           Pipeline
         </button>
+        <button className={mode === "panel" ? "on" : ""} disabled={running} onClick={() => setMode("panel")}>
+          Review panel
+        </button>
       </div>
 
-      {mode === "single" ? (
+      {mode === "panel" ? (
+        <div className="panel">
+          <p className="muted small">
+            Every endpoint routed to <code>review_panel</code> reviews the same evidence, and the
+            findings are merged with attribution. Different models notice different things, so a
+            finding only one of them raised is kept and labelled — never dropped.
+          </p>
+          <div className="row">
+            <button onClick={run} disabled={running}>{running ? "Reviewing…" : "Run panel"}</button>
+            {running && <button onClick={stop}>Stop</button>}
+          </div>
+        </div>
+      ) : mode === "single" ? (
         <div className="row">
           <select value={stage} onChange={(e) => setStage(e.target.value)} disabled={running}>
             {STAGES.map((s) => (
