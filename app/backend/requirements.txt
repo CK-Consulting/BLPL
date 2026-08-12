@@ -2,8 +2,16 @@
 # image, which makes builds only half-reproducible.
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-# Multipart parsing for the project-import upload endpoint.
-python-multipart==0.0.20
+# Multipart parsing for the project-import upload endpoint. 0.0.31 is the floor
+# that clears CVE-2026-24486 (arbitrary file write), three separate parser DoS
+# CVEs, and the RFC 2231 / semicolon parameter-smuggling pair. The upload
+# endpoint is the only caller, but it takes a file from the browser, which is
+# exactly the input those advisories are about.
+python-multipart==0.0.31
 # Vault: passphrase KDF and authenticated encryption for the API-key store.
 argon2-cffi==23.1.0
-cryptography==44.0.0
+# 50.0.0 clears the OpenSSL bundled in the wheels (GHSA-537c-gmf6-5ccf) plus a
+# run of X.509 path-building and PKCS#7 issues. The vault touches none of that —
+# it uses AESGCM and InvalidTag only — but the wheel's OpenSSL is ours whether we
+# call into it or not, and the API this code uses is unchanged across the jump.
+cryptography==50.0.0

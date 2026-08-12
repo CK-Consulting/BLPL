@@ -18,7 +18,11 @@ llm-anthropic = ["anthropic>=0.39"]
 llm-openai = ["openai>=1.0"]
 llm-ollama = ["ollama>=0.3"]
 all-llm = ["anthropic>=0.39", "openai>=1.0", "ollama>=0.3"]
-webapp = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "watchfiles>=0.22", "python-multipart>=0.0.18"]
+# python-multipart's floor is a security floor, not a feature one: every release
+# below 0.0.31 carries at least one of the parser CVEs (arbitrary file write,
+# three DoS variants, parameter smuggling). Keep the two in step with
+# app/backend/requirements.txt, which pins the container's exact version.
+webapp = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "watchfiles>=0.22", "python-multipart>=0.0.31"]
 dev = ["pytest>=7.4", "rich>=13.0"]
 
 [project.scripts]
