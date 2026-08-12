@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { del, readSSE } from "../api";
 
 /**
  * Runs pipeline work and streams its log to the screen as it happens — either a
  * single stage, or a contiguous range of stages end-to-end.
  *
- * These are POSTs that stream, so EventSource (GET-only) is out; we read the body
- * and parse SSE frames by hand. Aborting the fetch also kills the server-side
- * subprocess, because the backend tears the child down when the response
- * generator is closed.
+ * Runs are durable server-side: the POST registers a run and the response is
+ * just one reader attached to it. Losing this tab loses nothing — the run keeps
+ * going, keeps recording, and Run history can reattach to it. Stop is therefore
+ * an explicit DELETE on the run, not a dropped connection.
  */
 
 // Single-stage list, ordered as you actually run them. doctor is first because it
@@ -42,7 +43,7 @@ export function StageRunner({ projectId, onFinished }: Props) {
   const [lines, setLines] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
   const [exitCode, setExitCode] = useState<number | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  const runIdRef = useRef<string | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   // Follow the tail of a long pipeline run — but only if you're already near the
@@ -59,9 +60,6 @@ export function StageRunner({ projectId, onFinished }: Props) {
     setExitCode(null);
     setRunning(true);
 
-    const ac = new AbortController();
-    abortRef.current = ac;
-
     const label = mode === "single" ? stage : `${from}→${to}`;
     const url =
       mode === "single"
@@ -69,59 +67,29 @@ export function StageRunner({ projectId, onFinished }: Props) {
         : `/api/projects/${projectId}/pipeline?from_stage=${from}&to_stage=${to}`;
 
     try {
-      const res = await fetch(url, { method: "POST", credentials: "same-origin", signal: ac.signal });
-      if (res.status === 401) {
-        window.location.reload();
-        return;
-      }
-      if (!res.ok || !res.body) {
-        // A 400 here is usually the "no usable LLM provider" guard, whose detail is JSON.
-        let detail = `run failed to start: ${res.status}`;
-        try {
-          detail = (await res.clone().json()).detail ?? detail;
-        } catch {
-          /* not JSON */
+      await readSSE(url, { method: "POST" }, (event, payload) => {
+        if (event === "start") runIdRef.current = payload.run_id ?? null;
+        else if (event === "log") setLines((l) => [...l, payload.line]);
+        else if (event === "done") {
+          setExitCode(payload.exit_code);
+          onFinished(label, payload.exit_code);
         }
-        throw new Error(detail);
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        const frames = buffer.split("\n\n"); // SSE frames are blank-line separated
-        buffer = frames.pop() ?? "";
-
-        for (const frame of frames) {
-          let event = "message";
-          let data = "";
-          for (const ln of frame.split("\n")) {
-            if (ln.startsWith("event:")) event = ln.slice(6).trim();
-            else if (ln.startsWith("data:")) data += ln.slice(5).trim();
-          }
-          if (!data) continue;
-          const payload = JSON.parse(data);
-          if (event === "log") setLines((l) => [...l, payload.line]);
-          else if (event === "done") {
-            setExitCode(payload.exit_code);
-            onFinished(label, payload.exit_code);
-          }
-        }
-      }
+      });
     } catch (e) {
-      if ((e as Error).name !== "AbortError") {
-        setLines((l) => [...l, `error: ${(e as Error).message}`]);
-      }
+      // A 400 is usually the "no usable LLM provider" guard; a 409 means the
+      // project already has a run in flight (see Run history to reattach).
+      setLines((l) => [...l, `error: ${(e as Error).message}`]);
     } finally {
       setRunning(false);
-      abortRef.current = null;
+      runIdRef.current = null;
     }
   }, [projectId, mode, stage, from, to, onFinished]);
+
+  // Stop the RUN, not the stream: the server kills the subprocess and the done
+  // event arrives on this same reader with the kill's exit code.
+  const stop = () => {
+    if (runIdRef.current) del(`/api/runs/${runIdRef.current}`).catch(() => {});
+  };
 
   return (
     <div className="panel">
@@ -142,7 +110,7 @@ export function StageRunner({ projectId, onFinished }: Props) {
             ))}
           </select>
           <button onClick={run} disabled={running}>{running ? "Running…" : "Run"}</button>
-          {running && <button onClick={() => abortRef.current?.abort()}>Stop</button>}
+          {running && <button onClick={stop}>Stop</button>}
         </div>
       ) : (
         <div className="row wrap">
@@ -159,7 +127,7 @@ export function StageRunner({ projectId, onFinished }: Props) {
             ))}
           </select>
           <button onClick={run} disabled={running}>{running ? "Running…" : "Run pipeline"}</button>
-          {running && <button onClick={() => abortRef.current?.abort()}>Stop</button>}
+          {running && <button onClick={stop}>Stop</button>}
         </div>
       )}
 

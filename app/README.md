@@ -41,6 +41,12 @@ Everything stateful is on one named volume, `blpl-data`:
 | `/app/data/vault.db`     | Encrypted API keys + vault material (SQLite)     |
 | `/app/data/blpl.toml`    | Declarative config: LLM priority, model, projects|
 | `/app/data/projects/`    | Git-backed project working copies                |
+| `/app/data/runs.db`      | Run history: what ran, when, exit codes (SQLite) |
+| `/app/data/runs/`        | Full log per run, kept after the run ends        |
+
+Runs are durable: a stage keeps running and recording if the browser goes away,
+and the Run history panel can reattach to it (or replay it later) from any
+workstation. Stopping a run is an explicit act in the UI, not a closed tab.
 
 Back up the volume and you have backed up the whole app. `blpl.toml` is
 plaintext and safe to read/commit; `vault.db` holds only ciphertext.

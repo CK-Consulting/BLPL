@@ -60,6 +60,41 @@ export async function del(path: string): Promise<void> {
   if (!res.ok) throw new Error((await errorDetail(res)) || res.statusText);
 }
 
+// Read an SSE body and dispatch each frame. Used for run streams, which are
+// POST/GET fetches (EventSource is GET-only and can't carry our session
+// semantics through the Vite proxy identically). Resolves when the stream
+// ends; aborting the signal just stops reading — since runs became durable,
+// disconnecting a reader no longer stops anything server-side.
+export async function readSSE(
+  url: string,
+  init: RequestInit,
+  onEvent: (event: string, payload: any) => void,
+): Promise<void> {
+  const res = await request(url, init);
+  if (!res.ok || !res.body) {
+    throw new Error((await errorDetail(res)) || `stream failed to start: ${res.status}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n"); // SSE frames are blank-line separated
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      let event = "message";
+      let data = "";
+      for (const ln of frame.split("\n")) {
+        if (ln.startsWith("event:")) event = ln.slice(6).trim();
+        else if (ln.startsWith("data:")) data += ln.slice(5).trim();
+      }
+      if (data) onEvent(event, JSON.parse(data));
+    }
+  }
+}
+
 async function errorDetail(res: Response): Promise<string> {
   try {
     const body = await res.clone().json();
@@ -111,4 +146,14 @@ export type GitStatus = {
   behind: number;
   dirty: boolean;
   has_remote: boolean;
+};
+
+export type Run = {
+  id: string;
+  project: string;
+  kind: string;
+  started_at: string; // UTC "YYYY-MM-DD HH:MM:SS" from SQLite
+  ended_at: string | null;
+  exit_code: number | null;
+  running: boolean;
 };

@@ -34,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import appconfig, importer, llm_resolver, vault
+from . import appconfig, importer, llm_resolver, runs, vault
 from .appconfig import AppConfig, ProjectEntry
 from .conversations import Conversation, list_conversations
 from .identity import Identity, Locked
@@ -83,6 +83,9 @@ def _env_flag(name: str) -> bool:
 
 identity = Identity(store=Store(VAULT_DB))
 projects = Projects(PROJECTS_ROOT)
+# Run history is plaintext facts-about-what-happened, deliberately NOT in
+# vault.db — that file's contract is "a dump of it is a dump of ciphertext".
+run_manager = runs.RunManager(_DATA / "runs.db", _DATA / "runs")
 
 # Environment variable each provider's SDK reads its key from. ollama is keyless.
 _PROVIDER_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
@@ -858,33 +861,29 @@ def _inject_llm_env(env: dict[str, str], token: str) -> dict[str, str]:
     return env
 
 
-def _stream_subprocess(cmd: list[str], env: dict[str, str]) -> StreamingResponse:
-    """Run a command and stream its combined output to the browser as SSE.
+def _run_stream_response(run_id: str) -> StreamingResponse:
+    """SSE over a run's event stream: full replay from the top, then live tail.
 
-    Shared by single-stage and whole-pipeline runs. The argv is echoed in the
-    start event — safe, because keys ride in the environment, never on the
-    command line. If the client disconnects, the generator is closed and the
-    child is killed rather than left orphaned.
+    The argv echoed in the start event is safe — keys ride in the environment,
+    never on the command line. A client disconnect closes only this reader; the
+    run itself keeps going and keeps recording (see app/runs.py). Stopping a
+    run is an explicit DELETE /api/runs/{id}, not a dropped connection.
     """
 
     async def events():
-        yield f"event: start\ndata: {json.dumps({'cmd': cmd})}\n\n"
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
-        )
-        try:
-            assert proc.stdout is not None
-            async for raw in proc.stdout:
-                line = raw.decode("utf-8", errors="replace").rstrip("\n")
-                yield f"event: log\ndata: {json.dumps({'line': line})}\n\n"
-            code = await proc.wait()
-            yield f"event: done\ndata: {json.dumps({'exit_code': code})}\n\n"
-        finally:
-            if proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+        async for ev, payload in run_manager.stream(run_id):
+            yield f"event: {ev}\ndata: {json.dumps(payload)}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+def _start_run(project_id: str, kind: str, cmd: list[str], env: dict[str, str]) -> StreamingResponse:
+    """Register + launch a run, then attach the caller to its stream."""
+    try:
+        rec = run_manager.start(project_id, kind, cmd, env)
+    except runs.RunActive as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _run_stream_response(rec.id)
 
 
 @app.post("/api/projects/{project_id}/stages/{stage_name}")
@@ -900,7 +899,7 @@ async def run_stage(
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
-    return _stream_subprocess(cmd, env)
+    return _start_run(project_id, stage_name, cmd, env)
 
 
 # The stages the whole-pipeline runner understands, in order. The CLI `run`
@@ -946,7 +945,49 @@ async def run_pipeline(
         "--from", from_stage, "--to", to_stage,
         "--continue-on-error",
     ]
-    return _stream_subprocess(cmd, env)
+    return _start_run(project_id, f"pipeline {from_stage}→{to_stage}", cmd, env)
+
+
+# --------------------------------------------------------------------------
+# Run history — the durable record behind the streams above
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/projects/{project_id}/runs")
+def list_runs(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+    """Past and live runs for a project, newest first."""
+    _project_dir(project_id)
+    return [r.to_dict() for r in run_manager.list_for_project(project_id)]
+
+
+@app.get("/api/runs/{run_id}/stream")
+def stream_run(run_id: str, _: str = Depends(require_session)) -> StreamingResponse:
+    """Attach to a run: full log replay, then the live tail if it's still going.
+
+    This is what makes a mid-run browser refresh a non-event — reattach here
+    and catch up. On a finished run it replays and ends.
+    """
+    if run_manager.get(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+    return _run_stream_response(run_id)
+
+
+@app.get("/api/runs/{run_id}/log")
+def run_log(run_id: str, _: str = Depends(require_session)) -> PlainTextResponse:
+    if run_manager.get(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+    path = run_manager.log_path(run_id)
+    text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    return PlainTextResponse(text)
+
+
+@app.delete("/api/runs/{run_id}")
+def stop_run(run_id: str, _: str = Depends(require_session)) -> dict:
+    """Stop a live run. Stopping is an explicit, recorded act now — closing the
+    browser no longer kills anything."""
+    if run_manager.get(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+    return {"ok": True, "stopped": run_manager.stop(run_id)}
 
 
 # --------------------------------------------------------------------------

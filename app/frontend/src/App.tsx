@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { AuthGate } from "./components/AuthGate";
 import { DesignView } from "./components/Visualizer";
 import { StageRunner } from "./components/StageRunner";
+import { RunHistory } from "./components/RunHistory";
 import { SettingsPanel } from "./components/Settings";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
 import { Editor } from "./components/Editor";
@@ -100,6 +101,7 @@ function Workspace() {
           <main>
             <aside style={{ width: sidebar.width }}>
               <StageRunner projectId={selected} onFinished={() => { bump(); refresh(); }} />
+              <RunHistory projectId={selected} reloadToken={reloadToken} />
             </aside>
             <div
               className="resizer"
