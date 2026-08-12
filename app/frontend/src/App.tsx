@@ -9,6 +9,7 @@ import { Editor } from "./components/Editor";
 import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
 import { DiffView } from "./components/DiffView";
+import { Artifacts } from "./components/Artifacts";
 import { useResizable } from "./useResizable";
 import { Project, getJSON, postJSON } from "./api";
 
@@ -25,7 +26,7 @@ function Workspace() {
   const [selected, setSelected] = useState<string | null>(null);
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [tab, setTab] = useState<"board" | "edit" | "bom" | "reports" | "changes">("board");
+  const [tab, setTab] = useState<"board" | "edit" | "bom" | "reports" | "artifacts" | "changes">("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
 
   // Bumped whenever a stage finishes or a git sync lands, so the viewer
@@ -123,6 +124,9 @@ function Workspace() {
                 <button className={tab === "reports" ? "on" : ""} onClick={() => setTab("reports")}>
                   Reports
                 </button>
+                <button className={tab === "artifacts" ? "on" : ""} onClick={() => setTab("artifacts")}>
+                  Artifacts
+                </button>
                 <button className={tab === "changes" ? "on" : ""} onClick={() => setTab("changes")}>
                   Changes
                 </button>
@@ -131,6 +135,7 @@ function Workspace() {
               {tab === "edit" && <Editor projectId={selected} onSaved={refresh} />}
               {tab === "bom" && <BomTable projectId={selected} reloadToken={reloadToken} />}
               {tab === "reports" && <Reports projectId={selected} reloadToken={reloadToken} />}
+              {tab === "artifacts" && <Artifacts projectId={selected} reloadToken={reloadToken} />}
               {tab === "changes" && <DiffView projectId={selected} reloadToken={reloadToken} />}
             </section>
           </main>

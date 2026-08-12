@@ -205,3 +205,16 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .runrow.on { border-color: #34507f; }
 .run-kind { font-family: ui-monospace, monospace; font-size: 12px; }
 .runrow .badge { margin-left: auto; }
+
+/* Artifacts tab — list + typed viewer. */
+.artifacts { display: flex; gap: .8rem; height: 100%; min-height: 0; }
+.artifact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .3rem; width: 300px; flex: none; overflow-y: auto; }
+.artifact-row { display: flex; flex-direction: column; align-items: flex-start; gap: .1rem; width: 100%; text-align: left; background: #15181d; border: 1px solid #2a2e36; border-radius: 6px; color: #e6e6e6; padding: .4rem .6rem; font: inherit; font-size: 12px; cursor: pointer; }
+.artifact-row:hover { background: #1c2027; }
+.artifact-row.on { border-color: #34507f; }
+.artifact-row .mono { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
+.artifact-view { flex: 1; min-width: 0; overflow-y: auto; }
+.chip-row { display: flex; flex-wrap: wrap; gap: .4rem; }
+.chip { background: #191c22; border: 1px solid #2a2e36; border-radius: 999px; padding: .15rem .6rem; font-size: 12px; color: #c2c8d0; }
+.chip .mono { font-family: ui-monospace, monospace; color: #8ab4f8; }
+.small { font-size: 12px; }
