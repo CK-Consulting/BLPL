@@ -18,13 +18,18 @@ Hardware projects usually live in two disconnected worlds: narrative design docs
 
 | Area | State |
 |---|---|
-| Stages 0–7 (Markdown → KiCad) | Working. 116 tests passing. |
+| Stages 0–8 (Markdown → KiCad → review) | Working. 500 tests passing. |
 | Emitter (direct S-expression) | Working. Runs without KiCad installed. |
 | KiCad plugin (pcbnew Python API) | Working. Requires KiCad 10.x. |
 | Classifier (passives, generic connectors, 3-pin semis) | Working. Auto-resolves most of dev.03. |
 | Connector synthesis (pinout-only → BOM) | Working. |
-| Web UI | Planned — see `docs/roadmap.md`. |
-| Virtual-filesystem references | Planned — see `docs/references.md`. |
+| Web UI | Working. Vault-gated, git-backed projects, board viewer, durable runs. |
+| Design chat + agent tools | Working. Proposal-based edits, parts lookup, datasheet extraction. |
+| Module extraction / remix | Working — see `docs/workbench.md`. |
+| Mixture-of-experts review panel | Working — every routed endpoint reviews, findings merged with attribution. |
+| Release package for a contract fab | Working. Gated; gerbers, drill, placement, BOM, native project. |
+| KiCad editing over MCP (kcaa) | Working when a server is configured. |
+| Virtual-filesystem references | Working — see `docs/references.md`. |
 
 ## Quick start
 
@@ -67,8 +72,10 @@ blpl-repo-root/
         classifier/     # component + connector inference
         plugin_kicad/   # pcbnew ActionPlugin + standalone build_pcb CLI
         skills/         # Claude Code skill shipped with the package
+        agent/          # agent tools: parts, datasheets, review panel, batch dispatch
+        importer_kicad/ # reading existing boards; function-set module extraction
     app/
-        backend/        # FastAPI backend — auth/vault, git, stages, artifacts
+        backend/        # FastAPI backend — auth/vault, git, stages, artifacts, chat, agents
         frontend/       # React UI (ecad-viewer for in-browser board rendering)
         docker-compose.yml   # the hosted deploy; KiCad lives in the image
     docs/               # user-facing documentation (you're here)
@@ -86,6 +93,7 @@ blpl-repo-root/
 - [CLI reference](docs/cli.md) — every subcommand with flags and examples
 - [Architecture](docs/architecture.md) — component relationships and data flow
 - [Hardware-design skill](docs/skills.md) — how the Claude Code skill under `.claude/skills/hardware-design/` activates and what it promises
+- [Workbench](docs/workbench.md) — chat, endpoints, modules, the review panel, and the release package
 - [Roadmap](docs/roadmap.md) — what's planned for Web UI and VFS references
 
 ## License
