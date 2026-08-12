@@ -60,8 +60,12 @@ SIMULATORS = ("auto", "ngspice", "ltspice", "xyce")
 # that `echo` results to a text file, and its result parser reads only that file.
 # LTspice puts `.meas` output in a log of its own, which the backend then
 # overwrites with its captured stdout — so LTspice runs the sweep, writes a
-# perfectly good .raw, and every result still comes back "skip". Verified on
-# LTspice 24 / macOS with an RC low-pass whose answer is analytically known.
+# perfectly good .raw, and every result still comes back "skip".
+#
+# Both halves are measured, not assumed, against the same 1k/159nF low-pass
+# whose cutoff is analytically 1000.97 Hz: LTspice 24 on macOS skips it, and
+# ngspice 47 measures 998.6 Hz (0.14% off) and passes it. `tests/test_spice.py`
+# pins the ngspice half whenever the binary is present.
 LTSPICE_MEASUREMENT_NOTE = (
     "LTspice runs the sweep but kicad-happy can only read ngspice-style "
     "measurements, so every result is skipped — install ngspice "

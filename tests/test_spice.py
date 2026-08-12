@@ -1,9 +1,16 @@
 """Unit tests for blpl.agent.tools.spice and its Stage 8 integration.
 
-No simulator is assumed to exist — ngspice is a third-party install and CI has
-none — so every test either stubs the probe or asserts on the skip path. That
-constraint is the point rather than a limitation: the skip path is what most
-users will actually hit, and it is the one that must never be silent.
+No simulator is *assumed* to exist — ngspice is a third-party install — so the
+bulk of these stub the probe or assert on the skip path. That is not a
+concession: the skip path is what most users hit, and it is the one that must
+never be silent.
+
+The end of the file adds the other half. When ngspice really is installed, a
+handful of tests drive the whole chain — detect, generate a testbench, run the
+simulator, parse, evaluate — against an RC low-pass whose cutoff is known
+analytically. Stubs can only prove the code agrees with itself; these prove the
+numbers are right, and that a wrong filter is actually *caught* rather than
+merely reported on.
 """
 
 from __future__ import annotations
@@ -376,3 +383,113 @@ def test_agent_tool_points_at_stage8_when_there_is_nothing_to_simulate(tmp_path)
     )
     with pytest.raises(FileNotFoundError, match="stage8"):
         asyncio.run(spec.handler(ctx, {}))
+
+
+# ---------------------------------------------------------------------------
+# End-to-end, when a simulator is actually installed
+# ---------------------------------------------------------------------------
+
+needs_ngspice = pytest.mark.skipif(
+    not spice.find_simulator("ngspice").available,
+    reason="ngspice not installed — the measurement path cannot be exercised",
+)
+
+
+def _rc_schematic(path: Path, *, farads: float, declared_hz: float = 1000.0) -> Path:
+    """A single RC low-pass, in the shape analyze_schematic.py emits.
+
+    1k with 159nF is 1/(2*pi*R*C) = 1000.97 Hz, so a declared 1 kHz is honest and
+    the simulator has a right answer to find.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "analyzer_type": "schematic",
+                "findings": [
+                    {
+                        "detector": "detect_rc_filters",
+                        "rule_id": "RC-DET",
+                        "severity": "info",
+                        "summary": "RC low-pass R5/C3",
+                        "components": ["R5", "C3"],
+                        "resistor": {"ref": "R5", "ohms": 1000.0},
+                        "capacitor": {"ref": "C3", "farads": farads},
+                        "type": "low-pass",
+                        "cutoff_hz": declared_hz,
+                        "input_net": "AIN_RAW",
+                        "output_net": "AIN_FILT",
+                        "ground_net": "GND",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@needs_ngspice
+def test_a_correct_filter_measures_its_analytic_cutoff(tmp_path: Path) -> None:
+    sch = _rc_schematic(tmp_path / "schematic.json", farads=1.59e-7)
+    run = spice.simulate(sch, tmp_path / "spice.json", simulator="ngspice")
+
+    assert run.ok is True and run.skipped is False
+    assert run.simulator == "ngspice"
+    assert run.counts["pass"] == 1
+    assert run.nothing_measured is False
+    # The measured cutoff has to be the real one, not merely present: 1k/159nF
+    # is 1000.97 Hz analytically, and anything outside a percent means the
+    # testbench is measuring something other than what we think it is.
+    measured = run.results[0].simulated["cutoff_hz"]
+    assert abs(measured - 1000.97) / 1000.97 < 0.01, measured
+
+
+@needs_ngspice
+def test_a_wrong_filter_is_caught(tmp_path: Path) -> None:
+    """The test that matters. A checker that only ever agrees is indistinguishable
+    from one that is not running — so give it a cap 10x too large for its stated
+    cutoff and require it to say so."""
+    sch = _rc_schematic(tmp_path / "schematic.json", farads=1.59e-6)
+    run = spice.simulate(sch, tmp_path / "spice.json", simulator="ngspice")
+
+    assert run.counts["fail"] == 1
+    assert run.results[0].status == "fail"
+    # A decade of capacitance is a decade of cutoff: ~100 Hz against a declared
+    # 1 kHz. kicad-happy reports fc_error_pct as magnitude-off rather than
+    # signed direction, so assert on size — ~90%.
+    assert abs(run.results[0].delta["fc_error_pct"]) > 80
+    assert run.results[0].simulated["cutoff_hz"] < 200
+
+
+@needs_ngspice
+def test_a_failing_simulation_becomes_a_design_issue(tmp_path: Path) -> None:
+    """End of the chain: the finding has to survive into Stage 8 on the *design*
+    side. The component values came from the user's markdown, so a filter that
+    misses its cutoff is never an emitter defect."""
+    review = tmp_path / "review"
+    _rc_schematic(review / "schematic.json", farads=1.59e-6)
+    result = s8._run_spice(review / "schematic.json", review, pcb_json=None)
+
+    assert result["ok"] is True and result["skipped"] is False
+    assert result["counts"]["fail"] == 1
+    report = json.loads((review / "spice.json").read_text(encoding="utf-8"))
+    finding = report["findings"][0]
+    assert finding["rule_id"] == "SP-FAIL"
+    assert s8._classify(finding, {}) == ("design", None)
+
+
+@needs_ngspice
+def test_an_unroutable_board_still_simulates_on_ideal_nets(tmp_path: Path) -> None:
+    """A PCB with no traces yields no parasitics, and that has to be a stated
+    basis for the result rather than a silent one."""
+    review = tmp_path / "review"
+    sch = _rc_schematic(review / "schematic.json", farads=1.59e-7)
+    pcb = review / "pcb.json"
+    pcb.write_text(json.dumps({"net_lengths": [{"net": "AIN_FILT"}]}), encoding="utf-8")
+
+    run = spice.simulate(sch, review / "spice.json", pcb_json=pcb, simulator="ngspice")
+    assert run.counts["pass"] == 1
+    assert run.parasitics is False
+    assert "no routed traces" in run.parasitics_note
+    assert "ideal nets" in run.headline()

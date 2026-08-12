@@ -136,11 +136,13 @@ blpl spice --project-dir <proj>
     [--monte-carlo N]                       # tolerance samples, to test real parts
     [--simulator auto|ngspice|ltspice|xyce]
 ```
-Needs a simulator installed. A missing one is a **skip with a reason**, not a
-failure — but note that only ngspice returns usable measurements today:
-kicad-happy's testbenches carry their `.meas` in ngspice `.control` blocks, so
-LTspice runs the sweep and reports every result as skipped. `blpl spice` says so
-rather than letting "0 fail" read as a pass.
+Needs a simulator installed (`brew install ngspice`). A missing one is a **skip
+with a reason**, not a failure — but note that only ngspice returns usable
+measurements: kicad-happy's testbenches carry their `.meas` in ngspice
+`.control` blocks, so LTspice runs the sweep correctly and still reports every
+result as skipped. `blpl spice` says so rather than letting "0 fail" read as a
+pass. Measured on a 1k/159nF low-pass (analytically 1000.97 Hz): ngspice 47
+returns 998.6 Hz and passes it; LTspice 24 skips it.
 
 ### `bom-check`
 Sourcing readiness of the **emitted** schematic — which parts still have no
