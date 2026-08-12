@@ -24,6 +24,10 @@ type Props = {
 
 type LiveTool = { id: string; name: string; input: Record<string, unknown>; done?: boolean; error?: boolean };
 
+/** A tool call parked waiting for a human. The turn is idle, not stuck — it
+ *  resumes the moment this is answered, and expires as a denial. */
+type Approval = { call_id: string; tool: string; kind: string; summary: string };
+
 export function ChatPanel({ projectId, onApplied }: Props) {
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [filename, setFilename] = useState<string | null>(null);
@@ -39,6 +43,9 @@ export function ChatPanel({ projectId, onApplied }: Props) {
   // run-on paragraph until the persisted version reloads.
   const [liveSegments, setLiveSegments] = useState<string[]>([]);
   const [liveTools, setLiveTools] = useState<LiveTool[]>([]);
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [turnId, setTurnId] = useState<string | null>(null);
+  const [progress, setProgress] = useState<string | null>(null);
   const [model, setModel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -51,7 +58,7 @@ export function ChatPanel({ projectId, onApplied }: Props) {
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
     if (nearBottom) el.scrollTop = el.scrollHeight;
-  }, [messages, liveText, liveSegments, liveTools, proposals]);
+  }, [messages, liveText, liveSegments, liveTools, proposals, approvals]);
 
   const loadConversation = useCallback(
     async (name: string) => {
@@ -127,6 +134,7 @@ export function ChatPanel({ projectId, onApplied }: Props) {
         { content: text },
       );
       setModel(started.model);
+      setTurnId(started.turn_id);
       await readSSE(
         `/api/projects/${projectId}/chat/${started.turn_id}/events`,
         { method: "GET" },
@@ -144,6 +152,11 @@ export function ChatPanel({ projectId, onApplied }: Props) {
               t.map((x) => (x.id === payload.id ? { ...x, done: true, error: payload.is_error } : x)),
             );
           else if (event === "proposal") setProposals((p) => [...p, payload.proposal]);
+          else if (event === "progress") setProgress(payload.message);
+          else if (event === "approval_required")
+            setApprovals((a) => [...a, payload as Approval]);
+          else if (event === "approval_resolved")
+            setApprovals((a) => a.filter((x) => x.call_id !== payload.call_id));
           else if (event === "error") setError(payload.detail);
         },
       );
@@ -154,6 +167,9 @@ export function ChatPanel({ projectId, onApplied }: Props) {
       setLiveText("");
       setLiveSegments([]);
       setLiveTools([]);
+      setApprovals([]);
+      setProgress(null);
+      setTurnId(null);
       // The persisted turn is authoritative — reload rather than trusting the
       // deltas we happened to see.
       if (filename) await loadConversation(filename).catch(() => {});
@@ -201,6 +217,21 @@ export function ChatPanel({ projectId, onApplied }: Props) {
         {liveTools.map((t) => (
           <ToolLine key={t.id} tool={t} />
         ))}
+        {approvals.map((a) => (
+          <ApprovalCard
+            key={a.call_id}
+            approval={a}
+            onDecide={async (approved) => {
+              if (!turnId) return;
+              await postJSON(
+                `/api/projects/${projectId}/chat/${turnId}/approvals/${a.call_id}`,
+                { approved },
+              ).catch((e) => setError((e as Error).message));
+              setApprovals((list) => list.filter((x) => x.call_id !== a.call_id));
+            }}
+          />
+        ))}
+        {progress && streaming && <div className="muted small pad">{progress}</div>}
         {liveText && (
           <div className="msg assistant">
             <Markdown text={liveText} />
@@ -264,6 +295,36 @@ function Message({ message }: { message: ChatMessage }) {
         </div>
       )}
     </>
+  );
+}
+
+function ApprovalCard({
+  approval,
+  onDecide,
+}: {
+  approval: Approval;
+  onDecide: (approved: boolean) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const decide = (ok: boolean) => {
+    setBusy(true);
+    onDecide(ok);
+  };
+  return (
+    <div className="approval">
+      <div className="approval-head">
+        <span className="status-tag renamed">{approval.kind}</span>
+        <span className="mono">{approval.tool}</span>
+        <span className="spacer" />
+        <button className="link" disabled={busy} onClick={() => decide(true)}>
+          Allow
+        </button>
+        <button className="link" disabled={busy} onClick={() => decide(false)}>
+          Deny
+        </button>
+      </div>
+      <div className="muted small mono">{approval.summary}</div>
+    </div>
   );
 }
 

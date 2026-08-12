@@ -911,6 +911,50 @@ def _chat_endpoint(token: str) -> chat_mod.Endpoint:
     )
 
 
+def _cred_resolver(token: str):
+    """Distributor credentials for this request.
+
+    Vault first, process environment second. Keys the operator stored in the app
+    beat whatever the container happens to have, and neither is written back to
+    ``os.environ`` where an unrelated subprocess could pick it up.
+    """
+    from blpl.agent.kicad_happy import CredResolver
+
+    extra: dict[str, str] = {}
+    for name in ("digikey_client_id", "digikey_client_secret", "mouser_search_api_key",
+                 "element14_api_key"):
+        try:
+            value = identity.get_secret(token, name)
+        except Exception:  # noqa: BLE001 — a locked or absent secret is simply absent
+            value = None
+        if value:
+            extra[name.upper()] = value
+    return CredResolver(extra=extra)
+
+
+def _task_endpoint(token: str, task: str):
+    """The endpoint routed to a task, or None if nothing usable is routed there.
+
+    None rather than a fallback: a tool that needs vision must not quietly run
+    on a model that cannot see.
+    """
+    cfg = _load_config()
+    try:
+        rp = llm_resolver.resolve_primary(cfg, identity.providers_with_keys(), task)
+    except llm_resolver.NoUsableProvider:
+        return None
+    ep = cfg.endpoint(rp.name)
+    if task in appconfig.VISION_TASKS and ep is not None and not ep.can_see:
+        return None
+    return chat_mod.Endpoint(
+        name=rp.name or rp.provider,
+        kind=rp.provider,  # type: ignore[arg-type]
+        model=rp.model,
+        api_key=identity.get_secret(token, rp.name or rp.provider) if rp.needs_key else None,
+        base_url=rp.base_url or None,
+    )
+
+
 class ChatInput(BaseModel):
     content: str
 
@@ -943,6 +987,11 @@ async def start_chat_turn(
                 endpoint=endpoint,
                 sandbox=_sandbox_for(project_id),
                 usage_ledger=_blpl_dir(project_id) / "llm_usage.jsonl",
+                creds=_cred_resolver(token),
+                endpoint_for=lambda task: _task_endpoint(token, task),
+                record_tool_call=lambda rec: run_manager.record_tool_call(
+                    project_id, rec, conversation=conv.path.name
+                ),
             )
         )
     except chat_mod.ProposalError as exc:
@@ -966,6 +1015,36 @@ def stream_chat_turn(
             yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+class ApprovalDecision(BaseModel):
+    approved: bool
+
+
+@app.post("/api/projects/{project_id}/chat/{turn_id}/approvals/{call_id}")
+def resolve_approval(
+    project_id: str, turn_id: str, call_id: str, body: ApprovalDecision,
+    _: str = Depends(require_session),
+) -> dict:
+    """Answer a tool call that is waiting on a human.
+
+    The turn is parked on this, not spinning: it resumes the moment this lands.
+    A 404 means the question already expired or was answered — which is
+    information, not an error to swallow.
+    """
+    _project_dir(project_id)
+    if not chat_sessions.resolve_approval(turn_id, call_id, body.approved):
+        raise HTTPException(
+            status_code=404, detail="no pending approval with that id — it may have timed out"
+        )
+    return {"ok": True, "approved": body.approved}
+
+
+@app.get("/api/projects/{project_id}/tool-calls")
+def list_tool_calls(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+    """What the agents have actually done in this project, newest first."""
+    _project_dir(project_id)
+    return run_manager.tool_calls_for_project(project_id)
 
 
 @app.get("/api/projects/{project_id}/proposals")

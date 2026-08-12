@@ -42,6 +42,24 @@ CREATE TABLE IF NOT EXISTS run (
     exit_code   INTEGER
 );
 CREATE INDEX IF NOT EXISTS run_project ON run(project, started_at DESC);
+
+-- Every tool call an agent made, from either lane: the interactive chat loop
+-- and the batch dispatcher both write here. This is the audit trail for "what
+-- did the agent actually do", which matters more the moment tools stop being
+-- read-only.
+CREATE TABLE IF NOT EXISTS tool_call (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project       TEXT NOT NULL,
+    run_id        TEXT,                        -- batch lane; null for chat
+    conversation  TEXT,                        -- chat lane; null for batch
+    seq           INTEGER NOT NULL,
+    tool          TEXT NOT NULL,
+    args_json     TEXT NOT NULL,
+    status        TEXT NOT NULL,               -- ok | denied_* | error | ...
+    result_digest TEXT,
+    at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS tool_call_project ON tool_call(project, at DESC);
 """
 
 # The exit code recorded when a run's real exit was never observed: a row left
@@ -192,6 +210,52 @@ class RunManager:
             return False
         live.proc.kill()
         return True
+
+    # -- tool-call audit -----------------------------------------------------
+
+    def record_tool_call(
+        self, project: str, record: dict, *, run_id: str | None = None, conversation: str | None = None
+    ) -> None:
+        """Append one tool call. Never raises: losing an audit row must not take
+        down the turn that produced it, and a dropped row is visible as a gap in
+        the sequence numbers."""
+        try:
+            self._conn.execute(
+                "INSERT INTO tool_call (project, run_id, conversation, seq, tool, args_json,"
+                " status, result_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    project,
+                    run_id,
+                    conversation,
+                    int(record.get("seq", 0)),
+                    str(record.get("tool", "")),
+                    json.dumps(record.get("args", {}))[:4000],
+                    str(record.get("status", "")),
+                    str(record.get("result_digest", ""))[:400],
+                ),
+            )
+            self._conn.commit()
+        except sqlite3.Error:
+            pass
+
+    def tool_calls_for_project(self, project: str, limit: int = 100) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT tool, args_json, status, result_digest, at, conversation, run_id"
+            " FROM tool_call WHERE project = ? ORDER BY id DESC LIMIT ?",
+            (project, limit),
+        ).fetchall()
+        return [
+            {
+                "tool": r["tool"],
+                "args": json.loads(r["args_json"] or "{}"),
+                "status": r["status"],
+                "result_digest": r["result_digest"],
+                "at": r["at"],
+                "conversation": r["conversation"],
+                "run_id": r["run_id"],
+            }
+            for r in rows
+        ]
 
     # -- inspection ----------------------------------------------------------
 

@@ -14,12 +14,11 @@ from pathlib import Path
 import pytest
 
 from app import chat as chat_mod
+from app.agent import ToolContext, ToolExecutor, default_tools
 from app.chat import (
     ProposalStore,
-    ToolContext,
     apply_proposal,
     history_to_messages,
-    make_executor,
     persist_messages,
 )
 from app.conversations import Conversation
@@ -54,14 +53,21 @@ def _ctx(project: Path) -> ToolContext:
         sandbox=FilesystemSandbox(
             manifest=ReferenceManifest.empty(project_id="dev04", workspace_root=project)
         ),
-        proposals=ProposalStore(project),
     )
 
 
 def _call(ctx: ToolContext, _tool: str, **args) -> ToolResultBlock:
-    """Run one tool. The tool name is positional-only so it cannot collide with
-    an argument the tool itself takes (``name``, ``path``, …)."""
-    return asyncio.run(make_executor(ctx)(ToolUseBlock(id="t1", name=_tool, input=args)))
+    """Run one tool through the real executor — policy, sandbox and all.
+
+    The tool name is positional-only so it cannot collide with an argument the
+    tool itself takes (``name``, ``path``, …). Approval is auto-granted here;
+    the approval path has its own tests.
+    """
+    async def approve(_request):
+        return True
+
+    executor = ToolExecutor(default_tools(), ctx, approve=approve)
+    return asyncio.run(executor(ToolUseBlock(id="t1", name=_tool, input=args)))
 
 
 # -- tools --------------------------------------------------------------------
@@ -122,12 +128,7 @@ def test_unknown_tool_names_are_reported(project) -> None:
 
 def test_malformed_arguments_are_rejected_not_run_as_empty(project) -> None:
     """A turn cut off mid-JSON must not become a call with no arguments."""
-    ctx = _ctx(project)
-    res = asyncio.run(
-        make_executor(ctx)(
-            ToolUseBlock(id="t", name="read_project_file", input={"__malformed_arguments__": '{"pa'})
-        )
-    )
+    res = _call(_ctx(project), "read_project_file", __malformed_arguments__='{"pa')
     assert res.is_error and "not valid JSON" in res.content
 
 
