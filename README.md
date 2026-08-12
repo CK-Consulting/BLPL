@@ -27,6 +27,7 @@ Hardware projects usually live in two disconnected worlds: narrative design docs
 | Design chat + agent tools | Working. Proposal-based edits, parts lookup, datasheet extraction. |
 | Module extraction / remix | Working — see `docs/workbench.md`. |
 | Mixture-of-experts review panel | Working — every routed endpoint reviews, findings merged with attribution. |
+| SPICE simulation of detected subcircuits | Working with ngspice. LTspice/Xyce detected but return no measurements. |
 | Release package for a contract fab | Working. Gated; gerbers, drill, placement, BOM, native project. |
 | KiCad editing over MCP (kcaa) | Working when a server is configured. |
 | Virtual-filesystem references | Working — see `docs/references.md`. |

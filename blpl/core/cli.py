@@ -766,6 +766,7 @@ def _cmd_stage8(args: argparse.Namespace) -> int:
         sch_path=sch,
         pcb_path=pcb,
         emc=not args.no_emc,
+        spice=not args.no_spice,
     )
     if report.get("skipped"):
         print(f"stage8: skipped — {report['reason']}")
@@ -784,9 +785,77 @@ def _cmd_stage8(args: argparse.Namespace) -> int:
         print("        [placeholder] DO NOT FABRICATE — parts of this board are stand-ins:")
         for d in report["placeholders"]:
             print(f"        [placeholder] {d['summary']}")
+    sim = report.get("simulation") or {}
+    if sim.get("skipped"):
+        print(f"        [spice] not run — {sim.get('reason', 'unknown reason')}")
+    elif sim.get("nothing_to_simulate") or sim.get("nothing_measured"):
+        print(f"        [spice] {sim.get('headline', 'nothing was verified')}")
+    elif sim.get("counts"):
+        c = sim["counts"]
+        print(
+            f"        [spice] {c.get('total', 0)} simulated on {sim.get('simulator', '?')} — "
+            f"{c.get('pass', 0)} pass, {c.get('warn', 0)} warn, {c.get('fail', 0)} fail"
+        )
     print(f"        wrote {pipeline_dir / 'review.md'}")
     # Emitter defects and placeholders gate; design issues are the user's to triage.
     return 0 if report["ok"] else 1
+
+
+def _cmd_spice(args: argparse.Namespace) -> int:
+    """Re-simulate without re-running the analyzers.
+
+    Stage 8 already simulates once. This exists because the *interesting* runs
+    are the second and third — narrowing to one subcircuit type, or asking for
+    a Monte Carlo sweep — and paying for a full schematic and PCB analysis to
+    change one flag is the kind of friction that stops people looking.
+    """
+    from ..agent.tools.spice import find_simulator, simulate
+
+    proj = _project_dir(args)
+    review_dir = proj / ".pipeline" / "review"
+    schematic_json = review_dir / "schematic.json"
+    if not schematic_json.is_file():
+        print(
+            f"error: no schematic analysis at {schematic_json} — run stage8 first",
+            file=sys.stderr,
+        )
+        return 2
+
+    status = find_simulator(args.simulator)
+    if not status.available:
+        print(f"spice: skipped — {status.detail}", file=sys.stderr)
+        return 2
+
+    pcb_json = review_dir / "pcb.json"
+    run = simulate(
+        schematic_json,
+        review_dir / "spice.json",
+        pcb_json=pcb_json if pcb_json.is_file() else None,
+        types=[t.strip() for t in args.types.split(",")] if args.types else None,
+        timeout=args.timeout,
+        monte_carlo=args.monte_carlo,
+        simulator=args.simulator,
+    )
+    if not run.ok:
+        print(f"spice: {run.reason}", file=sys.stderr)
+        return 1
+
+    print(f"spice: {run.headline()}")
+    for r in run.results:
+        if r.status == "pass":
+            continue
+        detail = ", ".join(f"{k} {v:+.1f}%" for k, v in (r.delta or {}).items() if v is not None)
+        # A skip's reason is the whole story — "skip" alone tells the user
+        # nothing about whether their circuit or our tooling fell short.
+        detail = detail or r.note
+        print(
+            f"        [{r.status}] {r.subcircuit_type} {r.reference}"
+            + (f" — {detail}" if detail else "")
+        )
+    print(f"        wrote {run.report_json}")
+    # A failing simulation is a finding about the design, not a broken run —
+    # same reason stage8 does not gate on design issues.
+    return 0
 
 
 def _add_llm_flags(p: argparse.ArgumentParser) -> None:
@@ -898,7 +967,39 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip the EMC rule pass (the slowest analyzer).",
     )
+    p.add_argument(
+        "--no-spice",
+        action="store_true",
+        help="Skip SPICE simulation of the detected subcircuits.",
+    )
     p.set_defaults(func=_cmd_stage8)
+
+    p = sub.add_parser(
+        "spice",
+        help="Simulate the subcircuits stage8 detected (needs ngspice/LTspice/Xyce).",
+    )
+    p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--types",
+        help="Comma-separated subcircuit types to simulate (default: all supported).",
+    )
+    p.add_argument(
+        "--timeout", type=int, default=5, help="Seconds per simulation (default: 5)."
+    )
+    p.add_argument(
+        "--monte-carlo",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Run N tolerance samples per subcircuit, to see whether it passes on real parts.",
+    )
+    p.add_argument(
+        "--simulator",
+        default="auto",
+        choices=("auto", "ngspice", "ltspice", "xyce"),
+        help="Which simulator to use (default: auto-detect).",
+    )
+    p.set_defaults(func=_cmd_spice)
 
     p = sub.add_parser("run", help="Run the full pipeline end-to-end (stages 0–8).")
     p.add_argument("--project-dir", required=True)

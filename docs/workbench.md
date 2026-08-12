@@ -98,6 +98,35 @@ adjudicator, which may fold two findings together or decline, and cannot delete.
 
 Output lands in `.pipeline/review_panel.json` and renders in the Reports tab.
 
+## Simulation
+
+The schematic analyzer detects simulatable subcircuits — RC and LC filters,
+dividers, opamp stages, crystal load networks — but detection only proves the
+topology exists, not that it lands on the right numbers. Stage 8 now runs
+kicad-happy's SPICE testbenches over exactly those detections, and the chat can
+re-run them (`simulate_subcircuits`, or `blpl spice`) to narrow to one type or
+sweep component tolerances with `--monte-carlo`.
+
+A pass here is narrower than it looks, so the report distinguishes four
+outcomes rather than counting failures:
+
+- **skipped** — no simulator installed. ngspice, LTspice and Xyce are all
+  third-party; the skip carries the install hint.
+- **nothing to simulate** — the run happened and built no testbench. A crystal
+  drawn without its load caps lands here, which is a design gap rather than a
+  clean result.
+- **nothing measured** — testbenches ran and returned no numbers. This is the
+  normal LTspice outcome: kicad-happy's templates carry their `.meas` in ngspice
+  `.control` blocks, so LTspice sweeps correctly and reports nothing readable.
+- **measured** — real pass/warn/fail counts, and whether PCB parasitics were
+  included. On an unrouted board they are not, so a pass is about the topology
+  and not the layout.
+
+Only the last is verification, and the Reports tab labels the other three
+"nothing verified" — the fab banner above it is computed from placeholders and
+emitter defects alone, so it can read "no blockers" on a board whose analog side
+nobody has checked.
+
 ## Release
 
 The Release tab builds the package a contract fab quotes from: gerbers, drill

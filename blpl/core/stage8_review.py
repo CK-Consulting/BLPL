@@ -146,6 +146,34 @@ def _run_analyzer(script: Path, args: list[str], out_path: Path) -> dict:
     return result
 
 
+def _run_spice(schematic_json: Path, review_dir: Path, *, pcb_json: Path | None) -> dict:
+    """Simulate the detected subcircuits, in the analyzer result shape.
+
+    A missing simulator is by far the likeliest outcome — ngspice is a separate
+    install — so it lands here as a *skip with a reason*, exactly like a missing
+    kicad-happy checkout. The alternative, letting a review silently omit the
+    section, would let "nothing failed" and "nothing ran" look identical.
+    """
+    from ..agent.tools.spice import simulate
+
+    run = simulate(schematic_json, review_dir / "spice.json", pcb_json=pcb_json)
+    result: dict = {
+        "ok": run.ok,
+        "skipped": run.skipped,
+        "nothing_to_simulate": run.nothing_to_simulate,
+        "nothing_measured": run.nothing_measured,
+        "report_json": run.report_json or None,
+        "simulator": run.simulator,
+        "parasitics": run.parasitics,
+        "parasitics_note": run.parasitics_note,
+        "counts": run.counts,
+        "headline": run.headline(),
+    }
+    if run.reason:
+        result["reason"] = run.reason
+    return result
+
+
 def _load(path: str | None) -> dict:
     if not path:
         return {}
@@ -386,6 +414,48 @@ def _render_markdown(report: dict) -> str:
             lines.append(f"- **[{d['severity'].upper()}] {d.get('rule_id','')}** — {d['summary']}")
         lines.append("")
 
+    sim = report.get("simulation") or {}
+    if sim.get("skipped"):
+        # Said out loud rather than omitted: a review with no simulation section
+        # reads as "the analog side is fine", which is the one thing it does not
+        # mean.
+        lines += [
+            "## Simulation — not run",
+            "",
+            f"No subcircuit was simulated: {sim.get('reason', 'unknown reason')}.",
+            "Filter cutoffs, divider ratios and opamp gains in this design are "
+            "unverified by simulation.",
+            "",
+        ]
+    elif sim.get("nothing_to_simulate"):
+        lines += [
+            "## Simulation — nothing to simulate",
+            "",
+            f"{sim.get('simulator', 'SPICE')} ran and found no subcircuit it could build a "
+            "testbench for. This is **not** a pass: filters, dividers and crystal load "
+            "networks are only simulatable once their passives are in the schematic, so a "
+            "crystal drawn without its load caps is skipped rather than failed.",
+            "",
+        ]
+    elif sim.get("nothing_measured"):
+        lines += [
+            "## Simulation — no measurements came back",
+            "",
+            sim.get("headline") or "Every testbench ran and returned nothing.",
+            "",
+        ]
+    elif sim.get("counts"):
+        c = sim["counts"]
+        lines += [
+            "## Simulation",
+            "",
+            f"{c.get('total', 0)} subcircuits simulated with {sim.get('simulator', 'SPICE')} "
+            f"({sim.get('parasitics_note') or 'ideal nets'}) — "
+            f"{c.get('pass', 0)} pass, {c.get('warn', 0)} warn, {c.get('fail', 0)} fail, "
+            f"{c.get('skip', 0)} skip.",
+            "",
+        ]
+
     if report["expected"]:
         lines += ["## Expected — known BLPL limitations", ""]
         for d in report["expected"]:
@@ -402,6 +472,7 @@ def run(
     sch_path: Path | None = None,
     pcb_path: Path | None = None,
     emc: bool = True,
+    spice: bool = True,
 ) -> dict:
     """Run Stage 8 and write review_report.json + review.md into .pipeline/."""
     project_dir = Path(project_dir)
@@ -471,6 +542,20 @@ def run(
                 review_dir / "emc.json",
             )
 
+    # Simulation needs only the schematic — it reads the subcircuits the
+    # analyzer detected, not the copper. The PCB is an optional refinement:
+    # with traces, the testbenches carry their parasitics.
+    if spice and sch_json:
+        analyzers["spice"] = _run_spice(
+            Path(analyzers["schematic"]["report_json"]),
+            review_dir,
+            pcb_json=(
+                Path(analyzers["pcb"]["report_json"])
+                if analyzers["pcb"].get("report_json")
+                else None
+            ),
+        )
+
     # Emitter cross-checks need the BOM the board was generated from.
     bom_path = pipeline_dir / "bom.json"
     bom = schema.load_json(bom_path) if bom_path.exists() else {}
@@ -496,7 +581,7 @@ def run(
     design_issues: list[dict] = []
     expected_counts: dict[str, int] = {}
 
-    for source in ("schematic", "pcb", "cross", "emc"):
+    for source in ("schematic", "pcb", "cross", "emc", "spice"):
         data = _load(analyzers.get(source, {}).get("report_json"))
         for f in data.get("findings", []):
             provenance, owner = _classify(f, emitter_evidence, pwr_flag_nets)
@@ -548,6 +633,10 @@ def run(
             "placeholders": len(placeholders),
         },
         "placeholders": placeholders,
+        # Hoisted out of analyzers[] because it is the one analyzer whose
+        # *not having run* is a routine, actionable state rather than a broken
+        # checkout — the reader needs to see it without digging.
+        "simulation": analyzers.get("spice", {"skipped": True, "reason": "not run"}),
         "emitter_defects": emitter_defects,
         "design_issues": design_issues,
         "expected": expected,

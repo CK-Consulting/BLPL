@@ -133,7 +133,9 @@ def test_emitter_defects_gate_but_design_issues_do_not(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(s8, "_run_analyzer", _fake_run)
 
-    report = s8.run(tmp_path, sch_path=sch, pcb_path=None)
+    # spice=False keeps this hermetic: simulation shells out to a real binary
+    # that may or may not be installed, and this test is about classification.
+    report = s8.run(tmp_path, sch_path=sch, pcb_path=None, spice=False)
     assert report["summary"] == {"emitter": 0, "design": 1, "expected": 1, "placeholders": 0}
     assert report["ok"] is True
     assert "DC-002" in (pipeline / "review.md").read_text()

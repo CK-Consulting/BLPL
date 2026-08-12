@@ -21,6 +21,21 @@ type Finding = {
   refdes?: string;
 };
 
+// Simulation has four outcomes, not two, and the three that are not "it passed"
+// all look like silence if you only count failures: nobody ran it, nothing was
+// simulatable, or every testbench ran and measured nothing.
+type Simulation = {
+  skipped?: boolean;
+  nothing_to_simulate?: boolean;
+  nothing_measured?: boolean;
+  reason?: string;
+  headline?: string;
+  simulator?: string;
+  parasitics?: boolean;
+  parasitics_note?: string;
+  counts?: { total: number; pass: number; warn: number; fail: number; skip: number };
+};
+
 type Review = {
   ok: boolean;
   skipped: boolean;
@@ -30,6 +45,7 @@ type Review = {
   emitter_defects?: Finding[];
   design_issues?: Finding[];
   expected?: { rule_id: string; count: number }[];
+  simulation?: Simulation;
 };
 
 // The mixture-of-experts panel. `sources` and `agreement` are the whole point:
@@ -104,6 +120,7 @@ export function Reports({ projectId, reloadToken }: { projectId: string; reloadT
     <div className="reports">
       <FabBanner review={review} />
       <ValidationCard validation={validation} />
+      <SimulationCard review={review} />
       <ReviewSection review={review} />
       <PanelSection panel={panel} />
     </div>
@@ -190,6 +207,44 @@ function CheckPill({
       </div>
       {sub && <div className="check-sub">{sub}</div>}
     </div>
+  );
+}
+
+function SimulationCard({ review }: { review: Review | null | "missing" }) {
+  if (review === null || review === "missing" || review.skipped) return null;
+  const sim = review.simulation;
+  if (!sim) return null;
+
+  // The banner above says "no blockers" off placeholder and emitter counts
+  // alone. Analog correctness is not in that verdict, so an unrun simulation
+  // has to say so here rather than leaving the page reading as a clean pass.
+  const unverified = sim.skipped || sim.nothing_to_simulate || sim.nothing_measured;
+  const c = sim.counts;
+  const state = unverified ? "skip" : c && c.fail > 0 ? "fail" : "ok";
+
+  return (
+    <section className="report-block">
+      <h3>Simulation (SPICE)</h3>
+      <div className="check-grid">
+        <div className={`check-pill ${state}`}>
+          <div className="check-top">
+            <span>{sim.simulator || "SPICE"}</span>
+            <span className="check-state">
+              {unverified ? "nothing verified" : state === "ok" ? "pass" : "fail"}
+            </span>
+          </div>
+          <div className="check-sub">
+            {unverified
+              ? sim.headline || sim.reason || "Simulation did not run."
+              : `${c?.total ?? 0} subcircuits ${
+                  sim.parasitics ? "with PCB parasitics" : "on ideal nets"
+                } — ${c?.pass ?? 0} pass, ${c?.warn ?? 0} warn, ${c?.fail ?? 0} fail, ${
+                  c?.skip ?? 0
+                } skip`}
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 

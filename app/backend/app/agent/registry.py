@@ -367,6 +367,31 @@ async def _fab_readiness(ctx: ToolContext, args: dict) -> str:
     return json.dumps(gate, indent=2)[:20000]
 
 
+async def _simulate(ctx: ToolContext, args: dict) -> str:
+    from blpl.agent.tools.spice import simulate
+
+    review = ctx.project_dir / ".pipeline" / "review"
+    schematic_json = review / "schematic.json"
+    if not schematic_json.is_file():
+        raise FileNotFoundError(
+            "no schematic analysis to simulate — run stage8 first, which is also "
+            "what detects which subcircuits are simulatable"
+        )
+    ctx.sandbox.check_write(review)
+    pcb_json = review / "pcb.json"
+    mc = int(args.get("monte_carlo") or 0)
+    ctx.note("simulating subcircuits" + (f" ({mc} tolerance samples each)" if mc else ""))
+    run = await _to_thread(
+        simulate,
+        schematic_json,
+        review / "spice.json",
+        pcb_json=pcb_json if pcb_json.is_file() else None,
+        types=[str(t) for t in (args.get("types") or [])] or None,
+        monte_carlo=mc,
+    )
+    return json.dumps(run.to_dict(), indent=2)[:20000]
+
+
 async def _bulk_route(ctx: ToolContext, args: dict) -> str:
     from blpl.core import autoroute
 
@@ -437,6 +462,42 @@ def fab_tools() -> list[ToolSpec]:
             kind="kicad_mutation",
             handler=_bulk_route,
             approval="ask_always",
+        ),
+    ]
+
+
+def sim_tools() -> list[ToolSpec]:
+    return [
+        ToolSpec(
+            name="simulate_subcircuits",
+            description=(
+                "Run SPICE over the analog subcircuits the review detected — RC/LC filters, "
+                "voltage dividers, opamp stages, crystal load networks — and compare each "
+                "against what its topology was supposed to do. Reach for this when the user "
+                "asks whether a filter, divider or gain stage is actually right, or when a "
+                "review reports simulatable subcircuits: the analyzer can only see that a "
+                "divider exists, not that it lands on the wrong voltage. Ask for monte_carlo "
+                "when the question is whether it still works on real parts rather than "
+                "nominal ones. The reply says whether PCB parasitics were included — on an "
+                "unrouted board they are not, so a pass is about the topology, not the layout."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Subcircuit types to simulate; omit for all detected.",
+                    },
+                    "monte_carlo": {
+                        "type": "integer",
+                        "description": "Tolerance samples per subcircuit, e.g. 100. Omit for nominal only.",
+                    },
+                },
+            },
+            kind="file_mutation",
+            handler=_simulate,
+            approval="ask",
         ),
     ]
 
@@ -609,6 +670,7 @@ def default_tools(kicad_url: str | None = None) -> list[ToolSpec]:
         project_tools()
         + parts_tools()
         + module_tools()
+        + sim_tools()
         + fab_tools()
         + kicad_tools(kicad_url)
     )

@@ -92,6 +92,30 @@ KLC + ERC + DRC + coverage → `validation_report.json`.
 blpl stage7 --project-dir <proj>
 ```
 
+### `stage8`
+Design review via the kicad-happy analyzers → `review_report.json` + `review.md`.
+```
+blpl stage8 --project-dir <proj>
+    [--no-emc]                     # skip the EMC rule pass (the slowest analyzer)
+    [--no-spice]                   # skip SPICE simulation of detected subcircuits
+```
+
+### `spice`
+Re-simulate the subcircuits Stage 8 detected, without re-running the analyzers.
+Reads `.pipeline/review/schematic.json`; writes `.pipeline/review/spice.json`.
+```
+blpl spice --project-dir <proj>
+    [--types rc_filters,voltage_dividers]   # default: every supported type
+    [--timeout 5]                           # seconds per simulation
+    [--monte-carlo N]                       # tolerance samples, to test real parts
+    [--simulator auto|ngspice|ltspice|xyce]
+```
+Needs a simulator installed. A missing one is a **skip with a reason**, not a
+failure — but note that only ngspice returns usable measurements today:
+kicad-happy's testbenches carry their `.meas` in ngspice `.control` blocks, so
+LTspice runs the sweep and reports every result as skipped. `blpl spice` says so
+rather than letting "0 fail" read as a pass.
+
 ## Orchestrator
 
 ### `run`
