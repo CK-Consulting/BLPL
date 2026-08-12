@@ -10,6 +10,7 @@ import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
 import { DiffView } from "./components/DiffView";
 import { Artifacts } from "./components/Artifacts";
+import { ChatPanel } from "./components/ChatPanel";
 import { useResizable } from "./useResizable";
 import { Project, getJSON, postJSON } from "./api";
 
@@ -28,6 +29,18 @@ function Workspace() {
   const [showSettings, setShowSettings] = useState(false);
   const [tab, setTab] = useState<"board" | "edit" | "bom" | "reports" | "artifacts" | "changes">("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
+  const chat = useResizable("blpl.chatWidth", 420);
+  // Off by default so the workspace opens exactly as it did before; the
+  // preference sticks per browser once you turn it on.
+  const [showChat, setShowChat] = useState(
+    () => localStorage.getItem("blpl.showChat") === "1",
+  );
+  const toggleChat = () => {
+    setShowChat((on) => {
+      localStorage.setItem("blpl.showChat", on ? "0" : "1");
+      return !on;
+    });
+  };
 
   // Bumped whenever a stage finishes or a git sync lands, so the viewer
   // re-fetches a freshly emitted board. This is the loop the app exists to
@@ -85,6 +98,9 @@ function Workspace() {
         <span className="kicad" title="KiCad running server-side, in the container">
           {kicad ?? "kicad-cli: not found"}
         </span>
+        <button className={showChat ? "link on" : "link"} onClick={toggleChat}>
+          Chat
+        </button>
         <button className="link" onClick={() => setShowSettings(true)}>
           Settings
         </button>
@@ -138,6 +154,25 @@ function Workspace() {
               {tab === "artifacts" && <Artifacts projectId={selected} reloadToken={reloadToken} />}
               {tab === "changes" && <DiffView projectId={selected} reloadToken={reloadToken} />}
             </section>
+            {showChat && (
+              <>
+                <div
+                  className="resizer"
+                  onMouseDown={chat.onMouseDown}
+                  onDoubleClick={chat.reset}
+                  title="Drag to resize · double-click to reset"
+                />
+                <aside className="chat-dock" style={{ width: chat.width }}>
+                  <ChatPanel
+                    projectId={selected}
+                    onApplied={() => {
+                      bump();
+                      refresh();
+                    }}
+                  />
+                </aside>
+              </>
+            )}
           </main>
         </>
       ) : (

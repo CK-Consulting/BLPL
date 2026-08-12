@@ -34,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import appconfig, importer, llm_resolver, runs, vault
+from . import appconfig, chat as chat_mod, importer, llm_resolver, runs, vault
 from .appconfig import AppConfig, ProjectEntry
 from .conversations import Conversation, list_conversations
 from .identity import Identity, Locked
@@ -86,6 +86,10 @@ projects = Projects(PROJECTS_ROOT)
 # Run history is plaintext facts-about-what-happened, deliberately NOT in
 # vault.db — that file's contract is "a dump of it is a dump of ciphertext".
 run_manager = runs.RunManager(_DATA / "runs.db", _DATA / "runs")
+# Chat turns are in-process and in-memory: a turn needs sub-second first tokens
+# and (soon) approval round-trips, neither of which survives a pipe. What is
+# durable is the conversation JSONL each turn writes to.
+chat_sessions = chat_mod.ChatSessionManager()
 
 # Environment variable each provider's SDK reads its key from. ollama is keyless.
 _PROVIDER_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
@@ -811,6 +815,155 @@ def append_message(
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return conv.append(payload.role, payload.content, payload.metadata)
+
+
+# --------------------------------------------------------------------------
+# Design chat
+#
+# The one place the backend talks to an LLM itself rather than spawning a stage.
+# A turn runs in-process (see app/chat.py for why), streams over the same SSE
+# shape the run log uses, and can only change project files by proposing an edit
+# the user accepts.
+# --------------------------------------------------------------------------
+
+
+def _chat_endpoint(token: str) -> chat_mod.Endpoint:
+    """The endpoint a chat turn should use: highest-priority configured provider
+    with a usable key, its secret decrypted for this request only.
+
+    Shares one resolver with the pipeline (llm_resolver), so "which model am I
+    talking to" has the same answer in chat as in a stage — until Phase 2 gives
+    chat its own task route.
+    """
+    cfg = _load_config()
+    try:
+        primary = llm_resolver.resolve_primary(cfg, identity.providers_with_keys())
+    except llm_resolver.NoUsableProvider as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    key = identity.get_secret(token, primary.provider)
+    return chat_mod.Endpoint(
+        name=primary.provider,
+        kind=primary.provider,  # type: ignore[arg-type]
+        model=primary.model,
+        api_key=key,
+    )
+
+
+class ChatInput(BaseModel):
+    content: str
+
+
+@app.post("/api/projects/{project_id}/conversations/{filename}/chat")
+async def start_chat_turn(
+    project_id: str, filename: str, payload: ChatInput, token: str = Depends(require_session)
+) -> dict:
+    """Record the user's message and start the assistant's turn.
+
+    The message is persisted before the turn starts, so a failure mid-answer
+    costs the answer and never the question.
+    """
+    proj = _project_dir(project_id)
+    try:
+        conv = Conversation.open_existing(_conversations_dir(project_id), filename)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="message is empty")
+
+    endpoint = _chat_endpoint(token)
+    conv.append("user", payload.content, {"blocks": [{"type": "text", "text": payload.content}]})
+    try:
+        turn_id = chat_sessions.start(
+            chat_mod.TurnRequest(
+                project_id=project_id,
+                project_dir=proj,
+                conversation=conv,
+                endpoint=endpoint,
+                sandbox=_sandbox_for(project_id),
+                usage_ledger=_blpl_dir(project_id) / "llm_usage.jsonl",
+            )
+        )
+    except chat_mod.ProposalError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"turn_id": turn_id, "model": endpoint.model, "endpoint": endpoint.name}
+
+
+@app.get("/api/projects/{project_id}/chat/{turn_id}/events")
+def stream_chat_turn(
+    project_id: str, turn_id: str, _: str = Depends(require_session)
+) -> StreamingResponse:
+    """Attach to a turn: replay what it has emitted, then follow it live.
+
+    A turn that already finished replies with a single done event — its content
+    is in the conversation, which the client reloads.
+    """
+    _project_dir(project_id)
+
+    async def events():
+        async for event in chat_sessions.stream(turn_id):
+            yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@app.get("/api/projects/{project_id}/proposals")
+def list_proposals(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+    """Edits the assistant has proposed and nobody has ruled on yet."""
+    proj = _project_dir(project_id)
+    return [p.to_dict() for p in chat_mod.ProposalStore(proj).pending()]
+
+
+class ProposalDecision(BaseModel):
+    action: str  # accept | reject
+
+
+@app.post("/api/projects/{project_id}/proposals/{proposal_id}")
+def decide_proposal(
+    project_id: str, proposal_id: str, body: ProposalDecision, _: str = Depends(require_session)
+) -> dict:
+    """Accept an edit (write it, then commit it) or reject it.
+
+    Accepting is refused while a stage run is in flight for this project: the
+    pipeline reads these very files, and changing an input underneath a running
+    stage produces artifacts that match no version of the design.
+    """
+    proj = _project_dir(project_id)
+    store = chat_mod.ProposalStore(proj)
+    try:
+        proposal = store.get(proposal_id)
+    except chat_mod.ProposalError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if proposal is None:
+        raise HTTPException(status_code=404, detail=f"no proposal {proposal_id!r}")
+    if proposal.status != "pending":
+        raise HTTPException(status_code=409, detail=f"proposal is already {proposal.status}")
+
+    if body.action == "reject":
+        store.set_status(proposal, "rejected")
+        return {"ok": True, "status": "rejected"}
+    if body.action != "accept":
+        raise HTTPException(status_code=400, detail="action must be 'accept' or 'reject'")
+
+    if any(r.running for r in run_manager.list_for_project(project_id, limit=5)):
+        raise HTTPException(
+            status_code=409,
+            detail="a pipeline run is in flight for this project — accept the edit once it finishes",
+        )
+
+    applied, detail = chat_mod.apply_proposal(proposal, proj, _sandbox_for(project_id))
+    if not applied:
+        store.set_status(proposal, "stale")
+        raise HTTPException(status_code=409, detail=detail)
+
+    store.set_status(proposal, "accepted")
+    committed = False
+    try:
+        committed = projects.commit_all(project_id, f"chat: {proposal.rationale or proposal.path}") is not None
+    except ProjectError:
+        # A project without git history still gets its file. Losing the commit is
+        # worth reporting, not worth refusing the edit that already landed.
+        committed = False
+    return {"ok": True, "status": "accepted", "detail": detail, "committed": committed}
 
 
 # --------------------------------------------------------------------------

@@ -146,7 +146,12 @@ class Msg:
 
     @property
     def text(self) -> str:
-        return "".join(b.text for b in self.content if isinstance(b, TextBlock))
+        # Separate text blocks are separate paragraphs — providers split them
+        # around tool use, and joining with "" glues the end of one sentence to
+        # the start of the next.
+        return "\n\n".join(
+            b.text for b in self.content if isinstance(b, TextBlock) and b.text
+        )
 
     @property
     def tool_calls(self) -> list[ToolUseBlock]:

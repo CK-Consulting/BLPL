@@ -148,6 +148,39 @@ export type GitStatus = {
   has_remote: boolean;
 };
 
+export type ConversationMeta = {
+  slug: string;
+  filename: string;
+  started_at: string;
+  message_count: number;
+  last_message_at: string | null;
+};
+
+/** One persisted line of a conversation. `role` is free-form by design: user,
+ *  assistant, tool_results, error. */
+export type ChatMessage = {
+  role: string;
+  content: string;
+  timestamp: string;
+  metadata?: {
+    blocks?: { type: string; name?: string; input?: unknown; is_error?: boolean }[];
+    model?: string;
+    usage?: { input_tokens: number; output_tokens: number };
+  };
+};
+
+export type Proposal = {
+  id: string;
+  path: string;
+  rationale: string;
+  base_sha: string | null;
+  status: string;
+  created_at: string;
+  conversation: string;
+  creates_file: boolean;
+  new_content: string;
+};
+
 export type Run = {
   id: string;
   project: string;

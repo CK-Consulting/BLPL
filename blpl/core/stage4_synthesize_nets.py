@@ -213,13 +213,14 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
                 nets_by_name[name]["diff_pair_of"] = comp
                 break
 
-    out: dict = {
-        "project_id": design_artifact["project_id"],
-        "schema_version": 1,
-        "nets": [_strip_empty(n) for n in nets_by_name.values()],
-    }
+    out: dict = {"project_id": design_artifact["project_id"], "schema_version": 1}
+    # Warnings before nets, deliberately. On a real board the net list runs to
+    # tens of thousands of characters and the findings are a handful; anything
+    # that reads a prefix of this file — a log tail, a context window — must get
+    # the findings, not lose them behind the data they are about.
     if warnings:
         out["warnings"] = warnings
+    out["nets"] = [_strip_empty(n) for n in nets_by_name.values()]
     schema.validate("nets", out)
     return out
 
