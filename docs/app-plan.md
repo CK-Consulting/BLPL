@@ -305,26 +305,42 @@ stealing. The moment it holds encrypted API keys, several existing shortcuts bec
 real vulnerabilities. These are pre-existing, and each is small — but they must land
 with (or before) Phase C, not after:
 
-1. **Path traversal in the SPA fallback.** `main.py`'s catch-all does
-   `target = _STATIC_DIR / full_path` and tests `.exists()` without normalizing `..`
-   segments. Today it leaks static files; with a DB in the tree it is worse. Resolve
-   and assert the path stays under `_STATIC_DIR`.
-2. **`PUT /references` never validates through the sandbox.** A user-submitted
-   reference list is written to `.blpl/references.json` unchecked — and references
-   are precisely what *widens* `FilesystemSandbox`'s allowlist. That is a
-   privilege-escalation path into the sandbox itself. Validate on write.
-3. **The sandbox's `_created_paths` is always empty.** `_sandbox_for` constructs a
-   fresh `FilesystemSandbox` per request, so creation-tracking and session state
-   reset every call, making `check_delete`'s "only delete what you created" rule
-   vacuous. Either persist the set or drop the pretense.
-4. **No CSRF protection on mutating routes.** Irrelevant without cookies; the moment
-   Phase C introduces a session cookie, a page in another tab can drive this API.
-   Use `SameSite=Strict` and a CSRF token on state-changing requests.
-5. **The SSE stage runner leaks subprocesses.** Client abort cancels only the read;
-   the child keeps running. Bind the process lifetime to the request.
+All five are now settled. Two were fixed by later work before this pass reached
+them, one was the real hole, and one turned out to be the opposite of a bug.
 
-Point 2 is the one I would not ship without: it turns a user-editable JSON file into
-a sandbox-policy override.
+1. ~~**Path traversal in the SPA fallback.**~~ **ALREADY FIXED.** The catch-all
+   resolves the candidate and asserts `is_relative_to(_STATIC_DIR.resolve())`
+   before serving it. Pinned by a regression test that walks `..` and
+   percent-encoded `..%2f` out of the static root and gets `index.html` back.
+2. ~~**`PUT /references` never validates through the sandbox.**~~ **FIXED** — this
+   was the real one. `references.json` is the file that *defines* the sandbox, so
+   it is the one write in the backend that cannot be checked by the sandbox
+   afterwards. `validate_reference()` now refuses, on the way in: a path that does
+   not exist (it widens the policy now and arms whenever something appears there
+   later); `/` or the bare home directory; anything inside or containing BLPL's own
+   state roots, which is what would put `vault.db` and every other project inside
+   one project's sandbox; and a read-write reference covering the project's own
+   `.blpl/`, which would let a tool rewrite the policy judging it. One bad entry
+   rejects the whole list — a partially-applied policy is worse than a refused one.
+3. ~~**The sandbox's `_created_paths` is always empty.**~~ **PRETENSE DROPPED.** It
+   fails *closed* — an empty set means delete is refused, not permitted — so this
+   was a misleading docstring rather than a hole. The lifetime is now stated
+   exactly (per-request on the HTTP surface, per-turn inside an agent
+   conversation) instead of implying a session-wide memory that does not exist. No
+   production code calls `check_delete`; a persistent creation log would be
+   speculative work for a feature with no caller.
+4. ~~**No CSRF protection on mutating routes.**~~ **TIGHTENED.** The cookie was
+   already `httponly` + `SameSite=Lax`, which blocks cross-site POST/PUT/DELETE and
+   so covers classic CSRF. Raised to `SameSite=Strict`: nothing here changes state
+   on GET and the API is only ever reached from its own origin, so the stricter
+   rule costs one page load after an external link. A separate CSRF token would add
+   nothing on top of Strict for a same-origin-only, localhost-bound API.
+5. ~~**The SSE stage runner leaks subprocesses.**~~ **NO LONGER APPLICABLE.** The
+   durable-runs work inverted this deliberately: `run_manager` owns the child in a
+   background task, records it in SQLite, and exposes `stop(run_id)`. A client
+   abort cancels the stream and the run keeps going *on purpose* — that is the
+   feature that lets a run outlive the tab that started it. The process is tracked
+   and killable, so it is not a leak.
 
 ## UI screens (React, `app/frontend/` — all additive)
 
@@ -352,7 +368,7 @@ Each phase is independently shippable and leaves the CLI working.
 |---|---|---|
 | ~~**A. Input doctor**~~ ✅ | `blpl doctor` + preflight panel; fix the heading regex | Highest value/effort ratio in the whole plan; needs none of the below |
 | **B. Config layer** | `blpl.toml` cascade, loader, secret-rejecting validator, `blpl config` | Everything else reads config |
-| **B½. Security debt** | The 5 items above | Must precede the vault, not follow it |
+| ~~**B½. Security debt**~~ ✅ | The 5 items above | Must precede the vault, not follow it |
 | **C. Identity + vault** | SQLite, Argon2id/AES-GCM, auth routes, `get_adapter(task=)` reads vault | The security core |
 | **D. Settings + unlock UI** | Provider keys, model routing, effective-config view | Makes B and C usable |
 | **E. Project init** | Server-side dir browser, init wizard, `project.yaml` generation; delete `BLPL_WORKSPACE` | Depends on config roots (B) |

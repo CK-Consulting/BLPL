@@ -43,8 +43,10 @@ from .references import (
     FilesystemSandbox,
     Reference,
     ReferenceManifest,
+    ReferencePolicyError,
     load_global_allowlist,
     load_global_denylist,
+    validate_reference,
 )
 from .store import Store
 
@@ -187,14 +189,19 @@ def _cookie_secure(request: Request) -> bool:
 
 
 def _set_session_cookie(response: Response, request: Request, token: str) -> None:
-    # httpOnly so page JS can never read the token; SameSite=Lax so it rides
-    # normal navigation but not cross-site POSTs. Secure is decided by the
-    # connection scheme (see _cookie_secure), not a hand-set flag.
+    # httpOnly so page JS can never read the token. SameSite=Strict rather than
+    # Lax: Lax already blocks cross-site POST/PUT/DELETE, which covers classic
+    # CSRF, but it still rides a top-level GET navigation — and this API is
+    # reached only from its own origin, so there is no cross-site link into it
+    # worth preserving. Nothing here changes state on GET, so Strict costs a
+    # single page load after following an external link and buys the stricter
+    # rule. Secure is decided by the connection scheme (see _cookie_secure),
+    # not a hand-set flag.
     response.set_cookie(
         _SESSION_COOKIE,
         token,
         httponly=True,
-        samesite="lax",
+        samesite="strict",
         secure=_cookie_secure(request),
         max_age=8 * 3600,
     )
@@ -788,6 +795,23 @@ def put_references(
         ]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    # references.json is the file that *defines* the sandbox, so this is the one
+    # write in the backend that cannot be checked by the sandbox afterwards.
+    # Validate before storing: the whole list is refused if any entry is bad,
+    # because a partially-applied policy is worse than a rejected one.
+    denylist = load_global_denylist()
+    for ref in refs:
+        try:
+            validate_reference(
+                ref,
+                workspace_root=manifest.workspace_root,
+                denylist=denylist,
+                protected_roots=[_DATA, PROJECTS_ROOT],
+            )
+        except ReferencePolicyError as exc:
+            raise HTTPException(status_code=400, detail=f"reference {ref.name!r}: {exc}")
+
     manifest.references = refs
     _conversations_dir(project_id).mkdir(parents=True, exist_ok=True)
     path = _references_path(project_id)

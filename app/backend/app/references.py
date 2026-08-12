@@ -14,9 +14,9 @@ Security model (intentionally conservative):
     *or* the path is inside ``workspace_root`` *and* is tagged as BLPL-owned
     (under ``.pipeline/`` or ``.blpl/``, or matches the per-session write log
     — see ``register_creation``).
-  * A path is deletable iff it was created during the current session. Files
-    present at session start are never deleted by BLPL, even inside
-    read-write references.
+  * A path is deletable iff *this sandbox instance* was told it created it.
+    Instances are per-request on the HTTP surface and per-turn inside an agent
+    conversation, so delete fails closed everywhere else — see ``check_delete``.
 
 Global policy layered on top:
 
@@ -154,6 +154,80 @@ def load_global_denylist() -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
+# Validating a reference before it is stored
+# ---------------------------------------------------------------------------
+#
+# This is the one place in the system where a *user-supplied value widens the
+# policy that guards user-supplied values*. Every other path in the backend is
+# checked against the sandbox; the sandbox itself is checked against nothing but
+# references.json, so an unvalidated write here is not a path-traversal bug — it
+# is a policy-override bug, and no amount of downstream checking recovers from
+# it. Hence: validate on the way in, where the mistake is still cheap.
+
+
+def validate_reference(
+    ref: Reference,
+    *,
+    workspace_root: Path,
+    denylist: list[Path] | None = None,
+    protected_roots: list[Path] | None = None,
+) -> None:
+    """Refuse a reference that would compromise the sandbox. Raises on refusal.
+
+    ``protected_roots`` are BLPL's own state directories — the vault, the
+    projects root. They are passed in rather than imported so this module stays
+    the pure-policy layer it claims to be.
+    """
+    path = Path(ref.path).expanduser().resolve()
+    workspace_root = Path(workspace_root).resolve()
+
+    if not path.exists():
+        raise ReferencePolicyError(
+            f"{path} does not exist. A reference to a missing path is either a typo or a "
+            "trap: it widens the sandbox now and takes effect whenever something appears "
+            "there later."
+        )
+
+    for denied in denylist or []:
+        if _is_within(path, denied):
+            raise ReferencePolicyError(f"{path} is inside the global denylist entry {denied}")
+
+    # A reference at / or at the bare home directory does not widen the sandbox
+    # so much as abolish it.
+    if path == Path(path.anchor) or path == Path.home().resolve():
+        raise ReferencePolicyError(
+            f"{path} is too broad to be a reference — it would make every other rule in the "
+            "sandbox meaningless. Point at the specific directory you need."
+        )
+
+    for protected in protected_roots or []:
+        protected = Path(protected).resolve()
+        # Inside BLPL's own state: another project's files, or the vault itself.
+        # Read access leaks them; read-write lets the agent rewrite the policy
+        # that is supposed to be constraining it.
+        if _is_within(path, protected) and not _is_within(path, workspace_root):
+            raise ReferencePolicyError(
+                f"{path} is inside BLPL's own state directory ({protected}). That would put "
+                "the vault and other projects inside this project's sandbox."
+            )
+        # The reference is an *ancestor* of protected state, which reaches it
+        # just as effectively by a longer route.
+        if _is_within(protected, path):
+            raise ReferencePolicyError(
+                f"{path} contains BLPL's own state directory ({protected}), so referencing "
+                "it would pull the vault and every other project into this sandbox."
+            )
+
+    # The manifest lives here. A read-write reference covering it would let
+    # anything holding this sandbox edit the file that defines the sandbox.
+    if ref.access == "read-write" and _is_within(workspace_root / ".blpl", path):
+        raise ReferencePolicyError(
+            f"{path} contains this project's .blpl/ directory, and mounting it read-write "
+            "would let a tool rewrite references.json — the policy it is being judged by."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Sandbox
 # ---------------------------------------------------------------------------
 
@@ -251,10 +325,19 @@ class FilesystemSandbox:
     def check_delete(self, path: str | Path) -> Path:
         """Return the resolved Path if deletable, else raise ReferencePolicyError.
 
-        Delete is only allowed for files BLPL itself created during this session.
-        Files present at session start are never deleted by BLPL, even inside
-        read-write references — that's the "deliberately no delete" rule from
-        the reference-system spec.
+        Delete is only allowed for files this *sandbox instance* was told it
+        created, via ``register_creation``. That lifetime is deliberately stated
+        rather than called "the session": the backend builds a fresh sandbox per
+        request, so an HTTP caller's ``_created_paths`` is always empty and every
+        delete through that surface is refused. Within one agent turn the
+        instance is shared, so a tool that creates a file can clean it up again;
+        across turns it cannot.
+
+        Failing closed is the right default for delete, so this is left as-is
+        rather than given a persistent creation log. What must not happen is the
+        docstring implying a session-wide memory that does not exist — a rule
+        that reads as "we track what we made" but evaluates to "never" is how
+        a reviewer concludes a check is working when it is merely absent.
         """
         p = Path(path).expanduser().resolve()
         if self._denied(p):

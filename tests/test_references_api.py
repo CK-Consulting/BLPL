@@ -338,3 +338,114 @@ def test_unknown_non_api_routes_do_not_leak_api_errors(unlocked) -> None:
     r = unlocked.get("/projects/alpha/board")
     assert r.status_code in (200, 404)  # 200 with a build present, 404 without
     assert "no API route" not in r.text
+
+
+# ---------------------------------------------------------------------------
+# Validating a reference before it is stored
+# ---------------------------------------------------------------------------
+#
+# references.json is the file that *defines* the sandbox, so a write here cannot
+# be checked by the sandbox afterwards. These pin the checks that have to happen
+# on the way in.
+
+
+def _put(client, refs: list[dict]):
+    return client.put("/api/projects/alpha/references", json={"references": refs})
+
+
+def test_a_reference_to_a_missing_path_is_refused(unlocked, tmp_path: Path) -> None:
+    """It widens the sandbox now and takes effect whenever something appears
+    at that path later — a trap that survives review because it looks inert."""
+    _seed_project(unlocked)
+    r = _put(unlocked, [{"name": "ghost", "path": str(tmp_path / "not_here")}])
+    assert r.status_code == 400
+    assert "does not exist" in r.json()["detail"]
+
+
+def test_a_reference_at_the_filesystem_root_is_refused(unlocked) -> None:
+    _seed_project(unlocked)
+    r = _put(unlocked, [{"name": "everything", "path": "/"}])
+    assert r.status_code == 400
+    assert "too broad" in r.json()["detail"]
+
+
+def test_a_reference_covering_blpl_state_is_refused(unlocked) -> None:
+    """The escalation this check exists for: a reference at the data root puts
+    vault.db and every other project inside this project's sandbox."""
+    import app.main as main
+
+    _seed_project(unlocked)
+    r = _put(unlocked, [{"name": "vault", "path": str(main.PROJECTS_ROOT)}])
+    assert r.status_code == 400
+    assert "state directory" in r.json()["detail"]
+
+
+def test_a_reference_at_another_project_is_refused(unlocked) -> None:
+    import app.main as main
+
+    _seed_project(unlocked)
+    other = main.PROJECTS_ROOT / "somebody-elses-board"
+    other.mkdir(parents=True, exist_ok=True)
+    r = _put(unlocked, [{"name": "peek", "path": str(other)}])
+    assert r.status_code == 400
+    assert "state directory" in r.json()["detail"]
+
+
+def test_a_read_write_reference_over_the_manifest_is_refused(unlocked) -> None:
+    """Mounting the project's own .blpl/ read-write would let a tool rewrite
+    references.json — the policy it is being judged by."""
+    import app.main as main
+
+    proj = _seed_project(unlocked)
+    r = _put(
+        unlocked,
+        [{"name": "self", "path": str(proj), "access": "read-write"}],
+    )
+    assert r.status_code == 400
+    assert "references.json" in r.json()["detail"]
+    assert main  # the import is the point: PROJECTS_ROOT must be the live one
+
+
+def test_a_denylisted_reference_is_refused(unlocked, tmp_path: Path, monkeypatch) -> None:
+    import app.main as main
+
+    _seed_project(unlocked)
+    forbidden = tmp_path / "secrets"
+    (forbidden / "inner").mkdir(parents=True)
+    monkeypatch.setattr(main, "load_global_denylist", lambda: [forbidden])
+    r = _put(unlocked, [{"name": "nope", "path": str(forbidden / "inner")}])
+    assert r.status_code == 400
+    assert "denylist" in r.json()["detail"]
+
+
+def test_one_bad_reference_rejects_the_whole_list(unlocked, tmp_path: Path) -> None:
+    """A partially-applied policy is worse than a rejected one."""
+    proj = _seed_project(unlocked)
+    good = tmp_path / "fine"
+    good.mkdir()
+    r = _put(
+        unlocked,
+        [
+            {"name": "good", "path": str(good)},
+            {"name": "bad", "path": str(tmp_path / "missing")},
+        ],
+    )
+    assert r.status_code == 400
+    assert not (proj / ".blpl" / "references.json").is_file()
+
+
+def test_an_ordinary_external_reference_still_works(unlocked, tmp_path: Path) -> None:
+    # The validator must not be so strict that the feature stops working.
+    _seed_project(unlocked)
+    ext = tmp_path / "reference_design"
+    ext.mkdir()
+    assert _put(unlocked, [{"name": "ref", "path": str(ext)}]).status_code == 200
+
+
+def test_the_session_cookie_is_samesite_strict(client) -> None:
+    """Lax already blocks cross-site POSTs; Strict also declines to ride a
+    top-level GET into an API that is only ever reached from its own origin."""
+    r = client.post("/api/auth/initialize", json={"passphrase": "correct-horse-staple"})
+    cookie = r.headers.get("set-cookie", "")
+    assert "samesite=strict" in cookie.lower()
+    assert "httponly" in cookie.lower()

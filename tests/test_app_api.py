@@ -436,3 +436,18 @@ def test_preflight_mutates_nothing(unlocked) -> None:
     before = sorted(p.name for p in proj.iterdir())
     unlocked.get("/api/projects/scratch/preflight")
     assert sorted(p.name for p in proj.iterdir()) == before
+
+
+def test_the_spa_fallback_refuses_to_escape_the_static_root(client) -> None:
+    """A regression pin, not a fix: the catch-all resolves and re-checks
+    containment, so `..` segments fall through to index.html instead of
+    serving whatever they land on. Skipped when no bundle is built, since the
+    route only mounts if one is."""
+    import app.main as main
+
+    if not (main._STATIC_DIR / "index.html").is_file():
+        pytest.skip("no built frontend bundle — the SPA fallback is not mounted")
+    for attempt in ("../../../etc/passwd", "..%2f..%2f..%2fetc%2fpasswd"):
+        r = client.get(f"/{attempt}")
+        assert r.status_code == 200
+        assert "root:" not in r.text
