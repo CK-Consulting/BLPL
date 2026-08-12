@@ -82,8 +82,19 @@ _kill_port() {
 
 source ${HOME}/devspace/myprojects/blpl/.venv/bin/activate
 readenv
-export BLPL_WORKSPACE=${HOME}/projects/hardware/dev.04-unified-baseboard
+
+# Projects are imported from the browser now, so this script no longer pins one.
+# It used to hardcode a single board's directory, which meant "open a different
+# project" was: edit this file, kill the server, start it again.
+#
+# Pass a projects directory to override for one run:
+#     ./blpl-serve.sh ~/projects/hardware
+# Otherwise `blpl serve` uses $BLPL_PROJECTS_ROOT, else its XDG data dir.
 _kill_port 7878
-cmd="blpl serve"
+if [[ -n "${1:-}" ]]; then
+    cmd="blpl serve --workspace ${1}"
+else
+    cmd="blpl serve"
+fi
 _evalBg "${cmd}";
 

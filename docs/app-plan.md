@@ -206,7 +206,7 @@ config migration is a natural moment to fix it.
 yields an opaque handle, not a path, and the backend must run
 `blpl stage6 --project-dir <path>` as a subprocess. So the directory picker is
 **server-side**: the backend enumerates directories under configured roots and
-returns real paths. `FilesystemSandbox` in `blpl/webapp/references.py` already
+returns real paths. `FilesystemSandbox` in `app/backend/app/references.py` already
 implements the allow/deny logic to build on.
 
 New routes:
@@ -237,32 +237,39 @@ That silence is the actual usability bug. A `blpl doctor --project-dir <p>` comm
 (plus a UI panel) should run Stage 0's classifier in dry-run mode and report what it
 *would* drop, before anything runs:
 
-- Tables classified `other` and discarded. On `dev.04` this silently swallows the
-  overview's **Project identity / Stackup / Net classes** tables — the user writes
-  them, and the pipeline ignores them.
-- Pinout headings that don't anchor. **The documented contract and the parser
-  disagree**, which is the single worst thing an input contract can do. The regex is
-  `^#+\s*[\d.]*\s*(J[\w_]*\d*)[:\s(]` — the refdes must come *immediately* after the
-  heading marker, and must start with `J`. Verified against real headings:
+- ~~Tables classified `other` and discarded.~~ **REPORTED** (`STAGE0-004`). On
+  `dev.04` this silently swallowed 5 tables, two of them load-bearing: the
+  **net-classes** table (`Class | Trace width | Clearance | Via dia | Via drill`)
+  and a **GPIO map** (`GPIO | Signal | Destination | Notes`). Stage 0 now names
+  each ignored table with its columns and location. Still *ignored* — consuming
+  them is a separate feature — but no longer silently.
+- ~~Pinout headings that don't anchor.~~ **FIXED.** The contract and the parser
+  used to disagree, which is the single worst thing an input contract can do. The
+  old regex was `^#+\s*[\d.]*\s*(J[\w_]*\d*)[:\s(]` — the refdes had to come
+  *immediately* after the heading marker and start with `J`, so the exact form
+  `SKILL.md` documents was thrown on the floor with no error:
 
-  | Heading | Result |
-  |---|---|
-  | `## J_USB_C Pinout` | ✅ matches |
-  | `## J2: nRF FFC` | ✅ matches |
-  | `## 3.1 J_HALOW (u.FL)` | ✅ matches |
-  | `## Connector J_USB_C — USB-C receptacle (24-pin)` | ❌ **silently dropped** |
-  | `## Connector J1 - barrel` | ❌ **silently dropped** |
-  | `## U_GNSS (LC76G-PA) pinout` | ❌ **silently dropped** (not a `J` refdes) |
+  | Heading | Was | Now |
+  |---|---|---|
+  | `## J_USB_C Pinout` | ✅ | ✅ |
+  | `## J2: nRF FFC` | ✅ | ✅ |
+  | `## 3.1 J_HALOW (u.FL)` | ✅ | ✅ |
+  | `## Connector J_USB_C — USB-C receptacle (24-pin)` | ❌ silently dropped | ✅ |
+  | `## Connector J1 - barrel` | ❌ silently dropped | ✅ |
+  | `## U_GNSS (LC76G-PA) pinout` | ❌ silently dropped (not a `J`) | ✅ |
 
-  The two dropped `Connector …` forms are **the exact form `SKILL.md` tells the user
-  to write** ("`## Connector J_USB_C — USB-C receptacle` … both work"). They do not.
-  A user following the documentation to the letter gets their pinout table thrown on
-  the floor with no error. This alone probably explains a large share of the
-  "confusing multi-file back-and-forth."
+  Both halves are done. Anchoring now scans the heading for a refdes-shaped token
+  (`_REFDES_IN_HEADING_RE`) rather than anchoring on position, and Stage 0 reports
+  what it could not place instead of discarding it: `warnings[]` in
+  `design_artifact.json`, echoed to stderr with file:line and a suggested fix.
 
-  Two separate fixes are needed: correct the regex (allow a leading word like
-  `Connector`, and allow non-`J` refdes such as `U_GNSS`), and make Stage 0 *report*
-  unanchored pinout tables instead of discarding them.
+  The second half mattered more than the doc originally credited. Unanchored
+  tables were not being *dropped* — they all landed on the single `local_id`
+  "UNKNOWN" and **merged**, so a power header and an audio jack fused into one
+  bogus 4-pin part carrying `VBUS, GND, TIP, RING` that reached the board. Each
+  unanchored table now gets its own placeholder (`UNKNOWN_1`, `UNKNOWN_2`, …), so
+  unrelated pinouts can never fuse. See `STAGE0-001/002/003` and the tests in
+  `tests/test_stage0_deterministic.py`.
 - Grouped pin ranges (`| 1-5 | Power |`) that break pin mapping.
 - Duplicate signal names silently collapsing into one net (the `Reserved` /`NC` trap).
 - `footprint_hint` strings that don't exist on disk under `kicad-footprints/`.
@@ -300,7 +307,11 @@ with (or before) Phase C, not after:
 Point 2 is the one I would not ship without: it turns a user-editable JSON file into
 a sandbox-policy override.
 
-## UI screens (SolidJS, existing `ui/` — 511 LOC, all additive)
+## UI screens (React, `app/frontend/` — all additive)
+
+> Superseded note: this section was written against a SolidJS prototype in `ui/`.
+> That prototype was replaced by the React app in `app/frontend/` and deleted;
+> the screen breakdown below still describes what to build, not what to build it in.
 
 | Screen | Purpose |
 |---|---|

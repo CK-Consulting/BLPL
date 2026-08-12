@@ -98,6 +98,18 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .editor-bar { display: flex; align-items: center; gap: .5rem; padding: .45rem .7rem; border-bottom: 1px solid #2a2e36; background: #15181d; }
 .editor-text { flex: 1; resize: none; border: none; outline: none; background: #0f1115; color: #e6e6e6; padding: 1rem; font: 13px/1.5 ui-monospace, SFMono-Regular, monospace; tab-size: 2; }
 
+/* --- board tab --- */
+/* The viewer fills the tab; the banner only takes space when there is one, so a
+   current board renders edge-to-edge exactly as before. */
+.design-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.design-view > ecad-viewer { flex: 1; min-height: 0; }
+.archived-banner {
+  flex: 0 0 auto; padding: .55rem .9rem; line-height: 1.5; font-size: 13px;
+  background: #3a2a11; border-bottom: 1px solid #6e5021; color: #ffe4b8;
+}
+.archived-banner strong { color: #ffb454; }
+.archived-banner code { background: #00000038; padding: 0 .25rem; border-radius: 3px; }
+
 /* --- reports tab --- */
 .reports { overflow: auto; height: 100%; padding: 1rem 1.2rem; display: flex; flex-direction: column; gap: 1.1rem; }
 .fab-banner { padding: .8rem 1rem; border-radius: 8px; line-height: 1.5; }

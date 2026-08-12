@@ -24,7 +24,7 @@ BLPL is in active development. The pipeline (Stages 0–7) is stable; the Web UI
 
 **Scope**:
 
-- FastAPI backend at `blpl.webapp.main` launched via `blpl serve`.
+- FastAPI backend at `app/backend` (`app.main`), launched via `blpl serve` locally or docker compose for the hosted deploy.
 - REST endpoints: list projects, read/write `references.json`, run stages, stream logs (SSE), view artifacts.
 - Virtual filesystem layer per [`references.md`](references.md): per-project `references.json` + global allow/deny list, read-only vs read-write access modes, session/project/global scopes.
 - Conversation persistence: JSONL-per-conversation under `<project>/.blpl/conversations/`.

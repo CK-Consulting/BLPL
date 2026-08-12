@@ -9,11 +9,20 @@
 # First run:  open http://<host>:8080 and set a passphrase.
 services:
   backend:
+    # Upstream publishes kicad/kicad:10.0.0 for linux/amd64 only — there is no
+    # arm64 manifest. Without this pin the build dies with "no match for platform
+    # in manifest" on any Apple Silicon dev machine. On an amd64 server this is a
+    # no-op (already native); on arm64 it runs under Rosetta/QEMU emulation, which
+    # is slower but correct. Pin it rather than swap in a fork: see the Dockerfile
+    # header for why the official image is load-bearing.
+    platform: linux/amd64
     build:
       # Context is the repo root so the image can pull in blpl/ and
       # kicad-happy/ alongside the app.
       context: ..
       dockerfile: app/backend/Dockerfile
+      platforms:
+        - linux/amd64
     container_name: blpl-backend
     networks:
       - blpl

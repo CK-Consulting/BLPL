@@ -67,13 +67,15 @@ blpl-repo-root/
         classifier/     # component + connector inference
         plugin_kicad/   # pcbnew ActionPlugin + standalone build_pcb CLI
         skills/         # Claude Code skill shipped with the package
-        webapp/         # (planned) FastAPI backend for the browser UI
+    app/
+        backend/        # FastAPI backend — auth/vault, git, stages, artifacts
+        frontend/       # React UI (ecad-viewer for in-browser board rendering)
+        docker-compose.yml   # the hosted deploy; KiCad lives in the image
     docs/               # user-facing documentation (you're here)
     schemas/            # JSON Schemas for every inter-stage artifact
     tests/              # pytest suite
-    projects/           # symlinked user projects (design markdown lives here)
-    ui/                 # (planned) SolidJS frontend
-    kicad-{symbols,footprints,packages3D,…}   # symlinked submodules
+    kicad-happy/        # design-review + sourcing skills (submodule)
+    kicad-{symbols,footprints,packages3D,…}   # submodules
 ```
 
 ## Documentation map

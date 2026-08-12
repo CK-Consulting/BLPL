@@ -14,6 +14,22 @@
       "items": {"type": "string"},
       "description": "Relative paths to the Markdown files this artifact was extracted from."
     },
+    "warnings": {
+      "type": "array",
+      "description": "What Stage 0 could not extract cleanly. Stage 0 is forgiving by design — it skips what it does not recognize — and the silence around that is the parser's worst behaviour: a dropped pinout table produces no error, the pins simply never become nets. Every skip is recorded here so the loss is visible in the artifact itself, not only to whoever remembered to run `blpl doctor`.",
+      "items": {
+        "type": "object",
+        "required": ["code", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "code": {"type": "string"},
+          "summary": {"type": "string"},
+          "fix": {"type": "string"},
+          "local_id": {"type": "string"},
+          "source_ref": {"$ref": "#/$defs/source_ref"}
+        }
+      }
+    },
     "components": {
       "type": "array",
       "items": {

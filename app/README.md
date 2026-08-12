@@ -79,13 +79,16 @@ appear on a command line or in a log.
 
 ## Local development
 
-Backend (needs the KiCad libraries and `blpl` importable):
+Backend (needs the KiCad libraries and `blpl` importable). Either form works —
+`blpl serve` is a thin launcher for this same app that also picks sane local
+paths for the vault, config, and projects root:
 
 ```sh
-uvicorn app.main:app --reload --app-dir app/backend --port 8000
+blpl serve --no-browser                                    # :7878, state under XDG data
+uvicorn app.main:app --reload --app-dir app/backend --port 7878   # equivalent, bring your own env
 ```
 
-Frontend (proxies `/api` to `:8000`):
+Frontend (proxies `/api` to `:7878`; set `BLPL_API` to target another backend):
 
 ```sh
 cd app/frontend && npm install && npm run dev

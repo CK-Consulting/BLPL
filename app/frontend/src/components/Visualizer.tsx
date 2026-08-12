@@ -77,6 +77,7 @@ export function Visualizer({ sources }: Props) {
 /** Fetches the emitted design for a project and renders it. */
 export function DesignView({ projectId, reloadToken }: { projectId: string; reloadToken: number }) {
   const [sources, setSources] = useState<BlobSource[] | null>(null);
+  const [archived, setArchived] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -92,7 +93,11 @@ export function DesignView({ projectId, reloadToken }: { projectId: string; relo
         if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
         return r.json();
       })
-      .then((d) => !cancelled && setSources(d.sources))
+      .then((d) => {
+        if (cancelled) return;
+        setSources(d.sources);
+        setArchived(Boolean(d.archived));
+      })
       .catch((e) => !cancelled && setError(String(e.message ?? e)));
 
     return () => {
@@ -111,5 +116,18 @@ export function DesignView({ projectId, reloadToken }: { projectId: string; relo
   }
   if (!sources) return <div className="empty">Loading design…</div>;
 
-  return <Visualizer sources={sources} />;
+  // Say so when the only board on disk is a rotated one. Reviewing a revision you
+  // are not about to fabricate, believing it is current, is the failure this
+  // banner exists to prevent.
+  return (
+    <div className="design-view">
+      {archived && (
+        <div className="archived-banner">
+          Showing an <strong>archived</strong> board from <code>.pipeline/archive/</code> — Stage 6
+          has no current output. Re-run <code>stage6</code> to emit the live board.
+        </div>
+      )}
+      <Visualizer sources={sources} />
+    </div>
+  );
 }

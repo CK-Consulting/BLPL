@@ -301,7 +301,18 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    """Launch the FastAPI backend. Requires the 'webapp' extras."""
+    """Launch the FastAPI backend locally. Requires the 'webapp' extras.
+
+    This runs *the same* backend the container runs (app/backend), not a second
+    one. There used to be two: blpl/webapp served the built React bundle against
+    an API that had no auth, no git, and no /design, so the UI's first request
+    404'd and nothing worked. `blpl serve` is now a local launcher for the real
+    app — the difference between this and docker compose is only where KiCad
+    comes from (your PATH here, the pinned image there).
+
+    The container sets its own env in docker-compose.yml. Locally we default the
+    same three roots under XDG data, so serving needs no configuration at all.
+    """
     try:
         import uvicorn  # type: ignore[import-not-found]
     except ImportError:
@@ -312,12 +323,54 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Pre-set the env so main.py picks up the workspace root at import time.
-    if args.workspace:
-        os.environ["BLPL_WORKSPACE"] = str(Path(args.workspace).resolve())
+    repo_root = Path(__file__).resolve().parents[2]
+    backend_dir = repo_root / "app" / "backend"
+    if not (backend_dir / "app" / "main.py").is_file():
+        print(f"error: backend not found at {backend_dir}", file=sys.stderr)
+        return 2
+
+    data_root = Path(
+        os.environ.get("BLPL_DATA_ROOT")
+        or Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "blpl"
+    ).expanduser()
+
+    # BLPL_WORKSPACE is deliberately NOT honoured as a fallback. It meant "a root
+    # to scan for projects at any depth", and in practice was pointed straight at
+    # a single project directory. BLPL_PROJECTS_ROOT means "the directory whose
+    # immediate children are projects" — so silently reusing the old value would
+    # scan *inside* one board and report zero projects. Fail loudly instead.
+    stale = os.environ.get("BLPL_WORKSPACE")
+    if stale and not (args.workspace or os.environ.get("BLPL_PROJECTS_ROOT")):
+        print(
+            f"blpl serve: ignoring BLPL_WORKSPACE={stale!r} — it is no longer used.\n"
+            "  It named one project; the app now lists the children of a projects "
+            "directory.\n"
+            "  Pass --workspace <dir-containing-your-projects>, or import projects "
+            "from the browser.",
+            file=sys.stderr,
+        )
+
+    projects_root = (
+        args.workspace or os.environ.get("BLPL_PROJECTS_ROOT") or data_root / "projects"
+    )
+    projects_root = Path(projects_root).expanduser().resolve()
+    try:
+        projects_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"error: cannot use projects root {projects_root}: {exc}", file=sys.stderr)
+        return 2
+
+    os.environ.setdefault("BLPL_DATA_ROOT", str(data_root))
+    os.environ["BLPL_PROJECTS_ROOT"] = str(projects_root)
+    os.environ.setdefault("BLPL_VAULT_DB", str(data_root / "vault.db"))
+    os.environ.setdefault("BLPL_CONFIG", str(data_root / "blpl.toml"))
+    os.environ.setdefault("BLPL_KICAD_HAPPY", str(repo_root / "kicad-happy"))
+    data_root.mkdir(parents=True, exist_ok=True)
 
     url = f"http://{args.host}:{args.port}"
-    print(f"blpl serve: starting on {url} (workspace={os.environ.get('BLPL_WORKSPACE', 'auto')})", file=sys.stderr)
+    print(f"blpl serve: starting on {url}", file=sys.stderr)
+    print(f"blpl serve: projects={projects_root}", file=sys.stderr)
+    print(f"blpl serve: data={data_root}", file=sys.stderr)
 
     if not args.no_browser:
         import webbrowser
@@ -330,12 +383,15 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
         threading.Thread(target=_open_later, daemon=True).start()
 
+    # app_dir rather than sys.path: the --reload supervisor spawns a fresh
+    # process that would not inherit an in-process sys.path edit.
     uvicorn.run(
-        "blpl.webapp.main:app",
+        "app.main:app",
         host=args.host,
         port=args.port,
         reload=args.reload,
         log_level=args.log_level,
+        app_dir=str(backend_dir),
     )
     return 0
 
@@ -846,7 +902,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--workspace",
         default=None,
-        help="Root directory to scan for BLPL projects. Defaults to BLPL_WORKSPACE env or the repo root.",
+        help=(
+            "Directory holding your BLPL projects (one subdirectory each). "
+            "Defaults to $BLPL_PROJECTS_ROOT, else <data-root>/projects. "
+            "(The old $BLPL_WORKSPACE named a single project and is no longer used.)"
+        ),
     )
     p.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1 — local only).")
     p.add_argument("--port", type=int, default=7878, help="Bind port (default: 7878).")

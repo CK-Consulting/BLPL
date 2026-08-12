@@ -20,6 +20,40 @@ What ends up in `design_artifact.json`:
 - `connectors[]` — pinout tables: `local_id` + `pins[] = {pin, signal, function, voltage}`.
 - `subsystems[]` — optional logical groupings.
 - `raw_nets[]` — pre-synthesis net references.
+- `warnings[]` — what could not be extracted cleanly (omitted when there is nothing to say).
+
+### Anchoring a pinout table
+
+A pinout table binds to the nearest heading above it that contains a
+**refdes-shaped token**: `J` or `U` followed by a number (`J2`, `U1`) or an
+underscore-qualified name (`J_USB_C`, `U_GNSS`). The token may sit anywhere in the
+heading, so all of these work:
+
+```
+## J_USB_C Pinout
+## J2: nRF FFC
+## 3.1 J_HALOW (u.FL)
+## Connector J_USB_C — USB-C receptacle (24-pin)
+## U_GNSS (LC76G-PA) pinout
+```
+
+Headings with no refdes (`## Power input pinout`) do not anchor. Such a table is
+**not** discarded — its pins are kept under a placeholder `UNKNOWN_1`, `UNKNOWN_2`,
+… and a `STAGE0-001` warning is written to the artifact and printed to stderr with
+the file, line, and how to fix it. Each unanchored table gets its own placeholder,
+so two of them never merge into one part.
+
+The warning codes:
+
+| Code | Meaning |
+|---|---|
+| `STAGE0-001` | Pinout table has no refdes heading to anchor to. |
+| `STAGE0-002` | Rows skipped — each was missing a pin number or a signal name. |
+| `STAGE0-003` | Table classified as a pinout produced no usable pins (column-name mismatch). |
+| `STAGE0-004` | Table matched neither the BOM nor the pinout shape, so nothing reads it. |
+
+Run `blpl doctor` to see all of this — plus grouped pin ranges, fake no-connect
+placeholders, and missing footprints — *before* running the pipeline.
 
 ## Stage 1 — Component resolution + connector synthesis
 

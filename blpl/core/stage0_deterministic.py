@@ -10,6 +10,7 @@ against in stage0_compare.
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 from . import markdown_tables as _md
@@ -75,18 +76,33 @@ def _normalize_pin_headers(headers: list[str]) -> dict[str, str]:
     return mapping
 
 
+# The local_id given to a pinout table with no refdes heading above it. Callers
+# suffix it (_1, _2, …) so two unanchored tables never merge into one part.
+_UNANCHORED = "UNKNOWN"
+
+
+def _heading_text_above(text: str, line_start: int) -> str | None:
+    """The nearest heading line above a table, stripped of its '#' marks."""
+    lines = text.splitlines()
+    for i in range(min(line_start, len(lines)) - 1, -1, -1):
+        stripped = lines[i].lstrip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("# ").strip() or None
+    return None
+
+
 def _find_connector_for_table(text: str, table: _md.ParsedTable) -> str:
     """Return the connector refdes heading that most closely precedes the table,
-    or 'UNKNOWN' if none is found.
+    or ``_UNANCHORED`` if none is found.
 
     Uses the table's 1-based line_start (which is unambiguous even when multiple
     tables share identical header rows).
     """
     lines = text.splitlines(keepends=True)
     if table.line_start < 1 or table.line_start > len(lines):
-        return "UNKNOWN"
+        return _UNANCHORED
     tbl_offset = sum(len(line) for line in lines[: table.line_start - 1])
-    best_ref = "UNKNOWN"
+    best_ref = _UNANCHORED
     for m in _HEADING_RE.finditer(text):
         if m.start() > tbl_offset:
             break
@@ -116,6 +132,8 @@ def extract(md_files: list[Path]) -> dict:
     connectors: dict[str, dict] = {}       # keyed by local_id (refdes)
     raw_nets: list[dict] = []              # not filled by deterministic stage 0 — LLM's job
     subsystems: list[dict] = []            # not filled by deterministic stage 0 — LLM's job
+    warnings: list[dict] = []
+    unanchored_seen = 0
 
     source_files: list[str] = []
     for md_path in md_files:
@@ -139,9 +157,57 @@ def extract(md_files: list[Path]) -> dict:
                 _absorb_bom_table(table, components)
             elif kind == "pinout":
                 connector_ref = _find_connector_for_table(text, table)
-                _absorb_pinout_table(table, connector_ref, connectors)
+                if connector_ref == _UNANCHORED:
+                    # Every unanchored table used to land on the single local_id
+                    # "UNKNOWN", so a power header and an audio jack merged into one
+                    # bogus part carrying VBUS, GND, TIP and RING — silently, and it
+                    # reached the board. Give each its own id so unrelated pinouts can
+                    # never fuse, and say so.
+                    unanchored_seen += 1
+                    connector_ref = f"{_UNANCHORED}_{unanchored_seen}"
+                    heading = _heading_text_above(text, table.line_start)
+                    label = heading or "(no heading)"
+                    warnings.append(
+                        {
+                            "code": "STAGE0-001",
+                            "summary": (
+                                f'Pinout table under "{label}" has no refdes to anchor to; '
+                                f"its pins were kept under the placeholder {connector_ref}."
+                            ),
+                            "fix": (
+                                "Put the refdes in the heading, e.g. '## J_USB_C — USB-C "
+                                "receptacle' or '## U_GNSS (LC76G-PA) pinout'. A refdes is J or U "
+                                "followed by a number (J2) or an underscore name (J_USB_C)."
+                            ),
+                            "local_id": connector_ref,
+                            "source_ref": _make_source_ref(table),
+                        }
+                    )
+                _absorb_pinout_table(table, connector_ref, connectors, warnings)
+            else:
+                # Classified as neither BOM nor pinout, so nothing reads it. Often
+                # that is right (a file index, a prose table), but on a real design
+                # it also swallowed the net-classes table and a GPIO map — design
+                # intent the user wrote and the pipeline ignored without a word.
+                # Listing the columns is what makes this triageable at a glance.
+                warnings.append(
+                    {
+                        "code": "STAGE0-004",
+                        "summary": (
+                            f"Table ignored — classified as neither BOM nor pinout "
+                            f"(columns: {', '.join(table.headers) or 'none'})."
+                        ),
+                        "fix": (
+                            "Harmless for prose and index tables. If this table carries "
+                            "design intent, restate it in a form Stage 0 reads: a BOM table "
+                            "(Ref/Description/MPN…) or a pinout table (Pin/Signal) under a "
+                            "heading naming its refdes."
+                        ),
+                        "source_ref": _make_source_ref(table),
+                    }
+                )
 
-    return {
+    artifact = {
         "project_id": _infer_project_id(md_files),
         "schema_version": 1,
         "source_files": source_files,
@@ -150,6 +216,9 @@ def extract(md_files: list[Path]) -> dict:
         "subsystems": subsystems,
         "raw_nets": raw_nets,
     }
+    if warnings:
+        artifact["warnings"] = warnings
+    return artifact
 
 
 def _infer_project_id(md_files: list[Path]) -> str:
@@ -184,10 +253,14 @@ def _absorb_bom_table(table: _md.ParsedTable, components: dict[str, dict]) -> No
 
 
 def _absorb_pinout_table(
-    table: _md.ParsedTable, connector_ref: str, connectors: dict[str, dict]
+    table: _md.ParsedTable,
+    connector_ref: str,
+    connectors: dict[str, dict],
+    warnings: list[dict] | None = None,
 ) -> None:
     header_map = _normalize_pin_headers(table.headers)
     pins: list[dict] = []
+    skipped_rows = 0
     for row in table.rows:
         pin_val = ""
         signal_val = ""
@@ -206,6 +279,10 @@ def _absorb_pinout_table(
             elif norm_h == "voltage":
                 voltage_val = val
         if not pin_val or not signal_val:
+            # A row missing either half cannot become a net. Counted, not narrated
+            # per-row: a 100-pin BGA with a blank column would otherwise bury the
+            # report in a hundred identical lines.
+            skipped_rows += 1
             continue
         pin_entry: dict = {"pin": pin_val, "signal": signal_val}
         if function_val:
@@ -214,7 +291,43 @@ def _absorb_pinout_table(
             pin_entry["voltage"] = voltage_val
         pins.append(pin_entry)
 
+    if warnings is not None and skipped_rows:
+        warnings.append(
+            {
+                "code": "STAGE0-002",
+                "summary": (
+                    f"{connector_ref}: {skipped_rows} pinout row(s) skipped — each was "
+                    "missing a pin number or a signal name."
+                ),
+                "fix": (
+                    "Give every row both a pin and a signal. Blank signals are not treated "
+                    "as no-connects; the row is dropped and the pin never becomes a net."
+                ),
+                "local_id": connector_ref,
+                "source_ref": _make_source_ref(table),
+            }
+        )
+
     if not pins:
+        # A table the classifier called a pinout that yielded nothing is almost
+        # always a column-naming mismatch, and it is exactly the failure that used
+        # to pass in total silence.
+        if warnings is not None:
+            warnings.append(
+                {
+                    "code": "STAGE0-003",
+                    "summary": (
+                        f"{connector_ref}: pinout table produced no usable pins "
+                        f"(columns: {', '.join(table.headers) or 'none'})."
+                    ),
+                    "fix": (
+                        "Stage 0 needs a column matching 'Pin' and one matching 'Signal'. "
+                        "Rename the columns to match, or the whole table is ignored."
+                    ),
+                    "local_id": connector_ref,
+                    "source_ref": _make_source_ref(table),
+                }
+            )
         return
     entry = connectors.get(connector_ref)
     if entry is None:
@@ -235,4 +348,16 @@ def run(md_files: list[Path], output_path: Path) -> dict:
     artifact = extract([Path(p) for p in md_files])
     schema.validate("design_artifact", artifact)
     schema.dump_json(output_path, artifact)
+
+    # Print what was lost. A warning recorded only in the JSON is barely better
+    # than no warning at all — the whole failure mode here is that Stage 0 runs
+    # to completion looking successful while quietly leaving pins out of the board.
+    for w in artifact.get("warnings", []):
+        where = w.get("source_ref") or {}
+        loc = where.get("file", "")
+        if where.get("line_start"):
+            loc = f"{loc}:{where['line_start']}"
+        print(f"stage0: warning [{w['code']}] {loc}: {w['summary']}", file=sys.stderr)
+        if w.get("fix"):
+            print(f"        fix: {w['fix']}", file=sys.stderr)
     return artifact

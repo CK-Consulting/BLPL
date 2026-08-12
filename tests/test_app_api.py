@@ -1,54 +1,16 @@
 """End-to-end API tests: the session gate, first-run setup, settings, and the
 project git flow, exercised through the real FastAPI app.
 
-The app module reads its state roots from environment variables at import time,
-so the fixture sets those to a tmp dir and imports the module fresh per test —
-each test gets an empty vault, empty config, and empty projects root.
-
-Argon2id at default cost would make setup/unlock slow; the fixture patches it to
-a cheap cost inside the imported module. The crypto path is unchanged.
+The ``client`` fixture (tmp state roots, cheap Argon2id, fresh module import)
+lives in conftest.py — it is shared with the reference/conversation API tests.
 """
 
 from __future__ import annotations
 
-import dataclasses
-import importlib
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
-
-BACKEND = Path(__file__).resolve().parents[1] / "app" / "backend"
-sys.path.insert(0, str(BACKEND))
-
-
-@pytest.fixture
-def client(tmp_path, monkeypatch):
-    from starlette.testclient import TestClient
-
-    monkeypatch.setenv("BLPL_DATA_ROOT", str(tmp_path / "data"))
-    monkeypatch.setenv("BLPL_PROJECTS_ROOT", str(tmp_path / "data" / "projects"))
-    monkeypatch.setenv("BLPL_VAULT_DB", str(tmp_path / "data" / "vault.db"))
-    monkeypatch.setenv("BLPL_CONFIG", str(tmp_path / "data" / "blpl.toml"))
-
-    # Cheap Argon2id for the suite — patch before importing main so the app's
-    # identity uses it. The crypto path is unchanged, only the work factor.
-    from app import vault
-    real_init = vault.init_vault
-
-    def cheap_init(passphrase):
-        params, wrapped = real_init(passphrase)
-        cheap = dataclasses.replace(params, time_cost=1, memory_kib=8, parallelism=1)
-        kek = cheap.derive(passphrase)
-        return cheap, vault._wrap_dek(kek, vault.unlock(passphrase, params, wrapped))
-
-    monkeypatch.setattr("app.vault.init_vault", cheap_init)
-
-    import app.main as main
-    importlib.reload(main)  # rebuild identity/projects against the tmp env
-
-    return TestClient(main.app)
 
 
 def _seed_remote(tmp_path: Path) -> str:

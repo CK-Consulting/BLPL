@@ -84,11 +84,20 @@ _kill_port() {
 
 source ${HOME}/devspace/myprojects/blpl/.venv/bin/activate
 uv pip install -e ".[webapp]"              # fastapi + uvicorn backend
-cd ui && npm approve-scripts --allow-scripts-pending && npm install && npm run build
+
+# React frontend → app/frontend/dist/, which `blpl serve` mounts when present.
+# (This used to build ui/ — a SolidJS prototype that was superseded by
+# app/frontend and has been deleted.)
+cd ${HOME}/devspace/myprojects/blpl/app/frontend
+npm install && npm run build
 cd ${HOME}/devspace/myprojects/blpl
-readenv      # SolidJS frontend → blpl/webapp/static/
-export BLPL_WORKSPACE=${HOME}/projects/hardware/dev.04-unified-baseboard
+readenv
+
 _kill_port 7878
-cmd="blpl serve"
+if [[ -n "${1:-}" ]]; then
+    cmd="blpl serve --workspace ${1}"
+else
+    cmd="blpl serve"
+fi
 _evalBg "${cmd}";
 

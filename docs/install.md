@@ -27,11 +27,21 @@ uv pip install -e ".[all-llm]"             # all three
 For the web UI:
 
 ```bash
-uv pip install -e ".[webapp]"              # fastapi + uvicorn backend
-cd ui && npm install && npm run build      # SolidJS frontend → blpl/webapp/static/
+uv pip install -e ".[webapp]"                       # fastapi + uvicorn backend
+cd app/frontend && npm install && npm run build     # React frontend → app/frontend/dist/
 ```
 
 Then launch with `blpl serve`. The built frontend is served from the same FastAPI process at `http://127.0.0.1:7878/`.
+
+`blpl serve` runs the *same* backend the container runs (`app/backend`); the only
+difference is where KiCad comes from — your PATH here, the pinned `kicad/kicad`
+image there. If you would rather not install KiCad locally, run the hosted app
+instead: `docker compose -f app/docker-compose.yml up -d --build`, then open
+`http://<host>:1800`. See [`../app/README.md`](../app/README.md).
+
+Projects are imported from the browser. `blpl serve` keeps its state (vault,
+config, projects) under `$XDG_DATA_HOME/blpl` — pass `--workspace <dir>` to point
+it at a directory of existing projects instead.
 
 For UI development with live-reload:
 
@@ -40,7 +50,7 @@ For UI development with live-reload:
 blpl serve --no-browser
 
 # Terminal 2 — Vite dev server on :5173 with /api proxy
-cd ui && npm run dev
+cd app/frontend && npm run dev
 ```
 
 Verify the CLI:

@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
@@ -34,8 +35,16 @@ from pydantic import BaseModel
 
 from . import appconfig, llm_resolver, vault
 from .appconfig import AppConfig, ProjectEntry
+from .conversations import Conversation, list_conversations
 from .identity import Identity, Locked
 from .projects import ProjectError, Projects
+from .references import (
+    FilesystemSandbox,
+    Reference,
+    ReferenceManifest,
+    load_global_allowlist,
+    load_global_denylist,
+)
 from .store import Store
 
 app = FastAPI(title="BLPL", version="0.5.0")
@@ -294,10 +303,31 @@ def _project_dir(project_id: str) -> Path:
 
 
 def _latest(pipeline_dir: Path, suffix: str) -> Path | None:
+    """The current emitted file of a kind, or the newest archived one.
+
+    Emitted names embed a UTC stamp (``…_2026-07-14_141235Z.kicad_sch``), so a
+    reverse name sort is a recency sort. The non-obvious part is the fallback:
+    Stage 6 rotates previous outputs into ``.pipeline/archive/``, and a project
+    whose last run was rotated has *every* board one level down. A non-recursive
+    glob then reports "no board" for a project holding nine revisions of one —
+    which is what dev.04 did. Prefer the live output; fall back to the archive
+    rather than claim the board doesn't exist. Callers that care about the
+    difference should use ``_latest_with_origin``.
+    """
+    found, _ = _latest_with_origin(pipeline_dir, suffix)
+    return found
+
+
+def _latest_with_origin(pipeline_dir: Path, suffix: str) -> tuple[Path | None, bool]:
+    """``(path, is_archived)`` — is_archived is True when only a rotated copy exists."""
     if not pipeline_dir.is_dir():
-        return None
-    files = sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True)
-    return files[0] if files else None
+        return None, False
+    live = sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True)
+    if live:
+        return live[0], False
+    # rglob so any rotation layout is caught, not just archive/ specifically.
+    archived = sorted(pipeline_dir.rglob(f"*{suffix}"), reverse=True)
+    return (archived[0], True) if archived else (None, False)
 
 
 def _fab_readiness(pipeline_dir: Path) -> dict | None:
@@ -517,15 +547,199 @@ def design_sources(project_id: str, _: str = Depends(require_session)) -> dict:
     proj = _project_dir(project_id)
     pipeline = proj / ".pipeline"
     sources = []
+    archived = False
     for suffix in (".kicad_sch", ".kicad_pcb"):
-        f = _latest(pipeline, suffix)
+        f, was_archived = _latest_with_origin(pipeline, suffix)
         if f is not None:
+            archived = archived or was_archived
             sources.append(
                 {"filename": f.name, "content": f.read_text(encoding="utf-8", errors="replace")}
             )
     if not sources:
         raise HTTPException(status_code=404, detail="no emitted KiCad files — run stage6 first")
-    return {"sources": sources}
+    # The viewer badges this: showing a rotated board without saying so would be
+    # the worst outcome — you would review a revision you are not about to fab.
+    return {"sources": sources, "archived": archived}
+
+
+# --------------------------------------------------------------------------
+# References, sandbox, and conversations
+#
+# Ported from the second backend that used to live in blpl/webapp/. That app
+# served this same React bundle against an API with no auth, no git, and no
+# /design — so the UI's very first call (/api/auth/status) 404'd and the whole
+# thing dead-ended. There is now one backend; these are the routes it was
+# missing. Everything here sits behind require_session like the rest of /api.
+# --------------------------------------------------------------------------
+
+
+def _blpl_dir(project_id: str) -> Path:
+    return _project_dir(project_id) / ".blpl"
+
+
+def _references_path(project_id: str) -> Path:
+    return _blpl_dir(project_id) / "references.json"
+
+
+def _conversations_dir(project_id: str) -> Path:
+    return _blpl_dir(project_id) / "conversations"
+
+
+def _load_manifest(project_id: str) -> ReferenceManifest:
+    """The project's reference manifest, or an empty one rooted at the project.
+
+    A corrupt manifest degrades to empty rather than 500ing the whole project:
+    an unreadable references.json should cost you your external references, not
+    access to your board.
+    """
+    proj = _project_dir(project_id)
+    path = _references_path(project_id)
+    if path.is_file():
+        try:
+            return ReferenceManifest.load(path)
+        except Exception:
+            pass
+    return ReferenceManifest.empty(project_id=project_id, workspace_root=proj)
+
+
+def _sandbox_for(project_id: str) -> FilesystemSandbox:
+    return FilesystemSandbox(
+        manifest=_load_manifest(project_id),
+        global_allowlist=load_global_allowlist(),
+        global_denylist=load_global_denylist(),
+    )
+
+
+class ReferenceInput(BaseModel):
+    name: str
+    path: str
+    role: str = "other"
+    access: str = "read"
+    scope: str = "project"
+    materialize: bool = False
+
+
+class ReferenceManifestInput(BaseModel):
+    references: list[ReferenceInput]
+
+
+@app.get("/api/projects/{project_id}/references")
+def get_references(project_id: str, _: str = Depends(require_session)) -> dict:
+    manifest = _load_manifest(project_id)
+    return {
+        "project_id": project_id,
+        "workspace_root": str(manifest.workspace_root),
+        "references": [r.to_dict() for r in manifest.references],
+    }
+
+
+@app.put("/api/projects/{project_id}/references")
+def put_references(
+    project_id: str, payload: ReferenceManifestInput, _: str = Depends(require_session)
+) -> dict:
+    manifest = _load_manifest(project_id)
+    try:
+        refs = [
+            Reference(
+                name=r.name,
+                path=Path(r.path).expanduser().resolve(),
+                role=r.role,
+                access=r.access,
+                scope=r.scope,
+                materialize=r.materialize,
+            )
+            for r in payload.references
+        ]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    manifest.references = refs
+    _conversations_dir(project_id).mkdir(parents=True, exist_ok=True)
+    path = _references_path(project_id)
+    manifest.save(path)
+    return {"references": [r.to_dict() for r in refs], "saved_to": str(path)}
+
+
+@app.get("/api/projects/{project_id}/sandbox")
+def sandbox_summary(project_id: str, _: str = Depends(require_session)) -> dict:
+    return _sandbox_for(project_id).summary()
+
+
+def _artifact_meta(path: Path, pipeline: Path) -> dict:
+    """Name, size, and creation time as UTC ``YYYY-MM-DD_HHMMSSZ``."""
+    st = path.stat()
+    ts = getattr(st, "st_birthtime", None) or st.st_mtime
+    return {
+        "name": str(path.relative_to(pipeline)),
+        "size": st.st_size,
+        "created": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d_%H%M%SZ"),
+    }
+
+
+@app.get("/api/projects/{project_id}/artifacts")
+def list_artifacts(project_id: str, _: str = Depends(require_session)) -> dict:
+    """Every artifact the pipeline has written, newest first.
+
+    Top-level only. Rotated copies under archive/ are deliberately excluded —
+    listing nine historical boards alongside the current one is how the artifact
+    list stops being useful. /design already falls back to the archive when it
+    has to, and says so.
+    """
+    pipeline = _project_dir(project_id) / ".pipeline"
+    if not pipeline.is_dir():
+        return {"artifacts": []}
+    artifacts = [_artifact_meta(p, pipeline) for p in sorted(pipeline.iterdir()) if p.is_file()]
+    artifacts.sort(key=lambda a: a["created"], reverse=True)
+    return {"artifacts": artifacts}
+
+
+class NewConversationInput(BaseModel):
+    title: str = "conversation"
+
+
+class MessageInput(BaseModel):
+    role: str
+    content: str
+    metadata: dict | None = None
+
+
+@app.get("/api/projects/{project_id}/conversations")
+def get_conversations(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+    return [m.to_dict() for m in list_conversations(_conversations_dir(project_id))]
+
+
+@app.post("/api/projects/{project_id}/conversations")
+def create_conversation(
+    project_id: str, payload: NewConversationInput, _: str = Depends(require_session)
+) -> dict:
+    d = _conversations_dir(project_id)
+    d.mkdir(parents=True, exist_ok=True)
+    conv = Conversation.create(d, title=payload.title)
+    return {"slug": conv.slug, "filename": conv.path.name, "started_at": conv.started_at}
+
+
+@app.get("/api/projects/{project_id}/conversations/{filename}")
+def read_conversation(project_id: str, filename: str, _: str = Depends(require_session)) -> dict:
+    try:
+        conv = Conversation.open_existing(_conversations_dir(project_id), filename)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {
+        "slug": conv.slug,
+        "filename": conv.path.name,
+        "started_at": conv.started_at,
+        "events": conv.read_all(),
+    }
+
+
+@app.post("/api/projects/{project_id}/conversations/{filename}/messages")
+def append_message(
+    project_id: str, filename: str, payload: MessageInput, _: str = Depends(require_session)
+) -> dict:
+    try:
+        conv = Conversation.open_existing(_conversations_dir(project_id), filename)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return conv.append(payload.role, payload.content, payload.metadata)
 
 
 # --------------------------------------------------------------------------
@@ -665,3 +879,64 @@ async def run_pipeline(
         "--continue-on-error",
     ]
     return _stream_subprocess(cmd, env)
+
+
+# --------------------------------------------------------------------------
+# Optional SPA hosting (local `blpl serve` only)
+#
+# In the container nginx serves the built frontend and proxies /api here, so
+# this mount finds nothing and does nothing — the backend image contains no
+# dist/. Locally there is no nginx, so `blpl serve` would otherwise hand you a
+# bare API. Mounting the build here keeps one-port local serving, which is the
+# ergonomic the old blpl/webapp had and the reason people reached for it.
+#
+# Registered last so every /api route above wins the match.
+# --------------------------------------------------------------------------
+
+# app/backend/app/main.py → app/backend → app → app/frontend/dist.
+# Deliberately relative rather than indexed off the repo root: in the container
+# this file is /app/app/main.py, a shallower tree, and an absolute parents[N]
+# either raises IndexError or silently points somewhere wrong. This form resolves
+# to a path that simply does not exist there, so the mount is skipped — which is
+# correct, because nginx serves the frontend in the container.
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+_STATIC_DIR = Path(
+    os.environ.get("BLPL_STATIC_DIR") or _BACKEND_ROOT.parent / "frontend" / "dist"
+)
+
+
+# Registered after every real /api route (so those win) and unconditionally —
+# NOT inside the `if static exists` branch. Whether a frontend happens to be
+# built must not change API semantics. Without this, the GET-only SPA catch-all
+# below matches an unknown /api path for routing purposes but rejects the method,
+# turning what should be 404 into 405 for every POST/PUT/DELETE.
+@app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+def _api_route_not_found(rest: str):
+    raise HTTPException(status_code=404, detail=f"no API route /api/{rest}")
+
+
+if (_STATIC_DIR / "index.html").is_file():
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    if (_STATIC_DIR / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=_STATIC_DIR / "assets"), name="assets")
+
+    @app.get("/{full_path:path}")
+    def spa_fallback(full_path: str):
+        """index.html for any non-API path — client-side routing handles the rest.
+
+        /api is already claimed by _api_route_not_found above; this guard is the
+        belt to that suspenders, so a reordering never serves the SPA shell in
+        place of an API error.
+        """
+        if full_path == "api" or full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail=f"no API route /{full_path}")
+        candidate = (_STATIC_DIR / full_path).resolve()
+        if (
+            full_path
+            and candidate.is_file()
+            and candidate.is_relative_to(_STATIC_DIR.resolve())
+        ):
+            return FileResponse(candidate)
+        return FileResponse(_STATIC_DIR / "index.html")
