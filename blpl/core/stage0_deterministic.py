@@ -132,6 +132,7 @@ def extract(md_files: list[Path]) -> dict:
     connectors: dict[str, dict] = {}       # keyed by local_id (refdes)
     raw_nets: list[dict] = []              # not filled by deterministic stage 0 — LLM's job
     subsystems: list[dict] = []            # not filled by deterministic stage 0 — LLM's job
+    gpio_assignments: list[dict] = []      # host GPIO → signal rows, consumed by Stage 4
     warnings: list[dict] = []
     unanchored_seen = 0
 
@@ -184,6 +185,33 @@ def extract(md_files: list[Path]) -> dict:
                         }
                     )
                 _absorb_pinout_table(table, connector_ref, connectors, warnings)
+            elif kind == "gpio":
+                # A GPIO map records which HOST pin drives each signal, so it needs
+                # a host refdes — and it must come from the table's own heading, not
+                # the pinout-style "nearest refdes heading above" anchor: on a real
+                # doc the nearest refdes heading was the GNSS chip's pinout, which
+                # would have bound every host GPIO to the wrong part.
+                heading = _heading_text_above(text, table.line_start)
+                host = refdes_in_heading(heading) if heading else None
+                if host is None:
+                    label = heading or "(no heading)"
+                    warnings.append(
+                        {
+                            "code": "STAGE0-005",
+                            "summary": (
+                                f'GPIO map under "{label}" names no host refdes in its '
+                                "heading; its rows were not consumed."
+                            ),
+                            "fix": (
+                                "Put the host's refdes in the GPIO table's heading, e.g. "
+                                "'## U_MCU GPIO assignment'. Stage 4 then joins each GPIO "
+                                "pin into the named signal's net."
+                            ),
+                            "source_ref": _make_source_ref(table),
+                        }
+                    )
+                else:
+                    _absorb_gpio_table(table, host, gpio_assignments)
             else:
                 # Classified as neither BOM nor pinout, so nothing reads it. Often
                 # that is right (a file index, a prose table), but on a real design
@@ -200,8 +228,9 @@ def extract(md_files: list[Path]) -> dict:
                         "fix": (
                             "Harmless for prose and index tables. If this table carries "
                             "design intent, restate it in a form Stage 0 reads: a BOM table "
-                            "(Ref/Description/MPN…) or a pinout table (Pin/Signal) under a "
-                            "heading naming its refdes."
+                            "(Ref/Description/MPN…), a pinout table (Pin/Signal), or a GPIO "
+                            "assignment map (GPIO/Signal) — the latter two under a heading "
+                            "naming their refdes."
                         ),
                         "source_ref": _make_source_ref(table),
                     }
@@ -216,6 +245,8 @@ def extract(md_files: list[Path]) -> dict:
         "subsystems": subsystems,
         "raw_nets": raw_nets,
     }
+    if gpio_assignments:
+        artifact["gpio_assignments"] = gpio_assignments
     if warnings:
         artifact["warnings"] = warnings
     return artifact
@@ -341,6 +372,31 @@ def _absorb_pinout_table(
         # Append pins (handles multi-table connectors).
         entry["pins"].extend(pins)
         entry["pin_count"] = len(entry["pins"])
+
+
+def _absorb_gpio_table(
+    table: _md.ParsedTable, host: str, gpio_assignments: list[dict]
+) -> None:
+    """Record GPIO-map rows verbatim, bound to the host refdes.
+
+    Interpretation (which rows can bind, name cross-checks against pinout nets)
+    is Stage 4's job — Stage 0 only extracts. Rows are kept raw so a "GPIO— (TBD)"
+    row survives to be *counted* later instead of vanishing here.
+    """
+    source_ref = _make_source_ref(table)
+    for row in table.rows:
+        gpio = _column_lookup(row, ["gpio"]).strip()
+        signal = _column_lookup(row, ["signal"]).strip()
+        if not gpio and not signal:
+            continue
+        entry: dict = {"host": host, "gpio": gpio, "signal": signal, "source_ref": source_ref}
+        destination = _column_lookup(row, ["destination", "dest"]).strip()
+        notes = _column_lookup(row, ["note"]).strip()
+        if destination:
+            entry["destination"] = destination
+        if notes:
+            entry["notes"] = notes
+        gpio_assignments.append(entry)
 
 
 def run(md_files: list[Path], output_path: Path) -> dict:

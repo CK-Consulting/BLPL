@@ -10,6 +10,7 @@ Signals such as "NC", "N/C", "-", "" are dropped (not-connected).
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 from . import schema
@@ -79,6 +80,42 @@ _DIFF_PAIR_SUFFIX_ORDER = sorted(_DIFF_PAIR_SUFFIXES, key=len, reverse=True)
 
 
 _NC_SIGNALS = {"NC", "N/C", "N.C.", "-", "", "DNC"}
+
+
+# --- GPIO-map consumption ----------------------------------------------------
+#
+# A GPIO-assignment map ("GPIO | Signal | Destination | ...") carries the HOST
+# half of every control net. On dev.04 the host (an ESP32-S3 module) has no
+# pinout table — its connectivity exists only in this map — so before it was
+# consumed, every enable/reset/chip-select net ended at the peripheral and the
+# host side simply didn't exist.
+
+# A pin cell that can actually bind: one token ending in digits (GPIO8, IO42).
+# "GPIO— (TBD)" and "GPIO11-18 (subset)" fail — they are counted, not guessed at.
+_GPIO_PIN_RE = re.compile(r"[A-Za-z_]*\d+\Z")
+
+# A signal cell that names ONE net. Multi-signal shorthand ("CAM_PCLK, CAM_HSYNC",
+# "SOM_SPI_*", "BLE_B_UART_TX/RX", "Boot strap") is reported, never split by guess.
+_ACTIONABLE_SIGNAL_RE = re.compile(r"[A-Za-z0-9_+\-]+\Z")
+
+# Destination cross-references: "J_BLE_A pin 7", "U1 pin 36", "J_CAM pins 5-12",
+# "J_SOM pins 12, 15". Only the "<refdes> pin(s) <numbers>" shape is machine-read;
+# prose destinations ("Audio-haptics subsystem") deliberately parse to nothing.
+_DEST_RE = re.compile(r"\b([JU][A-Za-z0-9_]*)\s+pins?\s+(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+)*)")
+
+
+def _parse_destinations(dest: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for refdes, pins in _DEST_RE.findall(dest or ""):
+        rng = re.fullmatch(r"(\d+)\s*[-–]\s*(\d+)", pins.strip())
+        if rng:
+            for p in range(int(rng.group(1)), int(rng.group(2)) + 1):
+                out.append((refdes, str(p)))
+        else:
+            for p in re.split(r"[,\s]+", pins.strip()):
+                if p:
+                    out.append((refdes, p))
+    return out
 
 
 def _normalize_signal(signal: str) -> str:
@@ -167,6 +204,8 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
     # Currently design_artifact has no pin_map for non-connectors, so this is a no-op
     # placeholder for future extension.
 
+    warnings = _apply_gpio_assignments(design_artifact, nets_by_name, bom)
+
     # Diff-pair detection (bidirectional tagging).
     for name in list(nets_by_name.keys()):
         for comp in _diff_pair_complements(name):
@@ -179,8 +218,192 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
         "schema_version": 1,
         "nets": [_strip_empty(n) for n in nets_by_name.values()],
     }
+    if warnings:
+        out["warnings"] = warnings
     schema.validate("nets", out)
     return out
+
+
+def _apply_gpio_assignments(
+    design_artifact: dict, nets_by_name: dict[str, dict], bom: dict | None
+) -> list[dict]:
+    """Fold GPIO-map rows into the synthesized nets. Returns warnings.
+
+    Per row, in order of preference:
+      - the named signal already has a net → the host pin joins it;
+      - the signal is unknown but every machine-readable destination pin sits on
+        ONE existing net → the wire clearly exists under another name: the host
+        pin joins that net AND the naming split is reported (STAGE4-002). On a
+        real design this was five charger-control nets that would otherwise have
+        shipped split in two, with the battery-chemistry straps reaching nothing;
+      - destinations land on SEVERAL nets → grouped-row shorthand; reported, and
+        nothing is guessed;
+      - no destination resolves → a net is created holding just the host pin,
+        and its dangling other end is reported (STAGE4-004).
+    Rows whose pin or signal cell can't bind ("GPIO— (TBD)", "CAM_PCLK, CAM_HSYNC")
+    are counted in one summary warning (STAGE4-001) — the same no-silent-drops
+    contract Stage 0's warnings carry.
+    """
+    assignments = design_artifact.get("gpio_assignments", [])
+    if not assignments:
+        return []
+
+    warnings: list[dict] = []
+    unbound: list[str] = []
+
+    # (refdes, pin) -> owning net name, from the pinout-derived nets.
+    member_owner: dict[tuple[str, str], str] = {}
+    for net in nets_by_name.values():
+        for m in net["members"]:
+            member_owner.setdefault((m["refdes"], m["pin"]), net["name"])
+
+    for a in assignments:
+        signal = _normalize_signal(a["signal"])
+        if not signal or signal.upper() in _NC_SIGNALS:
+            continue
+        src_ref = a.get("source_ref")
+        gpio = a["gpio"].strip()
+        host = _resolve_refdes(a["host"], bom)
+        bindable = bool(_GPIO_PIN_RE.fullmatch(gpio))
+
+        if not _ACTIONABLE_SIGNAL_RE.fullmatch(signal):
+            unbound.append(f"{a['signal']} ({gpio or 'no pin'})")
+            continue
+
+        # Where do the row's named destination pins actually sit?
+        dest_owners: dict[str, list[str]] = {}
+        dest_missing: list[str] = []
+        for refdes, pin in _parse_destinations(a.get("destination", "")):
+            owner = member_owner.get((_resolve_refdes(refdes, bom), pin))
+            if owner is None:
+                dest_missing.append(f"{refdes} pin {pin}")
+            else:
+                dest_owners.setdefault(owner, []).append(f"{refdes} pin {pin}")
+
+        mismatched = {o: pins for o, pins in dest_owners.items() if o != signal}
+        target: str | None = None
+
+        if signal in nets_by_name:
+            target = signal
+            if mismatched:
+                listed = "; ".join(f"{o} (at {', '.join(p)})" for o, p in mismatched.items())
+                warnings.append(
+                    {
+                        "code": "STAGE4-002",
+                        "summary": (
+                            f"GPIO map routes {signal} to pins the pinouts place on "
+                            f"other net(s): {listed}."
+                        ),
+                        "fix": "Make the GPIO map and the pinout tables agree on one name per wire.",
+                        "net": signal,
+                        **({"source_ref": src_ref} if src_ref else {}),
+                    }
+                )
+        elif len(dest_owners) == 1:
+            # The wire exists — under a different name. Join it, loudly.
+            target = next(iter(dest_owners))
+            pins = ", ".join(dest_owners[target])
+            warnings.append(
+                {
+                    "code": "STAGE4-002",
+                    "summary": (
+                        f"GPIO map names the signal {signal}, but the pinout net at "
+                        f"{pins} is named {target}"
+                        + (
+                            f" — joined {host} {gpio} to {target}; rename one side."
+                            if bindable
+                            else " — and the row's pin cell cannot bind, so nothing was joined."
+                        )
+                    ),
+                    "fix": "Use one name per wire across the GPIO map and the pinout tables.",
+                    "net": target,
+                    **({"source_ref": src_ref} if src_ref else {}),
+                }
+            )
+        elif len(dest_owners) > 1:
+            listed = "; ".join(f"{o} (at {', '.join(p)})" for o, p in dest_owners.items())
+            warnings.append(
+                {
+                    "code": "STAGE4-002",
+                    "summary": (
+                        f"GPIO map row {signal} spans {len(dest_owners)} pinout nets: "
+                        f"{listed}. Grouped rows cannot bind — one row per signal."
+                    ),
+                    "fix": "Split the row so each signal has its own GPIO and destination.",
+                    **({"source_ref": src_ref} if src_ref else {}),
+                }
+            )
+        elif bindable:
+            # No resolvable destination: the host pin is all we know. Keep the
+            # net (it is real design intent) and say the other end is dangling.
+            nets_by_name[signal] = {
+                "name": signal,
+                "class": _assign_class(signal),
+                "members": [],
+                "source_refs": [],
+            }
+            target = signal
+            dangling = a.get("destination", "").strip() or "(none given)"
+            warnings.append(
+                {
+                    "code": "STAGE4-004",
+                    "summary": (
+                        f"Net {signal} created from the GPIO map with only the host pin "
+                        f"{host} {gpio}; its destination ‘{dangling}’ does not "
+                        "resolve to a refdes+pin."
+                    ),
+                    "fix": (
+                        "Write the destination as '<refdes> pin <n>' or add the signal to "
+                        "that part's pinout table."
+                    ),
+                    "net": signal,
+                    **({"source_ref": src_ref} if src_ref else {}),
+                }
+            )
+
+        if dest_missing:
+            warnings.append(
+                {
+                    "code": "STAGE4-003",
+                    "summary": (
+                        f"GPIO map row {signal} names destination pin(s) no pinout "
+                        f"declares: {', '.join(dest_missing)}."
+                    ),
+                    "fix": "Add the pin to that part's pinout table, or fix the reference.",
+                    **({"source_ref": src_ref} if src_ref else {}),
+                }
+            )
+
+        if not bindable:
+            unbound.append(f"{a['signal']} ({gpio or 'no pin'})")
+            continue
+
+        if target is not None:
+            net = nets_by_name[target]
+            member = {"refdes": host, "pin": gpio}
+            if member not in net["members"]:
+                net["members"].append(member)
+            if src_ref:
+                refs = net.setdefault("source_refs", [])
+                if src_ref not in refs:
+                    refs.append(src_ref)
+            member_owner.setdefault((host, gpio), target)
+
+    if unbound:
+        warnings.append(
+            {
+                "code": "STAGE4-001",
+                "summary": (
+                    f"{len(unbound)} GPIO map row(s) could not bind — pin is TBD/a range, "
+                    f"or the signal cell names more than one net: {'; '.join(unbound)}."
+                ),
+                "fix": (
+                    "One row per signal, with a concrete pin (GPIO8). TBD rows are fine "
+                    "to keep — they are counted here, never silently dropped."
+                ),
+            }
+        )
+    return warnings
 
 
 def _strip_empty(net: dict) -> dict:
@@ -199,4 +422,15 @@ def run(
     bom = schema.load_json(bom_path) if bom_path and bom_path.exists() else None
     nets = synthesize(artifact, bom)
     schema.dump_json(output_path, nets)
+
+    # Echo warnings to stderr, same contract as Stage 0: a warning recorded only
+    # in the JSON looks exactly like success from the terminal.
+    for w in nets.get("warnings", []):
+        where = w.get("source_ref") or {}
+        loc = where.get("file", "")
+        if where.get("line_start"):
+            loc = f"{loc}:{where['line_start']}"
+        print(f"stage4: warning [{w['code']}] {loc}: {w['summary']}", file=sys.stderr)
+        if w.get("fix"):
+            print(f"        fix: {w['fix']}", file=sys.stderr)
     return nets

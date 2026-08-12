@@ -164,8 +164,9 @@ def run(project_dir: Path) -> Report:
                         ),
                         fix=(
                             "Stage 0 keeps a table only if it has >=2 BOM-ish columns "
-                            "(Ref/MPN/Package/Description) or both a pin-ish and a signal-ish "
-                            "column. Anything else is dropped without warning. If this table is "
+                            "(Ref/MPN/Package/Description), both a pin-ish and a signal-ish "
+                            "column, or a GPIO column plus a signal column (a GPIO assignment "
+                            "map). Anything else is dropped without warning. If this table is "
                             "reference material, that's fine — if it's meant to be consumed "
                             "(stackup, net classes, project identity), it currently isn't: "
                             "put that in project.yaml instead."
@@ -199,6 +200,29 @@ def run(project_dir: Path) -> Report:
                                 line=table.line_start,
                             )
                         )
+
+            elif kind == "gpio":
+                heading, hline = _heading_above(text, table.line_start)
+                ref = refdes_in_heading(heading) if heading else None
+                if not ref:
+                    label = (heading or "").lstrip("# ").strip() or "(no heading)"
+                    report.findings.append(
+                        Finding(
+                            code="DOC-009",
+                            severity="warning",
+                            summary=(
+                                f'GPIO map under "{label}" names no host refdes in its '
+                                "heading — Stage 4 cannot join its pins into nets."
+                            ),
+                            fix=(
+                                "Put the host's refdes in the GPIO table's heading, e.g. "
+                                "'## U_MCU GPIO assignment'. Without it the map is reported "
+                                "and skipped, and every host-side pin stays off the board."
+                            ),
+                            file=rel,
+                            line=hline or table.line_start,
+                        )
+                    )
 
             elif kind == "pinout":
                 heading, hline = _heading_above(text, table.line_start)

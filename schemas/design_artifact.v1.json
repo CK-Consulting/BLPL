@@ -91,6 +91,23 @@
         }
       }
     },
+    "gpio_assignments": {
+      "type": "array",
+      "description": "Rows from GPIO-assignment maps (GPIO | Signal | Destination ...): which host pin drives which subsystem signal. Extracted verbatim; Stage 4 interprets them — joining bindable rows into nets and reporting the rest.",
+      "items": {
+        "type": "object",
+        "required": ["host", "gpio", "signal"],
+        "additionalProperties": false,
+        "properties": {
+          "host": {"type": "string", "description": "Refdes of the part whose pins the GPIO column names, from the table's heading."},
+          "gpio": {"type": "string", "description": "Raw pin cell, e.g. 'GPIO8' — or 'GPIO— (TBD)', kept so it can be counted."},
+          "signal": {"type": "string"},
+          "destination": {"type": "string"},
+          "notes": {"type": "string"},
+          "source_ref": {"$ref": "#/$defs/source_ref"}
+        }
+      }
+    },
     "raw_nets": {
       "type": "array",
       "items": {

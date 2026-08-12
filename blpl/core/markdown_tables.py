@@ -96,16 +96,23 @@ _PINOUT_HEADER_TOKENS_SIGNAL = {"signal", "signal name", "function"}
 
 
 def classify(table: ParsedTable) -> str:
-    """Return 'bom', 'pinout', or 'other' for a parsed table.
+    """Return 'bom', 'pinout', 'gpio', or 'other' for a parsed table.
 
     Relaxed matching: we check whether header cells contain known tokens (case
     insensitive) rather than requiring exact column names.
+
+    'gpio' is a GPIO-assignment map (GPIO | Signal | Destination | ...): which
+    host pin drives which subsystem signal. It is deliberately checked *after*
+    pinout — a table with both a pin-ish and a signal-ish column is a pinout
+    even if a header happens to mention GPIO.
     """
     header_lower = [h.lower() for h in table.headers]
     has_pin = any(any(tok in h for tok in _PINOUT_HEADER_TOKENS_PIN) for h in header_lower)
     has_signal = any(any(tok in h for tok in _PINOUT_HEADER_TOKENS_SIGNAL) for h in header_lower)
     if has_pin and has_signal:
         return "pinout"
+    if has_signal and any("gpio" in h for h in header_lower):
+        return "gpio"
     bom_hits = sum(1 for h in header_lower if any(tok == h or tok in h for tok in _BOM_HEADER_TOKENS))
     if bom_hits >= 2:
         return "bom"

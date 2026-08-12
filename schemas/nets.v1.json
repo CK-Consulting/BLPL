@@ -9,6 +9,31 @@
   "properties": {
     "project_id": {"type": "string"},
     "schema_version": {"const": 1},
+    "warnings": {
+      "type": "array",
+      "description": "What Stage 4 could not synthesize cleanly — GPIO-map rows it could not bind, and doc-vs-doc naming disagreements it detected. Same no-silent-drops contract as Stage 0's warnings.",
+      "items": {
+        "type": "object",
+        "required": ["code", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "code": {"type": "string"},
+          "summary": {"type": "string"},
+          "fix": {"type": "string"},
+          "net": {"type": "string"},
+          "source_ref": {
+            "type": "object",
+            "required": ["file"],
+            "additionalProperties": false,
+            "properties": {
+              "file": {"type": "string"},
+              "line_start": {"type": "integer", "minimum": 1},
+              "line_end": {"type": "integer", "minimum": 1}
+            }
+          }
+        }
+      }
+    },
     "nets": {
       "type": "array",
       "items": {
