@@ -110,11 +110,30 @@ export type AuthStatus = { initialized: boolean; unlocked: boolean };
 
 export type SecretMeta = { provider: string; updated_at: string };
 
+/** A named place to send an LLM request. Several of one kind is normal — each
+ *  keeps its own key, under its own name. */
+export type EndpointConfig = {
+  name: string;
+  kind: string;
+  model: string;
+  base_url: string;
+  auth: string;
+  vision: boolean;
+  needs_key: boolean;
+};
+
 export type Settings = {
+  endpoints: EndpointConfig[];
+  /** task → endpoint names, in fallback order. */
+  tasks: Record<string, string[]>;
+  known_kinds: string[];
+  known_tasks: string[];
+  vision_tasks: string[];
+  secrets: SecretMeta[];
+  // Older provider view, still returned while anything speaks it.
   llm_priority: string[];
   llm_models: Record<string, string>;
   known_providers: string[];
-  secrets: SecretMeta[];
 };
 
 export type FabReadiness = {

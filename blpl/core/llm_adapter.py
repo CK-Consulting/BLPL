@@ -60,14 +60,30 @@ class AllProvidersFailed(RuntimeError):
         super().__init__(f"all {len(errors)} LLM provider(s) failed — {detail}")
 
 
-def _build_one(provider: str, model: str | None) -> LLMAdapter:
+def _build_one(
+    provider: str,
+    model: str | None,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> LLMAdapter:
+    """One adapter for one chain entry.
+
+    ``api_key``/``base_url`` come from the app's endpoint registry. Both are
+    optional and default to the SDK's own environment lookup, which is what
+    keeps the plain CLI path (and every legacy chain) working byte-for-byte.
+    """
     provider = provider.lower()
     if provider == "anthropic":
-        return _AnthropicAdapter(model=model or _DEFAULT_MODELS["anthropic"])
-    if provider == "openai":
-        return _OpenAIAdapter(model=model or _DEFAULT_MODELS["openai"])
+        return _AnthropicAdapter(
+            model=model or _DEFAULT_MODELS["anthropic"], api_key=api_key, base_url=base_url
+        )
+    if provider in ("openai", "openai-compatible"):
+        return _OpenAIAdapter(
+            model=model or _DEFAULT_MODELS["openai"], api_key=api_key, base_url=base_url
+        )
     if provider == "ollama":
-        return _OllamaAdapter(model=model or _DEFAULT_MODELS["ollama"])
+        return _OllamaAdapter(model=model or _DEFAULT_MODELS["ollama"], base_url=base_url)
     raise ValueError(f"unknown LLM provider: {provider!r}")
 
 
@@ -93,7 +109,18 @@ def get_adapter(provider: str | None = None, model: str | None = None) -> LLMAda
                 chain = json.loads(chain_json)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"HDM_LLM_CHAIN is not valid JSON: {exc}") from exc
-            members = [_build_one(c["provider"], c.get("model")) for c in chain if c.get("provider")]
+            members = [
+                _build_one(
+                    c.get("provider") or c.get("kind"),
+                    c.get("model"),
+                    # The key rides in its own env var, named by the chain entry.
+                    # Absent (a legacy chain) means "let the SDK read its own".
+                    api_key=os.environ.get(c["key_env"]) if c.get("key_env") else None,
+                    base_url=c.get("base_url") or None,
+                )
+                for c in chain
+                if c.get("provider") or c.get("kind")
+            ]
             if members:
                 return _FallbackAdapter(members)
 
@@ -146,8 +173,10 @@ class _FallbackAdapter:
 class _AnthropicAdapter:
     provider = "anthropic"
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None):
         self.model = model
+        self.api_key = api_key
+        self.base_url = base_url
 
     def complete_json(
         self,
@@ -159,7 +188,12 @@ class _AnthropicAdapter:
     ) -> dict:
         import anthropic  # lazy import; optional dep
 
-        client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY from env
+        kwargs = {}
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+        client = anthropic.Anthropic(**kwargs)  # falls back to ANTHROPIC_API_KEY
         tool_name = "emit_structured_output"
         tool = {
             "name": tool_name,
@@ -202,15 +236,26 @@ class _AnthropicAdapter:
 class _OpenAIAdapter:
     provider = "openai"
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None):
         self.model = model
+        self.api_key = api_key
+        self.base_url = base_url
 
     def complete_json(
         self, system: str, user: str, output_schema: dict, model: str | None = None
     ) -> dict:
         from openai import OpenAI  # lazy import; optional dep
 
-        client = OpenAI()  # uses OPENAI_API_KEY
+        kwargs = {}
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        elif self.base_url:
+            # Local servers usually ignore auth, but the SDK refuses to build a
+            # client with no key at all.
+            kwargs["api_key"] = "not-required"
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+        client = OpenAI(**kwargs)  # falls back to OPENAI_API_KEY
         # OpenAI strict mode requires all properties be in `required` and no open
         # unions. We pass the schema as-is; callers are responsible for strict-compatible shapes.
         resp = client.chat.completions.create(
@@ -242,15 +287,16 @@ class _OpenAIAdapter:
 class _OllamaAdapter:
     provider = "ollama"
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, base_url: str | None = None):
         self.model = model
+        self.base_url = base_url
 
     def complete_json(
         self, system: str, user: str, output_schema: dict, model: str | None = None
     ) -> dict:
         import ollama  # lazy import; optional dep
 
-        host = os.environ.get("OLLAMA_HOST")
+        host = self.base_url or os.environ.get("OLLAMA_HOST")
         client = ollama.Client(host=host) if host else ollama.Client()
         resp = client.chat(
             model=model or self.model,

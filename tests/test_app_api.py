@@ -185,10 +185,18 @@ def test_an_llm_stage_injects_the_full_fallback_chain(tmp_path, client, monkeypa
     import json as _json
     chain = _json.loads(env["HDM_LLM_CHAIN"])
     assert [c["provider"] for c in chain] == ["anthropic", "openai"]
-    # Every provider's key is in its own SDK env var.
+
+    # Each endpoint's key rides in its OWN variable, named by the chain entry.
+    # A single shared ANTHROPIC_API_KEY could not carry two Anthropic endpoints
+    # on different accounts, which is what the endpoint registry exists to allow.
+    assert [c["key_env"] for c in chain] == ["BLPL_LLM_KEY__ANTHROPIC", "BLPL_LLM_KEY__OPENAI"]
+    assert env["BLPL_LLM_KEY__ANTHROPIC"] == "sk-ant-KEY"
+    assert env["BLPL_LLM_KEY__OPENAI"] == "sk-oai-KEY"
+
+    # The primary is also mirrored onto the SDK's own variable, for anything
+    # that reads it directly. Only the primary — two endpoints of one kind must
+    # not fight over one global.
     assert env["ANTHROPIC_API_KEY"] == "sk-ant-KEY"
-    assert env["OPENAI_API_KEY"] == "sk-oai-KEY"
-    # The primary is echoed for anything reading the single-provider vars.
     assert env["HDM_LLM_PROVIDER"] == "anthropic"
 
 

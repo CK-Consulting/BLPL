@@ -251,6 +251,24 @@ def auth_change(body: ChangePassphraseBody, _: str = Depends(require_session)) -
 def get_settings(_: str = Depends(require_session)) -> dict:
     cfg = _load_config()
     return {
+        # The registry: what exists, and which endpoints serve which job.
+        "endpoints": [
+            {
+                "name": ep.name,
+                "kind": ep.kind,
+                "model": ep.resolved_model(),
+                "base_url": ep.base_url,
+                "auth": ep.auth,
+                "vision": ep.can_see,
+                "needs_key": ep.needs_key,
+            }
+            for ep in cfg.endpoints.values()
+        ],
+        "tasks": {t: cfg.chain_for(t) for t in appconfig.KNOWN_TASKS},
+        "known_kinds": list(appconfig.KNOWN_KINDS),
+        "known_tasks": list(appconfig.KNOWN_TASKS),
+        "vision_tasks": sorted(appconfig.VISION_TASKS),
+        # Kept while the UI still speaks in providers.
         "llm_priority": cfg.llm_priority,
         "llm_models": cfg.llm_models,
         "known_providers": list(appconfig.KNOWN_PROVIDERS),
@@ -259,19 +277,62 @@ def get_settings(_: str = Depends(require_session)) -> dict:
     }
 
 
+class EndpointBody(BaseModel):
+    name: str
+    kind: str
+    model: str = ""
+    base_url: str = ""
+    auth: str = "vault"
+    vision: bool | None = None
+
+
 class LlmSettingsBody(BaseModel):
-    priority: list[str]
-    models: dict[str, str]
+    """Either shape is accepted. ``endpoints``/``tasks`` is the registry;
+    ``priority``/``models`` is the older provider view, kept so an existing
+    client keeps working while the UI moves over."""
+
+    endpoints: list[EndpointBody] | None = None
+    tasks: dict[str, list[str]] | None = None
+    priority: list[str] | None = None
+    models: dict[str, str] | None = None
 
 
 @app.put("/api/settings/llm")
 def put_llm_settings(body: LlmSettingsBody, _: str = Depends(require_session)) -> dict:
     cfg = _load_config()
-    cfg.llm_priority = body.priority
-    cfg.llm_models = {**cfg.llm_models, **body.models}
+
+    if body.endpoints is not None:
+        cfg.endpoints = {
+            e.name: appconfig.Endpoint(
+                name=e.name,
+                kind=e.kind,
+                model=e.model,
+                base_url=e.base_url,
+                auth=e.auth,
+                vision=e.vision,
+            )
+            for e in body.endpoints
+        }
+    if body.tasks is not None:
+        cfg.tasks = {t: list(chain) for t, chain in body.tasks.items() if chain}
+
+    # Legacy path: a priority list names endpoints (which, after migration, are
+    # named after the providers they replaced), and models patch those endpoints.
+    if body.models:
+        for name, model in body.models.items():
+            if name in cfg.endpoints:
+                cfg.endpoints[name].model = model
+            elif name in appconfig.KNOWN_PROVIDERS:
+                cfg.endpoints[name] = appconfig.Endpoint(name=name, kind=name, model=model)
+    if body.priority is not None:
+        for name in body.priority:
+            if name not in cfg.endpoints and name in appconfig.KNOWN_PROVIDERS:
+                cfg.endpoints[name] = appconfig.Endpoint(name=name, kind=name)
+        cfg.tasks["default"] = list(body.priority)
+
     try:
         appconfig.save(CONFIG_PATH, cfg)
-    except ValueError as exc:  # unknown provider, empty priority
+    except ValueError as exc:  # unknown kind/endpoint, empty chain, blind vision task
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True}
 
@@ -837,15 +898,16 @@ def _chat_endpoint(token: str) -> chat_mod.Endpoint:
     """
     cfg = _load_config()
     try:
-        primary = llm_resolver.resolve_primary(cfg, identity.providers_with_keys())
+        primary = llm_resolver.resolve_primary(cfg, identity.providers_with_keys(), "chat")
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    key = identity.get_secret(token, primary.provider)
+    key = identity.get_secret(token, primary.name or primary.provider) if primary.needs_key else None
     return chat_mod.Endpoint(
-        name=primary.provider,
+        name=primary.name or primary.provider,
         kind=primary.provider,  # type: ignore[arg-type]
         model=primary.model,
         api_key=key,
+        base_url=primary.base_url or None,
     )
 
 
@@ -985,29 +1047,57 @@ def _stage_env(token: str, stage_name: str) -> dict[str, str]:
     env = dict(os.environ)
     if stage_name not in _LLM_STAGES:
         return env
-    return _inject_llm_env(env, token)
+    # Stage names map to task routes: everything stage0-ish shares the stage0
+    # route, everything stage1-ish the stage1 route, so a cheap model can do the
+    # mechanical re-read while footprint resolution gets the expensive one.
+    task = "stage0" if stage_name.startswith("stage0") else "stage1"
+    return _inject_llm_env(env, token, task)
 
 
-def _inject_llm_env(env: dict[str, str], token: str) -> dict[str, str]:
+def _inject_llm_env(env: dict[str, str], token: str, task: str = "default") -> dict[str, str]:
     """Add the resolved LLM fallback chain and its keys to an environment.
 
-    Keys are decrypted here and passed only in the child's environment, never on a
-    command line or in a log. Raises NoUsableProvider if nothing configured has a
-    key, which the caller turns into a clear 400.
+    Each endpoint's key goes into its *own* variable, named by the chain entry
+    (``BLPL_LLM_KEY__<NAME>``). One shared ANTHROPIC_API_KEY could not express
+    two Anthropic endpoints on different accounts, which is exactly what the
+    endpoint registry exists to allow. The provider-wide variables are still set
+    from the primary so anything reading the SDK defaults keeps working.
+
+    Keys are decrypted here and passed only in the child's environment, never on
+    a command line or in a log. Raises NoUsableProvider if nothing routed to the
+    task has a key, which the caller turns into a clear 400.
     """
     cfg = _load_config()
-    chain = llm_resolver.resolve_chain(cfg, identity.providers_with_keys())
+    with_keys = identity.providers_with_keys()
+    chain = llm_resolver.resolve_chain(cfg, with_keys, task)
     if not chain:
-        llm_resolver.resolve_primary(cfg, identity.providers_with_keys())  # raise the good message
+        llm_resolver.resolve_primary(cfg, with_keys, task)  # raise the good message
 
     for rp in chain:
-        env_var = _PROVIDER_ENV.get(rp.provider)
-        if env_var:
-            key = identity.get_secret(token, rp.provider)
-            if key is not None:
-                env[env_var] = key
+        if not rp.needs_key:
+            continue
+        key = identity.get_secret(token, rp.name or rp.provider)
+        if key is None:
+            continue
+        env[rp.key_env] = key
+        # Mirror onto the SDK's own variable for the primary only — two
+        # endpoints of one kind must not fight over one global.
+        provider_var = _PROVIDER_ENV.get(rp.provider)
+        if provider_var and rp is chain[0]:
+            env[provider_var] = key
 
-    env["HDM_LLM_CHAIN"] = json.dumps([{"provider": rp.provider, "model": rp.model} for rp in chain])
+    env["HDM_LLM_CHAIN"] = json.dumps(
+        [
+            {
+                "provider": rp.provider,
+                "endpoint": rp.name,
+                "model": rp.model,
+                "base_url": rp.base_url,
+                "key_env": rp.key_env if rp.needs_key else "",
+            }
+            for rp in chain
+        ]
+    )
     env["HDM_LLM_PROVIDER"] = chain[0].provider
     if chain[0].model:
         env["HDM_LLM_MODEL"] = chain[0].model

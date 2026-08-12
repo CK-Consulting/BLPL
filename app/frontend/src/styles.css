@@ -269,3 +269,15 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .proposal-head { display: flex; align-items: center; gap: .5rem; padding: .4rem .6rem; background: #191c22; font-size: 12.5px; }
 .proposal-why { padding: .4rem .6rem; font-size: 12.5px; color: #c2c8d0; border-top: 1px solid #24262c; }
 .proposal .diff-body { max-height: 22rem; overflow: auto; border-top: 1px solid #24262c; }
+
+/* --- Settings: endpoint registry + task routing --- */
+.endpoint-row { border: 1px solid #2a2e36; border-radius: 8px; padding: .5rem .7rem; margin-bottom: .5rem; display: flex; flex-direction: column; gap: .4rem; background: #15181d; }
+.endpoint-row.new { border-color: #34507f; }
+.endpoint-top { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.task-row { border-top: 1px solid #24262c; padding: .55rem 0; display: flex; flex-direction: column; gap: .3rem; }
+.task-name { display: flex; align-items: center; gap: .5rem; }
+.chip.toggle { cursor: pointer; color: #9aa4b0; display: inline-flex; align-items: center; gap: .35rem; }
+.chip.toggle:hover:not(:disabled) { border-color: #34507f; }
+.chip.toggle.on { background: #1d2d4d; border-color: #34507f; color: #e6e6e6; }
+.chip.toggle:disabled { opacity: .35; cursor: not-allowed; }
+.chip .ord { background: #34507f; color: #fff; border-radius: 999px; width: 1.15em; height: 1.15em; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; }
