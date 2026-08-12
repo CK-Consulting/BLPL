@@ -20,6 +20,8 @@ type Props = {
   projectId: string;
   /** Bumped after an accepted edit so the editor, diff, and board views refetch. */
   onApplied: () => void;
+  /** The assistant pointing at something in the board while it talks about it. */
+  onHighlight?: (designators: string[], nets: string[]) => void;
 };
 
 type LiveTool = { id: string; name: string; input: Record<string, unknown>; done?: boolean; error?: boolean };
@@ -28,7 +30,7 @@ type LiveTool = { id: string; name: string; input: Record<string, unknown>; done
  *  resumes the moment this is answered, and expires as a denial. */
 type Approval = { call_id: string; tool: string; kind: string; summary: string };
 
-export function ChatPanel({ projectId, onApplied }: Props) {
+export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [filename, setFilename] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -153,6 +155,8 @@ export function ChatPanel({ projectId, onApplied }: Props) {
             );
           else if (event === "proposal") setProposals((p) => [...p, payload.proposal]);
           else if (event === "progress") setProgress(payload.message);
+          else if (event === "ui" && payload.type === "highlight")
+            onHighlight?.(payload.designators ?? [], payload.nets ?? []);
           else if (event === "approval_required")
             setApprovals((a) => [...a, payload as Approval]);
           else if (event === "approval_resolved")

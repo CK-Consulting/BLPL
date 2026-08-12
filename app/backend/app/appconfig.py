@@ -102,8 +102,18 @@ class Endpoint:
 
 
 @dataclass
+class McpServer:
+    """An MCP server BLPL may bridge to. Only kcaa today; the shape is a dict so
+    a second one does not need a schema change."""
+
+    name: str
+    url: str
+
+
+@dataclass
 class AppConfig:
     endpoints: dict[str, Endpoint] = field(default_factory=dict)
+    mcp: dict[str, McpServer] = field(default_factory=dict)
     # task → ordered endpoint names. Index 0 is tried first; the rest are
     # fallbacks, except for panel-style tasks where every entry runs.
     tasks: dict[str, list[str]] = field(default_factory=dict)
@@ -233,6 +243,12 @@ def load(path: Path) -> AppConfig:
             )
         tasks.setdefault("default", priority)
 
+    mcp: dict[str, McpServer] = {}
+    for name, entry in (data.get("mcp", {}) or {}).items():
+        url = str((entry or {}).get("url", ""))
+        if url:
+            mcp[name] = McpServer(name=name, url=url)
+
     projects: dict[str, ProjectEntry] = {}
     for name, entry in (data.get("projects", {}) or {}).items():
         projects[name] = ProjectEntry(
@@ -241,7 +257,7 @@ def load(path: Path) -> AppConfig:
             branch=str(entry.get("branch", "main")),
         )
 
-    cfg = AppConfig(endpoints=endpoints, tasks=tasks, projects=projects)
+    cfg = AppConfig(endpoints=endpoints, tasks=tasks, projects=projects, mcp=mcp)
     cfg.validate()
     return cfg
 
@@ -282,6 +298,11 @@ def _render(cfg: AppConfig) -> str:
         lines.append("# findings are merged with attribution.")
         for task, chain in cfg.tasks.items():
             lines.append(f"{_toml_key(task)} = {_toml_str_list(chain)}")
+        lines.append("")
+
+    for name, server in cfg.mcp.items():
+        lines.append(f"[mcp.{_toml_key(name)}]")
+        lines.append(f'url = "{server.url}"')
         lines.append("")
 
     for name in sorted(cfg.projects):

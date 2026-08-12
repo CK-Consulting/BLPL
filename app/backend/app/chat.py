@@ -422,6 +422,8 @@ class TurnRequest:
     # conversation's.
     endpoint_for: Callable[[str], Endpoint | None] | None = None
     record_tool_call: Callable[[dict], None] | None = None
+    # Where the KiCad MCP server is, if the deploy has one.
+    kicad_url: str | None = None
 
 
 # Finished turns are kept briefly so a reader that arrives late still gets the
@@ -479,6 +481,10 @@ class ChatSessionManager:
             creds=req.creds or CredResolver(),
             endpoint_for=req.endpoint_for or (lambda _t: None),
             on_progress=lambda m: live.publish({"type": "progress", "message": m}),
+            # A tool whose whole effect is visual publishes straight to the
+            # browser; highlighting the part under discussion beats describing
+            # where to look.
+            on_ui=lambda event: live.publish({"type": "ui", **event}),
         )
         live.publish({"type": "start", "turn_id": live.turn_id, "model": req.endpoint.model,
                       "endpoint": req.endpoint.name})
@@ -486,7 +492,7 @@ class ChatSessionManager:
             messages = history_to_messages(req.conversation.read_all())
             adapter = build_chat_adapter(req.endpoint)
             executor = ToolExecutor(
-                default_tools(),
+                default_tools(req.kicad_url),
                 ctx,
                 approve=lambda request: self._ask(live, request),
                 record=req.record_tool_call,

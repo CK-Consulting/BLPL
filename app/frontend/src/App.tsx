@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { AuthGate } from "./components/AuthGate";
-import { DesignView } from "./components/Visualizer";
+import { DesignView, type Highlight } from "./components/Visualizer";
 import { StageRunner } from "./components/StageRunner";
 import { RunHistory } from "./components/RunHistory";
 import { SettingsPanel } from "./components/Settings";
@@ -46,6 +46,9 @@ function Workspace() {
   // re-fetches a freshly emitted board. This is the loop the app exists to
   // shorten: edit markdown → run → see the board.
   const [reloadToken, setReloadToken] = useState(0);
+  // What the assistant last pointed at. Held here rather than in the chat so
+  // the board keeps the highlight while you switch tabs to look at it.
+  const [highlight, setHighlight] = useState<Highlight | null>(null);
 
   const refresh = () =>
     getJSON<Project[]>("/api/projects").then((p) => {
@@ -147,7 +150,9 @@ function Workspace() {
                   Changes
                 </button>
               </div>
-              {tab === "board" && <DesignView projectId={selected} reloadToken={reloadToken} />}
+              {tab === "board" && (
+                <DesignView projectId={selected} reloadToken={reloadToken} highlight={highlight} />
+              )}
               {tab === "edit" && <Editor projectId={selected} onSaved={refresh} />}
               {tab === "bom" && <BomTable projectId={selected} reloadToken={reloadToken} />}
               {tab === "reports" && <Reports projectId={selected} reloadToken={reloadToken} />}
@@ -168,6 +173,10 @@ function Workspace() {
                     onApplied={() => {
                       bump();
                       refresh();
+                    }}
+                    onHighlight={(designators, nets) => {
+                      setHighlight((h) => ({ designators, nets, seq: (h?.seq ?? 0) + 1 }));
+                      setTab("board");
                     }}
                   />
                 </aside>

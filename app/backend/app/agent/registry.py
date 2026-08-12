@@ -323,5 +323,25 @@ def parts_tools() -> list[ToolSpec]:
     ]
 
 
-def default_tools() -> list[ToolSpec]:
-    return project_tools() + parts_tools()
+def kicad_tools(url: str | None) -> list[ToolSpec]:
+    """KiCad editing tools, when a bridge is configured and offers what BLPL
+    needs. An unreachable or too-old server contributes nothing rather than a
+    partial set — discovering there are no vias three-quarters through routing
+    a board is worse than not starting.
+
+    The viewer highlight is always available: it needs no server, and pointing
+    at the part under discussion is useful in every conversation.
+    """
+    from .kicad_bridge import build_tools, highlight_tool, probe
+
+    tools = [highlight_tool()]
+    if not url:
+        return tools
+    status, usable = probe(url)
+    if not status.available:
+        return tools
+    return tools + build_tools(url, usable)
+
+
+def default_tools(kicad_url: str | None = None) -> list[ToolSpec]:
+    return project_tools() + parts_tools() + kicad_tools(kicad_url)

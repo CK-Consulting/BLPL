@@ -44,6 +44,24 @@ Everything stateful is on one named volume, `blpl-data`:
 | `/app/data/runs.db`      | Run history: what ran, when, exit codes (SQLite) |
 | `/app/data/runs/`        | Full log per run, kept after the run ends        |
 
+### KiCad editing (optional)
+
+BLPL's emitter writes a complete board and stops — every net ships unrouted, and
+Stage 8 classifies that as expected rather than broken. To close that gap, point
+BLPL at a headless [kicad-ai-assistant](https://github.com/shaunchokshi/KiCad-AI-Assistant)
+MCP server and the design chat gains routing, placement, zone and net-class
+tools:
+
+```sh
+BLPL_KICAD_MCP=http://kcaa:9000/mcp    # or [mcp.kcaa] url = "..." in blpl.toml
+```
+
+Only the tools BLPL has a policy for are exposed, board edits take a git
+snapshot first (`revert_kicad_edits` undoes the session), and a server missing
+any required tool disables the bridge with the list rather than exposing a
+partial set. `GET /api/kicad/bridge` says which of "not configured", "cannot
+reach it", or "too old" applies.
+
 Runs are durable: a stage keeps running and recording if the browser goes away,
 and the Run history panel can reattach to it (or replay it later) from any
 workstation. Stopping a run is an explicit act in the UI, not a closed tab.

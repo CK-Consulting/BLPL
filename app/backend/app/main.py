@@ -955,6 +955,19 @@ def _task_endpoint(token: str, task: str):
     )
 
 
+def _kicad_bridge_url() -> str | None:
+    """Where the KiCad MCP server is, if one is configured.
+
+    Env var first so a local `blpl serve` can point at a server started by hand
+    without editing the committed config.
+    """
+    from_env = os.environ.get("BLPL_KICAD_MCP")
+    if from_env:
+        return from_env
+    server = _load_config().mcp.get("kcaa")
+    return server.url if server else None
+
+
 class ChatInput(BaseModel):
     content: str
 
@@ -992,6 +1005,7 @@ async def start_chat_turn(
                 record_tool_call=lambda rec: run_manager.record_tool_call(
                     project_id, rec, conversation=conv.path.name
                 ),
+                kicad_url=_kicad_bridge_url(),
             )
         )
     except chat_mod.ProposalError as exc:
@@ -1038,6 +1052,27 @@ def resolve_approval(
             status_code=404, detail="no pending approval with that id — it may have timed out"
         )
     return {"ok": True, "approved": body.approved}
+
+
+@app.get("/api/kicad/bridge")
+def kicad_bridge_status(_: str = Depends(require_session)) -> dict:
+    """Whether the KiCad editing bridge is usable, and if not, exactly why.
+
+    "Not configured", "cannot reach it", and "running but too old" are three
+    different problems with three different fixes, so they are reported as three
+    different answers rather than one absent capability.
+    """
+    from .agent.kicad_bridge import probe
+
+    url = _kicad_bridge_url()
+    if not url:
+        return {
+            "available": False,
+            "url": "",
+            "error": "no KiCad MCP server configured — set BLPL_KICAD_MCP or [mcp.kcaa] url",
+        }
+    status, _usable = probe(url)
+    return status.to_dict()
 
 
 @app.get("/api/projects/{project_id}/tool-calls")

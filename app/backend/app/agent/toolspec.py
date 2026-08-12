@@ -55,11 +55,18 @@ class ToolContext:
     read_shas: dict[str, str] = field(default_factory=dict)
     # Set by whoever owns the run; tools use it to report progress.
     on_progress: Callable[[str], None] | None = None
+    # A channel to the user's screen, for tools whose whole effect is visual —
+    # highlighting the part being discussed rather than describing where to look.
+    on_ui: Callable[[dict], None] | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def note(self, message: str) -> None:
         if self.on_progress:
             self.on_progress(message)
+
+    def ui(self, event: dict) -> None:
+        if self.on_ui:
+            self.on_ui(event)
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { CrossProbeRequest } from "../types/ecad-viewer";
 
 /**
  * Browser-side KiCad renderer.
@@ -15,9 +16,9 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 
 export type BlobSource = { filename: string; content: string };
 
-type Props = { sources: BlobSource[] };
+type Props = { sources: BlobSource[]; highlight?: Highlight | null };
 
-export function Visualizer({ sources }: Props) {
+export function Visualizer({ sources, highlight }: Props) {
   const hostRef = useRef<HTMLElement | null>(null);
 
   // Remount the viewer wholesale when the design changes. The web component
@@ -63,6 +64,41 @@ export function Visualizer({ sources }: Props) {
     };
   }, [viewerKey, sources]);
 
+  // Cross-probing: the chat says "look at U3" and the viewer highlights it.
+  // The request shape has been declared in types/ecad-viewer.d.ts since the
+  // viewer was integrated and never exercised until now. The component may not
+  // implement it on every build, so a failure is logged and ignored rather than
+  // breaking the board view — the conversation still works without the pointer.
+  useEffect(() => {
+    const viewer = hostRef.current as (HTMLElement & {
+      crossProbe?: (req: CrossProbeRequest) => unknown;
+    }) | null;
+    if (!viewer || !highlight) return;
+    const targets: CrossProbeRequest[] = [
+      ...highlight.designators.map((value) => ({
+        sourceContext: "SCH" as const,
+        mode: "select" as const,
+        kind: "designator" as const,
+        value,
+        designator: value,
+      })),
+      ...highlight.nets.map((value) => ({
+        sourceContext: "SCH" as const,
+        mode: "select" as const,
+        kind: "net" as const,
+        value,
+        net: value,
+      })),
+    ];
+    for (const request of targets) {
+      try {
+        viewer.crossProbe?.(request);
+      } catch {
+        /* the loaded viewer build does not cross-probe; the answer still stands */
+      }
+    }
+  }, [highlight]);
+
   return (
     <ecad-viewer
       ref={attach}
@@ -75,7 +111,19 @@ export function Visualizer({ sources }: Props) {
 }
 
 /** Fetches the emitted design for a project and renders it. */
-export function DesignView({ projectId, reloadToken }: { projectId: string; reloadToken: number }) {
+/** What the chat asked us to point at. Bumping `seq` re-fires the same target,
+ *  so asking twice about U3 highlights it twice. */
+export type Highlight = { designators: string[]; nets: string[]; seq: number };
+
+export function DesignView({
+  projectId,
+  reloadToken,
+  highlight,
+}: {
+  projectId: string;
+  reloadToken: number;
+  highlight?: Highlight | null;
+}) {
   const [sources, setSources] = useState<BlobSource[] | null>(null);
   const [archived, setArchived] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -127,7 +175,7 @@ export function DesignView({ projectId, reloadToken }: { projectId: string; relo
           has no current output. Re-run <code>stage6</code> to emit the live board.
         </div>
       )}
-      <Visualizer sources={sources} />
+      <Visualizer sources={sources} highlight={highlight} />
     </div>
   );
 }
