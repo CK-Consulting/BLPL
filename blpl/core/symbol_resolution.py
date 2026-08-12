@@ -32,11 +32,43 @@ from pathlib import Path
 # Where a user puts symbols they drew themselves. Created by `blpl init`.
 CUSTOM_LIB_DIRNAME = "libraries"
 GENERATED_LIB_DIRNAME = "generated"
+MODULES_DIRNAME = "modules"
+
+# Where cross-project modules live when they are not vendored into the project.
+# A module is a project asset that deserves to be shared between boards — that
+# is the whole point of extracting one — so it gets a root outside any single
+# project, overridable for a deploy that keeps them elsewhere.
+def shared_modules_root() -> Path:
+    import os
+
+    return Path(os.environ.get("BLPL_MODULES_ROOT", Path.home() / ".blpl" / "modules"))
+
+
+def _module_lib_dirs(project_dir: Path) -> list[Path]:
+    """Every module directory that could supply a library.
+
+    A module directory *is* a library root: extraction writes each source
+    library back under its own name (``Device.kicad_sym``, ``Package_QFP.pretty/``)
+    rather than inventing one, so a lib_id copied from the source board still
+    resolves without rewriting.
+
+    Project-local modules come first: a project that vendored a module has
+    pinned that version on purpose, and a shared copy must not silently
+    override it.
+    """
+    out: list[Path] = []
+    for base in (Path(project_dir) / MODULES_DIRNAME, shared_modules_root()):
+        if not base.is_dir():
+            continue
+        out.extend(sorted(m for m in base.iterdir() if m.is_dir()))
+    return out
 
 # Source of a resolved symbol, in descending order of trustworthiness.
 STOCK = "stock"
 CUSTOM = "custom"
 GENERATED = "generated"
+# A symbol that came out of a real board via module extraction.
+MODULE = "module"
 PLACEHOLDER = "placeholder"
 
 
@@ -57,6 +89,10 @@ def search_path(project_dir: Path, stock_root: Path) -> list[tuple[Path, str]]:
     project_dir = Path(project_dir)
     return [
         (project_dir / CUSTOM_LIB_DIRNAME / "symbols", CUSTOM),
+        # Modules sit between hand-authored and generated: they are real,
+        # proven symbols from a shipped board, but a symbol the user drew for
+        # THIS project still wins.
+        *[(m, MODULE) for m in _module_lib_dirs(project_dir)],
         (project_dir / GENERATED_LIB_DIRNAME / "symbols", GENERATED),
         (Path(stock_root), STOCK),
     ]
@@ -82,6 +118,7 @@ def footprint_search_path(project_dir: Path, stock_root: Path) -> list[tuple[Pat
     project_dir = Path(project_dir)
     return [
         (project_dir / CUSTOM_LIB_DIRNAME / "footprints", CUSTOM),
+        *[(m, MODULE) for m in _module_lib_dirs(project_dir)],
         (project_dir / GENERATED_LIB_DIRNAME / "footprints", GENERATED),
         (Path(stock_root), STOCK),
     ]

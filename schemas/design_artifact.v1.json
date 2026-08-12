@@ -4,29 +4,55 @@
   "title": "Design Artifact v1",
   "description": "Stage 0 output. Entities extracted from Markdown before MPN resolution.",
   "type": "object",
-  "required": ["project_id", "schema_version", "components", "connectors", "subsystems", "raw_nets"],
+  "required": [
+    "project_id",
+    "schema_version",
+    "components",
+    "connectors",
+    "subsystems",
+    "raw_nets"
+  ],
   "additionalProperties": false,
   "properties": {
-    "project_id": {"type": "string"},
-    "schema_version": {"const": 1},
+    "project_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
     "source_files": {
       "type": "array",
-      "items": {"type": "string"},
+      "items": {
+        "type": "string"
+      },
       "description": "Relative paths to the Markdown files this artifact was extracted from."
     },
     "warnings": {
       "type": "array",
-      "description": "What Stage 0 could not extract cleanly. Stage 0 is forgiving by design — it skips what it does not recognize — and the silence around that is the parser's worst behaviour: a dropped pinout table produces no error, the pins simply never become nets. Every skip is recorded here so the loss is visible in the artifact itself, not only to whoever remembered to run `blpl doctor`.",
+      "description": "What Stage 0 could not extract cleanly. Stage 0 is forgiving by design \u2014 it skips what it does not recognize \u2014 and the silence around that is the parser's worst behaviour: a dropped pinout table produces no error, the pins simply never become nets. Every skip is recorded here so the loss is visible in the artifact itself, not only to whoever remembered to run `blpl doctor`.",
       "items": {
         "type": "object",
-        "required": ["code", "summary"],
+        "required": [
+          "code",
+          "summary"
+        ],
         "additionalProperties": false,
         "properties": {
-          "code": {"type": "string"},
-          "summary": {"type": "string"},
-          "fix": {"type": "string"},
-          "local_id": {"type": "string"},
-          "source_ref": {"$ref": "#/$defs/source_ref"}
+          "code": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "fix": {
+            "type": "string"
+          },
+          "local_id": {
+            "type": "string"
+          },
+          "source_ref": {
+            "$ref": "#/$defs/source_ref"
+          }
         }
       }
     },
@@ -34,17 +60,39 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["local_id", "description"],
+        "required": [
+          "local_id",
+          "description"
+        ],
         "additionalProperties": false,
         "properties": {
-          "local_id": {"type": "string", "description": "Stable ID within the project (e.g. 'U1', 'ZYNQ_MPSOC')."},
-          "description": {"type": "string"},
-          "role": {"type": "string"},
-          "package_hint": {"type": "string"},
-          "pin_count_hint": {"type": "integer", "minimum": 1},
-          "manufacturer_hint": {"type": "string"},
-          "part_hint": {"type": "string", "description": "Approximate MPN from Markdown; resolved in Stage 1."},
-          "source_ref": {"$ref": "#/$defs/source_ref"}
+          "local_id": {
+            "type": "string",
+            "description": "Stable ID within the project (e.g. 'U1', 'ZYNQ_MPSOC')."
+          },
+          "description": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "package_hint": {
+            "type": "string"
+          },
+          "pin_count_hint": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "manufacturer_hint": {
+            "type": "string"
+          },
+          "part_hint": {
+            "type": "string",
+            "description": "Approximate MPN from Markdown; resolved in Stage 1."
+          },
+          "source_ref": {
+            "$ref": "#/$defs/source_ref"
+          }
         }
       }
     },
@@ -52,28 +100,53 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["local_id", "pins"],
+        "required": [
+          "local_id",
+          "pins"
+        ],
         "additionalProperties": false,
         "properties": {
-          "local_id": {"type": "string"},
-          "description": {"type": "string"},
-          "pitch_mm": {"type": "number"},
-          "pin_count": {"type": "integer", "minimum": 1},
+          "local_id": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "pitch_mm": {
+            "type": "number"
+          },
+          "pin_count": {
+            "type": "integer",
+            "minimum": 1
+          },
           "pins": {
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["pin", "signal"],
+              "required": [
+                "pin",
+                "signal"
+              ],
               "additionalProperties": false,
               "properties": {
-                "pin": {"type": "string"},
-                "signal": {"type": "string"},
-                "voltage": {"type": "string"},
-                "function": {"type": "string"}
+                "pin": {
+                  "type": "string"
+                },
+                "signal": {
+                  "type": "string"
+                },
+                "voltage": {
+                  "type": "string"
+                },
+                "function": {
+                  "type": "string"
+                }
               }
             }
           },
-          "source_ref": {"$ref": "#/$defs/source_ref"}
+          "source_ref": {
+            "$ref": "#/$defs/source_ref"
+          }
         }
       }
     },
@@ -81,30 +154,61 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["name"],
+        "required": [
+          "name"
+        ],
         "additionalProperties": false,
         "properties": {
-          "name": {"type": "string"},
-          "member_local_ids": {"type": "array", "items": {"type": "string"}},
-          "notes": {"type": "string"},
-          "source_ref": {"$ref": "#/$defs/source_ref"}
+          "name": {
+            "type": "string"
+          },
+          "member_local_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "notes": {
+            "type": "string"
+          },
+          "source_ref": {
+            "$ref": "#/$defs/source_ref"
+          }
         }
       }
     },
     "gpio_assignments": {
       "type": "array",
-      "description": "Rows from GPIO-assignment maps (GPIO | Signal | Destination ...): which host pin drives which subsystem signal. Extracted verbatim; Stage 4 interprets them — joining bindable rows into nets and reporting the rest.",
+      "description": "Rows from GPIO-assignment maps (GPIO | Signal | Destination ...): which host pin drives which subsystem signal. Extracted verbatim; Stage 4 interprets them \u2014 joining bindable rows into nets and reporting the rest.",
       "items": {
         "type": "object",
-        "required": ["host", "gpio", "signal"],
+        "required": [
+          "host",
+          "gpio",
+          "signal"
+        ],
         "additionalProperties": false,
         "properties": {
-          "host": {"type": "string", "description": "Refdes of the part whose pins the GPIO column names, from the table's heading."},
-          "gpio": {"type": "string", "description": "Raw pin cell, e.g. 'GPIO8' — or 'GPIO— (TBD)', kept so it can be counted."},
-          "signal": {"type": "string"},
-          "destination": {"type": "string"},
-          "notes": {"type": "string"},
-          "source_ref": {"$ref": "#/$defs/source_ref"}
+          "host": {
+            "type": "string",
+            "description": "Refdes of the part whose pins the GPIO column names, from the table's heading."
+          },
+          "gpio": {
+            "type": "string",
+            "description": "Raw pin cell, e.g. 'GPIO8' \u2014 or 'GPIO\u2014 (TBD)', kept so it can be counted."
+          },
+          "signal": {
+            "type": "string"
+          },
+          "destination": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "source_ref": {
+            "$ref": "#/$defs/source_ref"
+          }
         }
       }
     },
@@ -112,37 +216,70 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["name", "members"],
+        "required": [
+          "name",
+          "members"
+        ],
         "additionalProperties": false,
         "properties": {
-          "name": {"type": "string"},
-          "class_hint": {"type": "string"},
+          "name": {
+            "type": "string"
+          },
+          "class_hint": {
+            "type": "string"
+          },
           "members": {
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["local_id", "pin"],
+              "required": [
+                "local_id",
+                "pin"
+              ],
               "additionalProperties": false,
               "properties": {
-                "local_id": {"type": "string"},
-                "pin": {"type": "string"}
+                "local_id": {
+                  "type": "string"
+                },
+                "pin": {
+                  "type": "string"
+                }
               }
             }
           },
-          "source_ref": {"$ref": "#/$defs/source_ref"}
+          "source_ref": {
+            "$ref": "#/$defs/source_ref"
+          }
         }
+      }
+    },
+    "modules": {
+      "type": "array",
+      "description": "Reusable function-set modules this design composes, named in a 'Modules' section of the Markdown and expanded into components with the module name prefixed onto each refdes. A carrier board is mostly this: proven blocks lifted from earlier boards, plus the glue around them.",
+      "items": {
+        "type": "string"
       }
     }
   },
   "$defs": {
     "source_ref": {
       "type": "object",
-      "required": ["file"],
+      "required": [
+        "file"
+      ],
       "additionalProperties": false,
       "properties": {
-        "file": {"type": "string"},
-        "line_start": {"type": "integer", "minimum": 1},
-        "line_end": {"type": "integer", "minimum": 1}
+        "file": {
+          "type": "string"
+        },
+        "line_start": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "line_end": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     }
   }

@@ -828,6 +828,23 @@ def list_artifacts(project_id: str, _: str = Depends(require_session)) -> dict:
     return {"artifacts": artifacts}
 
 
+@app.get("/api/projects/{project_id}/modules")
+def list_project_modules(project_id: str, _: str = Depends(require_session)) -> dict:
+    """Reusable function-set modules this project can compose.
+
+    Both roots, project-local first, because a project that vendored a module
+    pinned that version deliberately and a shared copy must not shadow it.
+    """
+    from blpl.core.symbol_resolution import shared_modules_root
+    from blpl.importer_kicad import list_modules
+
+    project_dir = _project_dir(project_id)
+    modules = list_modules(project_dir, shared_modules_root())
+    for m in modules:
+        m["scope"] = "project" if Path(m["root"]) == project_dir else "shared"
+    return {"modules": modules, "shared_root": str(shared_modules_root())}
+
+
 class NewConversationInput(BaseModel):
     title: str = "conversation"
 

@@ -8,6 +8,7 @@ import { NewProject, ProjectSync } from "./components/ProjectControls";
 import { Editor } from "./components/Editor";
 import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
+import { ModuleLibrary } from "./components/ModuleLibrary";
 import { DiffView } from "./components/DiffView";
 import { Artifacts } from "./components/Artifacts";
 import { ChatPanel } from "./components/ChatPanel";
@@ -27,7 +28,7 @@ function Workspace() {
   const [selected, setSelected] = useState<string | null>(null);
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [tab, setTab] = useState<"board" | "edit" | "bom" | "reports" | "artifacts" | "changes">("board");
+  const [tab, setTab] = useState<"board" | "edit" | "bom" | "modules" | "reports" | "artifacts" | "changes">("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
   const chat = useResizable("blpl.chatWidth", 420);
   // Off by default so the workspace opens exactly as it did before; the
@@ -140,6 +141,9 @@ function Workspace() {
                 <button className={tab === "bom" ? "on" : ""} onClick={() => setTab("bom")}>
                   BOM
                 </button>
+                <button className={tab === "modules" ? "on" : ""} onClick={() => setTab("modules")}>
+                  Modules
+                </button>
                 <button className={tab === "reports" ? "on" : ""} onClick={() => setTab("reports")}>
                   Reports
                 </button>
@@ -155,6 +159,7 @@ function Workspace() {
               )}
               {tab === "edit" && <Editor projectId={selected} onSaved={refresh} />}
               {tab === "bom" && <BomTable projectId={selected} reloadToken={reloadToken} />}
+              {tab === "modules" && <ModuleLibrary projectId={selected} reloadToken={reloadToken} />}
               {tab === "reports" && <Reports projectId={selected} reloadToken={reloadToken} />}
               {tab === "artifacts" && <Artifacts projectId={selected} reloadToken={reloadToken} />}
               {tab === "changes" && <DiffView projectId={selected} reloadToken={reloadToken} />}

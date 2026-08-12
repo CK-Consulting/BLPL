@@ -181,6 +181,180 @@ async def _to_thread(fn, *a, **kw):
 
 
 # ---------------------------------------------------------------------------
+# Import and module extraction
+# ---------------------------------------------------------------------------
+
+
+async def _read_board(ctx: ToolContext, args: dict) -> str:
+    from blpl.importer_kicad import read_project
+
+    sub = str(args.get("directory", "")).strip() or "."
+    target = (ctx.project_dir / sub).resolve()
+    if not target.is_relative_to(ctx.project_dir.resolve()):
+        raise ToolDenied("directory must be inside the project")
+    ctx.sandbox.check_read(target)
+    if not target.is_dir():
+        raise FileNotFoundError(f"no directory {sub!r} in this project")
+    ctx.note(f"reading KiCad design under {sub}")
+    board = await _to_thread(read_project, target)
+    ctx.extras["imported_board"] = board
+    data = board.to_dict()
+    # The full net list of a real board is enormous and rarely what the next
+    # question needs; the summary plus components is what a human would skim.
+    data["nets"] = data["nets"][:40]
+    if len(board.nets) > 40:
+        data["nets_note"] = f"showing 40 of {len(board.nets)} nets — ask about specific ones"
+    return json.dumps(data, indent=2)
+
+
+async def _plan_module(ctx: ToolContext, args: dict) -> str:
+    from blpl.importer_kicad import plan_module, read_project
+
+    refdes = [str(r) for r in (args.get("refdes") or [])]
+    if not refdes:
+        raise ToolDenied("refdes is required — name the parts that make up the block")
+    board = ctx.extras.get("imported_board")
+    if board is None:
+        sub = str(args.get("directory", "")).strip() or "."
+        board = await _to_thread(read_project, (ctx.project_dir / sub).resolve())
+        ctx.extras["imported_board"] = board
+
+    spec = plan_module(
+        board,
+        refdes,
+        name=str(args.get("name") or "module"),
+        description=str(args.get("description", "")),
+    )
+    ctx.extras["module_spec"] = spec
+    return json.dumps(spec.to_manifest(), indent=2)
+
+
+async def _extract_module(ctx: ToolContext, args: dict) -> str:
+    from blpl.core.symbol_resolution import search_path
+    from blpl.core.stage6_compile_kicad import _DEFAULT_FOOTPRINTS, _DEFAULT_SYMBOLS
+    from blpl.importer_kicad import plan_module, read_project, write_module
+
+    name = str(args.get("name", "")).strip()
+    if not name or "/" in name or name.startswith("."):
+        raise ToolDenied("name must be a simple module name")
+    refdes = [str(r) for r in (args.get("refdes") or [])]
+    board = ctx.extras.get("imported_board")
+    if board is None:
+        board = await _to_thread(read_project, ctx.project_dir)
+    spec = plan_module(
+        board, refdes, name=name, description=str(args.get("description", ""))
+    )
+    if not spec.components:
+        raise ToolDenied("none of those parts are on this board — nothing to extract")
+
+    dest_root = ctx.project_dir
+    ctx.sandbox.check_write(dest_root / "modules")
+    symbol_roots = [p for p, _ in search_path(ctx.project_dir, _DEFAULT_SYMBOLS)]
+    path, notes = await _to_thread(
+        write_module,
+        spec,
+        dest_root,
+        symbol_roots=symbol_roots,
+        footprint_root=_DEFAULT_FOOTPRINTS,
+        overwrite=bool(args.get("overwrite")),
+    )
+    ctx.note(f"wrote module {name}")
+    return json.dumps(
+        {"module": name, "path": str(path), "ports": len(spec.ports),
+         "components": len(spec.components), "notes": notes + spec.warnings},
+        indent=2,
+    )
+
+
+async def _list_modules(ctx: ToolContext, args: dict) -> str:
+    from blpl.core.symbol_resolution import shared_modules_root
+    from blpl.importer_kicad import list_modules
+
+    found = await _to_thread(list_modules, ctx.project_dir, shared_modules_root())
+    return json.dumps({"modules": found}, indent=2)
+
+
+def module_tools() -> list[ToolSpec]:
+    return [
+        ToolSpec(
+            name="read_kicad_design",
+            description=(
+                "Read an existing KiCad design in this project — schematics and PCB — into "
+                "components and nets. Use this when the project contains a board somebody else "
+                "made (an imported open-hardware design, a previous revision) and you need to "
+                "know what is actually on it before answering."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "directory": {
+                        "type": "string",
+                        "description": "Subdirectory to read; omit for the project root.",
+                    }
+                },
+            },
+            kind="file_read",
+            handler=_read_board,
+        ),
+        ToolSpec(
+            name="plan_module_extraction",
+            description=(
+                "Work out what extracting a set of parts as a reusable module would produce — "
+                "above all its interface: the nets that cross the boundary and become the module's "
+                "ports. Always do this before extracting, and walk the port list with the user: "
+                "the ports are the contract a future carrier board has to satisfy, and a wrong "
+                "boundary is much cheaper to fix here than after the module exists."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "refdes": {"type": "array", "items": {"type": "string"}},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "directory": {"type": "string"},
+                },
+                "required": ["refdes", "name"],
+            },
+            kind="file_read",
+            handler=_plan_module,
+        ),
+        ToolSpec(
+            name="extract_module",
+            description=(
+                "Write a reusable module directory from a set of parts: its manifest and interface, "
+                "the symbols and footprints it uses (copied in, so it survives the source board "
+                "disappearing), and its BOM. Run plan_module_extraction first and get the user to "
+                "agree with the ports."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "refdes": {"type": "array", "items": {"type": "string"}},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "overwrite": {"type": "boolean"},
+                },
+                "required": ["refdes", "name"],
+            },
+            kind="file_mutation",
+            handler=_extract_module,
+            approval="ask_always",
+        ),
+        ToolSpec(
+            name="list_modules",
+            description=(
+                "List reusable modules available to this project — its own, and the shared "
+                "library. Check here before designing a block from scratch: a proven one may "
+                "already exist."
+            ),
+            input_schema={"type": "object", "properties": {}},
+            kind="query",
+            handler=_list_modules,
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # The set
 # ---------------------------------------------------------------------------
 
@@ -344,4 +518,4 @@ def kicad_tools(url: str | None) -> list[ToolSpec]:
 
 
 def default_tools(kicad_url: str | None = None) -> list[ToolSpec]:
-    return project_tools() + parts_tools() + kicad_tools(kicad_url)
+    return project_tools() + parts_tools() + module_tools() + kicad_tools(kicad_url)

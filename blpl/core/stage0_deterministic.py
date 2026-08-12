@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from . import markdown_tables as _md
+from . import modules_remix as _modules_remix
 from . import schema
 
 
@@ -133,6 +134,7 @@ def extract(md_files: list[Path]) -> dict:
     raw_nets: list[dict] = []              # not filled by deterministic stage 0 — LLM's job
     subsystems: list[dict] = []            # not filled by deterministic stage 0 — LLM's job
     gpio_assignments: list[dict] = []      # host GPIO → signal rows, consumed by Stage 4
+    module_names: list[str] = []           # reusable blocks named in a "Modules" section
     warnings: list[dict] = []
     unanchored_seen = 0
 
@@ -142,6 +144,9 @@ def extract(md_files: list[Path]) -> dict:
         if not md_path.exists():
             continue
         text = md_path.read_text(encoding="utf-8")
+        for name in _modules_remix.parse_modules_section(text):
+            if name not in module_names:
+                module_names.append(name)
         tables = _md.extract_tables_from_file(md_path)
         # Track the source_file string as the parser recorded it (relative if possible).
         if tables:
@@ -249,6 +254,10 @@ def extract(md_files: list[Path]) -> dict:
         artifact["gpio_assignments"] = gpio_assignments
     if warnings:
         artifact["warnings"] = warnings
+    if module_names:
+        # Modules are resolved relative to the design document, which is the
+        # only project location this stage knows about.
+        _modules_remix.expand(artifact, Path(md_files[0]).resolve().parent, module_names)
     return artifact
 
 

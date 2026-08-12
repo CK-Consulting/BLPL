@@ -284,3 +284,15 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 
 .approval { border: 1px solid #6b5a1f; background: #1f1b12; border-radius: 8px; padding: .45rem .6rem; display: flex; flex-direction: column; gap: .25rem; }
 .approval-head { display: flex; align-items: center; gap: .5rem; font-size: 12.5px; }
+
+/* --- module library --- */
+.modules { display: flex; flex-direction: column; gap: .6rem; padding: .7rem; overflow: auto; min-height: 0; }
+.module-card { display: flex; flex-direction: column; gap: .35rem; padding: .6rem .7rem; background: #191c22; border: 1px solid #2a2e36; border-radius: 8px; }
+.module-card header { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; padding: 0; border: none; background: none; }
+.strong { font-weight: 600; }
+/* A vendored copy is pinned on purpose and outranks a shared one, so it reads
+   as the stronger of the two. */
+.badge.project { background: #16351f; color: #6ee7a0; }
+.badge.shared { background: #22262e; color: #9aa4b0; }
+.ports { display: flex; flex-wrap: wrap; gap: .25rem; }
+.ports .port { font-size: 12px; padding: .1rem .4rem; border-radius: 4px; background: #22262e; color: #cfd6e0; }
