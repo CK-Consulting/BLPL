@@ -395,3 +395,44 @@ def test_project_list_fab_is_null_when_review_is_unparseable(client) -> None:
     (pipeline / "review_report.json").write_text("{ not json")
     proj = next(p for p in client.get("/api/projects").json() if p["id"] == "scratch")
     assert proj["fab"] is None
+
+
+def test_preflight_needs_a_session(client) -> None:
+    assert client.get("/api/projects/scratch/preflight").status_code == 401
+
+
+def test_preflight_reports_what_stage0_would_discard(unlocked) -> None:
+    """The panel's whole reason to exist: Stage 0 drops tables it cannot
+    classify and says nothing, so the discard has to be visible *before* a run
+    rather than inferred from an artifact diff afterwards."""
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json={"name": "scratch"})
+    proj = main.PROJECTS_ROOT / "scratch"
+    (proj / "design.md").write_text(
+        "## Net classes\n\n"
+        "| Class | Trace width | Clearance |\n|---|---|---|\n| Power | 0.5 | 0.2 |\n\n"
+        "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U_MCU | ESP32-S3 | Module |\n",
+        encoding="utf-8",
+    )
+    r = unlocked.get("/api/projects/scratch/preflight")
+    assert r.status_code == 200
+    body = r.json()
+    codes = {f["code"] for f in body["findings"]}
+    # The net-class table matches neither a BOM nor a pinout, so it is silently
+    # dropped; the MCU has no pinout, so Stage 3 will halt on it.
+    assert "DOC-001" in codes
+    assert "DOC-011" in codes
+    assert body["summary"]["tables_discarded"] == 1
+
+
+def test_preflight_mutates_nothing(unlocked) -> None:
+    # It is safe to call on every visit to the tab, which is why the panel does.
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json={"name": "scratch"})
+    proj = main.PROJECTS_ROOT / "scratch"
+    (proj / "design.md").write_text("## Notes\n\nnothing here\n", encoding="utf-8")
+    before = sorted(p.name for p in proj.iterdir())
+    unlocked.get("/api/projects/scratch/preflight")
+    assert sorted(p.name for p in proj.iterdir()) == before

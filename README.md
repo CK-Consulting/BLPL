@@ -23,6 +23,7 @@ Hardware projects usually live in two disconnected worlds: narrative design docs
 | KiCad plugin (pcbnew Python API) | Working. Requires KiCad 10.x. |
 | Classifier (passives, generic connectors, 3-pin semis) | Working. Auto-resolves most of dev.03. |
 | Connector synthesis (pinout-only → BOM) | Working. |
+| Input doctor / Preflight | Working. 12 checks over your markdown, before any stage runs. |
 | Web UI | Working. Vault-gated, git-backed projects, board viewer, durable runs. |
 | Design chat + agent tools | Working. Proposal-based edits, parts lookup, datasheet extraction. |
 | Module extraction / remix | Working — see `docs/workbench.md`. |

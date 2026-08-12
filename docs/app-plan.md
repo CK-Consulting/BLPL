@@ -270,14 +270,33 @@ That silence is the actual usability bug. A `blpl doctor --project-dir <p>` comm
   unanchored table now gets its own placeholder (`UNKNOWN_1`, `UNKNOWN_2`, …), so
   unrelated pinouts can never fuse. See `STAGE0-001/002/003` and the tests in
   `tests/test_stage0_deterministic.py`.
-- Grouped pin ranges (`| 1-5 | Power |`) that break pin mapping.
-- Duplicate signal names silently collapsing into one net (the `Reserved` /`NC` trap).
-- `footprint_hint` strings that don't exist on disk under `kicad-footprints/`.
-- Specific parts (FPGA/MCU/PMIC) with no `pin_map`, which *will* halt Stage 3.
+- ~~Grouped pin ranges (`| 1-5 | Power |`) that break pin mapping.~~ **REPORTED**
+  (`DOC-003`).
+- ~~Duplicate signal names silently collapsing into one net (the `Reserved` /`NC`
+  trap).~~ **REPORTED** (`DOC-004` for placeholder names, `DOC-008` for genuine
+  collisions; power rails stay quiet, since merging those is the point).
+- ~~`footprint_hint` strings that don't exist on disk under `kicad-footprints/`.~~
+  **REPORTED** (`DOC-010`). Only library-form `Lib:Name` strings are checked — a
+  bare `QFN-38` is a hint the classifier resolves later, so testing it against the
+  filesystem would report a problem the pipeline exists to solve.
+- ~~Specific parts (FPGA/MCU/PMIC) with no `pin_map`, which *will* halt Stage 3.~~
+  **REPORTED** (`DOC-011`), keyed on the `U` refdes prefix rather than on the
+  classifier. Calling `component_classifier.classify` here is the obvious
+  implementation and it is wrong: the classifier reads `description` and
+  `pin_count`, which **Stage 1's LLM** fills in, so on raw markdown it declines
+  almost everything — 43 findings on `dev.04`, capacitors and resistors included.
+  The refdes prefix is the signal that is actually deterministic at this point;
+  it gives 6 findings on `dev.04`, every one a real IC with no pinout.
 
 Every one of these is cheap to detect and currently costs the user a full pipeline
 run plus a confusing artifact-diff to discover. This is the feature that makes BLPL
 feel like a product. **I would ship it before the settings UI.**
+
+**Shipped.** `blpl doctor --project-dir <p>` (`--json` for machines), plus the
+**Preflight** tab, served by `GET /api/projects/{id}/preflight`. The panel groups
+findings by code — a malformed BOM table produces one finding per row, and twenty
+copies of one sentence reads as twenty problems — and shows each group's *fix*
+inline, since knowing a table was discarded is only half an answer.
 
 ## Security debt that must be paid *before* the vault, not after
 
@@ -331,7 +350,7 @@ Each phase is independently shippable and leaves the CLI working.
 
 | Phase | Scope | Why here |
 |---|---|---|
-| **A. Input doctor** | `blpl doctor` + preflight panel; fix the heading regex | Highest value/effort ratio in the whole plan; needs none of the below |
+| ~~**A. Input doctor**~~ ✅ | `blpl doctor` + preflight panel; fix the heading regex | Highest value/effort ratio in the whole plan; needs none of the below |
 | **B. Config layer** | `blpl.toml` cascade, loader, secret-rejecting validator, `blpl config` | Everything else reads config |
 | **B½. Security debt** | The 5 items above | Must precede the vault, not follow it |
 | **C. Identity + vault** | SQLite, Argon2id/AES-GCM, auth routes, `get_adapter(task=)` reads vault | The security core |

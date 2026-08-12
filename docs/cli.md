@@ -2,6 +2,32 @@
 
 All commands: `blpl <subcommand> [flags]`. The old `hdm-pipeline` name is kept as an alias.
 
+## Preflight
+
+### `doctor`
+Report what Stage 0 would silently drop or misread — **before** running it. Reads
+markdown, mutates nothing, and is the intended first step of every session. Also
+served to the Preflight tab at `GET /api/projects/{id}/preflight`.
+```
+blpl doctor --project-dir <proj> [--json]
+```
+| Code | What it catches |
+|---|---|
+| `DOC-000` | No markdown at the project root (Stage 0 does not recurse) |
+| `DOC-001` | A table whose columns match neither a BOM nor a pinout — discarded |
+| `DOC-002` | A pinout table with no refdes in its heading to anchor to |
+| `DOC-003` | A grouped pin range (`1-5`) that cannot be mapped one-to-one |
+| `DOC-004` | A placeholder name (`Reserved`) shorting every pin carrying it into one net |
+| `DOC-005` | A BOM row with no MPN |
+| `DOC-006` | A pinout table with no BOM row |
+| `DOC-007` | No `project.yaml` — Stage 5 will halt |
+| `DOC-008` | One signal name on several components — a shared bus, or a silent short |
+| `DOC-009` | A GPIO map whose heading names no host refdes |
+| `DOC-010` | A library-form footprint that does not exist on disk |
+| `DOC-011` | An IC with no pinout table — Stage 3 will halt asking for its pin_map |
+
+Exit is 0 unless a `DOC-*` **error** was found; warnings do not fail.
+
 ## Per-stage commands
 
 ### `stage0-det`

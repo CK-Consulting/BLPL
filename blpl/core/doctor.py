@@ -18,6 +18,7 @@ time, and it is the intended first step of every session.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +43,11 @@ _NC_SIGNALS = _stage4._NC_SIGNALS
 _FAKE_NC_PLACEHOLDERS = {"RESERVED", "UNUSED", "TBD", "N.A.", "NA", "DNU", "—", "–"}
 
 _SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
+
+# An IC, by BLPL's own refdes convention: U1, U_MCU, U_GNSS. Deliberately not
+# Q/D (3-pin small-signal parts the classifier resolves), not J (connectors,
+# which synthesis handles), and not R/C/L.
+_IC_REFDES = re.compile(r"^U[\d_]", re.IGNORECASE)
 
 
 @dataclass
@@ -118,9 +124,112 @@ def _is_pin_range(cell: str) -> bool:
     return False
 
 
-def run(project_dir: Path) -> Report:
+def _footprint_column(row: dict) -> str:
+    for key in ("footprint", "footprint_hint", "package"):
+        val = (row.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _check_footprints(
+    report: Report, bom_rows: list[tuple[str, dict, str, int]], footprints_root: Path
+) -> None:
+    """Library-form footprints that do not exist on disk.
+
+    Only ``Lib:Name`` strings are checked. A bare ``0402`` is a *hint* that Stage 1
+    and the classifier turn into a real footprint later, so testing it against the
+    filesystem would report a problem the pipeline is designed to solve. A
+    library-form string, by contrast, is a claim about a file — and when the file is
+    absent Stage 5 substitutes a placeholder, which is how a 2.54mm header ends up
+    standing in for a QFN on a board that opens and renders perfectly.
+    """
+    checked: dict[str, bool] = {}
+    for ref, row, rel, line in bom_rows:
+        fp = _footprint_column(row)
+        if ":" not in fp:
+            continue
+        if fp not in checked:
+            lib, _, name = fp.partition(":")
+            checked[fp] = (Path(footprints_root) / f"{lib}.pretty" / f"{name}.kicad_mod").is_file()
+        if checked[fp]:
+            continue
+        report.findings.append(
+            Finding(
+                code="DOC-010",
+                severity="error",
+                summary=f"{ref}: footprint '{fp}' does not exist in the library.",
+                fix=(
+                    "Stage 5 substitutes a generic placeholder for a footprint it cannot "
+                    "find, so the board still opens, renders and routes — with the wrong "
+                    "copper. Check the spelling against kicad-footprints, or draw the part "
+                    "into the project's libraries/ directory."
+                ),
+                file=rel,
+                line=line,
+            )
+        )
+
+
+def _check_pin_maps(
+    report: Report, bom_rows: list[tuple[str, dict, str, int]], pinout_refs: set[str]
+) -> None:
+    """ICs that will stop Stage 3 to ask for a pin_map.
+
+    Stage 3 auto-resolves passives, generic connectors and 3-pin small-signal
+    parts; everything else is ``specific`` and needs a pin_map, which up front
+    means a pinout table. So a specific part with no pinout is a guaranteed
+    halt — knowable now, currently discovered several minutes into a run.
+
+    The tempting implementation is to call ``component_classifier.classify``
+    here and report whatever it declines. That is wrong, and measurably so: the
+    classifier reads ``description`` and ``pin_count``, which Stage *1* fills in
+    with an LLM. On raw markdown those fields are mostly absent, so the
+    classifier declines nearly everything — on dev.04 it flagged 43 rows,
+    including capacitors and resistors it resolves perfectly well once Stage 1
+    has run. A preflight check that cries wolf on every passive is worse than
+    no check, because it trains people to skip the output.
+
+    So this uses the one signal that *is* deterministic in the markdown: the
+    refdes prefix. ``U`` means an IC, and an IC with no pinout is the
+    FPGA/MCU/PMIC case that actually halts. Passives and connectors are left
+    alone because the classifier really will handle them.
+    """
+    for ref, row, rel, line in bom_rows:
+        if ref in pinout_refs or not _IC_REFDES.match(ref):
+            continue
+        report.findings.append(
+            Finding(
+                code="DOC-011",
+                severity="warning",
+                summary=(
+                    f"{ref} ({row.get('mpn') or 'no MPN'}) is an IC with no pinout table — "
+                    "Stage 3 will halt and ask for its pin_map."
+                ),
+                fix=(
+                    f"Add a pinout table anchored to its refdes, e.g. '## {ref} — pinout' "
+                    "with Pin | Signal columns. Or let Stage 3 stop and answer it there with "
+                    "`blpl resolve-pin-map --lib-symbol ...`, which derives the map from a "
+                    "library symbol when one matches."
+                ),
+                file=rel,
+                line=line,
+            )
+        )
+
+
+def run(
+    project_dir: Path,
+    *,
+    symbols_root: Path | None = None,
+    footprints_root: Path | None = None,
+) -> Report:
     """Inspect a project's Markdown and report what Stage 0 would drop or misread."""
+    from .stage6_compile_kicad import _DEFAULT_FOOTPRINTS, _DEFAULT_SYMBOLS
+
     project_dir = Path(project_dir)
+    symbols_root = Path(symbols_root) if symbols_root else _DEFAULT_SYMBOLS
+    footprints_root = Path(footprints_root) if footprints_root else _DEFAULT_FOOTPRINTS
     report = Report()
 
     md_files = sorted(project_dir.glob("*.md"))
@@ -142,6 +251,9 @@ def run(project_dir: Path) -> Report:
     signal_owners: dict[str, list[tuple[str, str]]] = {}
     bom_refs: set[str] = set()
     pinout_refs: set[str] = set()
+    # Kept for the two checks that need the whole row, not just its refdes:
+    # whether its footprint exists, and whether the classifier can resolve it.
+    bom_rows: list[tuple[str, dict, str, int]] = []
 
     for md_path in md_files:
         text = md_path.read_text(encoding="utf-8")
@@ -188,6 +300,7 @@ def run(project_dir: Path) -> Report:
                     if not ref:
                         continue
                     bom_refs.add(ref)
+                    bom_rows.append((ref, lower, rel, table.line_start))
                     if not any(lower.get(k) for k in ("mpn", "part number", "part")):
                         report.findings.append(
                             Finding(
@@ -324,6 +437,9 @@ def run(project_dir: Path) -> Report:
                     file=owners[0][1],
                 )
             )
+
+    _check_footprints(report, bom_rows, footprints_root)
+    _check_pin_maps(report, bom_rows, pinout_refs)
 
     # A connector with a pinout but no BOM row gets no footprint placed.
     for ref in sorted(pinout_refs - bom_refs):

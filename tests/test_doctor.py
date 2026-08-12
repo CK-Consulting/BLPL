@@ -190,3 +190,106 @@ def test_empty_project_is_an_error(tmp_path: Path) -> None:
     report = doctor.run(tmp_path)
     assert "DOC-000" in _codes(report)
     assert not report.ok
+
+
+# --- DOC-010: footprints that don't exist on disk ---------------------------
+
+
+def _fp_root(tmp_path: Path, lib: str, name: str) -> Path:
+    root = tmp_path / "fps"
+    (root / f"{lib}.pretty").mkdir(parents=True, exist_ok=True)
+    (root / f"{lib}.pretty" / f"{name}.kicad_mod").write_text("(footprint)", encoding="utf-8")
+    return root
+
+
+def test_a_library_form_footprint_that_does_not_exist_is_an_error(tmp_path: Path) -> None:
+    """Stage 5 substitutes a placeholder for a footprint it cannot find, so the
+    board opens, renders and routes with the wrong copper. That is the single
+    most expensive thing to discover late."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n"
+            "| Ref | MPN | Package |\n|---|---|---|\n"
+            "| C1 | GRM155 | Capacitor_SMD:C_0402_1005Metric |\n"
+            "| U1 | LTC4015 | Package_QFN:Definitely_Not_Real |\n"
+        ),
+    )
+    root = _fp_root(tmp_path, "Capacitor_SMD", "C_0402_1005Metric")
+    report = doctor.run(proj, footprints_root=root)
+    hits = [f for f in report.findings if f.code == "DOC-010"]
+    assert len(hits) == 1
+    assert "Definitely_Not_Real" in hits[0].summary
+    assert hits[0].severity == "error"
+
+
+def test_a_bare_package_hint_is_not_checked_against_disk(tmp_path: Path) -> None:
+    """`QFN-38` is a hint Stage 1 and the classifier turn into a real footprint.
+    Testing it against the filesystem would report a problem the pipeline exists
+    to solve."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| U1 | LTC4015 | QFN-38 (exposed pad) |\n"
+        ),
+    )
+    report = doctor.run(proj, footprints_root=tmp_path / "empty")
+    assert "DOC-010" not in _codes(report)
+
+
+# --- DOC-011: ICs that will halt Stage 3 ------------------------------------
+
+
+def test_an_ic_with_no_pinout_is_flagged(tmp_path: Path) -> None:
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| U_MCU | ESP32-S3-WROOM-1 | Module |\n"
+        ),
+    )
+    hits = [f for f in doctor.run(proj).findings if f.code == "DOC-011"]
+    assert len(hits) == 1
+    assert "U_MCU" in hits[0].summary
+
+
+def test_an_ic_with_a_pinout_is_not_flagged(tmp_path: Path) -> None:
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| U_MCU | ESP32-S3-WROOM-1 | Module |\n\n"
+            "## U_MCU pinout\n\n| Pin | Signal |\n|---|---|\n| 1 | GND |\n| 2 | VDD |\n"
+        ),
+    )
+    assert "DOC-011" not in _codes(doctor.run(proj))
+
+
+def test_passives_and_connectors_are_never_flagged_as_halting(tmp_path: Path) -> None:
+    """The check that made this necessary: running the classifier over raw
+    markdown flagged 43 rows on dev.04, capacitors and resistors included,
+    because the fields it reads are filled in by Stage 1's LLM, not by the
+    user. A preflight that cries wolf on every passive gets skipped."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| C_BOOST | — | 0402 |\n"
+            "| R_CCREFP | 301k 0.1% | 0402 |\n"
+            "| RT_BATT | — | 0603 |\n"
+            "| Q1 | FS8205A | SOT-23-6 |\n"
+            "| J_USB_C | — | USB-C |\n"
+        ),
+    )
+    assert "DOC-011" not in _codes(doctor.run(proj))

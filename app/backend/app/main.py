@@ -1303,6 +1303,23 @@ def latest_release(project_id: str, _: str = Depends(require_session)) -> dict:
     return data
 
 
+@app.get("/api/projects/{project_id}/preflight")
+def preflight(project_id: str, _: str = Depends(require_session)) -> dict:
+    """What Stage 0 would drop or misread, without running anything.
+
+    Served synchronously rather than through the SSE stage runner because the
+    doctor reads markdown and touches no subprocess — and because the panel
+    wants the findings *structured*, which a log stream cannot give it. Running
+    it is free and mutates nothing, so the panel can ask on every visit.
+    """
+    from blpl.core import doctor
+
+    try:
+        return doctor.run(_project_dir(project_id)).to_dict()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not read the project: {exc}")
+
+
 @app.get("/api/projects/{project_id}/release/latest.zip")
 def download_release(project_id: str, _: str = Depends(require_session)) -> Response:
     """The package itself.

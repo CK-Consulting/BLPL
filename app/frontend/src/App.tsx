@@ -8,6 +8,7 @@ import { NewProject, ProjectSync } from "./components/ProjectControls";
 import { Editor } from "./components/Editor";
 import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
+import { Preflight } from "./components/Preflight";
 import { ModuleLibrary } from "./components/ModuleLibrary";
 import { ReleasePanel } from "./components/ReleasePanel";
 import { DiffView } from "./components/DiffView";
@@ -29,7 +30,7 @@ function Workspace() {
   const [selected, setSelected] = useState<string | null>(null);
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [tab, setTab] = useState<"board" | "edit" | "bom" | "modules" | "reports" | "release" | "artifacts" | "changes">("board");
+  const [tab, setTab] = useState<"board" | "preflight" | "edit" | "bom" | "modules" | "reports" | "release" | "artifacts" | "changes">("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
   const chat = useResizable("blpl.chatWidth", 420);
   // Off by default so the workspace opens exactly as it did before; the
@@ -136,6 +137,12 @@ function Workspace() {
                 <button className={tab === "board" ? "on" : ""} onClick={() => setTab("board")}>
                   Board
                 </button>
+                <button
+                  className={tab === "preflight" ? "on" : ""}
+                  onClick={() => setTab("preflight")}
+                >
+                  Preflight
+                </button>
                 <button className={tab === "edit" ? "on" : ""} onClick={() => setTab("edit")}>
                   Edit
                 </button>
@@ -161,6 +168,7 @@ function Workspace() {
               {tab === "board" && (
                 <DesignView projectId={selected} reloadToken={reloadToken} highlight={highlight} />
               )}
+              {tab === "preflight" && <Preflight projectId={selected} reloadToken={reloadToken} />}
               {tab === "edit" && <Editor projectId={selected} onSaved={refresh} />}
               {tab === "bom" && <BomTable projectId={selected} reloadToken={reloadToken} />}
               {tab === "modules" && <ModuleLibrary projectId={selected} reloadToken={reloadToken} />}
