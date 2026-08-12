@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from blpl.agent.tools.bom import HOUSES as HOUSES_FOR_SCHEMA
 from blpl.agent.tools.parts import fetch_datasheet, search_parts
 
 from .toolspec import ToolContext, ToolDenied, ToolSpec
@@ -392,6 +393,56 @@ async def _simulate(ctx: ToolContext, args: dict) -> str:
     return json.dumps(run.to_dict(), indent=2)[:20000]
 
 
+async def _sourcing_gaps(ctx: ToolContext, args: dict) -> str:
+    from blpl.agent.tools.bom import sourcing_gaps
+
+    pipeline = ctx.project_dir / ".pipeline"
+    scans = sorted(pipeline.glob("*.kicad_sch"), reverse=True) or sorted(
+        ctx.project_dir.glob("*.kicad_sch"), reverse=True
+    )
+    if not scans:
+        raise FileNotFoundError("this project has no emitted schematic yet — run stage6 first")
+    ctx.sandbox.check_read(scans[0])
+    ctx.note("checking what still blocks an order")
+    return json.dumps(await _to_thread(sourcing_gaps, scans[0]), indent=2)[:20000]
+
+
+async def _assembly_files(ctx: ToolContext, args: dict) -> str:
+    from blpl.agent.tools.bom import HOUSES, build_assembly
+    from blpl.core.stage6_compile_kicad import _DEFAULT_FOOTPRINTS
+
+    house = str(args.get("house") or "jlcpcb").lower()
+    if house not in HOUSES:
+        raise ToolDenied(f"house must be one of {', '.join(HOUSES)}")
+    release_root = ctx.project_dir / "release"
+    stamps = sorted((d for d in release_root.glob("*") if d.is_dir()), reverse=True)
+    if not stamps:
+        raise FileNotFoundError(
+            "no release package yet — build the release first; the assembly files are "
+            "translations of what it exports"
+        )
+    out_dir = stamps[0]
+    boms = sorted(out_dir.glob("bom/*-bom.csv"))
+    if not boms:
+        raise FileNotFoundError("the release package has no BOM CSV to translate")
+
+    ctx.sandbox.check_write(out_dir / "assembly")
+    lcsc = bool(args.get("lcsc"))
+    ctx.note(f"writing {house} upload files" + (" with LCSC lookup" if lcsc else ""))
+    positions = out_dir / "placement" / "positions.csv"
+    pkg = await _to_thread(
+        build_assembly,
+        boms[0],
+        positions if positions.is_file() else None,
+        out_dir / "assembly",
+        house=house,
+        footprint_roots=[_DEFAULT_FOOTPRINTS],
+        lcsc=lcsc,
+        creds=ctx.creds,
+    )
+    return json.dumps(pkg.to_dict(), indent=2)[:20000]
+
+
 async def _bulk_route(ctx: ToolContext, args: dict) -> str:
     from blpl.core import autoroute
 
@@ -440,6 +491,48 @@ def fab_tools() -> list[ToolSpec]:
             input_schema={"type": "object", "properties": {}},
             kind="query",
             handler=_fab_readiness,
+        ),
+        ToolSpec(
+            name="check_sourcing_gaps",
+            description=(
+                "Read the emitted schematic and report which parts cannot be ordered yet — "
+                "missing manufacturer part numbers, missing distributor part numbers, "
+                "inconsistent part-number conventions. Use this before anyone starts a BOM "
+                "or asks what a build would cost: a board can pass every electrical check "
+                "and still be unorderable, and that is invisible until someone tries."
+            ),
+            input_schema={"type": "object", "properties": {}},
+            kind="file_read",
+            handler=_sourcing_gaps,
+        ),
+        ToolSpec(
+            name="write_assembly_files",
+            description=(
+                "Translate the release package's BOM and placement file into one assembly "
+                "house's upload format. The two houses are not interchangeable: JLCPCB "
+                "orders by LCSC part number, PCBWay sources turnkey by MPN, and they take "
+                "different columns. Pass lcsc=true for JLCPCB — without the LCSC numbers "
+                "the BOM uploads and then cannot be built, which is the expensive way to "
+                "find out. Requires a release package to already exist."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "house": {
+                        "type": "string",
+                        "enum": list(HOUSES_FOR_SCHEMA),
+                        "description": "Which assembly house the files are for.",
+                    },
+                    "lcsc": {
+                        "type": "boolean",
+                        "description": "Look up LCSC part numbers (network). JLCPCB needs them.",
+                    },
+                },
+                "required": ["house"],
+            },
+            kind="network",
+            handler=_assembly_files,
+            approval="ask",
         ),
         ToolSpec(
             name="bulk_autoroute",

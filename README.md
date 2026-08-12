@@ -29,6 +29,7 @@ Hardware projects usually live in two disconnected worlds: narrative design docs
 | Mixture-of-experts review panel | Working — every routed endpoint reviews, findings merged with attribution. |
 | SPICE simulation of detected subcircuits | Working with ngspice. LTspice/Xyce detected but return no measurements. |
 | Release package for a contract fab | Working. Gated; gerbers, drill, placement, BOM, native project. |
+| Assembly uploads (JLCPCB / PCBWay) | Working. Per-house BOM + CPL, LCSC part numbers resolved on request. |
 | KiCad editing over MCP (kcaa) | Working when a server is configured. |
 | Virtual-filesystem references | Working — see `docs/references.md`. |
 

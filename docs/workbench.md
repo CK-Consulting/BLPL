@@ -139,6 +139,32 @@ run is reported as unknown, never as a pass. A refused board still gets its
 package, carrying `READ-ME-FIRST.txt` *inside the zip*, because the zip is what
 gets emailed and the refusal has to travel with it.
 
+### Assembly uploads
+
+The grouped BOM in the package is what a *human* reads. Neither assembly house
+accepts it, and they do not accept each other's either — so the build also writes
+`assembly/jlcpcb/` and `assembly/pcbway/`, each with the BOM and placement file
+in that house's own columns.
+
+They differ because the houses source differently. **JLCPCB** orders assembly by
+LCSC part number; kicad-happy's translator leaves that column blank by design, so
+BLPL fills it by resolving each MPN through LCSC — and reports stock, since a
+C-number with no stock is not a part you can order. **PCBWay** sources turnkey by
+MPN, takes different columns entirely, and ships no script, so that writer is
+BLPL's. Its SMD/THT column is read out of the footprint library rather than
+guessed from the footprint name, and left blank when the library has no answer:
+a wrong mounting type is a re-quote at best.
+
+The placement file is filtered against the BOM for both — a CPL naming parts the
+BOM never mentioned is rejected on upload, and the rejection names neither file.
+Anything that will cost a round-trip with the fab (no LCSC number, zero stock, no
+MPN, a placed part with no BOM line) is carried onto the release step rather than
+swallowed.
+
+`blpl bom-check` asks the complementary question of the emitted schematic: which
+parts cannot be ordered *at all* yet. A board can pass every electrical check and
+still be unorderable, and that stays invisible until somebody tries.
+
 Bulk autorouting is available where the routing is housekeeping rather than
 constrained: `kicad-cli` exports Specctra DSN, Freerouting's jar routes it,
 `kicad-cli` imports the SES back. Set `FREEROUTING_JAR` to the jar's path — it is

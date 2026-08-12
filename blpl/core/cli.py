@@ -858,6 +858,93 @@ def _cmd_spice(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bom_check(args: argparse.Namespace) -> int:
+    """What the emitted board is still missing before anyone can order it.
+
+    Deliberately reads the emitted `.kicad_sch` rather than `bom.json`: the
+    point is to catch fields the emitter dropped on the way out, which no
+    artifact-to-artifact comparison can see.
+    """
+    from ..agent.tools.bom import sourcing_gaps
+
+    proj = _project_dir(args)
+    pipeline = proj / ".pipeline"
+    candidates = sorted(pipeline.glob("*.kicad_sch"), reverse=True) or sorted(
+        proj.glob("*.kicad_sch"), reverse=True
+    )
+    if not candidates:
+        print(f"error: no .kicad_sch in {proj} — run stage6 first", file=sys.stderr)
+        return 2
+
+    report = sourcing_gaps(candidates[0])
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+    if report.get("skipped"):
+        print(f"bom-check: skipped — {report['reason']}")
+        return 0
+    if not report.get("ok"):
+        print(f"bom-check: failed — {report.get('reason', 'unknown')}", file=sys.stderr)
+        return 1
+
+    total = report.get("total_components") or report.get("component_count") or 0
+    gaps = report.get("gaps") or report.get("missing") or []
+    print(f"bom-check: {total} components, {len(gaps)} with sourcing gaps")
+    for gap in gaps[:20]:
+        if isinstance(gap, dict):
+            ref = gap.get("reference") or gap.get("refdes") or "?"
+            missing = ", ".join(gap.get("missing_fields") or []) or "incomplete"
+            print(f"        {ref}: {missing}")
+    if len(gaps) > 20:
+        print(f"        … and {len(gaps) - 20} more")
+    # Gaps are the user's to fill, not a pipeline failure.
+    return 0
+
+
+def _cmd_bom_assembly(args: argparse.Namespace) -> int:
+    """Write the per-house upload files from the newest release package."""
+    from ..agent.tools.bom import HOUSES, build_assembly
+    from .stage6_compile_kicad import _DEFAULT_FOOTPRINTS
+
+    proj = _project_dir(args)
+    release_root = proj / "release"
+    stamps = sorted((d for d in release_root.glob("*") if d.is_dir()), reverse=True)
+    if not stamps:
+        print(
+            f"error: no release package in {release_root} — run the release build first",
+            file=sys.stderr,
+        )
+        return 2
+    out_dir = stamps[0]
+    boms = sorted(out_dir.glob("bom/*-bom.csv"))
+    if not boms:
+        print(f"error: no BOM CSV in {out_dir / 'bom'}", file=sys.stderr)
+        return 2
+
+    positions = out_dir / "placement" / "positions.csv"
+    houses = HOUSES if args.house == "both" else (args.house,)
+    rc = 0
+    for house in houses:
+        pkg = build_assembly(
+            boms[0],
+            positions if positions.is_file() else None,
+            out_dir / "assembly",
+            house=house,
+            footprint_roots=[_DEFAULT_FOOTPRINTS],
+            lcsc=args.lcsc,
+        )
+        if not pkg.ok:
+            print(f"{house}: failed — {pkg.reason}", file=sys.stderr)
+            rc = 1
+            continue
+        print(f"{house}: {len(pkg.files)} file(s)")
+        for f in pkg.files:
+            print(f"        {f.name}: {f.rows} rows → {f.path}")
+        for w in pkg.warnings:
+            print(f"        ! {w}")
+    return rc
+
+
 def _add_llm_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--llm-provider", default=None, help="anthropic | openai | ollama (falls back to HDM_LLM_PROVIDER env)")
     p.add_argument("--llm-model", default=None, help="provider-specific model ID (falls back to HDM_LLM_MODEL env)")
@@ -1000,6 +1087,33 @@ def main(argv: list[str] | None = None) -> int:
         help="Which simulator to use (default: auto-detect).",
     )
     p.set_defaults(func=_cmd_spice)
+
+    p = sub.add_parser(
+        "bom-check",
+        help="Sourcing readiness of the emitted schematic: which parts cannot be ordered yet.",
+    )
+    p.add_argument("--project-dir", required=True)
+    p.add_argument("--json", action="store_true", help="Emit the analyzer report as JSON.")
+    p.set_defaults(func=_cmd_bom_check)
+
+    p = sub.add_parser(
+        "bom-assembly",
+        help="Write JLCPCB / PCBWay upload files (BOM + CPL) from the latest release package.",
+    )
+    p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--house",
+        default="both",
+        choices=("both", "jlcpcb", "pcbway"),
+        help="Which assembly house to write files for (default: both).",
+    )
+    p.add_argument(
+        "--lcsc",
+        action="store_true",
+        help="Look up LCSC part numbers for the JLCPCB BOM. Needs network; JLCPCB "
+             "orders assembly by LCSC number, so without this the BOM is not buildable.",
+    )
+    p.set_defaults(func=_cmd_bom_assembly)
 
     p = sub.add_parser("run", help="Run the full pipeline end-to-end (stages 0–8).")
     p.add_argument("--project-dir", required=True)

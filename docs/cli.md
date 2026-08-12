@@ -116,6 +116,33 @@ kicad-happy's testbenches carry their `.meas` in ngspice `.control` blocks, so
 LTspice runs the sweep and reports every result as skipped. `blpl spice` says so
 rather than letting "0 fail" read as a pass.
 
+### `bom-check`
+Sourcing readiness of the **emitted** schematic — which parts still have no
+manufacturer or distributor part number. Reads the `.kicad_sch` rather than
+`bom.json` on purpose: the point is to catch fields the emitter dropped on the
+way out, which no artifact-to-artifact comparison can see.
+```
+blpl bom-check --project-dir <proj> [--json]
+```
+
+### `bom-assembly`
+Translate the newest release package's BOM and placement file into assembly-house
+upload format. Writes into `release/<stamp>/assembly/<house>/`.
+```
+blpl bom-assembly --project-dir <proj>
+    [--house both|jlcpcb|pcbway]   # default: both
+    [--lcsc]                       # resolve LCSC part numbers (needs network)
+```
+The two houses get **different** BOMs, because they source differently: JLCPCB
+orders assembly by LCSC part number, PCBWay turnkey by MPN. Without `--lcsc` the
+JLCPCB BOM's `LCSC Part #` column is blank — it uploads and then cannot be built,
+so the command says so rather than reporting success. The placement file is
+filtered against the BOM in both cases; a CPL naming parts the BOM never
+mentioned is rejected on upload, and the rejection names neither file.
+
+This runs automatically as part of the release build; the standalone command
+exists for re-running it with `--lcsc` without rebuilding the package.
+
 ## Orchestrator
 
 ### `run`

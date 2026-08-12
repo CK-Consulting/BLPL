@@ -210,6 +210,44 @@ def export_bom_csv(bom_json: Path, out_csv: Path) -> Step:
     return Step("bom", True, detail, [out_csv.name])
 
 
+def export_assembly(bom_csv: Path, out_dir: Path, *, lcsc: bool = False) -> list[Step]:
+    """Per-house assembly uploads, beside the generic BOM.
+
+    The grouped CSV above is what a *human* reads. Neither JLCPCB nor PCBWay
+    accepts it: they want their own columns, and they differ from each other
+    because they source differently — JLCPCB orders by LCSC part number, PCBWay
+    turnkey by MPN. Emitting one file and labelling it for both would produce a
+    quote against the wrong parts.
+
+    Every warning is carried onto the step rather than swallowed. A package that
+    silently ships an unbuildable BOM is exactly the failure this whole gate
+    exists to prevent.
+    """
+    from ..agent.tools.bom import HOUSES, build_assembly
+    from .stage6_compile_kicad import _DEFAULT_FOOTPRINTS
+
+    positions = out_dir / "placement" / "positions.csv"
+    steps: list[Step] = []
+    for house in HOUSES:
+        pkg = build_assembly(
+            bom_csv,
+            positions if positions.is_file() else None,
+            out_dir / "assembly",
+            house=house,
+            footprint_roots=[_DEFAULT_FOOTPRINTS],
+            lcsc=lcsc,
+        )
+        steps.append(
+            Step(
+                f"assembly-{house}",
+                pkg.ok,
+                pkg.reason or "; ".join(pkg.warnings),
+                [str(Path(f.path).relative_to(out_dir)) for f in pkg.files],
+            )
+        )
+    return steps
+
+
 def copy_native_project(project_dir: Path, out_dir: Path) -> Step:
     """The KiCad project itself, which is what a fab with KiCad would rather have.
 
@@ -330,6 +368,7 @@ def build(
     *,
     now: str = "",
     kicad_cli: str | None = None,
+    lcsc: bool = False,
 ) -> dict:
     """Build the release package. Returns the manifest.
 
@@ -357,8 +396,10 @@ def build(
     bom_json = pipeline / "bom_resolved.json"
     if not bom_json.is_file():
         bom_json = pipeline / "bom.json"
+    bom_csv = out_dir / "bom" / f"{name}-bom.csv"
     if bom_json.is_file():
-        steps.append(export_bom_csv(bom_json, out_dir / "bom" / f"{name}-bom.csv"))
+        steps.append(export_bom_csv(bom_json, bom_csv))
+        steps.extend(export_assembly(bom_csv, out_dir, lcsc=lcsc))
     else:
         steps.append(Step("bom", False, "no BOM artifact in .pipeline — run stage1/stage2 first"))
 
@@ -446,9 +487,14 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(prog="blpl-release")
     parser.add_argument("--project-dir", required=True)
+    parser.add_argument(
+        "--lcsc",
+        action="store_true",
+        help="Look up LCSC part numbers for the JLCPCB BOM (needs network).",
+    )
     args = parser.parse_args(argv)
 
-    manifest = build(Path(args.project_dir))
+    manifest = build(Path(args.project_dir), lcsc=args.lcsc)
     for step in manifest["steps"]:
         state = "ok" if step["ok"] else f"FAILED — {step['detail']}"
         print(f"  {step['step']}: {state}", flush=True)
