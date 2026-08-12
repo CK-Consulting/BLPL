@@ -1,8 +1,14 @@
+# NOTE: .gitignore is never consulted for a file git already tracks. If ignored
+# files keep showing up as modified, they were committed at some point — the fix
+# is `git rm -r --cached <path>`, not another pattern here. That is what happened
+# to .venv/ and __pycache__/, both untracked on 2026-08-12.
 
 __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+.venv/
+
 app/frontend/node_modules/
 app/frontend/dist/
 app/frontend/*.tsbuildinfo
