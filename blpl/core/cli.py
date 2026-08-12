@@ -703,6 +703,49 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+def _cmd_skills(args: argparse.Namespace) -> int:
+    from . import skills_install
+
+    source = Path(args.source) if args.source else None
+
+    if args.action == "list":
+        avail = skills_install.available(source)
+        if not avail:
+            print(
+                "no skills found — is kicad-happy checked out? "
+                "(git submodule update --init, or set BLPL_KICAD_HAPPY)",
+                file=sys.stderr,
+            )
+            return 1
+        have = skills_install.installed(Path(args.project_dir).resolve()) if args.project_dir else {}
+        for name, src in avail.items():
+            state = ""
+            if name in have:
+                state = "  [installed]" if have[name] else "  [present, not blpl-installed]"
+            default = "  (default)" if name in skills_install.DEFAULT_SET else ""
+            print(f"{name:<18} {src}{default}{state}")
+        return 0
+
+    # install
+    if not args.project_dir:
+        print("error: install needs --project-dir", file=sys.stderr)
+        return 2
+    proj = Path(args.project_dir).resolve()
+    names = args.skill or (
+        list(skills_install.available(source)) if getattr(args, "all", False) else skills_install.DEFAULT_SET
+    )
+    result = skills_install.install(proj, names, source=source, force=args.force)
+    for n in result.installed:
+        print(f"skills: installed {n} -> {proj / '.claude' / 'skills' / n}")
+    for n in result.refreshed:
+        print(f"skills: refreshed {n}")
+    for n in result.skipped:
+        print(f"skills: skipped {n} (already present — use --force to overwrite)")
+    for n in result.unknown:
+        print(f"skills: unknown skill {n!r} — see `blpl skills list`", file=sys.stderr)
+    return 1 if result.unknown else 0
+
+
 def _cmd_stage8(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
     pipeline_dir = proj / ".pipeline"
@@ -926,6 +969,22 @@ def main(argv: list[str] | None = None) -> int:
         choices=("critical", "error", "warning", "info", "debug", "trace"),
     )
     p.set_defaults(func=_cmd_serve)
+
+    p = sub.add_parser(
+        "skills",
+        help="Install BLPL's Claude Code skills (hardware-design + the kicad-happy set) into a project's .claude/skills/.",
+    )
+    p.add_argument("action", choices=("list", "install"))
+    p.add_argument("--project-dir", help="Required for install; optional for list (adds installed state).")
+    p.add_argument(
+        "--skill", action="append",
+        help="Skill to install, repeatable. Default: the review set "
+        "(hardware-design, kicad, emc, bom, datasheets, spice).",
+    )
+    p.add_argument("--all", action="store_true", help="Install every available skill, sourcing/fab included.")
+    p.add_argument("--force", action="store_true", help="Overwrite skills already present in the project.")
+    p.add_argument("--source", help="Explicit kicad-happy checkout (overrides BLPL_KICAD_HAPPY and the submodule).")
+    p.set_defaults(func=_cmd_skills)
 
     p = sub.add_parser("stage3", help="Emit gap prompts (and optionally auto-generate generic symbols).")
     p.add_argument("--project-dir", required=True)

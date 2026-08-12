@@ -1,6 +1,19 @@
-# Claude Code Skill: `hardware-design`
+# Claude Code Skills
 
-BLPL ships with a Claude Code skill that activates automatically when the user is doing hardware-design work. It lives at `blpl/skills/hardware-design/SKILL.md` (in the package) and at `.claude/skills/hardware-design/SKILL.md` (in the workspace root, project-scoped).
+BLPL carries two kinds of skill guidance for Claude Code, installed into a project with one command:
+
+```bash
+blpl skills install --project-dir <project>     # the review set (default)
+blpl skills install --project-dir <p> --all     # + sourcing/fab skills
+blpl skills list --project-dir <p>              # what's available / installed
+```
+
+- **`hardware-design`** (ships inside the blpl package): the input/output contract for design markdown — the table shapes Stage 0 parses, the naming conventions Stage 4 assumes, the accumulated pitfalls.
+- **The kicad-happy set** (the submodule, or `BLPL_KICAD_HAPPY`): `kicad` (design review), `emc`, `bom`, `datasheets`, `spice` in the default set; the distributor/fab skills (`digikey`, `mouser`, `lcsc`, `element14`, `jlcpcb`, `pcbway`) are opt-in via `--all` or `--skill` because they trigger on broad vocabulary.
+
+Installation is a **copy** into `<project>/.claude/skills/` — deliberately not a symlink, so the snapshot travels with the git-backed project to any machine or container. Each installed skill carries a `.blpl-installed` marker; refresh with `--force` (which will overwrite hand edits — a skill without the marker is never touched without `--force` either).
+
+Stage 8 independently runs the kicad-happy *analyzer scripts* over emitted boards — that path doesn't need this install; this is about the *guidance* reaching Claude Code sessions working on the design.
 
 ## What a skill is
 
@@ -30,25 +43,16 @@ In Claude Code:
 
 You can force-activate with a slash command — `/hardware-design` — if Claude didn't auto-detect.
 
-## Where the skill lives
+## Where skills live
 
-Two copies, kept in sync:
+The **sources of truth** are `blpl/skills/hardware-design/` (in the package) and `kicad-happy/skills/*` (the submodule). Project copies under `<project>/.claude/skills/` are installed snapshots — edit the source, then `blpl skills install --force` to refresh projects.
 
-1. **`.claude/skills/hardware-design/SKILL.md`** at the workspace root. Version-controlled alongside the workspace. This is what Claude Code loads.
-2. **`blpl/skills/hardware-design/SKILL.md`** inside the package. Ships with the BLPL install so other projects can symlink this into their own `.claude/skills/` and get the same guidance.
-
-The two copies must stay in sync. Phase 1's migration updates both; future edits should use `cp` or a symlink to avoid drift.
-
-## Editing the skill
+## Editing the hardware-design skill
 
 The skill is a contract — changes affect Claude's behavior across every hardware-design conversation. When updating:
 
-1. Edit `.claude/skills/hardware-design/SKILL.md`.
-2. Re-copy to `blpl/skills/hardware-design/SKILL.md`:
-   ```bash
-   cp .claude/skills/hardware-design/SKILL.md \
-      board-layer-pipe-line/blpl/skills/hardware-design/SKILL.md
-   ```
+1. Edit `blpl/skills/hardware-design/SKILL.md` (the packaged source).
+2. Refresh any project copies: `blpl skills install --project-dir <p> --skill hardware-design --force`.
 3. Think about the description field: too narrow and Claude won't load it when it should; too broad and it loads on unrelated messages.
 4. New pitfalls discovered in the wild belong in the "Known pitfalls" section of the skill — that's where the accumulated scar tissue lives.
 
