@@ -355,6 +355,93 @@ def module_tools() -> list[ToolSpec]:
 
 
 # ---------------------------------------------------------------------------
+# Getting to a quote
+# ---------------------------------------------------------------------------
+
+
+async def _fab_readiness(ctx: ToolContext, args: dict) -> str:
+    from blpl.core.release import run_gate
+
+    ctx.note("checking fabrication readiness")
+    gate = await _to_thread(run_gate, ctx.project_dir / ".pipeline", ctx.project_dir / ".pipeline")
+    return json.dumps(gate, indent=2)[:20000]
+
+
+async def _bulk_route(ctx: ToolContext, args: dict) -> str:
+    from blpl.core import autoroute
+
+    pcbs = sorted(ctx.project_dir.glob("*.kicad_pcb"))
+    if not pcbs:
+        raise ToolDenied("this project has no .kicad_pcb yet — run stage6 first")
+    ok, why = await _to_thread(autoroute.available)
+    if not ok:
+        raise ToolDenied(why)
+
+    # Same anchor the interactive KiCad edits use: an autoroute is the single
+    # largest change anything can make to a board, and "undo it" has to mean
+    # something.
+    from .kicad_bridge import snapshot
+
+    if not ctx.extras.get("kicad_snapshot"):
+        commit = await _to_thread(snapshot, ctx.project_dir)
+        ctx.extras["kicad_snapshot"] = commit or "none"
+        ctx.note("snapshotted the board before routing" if commit else "no git snapshot available")
+
+    ctx.sandbox.check_write(pcbs[0])
+    ctx.note("bulk routing — this can take several minutes")
+    result = await _to_thread(autoroute.route, pcbs[0], passes=int(args.get("passes") or 10))
+    return json.dumps(
+        {
+            **result.to_dict(),
+            "next": (
+                "run stage7 to DRC the result — an autorouter optimises for completing "
+                "connections, not for a board that works"
+            ),
+        },
+        indent=2,
+    )
+
+
+def fab_tools() -> list[ToolSpec]:
+    return [
+        ToolSpec(
+            name="check_fab_readiness",
+            description=(
+                "Run the fabrication release gate over the latest analysis and report what still "
+                "blocks a quote. Use this when the user asks whether the board is ready, or before "
+                "suggesting they send anything to a board house — a BLPL board opens and renders "
+                "perfectly while every net is still unrouted, so looking finished means nothing."
+            ),
+            input_schema={"type": "object", "properties": {}},
+            kind="query",
+            handler=_fab_readiness,
+        ),
+        ToolSpec(
+            name="bulk_autoroute",
+            description=(
+                "Route the whole board at once with Freerouting. Right for the housekeeping nets "
+                "that just need to get there; wrong for anything with a length, impedance or "
+                "isolation constraint — route those interactively first, because this will "
+                "cheerfully run a switching node under an analog input. The board is snapshotted "
+                "first and DRC afterwards decides whether the result stays."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "passes": {
+                        "type": "integer",
+                        "description": "Optimisation passes; more takes longer. Default 10.",
+                    }
+                },
+            },
+            kind="kicad_mutation",
+            handler=_bulk_route,
+            approval="ask_always",
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # The set
 # ---------------------------------------------------------------------------
 
@@ -518,4 +605,10 @@ def kicad_tools(url: str | None) -> list[ToolSpec]:
 
 
 def default_tools(kicad_url: str | None = None) -> list[ToolSpec]:
-    return project_tools() + parts_tools() + module_tools() + kicad_tools(kicad_url)
+    return (
+        project_tools()
+        + parts_tools()
+        + module_tools()
+        + fab_tools()
+        + kicad_tools(kicad_url)
+    )

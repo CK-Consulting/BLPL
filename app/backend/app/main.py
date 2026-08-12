@@ -1276,6 +1276,51 @@ async def run_stage(
     return _start_run(project_id, stage_name, cmd, env)
 
 
+@app.post("/api/projects/{project_id}/release")
+async def build_release(project_id: str, _: str = Depends(require_session)) -> StreamingResponse:
+    """Build the package a contract fab quotes from, gate included.
+
+    No LLM in this path: the gate reads what the analyzers already found and the
+    exports are kicad-cli. A release that depended on a model being reachable
+    would be a release you could not cut in a hurry.
+    """
+    proj = _project_dir(project_id)
+    cmd = [sys.executable, "-m", "blpl.core.release", "--project-dir", str(proj)]
+    return _start_run(project_id, "release", cmd, dict(os.environ))
+
+
+@app.get("/api/projects/{project_id}/release")
+def latest_release(project_id: str, _: str = Depends(require_session)) -> dict:
+    """The manifest of the most recent release, or why there is none."""
+    manifest = _project_dir(project_id) / "release" / "latest.json"
+    if not manifest.is_file():
+        return {"exists": False}
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"unreadable release manifest: {exc}")
+    data["exists"] = True
+    return data
+
+
+@app.get("/api/projects/{project_id}/release/latest.zip")
+def download_release(project_id: str, _: str = Depends(require_session)) -> Response:
+    """The package itself.
+
+    Served whether or not the gate passed — a refused package carries a
+    READ-ME-FIRST saying so, which is more useful than a download that silently
+    does not exist.
+    """
+    archive = _project_dir(project_id) / "release" / "latest.zip"
+    if not archive.is_file():
+        raise HTTPException(status_code=404, detail="no release has been built for this project")
+    return Response(
+        content=archive.read_bytes(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{project_id}-release.zip"'},
+    )
+
+
 @app.post("/api/projects/{project_id}/review-panel")
 async def run_review_panel(
     project_id: str, token: str = Depends(require_session)

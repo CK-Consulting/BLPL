@@ -305,3 +305,8 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .finding-list li.finding.error { border-left: 3px solid #ff8b8b; }
 .finding-list li.finding.warning { border-left: 3px solid #f0c674; }
 .finding-list li.finding.info { border-left: 3px solid #3d6fb4; }
+
+/* --- release --- */
+.release { display: flex; flex-direction: column; gap: .7rem; padding: .7rem; overflow: auto; min-height: 0; }
+.artifact-list.wide { width: auto; }
+.artifact-list.wide li { padding: .25rem .4rem; }
