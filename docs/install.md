@@ -5,6 +5,16 @@
 - **Python 3.11 or newer.** The pipeline itself runs on 3.11+; KiCad's bundled Python is 3.9 but you only need that for `stage6-plugin` (the PCB plugin path).
 - **KiCad 10.x (optional).** Needed for `stage6-plugin` (native pcbnew API) and for `kicad-cli` validation in Stage 7. Not needed for the S-expression emitter path (`stage6`), which produces v10-format files without KiCad installed.
 - **Git with submodule support.** The KiCad symbol and footprint libraries live as git submodules.
+- **Node 20+ (optional).** Only to build the web frontend.
+- **ngspice (optional).** For Stage 8's SPICE simulation — `brew install ngspice`,
+  `apt install ngspice`. Without it, simulation reports a **skip with a reason**
+  rather than failing. LTspice and Xyce are auto-detected too, but only ngspice
+  returns usable measurements: kicad-happy's testbenches carry their `.meas` in
+  ngspice `.control` blocks, so LTspice runs the sweep correctly and still
+  reports every result as skipped. See [`cli.md`](cli.md#spice).
+- **Freerouting jar (optional).** For `bulk_autoroute`. Point `FREEROUTING_JAR` at
+  it — the path is never guessed, since a wrong guess would leave a board
+  unrouted while reporting a completed run.
 
 ## Install the Python package
 
@@ -30,6 +40,12 @@ For the web UI:
 uv pip install -e ".[webapp]"                       # fastapi + uvicorn backend
 cd app/frontend && npm install && npm run build     # React frontend → app/frontend/dist/
 ```
+
+Both steps are required. Neither `node_modules/` nor `dist/` is tracked in git —
+they were, by accident, and a partially-committed `node_modules` meant fresh
+checkouts silently lacked two packages until it was untracked. If `npm run build`
+fails on a missing module, run `npm install` first rather than looking for a
+configuration problem.
 
 Then launch with `blpl serve`. The built frontend is served from the same FastAPI process at `http://127.0.0.1:7878/`.
 
@@ -114,4 +130,15 @@ cd blpl-repo-root/
 .venv/bin/python -m pytest tests/
 ```
 
-Expect 116 passing. One integration test (`test_plugin_hdm_to_pcb.py::test_plugin_produces_kicad_cli_loadable_board`) auto-skips if KiCad isn't installed.
+Expect 579 passing. A few auto-skip when the optional tool they exercise is
+absent, which is the intended behaviour rather than a gap:
+
+| Test | Skips without |
+|---|---|
+| `test_plugin_hdm_to_pcb.py::test_plugin_produces_kicad_cli_loadable_board` | KiCad |
+| the `needs_ngspice` tests in `test_spice.py` | ngspice |
+| the `needs_translator` tests in `test_bom.py` | the kicad-happy submodule |
+| `test_app_api.py::test_the_spa_fallback_refuses_to_escape_the_static_root` | a built frontend bundle |
+
+A skipped test is reported as skipped, never as passed — the same rule the
+pipeline applies to its own analyzers.

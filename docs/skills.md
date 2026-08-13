@@ -13,7 +13,37 @@ blpl skills list --project-dir <p>              # what's available / installed
 
 Installation is a **copy** into `<project>/.claude/skills/` — deliberately not a symlink, so the snapshot travels with the git-backed project to any machine or container. Each installed skill carries a `.blpl-installed` marker; refresh with `--force` (which will overwrite hand edits — a skill without the marker is never touched without `--force` either).
 
-Stage 8 independently runs the kicad-happy *analyzer scripts* over emitted boards — that path doesn't need this install; this is about the *guidance* reaching Claude Code sessions working on the design.
+## Two different things share the word "skill"
+
+This is the distinction that matters, because the kicad-happy submodule is used
+in two unrelated ways:
+
+- **The guidance** — `SKILL.md` files, copied into `<project>/.claude/skills/`
+  so a Claude Code session working on your design loads them. That is what
+  `blpl skills install` does, and what the rest of this page is about.
+- **The scripts** — `skills/*/scripts/*.py`, which BLPL calls directly as
+  subprocesses, with no LLM involved. That path needs no install and no Claude
+  Code session; it is ordinary Python the pipeline shells out to.
+
+Every one of the eleven skills is wired into BLPL through the second path:
+
+| Skill | Where BLPL calls it |
+|---|---|
+| `kicad`, `emc` | Stage 8 analyzers; `fab_release_gate.py` on release |
+| `spice` | Stage 8 simulation and `blpl spice` |
+| `bom` | `blpl bom-check`, `blpl bom-assembly`, and the release build |
+| `digikey`, `mouser`, `lcsc`, `element14` | `search_parts` / `fetch_datasheet` |
+| `datasheets` | `extract_datasheet_specs` |
+| `jlcpcb`, `pcbway` | Documentation only — no scripts. Served by BLPL's per-house BOM/CPL writers instead. |
+
+`blpl/agent/kicad_happy.py` is the single seam for all of it: it locates the
+checkout, remaps credential names to the ones each script reads, and turns a
+process into a structured result. That remapping is not tidiness — this repo's
+`.env` says `DIGIKEY_OAUTH_CLIENT_ID` while every kicad-happy script reads
+`DIGIKEY_CLIENT_ID`, and without the remap the scripts do not fail. They quietly
+report "no credentials" and fall through to a distributor that has none of the
+parts you asked about. A missing credential is reported as a **named skip**
+instead.
 
 ## What a skill is
 

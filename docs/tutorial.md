@@ -53,7 +53,50 @@ Dimensions: **40 × 30 mm**, 2-layer, 1.6 mm, ENIG finish.
 
 (Real project would have U1's pinout and Stage 4's synthesized nets wiring U1 to J_USB; we're keeping this minimal.)
 
-## 3. Run the pipeline
+## 3. Check the input before running anything
+
+```bash
+blpl doctor --project-dir ~/blpl-example
+```
+
+Do this first, every time. Stage 0 discards any table it cannot classify **and
+says nothing** — so a mistyped heading costs you a whole subsystem while the
+pipeline still runs to completion and emits a board that looks fine. The doctor
+reads the same markdown, writes nothing, and tells you what would vanish.
+
+On the file above you get no errors and three warnings:
+
+```
+doctor: OK  tables=3 (used 2, discarded 1)  errors=0 warnings=3
+```
+
+Read them, because between them they predict the rest of this tutorial:
+
+- **`DOC-001`** — the *Net classes* table is discarded. Its columns match neither
+  a BOM nor a pinout, so Stage 0 never sees it. That is why step 5 has you write
+  those values into `project.yaml` by hand.
+- **`DOC-007`** — no `project.yaml` yet, so Stage 5 would halt. Step 5 again.
+- **`DOC-011`** — `U1` is an IC with no pinout table, so Stage 3 will stop and ask
+  for its pin_map. That is exactly the `resolve-pin-map` step below.
+
+Now break it on purpose. Change the pinout heading from
+`## Connector J_USB — USB-C receptacle (24-pin)` to `## USB-C receptacle pinout`,
+dropping the refdes, and re-run:
+
+```
+[ERROR  ] DOC-002  Pinout table under "USB-C receptacle pinout" has no refdes to anchor to — its pins will be dropped or merged into the wrong connector.
+doctor: PROBLEMS  tables=3 (used 2, discarded 1)  errors=1 warnings=3
+```
+
+Without the doctor that mistake is invisible until you open the board and find
+J_USB has no pins. Put the heading back before continuing. Every check is listed
+in [`cli.md`](cli.md#doctor).
+
+> The anchor is the *refdes*, not the column names or the word "pinout". `Signal`
+> and `Net` are both accepted as the signal column, and `## J_USB anything at
+> all` anchors fine — but a heading with no refdes in it anchors to nothing.
+
+## 4. Run the pipeline
 
 Run one stage at a time so you can inspect what each produces:
 
@@ -96,7 +139,7 @@ OUT,5
 blpl resolve-pin-map --project-dir ~/blpl-example --local-id U1 --csv u1_pinout.csv
 ```
 
-## 4. Author a `project.yaml`
+## 5. Author a `project.yaml`
 
 Stage 5 needs board geometry and net-class definitions that aren't fully captured in the BOM markdown. The first run of Stage 5 writes a template:
 
@@ -148,11 +191,11 @@ blpl stage5 --project-dir ~/blpl-example
 
 You now have `~/blpl-example/.pipeline/hdm.yaml` — the **Hardware Description Manifest**, a single YAML file describing the whole board.
 
-## 5. Compile to KiCad
+## 6. Compile to KiCad
 
 Two paths:
 
-### 5a. Emitter (no KiCad installed)
+### 6a. Emitter (no KiCad installed)
 
 ```bash
 blpl stage6 --project-dir ~/blpl-example
@@ -160,7 +203,7 @@ blpl stage6 --project-dir ~/blpl-example
 
 Writes `USBC_Tap_<timestamp>.{kicad_sch,kicad_pcb,kicad_pro}` into `.pipeline/`.
 
-### 5b. Plugin (KiCad 10.x installed)
+### 6b. Plugin (KiCad 10.x installed)
 
 ```bash
 blpl stage6-plugin --project-dir ~/blpl-example
@@ -168,7 +211,7 @@ blpl stage6-plugin --project-dir ~/blpl-example
 
 Same output filenames, but the PCB is produced by pcbnew's own writer — no hand-rolled S-expressions. Cleaner for ERC/DRC and for downstream automation.
 
-## 6. Validate
+## 7. Validate
 
 ```bash
 blpl stage7 --project-dir ~/blpl-example
@@ -176,7 +219,7 @@ blpl stage7 --project-dir ~/blpl-example
 
 Runs KLC (KiCad Library Conventions check on any generated symbols), ERC (schematic rules), DRC (design rules on the PCB), and coverage. Report at `.pipeline/validation_report.json`. Expect ERC violations on a freshly emitted board — those are wires that need physical routing, not a pipeline bug.
 
-## 7. Open in KiCad
+## 8. Open in KiCad
 
 ```bash
 open ~/blpl-example/.pipeline/USBC_Tap_*.kicad_pro     # macOS
@@ -184,8 +227,39 @@ open ~/blpl-example/.pipeline/USBC_Tap_*.kicad_pro     # macOS
 
 You'll see U1 and J_USB placed inside a 40×30 mm board outline, pads tagged with nets, ready for you to route.
 
+## 9. Review it
+
+```bash
+blpl stage8 --project-dir ~/blpl-example
+```
+
+Stage 7 asked whether this is a *legal* KiCad project. Stage 8 asks whether it is
+a *good board*, and whether the pipeline emitted what the BOM said. It runs the
+kicad-happy analyzers and then sorts every finding into three buckets:
+
+```
+stage8: PASS  emitter=<n>  design=<n>  expected=<n>  placeholders=<n>
+        [spice] no simulatable subcircuits — nothing was verified
+        wrote ~/blpl-example/.pipeline/review.md
+```
+
+- **emitter** — BLPL lost or mangled something. These are our bugs and they gate.
+- **design** — a real electrical problem in what you wrote. Yours to triage.
+- **expected** — known BLPL limitations. Every net is unrouted because there is no
+  autorouter; reporting that as a failure would train you to ignore the report.
+
+Read `.pipeline/review.md` rather than the JSON. And note the `[spice]` line: on
+this two-part board there is nothing simulatable, which is *not* the same as
+everything passing — see [`pipeline-stages.md`](pipeline-stages.md#simulation-inside-stage-8).
+
+`blpl doctor` at the start and `blpl stage8` at the end are the two commands that
+turn a pipeline into something you can trust: one says what the input would lose,
+the other says what the output actually is.
+
 ## What to do next
 
 - Bigger projects: split markdown per subsystem (`core.md`, `power.md`, `network.md`).
-- External references: see [`references.md`](references.md) for the planned VFS design to point at reference designs, prior iterations, or third-party symbol/footprint libraries.
+- External references: point at reference designs, prior iterations, or third-party symbol/footprint libraries — see [`references.md`](references.md).
+- The web UI, design chat, module reuse and the fab release package: [`workbench.md`](workbench.md).
+- Getting to a quote: `blpl bom-check` for sourcing gaps, then the release build for gerbers plus JLCPCB/PCBWay BOM and CPL.
 - CLI reference: [`cli.md`](cli.md).

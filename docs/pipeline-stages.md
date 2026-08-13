@@ -141,10 +141,63 @@ Runs:
 - **DRC** via `kicad-cli pcb drc`.
 - **Coverage** — re-reports Stage 2's hit/miss percentages for completeness.
 
+## Stage 8 — Design review
+
+**Inputs**: the emitted `.kicad_sch` / `.kicad_pcb`, plus `bom.json`, `hdm.yaml` and `design_artifact.deterministic.json` for the cross-checks.
+**Outputs**: `.pipeline/review_report.json`, `.pipeline/review.md`, and the raw analyzer JSON under `.pipeline/review/`.
+
+Stage 7 asks *"is this a legal KiCad project?"*. Stage 8 asks *"is this a good board, and did the pipeline emit what the BOM said?"*
+
+It shells out to the kicad-happy analyzers — `analyze_schematic.py`, `analyze_pcb.py`, `cross_analysis.py`, `analyze_emc.py` — and then does the part that is BLPL-specific: **classifying each finding by provenance**.
+
+| Provenance | Meaning | Who fixes it |
+|---|---|---|
+| `emitter` | The pipeline lost or mangled data it was given | BLPL — fix the emitter, not the board |
+| `design` | A real electrical problem in the design you authored | You — fix the markdown |
+| `expected` | A known consequence of what BLPL does not do yet | Nobody, yet |
+
+That classification is the whole point. kicad-happy assumes a human drew the board, so an unclassified review of a *generated* one is ~90% noise — every net is unrouted by construction, there are no test points, and the generator's own limitations swamp the real findings. `_EMITTER_RULES` and `_EXPECTED_RULES` in `stage8_review.py` are where that knowledge lives.
+
+Two checks are invisible to the analyzers, because they compare against artifacts the analyzers never see:
+
+- **Stage 1 component loss.** Stage 0 is deterministic, so if it parsed 46 components the design has 46. Stage 1 resolves those through an LLM, and an LLM returning a short list produces a quietly smaller board rather than an error. The counts are compared and the difference reported.
+- **Placeholder parts.** Stage 5 substitutes generic stand-ins for parts with no real symbol or footprint, so the board opens, renders and routes — while being wrong. These block fabrication at any severity.
+
+`ok` is false when there are emitter defects or placeholders. Design issues never gate: they are yours to triage.
+
+```bash
+blpl stage8 --project-dir <proj> [--no-emc] [--no-spice]
+```
+
+### Simulation, inside Stage 8
+
+Stage 8 also runs kicad-happy's SPICE testbenches over the subcircuits the schematic analyzer detected — RC/LC filters, dividers, opamp stages, crystal load networks. Detection only proves the topology exists; simulation asks whether it lands on the right numbers.
+
+The result has **four** states, not two, because three of them are silent if you only count failures:
+
+| State | Meaning |
+|---|---|
+| skipped | No simulator installed. Carries the install hint. |
+| nothing to simulate | It ran and built no testbench — e.g. a crystal drawn without load caps. |
+| nothing measured | Testbenches ran and returned no numbers. The normal LTspice outcome. |
+| measured | Real pass/warn/fail counts, and whether PCB parasitics were included. |
+
+Only the last is verification. See [`cli.md`](cli.md#spice) for `blpl spice`, which re-runs simulation alone with a type filter or a Monte Carlo sweep.
+
 ## Orchestrator
 
 ```bash
-blpl run --project-dir <proj> --from stage0 --to stage7 [--continue-on-error]
+blpl run --project-dir <proj> --from stage0 --to stage8 [--continue-on-error]
 ```
 
-`--from` / `--to` can be any `stageN`. With `--continue-on-error`, non-zero exits from a stage don't abort the run — useful when Stage 3 pending prompts or Stage 2 misses shouldn't block Stage 6 emission.
+`--from` / `--to` can be any `stageN` (default `stage0` → `stage8`). With `--continue-on-error`, non-zero exits from a stage don't abort the run — useful when Stage 3 pending prompts or Stage 2 misses shouldn't block Stage 6 emission.
+
+## Before you start: `blpl doctor`
+
+Stage 0 discards tables it cannot classify **without saying so**, so a typo in a column header costs you a subsystem and the pipeline still runs to completion. `blpl doctor` reads your markdown and reports what Stage 0 would drop or misread, before anything runs. It mutates nothing.
+
+```bash
+blpl doctor --project-dir <proj> [--json]
+```
+
+Twelve checks (`DOC-000` … `DOC-011`), tabulated in [`cli.md`](cli.md#doctor). It is the intended first step of every session, and the **Preflight** tab in the web UI is the same report.

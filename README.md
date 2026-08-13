@@ -18,7 +18,7 @@ Hardware projects usually live in two disconnected worlds: narrative design docs
 
 | Area | State |
 |---|---|
-| Stages 0–8 (Markdown → KiCad → review) | Working. 500 tests passing. |
+| Stages 0–8 (Markdown → KiCad → review) | Working. 579 tests passing. |
 | Emitter (direct S-expression) | Working. Runs without KiCad installed. |
 | KiCad plugin (pcbnew Python API) | Working. Requires KiCad 10.x. |
 | Classifier (passives, generic connectors, 3-pin semis) | Working. Auto-resolves most of dev.03. |
@@ -50,6 +50,7 @@ Detailed setup: [`docs/install.md`](docs/install.md). Walk through a full projec
 ```
 Markdown design docs
         │
+        │   blpl doctor  → what Stage 0 would silently discard. Run this first.
         ▼
 ┌───────────────────┐
 │  Stage 0   parse  │  → design_artifact.json
@@ -60,17 +61,22 @@ Markdown design docs
 │  Stage 5   HDM    │  → hdm.yaml (Hardware Description Manifest — SoT)
 │  Stage 6   KiCad  │  → .kicad_sch + .kicad_pcb + .kicad_pro
 │  Stage 7   lint   │  → validation_report.json (ERC/DRC/coverage)
+│  Stage 8   review │  → review.md (emitter defects vs design issues vs expected)
 └───────────────────┘
+        │
+        ▼   release  → gerbers, drill, placement, BOM + per-house CPL — if the gate agrees
 ```
 
 Each stage is deterministic and idempotent; stages 0 and 1 use an LLM adapter (Anthropic / OpenAI / Ollama pluggable). Outputs are validated against JSON Schemas (`schemas/*.v1.json`). Every stage can be run standalone, so debugging is about narrowing to one stage and inspecting its artifact.
+
+The two ends are what make the middle trustworthy. `blpl doctor` says what your input would lose *before* anything runs, because Stage 0 discards tables it cannot classify without saying so. Stage 8 then sorts every finding by whose fault it is — a generated board trips analyzer rules by construction, and an unclassified review of one is mostly noise.
 
 ## Repo layout
 
 ```
 blpl-repo-root/
     blpl/
-        core/           # pipeline stages 0–7
+        core/           # pipeline stages 0–8, plus doctor and release
         emitter/        # v10 KiCad .kicad_sch / .kicad_pcb / .kicad_pro writer
         classifier/     # component + connector inference
         plugin_kicad/   # pcbnew ActionPlugin + standalone build_pcb CLI
@@ -95,9 +101,10 @@ blpl-repo-root/
 - [Pipeline stages](docs/pipeline-stages.md) — one section per stage with inputs, outputs, and commands
 - [CLI reference](docs/cli.md) — every subcommand with flags and examples
 - [Architecture](docs/architecture.md) — component relationships and data flow
-- [Hardware-design skill](docs/skills.md) — how the Claude Code skill under `.claude/skills/hardware-design/` activates and what it promises
+- [Skills](docs/skills.md) — the Claude Code skill set, and how the kicad-happy scripts are wired into the pipeline
+- [References](docs/references.md) — pointing a project at external folders, and the sandbox that polices it
 - [Workbench](docs/workbench.md) — chat, endpoints, modules, the review panel, and the release package
-- [Roadmap](docs/roadmap.md) — what's planned for Web UI and VFS references
+- [Roadmap](docs/roadmap.md) — what is shipped, and what is next
 
 ## License
 

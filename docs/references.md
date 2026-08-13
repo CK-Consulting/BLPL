@@ -1,8 +1,16 @@
-# References (planned)
+# References
 
-This document describes the virtual-filesystem / external-folder reference system planned for **Phase 3**. The goal: let a project point at arbitrary external folders (reference designs, prior iterations, third-party symbol libraries) with explicit access controls, without that material having to live inside the project's own worktree.
+The virtual-filesystem / external-folder reference system: a project can point at
+arbitrary external folders — reference designs, prior iterations, third-party
+symbol libraries — with explicit access controls, without that material having to
+live inside the project's own worktree.
 
-> Status: **not yet implemented.** Ship date tracked in `roadmap.md`. This document captures the design so Phase 3 code can be written against a fixed spec.
+> Status: **implemented.** `app/backend/app/references.py` holds the manifest,
+> the sandbox and the manifest validator; `tests/test_references_api.py` covers
+> them. The one piece still outstanding is a dedicated editor screen — see
+> [API surface](#api-surface). Sections below marked with a note describe
+> behaviour that differs from the original design; the difference is the
+> interesting part and is called out rather than quietly rewritten.
 
 ## Motivation
 
@@ -87,14 +95,51 @@ Stages can filter references by role: Stage 2's library lookup can opt to also s
 
 ## Enforcement
 
-BLPL's filesystem layer (introduced in Phase 3) is a thin wrapper around Python's `pathlib.Path` that:
+`FilesystemSandbox` in `app/backend/app/references.py` is a userspace wrapper
+around `pathlib.Path.resolve()`. No FUSE, no kernel mounts. Every path the
+backend touches goes through `check_read` / `check_write` / `check_delete`:
 
-1. Rejects paths outside `workspace_root ∪ references[*].path` with a `PermissionError`.
-2. Rejects write/create operations to `read`-mode references.
-3. Rejects `unlink()` / `rmtree()` on files that existed before the current session started (tracked via a snapshot manifest at session start).
-4. Materialises a symlink tree at `<project>/.blpl/refs/<name>/` → real path, for tools that can't accept arbitrary paths. Toggled per reference (`"materialize": true`).
+1. **Read** — allowed inside `workspace_root ∪ references[*].path ∪ global allowlist`.
+   Anything else raises `ReferencePolicyError`.
+2. **Write** — allowed inside `workspace_root`, inside a `read-write` reference,
+   or on a path this sandbox instance was told it created.
+3. **Delete** — allowed *only* on paths registered as created by this sandbox
+   instance. Instances are per-request on the HTTP surface and per-turn inside an
+   agent conversation, so delete fails closed almost everywhere. That is
+   deliberate for delete; see the note below.
+4. **Denylist outranks everything**, checked first in all three.
 
-No FUSE, no custom kernel mounts. Pure userspace path validation.
+Materialising a symlink tree at `<project>/.blpl/refs/<name>/` is declared per
+reference (`"materialize": true`) for tools that cannot accept arbitrary paths.
+
+### Validating the manifest itself
+
+`references.json` is the file that *defines* the sandbox, which makes writing it
+the one operation the sandbox cannot check afterwards — not a path-traversal
+problem but a policy-override one, and no amount of downstream checking recovers
+from it. So `PUT /api/projects/{id}/references` validates before storing, via
+`validate_reference()`. It refuses:
+
+| Refusal | Why |
+|---|---|
+| A path that does not exist | It widens the policy now and arms whenever something appears there later — a trap that survives review because it looks inert. |
+| `/` or the bare home directory | Does not widen the sandbox so much as abolish it. |
+| Anything inside or containing BLPL's state roots | Would put `vault.db` and every other project inside one project's sandbox. Read leaks them; read-write lets a tool rewrite them. |
+| A `read-write` reference covering the project's own `.blpl/` | Would let a tool rewrite `references.json` — the policy it is being judged by. |
+
+One bad entry rejects the whole list: a partially-applied policy is worse than a
+refused one.
+
+### On delete
+
+The "snapshot every path at session start" design below was not built, and on
+reflection should not be. Creation-tracking lives on the sandbox *instance*, so
+an empty set means delete is refused rather than permitted — it fails closed,
+which is the right default for the one irreversible operation. Nothing in
+production calls `check_delete` today. What matters is that the rule states its
+real lifetime instead of implying a session-wide memory that does not exist: a
+check that reads as "we track what we made" but evaluates to "never" is how a
+reviewer concludes a guard is working when it is merely absent.
 
 ## Global allow/deny lists
 
@@ -113,20 +158,26 @@ When a reference's `path` is itself a git repo, BLPL offers to:
 - **Record as a weak reference** in `references.json` with the repo's current `HEAD` sha, for reproducibility audits. Default.
 - **Add as `.gitignore`d symlink** under `.blpl/refs/`. No tracking; fastest.
 
-## UI surface
+## API surface
 
-In the (planned) web UI:
+- `GET  /api/projects/{id}/references` — the manifest as stored.
+- `PUT  /api/projects/{id}/references` — replace it, subject to the validation above.
+- `GET  /api/projects/{id}/sandbox` — a diagnostic view of the policy actually in
+  force: workspace root, manifest and session references, both global lists.
 
-- Project sidebar: list references with role badges and access mode icons.
-- Add-reference button: folder picker → role/access/scope pickers → preview (file count, total size, git status if applicable).
-- Per-session overrides: a toggle switches a `read` reference to `read-write` for the current session only.
-- Allow/deny list editor: table view of the global config.
+The dedicated reference editor described in earlier drafts of this document —
+folder picker, role and access pickers, per-session read→read-write toggle,
+allow/deny list editor — is **not built**. The API is complete and the sandbox
+enforces it; what is missing is a screen in front of it. References are edited by
+`PUT` today.
 
 ## Open questions
 
-These are explicit follow-ups for Phase 3:
-
-1. **Delete enforcement**: can we reliably prevent deletion of user files while allowing BLPL to manage its own outputs? Proposal: snapshot paths at session start; refuse `unlink()` on any path present in the snapshot unless BLPL created it during this session (tracked in a per-session write log).
-2. **Symlink loops**: detect and reject cyclic reference graphs at manifest load time.
+1. ~~**Delete enforcement.**~~ Settled — see "On delete" above. It fails closed
+   and the docstring now states the real lifetime.
+2. **Symlink loops** — detect and reject cyclic reference graphs at manifest load
+   time. Still open. `_is_within` resolves symlinks, so a cycle cannot escape the
+   sandbox; the risk is a traversal that does not terminate.
+3. **Reference editor UI** — see above.
 3. **Cross-platform file watching**: `watchfiles` works on macOS/Linux; Windows may need extra care for referenced paths outside the worktree.
 4. **Plugin path**: the `plugin_kicad` subprocess bypasses the BLPL FS layer. Phase 3 needs a per-subprocess policy or a warning that plugin invocations can see paths outside the reference graph.

@@ -171,13 +171,53 @@ mentioned is rejected on upload, and the rejection names neither file.
 This runs automatically as part of the release build; the standalone command
 exists for re-running it with `--lcsc` without rebuilding the package.
 
+## Project setup
+
+### `init`
+Generate `project.yaml` from the identity, stackup and net-class tables already in
+your markdown. Stage 5 halts without it, and `DOC-007` warns about it.
+```
+blpl init --project-dir <proj> [--force]
+```
+This is the answer to `DOC-001` reporting your net-classes table as discarded:
+Stage 0 does not consume it, but `init` does.
+
+### `skills`
+Install BLPL's Claude Code skills into a project's `.claude/skills/`.
+```
+blpl skills list    [--project-dir <proj>]              # what exists / what's installed
+blpl skills install --project-dir <proj>                # the review set (default)
+blpl skills install --project-dir <proj> --all          # + sourcing/fab skills
+blpl skills install --project-dir <proj> --skill kicad --force
+    [--source <kicad-happy checkout>]  # overrides BLPL_KICAD_HAPPY and the submodule
+```
+A copy, deliberately not a symlink, so the snapshot travels with the git-backed
+project. See [`skills.md`](skills.md) — note that this installs *guidance* for a
+Claude Code session; the pipeline's own use of the kicad-happy **scripts** needs
+no install.
+
+## Serving the app
+
+### `serve`
+Launch the FastAPI backend on localhost. Requires the `webapp` extras, and serves
+the built frontend from the same process if `app/frontend/dist/` exists.
+```
+blpl serve
+    [--workspace <dir>]     # directory of projects; default <data-root>/projects
+    [--host 127.0.0.1]      # local only by default, and that is deliberate
+    [--port 7878]
+    [--no-browser]          # don't auto-open a browser
+    [--reload]              # uvicorn dev mode
+    [--log-level info]
+```
+
 ## Orchestrator
 
 ### `run`
-Chain stages 0–7 with bounded range and error handling.
+Chain stages 0–8 with bounded range and error handling.
 ```
 blpl run --project-dir <proj>
-    [--from stage0] [--to stage7]
+    [--from stage0] [--to stage8]        # defaults
     [--stage0 det|llm|both]        # mode for Stage 0; 'both' also runs stage0-compare
     [--auto-fill-gaps]             # forwarded to stage3
     [--continue-on-error]          # don't abort on non-zero stage exit

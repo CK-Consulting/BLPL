@@ -1,79 +1,115 @@
 # Roadmap
 
-BLPL is in active development. The pipeline (Stages 0–7) is stable; the Web UI and virtual-filesystem reference system are planned but not yet implemented.
+The pipeline (Stages 0–8) and the web application are both working. What remains
+is packaging, a few CLI surfaces the web UI already has, and the long-tail
+accuracy work that never really ends.
 
-## Phases
+For the app's own design record — the reasoning behind the vault, the config
+cascade and the tool policy — see [`app-plan.md`](app-plan.md). This file is the
+shorter "what is done, what is next".
+
+## Shipped
 
 ### Phase 1 — Pipeline + KiCad plugin ✅
 
 - Stages 0–7 end-to-end Markdown → KiCad.
 - S-expression emitter (runs without KiCad installed).
-- KiCad pcbnew ActionPlugin + standalone build_pcb entry.
+- KiCad pcbnew ActionPlugin + standalone `build_pcb` entry.
 - Component classifier (passives, generic connectors, SOT-23 3-pin).
 - Deterministic connector synthesis (pinout-only → BOM rows).
 - `resolve-pin-map` CLI for specific parts.
-- 116 tests passing.
 
-### Phase 2 — Docs baseline ✅ (this doc)
+### Phase 2 — Docs baseline ✅
 
-- README with orientation.
-- `install.md`, `tutorial.md`, `pipeline-stages.md`, `cli.md`, `skills.md`, `architecture.md`, `references.md`, `roadmap.md`.
-- Hardware-design skill at `.claude/skills/hardware-design/`.
+- README plus `install`, `tutorial`, `pipeline-stages`, `cli`, `skills`,
+  `architecture`, `references`, `workbench`, `roadmap`.
+- Hardware-design skill shipped inside the package.
 
-### Phase 3 — Web backend + references
+### Phase 3 — Web backend + references ✅
 
-**Scope**:
+- FastAPI backend at `app/backend` (`app.main`), via `blpl serve` or docker compose.
+- Projects, stage runs with streamed logs, artifacts, conversations.
+- Virtual-filesystem references per [`references.md`](references.md), with a
+  `FilesystemSandbox` every path goes through.
 
-- FastAPI backend at `app/backend` (`app.main`), launched via `blpl serve` locally or docker compose for the hosted deploy.
-- REST endpoints: list projects, read/write `references.json`, run stages, stream logs (SSE), view artifacts.
-- Virtual filesystem layer per [`references.md`](references.md): per-project `references.json` + global allow/deny list, read-only vs read-write access modes, session/project/global scopes.
-- Conversation persistence: JSONL-per-conversation under `<project>/.blpl/conversations/`.
-- Security model: BLPL filesystem wrapper refuses paths outside the union of workspace_root and declared references.
+### Phase 4 — Web UI ✅
 
-**Exit criteria**:
-- `curl localhost:<port>/api/projects` returns project list.
-- `curl -X POST /api/projects/<id>/stages/stage0-det` triggers Stage 0 and streams log lines.
-- `references.json` edits via API propagate to filesystem access checks.
-- Tests: new `tests/test_webapp.py` covers auth (local-only), path validation, and stage-runner endpoints.
+React + Vite (`app/frontend/`), not the SolidJS prototype this doc originally
+planned — that prototype was deleted. Board viewer via `ecad-viewer`, project
+picker, editor, BOM, Reports, Release, Artifacts, Changes, and Preflight.
 
-### Phase 4 — Web UI (SolidJS + Vite)
+### Phase 5 — Identity, vault, and durable state ✅
 
-**Scope**:
+- Passphrase → session; Argon2id KDF and AES-GCM key store (`vault.py`).
+- Git-backed projects; import an existing KiCad project from the browser.
+- Durable runs: a run outlives the tab that started it.
+- `blpl.toml` config cascade with per-task LLM routing.
 
-- Project picker — browse workspace for projects with `.blpl/` or manually add.
-- Reference editor — add/remove/edit external paths, toggle access modes.
-- Stage runner — click-to-run each stage, with live log streaming and artifact preview.
-- Conversation view — LLM history sidebar, threaded replies, resume/fork conversations.
-- Artifact inspector — tree view of `.pipeline/`, JSON syntax highlighting, diff between runs.
-- Design-review mode — side-by-side markdown ↔ generated artifact ↔ KiCad render.
+### Phase 6 — Design chat and the agent platform ✅
 
-**Exit criteria**:
-- `blpl serve` + opening `http://localhost:<port>` lands in the project picker.
-- Full tutorial (from [`tutorial.md`](tutorial.md)) completable through the UI without CLI.
-- Conversation history survives restart.
+- Provider-agnostic streaming chat with a tool loop.
+- Tool policy separate from tool description — the model sees a name and a
+  schema, the executor sees a kind, path arguments and an approval rule.
+- Edits arrive as **proposals** the user accepts as a diff; nothing is written
+  behind their back.
+- Parts lookup and datasheet extraction; KiCad editing over MCP when a
+  kicad-ai-assistant server is configured.
+- Module extraction — lift a proven block out of an existing board and reuse it.
 
-### Phase 5+ — Post-MVP ideas (not committed)
+### Phase 7 — Review, simulation, and a quotable package ✅
 
-- **Native packaging** via Tauri — bundle BLPL as a macOS/Windows/Linux app. FastAPI backend stays authoritative; Tauri is just a shell.
-- **Multi-user collaboration** — shared backend with per-user workspaces. Questionable for a hardware design tool, but possibly useful for design reviews.
-- **KiCad project round-trip** — import an existing `.kicad_sch`/`.kicad_pcb`, generate the equivalent HDM, let the user edit the HDM and re-emit. Effectively makes BLPL a KiCad alternative frontend.
-- **Autorouter integration** — `stage6-plugin` extension that calls KiCad's interactive router or an external tool (Freerouter) on the emitted board.
-- **Schematic-side eeschema bindings** — if KiCad adds a Python API for the schematic editor, replace the hand-rolled `.kicad_sch` emitter with native calls.
+- Stage 8 design review with provenance classification (emitter / design / expected).
+- Mixture-of-experts review panel across every routed endpoint.
+- SPICE simulation of detected subcircuits (see [`workbench.md`](workbench.md#simulation)).
+- Release package a contract fab can quote, gated, with per-house JLCPCB and
+  PCBWay BOM/CPL.
+- `blpl doctor` + the Preflight tab: what Stage 0 would silently discard.
 
-## Version plan
+## Next
 
-| Version | Phase | Target |
-|---|---|---|
-| 0.1.0 | Phase 1 (initial) | ✅ Released |
-| 0.2.0 | Phase 1.1 (restructure + rename) | ✅ Current |
-| 0.3.0 | Phase 2 (docs) | ✅ This commit |
-| 0.4.0 | Phase 3 (backend + refs) | Planned |
-| 0.5.0 | Phase 4 (UI) | Planned |
-| 1.0.0 | Stabilized UI + docs | Planned |
+### Packaging — the one that matters
+
+The install is still "clone the repo, make a venv, init submodules, build the
+frontend". The target is one command that needs no environment variables and
+opens a browser. This is Phase G in [`app-plan.md`](app-plan.md#phasing) and it
+is the last thing between BLPL and somebody else being able to use it.
+
+### CLI parity with the web UI
+
+The web UI can edit configuration the CLI cannot read back out:
+
+- **`blpl config`** — show the merged `blpl.toml`, and which layer each value
+  came from. `appconfig.py` already implements the cascade and the validator;
+  there is simply no subcommand in front of it.
+- **`blpl release`** — the release build is reachable from the app and from
+  `python -m blpl.core.release`, but is not a `blpl` subcommand like every other
+  step.
+
+### Consuming the tables Stage 0 currently reports and ignores
+
+`DOC-001` names every discarded table instead of dropping it silently, which was
+the point of the doctor. But two of them are load-bearing and still unconsumed:
+the **net-classes** table (`Class | Trace width | Clearance | Via dia | Via drill`)
+and the **stackup** table. Both currently have to be restated in `project.yaml`.
+Reading them from the markdown would remove the last hand-authored file.
+
+### Ideas, not commitments
+
+- **Native packaging** via Tauri — the FastAPI backend stays authoritative,
+  Tauri is only a shell.
+- **Schematic-side pcbnew bindings** — if KiCad ever exposes a Python API for
+  eeschema, the hand-rolled `.kicad_sch` emitter can go.
+- **Multi-user collaboration** — the passphrase design already supports it; see
+  the open questions in [`app-plan.md`](app-plan.md#open-questions) for whether
+  it is wanted at all.
 
 ## Ongoing
 
-- Expand classifier coverage — every time a BOM row falls into `specific` that didn't need to, add a pattern to `blpl/classifier/component_classifier.py`.
-- Expand connector synthesis — every time a pinout-only entry gets misclassified, add a heuristic to `blpl/classifier/connector_synthesis.py`.
-- Keep the hardware-design skill's "Known pitfalls" section current as new failure modes surface.
-- Keep tests green. 116 now; grows with every resolved issue.
+- Expand classifier coverage — every time a BOM row falls into `specific` that
+  didn't need to, add a pattern to `blpl/classifier/component_classifier.py`.
+- Expand connector synthesis — every time a pinout-only entry gets
+  misclassified, add a heuristic to `blpl/classifier/connector_synthesis.py`.
+- Grow the doctor. Every failure mode that costs somebody a full pipeline run to
+  discover should become a `DOC-*` check that costs them a second.
+- Keep the "Known pitfalls" section of the hardware-design skill current.
+- Keep tests green. 579 now; grows with every resolved issue.
