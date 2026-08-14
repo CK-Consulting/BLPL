@@ -7,6 +7,14 @@ not returned over the wire. A server restart drops every session, and unlocking
 again is the only way back in — which is the behaviour you want for a box you
 leave running and roam back to.
 
+There are two ways to reach an unlocked session, and they differ in what they
+prove. The passphrase *derives* the key — knowing it is the same as holding the
+key. An SSO login proves only identity, so it opens a session via a second
+wrapping of the same DEK held under a server key (app/serverkey.py); the vault
+module's docstring spells out what that costs. Either way what lands here is the
+same DEK in the same in-memory session, and everything above this layer is
+unable to tell which door was used.
+
 Sessions are in-process because the backend runs a single worker on purpose (SSE
 stage streams come off an in-process subprocess, so multiple workers would break
 them anyway). A token is handed to the browser as an httpOnly cookie; the token
@@ -42,6 +50,15 @@ class AlreadyInitialized(RuntimeError):
 
 class Locked(RuntimeError):
     """An operation needed the DEK but no unlocked session was supplied."""
+
+
+class SsoNotEnabled(RuntimeError):
+    """An SSO login succeeded, but this vault has no server-key wrapping to open.
+
+    The remedy is specific and worth keeping distinct from a failed login: unlock
+    once with the passphrase while OAuth is configured, which enrols the wrapping.
+    Until then the identity is fine and the vault is simply shut to it.
+    """
 
 
 @dataclass
@@ -86,6 +103,49 @@ class Identity:
             raise NotInitialized("no passphrase has been set")
         params, wrapped = self.store.load_vault()
         dek = vault.unlock(passphrase, params, wrapped)  # raises WrongPassphrase
+        return self._open_session(dek)
+
+    # -- SSO login -----------------------------------------------------------
+
+    def sso_enabled(self) -> bool:
+        """Whether a server-key wrapping exists, i.e. whether an OAuth login can
+        open a session. Cheap and session-free, because the unlock screen has to
+        ask this before anyone is authenticated."""
+        return self.store.has_server_wrapped_dek()
+
+    def enable_sso(self, token: str, server_key: bytes) -> None:
+        """Wrap the live DEK under the server key so SSO logins can unlock.
+
+        Requires an unlocked session by construction: the DEK it wraps is the one
+        held by ``token``. You cannot enable SSO without first proving you can
+        already open the vault, which is what stops a stolen server key from
+        being enough on its own to enrol.
+
+        Idempotent — re-enrolling rewraps the same DEK under the same key, which
+        is how a rotated server key is adopted.
+        """
+        dek = self._require_dek(token)
+        self.store.save_server_wrapped_dek(vault.wrap_dek_with_key(server_key, dek))
+
+    def disable_sso(self) -> bool:
+        """Drop the server-key wrapping. Needs no session: revoking access is
+        never something to gate behind having access. Existing sessions live on
+        — they already hold the DEK — but no new SSO login can open one."""
+        return self.store.delete_server_wrapped_dek()
+
+    def unlock_with_server_key(self, server_key: bytes) -> str:
+        """Open a session from the server-key wrapping, returning its token.
+
+        The caller must have established *identity* before calling this: this
+        function checks a key the server holds, not anything about the person.
+        It is the last step of an OAuth callback, never a route of its own.
+        """
+        if not self.store.is_initialized():
+            raise NotInitialized("no passphrase has been set")
+        wrapped = self.store.load_server_wrapped_dek()
+        if wrapped is None:
+            raise SsoNotEnabled("no server-key wrapping; sign in with the passphrase once first")
+        dek = vault.unwrap_dek_with_key(server_key, wrapped)  # raises WrongServerKey
         return self._open_session(dek)
 
     def change_passphrase(self, old: str, new: str) -> None:

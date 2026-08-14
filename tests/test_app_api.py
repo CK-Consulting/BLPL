@@ -35,7 +35,11 @@ def test_health_is_reachable_while_locked(client) -> None:
 
 def test_a_fresh_app_reports_uninitialized(client) -> None:
     r = client.get("/api/auth/status")
-    assert r.json() == {"initialized": False, "unlocked": False}
+    # Subset rather than equality: the payload also carries the SSO fields, which
+    # tests/test_oauth_login.py owns. Pinning the whole dict here made this test
+    # fail for a change it has no opinion about.
+    assert r.json()["initialized"] is False
+    assert r.json()["unlocked"] is False
 
 
 def test_the_api_is_closed_until_you_unlock(client) -> None:
@@ -48,7 +52,8 @@ def test_first_run_setup_unlocks_the_session(client) -> None:
     assert r.status_code == 200 and r.json()["unlocked"] is True
     # The session cookie now opens the gate.
     assert client.get("/api/projects").status_code == 200
-    assert client.get("/api/auth/status").json() == {"initialized": True, "unlocked": True}
+    status = client.get("/api/auth/status").json()
+    assert status["initialized"] is True and status["unlocked"] is True
 
 
 def test_setup_cannot_run_twice(client) -> None:

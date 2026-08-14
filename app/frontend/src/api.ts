@@ -106,7 +106,17 @@ async function errorDetail(res: Response): Promise<string> {
 
 // --- typed shapes the UI consumes ---
 
-export type AuthStatus = { initialized: boolean; unlocked: boolean };
+export type SsoProvider = { id: string; label: string };
+
+export type AuthStatus = {
+  initialized: boolean;
+  unlocked: boolean;
+  /** Providers are configured AND the vault has been enrolled for SSO. False
+   *  until someone unlocks once with the passphrase, which is what creates the
+   *  server-key wrapping the sign-in buttons depend on. */
+  sso_ready: boolean;
+  sso_providers: SsoProvider[];
+};
 
 export type SecretMeta = { provider: string; updated_at: string };
 

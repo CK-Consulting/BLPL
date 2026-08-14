@@ -61,6 +61,33 @@ services:
       # the request scheme (plain http → off so it works, https → on). Put TLS in
       # front and have that proxy send X-Forwarded-Proto: https; the flag follows.
       #
+      # Optional SSO. Leave every one of these unset and the app's front door is
+      # the passphrase, which is a complete setup — SSO only ever adds a door.
+      # Note what it costs: the passphrase derives the key, so it is stored
+      # nowhere; an OAuth login cannot derive anything, so enabling it wraps the
+      # same key under a server-held one and the data directory alone becomes
+      # enough to read your secrets. BLPL_SERVER_KEY holds that key (else it is
+      # generated at /app/data/server.key) — do not back it up beside vault.db.
+      #
+      # The allowlist is load-bearing, not advisory: without it any account at
+      # the provider could sign in, so SSO stays off until one is set.
+      # BLPL_PUBLIC_URL must be the origin the browser uses — the backend sees
+      # http://backend:8000 behind nginx, and a redirect_uri that doesn't match
+      # what you registered is the usual reason a login fails.
+      - BLPL_PUBLIC_URL=${BLPL_PUBLIC_URL:-}
+      - BLPL_SERVER_KEY=${BLPL_SERVER_KEY:-}
+      - BLPL_OAUTH_ALLOWED_EMAILS=${BLPL_OAUTH_ALLOWED_EMAILS:-}
+      - BLPL_OAUTH_ALLOWED_DOMAINS=${BLPL_OAUTH_ALLOWED_DOMAINS:-}
+      - BLPL_OAUTH_GITLAB_CLIENT_ID=${BLPL_OAUTH_GITLAB_CLIENT_ID:-}
+      - BLPL_OAUTH_GITLAB_CLIENT_SECRET=${BLPL_OAUTH_GITLAB_CLIENT_SECRET:-}
+      - BLPL_OAUTH_GITLAB_SELF_CLIENT_ID=${BLPL_OAUTH_GITLAB_SELF_CLIENT_ID:-}
+      - BLPL_OAUTH_GITLAB_SELF_CLIENT_SECRET=${BLPL_OAUTH_GITLAB_SELF_CLIENT_SECRET:-}
+      - BLPL_OAUTH_GITLAB_SELF_ISSUER=${BLPL_OAUTH_GITLAB_SELF_ISSUER:-}
+      - BLPL_OAUTH_GITHUB_CLIENT_ID=${BLPL_OAUTH_GITHUB_CLIENT_ID:-}
+      - BLPL_OAUTH_GITHUB_CLIENT_SECRET=${BLPL_OAUTH_GITHUB_CLIENT_SECRET:-}
+      - BLPL_OAUTH_GOOGLE_CLIENT_ID=${BLPL_OAUTH_GOOGLE_CLIENT_ID:-}
+      - BLPL_OAUTH_GOOGLE_CLIENT_SECRET=${BLPL_OAUTH_GOOGLE_CLIENT_SECRET:-}
+      #
       # The vars below are for kicad-happy features for pulling datasheet and quotes.
       # DigiKey authenticates with the two-legged client_credentials grant — the ID
       # and secret are exchanged for a 10-minute bearer token per run, with no

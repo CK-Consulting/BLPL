@@ -42,6 +42,11 @@ header .kicad { margin-left: 0; }
 .gate-card button { padding: .5rem; background: #2b4a86; border-color: #396; border: 1px solid #34507f; }
 .gate-error { color: #ff8b8b; font-size: 13px; }
 .gate-hint { color: #7d8590; font-size: 12px; }
+/* An anchor, not a button — it must be a real top-level navigation so the
+   provider can take the tab. Styled to sit alongside the unlock button without
+   competing with it: the passphrase remains the primary path. */
+.gate-sso { display: block; padding: .5rem; text-align: center; background: #20242c; border: 1px solid #343a44; border-radius: 6px; color: #cfd6df; text-decoration: none; font-size: 13px; }
+.gate-sso:hover { background: #262b34; border-color: #46505f; }
 
 /* --- git strip --- */
 .git-strip { display: flex; align-items: center; gap: .5rem; padding: .35rem 1rem; border-bottom: 1px solid #2a2e36; background: #15181d; font-size: 13px; }

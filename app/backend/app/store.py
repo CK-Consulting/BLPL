@@ -44,6 +44,18 @@ CREATE TABLE IF NOT EXISTS secret (
     ciphertext  BLOB NOT NULL,
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- The same DEK as the vault row, wrapped under the server key instead of the
+-- passphrase, so an SSO login can open a session. Separate table rather than
+-- two more columns on `vault`: its presence is exactly the question "is SSO
+-- enabled", and DELETE answers it in one statement without disturbing the
+-- passphrase material sitting next to it.
+CREATE TABLE IF NOT EXISTS vault_server_key (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),  -- single-user: exactly one row
+    dek_nonce    BLOB NOT NULL,
+    dek_wrapped  BLOB NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -106,6 +118,42 @@ class Store:
         )
         wrapped = vault.WrappedDek(nonce=row["dek_nonce"], ciphertext=row["dek_wrapped"])
         return params, wrapped
+
+    # -- server-key wrapping (SSO login) -------------------------------------
+
+    def has_server_wrapped_dek(self) -> bool:
+        row = self._conn.execute("SELECT 1 FROM vault_server_key WHERE id = 1").fetchone()
+        return row is not None
+
+    def save_server_wrapped_dek(self, wrapped: vault.WrappedDek) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO vault_server_key (id, dek_nonce, dek_wrapped)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                dek_nonce=excluded.dek_nonce, dek_wrapped=excluded.dek_wrapped
+            """,
+            (wrapped.nonce, wrapped.ciphertext),
+        )
+        self._conn.commit()
+
+    def load_server_wrapped_dek(self) -> vault.WrappedDek | None:
+        row = self._conn.execute("SELECT * FROM vault_server_key WHERE id = 1").fetchone()
+        if row is None:
+            return None
+        return vault.WrappedDek(nonce=row["dek_nonce"], ciphertext=row["dek_wrapped"])
+
+    def delete_server_wrapped_dek(self) -> bool:
+        """Turn SSO login back off. Returns whether there was anything to delete.
+
+        Only the second wrapping goes; the passphrase wrapping and every secret
+        are untouched, so this is a safe thing to reach for in a hurry — which
+        is the point, because "the server key may have leaked" is the situation
+        it exists for.
+        """
+        cur = self._conn.execute("DELETE FROM vault_server_key WHERE id = 1")
+        self._conn.commit()
+        return cur.rowcount > 0
 
     # -- secrets -------------------------------------------------------------
 

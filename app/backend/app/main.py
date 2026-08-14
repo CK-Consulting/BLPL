@@ -5,9 +5,14 @@ Three things make this the hosted app rather than the earlier vertical slice:
 * KiCad lives in the *image*, not on your laptop (FROM kicad/kicad:10.0.0), so
   every workstation you sit at renders and exports identically.
 
-* Your secrets live in an encrypted vault, unlocked by a passphrase you type and
-  the server never stores. The whole API sits behind that unlock — the passphrase
-  is the app's front door. See app/vault.py and app/identity.py.
+* Your secrets live in an encrypted vault. The whole API sits behind unlocking it,
+  and there are two doors. The passphrase *derives* the key, so it is never stored
+  anywhere. Signing in with GitLab, GitHub, or Google proves only who you are, so
+  it opens the vault via a second wrapping of the same key held server-side — which
+  means that on an SSO-enabled install, whoever holds the data directory holds the
+  secrets, and the passphrase-only guarantee no longer applies. That trade is
+  opt-in and reversible; app/vault.py states it in full, and app/oauth.py covers
+  who is allowed through the second door.
 
 * Your projects are git-backed working copies on the server, so they follow you
   between machines. See app/projects.py.
@@ -31,13 +36,13 @@ from pathlib import Path
 
 from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import appconfig, chat as chat_mod, importer, llm_resolver, runs, vault
+from . import appconfig, chat as chat_mod, importer, llm_resolver, oauth, runs, serverkey, vault
 from .appconfig import AppConfig, ProjectEntry
 from .conversations import Conversation, list_conversations
-from .identity import Identity, Locked
+from .identity import Identity, Locked, NotInitialized, SsoNotEnabled
 from .projects import ProjectError, Projects
 from .references import (
     FilesystemSandbox,
@@ -211,10 +216,23 @@ def health() -> dict:
 @app.get("/api/auth/status")
 def auth_status(blpl_session: str | None = Cookie(default=None)) -> dict:
     """What the client needs to decide which screen to show: is a passphrase set
-    yet (first-run vs returning), and is this browser currently unlocked."""
+    yet (first-run vs returning), is this browser currently unlocked, and which
+    sign-in buttons to offer.
+
+    Deliberately unauthenticated, and deliberately says nothing an anonymous
+    caller shouldn't have: provider ids and labels are the same information the
+    login page shows anyway, and ``sso_ready`` is a yes/no about this server's
+    configuration, not about any account.
+    """
+    provider_list = oauth.providers() if oauth.sso_configured() else {}
     return {
         "initialized": identity.is_initialized(),
         "unlocked": identity.is_unlocked(blpl_session),
+        # Configured *and* enrolled. A provider set up before anyone has unlocked
+        # with the passphrase cannot open anything yet (there is no server-key
+        # wrapping to unwrap), so offering the button would be a dead end.
+        "sso_ready": bool(provider_list) and identity.sso_enabled(),
+        "sso_providers": [{"id": p.id, "label": p.label} for p in provider_list.values()],
     }
 
 
@@ -268,6 +286,23 @@ def _set_session_cookie(response: Response, request: Request, token: str) -> Non
     )
 
 
+def _enrol_sso(token: str) -> bool:
+    """Wrap the DEK under the server key, if SSO is configured and not yet enrolled.
+
+    Called from the passphrase paths because enrolment needs a DEK, and the
+    passphrase is the only thing that produces one from cold. So the sequence for
+    an operator is: configure the providers, unlock once with the passphrase, and
+    from then on the sign-in buttons work.
+
+    Returns whether it enrolled, so the caller can tell the user their vault's
+    at-rest protection just changed — that should never happen silently.
+    """
+    if not oauth.sso_configured() or identity.sso_enabled():
+        return False
+    identity.enable_sso(token, serverkey.load_or_create(_DATA))
+    return True
+
+
 @app.post("/api/auth/initialize")
 def auth_initialize(body: PassphraseBody, request: Request, response: Response) -> dict:
     """First-run: set the passphrase. Refused if one already exists."""
@@ -276,7 +311,7 @@ def auth_initialize(body: PassphraseBody, request: Request, response: Response) 
     except Exception as exc:  # AlreadyInitialized / ValueError
         raise HTTPException(status_code=400, detail=str(exc))
     _set_session_cookie(response, request, token)
-    return {"unlocked": True}
+    return {"unlocked": True, "sso_enrolled": _enrol_sso(token)}
 
 
 @app.post("/api/auth/unlock")
@@ -288,7 +323,142 @@ def auth_unlock(body: PassphraseBody, request: Request, response: Response) -> d
     except Exception as exc:  # NotInitialized
         raise HTTPException(status_code=400, detail=str(exc))
     _set_session_cookie(response, request, token)
-    return {"unlocked": True}
+    return {"unlocked": True, "sso_enrolled": _enrol_sso(token)}
+
+
+# --------------------------------------------------------------------------
+# Sign in with GitLab / GitHub / Google
+#
+# The provider says who you are; app/serverkey.py supplies the key that opens
+# the vault. Neither half is sufficient alone, which is why the callback checks
+# the allowlist before it ever asks identity for a session.
+# --------------------------------------------------------------------------
+
+_OAUTH_NONCE_COOKIE = "blpl_oauth_nonce"
+
+
+def _public_base_url(request: Request) -> str:
+    """The origin the *browser* is talking to, which is what the redirect URI
+    must match at the provider.
+
+    Behind a proxy the backend sees http://backend:8000, which is useless here
+    and would be rejected as a redirect_uri mismatch. X-Forwarded-Proto/Host fix
+    the common case; BLPL_PUBLIC_URL is the escape hatch for the deploy where
+    they are wrong or absent, and it is worth setting explicitly because a
+    mismatched redirect URI is the single most common OAuth setup failure.
+    """
+    override = os.environ.get("BLPL_PUBLIC_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    scheme = forwarded_proto or request.scope.get("scheme", "http")
+    forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    host = forwarded_host or request.headers.get("host", "")
+    return f"{scheme}://{host}"
+
+
+def _redirect_uri(request: Request, provider_id: str) -> str:
+    return f"{_public_base_url(request)}/api/auth/oauth/{provider_id}/callback"
+
+
+def _bounce(message_html: str, target: str | None) -> HTMLResponse:
+    """Finish a login from our own origin rather than with a bare redirect.
+
+    The session cookie is SameSite=Strict. A 302 straight to "/" is the last hop
+    of a redirect chain the *provider* started, so browsers may treat it as
+    cross-site and withhold the cookie — the user would land back on the lock
+    screen holding a perfectly good session. Serving a page from this origin and
+    navigating from script makes the next request unambiguously same-site.
+    """
+    nav = f'<script>location.replace({json.dumps(target)})</script>' if target else ""
+    return HTMLResponse(
+        "<!doctype html><meta charset=utf-8><title>BLPL</title>"
+        '<body style="font:14px system-ui;padding:2rem">'
+        f"{message_html}{nav}</body>"
+    )
+
+
+@app.get("/api/auth/oauth/{provider_id}/start")
+def oauth_start(provider_id: str, request: Request) -> HTMLResponse:
+    """Begin a login: sign a state, echo its nonce into a cookie, and bounce the
+    browser to the provider."""
+    provider = oauth.providers().get(provider_id)
+    if provider is None or not oauth.sso_configured():
+        raise HTTPException(status_code=404, detail="that sign-in provider is not configured")
+    nonce = oauth.new_nonce()
+    state = oauth.sign_state(serverkey.load_or_create(_DATA), provider_id, nonce)
+    response = _bounce("Redirecting to sign in…", oauth.authorize_url(provider, _redirect_uri(request, provider_id), state))
+    # SameSite=Lax, not Strict: this cookie has to survive the provider
+    # navigating back to us, and Strict would withhold it on exactly that hop —
+    # which is the one hop it exists for. Lax still blocks cross-site POSTs, and
+    # the value is a single-use random nonce that authorises nothing on its own.
+    response.set_cookie(
+        _OAUTH_NONCE_COOKIE,
+        nonce,
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(request),
+        max_age=600,
+    )
+    return response
+
+
+@app.get("/api/auth/oauth/{provider_id}/callback")
+def oauth_callback(
+    provider_id: str,
+    request: Request,
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    blpl_oauth_nonce: str | None = Cookie(default=None),
+) -> HTMLResponse:
+    """Finish a login: verify the state, resolve the identity, check the
+    allowlist, then open a session from the server-key wrapping.
+
+    Returns HTML rather than JSON because the caller is a browser mid-navigation,
+    not the app's own fetch layer.
+    """
+    if error:
+        return _bounce(f"Sign-in was refused by the provider: {_esc(error)}", None)
+    try:
+        signed_provider = oauth.verify_state(serverkey.load_or_create(_DATA), state, blpl_oauth_nonce or "")
+        if signed_provider != provider_id:
+            raise oauth.OAuthError("sign-in state was issued for a different provider")
+        provider = oauth.providers().get(provider_id)
+        if provider is None or not oauth.sso_configured():
+            raise oauth.OAuthError("that sign-in provider is not configured")
+        if not code:
+            raise oauth.OAuthError("the provider returned no authorization code")
+
+        access_token = oauth.exchange_code(provider, code, _redirect_uri(request, provider_id))
+        who = oauth.fetch_identity(provider, access_token)
+        oauth.check_allowed(who)
+        token = identity.unlock_with_server_key(serverkey.load_or_create(_DATA))
+    except (oauth.OAuthError, SsoNotEnabled, vault.VaultError, NotInitialized) as exc:
+        return _bounce(f"Could not sign in: {_esc(str(exc))}", None)
+
+    response = _bounce(f"Signed in as {_esc(who.email)}…", "/")
+    _set_session_cookie(response, request, token)
+    response.delete_cookie(_OAUTH_NONCE_COOKIE)
+    return response
+
+
+@app.post("/api/auth/oauth/disable")
+def oauth_disable(_: str = Depends(require_session)) -> dict:
+    """Turn SSO login off by dropping the server-key wrapping.
+
+    The passphrase and every secret are untouched — this only removes the second
+    way in, restoring "a stolen vault.db is useless on its own". The obvious
+    reason to reach for it is a leaked server key.
+    """
+    return {"disabled": identity.disable_sso()}
+
+
+def _esc(text: str) -> str:
+    """Provider error strings land in HTML; they are not ours and not trusted."""
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
 
 
 @app.post("/api/auth/lock")

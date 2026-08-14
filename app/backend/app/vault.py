@@ -27,6 +27,28 @@ AES-GCM's own rule — never reuse a (key, nonce) pair — is the sharp edge her
 Every encrypt generates a fresh random 12-byte nonce and stores it beside the
 ciphertext. The AAD binds each secret to its provider name, so a ciphertext
 lifted from the ``openai`` row cannot be replayed into the ``anthropic`` row.
+
+The second wrapping, and what it costs
+--------------------------------------
+
+Signing in with GitLab or Google proves who you are. It does not produce a KEK,
+so on its own it cannot open the vault. To let an OAuth login unlock, the same
+DEK is *additionally* wrapped under a server-held key (see ``wrap_dek_with_key``
+and app/serverkey.py). Both wrappings unwrap the identical DEK, so no secret is
+re-encrypted and the passphrase keeps working unchanged.
+
+Be clear about what that trades away. The paragraph above says the thing that
+decrypts your keys is never on disk. With server-key wrapping enabled that is no
+longer true: whoever holds ``vault.db`` *and* the server key holds every secret,
+without knowing your passphrase. A stolen snapshot of the whole data directory is
+now sufficient where it used to be useless. That is the accepted cost of not
+typing a passphrase after an SSO login; it is opt-in, it is off until a server
+key exists, and app/identity.py can undo it by dropping the second wrapping.
+
+The two wrappings use different AAD strings — ``blpl-dek`` and
+``blpl-dek-server`` — so a blob from one path cannot be fed to the other. They
+are the same 32 bytes of plaintext DEK, but they are not interchangeable
+ciphertexts, and a mix-up fails loudly instead of silently.
 """
 
 from __future__ import annotations
@@ -50,6 +72,12 @@ _KEY_LEN = 32  # 256-bit keys for both KEK and DEK
 _SALT_LEN = 16
 _NONCE_LEN = 12  # AES-GCM standard nonce size
 
+# AAD for the server-key wrapping. Deliberately different from the passphrase
+# path's b"blpl-dek": the two blobs are the same shape and sit in the same
+# database, so distinct associated data is what stops one being decrypted as the
+# other. Changing this string orphans every existing server-key enrolment.
+_SERVER_AAD = b"blpl-dek-server"
+
 
 class VaultError(RuntimeError):
     """Base for vault failures."""
@@ -58,6 +86,14 @@ class VaultError(RuntimeError):
 class WrongPassphrase(VaultError):
     """The passphrase did not unwrap the DEK. Indistinguishable from a corrupt
     wrapped-DEK blob, and deliberately so — we don't tell an attacker which."""
+
+
+class WrongServerKey(VaultError):
+    """The server key did not unwrap the DEK. Distinct from WrongPassphrase
+    because the remedy is completely different: nobody mistyped anything, so
+    either the key file was rotated out from under an existing vault or the
+    wrong data directory is mounted. Saying "wrong passphrase" there would send
+    the operator hunting for a typo that does not exist."""
 
 
 @dataclass(frozen=True)
@@ -154,6 +190,38 @@ def decrypt_secret(dek: bytes, provider: str, nonce: bytes, ciphertext: bytes) -
     except InvalidTag as exc:
         raise VaultError(f"could not decrypt secret for {provider!r}") from exc
     return plaintext.decode("utf-8")
+
+
+def wrap_dek_with_key(server_key: bytes, dek: bytes) -> WrappedDek:
+    """Wrap the DEK under a raw 32-byte server key, for OAuth-login unlocking.
+
+    Takes the DEK the caller already holds rather than generating one: the whole
+    point is that both wrappings open the *same* DEK, so every secret already
+    encrypted under it stays readable. Enrolling therefore requires an unlocked
+    session — you cannot wrap a key you cannot see.
+    """
+    _check_server_key(server_key)
+    nonce = os.urandom(_NONCE_LEN)
+    return WrappedDek(nonce=nonce, ciphertext=AESGCM(server_key).encrypt(nonce, dek, _SERVER_AAD))
+
+
+def unwrap_dek_with_key(server_key: bytes, wrapped: WrappedDek) -> bytes:
+    """Return the plaintext DEK from the server-key wrapping, or raise
+    WrongServerKey. This is the whole of what an OAuth login buys: identity is
+    established elsewhere, and this hands back the key material that identity
+    alone could never produce."""
+    _check_server_key(server_key)
+    try:
+        return AESGCM(server_key).decrypt(wrapped.nonce, wrapped.ciphertext, _SERVER_AAD)
+    except InvalidTag as exc:
+        raise WrongServerKey("server key did not unwrap the data key") from exc
+
+
+def _check_server_key(server_key: bytes) -> None:
+    """A short or truncated key must fail here, not silently produce a weaker
+    AES key. AESGCM would accept 16 or 24 bytes without comment."""
+    if len(server_key) != _KEY_LEN:
+        raise VaultError(f"server key must be {_KEY_LEN} bytes, got {len(server_key)}")
 
 
 def _wrap_dek(kek: bytes, dek: bytes) -> WrappedDek:

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AuthStatus, getJSON, postJSON, setLockedHandler } from "../api";
+import { AuthStatus, SsoProvider, getJSON, postJSON, setLockedHandler } from "../api";
 
 // The front door. Until the vault is unlocked, this is the only thing the app
 // shows — no project list, no board, nothing. First run asks you to *set* a
@@ -25,12 +25,21 @@ export function AuthGate({ children }: Props) {
   return (
     <UnlockScreen
       firstRun={!status.initialized}
-      onUnlocked={() => setStatus({ initialized: true, unlocked: true })}
+      providers={status.sso_ready ? status.sso_providers : []}
+      onUnlocked={() => setStatus({ ...status, initialized: true, unlocked: true })}
     />
   );
 }
 
-function UnlockScreen({ firstRun, onUnlocked }: { firstRun: boolean; onUnlocked: () => void }) {
+function UnlockScreen({
+  firstRun,
+  providers,
+  onUnlocked,
+}: {
+  firstRun: boolean;
+  providers: SsoProvider[];
+  onUnlocked: () => void;
+}) {
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -99,6 +108,23 @@ function UnlockScreen({ firstRun, onUnlocked }: { firstRun: boolean; onUnlocked:
           {busy ? "…" : firstRun ? "Set passphrase" : "Unlock"}
         </button>
         {firstRun && <div className="gate-hint">At least 8 characters.</div>}
+        {/* Only on a returning run. On first run there is no vault yet, so
+            there is nothing for a provider to unlock — the passphrase has to
+            come first, and offering a button that cannot work is worse than
+            offering none. */}
+        {!firstRun && providers.length > 0 && (
+          <>
+            <div className="gate-hint">or</div>
+            {providers.map((p) => (
+              // A plain link, not fetch: the whole point is a top-level
+              // navigation the browser owns, so the provider can take over the
+              // tab and hand it back to our callback.
+              <a key={p.id} className="gate-sso" href={`/api/auth/oauth/${p.id}/start`}>
+                Sign in with {p.label}
+              </a>
+            ))}
+          </>
+        )}
       </form>
     </div>
   );

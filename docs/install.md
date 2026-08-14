@@ -127,6 +127,64 @@ different accounts — both would use it. Name them individually instead, either
 by vaulting a key per endpoint or with `BLPL_LLM_KEY__<ENDPOINT>` (uppercase,
 `-` and `.` become `_`), which beats the provider-wide variable.
 
+## Signing in with GitLab, GitHub, or Google
+
+Optional. Without it the app's front door is the passphrase, and that is a
+complete, working setup — skip this section unless you want SSO.
+
+**Read this first.** The passphrase *derives* the key that decrypts your secrets,
+so it is never stored and a stolen `vault.db` is useless without it. An OAuth
+login cannot derive anything — it only proves who you are — so enabling SSO adds
+a second wrapping of the same key, held by the server. From then on, whoever has
+the data directory has your secrets. That is the price of not typing a
+passphrase; it is off until you turn it on, and `POST /api/auth/oauth/disable`
+turns it back off without touching the passphrase or any stored secret.
+
+Configure at least one provider and an allowlist:
+
+```bash
+BLPL_OAUTH_GITLAB_CLIENT_ID=…        # gitlab.com
+BLPL_OAUTH_GITLAB_CLIENT_SECRET=…
+BLPL_OAUTH_GITHUB_CLIENT_ID=…        # github.com
+BLPL_OAUTH_GITHUB_CLIENT_SECRET=…
+BLPL_OAUTH_GOOGLE_CLIENT_ID=…
+BLPL_OAUTH_GOOGLE_CLIENT_SECRET=…
+BLPL_OAUTH_GITLAB_SELF_CLIENT_ID=…   # a company GitLab, alongside gitlab.com
+BLPL_OAUTH_GITLAB_SELF_CLIENT_SECRET=…
+BLPL_OAUTH_GITLAB_SELF_ISSUER=https://git.example.com
+
+BLPL_OAUTH_ALLOWED_EMAILS=you@example.com
+BLPL_OAUTH_ALLOWED_DOMAINS=example.com
+BLPL_PUBLIC_URL=https://blpl.example.com
+```
+
+**The allowlist is not optional.** A provider with no allowlist would let anyone
+with an account at that provider open your vault, so SSO reports itself
+unconfigured until you set at least one of the two, and refuses every login.
+Provider emails that come back unverified are refused as well.
+
+Register the redirect URI at the provider as:
+
+```
+https://<your-host>/api/auth/oauth/<provider>/callback
+```
+
+where `<provider>` is `gitlab`, `gitlab-self`, `github`, or `google`. Set
+`BLPL_PUBLIC_URL` to the origin the *browser* uses — behind a proxy the backend
+sees `http://backend:8000`, and a redirect URI that doesn't match exactly is the
+most common way this fails.
+
+Then **unlock once with the passphrase**. That is what wraps the key for the
+server and makes the sign-in buttons appear; until it happens they'd have nothing
+to open. The server key is read from `BLPL_SERVER_KEY` if set, otherwise
+generated at `$BLPL_DATA_ROOT/server.key` with mode 0600. Keep it out of the
+same backup as `vault.db` — together they are the lock and its key.
+
+Note that GitHub is not an OIDC provider (it publishes no discovery document and
+no id_token), so it uses a separate code path that reads your primary verified
+address from `api.github.com/user/emails`. A GitHub account with no verified
+primary address cannot sign in.
+
 ## KiCad Python (optional)
 
 For the pcbnew API path (`blpl stage6-plugin`):
