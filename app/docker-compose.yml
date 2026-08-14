@@ -60,6 +60,19 @@ services:
       # No cookie-secure knob: the session cookie's Secure flag is derived from
       # the request scheme (plain http → off so it works, https → on). Put TLS in
       # front and have that proxy send X-Forwarded-Proto: https; the flag follows.
+      #
+      # The vars below are for kicad-happy features for pulling datasheet and quotes.
+      # DigiKey authenticates with the two-legged client_credentials grant — the ID
+      # and secret are exchanged for a 10-minute bearer token per run, with no
+      # redirect step — so the API is available on these two alone. The _OAUTH_
+      # spelling is what DigiKey's portal calls them; blpl.agent.kicad_happy._CRED_MAP
+      # aliases both to the DIGIKEY_CLIENT_* names the scripts read.
+      #
+      # CALLBACK_URL is not read at runtime by that grant. It is here because
+      # registering the app on developer.digikey.com demands a redirect URI anyway,
+      # and a three-legged flow (orders, MyLists) would need the real one. Likewise
+      # MOUSER_ORDERS_API_KEY: passed through and unread, held for ordering work
+      # that goes past what kicad-happy does. Quoting needs only the search key.
       - DIGIKEY_OAUTH_CLIENT_ID=${DIGIKEY_OAUTH_CLIENT_ID:-}
       - DIGIKEY_OAUTH_CLIENT_SECRET=${DIGIKEY_OAUTH_CLIENT_SECRET:-}
       - DIGIKEY_CALLBACK_URL=${DIGIKEY_CALLBACK_URL:-}
