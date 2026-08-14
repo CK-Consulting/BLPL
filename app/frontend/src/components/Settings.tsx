@@ -137,6 +137,7 @@ function EndpointRow({
 }) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
+  const fromEnv = endpoint.key_source === "env";
 
   const setKey = async () => {
     setBusy(true);
@@ -171,17 +172,31 @@ function EndpointRow({
         <div className="muted small mono">→ {endpoint.base_url}</div>
       )}
       {endpoint.needs_key ? (
+        // Three states, not two. An endpoint can also be keyed from the server's
+        // environment (ANTHROPIC_API_KEY, passed in by the deploy), which leaves
+        // no vault entry to show. Rendering that as "no key" was actively
+        // misleading: the field looked empty while runs on it worked.
         <div className="row">
           <input
             type="password"
-            placeholder={keyedAt ? `key set ${keyedAt} — replace` : "paste API key"}
+            placeholder={
+              keyedAt
+                ? `key set ${keyedAt} — replace`
+                : fromEnv
+                  ? "using the server's environment key — paste one to override"
+                  : "paste API key"
+            }
             value={value}
             onChange={(e) => setValue(e.target.value)}
           />
           <button disabled={busy || !value} onClick={setKey}>
-            {keyedAt ? "Replace" : "Set"}
+            {keyedAt || fromEnv ? "Replace" : "Set"}
           </button>
-          {keyedAt && <span className="badge ok">set</span>}
+          {keyedAt ? (
+            <span className="badge ok">set</span>
+          ) : (
+            fromEnv && <span className="badge ok">from environment</span>
+          )}
         </div>
       ) : (
         <div className="muted small">No key needed.</div>
@@ -255,6 +270,11 @@ function NewEndpoint({
               auth,
               vision,
               needs_key: auth !== "none" && kind !== "ollama",
+              // A brand-new endpoint has nothing typed into it yet. Whether the
+              // server's environment happens to key it is the server's call —
+              // the reload after Add replaces these two with its answer.
+              has_key: auth === "none" || kind === "ollama",
+              key_source: "",
             })
           }
         >

@@ -42,21 +42,30 @@ services:
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
       # LLM provider credentials, so all three backends are testable from the app.
-      # For anthropic/openai the app normally injects the key it has stored in its
-      # vault (Settings UI) per stage, and that OVERRIDES whatever is passed here —
-      # so these two are a fallback/default, and a provider only enters the run
-      # chain if it has a vaulted key (or is keyless). Ollama IS keyless: it never
-      # takes a key, it needs OLLAMA_HOST pointing at a reachable server. Inside
-      # the container `localhost` is the container itself, so point it at the host
-      # (http://host.docker.internal:11434 works via the extra_hosts mapping below)
-      # or at an ollama service on the blpl network. The `:-` defaults keep
-      # compose quiet when you are only exercising one or two of the three.
+      # For anthropic/openai a key stored in the vault (Settings UI) OVERRIDES
+      # whatever is passed here — but these are a real fallback, not decoration:
+      # an endpoint whose key is only in this environment still enters the run
+      # chain. Set one of these and the app runs on a fresh container with nothing
+      # typed into Settings. For a deploy with two endpoints of one kind, name
+      # them individually with BLPL_LLM_KEY__<ENDPOINT> instead — one shared
+      # variable cannot tell them apart, so both would use it. Ollama IS keyless:
+      # it never takes a key, it needs OLLAMA_HOST pointing at a reachable
+      # server. Inside the container `localhost` is the container itself, so point
+      # it at the host (http://host.docker.internal:11434 works via the extra_hosts
+      # mapping below) or at an ollama service on the blpl network. The `:-`
+      # defaults keep compose quiet when you are only exercising one or two.
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OLLAMA_HOST=${OLLAMA_HOST:-}
       # No cookie-secure knob: the session cookie's Secure flag is derived from
       # the request scheme (plain http → off so it works, https → on). Put TLS in
       # front and have that proxy send X-Forwarded-Proto: https; the flag follows.
+      - DIGIKEY_OAUTH_CLIENT_ID=${DIGIKEY_OAUTH_CLIENT_ID:-}
+      - DIGIKEY_OAUTH_CLIENT_SECRET=${DIGIKEY_OAUTH_CLIENT_SECRET:-}
+      - DIGIKEY_CALLBACK_URL=${DIGIKEY_CALLBACK_URL:-}
+      - MOUSER_SEARCH_API_KEY=${MOUSER_SEARCH_API_KEY:-}
+      - MOUSER_ORDERS_API_KEY=${MOUSER_ORDERS_API_KEY:-}
+      - ELEMENT14_API_KEY=${ELEMENT14_API_KEY:-}
     volumes:
       # Everything stateful — vault, config, and your git-backed designs — on one
       # named volume so it survives rebuilds and can be backed up as a unit.

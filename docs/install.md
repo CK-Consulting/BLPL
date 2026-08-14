@@ -109,6 +109,24 @@ export BLPL_LLM_PROVIDER=anthropic
 export BLPL_LLM_MODEL=claude-opus-4-7
 ```
 
+### In the hosted app
+
+The app routes each task to a *named endpoint* rather than to a provider, so a
+key belongs to an endpoint. It looks for one in two places, in this order:
+
+1. **The vault** — what you type into Settings, encrypted under your passphrase.
+2. **The server's environment** — `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, which
+   `app/docker-compose.yml` passes through from `app/.env`. Enough on its own:
+   a container started with one runs without anything typed into Settings.
+
+Settings shows which of the two is in play per endpoint, so an endpoint keyed
+from the environment reads as `from environment` rather than as unconfigured.
+
+One shared `ANTHROPIC_API_KEY` cannot distinguish two Anthropic endpoints on
+different accounts — both would use it. Name them individually instead, either
+by vaulting a key per endpoint or with `BLPL_LLM_KEY__<ENDPOINT>` (uppercase,
+`-` and `.` become `_`), which beats the provider-wide variable.
+
 ## KiCad Python (optional)
 
 For the pcbnew API path (`blpl stage6-plugin`):

@@ -120,6 +120,15 @@ export type EndpointConfig = {
   auth: string;
   vision: boolean;
   needs_key: boolean;
+  /** Whether this endpoint can authenticate at all — the thing that decides
+   *  whether a run starts. True for a keyless endpoint. */
+  has_key: boolean;
+  /** Where that key comes from: "vault" (typed into this screen), "env" (the
+   *  server's own environment, e.g. ANTHROPIC_API_KEY from the deploy's .env),
+   *  or "" for none and for endpoints that need no key. An env-keyed endpoint
+   *  has no entry in `secrets`, so without this it looks unconfigured here
+   *  while runs using it succeed. */
+  key_source: string;
 };
 
 export type Settings = {

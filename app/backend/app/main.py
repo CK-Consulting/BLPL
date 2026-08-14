@@ -96,6 +96,67 @@ chat_sessions = chat_mod.ChatSessionManager()
 # Environment variable each provider's SDK reads its key from. ollama is keyless.
 _PROVIDER_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
 
+
+# --------------------------------------------------------------------------
+# Where an endpoint's key comes from
+#
+# Two sources, in a fixed order: the vault, then the process environment. The
+# vault wins because a key typed into Settings is a deliberate choice about this
+# install. The environment is the deploy's answer — docker-compose passes
+# ANTHROPIC_API_KEY / OPENAI_API_KEY through from .env, and on a single-account
+# install that is the only key there will ever be. Requiring it to be re-entered
+# in the UI before anything can run made the compose variables decorative.
+#
+# The same precedence distributor credentials already use (_cred_resolver), for
+# the same reason.
+# --------------------------------------------------------------------------
+
+
+def _env_key_for(cfg: AppConfig, name: str) -> str | None:
+    """An endpoint's key as supplied by the environment, most specific first.
+
+    ``BLPL_LLM_KEY__<ENDPOINT>`` names one endpoint, so two Anthropic accounts
+    can be told apart without either being vaulted. ``ANTHROPIC_API_KEY`` /
+    ``OPENAI_API_KEY`` are provider-wide: one global cannot distinguish two
+    endpoints of a kind, so *every* unvaulted endpoint of that kind falls back
+    to it. That is the honest limit of a shared variable, not a bug — vault or
+    the per-endpoint variable is how you say something more precise.
+    """
+    value = os.environ.get(llm_resolver.key_env_var(name))
+    if value:
+        return value
+    ep = cfg.endpoint(name)
+    provider_var = _PROVIDER_ENV.get(ep.kind) if ep is not None else None
+    if provider_var:
+        return os.environ.get(provider_var) or None
+    return None
+
+
+def _endpoint_key(token: str | None, cfg: AppConfig, name: str) -> str | None:
+    """The key to authenticate one endpoint with, or None if it has none."""
+    try:
+        vaulted = identity.get_secret(token, name) if token else None
+    except Exception:  # noqa: BLE001 — a locked or absent secret is simply absent
+        vaulted = None
+    return vaulted or _env_key_for(cfg, name)
+
+
+def _endpoints_with_keys(cfg: AppConfig) -> set[str]:
+    """Endpoint names that can authenticate, from either source.
+
+    This is what llm_resolver is handed, so the resolver stays pure: it is told
+    which endpoints have a key, never where the key came from. Reading vault
+    *presence* needs no session, and neither does reading the environment — so
+    the run preflight can answer "will this work" before a passphrase is typed.
+    """
+    names = identity.providers_with_keys()
+    return names | {
+        name
+        for name, ep in cfg.endpoints.items()
+        if ep.needs_key and name not in names and _env_key_for(cfg, name)
+    }
+
+
 VALID_STAGES = {
     "doctor",
     "stage0-det", "stage0-llm", "stage0-compare",
@@ -257,8 +318,16 @@ def auth_change(body: ChangePassphraseBody, _: str = Depends(require_session)) -
 @app.get("/api/settings")
 def get_settings(_: str = Depends(require_session)) -> dict:
     cfg = _load_config()
+    vaulted = identity.providers_with_keys()
+    with_keys = _endpoints_with_keys(cfg)
     return {
         # The registry: what exists, and which endpoints serve which job.
+        #
+        # has_key is what actually decides whether a run starts, so it counts
+        # both sources. Without key_source alongside it, an endpoint keyed from
+        # the deploy's environment looks unconfigured on this screen — it has no
+        # vault entry to list — while runs using it succeed, which is a
+        # confusing pair of facts to hold at once.
         "endpoints": [
             {
                 "name": ep.name,
@@ -268,6 +337,16 @@ def get_settings(_: str = Depends(require_session)) -> dict:
                 "auth": ep.auth,
                 "vision": ep.can_see,
                 "needs_key": ep.needs_key,
+                "has_key": not ep.needs_key or ep.name in with_keys,
+                "key_source": (
+                    ""
+                    if not ep.needs_key
+                    else "vault"
+                    if ep.name in vaulted
+                    else "env"
+                    if ep.name in with_keys
+                    else ""
+                ),
             }
             for ep in cfg.endpoints.values()
         ],
@@ -939,10 +1018,10 @@ def _chat_endpoint(token: str) -> chat_mod.Endpoint:
     """
     cfg = _load_config()
     try:
-        primary = llm_resolver.resolve_primary(cfg, identity.providers_with_keys(), "chat")
+        primary = llm_resolver.resolve_primary(cfg, _endpoints_with_keys(cfg), "chat")
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    key = identity.get_secret(token, primary.name or primary.provider) if primary.needs_key else None
+    key = _endpoint_key(token, cfg, primary.name or primary.provider) if primary.needs_key else None
     return chat_mod.Endpoint(
         name=primary.name or primary.provider,
         kind=primary.provider,  # type: ignore[arg-type]
@@ -981,7 +1060,7 @@ def _task_endpoint(token: str, task: str):
     """
     cfg = _load_config()
     try:
-        rp = llm_resolver.resolve_primary(cfg, identity.providers_with_keys(), task)
+        rp = llm_resolver.resolve_primary(cfg, _endpoints_with_keys(cfg), task)
     except llm_resolver.NoUsableProvider:
         return None
     ep = cfg.endpoint(rp.name)
@@ -991,7 +1070,7 @@ def _task_endpoint(token: str, task: str):
         name=rp.name or rp.provider,
         kind=rp.provider,  # type: ignore[arg-type]
         model=rp.model,
-        api_key=identity.get_secret(token, rp.name or rp.provider) if rp.needs_key else None,
+        api_key=_endpoint_key(token, cfg, rp.name or rp.provider) if rp.needs_key else None,
         base_url=rp.base_url or None,
     )
 
@@ -1218,12 +1297,13 @@ def _inject_llm_env(env: dict[str, str], token: str, task: str = "default") -> d
     endpoint registry exists to allow. The provider-wide variables are still set
     from the primary so anything reading the SDK defaults keeps working.
 
-    Keys are decrypted here and passed only in the child's environment, never on
-    a command line or in a log. Raises NoUsableProvider if nothing routed to the
-    task has a key, which the caller turns into a clear 400.
+    Keys come from _endpoint_key (vault first, environment second) and are passed
+    only in the child's environment, never on a command line or in a log. Raises
+    NoUsableProvider if nothing routed to the task has a key from either source,
+    which the caller turns into a clear 400.
     """
     cfg = _load_config()
-    with_keys = identity.providers_with_keys()
+    with_keys = _endpoints_with_keys(cfg)
     chain = llm_resolver.resolve_chain(cfg, with_keys, task)
     if not chain:
         llm_resolver.resolve_primary(cfg, with_keys, task)  # raise the good message
@@ -1231,7 +1311,7 @@ def _inject_llm_env(env: dict[str, str], token: str, task: str = "default") -> d
     for rp in chain:
         if not rp.needs_key:
             continue
-        key = identity.get_secret(token, rp.name or rp.provider)
+        key = _endpoint_key(token, cfg, rp.name or rp.provider)
         if key is None:
             continue
         env[rp.key_env] = key

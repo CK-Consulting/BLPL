@@ -19,6 +19,22 @@ from dataclasses import dataclass
 from .appconfig import AppConfig
 
 
+def key_env_var(endpoint_name: str) -> str:
+    """The env var that carries one endpoint's key.
+
+    Per-endpoint rather than per-provider: two Anthropic endpoints on different
+    accounts have different keys, and one shared ANTHROPIC_API_KEY cannot
+    express that.
+
+    Defined here, once, because it is read from both directions — the stage
+    runner writes this variable for a child process, and the key lookup reads it
+    as a source of keys for an endpoint the vault doesn't hold. Two spellings of
+    the same rule would drift.
+    """
+    base = endpoint_name.upper().replace("-", "_").replace(".", "_")
+    return f"BLPL_LLM_KEY__{base}"
+
+
 @dataclass(frozen=True)
 class ResolvedProvider:
     """One endpoint, ready to use. ``provider`` is its kind — the thing an
@@ -33,14 +49,8 @@ class ResolvedProvider:
 
     @property
     def key_env(self) -> str:
-        """The env var a subprocess should read this endpoint's key from.
-
-        Per-endpoint rather than per-provider: two Anthropic endpoints on
-        different accounts have different keys, and one shared ANTHROPIC_API_KEY
-        cannot express that.
-        """
-        base = (self.name or self.provider).upper().replace("-", "_").replace(".", "_")
-        return f"BLPL_LLM_KEY__{base}"
+        """The env var a subprocess should read this endpoint's key from."""
+        return key_env_var(self.name or self.provider)
 
 
 class NoUsableProvider(RuntimeError):
