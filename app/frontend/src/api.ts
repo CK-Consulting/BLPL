@@ -126,6 +126,35 @@ async function errorDetail(res: Response): Promise<string> {
  *  different remedies. */
 export type AuthConfig = { clerk_configured: boolean };
 
+/** One choice in the setup screen's provider picker. Sourced from
+ *  app/backend/app/providers.py, whose facts come from hermes-agent (MIT). */
+export type ProviderInfo = {
+  id: string;
+  label: string;
+  kind: string;
+  description: string;
+  signup_url: string;
+  base_url: string;
+  default_model: string;
+  suggested_models: string[];
+  needs_key: boolean;
+  needs_base_url: boolean;
+  vision: boolean;
+  key_hint: string;
+  /** Which inputs to render. Varies by provider: Ollama needs no key, a
+   *  self-hosted endpoint needs a base URL, Anthropic needs neither. */
+  fields: string[];
+};
+
+/** Where the user is in setup, and whether this session can decrypt anything. */
+export type OnboardingState = {
+  complete: boolean;
+  has_passphrase: boolean;
+  endpoints_with_keys: string[];
+};
+
+export type LockState = { unlocked: boolean; has_passphrase: boolean };
+
 /** Who the *backend* thinks you are. Clerk telling the browser it is signed in
  *  and the backend agreeing are two different facts, and they can disagree — a
  *  token from another Clerk instance, or a misconfigured issuer. */

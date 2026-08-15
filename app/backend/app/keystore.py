@@ -10,9 +10,15 @@ operator's quota under the operator's account, which is not a default anyone can
 consent to. Users bring their own keys, or route the task to something keyless
 (ollama, or an OpenAI-compatible endpoint with auth = "none").
 
-Sealing is the same AES-GCM used before, under the server key from
-app/serverkey.py, with the endpoint name as associated data. The plaintext exists
-only inside a request, on its way to a stage subprocess's environment.
+Sealed under the user's own master key (app/userkey.py), not a server-held one.
+That is what makes the onboarding promise true: the operator holds the database
+but not the key that opens these rows. It also means a key can only be read
+while its owner has an unlocked session — a background job cannot quietly reach
+into someone's credentials.
+
+The endpoint name is the AES-GCM associated data, so a ciphertext is bound to the
+row it belongs to and cannot be replayed into another endpoint or another user.
+The plaintext exists only inside a request, on its way to a stage subprocess.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import serverkey, vault
+from . import vault
 from .models import ProviderKey, User
 
 
@@ -35,24 +41,14 @@ class KeyMeta:
 
 
 class KeystoreError(RuntimeError):
-    """The keystore cannot operate — almost always a missing server key."""
+    """The keystore cannot operate — the account is locked, or has no key."""
 
 
-def _server_key(data_root) -> bytes:
-    key = serverkey.load(data_root)
-    if key is None:
-        raise KeystoreError(
-            "no server key: set BLPL_SERVER_KEY or let the app create "
-            f"{serverkey.key_path(data_root)}. Provider keys cannot be sealed without one."
-        )
-    return key
-
-
-def put(session: Session, data_root, user: User, endpoint: str, value: str) -> None:
+def put(session: Session, master_key: bytes, user: User, endpoint: str, value: str) -> None:
     """Store (or replace) this user's key for one endpoint."""
     if not value.strip():
         raise ValueError("an empty key is not a key")
-    nonce, ciphertext = vault.encrypt_secret(_server_key(data_root), endpoint, value)
+    nonce, ciphertext = vault.encrypt_secret(master_key, endpoint, value)
     existing = session.scalar(
         select(ProviderKey).where(
             ProviderKey.user_id == user.id, ProviderKey.endpoint == endpoint
@@ -68,7 +64,7 @@ def put(session: Session, data_root, user: User, endpoint: str, value: str) -> N
         existing.nonce, existing.ciphertext = nonce, ciphertext
 
 
-def get(session: Session, data_root, user: User, endpoint: str) -> str | None:
+def get(session: Session, master_key: bytes, user: User, endpoint: str) -> str | None:
     """This user's plaintext key for one endpoint, or None.
 
     The ONLY callers are the ones injecting it into a subprocess environment or
@@ -81,15 +77,15 @@ def get(session: Session, data_root, user: User, endpoint: str) -> str | None:
     )
     if row is None:
         return None
-    return vault.decrypt_secret(_server_key(data_root), endpoint, row.nonce, row.ciphertext)
+    return vault.decrypt_secret(master_key, endpoint, row.nonce, row.ciphertext)
 
 
 def endpoints_with_keys(session: Session, user: User) -> set[str]:
     """Which endpoints this user can authenticate.
 
-    Reads presence, never values, so it needs no server key — which means the run
-    preflight can answer "will this work" even on an install whose server key is
-    misconfigured, and say so precisely instead of failing at the first decrypt.
+    Reads presence, never values, so it needs no master key — which means the
+    settings screen and the run preflight both work while the account is locked,
+    and can say "unlock to run" rather than failing at the first decrypt.
     """
     rows = session.scalars(
         select(ProviderKey.endpoint).where(ProviderKey.user_id == user.id)
@@ -105,7 +101,7 @@ def list_meta(session: Session, user: User) -> list[KeyMeta]:
 
 
 def delete(session: Session, user: User, endpoint: str) -> bool:
-    """Forget a key. Needs no server key — you can discard what you cannot read."""
+    """Forget a key. Needs no master key — you can discard what you cannot read."""
     row = session.scalar(
         select(ProviderKey).where(
             ProviderKey.user_id == user.id, ProviderKey.endpoint == endpoint

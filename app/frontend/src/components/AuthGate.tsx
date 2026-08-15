@@ -7,7 +7,9 @@ import {
   UserButton,
   useAuth,
 } from "@clerk/react";
-import { AuthConfig, getJSON, setLockedHandler, setTokenGetter } from "../api";
+import { AuthConfig, LockState, OnboardingState, getJSON, setLockedHandler, setTokenGetter } from "../api";
+import { Onboarding } from "./Onboarding";
+import { UnlockScreen } from "./UnlockScreen";
 
 // The front door. Until Clerk says you are signed in, this is the only thing the
 // app shows — no project list, no board, nothing.
@@ -24,6 +26,18 @@ export function AuthGate({ children }: Props) {
   const { isSignedIn, getToken } = useAuth();
   const [config, setConfig] = useState<AuthConfig | null>(null);
   const [rejected, setRejected] = useState(false);
+  // Three states past sign-in, and they are not the same: not set up, set up
+  // but locked, and ready. Collapsing any two of them produces a screen that
+  // asks for the wrong thing.
+  const [state, setState] = useState<{ onboarded: boolean; unlocked: boolean } | null>(null);
+
+  const refreshState = () =>
+    Promise.all([
+      getJSON<OnboardingState>("/api/onboarding"),
+      getJSON<LockState>("/api/auth/lock-state"),
+    ])
+      .then(([o, l]) => setState({ onboarded: o.complete, unlocked: l.unlocked }))
+      .catch(() => setState(null));
 
   // Hand the API layer Clerk's token source once. Not cached beyond this:
   // getToken() refreshes short-lived tokens transparently, and holding one
@@ -44,7 +58,10 @@ export function AuthGate({ children }: Props) {
   // Signing in again clears a stale rejection; without this a single expired
   // token would pin the error on screen for the rest of the session.
   useEffect(() => {
-    if (isSignedIn) setRejected(false);
+    if (isSignedIn) {
+      setRejected(false);
+      refreshState();
+    }
   }, [isSignedIn]);
 
   if (config && !config.clerk_configured) {
@@ -91,6 +108,12 @@ export function AuthGate({ children }: Props) {
                 </div>
               </div>
             </div>
+          ) : state === null ? (
+            <div className="gate">Checking…</div>
+          ) : !state.onboarded ? (
+            <Onboarding onDone={refreshState} />
+          ) : !state.unlocked ? (
+            <UnlockScreen onUnlocked={refreshState} />
           ) : (
             children
           )}

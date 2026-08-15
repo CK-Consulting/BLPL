@@ -112,9 +112,39 @@ def client(tmp_path, monkeypatch):
     return TestClient(main.app)
 
 
-def sign_in(client, clerk_id: str = "user_test", email: str = "test@example.com"):
-    """Make this client's requests arrive as a signed-in user."""
+def sign_in_only(client, clerk_id: str = "user_test", email: str = "test@example.com"):
+    """Signed in, but NOT onboarded — the state the setup screen exists for."""
     client.headers.update({"Authorization": f"Bearer stub:{clerk_id}:{email}"})
+    client.get("/api/me")  # first request is what creates the user row
+    return client
+
+
+def sign_in(client, clerk_id: str = "user_test", email: str = "test@example.com"):
+    """Signed in, onboarded, and unlocked — what most tests mean by "in".
+
+    Onboarding is completed against the database rather than through
+    POST /api/onboarding on purpose. That route also writes an endpoint and a
+    task route into blpl.toml, which would trample the config the caller set up
+    for its own test. Tests *about* onboarding use sign_in_only and call the
+    real route.
+    """
+    from sqlalchemy import select
+
+    import app.db
+    import app.main as main
+    import app.profile as profile_mod
+    import app.unlock as unlock_mod
+    from app.models import User
+
+    sign_in_only(client, clerk_id, email)
+    with app.db.SessionFactory() as s:
+        user = s.scalar(select(User).where(User.clerk_user_id == clerk_id))
+        master = profile_mod.set_passphrase(s, user, "a-test-passphrase")
+        profile_mod.mark_complete(s, user)
+        s.commit()
+    # The stub verifier returns no claims, so there is no sid and the session key
+    # is deterministic — see unlock.session_key_for.
+    main.unlocked.put(unlock_mod.session_key_for(clerk_id, {}), master)
     return client
 
 

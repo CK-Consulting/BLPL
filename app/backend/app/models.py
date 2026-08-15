@@ -42,8 +42,20 @@ class User(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
     )
+    # Null until onboarding is finished. The gate reads this and nothing else,
+    # so "has this user set up" is one column rather than a rule spread across
+    # several tables that could disagree.
+    profile_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
 
     keys: Mapped[list["ProviderKey"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    master_key: Mapped["UserMasterKey | None"] = relationship(
+        back_populates="user", cascade="all, delete-orphan", uselist=False
+    )
+    credentials: Mapped[list["UserKeyCredential"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -84,3 +96,63 @@ class ProviderKey(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="keys")
+
+
+class UserMasterKey(Base):
+    """One user's master key, wrapped under their passphrase.
+
+    Only the wrapping is stored. The plaintext master key exists in this
+    process's memory for the length of an unlocked session and nowhere else —
+    not in this table, not on disk, and never in a response body.
+
+    The Argon2id parameters live beside the salt because a later unlock must use
+    exactly the ones the material was created with. Raising the cost for new
+    users therefore does not lock out existing ones.
+    """
+
+    __tablename__ = "user_master_key"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    kdf_salt: Mapped[bytes] = mapped_column(LargeBinary(16))
+    kdf_time_cost: Mapped[int] = mapped_column()
+    kdf_memory_kib: Mapped[int] = mapped_column()
+    kdf_parallelism: Mapped[int] = mapped_column()
+    nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    user: Mapped[User] = relationship(back_populates="master_key")
+
+
+class UserKeyCredential(Base):
+    """A second way to unwrap the same master key — the WebAuthn PRF slot.
+
+    Empty today. It exists now because the alternative is a migration over live
+    user data later: every row here wraps the *same* master key the passphrase
+    wraps, so adding a passkey is an INSERT and losing one is a DELETE, with no
+    provider key or project file re-encrypted either way.
+
+    ``prf_salt`` is the input handed to the authenticator's PRF evaluation. It is
+    not secret — it is the "which key" selector — but it must be stable, because
+    a different salt produces a different secret and the wrapping stops opening.
+    """
+
+    __tablename__ = "user_key_credential"
+    __table_args__ = (UniqueConstraint("credential_id", name="uq_credential_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    label: Mapped[str] = mapped_column(String(128), default="")
+    # Base64url of the WebAuthn credential id.
+    credential_id: Mapped[str] = mapped_column(String(512))
+    prf_salt: Mapped[bytes] = mapped_column(LargeBinary(32))
+    nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    user: Mapped[User] = relationship(back_populates="credentials")

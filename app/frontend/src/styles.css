@@ -363,3 +363,21 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .run-line.stage { margin: .5rem 0 .2rem; padding-top: .35rem; border-top: 1px solid #23272f; color: #8ab4f8; font-weight: 600; }
 .run-line.stage:first-child { margin-top: 0; border-top: none; padding-top: 0; }
 .run-log-foot { padding-left: .2rem; }
+
+/* --- onboarding --- */
+/* Wider than the sign-in card and scrollable: this is a form with two sections
+   and explanatory copy, not a single field, and cramming it into the gate card
+   made the passphrase explanation unreadable. */
+.onboarding { display: flex; justify-content: center; align-items: flex-start; height: 100vh; overflow: auto; padding: 4vh 1rem; }
+.onboarding-card { display: flex; flex-direction: column; gap: 1rem; width: 560px; max-width: 100%; padding: 2rem; background: #191c22; border: 1px solid #2a2e36; border-radius: 12px; }
+.onboarding-card h1 { margin: 0; letter-spacing: .04em; }
+.onboarding-card > button[type="submit"] { padding: .6rem; background: #2b4a86; border: 1px solid #34507f; }
+/* Deliberately loud. The backend refuses every other route until this is done,
+   so the page has to say why rather than let the user wonder what is broken. */
+.onboarding-notice { padding: .6rem .8rem; border-radius: 6px; background: #3a2f14; color: #f0c674; font-size: 12px; letter-spacing: .03em; border: 1px solid #5a4a20; }
+.onboarding-card .card { display: flex; flex-direction: column; gap: .6rem; padding: 1rem; background: #15181d; border: 1px solid #2a2e36; border-radius: 8px; }
+.onboarding-card .card h3 { margin: 0; font-size: 14px; }
+.onboarding-card input, .onboarding-card select { background: #0f1115; color: #e6e6e6; border: 1px solid #343a44; border-radius: 6px; padding: .5rem .6rem; font: inherit; }
+.onboarding-card .field { display: flex; flex-direction: column; gap: .25rem; }
+.onboarding-card .field > span { font-size: 12px; color: #9aa4b0; }
+.onboarding-card a { color: #8ab4f8; }

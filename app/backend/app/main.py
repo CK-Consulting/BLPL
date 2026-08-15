@@ -46,7 +46,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import appconfig, chat as chat_mod, clerk_auth, importer, keystore, llm_resolver, runs, serverkey, users
+from . import (
+    appconfig,
+    chat as chat_mod,
+    clerk_auth,
+    importer,
+    keystore,
+    llm_resolver,
+    profile as profile_mod,
+    providers as provider_catalog,
+    runs,
+    serverkey,
+    unlock as unlock_mod,
+    userkey,
+    users,
+)
 from .appconfig import AppConfig, ProjectEntry
 from .db import session_scope
 from .models import User
@@ -96,6 +110,10 @@ PROJECTS_ROOT = Path(os.environ.get("BLPL_PROJECTS_ROOT", str(_DATA / "projects"
 CONFIG_PATH = Path(os.environ.get("BLPL_CONFIG", str(_DATA / "blpl.toml")))
 
 projects = Projects(PROJECTS_ROOT)
+# Unlocked master keys, one per Clerk session. In-memory on purpose: a
+# restart drops them, which is the correct behaviour for derived key
+# material — see app/unlock.py.
+unlocked = unlock_mod.Unlocked()
 # Run history is plaintext facts-about-what-happened, deliberately NOT in
 # vault.db — that file's contract is "a dump of it is a dump of ciphertext".
 run_manager = runs.RunManager(_DATA / "runs.db", _DATA / "runs")
@@ -143,6 +161,7 @@ _LLM_STAGES = {"stage0-llm", "stage0-compare", "stage1", "stage1-synthesize-conn
 
 
 def require_user(
+    request: Request,
     session: Session = Depends(session_scope),
     authorization: str | None = Header(default=None),
     __session: str | None = Cookie(default=None, alias="__session"),
@@ -174,7 +193,39 @@ def require_user(
     except clerk_auth.ClerkAuthError as exc:
         logger.info("rejected a request: %s", exc)
         raise HTTPException(status_code=401, detail="not signed in")
-    return users.get_or_create(session, who)
+    user = users.get_or_create(session, who)
+    # Stashed for the dependencies below, which need the session id to find this
+    # user's unlocked key but must not re-verify the token to get it.
+    request.state.clerk_claims = who.claims
+    return user
+
+
+def require_onboarded(user: User = Depends(require_user)) -> User:
+    """The gate for everything except onboarding itself.
+
+    A 428 rather than a 403: the request is not forbidden, it is premature, and
+    the client's job is to send the user to setup rather than to show an error.
+    Using 403 here would be indistinguishable from a permissions problem once
+    project sharing lands.
+    """
+    if not profile_mod.is_complete(user):
+        raise HTTPException(status_code=428, detail="finish setting up your account first")
+    return user
+
+
+def require_master_key(request: Request, user: User = Depends(require_user)) -> bytes:
+    """The unlocked master key for this session, or 423 Locked.
+
+    Separate from require_onboarded because most routes never touch a secret —
+    listing projects, reading a file, watching a run. Only the ones that seal or
+    open a provider key need this, and making them ask for it explicitly is what
+    keeps "which endpoints have keys" answerable while locked.
+    """
+    claims = getattr(request.state, "clerk_claims", {}) or {}
+    key = unlocked.get(unlock_mod.session_key_for(user.clerk_user_id, claims))
+    if key is None:
+        raise HTTPException(status_code=423, detail="locked: enter your encryption passphrase")
+    return key
 
 
 def _load_config() -> AppConfig:
@@ -211,6 +262,142 @@ def whoami(user: User = Depends(require_user)) -> dict:
     return {"id": user.id, "clerk_user_id": user.clerk_user_id, "email": user.email}
 
 
+class PassphraseBody(BaseModel):
+    passphrase: str
+
+
+class SetupBody(BaseModel):
+    """Everything the setup screen collects, in one request.
+
+    One call rather than three, because a half-finished account is the state
+    worth designing out: a master key with no provider, or a provider whose key
+    was sealed under a passphrase the user then failed to confirm. The whole
+    thing commits or none of it does.
+    """
+
+    passphrase: str
+    provider: str
+    api_key: str = ""
+    model: str = ""
+    base_url: str = ""
+
+
+@app.get("/api/providers")
+def list_providers() -> list[dict]:
+    """The provider catalog for the setup form. No secrets, nothing
+    installation-specific, so it needs no session — the sign-in screen and the
+    setup screen can both render before anything is known about the user."""
+    return provider_catalog.as_json()
+
+
+@app.get("/api/onboarding")
+def onboarding_state(
+    user: User = Depends(require_user), session: Session = Depends(session_scope)
+) -> dict:
+    """What the client needs to decide between setup, unlock, and the app."""
+    return {
+        "complete": profile_mod.is_complete(user),
+        "has_passphrase": profile_mod.is_set_up(user),
+        "endpoints_with_keys": sorted(keystore.endpoints_with_keys(session, user)),
+    }
+
+
+@app.post("/api/onboarding")
+def complete_onboarding(
+    body: SetupBody,
+    request: Request,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Set the encryption passphrase, register the first provider, and open the gate.
+
+    Deliberately not behind require_onboarded — it is the one route that exists
+    to *stop* being un-onboarded.
+    """
+    if profile_mod.is_complete(user):
+        raise HTTPException(status_code=400, detail="this account is already set up")
+
+    info = provider_catalog.get(body.provider)
+    if info is None:
+        raise HTTPException(status_code=400, detail=f"unknown provider {body.provider!r}")
+    if info.needs_key and not body.api_key.strip():
+        raise HTTPException(status_code=400, detail=f"{info.label} needs an API key")
+    if info.needs_base_url and not body.base_url.strip():
+        raise HTTPException(status_code=400, detail=f"{info.label} needs a base URL")
+
+    try:
+        master_key = profile_mod.set_passphrase(session, user, body.passphrase)
+    except profile_mod.AlreadySetUp as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:  # too short
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # The endpoint is named for the provider it is. A second Anthropic account
+    # later becomes a second endpoint with its own name and its own key, which
+    # is what the registry is for.
+    endpoint_name = body.provider
+    cfg = _load_config()
+    cfg.endpoints[endpoint_name] = appconfig.Endpoint(
+        name=endpoint_name,
+        kind=info.kind,
+        model=body.model.strip() or info.default_model,
+        base_url=body.base_url.strip() or info.base_url,
+        auth="vault" if info.needs_key else "none",
+        vision=info.vision,
+    )
+    # Route everything here for now. One provider is the whole point of the
+    # setup screen; splitting tasks across several is a Settings decision made
+    # once there is more than one to split between.
+    cfg.tasks["default"] = [endpoint_name]
+    appconfig.save(CONFIG_PATH, cfg)
+
+    if info.needs_key:
+        keystore.put(session, master_key, user, endpoint_name, body.api_key)
+
+    profile_mod.mark_complete(session, user)
+    unlocked.put(
+        unlock_mod.session_key_for(user.clerk_user_id, getattr(request.state, "clerk_claims", {})),
+        master_key,
+    )
+    return {"ok": True, "endpoint": endpoint_name}
+
+
+@app.post("/api/auth/unlock")
+def auth_unlock(
+    body: PassphraseBody, request: Request, user: User = Depends(require_user)
+) -> dict:
+    """Open this session with the encryption passphrase."""
+    try:
+        master_key = profile_mod.unlock(user, body.passphrase)
+    except userkey.WrongPassphrase:
+        raise HTTPException(status_code=401, detail="wrong passphrase")
+    except profile_mod.NotSetUp as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    unlocked.put(
+        unlock_mod.session_key_for(user.clerk_user_id, getattr(request.state, "clerk_claims", {})),
+        master_key,
+    )
+    return {"unlocked": True}
+
+
+@app.post("/api/auth/lock")
+def auth_lock(request: Request, user: User = Depends(require_user)) -> dict:
+    """Forget this session's key without signing out of Clerk. Two separate
+    things: you can be signed in and locked, which is the state after a server
+    restart."""
+    unlocked.drop(
+        unlock_mod.session_key_for(user.clerk_user_id, getattr(request.state, "clerk_claims", {}))
+    )
+    return {"unlocked": False}
+
+
+@app.get("/api/auth/lock-state")
+def lock_state(request: Request, user: User = Depends(require_user)) -> dict:
+    claims = getattr(request.state, "clerk_claims", {}) or {}
+    key = unlocked.get(unlock_mod.session_key_for(user.clerk_user_id, claims))
+    return {"unlocked": key is not None, "has_passphrase": profile_mod.is_set_up(user)}
+
+
 @app.get("/api/auth/config")
 def auth_config() -> dict:
     """Unauthenticated: whether this server can accept sign-ins at all.
@@ -229,7 +416,7 @@ def auth_config() -> dict:
 
 @app.get("/api/settings")
 def get_settings(
-    user: User = Depends(require_user), session: Session = Depends(session_scope)
+    user: User = Depends(require_onboarded), session: Session = Depends(session_scope)
 ) -> dict:
     cfg = _load_config()
     with_keys = keystore.endpoints_with_keys(session, user)
@@ -290,7 +477,7 @@ class LlmSettingsBody(BaseModel):
 
 
 @app.put("/api/settings/llm")
-def put_llm_settings(body: LlmSettingsBody, _: User = Depends(require_user)) -> dict:
+def put_llm_settings(body: LlmSettingsBody, _: User = Depends(require_onboarded)) -> dict:
     cfg = _load_config()
 
     if body.endpoints is not None:
@@ -337,12 +524,13 @@ class SecretBody(BaseModel):
 def put_secret(
     provider: str,
     body: SecretBody,
-    user: User = Depends(require_user),
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> dict:
     """Store one of *this user's* keys. The path parameter is an endpoint name."""
     try:
-        keystore.put(session, _DATA, user, provider, body.value)
+        keystore.put(session, master_key, user, provider, body.value)
     except (ValueError, keystore.KeystoreError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "provider": provider}
@@ -351,7 +539,7 @@ def put_secret(
 @app.delete("/api/settings/secrets/{provider}")
 def delete_secret(
     provider: str,
-    user: User = Depends(require_user),
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
 ) -> dict:
     return {"ok": True, "removed": keystore.delete(session, user, provider)}
@@ -425,7 +613,7 @@ def _fab_readiness(pipeline_dir: Path) -> dict | None:
 
 
 @app.get("/api/projects")
-def list_projects(_: User = Depends(require_user)) -> list[dict]:
+def list_projects(_: User = Depends(require_onboarded)) -> list[dict]:
     if not PROJECTS_ROOT.is_dir():
         return []
     out = []
@@ -453,7 +641,7 @@ class CloneBody(BaseModel):
 
 
 @app.post("/api/projects/clone")
-def clone_project(body: CloneBody, _: User = Depends(require_user)) -> dict:
+def clone_project(body: CloneBody, _: User = Depends(require_onboarded)) -> dict:
     """Clone a remote into a new working copy, and register it in blpl.toml so the
     server remembers where it came from."""
     try:
@@ -471,7 +659,7 @@ class InitBody(BaseModel):
 
 
 @app.post("/api/projects/init")
-def init_project(body: InitBody, _: User = Depends(require_user)) -> dict:
+def init_project(body: InitBody, _: User = Depends(require_onboarded)) -> dict:
     """Create a new, empty, local git project. A remote can be attached later."""
     try:
         projects.init_local(body.name)
@@ -487,7 +675,7 @@ def init_project(body: InitBody, _: User = Depends(require_user)) -> dict:
 async def import_project(
     name: str = Form(...),
     files: list[UploadFile] = File(...),
-    _: User = Depends(require_user),
+    _: User = Depends(require_onboarded),
 ) -> dict:
     """Bring an existing design into the app from the browser: a selection of
     files, or a single .zip of the project folder. The server creates a local
@@ -551,7 +739,7 @@ async def import_project(
 
 
 @app.get("/api/projects/{project_id}/git/status")
-def git_status(project_id: str, _: User = Depends(require_user)) -> dict:
+def git_status(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     _project_dir(project_id)
     try:
         st = projects.status(project_id)
@@ -568,7 +756,7 @@ class CommitBody(BaseModel):
 
 
 @app.post("/api/projects/{project_id}/git/commit")
-def git_commit(project_id: str, body: CommitBody, _: User = Depends(require_user)) -> dict:
+def git_commit(project_id: str, body: CommitBody, _: User = Depends(require_onboarded)) -> dict:
     _project_dir(project_id)
     try:
         out = projects.commit_all(project_id, body.message)
@@ -578,7 +766,7 @@ def git_commit(project_id: str, body: CommitBody, _: User = Depends(require_user
 
 
 @app.get("/api/projects/{project_id}/git/diff")
-def git_diff(project_id: str, _: User = Depends(require_user)) -> dict:
+def git_diff(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     """What changed in the working copy since the last commit — the 'what did that
     run do' view. Diffs are size-capped server-side."""
     _project_dir(project_id)
@@ -589,7 +777,7 @@ def git_diff(project_id: str, _: User = Depends(require_user)) -> dict:
 
 
 @app.post("/api/projects/{project_id}/git/pull")
-def git_pull(project_id: str, _: User = Depends(require_user)) -> dict:
+def git_pull(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     _project_dir(project_id)
     try:
         out = projects.pull(project_id)
@@ -599,7 +787,7 @@ def git_pull(project_id: str, _: User = Depends(require_user)) -> dict:
 
 
 @app.post("/api/projects/{project_id}/git/push")
-def git_push(project_id: str, _: User = Depends(require_user)) -> dict:
+def git_push(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     _project_dir(project_id)
     try:
         out = projects.push(project_id)
@@ -637,7 +825,7 @@ class FileBody(BaseModel):
 
 
 @app.get("/api/projects/{project_id}/files")
-def list_files(project_id: str, _: User = Depends(require_user)) -> list[dict]:
+def list_files(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
     """The editable design inputs in the project root, markdown and config."""
     proj = _project_dir(project_id)
     out = []
@@ -648,7 +836,7 @@ def list_files(project_id: str, _: User = Depends(require_user)) -> list[dict]:
 
 
 @app.get("/api/projects/{project_id}/files/{name}")
-def read_file(project_id: str, name: str, _: User = Depends(require_user)):
+def read_file(project_id: str, name: str, _: User = Depends(require_onboarded)):
     target = _editable_file(project_id, name)
     if not target.is_file():
         raise HTTPException(status_code=404, detail=f"no file {name!r}")
@@ -656,7 +844,7 @@ def read_file(project_id: str, name: str, _: User = Depends(require_user)):
 
 
 @app.put("/api/projects/{project_id}/files/{name}")
-def write_file(project_id: str, name: str, body: FileBody, _: User = Depends(require_user)) -> dict:
+def write_file(project_id: str, name: str, body: FileBody, _: User = Depends(require_onboarded)) -> dict:
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
     target = _editable_file(project_id, name)
@@ -665,7 +853,7 @@ def write_file(project_id: str, name: str, body: FileBody, _: User = Depends(req
 
 
 @app.get("/api/projects/{project_id}/artifacts/{name}")
-def read_artifact(project_id: str, name: str, _: User = Depends(require_user)):
+def read_artifact(project_id: str, name: str, _: User = Depends(require_onboarded)):
     proj = _project_dir(project_id)
     target = (proj / ".pipeline" / name).resolve()
     if not target.is_relative_to(proj / ".pipeline") or not target.is_file():
@@ -680,7 +868,7 @@ def read_artifact(project_id: str, name: str, _: User = Depends(require_user)):
 
 
 @app.get("/api/projects/{project_id}/design")
-def design_sources(project_id: str, _: User = Depends(require_user)) -> dict:
+def design_sources(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     proj = _project_dir(project_id)
     pipeline = proj / ".pipeline"
     sources = []
@@ -761,7 +949,7 @@ class ReferenceManifestInput(BaseModel):
 
 
 @app.get("/api/projects/{project_id}/references")
-def get_references(project_id: str, _: User = Depends(require_user)) -> dict:
+def get_references(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     manifest = _load_manifest(project_id)
     return {
         "project_id": project_id,
@@ -772,7 +960,7 @@ def get_references(project_id: str, _: User = Depends(require_user)) -> dict:
 
 @app.put("/api/projects/{project_id}/references")
 def put_references(
-    project_id: str, payload: ReferenceManifestInput, _: User = Depends(require_user)
+    project_id: str, payload: ReferenceManifestInput, _: User = Depends(require_onboarded)
 ) -> dict:
     manifest = _load_manifest(project_id)
     try:
@@ -814,7 +1002,7 @@ def put_references(
 
 
 @app.get("/api/projects/{project_id}/sandbox")
-def sandbox_summary(project_id: str, _: User = Depends(require_user)) -> dict:
+def sandbox_summary(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     return _sandbox_for(project_id).summary()
 
 
@@ -830,7 +1018,7 @@ def _artifact_meta(path: Path, pipeline: Path) -> dict:
 
 
 @app.get("/api/projects/{project_id}/artifacts")
-def list_artifacts(project_id: str, _: User = Depends(require_user)) -> dict:
+def list_artifacts(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     """Every artifact the pipeline has written, newest first.
 
     Top-level only. Rotated copies under archive/ are deliberately excluded —
@@ -847,7 +1035,7 @@ def list_artifacts(project_id: str, _: User = Depends(require_user)) -> dict:
 
 
 @app.get("/api/projects/{project_id}/modules")
-def list_project_modules(project_id: str, _: User = Depends(require_user)) -> dict:
+def list_project_modules(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     """Reusable function-set modules this project can compose.
 
     Both roots, project-local first, because a project that vendored a module
@@ -874,13 +1062,13 @@ class MessageInput(BaseModel):
 
 
 @app.get("/api/projects/{project_id}/conversations")
-def get_conversations(project_id: str, _: User = Depends(require_user)) -> list[dict]:
+def get_conversations(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
     return [m.to_dict() for m in list_conversations(_conversations_dir(project_id))]
 
 
 @app.post("/api/projects/{project_id}/conversations")
 def create_conversation(
-    project_id: str, payload: NewConversationInput, _: User = Depends(require_user)
+    project_id: str, payload: NewConversationInput, _: User = Depends(require_onboarded)
 ) -> dict:
     d = _conversations_dir(project_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -889,7 +1077,7 @@ def create_conversation(
 
 
 @app.get("/api/projects/{project_id}/conversations/{filename}")
-def read_conversation(project_id: str, filename: str, _: User = Depends(require_user)) -> dict:
+def read_conversation(project_id: str, filename: str, _: User = Depends(require_onboarded)) -> dict:
     try:
         conv = Conversation.open_existing(_conversations_dir(project_id), filename)
     except (FileNotFoundError, ValueError) as exc:
@@ -904,7 +1092,7 @@ def read_conversation(project_id: str, filename: str, _: User = Depends(require_
 
 @app.post("/api/projects/{project_id}/conversations/{filename}/messages")
 def append_message(
-    project_id: str, filename: str, payload: MessageInput, _: User = Depends(require_user)
+    project_id: str, filename: str, payload: MessageInput, _: User = Depends(require_onboarded)
 ) -> dict:
     try:
         conv = Conversation.open_existing(_conversations_dir(project_id), filename)
@@ -923,7 +1111,7 @@ def append_message(
 # --------------------------------------------------------------------------
 
 
-def _chat_endpoint(session: Session, user: User) -> chat_mod.Endpoint:
+def _chat_endpoint(session: Session, user: User, master_key: bytes) -> chat_mod.Endpoint:
     """The endpoint *this user's* chat turn should use, key decrypted for this
     request only.
 
@@ -940,7 +1128,7 @@ def _chat_endpoint(session: Session, user: User) -> chat_mod.Endpoint:
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     key = (
-        keystore.get(session, _DATA, user, primary.name or primary.provider)
+        keystore.get(session, master_key, user, primary.name or primary.provider)
         if primary.needs_key
         else None
     )
@@ -970,7 +1158,7 @@ def _cred_resolver():
     return CredResolver()
 
 
-def _task_endpoint(session: Session, user: User, task: str):
+def _task_endpoint(session: Session, user: User, master_key: bytes, task: str):
     """The endpoint routed to a task for this user, or None if nothing usable is.
 
     None rather than a fallback: a tool that needs vision must not quietly run
@@ -989,7 +1177,9 @@ def _task_endpoint(session: Session, user: User, task: str):
         kind=rp.provider,  # type: ignore[arg-type]
         model=rp.model,
         api_key=(
-            keystore.get(session, _DATA, user, rp.name or rp.provider) if rp.needs_key else None
+            keystore.get(session, master_key, user, rp.name or rp.provider)
+            if rp.needs_key
+            else None
         ),
         base_url=rp.base_url or None,
     )
@@ -1017,8 +1207,9 @@ async def start_chat_turn(
     project_id: str,
     filename: str,
     payload: ChatInput,
-    user: User = Depends(require_user),
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> dict:
     """Record the user's message and start the assistant's turn.
 
@@ -1033,7 +1224,7 @@ async def start_chat_turn(
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="message is empty")
 
-    endpoint = _chat_endpoint(session, user)
+    endpoint = _chat_endpoint(session, user, master_key)
     conv.append("user", payload.content, {"blocks": [{"type": "text", "text": payload.content}]})
     try:
         turn_id = chat_sessions.start(
@@ -1045,7 +1236,7 @@ async def start_chat_turn(
                 sandbox=_sandbox_for(project_id),
                 usage_ledger=_blpl_dir(project_id) / "llm_usage.jsonl",
                 creds=_cred_resolver(),
-                endpoint_for=lambda task: _task_endpoint(session, user, task),
+                endpoint_for=lambda task: _task_endpoint(session, user, master_key, task),
                 record_tool_call=lambda rec: run_manager.record_tool_call(
                     project_id, rec, conversation=conv.path.name
                 ),
@@ -1059,7 +1250,7 @@ async def start_chat_turn(
 
 @app.get("/api/projects/{project_id}/chat/{turn_id}/events")
 def stream_chat_turn(
-    project_id: str, turn_id: str, _: User = Depends(require_user)
+    project_id: str, turn_id: str, _: User = Depends(require_onboarded)
 ) -> StreamingResponse:
     """Attach to a turn: replay what it has emitted, then follow it live.
 
@@ -1082,7 +1273,7 @@ class ApprovalDecision(BaseModel):
 @app.post("/api/projects/{project_id}/chat/{turn_id}/approvals/{call_id}")
 def resolve_approval(
     project_id: str, turn_id: str, call_id: str, body: ApprovalDecision,
-    _: User = Depends(require_user),
+    _: User = Depends(require_onboarded),
 ) -> dict:
     """Answer a tool call that is waiting on a human.
 
@@ -1099,7 +1290,7 @@ def resolve_approval(
 
 
 @app.get("/api/kicad/bridge")
-def kicad_bridge_status(_: User = Depends(require_user)) -> dict:
+def kicad_bridge_status(_: User = Depends(require_onboarded)) -> dict:
     """Whether the KiCad editing bridge is usable, and if not, exactly why.
 
     "Not configured", "cannot reach it", and "running but too old" are three
@@ -1120,14 +1311,14 @@ def kicad_bridge_status(_: User = Depends(require_user)) -> dict:
 
 
 @app.get("/api/projects/{project_id}/tool-calls")
-def list_tool_calls(project_id: str, _: User = Depends(require_user)) -> list[dict]:
+def list_tool_calls(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
     """What the agents have actually done in this project, newest first."""
     _project_dir(project_id)
     return run_manager.tool_calls_for_project(project_id)
 
 
 @app.get("/api/projects/{project_id}/proposals")
-def list_proposals(project_id: str, _: User = Depends(require_user)) -> list[dict]:
+def list_proposals(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
     """Edits the assistant has proposed and nobody has ruled on yet."""
     proj = _project_dir(project_id)
     return [p.to_dict() for p in chat_mod.ProposalStore(proj).pending()]
@@ -1139,7 +1330,7 @@ class ProposalDecision(BaseModel):
 
 @app.post("/api/projects/{project_id}/proposals/{proposal_id}")
 def decide_proposal(
-    project_id: str, proposal_id: str, body: ProposalDecision, _: User = Depends(require_user)
+    project_id: str, proposal_id: str, body: ProposalDecision, _: User = Depends(require_onboarded)
 ) -> dict:
     """Accept an edit (write it, then commit it) or reject it.
 
@@ -1191,7 +1382,7 @@ def decide_proposal(
 # --------------------------------------------------------------------------
 
 
-def _stage_env(session: Session, user: User, stage_name: str) -> dict[str, str]:
+def _stage_env(session: Session, user: User, master_key: bytes, stage_name: str) -> dict[str, str]:
     """The subprocess environment for a stage run.
 
     For LLM stages, resolve the *whole* fallback chain the config prefers and has
@@ -1213,11 +1404,15 @@ def _stage_env(session: Session, user: User, stage_name: str) -> dict[str, str]:
     # route, everything stage1-ish the stage1 route, so a cheap model can do the
     # mechanical re-read while footprint resolution gets the expensive one.
     task = "stage0" if stage_name.startswith("stage0") else "stage1"
-    return _inject_llm_env(env, session, user, task)
+    return _inject_llm_env(env, session, user, master_key, task)
 
 
 def _inject_llm_env(
-    env: dict[str, str], session: Session, user: User, task: str = "default"
+    env: dict[str, str],
+    session: Session,
+    user: User,
+    master_key: bytes,
+    task: str = "default",
 ) -> dict[str, str]:
     """Add the resolved LLM fallback chain and its keys to an environment.
 
@@ -1241,7 +1436,7 @@ def _inject_llm_env(
     for rp in chain:
         if not rp.needs_key:
             continue
-        key = keystore.get(session, _DATA, user, rp.name or rp.provider)
+        key = keystore.get(session, master_key, user, rp.name or rp.provider)
         if key is None:
             continue
         env[rp.key_env] = key
@@ -1298,15 +1493,16 @@ def _start_run(project_id: str, kind: str, cmd: list[str], env: dict[str, str]) 
 async def run_stage(
     project_id: str,
     stage_name: str,
-    user: User = Depends(require_user),
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> StreamingResponse:
     """Run a pipeline stage, streaming its output to the browser as it happens."""
     if stage_name not in VALID_STAGES:
         raise HTTPException(status_code=400, detail=f"unknown stage {stage_name!r}")
     proj = _project_dir(project_id)
     try:
-        env = _stage_env(session, user, stage_name)
+        env = _stage_env(session, user, master_key, stage_name)
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
@@ -1314,7 +1510,7 @@ async def run_stage(
 
 
 @app.post("/api/projects/{project_id}/release")
-async def build_release(project_id: str, _: User = Depends(require_user)) -> StreamingResponse:
+async def build_release(project_id: str, _: User = Depends(require_onboarded)) -> StreamingResponse:
     """Build the package a contract fab quotes from, gate included.
 
     No LLM in this path: the gate reads what the analyzers already found and the
@@ -1327,7 +1523,7 @@ async def build_release(project_id: str, _: User = Depends(require_user)) -> Str
 
 
 @app.get("/api/projects/{project_id}/release")
-def latest_release(project_id: str, _: User = Depends(require_user)) -> dict:
+def latest_release(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     """The manifest of the most recent release, or why there is none."""
     manifest = _project_dir(project_id) / "release" / "latest.json"
     if not manifest.is_file():
@@ -1341,7 +1537,7 @@ def latest_release(project_id: str, _: User = Depends(require_user)) -> dict:
 
 
 @app.get("/api/projects/{project_id}/preflight")
-def preflight(project_id: str, _: User = Depends(require_user)) -> dict:
+def preflight(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     """What Stage 0 would drop or misread, without running anything.
 
     Served synchronously rather than through the SSE stage runner because the
@@ -1358,7 +1554,7 @@ def preflight(project_id: str, _: User = Depends(require_user)) -> dict:
 
 
 @app.get("/api/projects/{project_id}/release/latest.zip")
-def download_release(project_id: str, _: User = Depends(require_user)) -> Response:
+def download_release(project_id: str, _: User = Depends(require_onboarded)) -> Response:
     """The package itself.
 
     Served whether or not the gate passed — a refused package carries a
@@ -1378,8 +1574,9 @@ def download_release(project_id: str, _: User = Depends(require_user)) -> Respon
 @app.post("/api/projects/{project_id}/review-panel")
 async def run_review_panel(
     project_id: str,
-    user: User = Depends(require_user),
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> StreamingResponse:
     """Review the board with every endpoint routed to the review_panel task.
 
@@ -1389,7 +1586,7 @@ async def run_review_panel(
     """
     proj = _project_dir(project_id)
     try:
-        env = _inject_llm_env(dict(os.environ), session, user, "review_panel")
+        env = _inject_llm_env(dict(os.environ), session, user, master_key, "review_panel")
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [
@@ -1412,8 +1609,9 @@ async def run_pipeline(
     project_id: str,
     from_stage: str = "stage0",
     to_stage: str = "stage8",
-    user: User = Depends(require_user),
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> StreamingResponse:
     """Run a contiguous range of stages end-to-end, streaming per-stage progress.
 
@@ -1433,7 +1631,7 @@ async def run_pipeline(
     lo, hi = _PIPELINE_STAGES.index(from_stage), _PIPELINE_STAGES.index(to_stage)
     if lo <= _PIPELINE_STAGES.index("stage1") <= hi:
         try:
-            env = _inject_llm_env(env, session, user)
+            env = _inject_llm_env(env, session, user, master_key)
         except llm_resolver.NoUsableProvider as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1452,14 +1650,14 @@ async def run_pipeline(
 
 
 @app.get("/api/projects/{project_id}/runs")
-def list_runs(project_id: str, _: User = Depends(require_user)) -> list[dict]:
+def list_runs(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
     """Past and live runs for a project, newest first."""
     _project_dir(project_id)
     return [r.to_dict() for r in run_manager.list_for_project(project_id)]
 
 
 @app.get("/api/runs/{run_id}/stream")
-def stream_run(run_id: str, _: User = Depends(require_user)) -> StreamingResponse:
+def stream_run(run_id: str, _: User = Depends(require_onboarded)) -> StreamingResponse:
     """Attach to a run: full log replay, then the live tail if it's still going.
 
     This is what makes a mid-run browser refresh a non-event — reattach here
@@ -1471,7 +1669,7 @@ def stream_run(run_id: str, _: User = Depends(require_user)) -> StreamingRespons
 
 
 @app.get("/api/runs/{run_id}/log")
-def run_log(run_id: str, _: User = Depends(require_user)) -> PlainTextResponse:
+def run_log(run_id: str, _: User = Depends(require_onboarded)) -> PlainTextResponse:
     if run_manager.get(run_id) is None:
         raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
     path = run_manager.log_path(run_id)
@@ -1480,7 +1678,7 @@ def run_log(run_id: str, _: User = Depends(require_user)) -> PlainTextResponse:
 
 
 @app.delete("/api/runs/{run_id}")
-def stop_run(run_id: str, _: User = Depends(require_user)) -> dict:
+def stop_run(run_id: str, _: User = Depends(require_onboarded)) -> dict:
     """Stop a live run. Stopping is an explicit, recorded act now — closing the
     browser no longer kills anything."""
     if run_manager.get(run_id) is None:
