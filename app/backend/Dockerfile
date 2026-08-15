@@ -46,12 +46,20 @@ COPY kicad-happy /app/kicad-happy
 RUN pip install --no-cache-dir -e /app[all-llm]
 
 COPY app/backend/app /app/app
+COPY app/backend/alembic.ini /app/alembic.ini
+COPY app/backend/alembic /app/alembic
+COPY app/backend/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 ENV BLPL_PROJECTS_ROOT=/app/projects \
     BLPL_KICAD_HAPPY=/app/kicad-happy \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8000
+
+# Migrations run before the server does — see entrypoint.sh for why that is a
+# script and not a compose `command`.
+ENTRYPOINT ["/app/entrypoint.sh"]
 
 # One worker on purpose. Stage runs stream over SSE from an in-process
 # subprocess; adding workers without a shared job store just makes streams land

@@ -8,6 +8,35 @@
 # Bring up:   docker compose -f app/docker-compose.yml up -d --build
 # First run:  open http://<host>:8080 and set a passphrase.
 services:
+  # Who exists and whose provider key is whose. The SQLite vault this replaces
+  # was structurally single-tenant — one DEK from one passphrase, one secret
+  # table with no owner column — so there was no version of "several people, each
+  # with their own keys" that fitted inside it. Postgres is here for the
+  # ownership model, not the volume.
+  db:
+    image: postgres:17-alpine
+    container_name: blpl-db
+    restart: unless-stopped
+    networks:
+      - blpl
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-blpl}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-blpl}
+      - POSTGRES_DB=${POSTGRES_DB:-blpl}
+    volumes:
+      - blpl-db:/var/lib/postgresql/data
+    # The backend runs `alembic upgrade head` before it starts, so it needs a
+    # database that is genuinely accepting connections — not merely a container
+    # that exists. Without this the first boot after a rebuild races and the
+    # migration fails on a refused connection.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-blpl} -d ${POSTGRES_DB:-blpl}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Not published to the host. Nothing outside the compose network has any
+    # business reaching it, and the keys it holds are the reason.
+
   backend:
     # Upstream publishes kicad/kicad:10.0.0 for linux/amd64 only — there is no
     # arm64 manifest. Without this pin the build dies with "no match for platform
@@ -33,7 +62,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
+      - BLPL_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-blpl}:${POSTGRES_PASSWORD:-blpl}@db:5432/${POSTGRES_DB:-blpl}
       # One data root holds the three stateful things: the vault DB, the
       # declarative config, and the project working copies.
       - BLPL_DATA_ROOT=/app/data
@@ -146,3 +179,9 @@ services:
 networks:
   blpl:
     external: true
+
+volumes:
+  # A named volume, not a bind mount under ./data like the rest of the app's
+  # state. Postgres owns its data directory's permissions and ownership, and a
+  # bind mount onto a macOS filesystem is exactly where that goes wrong.
+  blpl-db:
