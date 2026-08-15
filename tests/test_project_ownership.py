@@ -71,20 +71,83 @@ def test_the_name_space_is_shared_even_though_projects_are_not(unlocked, second_
 # -- sharing -----------------------------------------------------------------
 
 
-def test_sharing_grants_access(unlocked, second_user):
+def test_an_invitation_grants_nothing_until_it_is_accepted(unlocked, second_user):
+    """Being added to a project puts it in your list, spends your provider key on
+    its runs, and hands you material you become responsible for. Opting in is a
+    choice, so the invitation alone changes nothing."""
     _make(unlocked)
+
+    invited = unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
+    assert invited.status_code == 200
+
     assert second_user.get("/api/projects/mine/git/status").status_code == 404
+    assert second_user.get("/api/projects").json() == []
 
-    shared = unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
-    assert shared.status_code == 200 and shared.json()["added"] is True
+    waiting = second_user.get("/api/invitations").json()
+    assert [i["project"] for i in waiting] == ["mine"]
 
+    assert second_user.post(f"/api/invitations/{waiting[0]['id']}/accept").status_code == 200
     assert second_user.get("/api/projects/mine/git/status").status_code == 200
     assert [p["id"] for p in second_user.get("/api/projects").json()] == ["mine"]
 
 
-def test_a_shared_project_says_who_owns_it(unlocked, second_user):
+def _invite_and_accept(owner, invitee, project="mine", email="other@example.com"):
+    owner.post(f"/api/projects/{project}/members", json={"email": email})
+    inv = invitee.get("/api/invitations").json()[0]["id"]
+    invitee.post(f"/api/invitations/{inv}/accept")
+
+
+def test_declining_leaves_you_out(unlocked, second_user):
     _make(unlocked)
     unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
+    inv = second_user.get("/api/invitations").json()[0]["id"]
+
+    assert second_user.post(f"/api/invitations/{inv}/decline").status_code == 200
+    assert second_user.get("/api/projects").json() == []
+    # ...and it is not offered again on a loop.
+    assert second_user.get("/api/invitations").json() == []
+
+
+def test_a_withdrawn_invitation_cannot_be_accepted(unlocked, second_user):
+    _make(unlocked)
+    unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
+    inv = second_user.get("/api/invitations").json()[0]["id"]
+
+    assert unlocked.delete(f"/api/projects/mine/invitations/{inv}").status_code == 200
+    assert second_user.post(f"/api/invitations/{inv}/accept").status_code == 404
+    assert second_user.get("/api/projects").json() == []
+
+
+def test_an_expired_invitation_cannot_be_accepted(unlocked, second_user, monkeypatch):
+    """A pending invitation is a standing grant waiting to be taken. One left for
+    a year is a way into a project whose owner stopped thinking about it."""
+    import app.projectacl as projectacl
+    from datetime import timedelta
+
+    _make(unlocked)
+    unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
+    inv = second_user.get("/api/invitations").json()[0]["id"]
+
+    real_now = projectacl._now
+    monkeypatch.setattr(
+        projectacl, "_now", lambda: real_now() + projectacl.INVITATION_TTL + timedelta(days=1)
+    )
+
+    assert second_user.get("/api/invitations").json() == []
+    assert second_user.post(f"/api/invitations/{inv}/accept").status_code == 404
+
+
+def test_inviting_someone_who_is_already_a_member_is_refused(unlocked, second_user):
+    _make(unlocked)
+    _invite_and_accept(unlocked, second_user)
+
+    again = unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
+    assert again.status_code == 409
+
+
+def test_a_shared_project_says_who_owns_it(unlocked, second_user):
+    _make(unlocked)
+    _invite_and_accept(unlocked, second_user)
 
     assert unlocked.get("/api/projects").json()[0]["owned"] is True
     assert second_user.get("/api/projects").json()[0]["owned"] is False
@@ -94,7 +157,7 @@ def test_only_the_owner_can_share(unlocked, second_user):
     """403 here, not 404: they are already a member, so the project's existence
     is not a secret from them and naming the real reason is useful."""
     _make(unlocked)
-    unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
+    _invite_and_accept(unlocked, second_user)
 
     refused = second_user.post("/api/projects/mine/members", json={"email": "third@example.com"})
     assert refused.status_code == 403
@@ -111,7 +174,7 @@ def test_sharing_with_someone_who_has_never_signed_in_is_refused(unlocked):
 
 def test_unsharing_takes_access_away_again(unlocked, second_user):
     _make(unlocked)
-    unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
+    _invite_and_accept(unlocked, second_user)
     other_id = [
         m["id"] for m in unlocked.get("/api/projects/mine/members").json()["members"] if not m["is_you"]
     ][0]
@@ -136,7 +199,7 @@ def test_members_can_see_who_else_has_access(unlocked, second_user):
     """Any member, not just the owner: you are entitled to know who else can
     read what you are working on."""
     _make(unlocked)
-    unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
+    _invite_and_accept(unlocked, second_user)
 
     listing = second_user.get("/api/projects/mine/members").json()
     assert listing["owned_by_me"] is False

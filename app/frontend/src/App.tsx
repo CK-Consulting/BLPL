@@ -5,6 +5,7 @@ import { StageRunner } from "./components/StageRunner";
 import { RunHistory } from "./components/RunHistory";
 import { SettingsPanel } from "./components/Settings";
 import { Sharing } from "./components/Sharing";
+import { Invitations } from "./components/Invitations";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
 import { Editor } from "./components/Editor";
 import { Reports } from "./components/Reports";
@@ -70,6 +71,7 @@ function Workspace() {
 
   return (
     <div className="app">
+      <Invitations onChanged={refresh} />
       <header>
         <strong>BLPL</strong>
         <span className="sep">/</span>

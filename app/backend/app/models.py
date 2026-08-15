@@ -296,3 +296,53 @@ class ProjectMember(Base):
 
     project: Mapped[Project] = relationship(back_populates="members")
     user: Mapped[User] = relationship(back_populates="memberships")
+
+
+class ProjectInvitation(Base):
+    """An offer of access that the recipient has to accept.
+
+    Sharing used to take effect the moment the owner clicked. That is fine for a
+    row in a table and wrong for anything with consequences: being added to a
+    project puts it in your list, spends your provider key on its runs, and — once
+    project files are encrypted — hands you material you are then responsible for.
+    Opting in should be a choice, the way it is for a repository invitation.
+
+    The recipient must already have an account. That looks like a limitation next
+    to inviting any email address, and it is the encryption that makes it one
+    worth having: granting access means wrapping the project key for someone, and
+    the owner has to be unlocked to do it. An invitation to an address nobody
+    holds would either carry no key for anyone — so acceptance would need the
+    owner back, unlocked, at a moment nobody can predict — or attach to whoever
+    claims that address next, which is a way to hand someone your design.
+
+    Expiry is not tidiness. A pending invitation is a standing grant waiting to
+    be taken; one forgotten for a year is a way into a project whose owner has
+    long since stopped thinking about it.
+    """
+
+    __tablename__ = "project_invitation"
+    __table_args__ = (
+        # One live invitation per (project, invitee). Re-inviting updates the
+        # existing row rather than stacking duplicates that would each have to
+        # be revoked separately.
+        UniqueConstraint("project_id", "invitee_id", name="uq_invitation_project_invitee"),
+        Index("ix_invitation_invitee", "invitee_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("project.id", ondelete="CASCADE"))
+    invitee_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    invited_by_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # pending | accepted | declined | revoked. Kept after the fact rather than
+    # deleted, so "did I already turn this down" has an answer and a declined
+    # invitation is not silently re-sent on a loop.
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    responded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
+    project: Mapped[Project] = relationship()
+    invitee: Mapped[User] = relationship(foreign_keys=[invitee_id])
+    invited_by: Mapped[User] = relationship(foreign_keys=[invited_by_id])

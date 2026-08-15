@@ -219,9 +219,23 @@ export type ProjectMember = {
   is_you: boolean;
 };
 
+export type PendingInvite = { id: number; email: string; expires_at: string };
+
 export type ProjectMembers = {
   owned_by_me: boolean;
   members: ProjectMember[];
+  /** Offers not yet answered. Shown to every member: someone about to be able
+   *  to read this is worth seeing before they arrive, not after. */
+  invited: PendingInvite[];
+};
+
+/** An offer of access waiting for you. Not nested under a project, because you
+ *  cannot reach that project yet — a route beneath it would 404. */
+export type Invitation = {
+  id: number;
+  project: string;
+  invited_by: string;
+  expires_at: string;
 };
 
 export type ImportResult = {

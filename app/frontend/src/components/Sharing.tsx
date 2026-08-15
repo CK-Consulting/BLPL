@@ -40,6 +40,16 @@ export function Sharing({ projectId }: { projectId: string }) {
     }
   };
 
+  const revoke = async (invitationId: number) => {
+    setError(null);
+    try {
+      await del(`/api/projects/${projectId}/invitations/${invitationId}`);
+      await refresh();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   const remove = async (userId: number) => {
     setError(null);
     try {
@@ -80,6 +90,26 @@ export function Sharing({ projectId }: { projectId: string }) {
         ))}
       </ul>
 
+      {data.invited.length > 0 && (
+        <>
+          <h3>Invited, not yet accepted</h3>
+          <ul className="member-list">
+            {data.invited.map((inv) => (
+              <li key={inv.id}>
+                <span className="mono">{inv.email}</span>
+                <span className="chip">pending</span>
+                <span className="spacer" />
+                {data.owned_by_me && (
+                  <button className="link" onClick={() => revoke(inv.id)}>
+                    Withdraw
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+
       {data.owned_by_me && (
         <form className="row" onSubmit={add}>
           <input
@@ -95,8 +125,8 @@ export function Sharing({ projectId }: { projectId: string }) {
       )}
       {data.owned_by_me && (
         <div className="gate-hint">
-          They must have signed in here at least once — an invitation to an address nobody holds
-          would attach to whoever claims it later.
+          They must have signed in here at least once, and they have to accept before they get
+          access. An invitation to an address nobody holds would attach to whoever claims it later.
         </div>
       )}
       {error && <div className="gate-error">{error}</div>}

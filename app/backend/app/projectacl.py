@@ -17,13 +17,40 @@ Two rules, and both are about what a refusal reveals:
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import Project, ProjectMember, User
+from .models import Project, ProjectInvitation, ProjectMember, User
 
 OWNER = "owner"
 MEMBER = "member"
+
+PENDING = "pending"
+ACCEPTED = "accepted"
+DECLINED = "declined"
+REVOKED = "revoked"
+
+# Long enough to survive a holiday, short enough that a forgotten invitation
+# stops being a standing grant into someone's project.
+INVITATION_TTL = timedelta(days=14)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _aware(when: datetime) -> datetime:
+    """Read a stored timestamp back as UTC-aware.
+
+    Postgres returns timezone-aware values for these columns; SQLite, which the
+    tests run on, drops the offset and hands back a naive one. Comparing the two
+    raises, so every expiry check would have worked in production and failed in
+    the suite — or, had the defaults gone the other way, passed in the suite and
+    let expired invitations through in production.
+    """
+    return when if when.tzinfo is not None else when.replace(tzinfo=timezone.utc)
 
 
 class NoSuchProject(LookupError):
@@ -126,3 +153,121 @@ def unshare(session: Session, project: Project, user_id: int) -> bool:
     session.delete(row)
     session.flush()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Invitations
+# ---------------------------------------------------------------------------
+
+
+class AlreadyAMember(ValueError):
+    """The invitee can already open this project."""
+
+
+class NoSuchInvitation(LookupError):
+    """No pending invitation by that id for this user."""
+
+
+def invite(session: Session, project: Project, invited_by: User, invitee: User) -> ProjectInvitation:
+    """Offer access. The invitee decides whether to take it.
+
+    Re-inviting someone who declined replaces the old row rather than adding a
+    second one — otherwise a declined invitation could be re-sent indefinitely
+    and each would need revoking separately.
+    """
+    if any(m.user_id == invitee.id for m in project.members):
+        raise AlreadyAMember(invitee.email or str(invitee.id))
+
+    existing = session.scalar(
+        select(ProjectInvitation).where(
+            ProjectInvitation.project_id == project.id,
+            ProjectInvitation.invitee_id == invitee.id,
+        )
+    )
+    if existing is None:
+        existing = ProjectInvitation(project_id=project.id, invitee_id=invitee.id)
+        session.add(existing)
+    existing.invited_by_id = invited_by.id
+    existing.status = PENDING
+    existing.created_at = _now()
+    existing.expires_at = _now() + INVITATION_TTL
+    existing.responded_at = None
+    session.flush()
+    return existing
+
+
+def pending_for(session: Session, user: User) -> list[ProjectInvitation]:
+    """Live invitations awaiting this user's answer.
+
+    Expired ones are filtered here rather than swept by a job: the question
+    "may this be accepted" has to check the clock anyway, so a background
+    cleaner would only be a second place for the same rule to live — and to
+    disagree.
+    """
+    rows = session.scalars(
+        select(ProjectInvitation).where(
+            ProjectInvitation.invitee_id == user.id,
+            ProjectInvitation.status == PENDING,
+        )
+    )
+    return [r for r in rows if _aware(r.expires_at) > _now()]
+
+
+def _live_invitation(session: Session, user: User, invitation_id: int) -> ProjectInvitation:
+    row = session.scalar(
+        select(ProjectInvitation).where(
+            ProjectInvitation.id == invitation_id,
+            ProjectInvitation.invitee_id == user.id,
+            ProjectInvitation.status == PENDING,
+        )
+    )
+    if row is None or _aware(row.expires_at) <= _now():
+        raise NoSuchInvitation(str(invitation_id))
+    return row
+
+
+def accept(session: Session, user: User, invitation_id: int) -> Project:
+    """Take up an invitation, becoming a member."""
+    row = _live_invitation(session, user, invitation_id)
+    row.status = ACCEPTED
+    row.responded_at = _now()
+    session.add(ProjectMember(project_id=row.project_id, user_id=user.id, role=MEMBER))
+    session.flush()
+    return row.project
+
+
+def decline(session: Session, user: User, invitation_id: int) -> None:
+    """Turn one down. Recorded rather than deleted, so the answer is remembered
+    and the same invitation is not quietly re-offered on a loop."""
+    row = _live_invitation(session, user, invitation_id)
+    row.status = DECLINED
+    row.responded_at = _now()
+    session.flush()
+
+
+def revoke(session: Session, project: Project, invitation_id: int) -> bool:
+    """Withdraw an offer before it is taken."""
+    row = session.scalar(
+        select(ProjectInvitation).where(
+            ProjectInvitation.id == invitation_id,
+            ProjectInvitation.project_id == project.id,
+            ProjectInvitation.status == PENDING,
+        )
+    )
+    if row is None:
+        return False
+    row.status = REVOKED
+    row.responded_at = _now()
+    session.flush()
+    return True
+
+
+def outstanding(session: Session, project: Project) -> list[ProjectInvitation]:
+    """Invitations this project is still waiting on, for the owner's view."""
+    rows = session.scalars(
+        select(ProjectInvitation).where(
+            ProjectInvitation.project_id == project.id,
+            ProjectInvitation.status == PENDING,
+        )
+    )
+    return [r for r in rows if _aware(r.expires_at) > _now()]

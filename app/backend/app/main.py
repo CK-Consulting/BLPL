@@ -756,6 +756,17 @@ def list_members(
             {"id": u.id, "email": u.email, "role": role, "is_you": u.id == user.id}
             for u, role in projectacl.members(session, project)
         ],
+        # Shown to every member, not just the owner: an outstanding invitation is
+        # someone who is about to be able to read this, and that is worth seeing
+        # before they arrive rather than after.
+        "invited": [
+            {
+                "id": inv.id,
+                "email": inv.invitee.email,
+                "expires_at": inv.expires_at.isoformat(),
+            }
+            for inv in projectacl.outstanding(session, project)
+        ],
     }
 
 
@@ -786,8 +797,18 @@ def add_member(
             status_code=404,
             detail=f"nobody has signed in with {body.email!r} yet — they need an account first",
         )
-    added = projectacl.share(session, project, target)
-    return {"ok": True, "added": added, "email": target.email}
+    if target.id == user.id:
+        raise HTTPException(status_code=400, detail="you already own this project")
+    try:
+        invitation = projectacl.invite(session, project, user, target)
+    except projectacl.AlreadyAMember:
+        raise HTTPException(status_code=409, detail=f"{target.email} can already open this project")
+    return {
+        "ok": True,
+        "invited": target.email,
+        "invitation_id": invitation.id,
+        "expires_at": invitation.expires_at.isoformat(),
+    }
 
 
 @app.delete("/api/projects/{project_id}/members/{user_id}")
@@ -810,6 +831,73 @@ def remove_member(
         # share it, delete it, or grant anyone else access.
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "removed": removed}
+
+
+@app.delete("/api/projects/{project_id}/invitations/{invitation_id}")
+def revoke_invitation(
+    project_id: str,
+    invitation_id: int,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Withdraw an offer before it is taken."""
+    try:
+        project = projectacl.require_owner(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    except projectacl.NotTheOwner:
+        raise HTTPException(status_code=403, detail="only the owner can withdraw an invitation")
+    return {"ok": True, "revoked": projectacl.revoke(session, project, invitation_id)}
+
+
+@app.get("/api/invitations")
+def list_invitations(
+    user: User = Depends(require_onboarded), session: Session = Depends(session_scope)
+) -> list[dict]:
+    """Projects waiting for this user to say yes or no.
+
+    Not under /api/projects/{id}: the whole point is that you cannot reach that
+    project yet, so a route beneath it would 404 on the permission check that has
+    not been granted.
+    """
+    return [
+        {
+            "id": inv.id,
+            "project": inv.project.name,
+            "invited_by": inv.invited_by.email,
+            "expires_at": inv.expires_at.isoformat(),
+        }
+        for inv in projectacl.pending_for(session, user)
+    ]
+
+
+@app.post("/api/invitations/{invitation_id}/accept")
+def accept_invitation(
+    invitation_id: int,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    try:
+        project = projectacl.accept(session, user, invitation_id)
+    except projectacl.NoSuchInvitation:
+        # Covers withdrawn, already answered, and expired alike. They are all
+        # "there is nothing here for you to accept", and distinguishing them
+        # would report on a project the caller still cannot see.
+        raise HTTPException(status_code=404, detail="no invitation waiting for you")
+    return {"ok": True, "project": project.name}
+
+
+@app.post("/api/invitations/{invitation_id}/decline")
+def decline_invitation(
+    invitation_id: int,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    try:
+        projectacl.decline(session, user, invitation_id)
+    except projectacl.NoSuchInvitation:
+        raise HTTPException(status_code=404, detail="no invitation waiting for you")
+    return {"ok": True}
 
 
 @app.post("/api/projects/import")
