@@ -113,6 +113,7 @@ services:
       # 3D model libraries, so `kicad-cli pcb export glb --subst-models` can
       # substitute real component models off the official KiCad image.
       - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
+      - ../kicad-packages3D-source:/usr/share/kicad/3dmodels-source:ro
       # Stock symbol/footprint libraries. The image copies blpl/schemas/kicad-happy
       # but NOT these (they are large and versioned as submodules), and inside the
       # container the CLI resolves its default library roots to /app/kicad-symbols
@@ -124,8 +125,8 @@ services:
       - ../kicad-footprints:/app/kicad-footprints:ro
       - ../kicad-happy:/app/kicad-happy
       - ../kicad-packages:/app/kicad-packages
-      - ../kicad-templates:/app/kicad-templates
-      - ../KiCAD-Prism:/app/kicad-prism
+      - ../kicad-templates:/app/kicad-templates:ro
+      - ../KiCAD-Prism:/app/kicad-prism:ro
       # An SSH deploy key for git, if your project remotes need one. The git CLI
       # in the container reads ~/.ssh; mount a read-only key here. Optional —
       # local-only projects and https remotes with a token helper don't need it.

@@ -15,3 +15,10 @@ app/frontend/*.tsbuildinfo
 app/data/
 ui/node_modules/
 blpl/webapp/static/assets/
+.env
+# ...but the example must be committed. A personal ~/.gitignore with `.env.*` in
+# it is a common and sensible thing to have, and it silently swallows this file —
+# a repo-level rule outranks core.excludesFile, so state it here rather than
+# expecting every clone to have the same global config.
+!.env.example
+*.swp
