@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from blpl.agent import review_panel as rp
+from conftest import sign_in
 
 
 def _finding(rule="missing-decoupling", sev="warning", summary="U1 has no decoupling capacitor",
@@ -360,7 +361,7 @@ def test_the_panel_route_dispatches_every_routed_endpoint(client, monkeypatch) -
 
     monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
 
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.put("/api/settings/llm", json={"priority": ["anthropic", "openai"], "models": {}})
     client.put("/api/settings/secrets/anthropic", json={"value": "sk-ant-KEY"})
     client.put("/api/settings/secrets/openai", json={"value": "sk-oai-KEY"})
@@ -379,7 +380,7 @@ def test_the_panel_route_dispatches_every_routed_endpoint(client, monkeypatch) -
 
 
 def test_the_panel_route_refuses_up_front_when_nothing_can_review(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     r = client.post("/api/projects/scratch/review-panel")
     assert r.status_code == 400

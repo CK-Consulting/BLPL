@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from blpl.core import release
+from conftest import sign_in
 
 
 @pytest.fixture
@@ -210,7 +211,7 @@ def test_the_jar_location_comes_from_the_environment(monkeypatch, tmp_path) -> N
 def test_the_release_route_serves_the_package_even_when_it_was_refused(client) -> None:
     """A refused package carries a README saying so, which is more useful than a
     download that silently does not exist."""
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
 
     assert client.get("/api/projects/scratch/release").json() == {"exists": False}

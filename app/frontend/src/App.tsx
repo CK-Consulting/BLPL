@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AuthGate } from "./components/AuthGate";
+import { AuthGate, UserControl } from "./components/AuthGate";
 import { DesignView, type Highlight } from "./components/Visualizer";
 import { StageRunner } from "./components/StageRunner";
 import { RunHistory } from "./components/RunHistory";
@@ -15,7 +15,7 @@ import { DiffView } from "./components/DiffView";
 import { Artifacts } from "./components/Artifacts";
 import { ChatPanel } from "./components/ChatPanel";
 import { useResizable } from "./useResizable";
-import { Project, getJSON, postJSON } from "./api";
+import { Project, getJSON } from "./api";
 
 export default function App() {
   return (
@@ -110,12 +110,9 @@ function Workspace() {
         <button className="link" onClick={() => setShowSettings(true)}>
           Settings
         </button>
-        <button
-          className="link"
-          onClick={() => postJSON("/api/auth/lock", {}).then(() => window.location.reload())}
-        >
-          Lock
-        </button>
+        {/* Clerk owns sign-out, the account menu, and everything under it, so
+            there is nothing here for the app to reimplement. */}
+        <UserControl />
       </header>
 
       {selected ? (

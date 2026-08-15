@@ -5,14 +5,19 @@ Three things make this the hosted app rather than the earlier vertical slice:
 * KiCad lives in the *image*, not on your laptop (FROM kicad/kicad:10.0.0), so
   every workstation you sit at renders and exports identically.
 
-* Your secrets live in an encrypted vault. The whole API sits behind unlocking it,
-  and there are two doors. The passphrase *derives* the key, so it is never stored
-  anywhere. Signing in with GitLab, GitHub, or Google proves only who you are, so
-  it opens the vault via a second wrapping of the same key held server-side — which
-  means that on an SSO-enabled install, whoever holds the data directory holds the
-  secrets, and the passphrase-only guarantee no longer applies. That trade is
-  opt-in and reversible; app/vault.py states it in full, and app/oauth.py covers
-  who is allowed through the second door.
+* Clerk is the front door. Every route under /api except the health probe and
+  the config probe requires a Clerk session token, verified here against Clerk's
+  published JWKS (app/clerk_auth.py) — the backend gets no Clerk SDK, so it does
+  the verification itself, and pins the issuer because a correctly-signed token
+  from someone else's Clerk instance is otherwise indistinguishable from ours.
+
+* Provider API keys belong to a *user*, not to the server. They live in Postgres
+  sealed with AES-GCM under a server-held key (app/keystore.py), and there is no
+  environment fallback: a shared key would mean every user of a deployment
+  spending the operator's quota on the operator's account. Be clear about what
+  this protects — a stolen dump is inert, a dump plus the server key is not, and
+  the operator can always read them. A user typing a key into Settings is
+  trusting the operator, not only the software.
 
 * Your projects are git-backed working copies on the server, so they follow you
   between machines. See app/projects.py.
@@ -31,18 +36,21 @@ import os
 import shutil
 import subprocess
 import sys
+import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import appconfig, chat as chat_mod, importer, llm_resolver, oauth, runs, serverkey, vault
+from . import appconfig, chat as chat_mod, clerk_auth, importer, keystore, llm_resolver, runs, serverkey, users
 from .appconfig import AppConfig, ProjectEntry
+from .db import session_scope
+from .models import User
 from .conversations import Conversation, list_conversations
-from .identity import Identity, Locked, NotInitialized, SsoNotEnabled
 from .projects import ProjectError, Projects
 from .references import (
     FilesystemSandbox,
@@ -53,42 +61,40 @@ from .references import (
     load_global_denylist,
     validate_reference,
 )
-from .store import Store
 
-app = FastAPI(title="BLPL", version="0.5.0")
+logger = logging.getLogger("blpl.app")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,  # the session cookie must ride cross-origin in dev
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Make sure the key that seals provider keys exists before anyone stores one.
+
+    Created at boot rather than lazily on first write so the operator learns
+    where it is — and can get it into their backup story — *before* it is the
+    only thing standing between a database dump and every user's keys. Losing it
+    later means every stored key is unreadable and must be re-entered.
+    """
+    key_path = serverkey.key_path(_DATA)
+    existed = serverkey.load(_DATA) is not None
+    serverkey.load_or_create(_DATA)
+    if not existed and not os.environ.get("BLPL_SERVER_KEY"):
+        logger.warning(
+            "generated a new server key at %s — it seals every stored provider key. "
+            "Back it up separately from the database; together they are the lock and its key.",
+            key_path,
+        )
+    yield
+
+
+app = FastAPI(title="BLPL", version="0.5.0", lifespan=_lifespan)
+
 
 # State roots. All three are volumes on the deploy; all three default under one
 # data dir so a bare `docker run` still works.
 _DATA = Path(os.environ.get("BLPL_DATA_ROOT", "/app/data"))
 PROJECTS_ROOT = Path(os.environ.get("BLPL_PROJECTS_ROOT", str(_DATA / "projects"))).resolve()
-VAULT_DB = Path(os.environ.get("BLPL_VAULT_DB", str(_DATA / "vault.db")))
 CONFIG_PATH = Path(os.environ.get("BLPL_CONFIG", str(_DATA / "blpl.toml")))
 
-_SESSION_COOKIE = "blpl_session"
-
-
-def _env_flag(name: str) -> bool:
-    """Parse a boolean environment variable the way a human means it.
-
-    ``bool(os.environ.get(name))`` is a trap: every non-empty string is truthy, so
-    ``FOO=0`` and ``FOO=false`` both come out True. That exact trap flagged the
-    session cookie Secure when someone set BLPL_COOKIE_SECURE=0 to turn it *off* —
-    and a Secure cookie is silently dropped over plain HTTP, so the session never
-    stuck and every unlock bounced straight back to the lock screen. Only an
-    explicit truthy token counts.
-    """
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-identity = Identity(store=Store(VAULT_DB))
 projects = Projects(PROJECTS_ROOT)
 # Run history is plaintext facts-about-what-happened, deliberately NOT in
 # vault.db — that file's contract is "a dump of it is a dump of ciphertext".
@@ -105,62 +111,18 @@ _PROVIDER_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
 # --------------------------------------------------------------------------
 # Where an endpoint's key comes from
 #
-# Two sources, in a fixed order: the vault, then the process environment. The
-# vault wins because a key typed into Settings is a deliberate choice about this
-# install. The environment is the deploy's answer — docker-compose passes
-# ANTHROPIC_API_KEY / OPENAI_API_KEY through from .env, and on a single-account
-# install that is the only key there will ever be. Requiring it to be re-entered
-# in the UI before anything can run made the compose variables decorative.
+# One place: the signed-in user's own row. There is deliberately no fallback to
+# the server's environment. A shared ANTHROPIC_API_KEY would mean every user of
+# this deployment silently spending the operator's quota on the operator's
+# account — a default nobody can consent to, and one that gets more wrong the
+# more people use the server. Bring your own key, or route the task somewhere
+# keyless: ollama, or an OpenAI-compatible endpoint declaring auth = "none".
 #
-# The same precedence distributor credentials already use (_cred_resolver), for
-# the same reason.
+# The endpoint registry already models this well. A key belongs to a *named
+# endpoint*, not a provider kind, so two Anthropic accounts are two endpoints
+# with two keys, and a self-hosted OpenAI-compatible server is just another
+# endpoint with its own base_url and credential.
 # --------------------------------------------------------------------------
-
-
-def _env_key_for(cfg: AppConfig, name: str) -> str | None:
-    """An endpoint's key as supplied by the environment, most specific first.
-
-    ``BLPL_LLM_KEY__<ENDPOINT>`` names one endpoint, so two Anthropic accounts
-    can be told apart without either being vaulted. ``ANTHROPIC_API_KEY`` /
-    ``OPENAI_API_KEY`` are provider-wide: one global cannot distinguish two
-    endpoints of a kind, so *every* unvaulted endpoint of that kind falls back
-    to it. That is the honest limit of a shared variable, not a bug — vault or
-    the per-endpoint variable is how you say something more precise.
-    """
-    value = os.environ.get(llm_resolver.key_env_var(name))
-    if value:
-        return value
-    ep = cfg.endpoint(name)
-    provider_var = _PROVIDER_ENV.get(ep.kind) if ep is not None else None
-    if provider_var:
-        return os.environ.get(provider_var) or None
-    return None
-
-
-def _endpoint_key(token: str | None, cfg: AppConfig, name: str) -> str | None:
-    """The key to authenticate one endpoint with, or None if it has none."""
-    try:
-        vaulted = identity.get_secret(token, name) if token else None
-    except Exception:  # noqa: BLE001 — a locked or absent secret is simply absent
-        vaulted = None
-    return vaulted or _env_key_for(cfg, name)
-
-
-def _endpoints_with_keys(cfg: AppConfig) -> set[str]:
-    """Endpoint names that can authenticate, from either source.
-
-    This is what llm_resolver is handed, so the resolver stays pure: it is told
-    which endpoints have a key, never where the key came from. Reading vault
-    *presence* needs no session, and neither does reading the environment — so
-    the run preflight can answer "will this work" before a passphrase is typed.
-    """
-    names = identity.providers_with_keys()
-    return names | {
-        name
-        for name, ep in cfg.endpoints.items()
-        if ep.needs_key and name not in names and _env_key_for(cfg, name)
-    }
-
 
 VALID_STAGES = {
     "doctor",
@@ -180,16 +142,39 @@ _LLM_STAGES = {"stage0-llm", "stage0-compare", "stage1", "stage1-synthesize-conn
 # --------------------------------------------------------------------------
 
 
-def require_session(blpl_session: str | None = Cookie(default=None)) -> str:
-    """FastAPI dependency: the request must carry a live unlocked session.
+def require_user(
+    session: Session = Depends(session_scope),
+    authorization: str | None = Header(default=None),
+    __session: str | None = Cookie(default=None, alias="__session"),
+) -> User:
+    """FastAPI dependency: the request must carry a verified Clerk session.
 
-    Returns the token so handlers can pull the DEK-backed secret through it. A
-    missing or expired session is a 401 — the client then shows the unlock
-    screen.
+    Returns *our* user row, not Clerk's claims, so every handler downstream
+    works in terms of an owner it can attach data to. The row is created on
+    first sign-in; Clerk has already decided the person may authenticate, so
+    there is no second approval step here.
+
+    Both places Clerk puts a token are accepted — the Authorization header the
+    frontend sends after getToken(), and the __session cookie on a same-origin
+    request. FastAPI caches dependencies per request, so the session opened here
+    is the same one the handler receives.
+
+    401 for every failure, with the reason logged rather than returned: telling
+    an unauthenticated caller *why* verification failed is free reconnaissance.
     """
-    if not identity.is_unlocked(blpl_session):
-        raise HTTPException(status_code=401, detail="locked")
-    return blpl_session  # type: ignore[return-value]
+    if not clerk_auth.configured():
+        # A 503 rather than a 401: nobody can fix this by signing in again, and
+        # a login screen that cannot possibly work is worse than an error.
+        raise HTTPException(
+            status_code=503,
+            detail="this server has no Clerk issuer configured; set BLPL_CLERK_ISSUER",
+        )
+    try:
+        who = clerk_auth.verify(clerk_auth.token_from_request(authorization, __session))
+    except clerk_auth.ClerkAuthError as exc:
+        logger.info("rejected a request: %s", exc)
+        raise HTTPException(status_code=401, detail="not signed in")
+    return users.get_or_create(session, who)
 
 
 def _load_config() -> AppConfig:
@@ -213,291 +198,47 @@ def health() -> dict:
     }
 
 
-@app.get("/api/auth/status")
-def auth_status(blpl_session: str | None = Cookie(default=None)) -> dict:
-    """What the client needs to decide which screen to show: is a passphrase set
-    yet (first-run vs returning), is this browser currently unlocked, and which
-    sign-in buttons to offer.
+@app.get("/api/me")
+def whoami(user: User = Depends(require_user)) -> dict:
+    """Who the caller is, as this server understands them.
 
-    Deliberately unauthenticated, and deliberately says nothing an anonymous
-    caller shouldn't have: provider ids and labels are the same information the
-    login page shows anyway, and ``sso_ready`` is a yes/no about this server's
-    configuration, not about any account.
+    The one authenticated route the UI can call to confirm a session actually
+    works end to end. Clerk tells the browser it is signed in; this says the
+    backend agrees — that the token verified against our issuer and resolved to
+    a row here. Those can disagree (a misconfigured issuer, a token from another
+    instance), and when they do the browser's own state is the misleading one.
     """
-    provider_list = oauth.providers() if oauth.sso_configured() else {}
-    return {
-        "initialized": identity.is_initialized(),
-        "unlocked": identity.is_unlocked(blpl_session),
-        # Configured *and* enrolled. A provider set up before anyone has unlocked
-        # with the passphrase cannot open anything yet (there is no server-key
-        # wrapping to unwrap), so offering the button would be a dead end.
-        "sso_ready": bool(provider_list) and identity.sso_enabled(),
-        "sso_providers": [{"id": p.id, "label": p.label} for p in provider_list.values()],
-    }
+    return {"id": user.id, "clerk_user_id": user.clerk_user_id, "email": user.email}
 
 
-class PassphraseBody(BaseModel):
-    passphrase: str
+@app.get("/api/auth/config")
+def auth_config() -> dict:
+    """Unauthenticated: whether this server can accept sign-ins at all.
 
-
-class ChangePassphraseBody(BaseModel):
-    old_passphrase: str
-    new_passphrase: str
-
-
-def _cookie_secure(request: Request) -> bool:
-    """Whether the session cookie should carry the Secure flag.
-
-    Derived purely from the connection scheme — there is deliberately no manual
-    toggle. A Secure cookie is silently dropped by the browser over plain HTTP, so
-    flagging it Secure on an HTTP deploy locks the user out, and no setting can be
-    right that does that. Scheme detection is self-correcting:
-
-      - plain http  → not Secure  → the cookie is kept, the session works
-      - https       → Secure      → the cookie is kept AND protected in transit
-
-    Behind a TLS-terminating proxy the backend sees http, so the proxy must send
-    ``X-Forwarded-Proto: https`` for the flag to switch on — our nginx does, and
-    that is the one knob. A proxy that fails to forward the scheme gets a working
-    (if unmarked) cookie, which is the safe direction to fail; the fix is to
-    forward the scheme, not to force the flag on and risk the lockout.
+    Lets the UI distinguish "you are signed out" from "this deployment has no
+    Clerk issuer set", which look identical from the browser and have completely
+    different remedies.
     """
-    forwarded = request.headers.get("x-forwarded-proto", "")
-    proto = (forwarded.split(",")[0].strip() or request.scope.get("scheme", "http")).lower()
-    return proto == "https"
-
-
-def _set_session_cookie(response: Response, request: Request, token: str) -> None:
-    # httpOnly so page JS can never read the token. SameSite=Strict rather than
-    # Lax: Lax already blocks cross-site POST/PUT/DELETE, which covers classic
-    # CSRF, but it still rides a top-level GET navigation — and this API is
-    # reached only from its own origin, so there is no cross-site link into it
-    # worth preserving. Nothing here changes state on GET, so Strict costs a
-    # single page load after following an external link and buys the stricter
-    # rule. Secure is decided by the connection scheme (see _cookie_secure),
-    # not a hand-set flag.
-    response.set_cookie(
-        _SESSION_COOKIE,
-        token,
-        httponly=True,
-        samesite="strict",
-        secure=_cookie_secure(request),
-        max_age=8 * 3600,
-    )
-
-
-def _enrol_sso(token: str) -> bool:
-    """Wrap the DEK under the server key, if SSO is configured and not yet enrolled.
-
-    Called from the passphrase paths because enrolment needs a DEK, and the
-    passphrase is the only thing that produces one from cold. So the sequence for
-    an operator is: configure the providers, unlock once with the passphrase, and
-    from then on the sign-in buttons work.
-
-    Returns whether it enrolled, so the caller can tell the user their vault's
-    at-rest protection just changed — that should never happen silently.
-    """
-    if not oauth.sso_configured() or identity.sso_enabled():
-        return False
-    identity.enable_sso(token, serverkey.load_or_create(_DATA))
-    return True
-
-
-@app.post("/api/auth/initialize")
-def auth_initialize(body: PassphraseBody, request: Request, response: Response) -> dict:
-    """First-run: set the passphrase. Refused if one already exists."""
-    try:
-        token = identity.initialize(body.passphrase)
-    except Exception as exc:  # AlreadyInitialized / ValueError
-        raise HTTPException(status_code=400, detail=str(exc))
-    _set_session_cookie(response, request, token)
-    return {"unlocked": True, "sso_enrolled": _enrol_sso(token)}
-
-
-@app.post("/api/auth/unlock")
-def auth_unlock(body: PassphraseBody, request: Request, response: Response) -> dict:
-    try:
-        token = identity.unlock(body.passphrase)
-    except vault.WrongPassphrase:
-        raise HTTPException(status_code=401, detail="wrong passphrase")
-    except Exception as exc:  # NotInitialized
-        raise HTTPException(status_code=400, detail=str(exc))
-    _set_session_cookie(response, request, token)
-    return {"unlocked": True, "sso_enrolled": _enrol_sso(token)}
+    return {"clerk_configured": clerk_auth.configured()}
 
 
 # --------------------------------------------------------------------------
-# Sign in with GitLab / GitHub / Google
-#
-# The provider says who you are; app/serverkey.py supplies the key that opens
-# the vault. Neither half is sufficient alone, which is why the callback checks
-# the allowlist before it ever asks identity for a session.
-# --------------------------------------------------------------------------
-
-_OAUTH_NONCE_COOKIE = "blpl_oauth_nonce"
-
-
-def _public_base_url(request: Request) -> str:
-    """The origin the *browser* is talking to, which is what the redirect URI
-    must match at the provider.
-
-    Behind a proxy the backend sees http://backend:8000, which is useless here
-    and would be rejected as a redirect_uri mismatch. X-Forwarded-Proto/Host fix
-    the common case; BLPL_PUBLIC_URL is the escape hatch for the deploy where
-    they are wrong or absent, and it is worth setting explicitly because a
-    mismatched redirect URI is the single most common OAuth setup failure.
-    """
-    override = os.environ.get("BLPL_PUBLIC_URL", "").strip()
-    if override:
-        return override.rstrip("/")
-    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
-    scheme = forwarded_proto or request.scope.get("scheme", "http")
-    forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
-    host = forwarded_host or request.headers.get("host", "")
-    return f"{scheme}://{host}"
-
-
-def _redirect_uri(request: Request, provider_id: str) -> str:
-    return f"{_public_base_url(request)}/api/auth/oauth/{provider_id}/callback"
-
-
-def _bounce(message_html: str, target: str | None) -> HTMLResponse:
-    """Finish a login from our own origin rather than with a bare redirect.
-
-    The session cookie is SameSite=Strict. A 302 straight to "/" is the last hop
-    of a redirect chain the *provider* started, so browsers may treat it as
-    cross-site and withhold the cookie — the user would land back on the lock
-    screen holding a perfectly good session. Serving a page from this origin and
-    navigating from script makes the next request unambiguously same-site.
-    """
-    nav = f'<script>location.replace({json.dumps(target)})</script>' if target else ""
-    return HTMLResponse(
-        "<!doctype html><meta charset=utf-8><title>BLPL</title>"
-        '<body style="font:14px system-ui;padding:2rem">'
-        f"{message_html}{nav}</body>"
-    )
-
-
-@app.get("/api/auth/oauth/{provider_id}/start")
-def oauth_start(provider_id: str, request: Request) -> HTMLResponse:
-    """Begin a login: sign a state, echo its nonce into a cookie, and bounce the
-    browser to the provider."""
-    provider = oauth.providers().get(provider_id)
-    if provider is None or not oauth.sso_configured():
-        raise HTTPException(status_code=404, detail="that sign-in provider is not configured")
-    nonce = oauth.new_nonce()
-    state = oauth.sign_state(serverkey.load_or_create(_DATA), provider_id, nonce)
-    response = _bounce("Redirecting to sign in…", oauth.authorize_url(provider, _redirect_uri(request, provider_id), state))
-    # SameSite=Lax, not Strict: this cookie has to survive the provider
-    # navigating back to us, and Strict would withhold it on exactly that hop —
-    # which is the one hop it exists for. Lax still blocks cross-site POSTs, and
-    # the value is a single-use random nonce that authorises nothing on its own.
-    response.set_cookie(
-        _OAUTH_NONCE_COOKIE,
-        nonce,
-        httponly=True,
-        samesite="lax",
-        secure=_cookie_secure(request),
-        max_age=600,
-    )
-    return response
-
-
-@app.get("/api/auth/oauth/{provider_id}/callback")
-def oauth_callback(
-    provider_id: str,
-    request: Request,
-    code: str = "",
-    state: str = "",
-    error: str = "",
-    blpl_oauth_nonce: str | None = Cookie(default=None),
-) -> HTMLResponse:
-    """Finish a login: verify the state, resolve the identity, check the
-    allowlist, then open a session from the server-key wrapping.
-
-    Returns HTML rather than JSON because the caller is a browser mid-navigation,
-    not the app's own fetch layer.
-    """
-    if error:
-        return _bounce(f"Sign-in was refused by the provider: {_esc(error)}", None)
-    try:
-        signed_provider = oauth.verify_state(serverkey.load_or_create(_DATA), state, blpl_oauth_nonce or "")
-        if signed_provider != provider_id:
-            raise oauth.OAuthError("sign-in state was issued for a different provider")
-        provider = oauth.providers().get(provider_id)
-        if provider is None or not oauth.sso_configured():
-            raise oauth.OAuthError("that sign-in provider is not configured")
-        if not code:
-            raise oauth.OAuthError("the provider returned no authorization code")
-
-        access_token = oauth.exchange_code(provider, code, _redirect_uri(request, provider_id))
-        who = oauth.fetch_identity(provider, access_token)
-        oauth.check_allowed(who)
-        token = identity.unlock_with_server_key(serverkey.load_or_create(_DATA))
-    except (oauth.OAuthError, SsoNotEnabled, vault.VaultError, NotInitialized) as exc:
-        return _bounce(f"Could not sign in: {_esc(str(exc))}", None)
-
-    response = _bounce(f"Signed in as {_esc(who.email)}…", "/")
-    _set_session_cookie(response, request, token)
-    response.delete_cookie(_OAUTH_NONCE_COOKIE)
-    return response
-
-
-@app.post("/api/auth/oauth/disable")
-def oauth_disable(_: str = Depends(require_session)) -> dict:
-    """Turn SSO login off by dropping the server-key wrapping.
-
-    The passphrase and every secret are untouched — this only removes the second
-    way in, restoring "a stolen vault.db is useless on its own". The obvious
-    reason to reach for it is a leaked server key.
-    """
-    return {"disabled": identity.disable_sso()}
-
-
-def _esc(text: str) -> str:
-    """Provider error strings land in HTML; they are not ours and not trusted."""
-    return (
-        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-    )
-
-
-@app.post("/api/auth/lock")
-def auth_lock(response: Response, blpl_session: str | None = Cookie(default=None)) -> dict:
-    if blpl_session:
-        identity.lock(blpl_session)
-    response.delete_cookie(_SESSION_COOKIE)
-    return {"unlocked": False}
-
-
-@app.post("/api/auth/change-passphrase")
-def auth_change(body: ChangePassphraseBody, _: str = Depends(require_session)) -> dict:
-    try:
-        identity.change_passphrase(body.old_passphrase, body.new_passphrase)
-    except vault.WrongPassphrase:
-        raise HTTPException(status_code=401, detail="wrong current passphrase")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"ok": True}
-
-
-# --------------------------------------------------------------------------
-# Settings: LLM priority/models (config) + API keys (vault)
+# Settings: LLM routing (server config) + this user's own API keys
 # --------------------------------------------------------------------------
 
 
 @app.get("/api/settings")
-def get_settings(_: str = Depends(require_session)) -> dict:
+def get_settings(
+    user: User = Depends(require_user), session: Session = Depends(session_scope)
+) -> dict:
     cfg = _load_config()
-    vaulted = identity.providers_with_keys()
-    with_keys = _endpoints_with_keys(cfg)
+    with_keys = keystore.endpoints_with_keys(session, user)
     return {
         # The registry: what exists, and which endpoints serve which job.
         #
-        # has_key is what actually decides whether a run starts, so it counts
-        # both sources. Without key_source alongside it, an endpoint keyed from
-        # the deploy's environment looks unconfigured on this screen — it has no
-        # vault entry to list — while runs using it succeed, which is a
-        # confusing pair of facts to hold at once.
+        # has_key answers "will a run on this endpoint start", and it is about
+        # THIS user: another user having a key for the same endpoint tells you
+        # nothing about whether yours will run.
         "endpoints": [
             {
                 "name": ep.name,
@@ -508,15 +249,6 @@ def get_settings(_: str = Depends(require_session)) -> dict:
                 "vision": ep.can_see,
                 "needs_key": ep.needs_key,
                 "has_key": not ep.needs_key or ep.name in with_keys,
-                "key_source": (
-                    ""
-                    if not ep.needs_key
-                    else "vault"
-                    if ep.name in vaulted
-                    else "env"
-                    if ep.name in with_keys
-                    else ""
-                ),
             }
             for ep in cfg.endpoints.values()
         ],
@@ -528,8 +260,12 @@ def get_settings(_: str = Depends(require_session)) -> dict:
         "llm_priority": cfg.llm_priority,
         "llm_models": cfg.llm_models,
         "known_providers": list(appconfig.KNOWN_PROVIDERS),
-        # Presence and timestamps only — the values never leave the vault.
-        "secrets": [{"provider": m.provider, "updated_at": m.updated_at} for m in identity.list_secrets()],
+        # Presence and timestamps only, and only this user's. The values never
+        # leave the database except into a subprocess environment.
+        "secrets": [
+            {"provider": m.endpoint, "updated_at": m.updated_at}
+            for m in keystore.list_meta(session, user)
+        ],
     }
 
 
@@ -554,7 +290,7 @@ class LlmSettingsBody(BaseModel):
 
 
 @app.put("/api/settings/llm")
-def put_llm_settings(body: LlmSettingsBody, _: str = Depends(require_session)) -> dict:
+def put_llm_settings(body: LlmSettingsBody, _: User = Depends(require_user)) -> dict:
     cfg = _load_config()
 
     if body.endpoints is not None:
@@ -598,18 +334,27 @@ class SecretBody(BaseModel):
 
 
 @app.put("/api/settings/secrets/{provider}")
-def put_secret(provider: str, body: SecretBody, token: str = Depends(require_session)) -> dict:
+def put_secret(
+    provider: str,
+    body: SecretBody,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Store one of *this user's* keys. The path parameter is an endpoint name."""
     try:
-        identity.set_secret(token, provider, body.value)
-    except (ValueError, Locked) as exc:
+        keystore.put(session, _DATA, user, provider, body.value)
+    except (ValueError, keystore.KeystoreError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "provider": provider}
 
 
 @app.delete("/api/settings/secrets/{provider}")
-def delete_secret(provider: str, _: str = Depends(require_session)) -> dict:
-    removed = identity.delete_secret(provider)
-    return {"ok": True, "removed": removed}
+def delete_secret(
+    provider: str,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
+) -> dict:
+    return {"ok": True, "removed": keystore.delete(session, user, provider)}
 
 
 # --------------------------------------------------------------------------
@@ -680,7 +425,7 @@ def _fab_readiness(pipeline_dir: Path) -> dict | None:
 
 
 @app.get("/api/projects")
-def list_projects(_: str = Depends(require_session)) -> list[dict]:
+def list_projects(_: User = Depends(require_user)) -> list[dict]:
     if not PROJECTS_ROOT.is_dir():
         return []
     out = []
@@ -708,7 +453,7 @@ class CloneBody(BaseModel):
 
 
 @app.post("/api/projects/clone")
-def clone_project(body: CloneBody, _: str = Depends(require_session)) -> dict:
+def clone_project(body: CloneBody, _: User = Depends(require_user)) -> dict:
     """Clone a remote into a new working copy, and register it in blpl.toml so the
     server remembers where it came from."""
     try:
@@ -726,7 +471,7 @@ class InitBody(BaseModel):
 
 
 @app.post("/api/projects/init")
-def init_project(body: InitBody, _: str = Depends(require_session)) -> dict:
+def init_project(body: InitBody, _: User = Depends(require_user)) -> dict:
     """Create a new, empty, local git project. A remote can be attached later."""
     try:
         projects.init_local(body.name)
@@ -742,7 +487,7 @@ def init_project(body: InitBody, _: str = Depends(require_session)) -> dict:
 async def import_project(
     name: str = Form(...),
     files: list[UploadFile] = File(...),
-    _: str = Depends(require_session),
+    _: User = Depends(require_user),
 ) -> dict:
     """Bring an existing design into the app from the browser: a selection of
     files, or a single .zip of the project folder. The server creates a local
@@ -806,7 +551,7 @@ async def import_project(
 
 
 @app.get("/api/projects/{project_id}/git/status")
-def git_status(project_id: str, _: str = Depends(require_session)) -> dict:
+def git_status(project_id: str, _: User = Depends(require_user)) -> dict:
     _project_dir(project_id)
     try:
         st = projects.status(project_id)
@@ -823,7 +568,7 @@ class CommitBody(BaseModel):
 
 
 @app.post("/api/projects/{project_id}/git/commit")
-def git_commit(project_id: str, body: CommitBody, _: str = Depends(require_session)) -> dict:
+def git_commit(project_id: str, body: CommitBody, _: User = Depends(require_user)) -> dict:
     _project_dir(project_id)
     try:
         out = projects.commit_all(project_id, body.message)
@@ -833,7 +578,7 @@ def git_commit(project_id: str, body: CommitBody, _: str = Depends(require_sessi
 
 
 @app.get("/api/projects/{project_id}/git/diff")
-def git_diff(project_id: str, _: str = Depends(require_session)) -> dict:
+def git_diff(project_id: str, _: User = Depends(require_user)) -> dict:
     """What changed in the working copy since the last commit — the 'what did that
     run do' view. Diffs are size-capped server-side."""
     _project_dir(project_id)
@@ -844,7 +589,7 @@ def git_diff(project_id: str, _: str = Depends(require_session)) -> dict:
 
 
 @app.post("/api/projects/{project_id}/git/pull")
-def git_pull(project_id: str, _: str = Depends(require_session)) -> dict:
+def git_pull(project_id: str, _: User = Depends(require_user)) -> dict:
     _project_dir(project_id)
     try:
         out = projects.pull(project_id)
@@ -854,7 +599,7 @@ def git_pull(project_id: str, _: str = Depends(require_session)) -> dict:
 
 
 @app.post("/api/projects/{project_id}/git/push")
-def git_push(project_id: str, _: str = Depends(require_session)) -> dict:
+def git_push(project_id: str, _: User = Depends(require_user)) -> dict:
     _project_dir(project_id)
     try:
         out = projects.push(project_id)
@@ -892,7 +637,7 @@ class FileBody(BaseModel):
 
 
 @app.get("/api/projects/{project_id}/files")
-def list_files(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+def list_files(project_id: str, _: User = Depends(require_user)) -> list[dict]:
     """The editable design inputs in the project root, markdown and config."""
     proj = _project_dir(project_id)
     out = []
@@ -903,7 +648,7 @@ def list_files(project_id: str, _: str = Depends(require_session)) -> list[dict]
 
 
 @app.get("/api/projects/{project_id}/files/{name}")
-def read_file(project_id: str, name: str, _: str = Depends(require_session)):
+def read_file(project_id: str, name: str, _: User = Depends(require_user)):
     target = _editable_file(project_id, name)
     if not target.is_file():
         raise HTTPException(status_code=404, detail=f"no file {name!r}")
@@ -911,7 +656,7 @@ def read_file(project_id: str, name: str, _: str = Depends(require_session)):
 
 
 @app.put("/api/projects/{project_id}/files/{name}")
-def write_file(project_id: str, name: str, body: FileBody, _: str = Depends(require_session)) -> dict:
+def write_file(project_id: str, name: str, body: FileBody, _: User = Depends(require_user)) -> dict:
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
     target = _editable_file(project_id, name)
@@ -920,7 +665,7 @@ def write_file(project_id: str, name: str, body: FileBody, _: str = Depends(requ
 
 
 @app.get("/api/projects/{project_id}/artifacts/{name}")
-def read_artifact(project_id: str, name: str, _: str = Depends(require_session)):
+def read_artifact(project_id: str, name: str, _: User = Depends(require_user)):
     proj = _project_dir(project_id)
     target = (proj / ".pipeline" / name).resolve()
     if not target.is_relative_to(proj / ".pipeline") or not target.is_file():
@@ -935,7 +680,7 @@ def read_artifact(project_id: str, name: str, _: str = Depends(require_session))
 
 
 @app.get("/api/projects/{project_id}/design")
-def design_sources(project_id: str, _: str = Depends(require_session)) -> dict:
+def design_sources(project_id: str, _: User = Depends(require_user)) -> dict:
     proj = _project_dir(project_id)
     pipeline = proj / ".pipeline"
     sources = []
@@ -1016,7 +761,7 @@ class ReferenceManifestInput(BaseModel):
 
 
 @app.get("/api/projects/{project_id}/references")
-def get_references(project_id: str, _: str = Depends(require_session)) -> dict:
+def get_references(project_id: str, _: User = Depends(require_user)) -> dict:
     manifest = _load_manifest(project_id)
     return {
         "project_id": project_id,
@@ -1027,7 +772,7 @@ def get_references(project_id: str, _: str = Depends(require_session)) -> dict:
 
 @app.put("/api/projects/{project_id}/references")
 def put_references(
-    project_id: str, payload: ReferenceManifestInput, _: str = Depends(require_session)
+    project_id: str, payload: ReferenceManifestInput, _: User = Depends(require_user)
 ) -> dict:
     manifest = _load_manifest(project_id)
     try:
@@ -1069,7 +814,7 @@ def put_references(
 
 
 @app.get("/api/projects/{project_id}/sandbox")
-def sandbox_summary(project_id: str, _: str = Depends(require_session)) -> dict:
+def sandbox_summary(project_id: str, _: User = Depends(require_user)) -> dict:
     return _sandbox_for(project_id).summary()
 
 
@@ -1085,7 +830,7 @@ def _artifact_meta(path: Path, pipeline: Path) -> dict:
 
 
 @app.get("/api/projects/{project_id}/artifacts")
-def list_artifacts(project_id: str, _: str = Depends(require_session)) -> dict:
+def list_artifacts(project_id: str, _: User = Depends(require_user)) -> dict:
     """Every artifact the pipeline has written, newest first.
 
     Top-level only. Rotated copies under archive/ are deliberately excluded —
@@ -1102,7 +847,7 @@ def list_artifacts(project_id: str, _: str = Depends(require_session)) -> dict:
 
 
 @app.get("/api/projects/{project_id}/modules")
-def list_project_modules(project_id: str, _: str = Depends(require_session)) -> dict:
+def list_project_modules(project_id: str, _: User = Depends(require_user)) -> dict:
     """Reusable function-set modules this project can compose.
 
     Both roots, project-local first, because a project that vendored a module
@@ -1129,13 +874,13 @@ class MessageInput(BaseModel):
 
 
 @app.get("/api/projects/{project_id}/conversations")
-def get_conversations(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+def get_conversations(project_id: str, _: User = Depends(require_user)) -> list[dict]:
     return [m.to_dict() for m in list_conversations(_conversations_dir(project_id))]
 
 
 @app.post("/api/projects/{project_id}/conversations")
 def create_conversation(
-    project_id: str, payload: NewConversationInput, _: str = Depends(require_session)
+    project_id: str, payload: NewConversationInput, _: User = Depends(require_user)
 ) -> dict:
     d = _conversations_dir(project_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -1144,7 +889,7 @@ def create_conversation(
 
 
 @app.get("/api/projects/{project_id}/conversations/{filename}")
-def read_conversation(project_id: str, filename: str, _: str = Depends(require_session)) -> dict:
+def read_conversation(project_id: str, filename: str, _: User = Depends(require_user)) -> dict:
     try:
         conv = Conversation.open_existing(_conversations_dir(project_id), filename)
     except (FileNotFoundError, ValueError) as exc:
@@ -1159,7 +904,7 @@ def read_conversation(project_id: str, filename: str, _: str = Depends(require_s
 
 @app.post("/api/projects/{project_id}/conversations/{filename}/messages")
 def append_message(
-    project_id: str, filename: str, payload: MessageInput, _: str = Depends(require_session)
+    project_id: str, filename: str, payload: MessageInput, _: User = Depends(require_user)
 ) -> dict:
     try:
         conv = Conversation.open_existing(_conversations_dir(project_id), filename)
@@ -1178,20 +923,27 @@ def append_message(
 # --------------------------------------------------------------------------
 
 
-def _chat_endpoint(token: str) -> chat_mod.Endpoint:
-    """The endpoint a chat turn should use: highest-priority configured provider
-    with a usable key, its secret decrypted for this request only.
+def _chat_endpoint(session: Session, user: User) -> chat_mod.Endpoint:
+    """The endpoint *this user's* chat turn should use, key decrypted for this
+    request only.
 
     Shares one resolver with the pipeline (llm_resolver), so "which model am I
-    talking to" has the same answer in chat as in a stage — until Phase 2 gives
-    chat its own task route.
+    talking to" has the same answer in chat as in a stage. The resolver stays
+    pure — it is handed the set of endpoints this user can authenticate and
+    never learns whose keys they are.
     """
     cfg = _load_config()
     try:
-        primary = llm_resolver.resolve_primary(cfg, _endpoints_with_keys(cfg), "chat")
+        primary = llm_resolver.resolve_primary(
+            cfg, keystore.endpoints_with_keys(session, user), "chat"
+        )
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    key = _endpoint_key(token, cfg, primary.name or primary.provider) if primary.needs_key else None
+    key = (
+        keystore.get(session, _DATA, user, primary.name or primary.provider)
+        if primary.needs_key
+        else None
+    )
     return chat_mod.Endpoint(
         name=primary.name or primary.provider,
         kind=primary.provider,  # type: ignore[arg-type]
@@ -1201,36 +953,32 @@ def _chat_endpoint(token: str) -> chat_mod.Endpoint:
     )
 
 
-def _cred_resolver(token: str):
+def _cred_resolver():
     """Distributor credentials for this request.
 
-    Vault first, process environment second. Keys the operator stored in the app
-    beat whatever the container happens to have, and neither is written back to
-    ``os.environ`` where an unrelated subprocess could pick it up.
+    Still install-level, from the server's environment: a Digi-Key or Mouser
+    account is the operator's relationship with a supplier, not the user's, and
+    the searches it backs are read-only catalogue lookups rather than anything
+    billed per user. That is a different judgement from LLM keys, which are
+    metered and personal — hence the different treatment.
+
+    If suppliers ever become per-user, this is the seam: it already returns a
+    resolver object rather than reading os.environ at the call sites.
     """
     from blpl.agent.kicad_happy import CredResolver
 
-    extra: dict[str, str] = {}
-    for name in ("digikey_client_id", "digikey_client_secret", "mouser_search_api_key",
-                 "element14_api_key"):
-        try:
-            value = identity.get_secret(token, name)
-        except Exception:  # noqa: BLE001 — a locked or absent secret is simply absent
-            value = None
-        if value:
-            extra[name.upper()] = value
-    return CredResolver(extra=extra)
+    return CredResolver()
 
 
-def _task_endpoint(token: str, task: str):
-    """The endpoint routed to a task, or None if nothing usable is routed there.
+def _task_endpoint(session: Session, user: User, task: str):
+    """The endpoint routed to a task for this user, or None if nothing usable is.
 
     None rather than a fallback: a tool that needs vision must not quietly run
     on a model that cannot see.
     """
     cfg = _load_config()
     try:
-        rp = llm_resolver.resolve_primary(cfg, _endpoints_with_keys(cfg), task)
+        rp = llm_resolver.resolve_primary(cfg, keystore.endpoints_with_keys(session, user), task)
     except llm_resolver.NoUsableProvider:
         return None
     ep = cfg.endpoint(rp.name)
@@ -1240,7 +988,9 @@ def _task_endpoint(token: str, task: str):
         name=rp.name or rp.provider,
         kind=rp.provider,  # type: ignore[arg-type]
         model=rp.model,
-        api_key=_endpoint_key(token, cfg, rp.name or rp.provider) if rp.needs_key else None,
+        api_key=(
+            keystore.get(session, _DATA, user, rp.name or rp.provider) if rp.needs_key else None
+        ),
         base_url=rp.base_url or None,
     )
 
@@ -1264,7 +1014,11 @@ class ChatInput(BaseModel):
 
 @app.post("/api/projects/{project_id}/conversations/{filename}/chat")
 async def start_chat_turn(
-    project_id: str, filename: str, payload: ChatInput, token: str = Depends(require_session)
+    project_id: str,
+    filename: str,
+    payload: ChatInput,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
 ) -> dict:
     """Record the user's message and start the assistant's turn.
 
@@ -1279,7 +1033,7 @@ async def start_chat_turn(
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="message is empty")
 
-    endpoint = _chat_endpoint(token)
+    endpoint = _chat_endpoint(session, user)
     conv.append("user", payload.content, {"blocks": [{"type": "text", "text": payload.content}]})
     try:
         turn_id = chat_sessions.start(
@@ -1290,8 +1044,8 @@ async def start_chat_turn(
                 endpoint=endpoint,
                 sandbox=_sandbox_for(project_id),
                 usage_ledger=_blpl_dir(project_id) / "llm_usage.jsonl",
-                creds=_cred_resolver(token),
-                endpoint_for=lambda task: _task_endpoint(token, task),
+                creds=_cred_resolver(),
+                endpoint_for=lambda task: _task_endpoint(session, user, task),
                 record_tool_call=lambda rec: run_manager.record_tool_call(
                     project_id, rec, conversation=conv.path.name
                 ),
@@ -1305,7 +1059,7 @@ async def start_chat_turn(
 
 @app.get("/api/projects/{project_id}/chat/{turn_id}/events")
 def stream_chat_turn(
-    project_id: str, turn_id: str, _: str = Depends(require_session)
+    project_id: str, turn_id: str, _: User = Depends(require_user)
 ) -> StreamingResponse:
     """Attach to a turn: replay what it has emitted, then follow it live.
 
@@ -1328,7 +1082,7 @@ class ApprovalDecision(BaseModel):
 @app.post("/api/projects/{project_id}/chat/{turn_id}/approvals/{call_id}")
 def resolve_approval(
     project_id: str, turn_id: str, call_id: str, body: ApprovalDecision,
-    _: str = Depends(require_session),
+    _: User = Depends(require_user),
 ) -> dict:
     """Answer a tool call that is waiting on a human.
 
@@ -1345,7 +1099,7 @@ def resolve_approval(
 
 
 @app.get("/api/kicad/bridge")
-def kicad_bridge_status(_: str = Depends(require_session)) -> dict:
+def kicad_bridge_status(_: User = Depends(require_user)) -> dict:
     """Whether the KiCad editing bridge is usable, and if not, exactly why.
 
     "Not configured", "cannot reach it", and "running but too old" are three
@@ -1366,14 +1120,14 @@ def kicad_bridge_status(_: str = Depends(require_session)) -> dict:
 
 
 @app.get("/api/projects/{project_id}/tool-calls")
-def list_tool_calls(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+def list_tool_calls(project_id: str, _: User = Depends(require_user)) -> list[dict]:
     """What the agents have actually done in this project, newest first."""
     _project_dir(project_id)
     return run_manager.tool_calls_for_project(project_id)
 
 
 @app.get("/api/projects/{project_id}/proposals")
-def list_proposals(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+def list_proposals(project_id: str, _: User = Depends(require_user)) -> list[dict]:
     """Edits the assistant has proposed and nobody has ruled on yet."""
     proj = _project_dir(project_id)
     return [p.to_dict() for p in chat_mod.ProposalStore(proj).pending()]
@@ -1385,7 +1139,7 @@ class ProposalDecision(BaseModel):
 
 @app.post("/api/projects/{project_id}/proposals/{proposal_id}")
 def decide_proposal(
-    project_id: str, proposal_id: str, body: ProposalDecision, _: str = Depends(require_session)
+    project_id: str, proposal_id: str, body: ProposalDecision, _: User = Depends(require_user)
 ) -> dict:
     """Accept an edit (write it, then commit it) or reject it.
 
@@ -1437,16 +1191,20 @@ def decide_proposal(
 # --------------------------------------------------------------------------
 
 
-def _stage_env(token: str, stage_name: str) -> dict[str, str]:
+def _stage_env(session: Session, user: User, stage_name: str) -> dict[str, str]:
     """The subprocess environment for a stage run.
 
     For LLM stages, resolve the *whole* fallback chain the config prefers and has
     keys for, inject every provider's key into its own SDK env var, and hand the
     ordered chain to the pipeline as HDM_LLM_CHAIN. The pipeline then tries each in
     turn, so a dead key or an unreachable provider fails over to the next instead
-    of failing the stage. This is where the vault meets the pipeline: keys are
+    of failing the stage. This is where a user's keys meet the pipeline: they are
     decrypted here, passed in the child's environment, and never written to a
     command line or a log. Deterministic stages get the base environment unchanged.
+
+    The environment this starts from is the server's, which no longer carries any
+    provider key — so a stage that gets no key from the user gets none at all,
+    rather than silently falling back to the operator's.
     """
     env = dict(os.environ)
     if stage_name not in _LLM_STAGES:
@@ -1455,10 +1213,12 @@ def _stage_env(token: str, stage_name: str) -> dict[str, str]:
     # route, everything stage1-ish the stage1 route, so a cheap model can do the
     # mechanical re-read while footprint resolution gets the expensive one.
     task = "stage0" if stage_name.startswith("stage0") else "stage1"
-    return _inject_llm_env(env, token, task)
+    return _inject_llm_env(env, session, user, task)
 
 
-def _inject_llm_env(env: dict[str, str], token: str, task: str = "default") -> dict[str, str]:
+def _inject_llm_env(
+    env: dict[str, str], session: Session, user: User, task: str = "default"
+) -> dict[str, str]:
     """Add the resolved LLM fallback chain and its keys to an environment.
 
     Each endpoint's key goes into its *own* variable, named by the chain entry
@@ -1467,13 +1227,13 @@ def _inject_llm_env(env: dict[str, str], token: str, task: str = "default") -> d
     endpoint registry exists to allow. The provider-wide variables are still set
     from the primary so anything reading the SDK defaults keeps working.
 
-    Keys come from _endpoint_key (vault first, environment second) and are passed
+    Keys are this user's own — there is no server-wide fallback — and are passed
     only in the child's environment, never on a command line or in a log. Raises
-    NoUsableProvider if nothing routed to the task has a key from either source,
-    which the caller turns into a clear 400.
+    NoUsableProvider if nothing routed to the task has one, which the caller
+    turns into a clear 400.
     """
     cfg = _load_config()
-    with_keys = _endpoints_with_keys(cfg)
+    with_keys = keystore.endpoints_with_keys(session, user)
     chain = llm_resolver.resolve_chain(cfg, with_keys, task)
     if not chain:
         llm_resolver.resolve_primary(cfg, with_keys, task)  # raise the good message
@@ -1481,7 +1241,7 @@ def _inject_llm_env(env: dict[str, str], token: str, task: str = "default") -> d
     for rp in chain:
         if not rp.needs_key:
             continue
-        key = _endpoint_key(token, cfg, rp.name or rp.provider)
+        key = keystore.get(session, _DATA, user, rp.name or rp.provider)
         if key is None:
             continue
         env[rp.key_env] = key
@@ -1536,14 +1296,17 @@ def _start_run(project_id: str, kind: str, cmd: list[str], env: dict[str, str]) 
 
 @app.post("/api/projects/{project_id}/stages/{stage_name}")
 async def run_stage(
-    project_id: str, stage_name: str, token: str = Depends(require_session)
+    project_id: str,
+    stage_name: str,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
 ) -> StreamingResponse:
     """Run a pipeline stage, streaming its output to the browser as it happens."""
     if stage_name not in VALID_STAGES:
         raise HTTPException(status_code=400, detail=f"unknown stage {stage_name!r}")
     proj = _project_dir(project_id)
     try:
-        env = _stage_env(token, stage_name)
+        env = _stage_env(session, user, stage_name)
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
@@ -1551,7 +1314,7 @@ async def run_stage(
 
 
 @app.post("/api/projects/{project_id}/release")
-async def build_release(project_id: str, _: str = Depends(require_session)) -> StreamingResponse:
+async def build_release(project_id: str, _: User = Depends(require_user)) -> StreamingResponse:
     """Build the package a contract fab quotes from, gate included.
 
     No LLM in this path: the gate reads what the analyzers already found and the
@@ -1564,7 +1327,7 @@ async def build_release(project_id: str, _: str = Depends(require_session)) -> S
 
 
 @app.get("/api/projects/{project_id}/release")
-def latest_release(project_id: str, _: str = Depends(require_session)) -> dict:
+def latest_release(project_id: str, _: User = Depends(require_user)) -> dict:
     """The manifest of the most recent release, or why there is none."""
     manifest = _project_dir(project_id) / "release" / "latest.json"
     if not manifest.is_file():
@@ -1578,7 +1341,7 @@ def latest_release(project_id: str, _: str = Depends(require_session)) -> dict:
 
 
 @app.get("/api/projects/{project_id}/preflight")
-def preflight(project_id: str, _: str = Depends(require_session)) -> dict:
+def preflight(project_id: str, _: User = Depends(require_user)) -> dict:
     """What Stage 0 would drop or misread, without running anything.
 
     Served synchronously rather than through the SSE stage runner because the
@@ -1595,7 +1358,7 @@ def preflight(project_id: str, _: str = Depends(require_session)) -> dict:
 
 
 @app.get("/api/projects/{project_id}/release/latest.zip")
-def download_release(project_id: str, _: str = Depends(require_session)) -> Response:
+def download_release(project_id: str, _: User = Depends(require_user)) -> Response:
     """The package itself.
 
     Served whether or not the gate passed — a refused package carries a
@@ -1614,7 +1377,9 @@ def download_release(project_id: str, _: str = Depends(require_session)) -> Resp
 
 @app.post("/api/projects/{project_id}/review-panel")
 async def run_review_panel(
-    project_id: str, token: str = Depends(require_session)
+    project_id: str,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
 ) -> StreamingResponse:
     """Review the board with every endpoint routed to the review_panel task.
 
@@ -1624,7 +1389,7 @@ async def run_review_panel(
     """
     proj = _project_dir(project_id)
     try:
-        env = _inject_llm_env(dict(os.environ), token, "review_panel")
+        env = _inject_llm_env(dict(os.environ), session, user, "review_panel")
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [
@@ -1647,7 +1412,8 @@ async def run_pipeline(
     project_id: str,
     from_stage: str = "stage0",
     to_stage: str = "stage8",
-    token: str = Depends(require_session),
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
 ) -> StreamingResponse:
     """Run a contiguous range of stages end-to-end, streaming per-stage progress.
 
@@ -1667,7 +1433,7 @@ async def run_pipeline(
     lo, hi = _PIPELINE_STAGES.index(from_stage), _PIPELINE_STAGES.index(to_stage)
     if lo <= _PIPELINE_STAGES.index("stage1") <= hi:
         try:
-            env = _inject_llm_env(env, token)
+            env = _inject_llm_env(env, session, user)
         except llm_resolver.NoUsableProvider as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1686,14 +1452,14 @@ async def run_pipeline(
 
 
 @app.get("/api/projects/{project_id}/runs")
-def list_runs(project_id: str, _: str = Depends(require_session)) -> list[dict]:
+def list_runs(project_id: str, _: User = Depends(require_user)) -> list[dict]:
     """Past and live runs for a project, newest first."""
     _project_dir(project_id)
     return [r.to_dict() for r in run_manager.list_for_project(project_id)]
 
 
 @app.get("/api/runs/{run_id}/stream")
-def stream_run(run_id: str, _: str = Depends(require_session)) -> StreamingResponse:
+def stream_run(run_id: str, _: User = Depends(require_user)) -> StreamingResponse:
     """Attach to a run: full log replay, then the live tail if it's still going.
 
     This is what makes a mid-run browser refresh a non-event — reattach here
@@ -1705,7 +1471,7 @@ def stream_run(run_id: str, _: str = Depends(require_session)) -> StreamingRespo
 
 
 @app.get("/api/runs/{run_id}/log")
-def run_log(run_id: str, _: str = Depends(require_session)) -> PlainTextResponse:
+def run_log(run_id: str, _: User = Depends(require_user)) -> PlainTextResponse:
     if run_manager.get(run_id) is None:
         raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
     path = run_manager.log_path(run_id)
@@ -1714,7 +1480,7 @@ def run_log(run_id: str, _: str = Depends(require_session)) -> PlainTextResponse
 
 
 @app.delete("/api/runs/{run_id}")
-def stop_run(run_id: str, _: str = Depends(require_session)) -> dict:
+def stop_run(run_id: str, _: User = Depends(require_user)) -> dict:
     """Stop a live run. Stopping is an explicit, recorded act now — closing the
     browser no longer kills anything."""
     if run_manager.get(run_id) is None:

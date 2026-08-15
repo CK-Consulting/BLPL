@@ -1,30 +1,44 @@
-// One place for every API call, so a 401 has exactly one meaning everywhere:
-// the session locked (expired, or the server restarted and dropped it). When
-// that happens we tell the app to fall back to the unlock screen rather than
-// letting each component invent its own handling.
+// One place for every API call, so authentication is attached in exactly one
+// place and a 401 means exactly one thing everywhere: the Clerk session is no
+// longer valid here.
+//
+// The token is fetched per request rather than cached. Clerk session tokens are
+// short-lived by design and getToken() refreshes them transparently, so holding
+// one in a module variable would work right up until it quietly expired
+// mid-session — the failure mode being "the app stops working after a while",
+// which is miserable to diagnose.
 
+let getToken: () => Promise<string | null> = async () => null;
 let onLocked: () => void = () => {};
+
+/** Installed once by AuthGate from Clerk's useAuth(). */
+export function setTokenGetter(fn: () => Promise<string | null>) {
+  getToken = fn;
+}
 
 export function setLockedHandler(fn: () => void) {
   onLocked = fn;
 }
 
 async function request(path: string, init?: RequestInit): Promise<Response> {
+  const token = await getToken();
   const res = await fetch(path, {
     ...init,
-    // Same-origin in prod (nginx) and dev (Vite proxy), so the session cookie
-    // rides automatically; "same-origin" is belt-and-suspenders.
+    // Same-origin in prod (nginx) and dev (Vite proxy). The __session cookie
+    // rides along too and the backend accepts either, but the explicit header
+    // is what this client intends to send.
     credentials: "same-origin",
     // Only a string body is JSON; a FormData body must NOT get a Content-Type
     // here, or the browser's multipart boundary never makes it onto the wire.
     headers: {
       ...(typeof init?.body === "string" ? { "Content-Type": "application/json" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
   });
-  // 401 anywhere means "you are locked out now" — surface it once, centrally.
-  // The auth handshake calls are allowed to see their own 401s (wrong passphrase).
-  if (res.status === 401 && !path.startsWith("/api/auth/")) onLocked();
+  // 401 anywhere means the session is gone — surface it once, centrally, and
+  // let the gate show the sign-in.
+  if (res.status === 401) onLocked();
   return res;
 }
 
@@ -106,17 +120,16 @@ async function errorDetail(res: Response): Promise<string> {
 
 // --- typed shapes the UI consumes ---
 
-export type SsoProvider = { id: string; label: string };
+/** Unauthenticated probe: can this deployment accept sign-ins at all?
+ *  Distinguishes "you are signed out" from "this server has no Clerk issuer
+ *  configured", which look identical in the browser and have entirely
+ *  different remedies. */
+export type AuthConfig = { clerk_configured: boolean };
 
-export type AuthStatus = {
-  initialized: boolean;
-  unlocked: boolean;
-  /** Providers are configured AND the vault has been enrolled for SSO. False
-   *  until someone unlocks once with the passphrase, which is what creates the
-   *  server-key wrapping the sign-in buttons depend on. */
-  sso_ready: boolean;
-  sso_providers: SsoProvider[];
-};
+/** Who the *backend* thinks you are. Clerk telling the browser it is signed in
+ *  and the backend agreeing are two different facts, and they can disagree — a
+ *  token from another Clerk instance, or a misconfigured issuer. */
+export type Me = { id: number; clerk_user_id: string; email: string };
 
 export type SecretMeta = { provider: string; updated_at: string };
 
@@ -130,15 +143,10 @@ export type EndpointConfig = {
   auth: string;
   vision: boolean;
   needs_key: boolean;
-  /** Whether this endpoint can authenticate at all — the thing that decides
-   *  whether a run starts. True for a keyless endpoint. */
+  /** Whether *you* can run on this endpoint. Per-user: another user having a key
+   *  for the same endpoint says nothing about whether yours will run. True for
+   *  a keyless endpoint. */
   has_key: boolean;
-  /** Where that key comes from: "vault" (typed into this screen), "env" (the
-   *  server's own environment, e.g. ANTHROPIC_API_KEY from the deploy's .env),
-   *  or "" for none and for endpoints that need no key. An env-keyed endpoint
-   *  has no entry in `secrets`, so without this it looks unconfigured here
-   *  while runs using it succeed. */
-  key_source: string;
 };
 
 export type Settings = {

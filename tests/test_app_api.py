@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from conftest import sign_in
 
 
 def _seed_remote(tmp_path: Path) -> str:
@@ -29,58 +30,49 @@ def _seed_remote(tmp_path: Path) -> str:
 # -- auth gate --------------------------------------------------------------
 
 
-def test_health_is_reachable_while_locked(client) -> None:
+def test_health_is_reachable_without_a_session(client) -> None:
     assert client.get("/api/health").status_code == 200
 
 
-def test_a_fresh_app_reports_uninitialized(client) -> None:
-    r = client.get("/api/auth/status")
-    # Subset rather than equality: the payload also carries the SSO fields, which
-    # tests/test_oauth_login.py owns. Pinning the whole dict here made this test
-    # fail for a change it has no opinion about.
-    assert r.json()["initialized"] is False
-    assert r.json()["unlocked"] is False
+def test_the_config_probe_is_reachable_without_a_session(client) -> None:
+    """The UI must be able to tell "you are signed out" from "this server has no
+    Clerk issuer set" — they look identical in a browser and have completely
+    different remedies, so this one route answers before authentication."""
+    assert client.get("/api/auth/config").json() == {"clerk_configured": True}
 
 
-def test_the_api_is_closed_until_you_unlock(client) -> None:
+def test_the_api_is_closed_until_you_sign_in(client) -> None:
     assert client.get("/api/projects").status_code == 401
     assert client.get("/api/settings").status_code == 401
 
 
-def test_first_run_setup_unlocks_the_session(client) -> None:
-    r = client.post("/api/auth/initialize", json={"passphrase": "correct-horse-staple"})
-    assert r.status_code == 200 and r.json()["unlocked"] is True
-    # The session cookie now opens the gate.
-    assert client.get("/api/projects").status_code == 200
-    status = client.get("/api/auth/status").json()
-    assert status["initialized"] is True and status["unlocked"] is True
-
-
-def test_setup_cannot_run_twice(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "correct-horse-staple"})
-    r = client.post("/api/auth/initialize", json={"passphrase": "another-one-two"})
-    assert r.status_code == 400
-
-
-def test_unlock_with_wrong_passphrase_is_401(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
-    client.post("/api/auth/lock")
-    assert client.post("/api/auth/unlock", json={"passphrase": "wrong"}).status_code == 401
-    assert client.post("/api/auth/unlock", json={"passphrase": "the-real-one"}).status_code == 200
-
-
-def test_lock_closes_the_gate_again(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
-    assert client.get("/api/projects").status_code == 200
-    client.post("/api/auth/lock")
+def test_an_unverifiable_token_is_refused(client) -> None:
+    """The gate is the verification, not the presence of a header."""
+    client.headers.update({"Authorization": "Bearer not-a-real-token"})
     assert client.get("/api/projects").status_code == 401
+
+
+def test_signing_in_opens_the_gate_and_creates_the_user(client) -> None:
+    sign_in(client)
+    assert client.get("/api/projects").status_code == 200
+    me = client.get("/api/me").json()
+    assert me["clerk_user_id"] == "user_test" and me["email"] == "test@example.com"
+
+
+def test_the_same_clerk_subject_resolves_to_one_user_row(client) -> None:
+    """Sign-in is get-or-create, so a returning user must not accumulate rows —
+    each one would come with its own separate set of provider keys."""
+    sign_in(client)
+    first = client.get("/api/me").json()["id"]
+    for _ in range(3):
+        assert client.get("/api/me").json()["id"] == first
 
 
 # -- settings ---------------------------------------------------------------
 
 
 def test_settings_shows_key_presence_never_values(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.put("/api/settings/secrets/anthropic", json={"value": "sk-ant-SECRET"})
 
     s = client.get("/api/settings").json()
@@ -91,7 +83,7 @@ def test_settings_shows_key_presence_never_values(client) -> None:
 
 
 def test_llm_priority_round_trips_and_rejects_nonsense(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     ok = client.put("/api/settings/llm", json={"priority": ["openai", "anthropic"], "models": {}})
     assert ok.status_code == 200
     assert client.get("/api/settings").json()["llm_priority"] == ["openai", "anthropic"]
@@ -101,7 +93,7 @@ def test_llm_priority_round_trips_and_rejects_nonsense(client) -> None:
 
 
 def test_a_deleted_key_disappears_from_settings(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.put("/api/settings/secrets/openai", json={"value": "sk-oai"})
     client.delete("/api/settings/secrets/openai")
     assert client.get("/api/settings").json()["secrets"] == []
@@ -111,7 +103,7 @@ def test_a_deleted_key_disappears_from_settings(client) -> None:
 
 
 def test_clone_registers_a_project(tmp_path, client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     remote = _seed_remote(tmp_path)
     r = client.post("/api/projects/clone", json={"name": "dev04", "remote": remote, "branch": "main"})
     assert r.status_code == 200
@@ -120,7 +112,7 @@ def test_clone_registers_a_project(tmp_path, client) -> None:
 
 
 def test_git_status_reports_clean_after_clone(tmp_path, client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     remote = _seed_remote(tmp_path)
     client.post("/api/projects/clone", json={"name": "dev04", "remote": remote, "branch": "main"})
     st = client.get("/api/projects/dev04/git/status").json()
@@ -128,7 +120,7 @@ def test_git_status_reports_clean_after_clone(tmp_path, client) -> None:
 
 
 def test_init_creates_a_local_project(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     r = client.post("/api/projects/init", json={"name": "scratch"})
     assert r.status_code == 200
     st = client.get("/api/projects/scratch/git/status").json()
@@ -138,7 +130,7 @@ def test_init_creates_a_local_project(client) -> None:
 def test_running_an_llm_stage_without_a_key_is_a_clear_error(tmp_path, client) -> None:
     """Stage 1 needs a provider key. With none stored, the app must refuse up
     front with an actionable message, not fail deep inside the subprocess."""
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     r = client.post("/api/projects/scratch/stages/stage1")
     assert r.status_code == 400
@@ -176,7 +168,7 @@ def test_an_llm_stage_injects_the_full_fallback_chain(tmp_path, client, monkeypa
 
     monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
 
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.put("/api/settings/llm", json={"priority": ["anthropic", "openai"], "models": {}})
     client.put("/api/settings/secrets/anthropic", json={"value": "sk-ant-KEY"})
     client.put("/api/settings/secrets/openai", json={"value": "sk-oai-KEY"})
@@ -208,7 +200,7 @@ def test_an_llm_stage_injects_the_full_fallback_chain(tmp_path, client, monkeypa
 def test_a_deterministic_stage_runs_without_any_key(tmp_path, client) -> None:
     """doctor is deterministic — it must run with no provider configured. It will
     exit non-zero on an empty project, but the request itself must stream, not 400."""
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     with client.stream("POST", "/api/projects/scratch/stages/doctor") as r:
         assert r.status_code == 200
@@ -220,7 +212,7 @@ def test_a_deterministic_stage_runs_without_any_key(tmp_path, client) -> None:
 
 
 def test_files_can_be_created_listed_read_and_updated(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
 
     # A fresh project has no editable files.
@@ -241,7 +233,7 @@ def test_files_can_be_created_listed_read_and_updated(client) -> None:
 
 
 def test_only_editable_suffixes_are_allowed(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     # A .py file is not a design input.
     assert client.put("/api/projects/scratch/files/evil.py", json={"content": "x"}).status_code == 400
@@ -250,7 +242,7 @@ def test_only_editable_suffixes_are_allowed(client) -> None:
 
 
 def test_file_names_cannot_traverse_out_of_the_project(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     for bad in ("../secret.md", "sub/dir.md", ".hidden.md"):
         r = client.put(f"/api/projects/scratch/files/{bad}", json={"content": "x"})
@@ -260,7 +252,7 @@ def test_file_names_cannot_traverse_out_of_the_project(client) -> None:
 def test_generated_pipeline_files_are_not_editable(client) -> None:
     """.pipeline/ artifacts are read-only outputs, reached through /artifacts, not
     the editor — the editor is only for design inputs."""
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     # Even with a valid suffix, a path into .pipeline/ must not resolve here.
     r = client.get("/api/projects/scratch/files/.pipeline")
@@ -270,74 +262,13 @@ def test_generated_pipeline_files_are_not_editable(client) -> None:
 # -- cookie Secure flag: the footgun that dropped sessions over HTTP ----------
 
 
-def test_env_flag_parses_human_intent(client) -> None:
-    """`bool("0")` is True, which is what once flagged the cookie Secure when
-    someone set BLPL_COOKIE_SECURE=0 to turn it off. Only real truthy tokens count."""
-    import os
-    import app.main as main
-
-    def flag(val):
-        if val is None:
-            os.environ.pop("BLPL_COOKIE_SECURE", None)
-        else:
-            os.environ["BLPL_COOKIE_SECURE"] = val
-        return main._env_flag("BLPL_COOKIE_SECURE")
-
-    for off in ("0", "false", "no", "off", "", "  ", None):
-        assert flag(off) is False, f"{off!r} must be off"
-    for on in ("1", "true", "TRUE", "yes", "on"):
-        assert flag(on) is True, f"{on!r} must be on"
-
-
-def test_cookie_secure_follows_the_connection_scheme(client) -> None:
-    """The real fix: Secure is decided by the scheme, not a hand-set flag — so it
-    is always right and can never lock a user out. A Secure cookie over http is
-    dropped by the browser, and there is no setup where that is correct."""
-    import os
-    import app.main as main
-    from starlette.requests import Request
-
-    os.environ.pop("BLPL_COOKIE_SECURE", None)
-
-    def req(scheme: str, xfp: str | None = None) -> Request:
-        headers = [(b"x-forwarded-proto", xfp.encode())] if xfp else []
-        return Request({"type": "http", "scheme": scheme, "headers": headers, "method": "GET"})
-
-    # Plain http, no forwarding → not Secure (the cookie must survive).
-    assert main._cookie_secure(req("http")) is False
-    # Direct https → Secure.
-    assert main._cookie_secure(req("https")) is True
-    # Behind a TLS proxy that forwards the scheme → Secure even though the hop to
-    # the backend is http.
-    assert main._cookie_secure(req("http", xfp="https")) is True
-    # A proxy forwarding http must NOT be marked Secure.
-    assert main._cookie_secure(req("http", xfp="http")) is False
-
-
-def test_no_env_var_can_force_secure_over_plain_http(client) -> None:
-    """There is deliberately no override: 'plain http' and 'https proxy that
-    forgot to forward the scheme' look identical to the backend, so honouring any
-    force-on flag would re-open the exact lockout. Setting the old env var must do
-    nothing over a visibly-http request."""
-    import os
-    import app.main as main
-    from starlette.requests import Request
-
-    os.environ["BLPL_COOKIE_SECURE"] = "1"
-    try:
-        r = Request({"type": "http", "scheme": "http", "headers": [], "method": "GET"})
-        assert main._cookie_secure(r) is False, "no env var may force Secure over http"
-    finally:
-        os.environ.pop("BLPL_COOKIE_SECURE", None)
-
-
 # -- whole-pipeline runner ----------------------------------------------------
 
 
 def test_pipeline_range_streams_and_needs_no_key_when_llm_excluded(client) -> None:
     """A stage5→8 range has no LLM stage, so it must run with no key configured —
     it will exit non-zero on an unbuilt project, but the request itself streams."""
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     with client.stream("POST", "/api/projects/scratch/pipeline?from_stage=stage5&to_stage=stage8") as r:
         assert r.status_code == 200
@@ -346,7 +277,7 @@ def test_pipeline_range_streams_and_needs_no_key_when_llm_excluded(client) -> No
 
 
 def test_pipeline_range_including_stage1_requires_a_key(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     r = client.post("/api/projects/scratch/pipeline?from_stage=stage0&to_stage=stage8")
     assert r.status_code == 400
@@ -354,14 +285,14 @@ def test_pipeline_range_including_stage1_requires_a_key(client) -> None:
 
 
 def test_pipeline_rejects_a_backwards_range(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     r = client.post("/api/projects/scratch/pipeline?from_stage=stage8&to_stage=stage2")
     assert r.status_code == 400
 
 
 def test_pipeline_rejects_an_unknown_stage(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     r = client.post("/api/projects/scratch/pipeline?from_stage=stage9&to_stage=stage9")
     assert r.status_code == 400
@@ -372,7 +303,7 @@ def test_pipeline_rejects_an_unknown_stage(client) -> None:
 
 def test_project_list_flags_a_board_with_placeholders(client) -> None:
     import json as _json, os
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
 
     # No review yet → fab is null.
@@ -392,7 +323,7 @@ def test_project_list_flags_a_board_with_placeholders(client) -> None:
 
 
 def test_project_list_fab_is_null_when_review_is_unparseable(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
     import app.main as main
     pipeline = main.PROJECTS_ROOT / "scratch" / ".pipeline"

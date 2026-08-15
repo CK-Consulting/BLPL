@@ -32,6 +32,7 @@ from blpl.core.llm_chat import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from conftest import sign_in
 
 
 # -- fixtures -----------------------------------------------------------------
@@ -278,7 +279,7 @@ def chat_client(client):
 
 
 def _ready(chat_client) -> None:
-    chat_client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(chat_client)
     chat_client.put("/api/settings/secrets/anthropic", json={"value": "sk-test"})
     chat_client.post("/api/projects/init", json={"name": "scratch"})
     chat_client.put("/api/projects/scratch/files/overview.md", json={"content": "# Board\n"})
@@ -435,7 +436,7 @@ def test_accepting_a_stale_proposal_is_a_409_not_a_clobber(chat_client, monkeypa
 
 
 def test_chat_needs_a_provider_key_and_a_real_conversation(chat_client, monkeypatch) -> None:
-    chat_client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    sign_in(chat_client)
     chat_client.post("/api/projects/init", json={"name": "scratch"})
     filename = chat_client.post(
         "/api/projects/scratch/conversations", json={"title": "d"}

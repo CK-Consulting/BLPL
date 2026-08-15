@@ -1,28 +1,25 @@
-"""The key that lets an SSO login open the vault without a passphrase.
+"""The key that seals every stored provider key.
 
-An OAuth login proves *who you are*. It produces no key material, so by itself
-it cannot decrypt anything. This module supplies the missing half: 32 bytes the
-server holds, under which app/vault.py keeps a second wrapping of the same DEK.
-Sign in with GitLab, the server unwraps the DEK with this key, and the session is
-open — no passphrase in the loop.
+Clerk establishes who a user is and holds nothing that could decrypt their data,
+and since a user never hands us a secret there is nothing to derive a per-user
+key from. So provider keys in Postgres are sealed under one key the server holds:
+these 32 bytes.
 
-That is a real reduction in what the encryption protects against, stated plainly
-here because it is easy to forget once it works: ``vault.db`` plus this key is
-every secret you own. Before, a stolen disk image was inert without a passphrase
-that existed only in your head. So:
+That is a real limit, stated plainly because it is easy to forget once it works:
+the database plus this key is every user's keys, and the operator has both. What
+it does buy is that a dump, a snapshot, or a stolen backup is inert on its own.
+So:
 
-* The key lives *outside* the database it opens. Keeping both in one file would
-  make the encryption ornamental — a single stolen file would carry the lock and
-  its key together.
-* On disk it is written 0600 and re-checked on every read, because a key file
-  the whole host can read is not a key.
-* ``BLPL_SERVER_KEY`` takes precedence, so a deploy that keeps secrets in a
-  secret manager (or a tmpfs mount) never has to materialise the file at all.
+* The key lives *outside* the database it opens. In one file they would be lock
+  and key together, and the encryption would be decoration.
+* On disk it is written 0600 and re-checked on every read, because a key file the
+  whole host can read is not a key.
+* ``BLPL_SERVER_KEY`` takes precedence, so a deploy keeping secrets in a secret
+  manager or on a tmpfs never has to materialise the file at all.
 
-No key configured and no file on disk means SSO is simply off. Nothing is
-auto-generated at import time: the file appears only when something explicitly
-asks to enable OAuth login, so a passphrase-only install stays passphrase-only
-and its threat model stays intact.
+Losing it is not recoverable: every stored key becomes ciphertext nobody can
+open, and every user has to re-enter theirs. It belongs in a backup, and not the
+same one as the database.
 """
 
 from __future__ import annotations
@@ -41,8 +38,9 @@ _FILE_MODE = 0o600
 
 
 class ServerKeyError(VaultError):
-    """The configured server key is unusable. Never raised for a *missing* key —
-    absence means "SSO is off", which is a valid state, not a failure."""
+    """The configured server key is unusable — malformed, or a key file the whole
+    host can read. Never raised for a *missing* key: absence is answered by
+    creating one at startup, not by failing."""
 
 
 def encode(key: bytes) -> str:
@@ -56,7 +54,7 @@ def generate() -> bytes:
 
 
 def load(data_root: Path) -> bytes | None:
-    """The configured server key, or None if SSO has never been enabled.
+    """The configured server key, or None if there is not one yet.
 
     Environment first: a deploy that injects the key has said something more
     deliberate than a file left over from an earlier run, and it is the form that
@@ -75,9 +73,11 @@ def load(data_root: Path) -> bytes | None:
 def load_or_create(data_root: Path) -> bytes:
     """The server key, generating and persisting one if there is none.
 
-    Only called from the enable-OAuth path. A read that happens to find no key
-    must not quietly mint one — that would turn "SSO is off" into "SSO is on"
-    as a side effect of asking a question.
+    Called once at startup, deliberately not lazily from the first write: the
+    operator should learn the key exists — and get it into a backup — before it
+    becomes the only thing between a database dump and every user's keys.
+    ``load`` stays non-creating so that merely *asking* whether a key exists
+    never brings one into being.
     """
     existing = load(data_root)
     if existing is not None:
@@ -126,6 +126,6 @@ def _require_private(path: Path) -> None:
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
         raise ServerKeyError(
-            f"{path} is mode {mode:o}; it unwraps the vault and must not be readable "
-            f"by group or other. Fix with: chmod 600 {path}"
+            f"{path} is mode {mode:o}; it opens every stored provider key and must "
+            f"not be readable by group or other. Fix with: chmod 600 {path}"
         )

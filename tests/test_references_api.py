@@ -442,10 +442,11 @@ def test_an_ordinary_external_reference_still_works(unlocked, tmp_path: Path) ->
     assert _put(unlocked, [{"name": "ref", "path": str(ext)}]).status_code == 200
 
 
-def test_the_session_cookie_is_samesite_strict(client) -> None:
-    """Lax already blocks cross-site POSTs; Strict also declines to ride a
-    top-level GET into an API that is only ever reached from its own origin."""
-    r = client.post("/api/auth/initialize", json={"passphrase": "correct-horse-staple"})
-    cookie = r.headers.get("set-cookie", "")
-    assert "samesite=strict" in cookie.lower()
-    assert "httponly" in cookie.lower()
+def test_the_api_is_closed_without_a_session(client) -> None:
+    """What the session-cookie test used to guard, at the level that still
+    exists. Clerk owns the session cookie now — its flags are Clerk's business,
+    set on Clerk's own domain — so what remains ours to assert is that no route
+    opens without a verified token."""
+    assert client.get("/api/projects").status_code == 401
+    assert client.get("/api/settings").status_code == 401
+    assert client.get("/api/me").status_code == 401

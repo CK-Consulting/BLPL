@@ -1,3 +1,4 @@
+import { ClerkProvider } from "@clerk/react";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
@@ -31,8 +32,23 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
+// The publishable key is not a secret — it identifies the Clerk instance to the
+// browser and is visible in any built bundle. It is passed explicitly rather
+// than left to ambient discovery so a build with it missing fails here, loudly,
+// instead of rendering a sign-in that silently never works.
+const CLERK_PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
+if (!CLERK_PUBLISHABLE_KEY) {
+  throw new Error(
+    "VITE_CLERK_PUBLISHABLE_KEY is not set. Vite reads it at BUILD time, so it " +
+      "must be present when `npm run build` runs — for the container that means " +
+      "the build arg in app/docker-compose.yml, not the runtime environment.",
+  );
+}
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    <ClerkProvider publishableKey={CLERK_PUBLISHABLE_KEY} afterSignOutUrl="/">
+      <App />
+    </ClerkProvider>
   </StrictMode>,
 );

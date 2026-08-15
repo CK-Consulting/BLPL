@@ -149,7 +149,11 @@ def test_restart_marks_orphaned_rows_interrupted(tmp_path) -> None:
 
 
 def _unlock(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    """Sign this client in. The passphrase handshake it used to perform is gone;
+    the gate is Clerk now, stubbed in conftest."""
+    from conftest import sign_in
+
+    sign_in(client)
 
 
 def test_a_stage_run_lands_in_history_with_its_log(client) -> None:
@@ -181,5 +185,7 @@ def test_runs_endpoints_404_unknown_ids_and_respect_the_session_gate(client) -> 
     _unlock(client)
     assert client.get("/api/runs/run_nope/log").status_code == 404
     assert client.delete("/api/runs/run_nope").status_code == 404
-    client.post("/api/auth/lock")
+    # Sign-out is Clerk's, not ours — dropping the token is the same thing from
+    # this side of the wire, and is what the gate actually keys on.
+    client.headers.pop("Authorization", None)
     assert client.get("/api/projects/scratch/runs").status_code == 401

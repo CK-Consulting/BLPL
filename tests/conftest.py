@@ -10,7 +10,6 @@ backend under ``app/backend`` is the single backend, so its fixture is shared
 setup, not one file's private helper.
 """
 
-import dataclasses
 import importlib
 import importlib.util
 import sys
@@ -51,41 +50,89 @@ def client(tmp_path, monkeypatch):
 
     The app module reads its state roots from the environment at import time, so
     the fixture points those at a tmp dir and reloads the module — each test gets
-    an empty vault, empty config, and empty projects root.
+    an empty database, empty config, and empty projects root.
 
-    Argon2id at default cost would make setup/unlock slow enough to dominate the
-    suite; it is patched to a cheap work factor before ``main`` is imported. The
-    crypto path itself is unchanged — only the cost parameters.
+    The database is SQLite, not the Postgres the app deploys on. That is a real
+    difference and worth naming: what is exercised here is the ORM layer and the
+    routes above it, not Postgres-specific behaviour. It is worth it because a
+    suite that needs a live database server is a suite that gets skipped, and
+    every model here is plain SQLAlchemy with no Postgres-only types. Schema
+    comes from metadata rather than Alembic for the same reason — the migration
+    is verified against real Postgres separately.
+
+    Clerk is stubbed at the verification boundary. Reaching the real thing would
+    need network and a live token; what the routes care about is that some
+    verified subject arrived, and clerk_auth's own tests cover the verifying.
     """
     pytest.importorskip("fastapi")
+    pytest.importorskip("sqlalchemy")
     from starlette.testclient import TestClient
 
     monkeypatch.setenv("BLPL_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("BLPL_PROJECTS_ROOT", str(tmp_path / "data" / "projects"))
-    monkeypatch.setenv("BLPL_VAULT_DB", str(tmp_path / "data" / "vault.db"))
     monkeypatch.setenv("BLPL_CONFIG", str(tmp_path / "data" / "blpl.toml"))
+    monkeypatch.setenv("BLPL_DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
+    # Any non-empty value: verification itself is stubbed below, but the issuer
+    # must look configured or every route answers 503 instead of running.
+    monkeypatch.setenv("BLPL_CLERK_ISSUER", "https://test.clerk.accounts.dev")
 
-    from app import vault
+    import app.db
 
-    real_init = vault.init_vault
+    importlib.reload(app.db)  # rebind the engine to the tmp database
 
-    def cheap_init(passphrase):
-        params, wrapped = real_init(passphrase)
-        cheap = dataclasses.replace(params, time_cost=1, memory_kib=8, parallelism=1)
-        kek = cheap.derive(passphrase)
-        return cheap, vault._wrap_dek(kek, vault.unlock(passphrase, params, wrapped))
+    import app.models
 
-    monkeypatch.setattr("app.vault.init_vault", cheap_init)
+    app.models.Base.metadata.create_all(app.db.engine)
 
     import app.main as main
 
-    importlib.reload(main)  # rebuild identity/projects against the tmp env
+    importlib.reload(main)  # rebuild projects/config against the tmp env
+
+    # In the container this is created by the startup hook. TestClient does not
+    # run lifespan events unless used as a context manager, so the fixture does
+    # what boot does — otherwise storing a key fails for a reason that has
+    # nothing to do with the test.
+    from app import serverkey
+
+    serverkey.load_or_create(Path(str(tmp_path / "data")))
+
+    # Stub verification, not the gate itself. A test "signs in" by sending
+    # `Bearer stub:<clerk-id>:<email>`; anything else is refused exactly as a
+    # forged token would be, so tests asserting 401 still mean something.
+    import app.clerk_auth as clerk_auth
+
+    def fake_verify(token: str):
+        if not token.startswith("stub:"):
+            raise clerk_auth.ClerkAuthError("not a stub token")
+        _, clerk_id, email = token.split(":", 2)
+        return clerk_auth.ClerkUser(id=clerk_id, email=email, claims={})
+
+    monkeypatch.setattr(main.clerk_auth, "verify", fake_verify)
 
     return TestClient(main.app)
 
 
+def sign_in(client, clerk_id: str = "user_test", email: str = "test@example.com"):
+    """Make this client's requests arrive as a signed-in user."""
+    client.headers.update({"Authorization": f"Bearer stub:{clerk_id}:{email}"})
+    return client
+
+
 @pytest.fixture
 def unlocked(client):
-    """A client with the vault initialized and the session unlocked."""
-    client.post("/api/auth/initialize", json={"passphrase": "correct-horse-staple"})
-    return client
+    """A client whose requests arrive as a signed-in user.
+
+    Still named `unlocked` because ~90 tests say so and the meaning carries: the
+    gate is open. What opens it changed; what it means downstream did not.
+    """
+    return sign_in(client)
+
+
+@pytest.fixture
+def second_user(client):
+    """A *different* signed-in user over the same app, for isolation tests."""
+    from starlette.testclient import TestClient
+
+    import app.main as main
+
+    return sign_in(TestClient(main.app), "user_other", "other@example.com")

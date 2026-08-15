@@ -55,8 +55,8 @@ image there. If you would rather not install KiCad locally, run the hosted app
 instead: `docker compose -f app/docker-compose.yml up -d --build`, then open
 `http://<host>:1800`. See [`../app/README.md`](../app/README.md).
 
-Projects are imported from the browser. `blpl serve` keeps its state (vault,
-config, projects) under `$XDG_DATA_HOME/blpl` — pass `--workspace <dir>` to point
+Projects are imported from the browser. `blpl serve` keeps its state (config,
+projects) under `$XDG_DATA_HOME/blpl` — pass `--workspace <dir>` to point
 it at a directory of existing projects instead.
 
 For UI development with live-reload:
@@ -109,91 +109,61 @@ export BLPL_LLM_PROVIDER=anthropic
 export BLPL_LLM_MODEL=claude-opus-4-7
 ```
 
-### In the hosted app
+The table above is for the **CLI**, which is single-user and reads its keys from
+your own environment. The hosted app works differently — keys there belong to a
+signed-in user; see "Provider API keys" below.
 
-The app routes each task to a *named endpoint* rather than to a provider, so a
-key belongs to an endpoint. It looks for one in two places, in this order:
+## Signing in
 
-1. **The vault** — what you type into Settings, encrypted at rest (under your
-   passphrase, or under the server key as well once SSO is enabled).
-2. **The server's environment** — `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, which
-   `app/docker-compose.yml` passes through from `app/.env`. Enough on its own:
-   a container started with one runs without anything typed into Settings.
-
-Settings shows which of the two is in play per endpoint, so an endpoint keyed
-from the environment reads as `from environment` rather than as unconfigured.
-
-**Prefer the vault for anything real.** Neither source is per-user — the vault is
-install-wide, so today every key is shared by everyone who can unlock the app,
-and moving a key between the two changes nothing about who may use it. What it
-does change is exposure: `.env` values are plaintext on disk, are printed by
-`docker inspect`, and are inherited by *every* stage subprocess including the
-deterministic ones that never call a model, whereas a vaulted key is decrypted
-only for the stages that need it. Store the key in Settings before removing it
-from `.env`, or the next run has no key at all.
-
-One shared `ANTHROPIC_API_KEY` cannot distinguish two Anthropic endpoints on
-different accounts — both would use it. Name them individually instead, either
-by vaulting a key per endpoint or with `BLPL_LLM_KEY__<ENDPOINT>` (uppercase,
-`-` and `.` become `_`), which beats the provider-wide variable.
-
-## Signing in with GitLab, GitHub, or Google
-
-Optional. Without it the app's front door is the passphrase, and that is a
-complete, working setup — skip this section unless you want SSO.
-
-**Read this first.** The passphrase *derives* the key that decrypts your secrets,
-so it is never stored and a stolen `vault.db` is useless without it. An OAuth
-login cannot derive anything — it only proves who you are — so enabling SSO adds
-a second wrapping of the same key, held by the server. From then on, whoever has
-the data directory has your secrets. That is the price of not typing a
-passphrase; it is off until you turn it on, and `POST /api/auth/oauth/disable`
-turns it back off without touching the passphrase or any stored secret.
-
-Configure at least one provider and an allowlist:
+The app uses [Clerk](https://clerk.com) for authentication. The frontend gets
+Clerk's React SDK; the backend has no Clerk SDK, so it verifies session tokens
+itself against the instance's published JWKS.
 
 ```bash
-BLPL_OAUTH_GITLAB_CLIENT_ID=…        # gitlab.com
-BLPL_OAUTH_GITLAB_CLIENT_SECRET=…
-BLPL_OAUTH_GITHUB_CLIENT_ID=…        # github.com
-BLPL_OAUTH_GITHUB_CLIENT_SECRET=…
-BLPL_OAUTH_GOOGLE_CLIENT_ID=…
-BLPL_OAUTH_GOOGLE_CLIENT_SECRET=…
-BLPL_OAUTH_GITLAB_SELF_CLIENT_ID=…   # a company GitLab, alongside gitlab.com
-BLPL_OAUTH_GITLAB_SELF_CLIENT_SECRET=…
-BLPL_OAUTH_GITLAB_SELF_ISSUER=https://git.example.com
+# app/frontend/.env.local — written by `clerk init`, never committed
+VITE_CLERK_PUBLISHABLE_KEY=pk_test_…
 
-BLPL_OAUTH_ALLOWED_EMAILS=you@example.com
-BLPL_OAUTH_ALLOWED_DOMAINS=example.com
-BLPL_PUBLIC_URL=https://blpl.example.com
+# app/.env — the backend, and the frontend build
+BLPL_CLERK_ISSUER=https://<your-instance>.clerk.accounts.dev
+VITE_CLERK_PUBLISHABLE_KEY=pk_test_…
 ```
 
-**The allowlist is not optional.** A provider with no allowlist would let anyone
-with an account at that provider open your vault, so SSO reports itself
-unconfigured until you set at least one of the two, and refuses every login.
-Provider emails that come back unverified are refused as well.
+**The issuer must match the publishable key.** It is derived from the same
+instance, and the backend pins it — without that check, a correctly-signed token
+from *anyone else's* Clerk instance would verify, and anyone can create one in a
+minute. When the two disagree the symptom is confusing: sign-in succeeds in the
+browser and every API call comes back 401. The app detects that case and says so
+rather than bouncing you back to a login screen that already worked.
 
-Register the redirect URI at the provider as:
+The publishable key is read by Vite at **build** time, so it reaches the
+container as a build arg (see `app/docker-compose.yml`). Changing it needs a
+rebuild, not a restart.
 
-```
-https://<your-host>/api/auth/oauth/<provider>/callback
-```
+## Provider API keys
 
-where `<provider>` is `gitlab`, `gitlab-self`, `github`, or `google`. Set
-`BLPL_PUBLIC_URL` to the origin the *browser* uses — behind a proxy the backend
-sees `http://backend:8000`, and a redirect URI that doesn't match exactly is the
-most common way this fails.
+Keys belong to a **user**, not to the server. Sign in, open Settings, and add
+your own. There is deliberately no server-wide fallback: a shared
+`ANTHROPIC_API_KEY` in `.env` would mean every user of the deployment spending
+the operator's quota on the operator's account. If you would rather not bring a
+key, route the task to something keyless — ollama, or an OpenAI-compatible
+endpoint declaring `auth = "none"`.
 
-Then **unlock once with the passphrase**. That is what wraps the key for the
-server and makes the sign-in buttons appear; until it happens they'd have nothing
-to open. The server key is read from `BLPL_SERVER_KEY` if set, otherwise
-generated at `$BLPL_DATA_ROOT/server.key` with mode 0600. Keep it out of the
-same backup as `vault.db` — together they are the lock and its key.
+Keys are stored in Postgres sealed with AES-GCM under a server-held key
+(`BLPL_SERVER_KEY`, or generated at `$BLPL_DATA_ROOT/server.key` on first boot).
+Be clear about what that protects:
 
-Note that GitHub is not an OIDC provider (it publishes no discovery document and
-no id_token), so it uses a separate code path that reads your primary verified
-address from `api.github.com/user/emails`. A GitHub account with no verified
-primary address cannot sign in.
+* A stolen database dump on its own is **inert**.
+* A dump **plus the server key** is every user's keys.
+* The operator has both, always.
+
+So keep the server key out of the same backup as the database — together they
+are the lock and its key — and understand that a user typing a key into Settings
+is trusting the operator, not only the software. Losing the server key is not
+recoverable: every stored key becomes ciphertext nobody can open.
+
+For an additional layer, encrypt the volume the deployment sits on (LUKS or your
+host's equivalent). That is outside this stack and worth doing on any server you
+expose, but it protects a stolen disk, not a running host.
 
 ## KiCad Python (optional)
 

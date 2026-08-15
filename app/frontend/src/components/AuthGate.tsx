@@ -1,131 +1,108 @@
 import { useEffect, useState } from "react";
-import { AuthStatus, SsoProvider, getJSON, postJSON, setLockedHandler } from "../api";
+import {
+  ClerkLoaded,
+  ClerkLoading,
+  Show,
+  SignIn,
+  UserButton,
+  useAuth,
+} from "@clerk/react";
+import { AuthConfig, getJSON, setLockedHandler, setTokenGetter } from "../api";
 
-// The front door. Until the vault is unlocked, this is the only thing the app
-// shows — no project list, no board, nothing. First run asks you to *set* a
-// passphrase; every run after asks you to *enter* it. A 401 from anywhere in the
-// app drops back here, because the session is how the whole API is gated.
+// The front door. Until Clerk says you are signed in, this is the only thing the
+// app shows — no project list, no board, nothing.
+//
+// Two facts have to line up, and they are not the same fact: Clerk can tell the
+// browser it holds a valid session while the backend rejects the token, because
+// the backend pins the issuer and will refuse a token minted by a different
+// Clerk instance. When they disagree the browser's version is the misleading
+// one, so the gate reports what the *server* said rather than trusting the SDK.
 
 type Props = { children: React.ReactNode };
 
 export function AuthGate({ children }: Props) {
-  const [status, setStatus] = useState<AuthStatus | null>(null);
+  const { isSignedIn, getToken } = useAuth();
+  const [config, setConfig] = useState<AuthConfig | null>(null);
+  const [rejected, setRejected] = useState(false);
 
-  const refresh = () => getJSON<AuthStatus>("/api/auth/status").then(setStatus);
-
+  // Hand the API layer Clerk's token source once. Not cached beyond this:
+  // getToken() refreshes short-lived tokens transparently, and holding one
+  // would work until it silently expired mid-session.
   useEffect(() => {
-    refresh();
-    // Any 401 in the app means the session ended — re-check and this gate closes.
-    setLockedHandler(() => setStatus((s) => (s ? { ...s, unlocked: false } : s)));
+    setTokenGetter(() => getToken());
+    setLockedHandler(() => setRejected(true));
+  }, [getToken]);
+
+  // Asked unauthenticated, so a server with no Clerk issuer can say so instead
+  // of showing a sign-in that cannot possibly succeed.
+  useEffect(() => {
+    getJSON<AuthConfig>("/api/auth/config")
+      .then(setConfig)
+      .catch(() => setConfig({ clerk_configured: false }));
   }, []);
 
-  if (!status) return <div className="gate">Checking…</div>;
-  if (status.unlocked) return <>{children}</>;
+  // Signing in again clears a stale rejection; without this a single expired
+  // token would pin the error on screen for the rest of the session.
+  useEffect(() => {
+    if (isSignedIn) setRejected(false);
+  }, [isSignedIn]);
+
+  if (config && !config.clerk_configured) {
+    return (
+      <div className="gate">
+        <div className="gate-card">
+          <h1>BLPL</h1>
+          <p className="gate-sub">
+            This server has no Clerk issuer configured, so nobody can sign in yet. Set{" "}
+            <code>BLPL_CLERK_ISSUER</code> on the backend and restart it.
+          </p>
+          <div className="gate-hint">
+            Signing in from another browser will not help — this is a server setting.
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <UnlockScreen
-      firstRun={!status.initialized}
-      providers={status.sso_ready ? status.sso_providers : []}
-      onUnlocked={() => setStatus({ ...status, initialized: true, unlocked: true })}
-    />
+    <>
+      <ClerkLoading>
+        <div className="gate">Checking…</div>
+      </ClerkLoading>
+      <ClerkLoaded>
+        <Show when="signed-out">
+          <div className="gate">
+            <SignIn />
+          </div>
+        </Show>
+        <Show when="signed-in">
+          {rejected ? (
+            <div className="gate">
+              <div className="gate-card">
+                <h1>BLPL</h1>
+                <p className="gate-sub">
+                  You are signed in to Clerk, but this server rejected the session. That
+                  usually means it is configured for a different Clerk instance than the one
+                  this page signed in to.
+                </p>
+                <div className="gate-error">
+                  Check that <code>BLPL_CLERK_ISSUER</code> matches the publishable key the
+                  frontend was built with.
+                </div>
+              </div>
+            </div>
+          ) : (
+            children
+          )}
+        </Show>
+      </ClerkLoaded>
+    </>
   );
 }
 
-function UnlockScreen({
-  firstRun,
-  providers,
-  onUnlocked,
-}: {
-  firstRun: boolean;
-  providers: SsoProvider[];
-  onUnlocked: () => void;
-}) {
-  const [passphrase, setPassphrase] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    if (firstRun && passphrase !== confirm) {
-      setError("Passphrases do not match.");
-      return;
-    }
-    setBusy(true);
-    try {
-      const path = firstRun ? "/api/auth/initialize" : "/api/auth/unlock";
-      await postJSON(path, { passphrase });
-      // Don't just trust the 200 — verify the session cookie actually round-trips.
-      // If the server set the cookie but the browser dropped it (a Secure cookie
-      // over plain HTTP, or cookies blocked), the passphrase was "accepted" yet the
-      // next request is still locked. Say so, loudly, instead of bouncing silently.
-      const status = await getJSON<AuthStatus>("/api/auth/status");
-      if (status.unlocked) {
-        onUnlocked();
-      } else {
-        setError(
-          "The server accepted your passphrase, but your browser didn't keep the session " +
-            "cookie — so the next request is still locked. This is almost always a cookie " +
-            "being dropped: if you're on plain http://, make sure BLPL_COOKIE_SECURE is not " +
-            "enabled; if you're behind an https proxy, serve the app over https. Check that " +
-            "cookies aren't blocked for this site.",
-        );
-      }
-    } catch (err) {
-      setError((err as Error).message || "Could not unlock.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="gate">
-      <form className="gate-card" onSubmit={submit}>
-        <h1>BLPL</h1>
-        <p className="gate-sub">
-          {firstRun
-            ? "Set a passphrase. It encrypts your API keys and is never stored — if you lose it, the stored keys are unrecoverable."
-            : "Enter your passphrase to unlock this session."}
-        </p>
-        <input
-          type="password"
-          autoFocus
-          placeholder="Passphrase"
-          value={passphrase}
-          onChange={(e) => setPassphrase(e.target.value)}
-        />
-        {firstRun && (
-          <input
-            type="password"
-            placeholder="Confirm passphrase"
-            value={confirm}
-            onChange={(e) => setConfirm(e.target.value)}
-          />
-        )}
-        {error && <div className="gate-error">{error}</div>}
-        <button type="submit" disabled={busy || passphrase.length < 8}>
-          {busy ? "…" : firstRun ? "Set passphrase" : "Unlock"}
-        </button>
-        {firstRun && <div className="gate-hint">At least 8 characters.</div>}
-        {/* Only on a returning run. On first run there is no vault yet, so
-            there is nothing for a provider to unlock — the passphrase has to
-            come first, and offering a button that cannot work is worse than
-            offering none. */}
-        {!firstRun && providers.length > 0 && (
-          <>
-            <div className="gate-hint">or</div>
-            {providers.map((p) => (
-              // A plain link, not fetch: the whole point is a top-level
-              // navigation the browser owns, so the provider can take over the
-              // tab and hand it back to our callback.
-              <a key={p.id} className="gate-sso" href={`/api/auth/oauth/${p.id}/start`}>
-                Sign in with {p.label}
-              </a>
-            ))}
-          </>
-        )}
-      </form>
-    </div>
-  );
+/** The signed-in user's control, for the app header. Where sign-out lives, so
+ *  the app does not reimplement it. afterSignOutUrl is set once on
+ *  ClerkProvider in main.tsx rather than per component. */
+export function UserControl() {
+  return <UserButton />;
 }

@@ -13,7 +13,11 @@ import zipfile
 
 
 def _unlock(client) -> None:
-    client.post("/api/auth/initialize", json={"passphrase": "the-real-one"})
+    """Sign this client in. The passphrase handshake it used to perform is gone;
+    the gate is Clerk now, stubbed in conftest."""
+    from conftest import sign_in
+
+    sign_in(client)
 
 
 def _zip_bytes(entries: dict[str, bytes]) -> bytes:

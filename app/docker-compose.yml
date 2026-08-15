@@ -1,12 +1,13 @@
 # Run BLPL as a hosted app on a VM you control.
 #
 # The point of hosting: KiCad lives here, not on your laptop. Sit down at any
-# workstation, open a browser, unlock with your passphrase, and the toolchain is
+# workstation, open a browser, sign in with Clerk, and the toolchain is
 # byte-identical — no local KiCad to update, no mac-vs-linux path mismatches, and
 # your projects are already here because they are git-backed on the server.
 #
 # Bring up:   docker compose -f app/docker-compose.yml up -d --build
-# First run:  open http://<host>:8080 and set a passphrase.
+# First run:  open http://<host>:1800 and sign in. Provider API keys are
+#             per-user — add yours under Settings.
 services:
   # Who exists and whose provider key is whose. The SQLite vault this replaces
   # was structurally single-tenant — one DEK from one passphrase, one secret
@@ -67,59 +68,31 @@ services:
         condition: service_healthy
     environment:
       - BLPL_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-blpl}:${POSTGRES_PASSWORD:-blpl}@db:5432/${POSTGRES_DB:-blpl}
-      # One data root holds the three stateful things: the vault DB, the
+      # One data root holds what is not in Postgres: the server key, the
       # declarative config, and the project working copies.
       - BLPL_DATA_ROOT=/app/data
       - BLPL_PROJECTS_ROOT=/app/data/projects
-      - BLPL_VAULT_DB=/app/data/vault.db
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
-      # LLM provider credentials, so all three backends are testable from the app.
-      # For anthropic/openai a key stored in the vault (Settings UI) OVERRIDES
-      # whatever is passed here — but these are a real fallback, not decoration:
-      # an endpoint whose key is only in this environment still enters the run
-      # chain. Set one of these and the app runs on a fresh container with nothing
-      # typed into Settings. For a deploy with two endpoints of one kind, name
-      # them individually with BLPL_LLM_KEY__<ENDPOINT> instead — one shared
-      # variable cannot tell them apart, so both would use it. Ollama IS keyless:
-      # it never takes a key, it needs OLLAMA_HOST pointing at a reachable
-      # server. Inside the container `localhost` is the container itself, so point
-      # it at the host (http://host.docker.internal:11434 works via the extra_hosts
-      # mapping below) or at an ollama service on the blpl network. The `:-`
-      # defaults keep compose quiet when you are only exercising one or two.
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # No provider API keys here, deliberately. Keys belong to a signed-in user
+      # and live in Postgres sealed under BLPL_SERVER_KEY; a shared one in this
+      # file would mean every user of the deployment spending the operator's
+      # quota on the operator's account. Users bring their own, or route a task
+      # to something keyless. OLLAMA_HOST is not a key — it is an address, and a
+      # sensible default for the whole deployment.
       - OLLAMA_HOST=${OLLAMA_HOST:-}
-      # No cookie-secure knob: the session cookie's Secure flag is derived from
-      # the request scheme (plain http → off so it works, https → on). Put TLS in
-      # front and have that proxy send X-Forwarded-Proto: https; the flag follows.
-      #
-      # Optional SSO. Leave every one of these unset and the app's front door is
-      # the passphrase, which is a complete setup — SSO only ever adds a door.
-      # Note what it costs: the passphrase derives the key, so it is stored
-      # nowhere; an OAuth login cannot derive anything, so enabling it wraps the
-      # same key under a server-held one and the data directory alone becomes
-      # enough to read your secrets. BLPL_SERVER_KEY holds that key (else it is
-      # generated at /app/data/server.key) — do not back it up beside vault.db.
-      #
-      # The allowlist is load-bearing, not advisory: without it any account at
-      # the provider could sign in, so SSO stays off until one is set.
-      # BLPL_PUBLIC_URL must be the origin the browser uses — the backend sees
-      # http://backend:8000 behind nginx, and a redirect_uri that doesn't match
-      # what you registered is the usual reason a login fails.
-      - BLPL_PUBLIC_URL=${BLPL_PUBLIC_URL:-}
+      # Clerk is the front door. The backend has no Clerk SDK, so it verifies
+      # session tokens against this issuer's published JWKS itself — and pins
+      # the issuer, because a correctly-signed token from anyone else's Clerk
+      # instance is otherwise indistinguishable from one of ours. Derived from
+      # the publishable key the frontend was built with; if the two disagree,
+      # every sign-in succeeds in the browser and is rejected here.
+      - BLPL_CLERK_ISSUER=${BLPL_CLERK_ISSUER:-}
+      # Seals every stored provider key (AES-GCM). Generated at
+      # /app/data/server.key on first boot if unset. Back it up SEPARATELY from
+      # the database: together they are the lock and its key, and losing it
+      # makes every stored key unreadable.
       - BLPL_SERVER_KEY=${BLPL_SERVER_KEY:-}
-      - BLPL_OAUTH_ALLOWED_EMAILS=${BLPL_OAUTH_ALLOWED_EMAILS:-}
-      - BLPL_OAUTH_ALLOWED_DOMAINS=${BLPL_OAUTH_ALLOWED_DOMAINS:-}
-      - BLPL_OAUTH_GITLAB_CLIENT_ID=${BLPL_OAUTH_GITLAB_CLIENT_ID:-}
-      - BLPL_OAUTH_GITLAB_CLIENT_SECRET=${BLPL_OAUTH_GITLAB_CLIENT_SECRET:-}
-      - BLPL_OAUTH_GITLAB_SELF_CLIENT_ID=${BLPL_OAUTH_GITLAB_SELF_CLIENT_ID:-}
-      - BLPL_OAUTH_GITLAB_SELF_CLIENT_SECRET=${BLPL_OAUTH_GITLAB_SELF_CLIENT_SECRET:-}
-      - BLPL_OAUTH_GITLAB_SELF_ISSUER=${BLPL_OAUTH_GITLAB_SELF_ISSUER:-}
-      - BLPL_OAUTH_GITHUB_CLIENT_ID=${BLPL_OAUTH_GITHUB_CLIENT_ID:-}
-      - BLPL_OAUTH_GITHUB_CLIENT_SECRET=${BLPL_OAUTH_GITHUB_CLIENT_SECRET:-}
-      - BLPL_OAUTH_GOOGLE_CLIENT_ID=${BLPL_OAUTH_GOOGLE_CLIENT_ID:-}
-      - BLPL_OAUTH_GOOGLE_CLIENT_SECRET=${BLPL_OAUTH_GOOGLE_CLIENT_SECRET:-}
       #
       # The vars below are for kicad-happy features for pulling datasheet and quotes.
       # DigiKey authenticates with the two-legged client_credentials grant — the ID
@@ -140,8 +113,10 @@ services:
       - MOUSER_ORDERS_API_KEY=${MOUSER_ORDERS_API_KEY:-}
       - ELEMENT14_API_KEY=${ELEMENT14_API_KEY:-}
     volumes:
-      # Everything stateful — vault, config, and your git-backed designs — on one
-      # named volume so it survives rebuilds and can be backed up as a unit.
+      # Server key, config, and your git-backed designs. Users and their sealed
+      # provider keys live in Postgres (the blpl-db volume) instead — note that
+      # a backup of BOTH this and that volume together carries the key and the
+      # ciphertext it opens.
       - ./data:/app/data
       # 3D model libraries, so `kicad-cli pcb export glb --subst-models` can
       # substitute real component models off the official KiCad image.
@@ -168,6 +143,11 @@ services:
   frontend:
     build:
       context: ./frontend
+      args:
+        # Build-time, not runtime: Vite inlines VITE_* into the bundle, so a
+        # container handed this at start would still serve one that never saw
+        # it. Changing the key therefore needs a rebuild, not a restart.
+        - VITE_CLERK_PUBLISHABLE_KEY=${VITE_CLERK_PUBLISHABLE_KEY:-}
     container_name: blpl-frontend
     restart: unless-stopped
     ports:

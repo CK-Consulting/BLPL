@@ -21,4 +21,9 @@ blpl/webapp/static/assets/
 # a repo-level rule outranks core.excludesFile, so state it here rather than
 # expecting every clone to have the same global config.
 !.env.example
+# Clerk writes app/frontend/.env.local with the publishable key AND the
+# secret key. Covered by the .env rule only if your personal ~/.gitignore
+# happens to have `.env.*`; state it here so no clone depends on that.
+.env.local
+*.env.local
 *.swp
