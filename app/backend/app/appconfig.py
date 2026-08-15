@@ -274,8 +274,13 @@ def save(path: Path, cfg: AppConfig) -> None:
 def _render(cfg: AppConfig) -> str:
     lines = [
         "# BLPL app configuration. Non-secret and declarative — commit it.",
-        "# API keys are NOT here; they live encrypted in the vault DB, keyed by",
-        "# endpoint name, so two endpoints of the same kind can hold different keys.",
+        "# API keys are NOT here. Each user's keys live in Postgres, sealed under a",
+        "# key derived from their own passphrase and stored per endpoint name — so",
+        "# two people can use the same endpoint with entirely different accounts.",
+        "#",
+        "# This file is still INSTALL-WIDE: the endpoints and task routes below are",
+        "# shared by everyone. Until the registry moves per-user, a second person",
+        "# completing setup overwrites the routing chosen by the first.",
         "",
     ]
     for name, ep in cfg.endpoints.items():
