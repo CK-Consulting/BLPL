@@ -153,14 +153,20 @@ class AppConfig:
 
     # -- validation ----------------------------------------------------------
 
-    def validate(self) -> None:
+    def validate(self, *, require_endpoints: bool = True) -> None:
         """Reject a config that cannot run, naming what is wrong.
 
         A silently-degraded chain is the failure this codebase keeps getting
         burned by: a typo'd name would otherwise just shorten the fallback list
         and nobody would know until a stage picked a model they never chose.
+
+        ``require_endpoints`` is False for the file config, which no longer
+        carries any — endpoints moved per-user into the database, and the file
+        keeps only the project registry and MCP servers. Demanding one there
+        would make saving a newly-imported project fail for want of an LLM it
+        has nothing to do with.
         """
-        if not self.endpoints:
+        if require_endpoints and not self.endpoints:
             raise ValueError("no LLM endpoints configured — declare at least one")
 
         for name, ep in self.endpoints.items():
@@ -264,8 +270,13 @@ def load(path: Path) -> AppConfig:
 
 def save(path: Path, cfg: AppConfig) -> None:
     """Render blpl.toml. Validates first — we never write a config that would
-    fail to load."""
-    cfg.validate()
+    fail to load.
+
+    Endpoints are not required here: this file is now the project registry and
+    the MCP servers, and the LLM registry it used to hold is per-user in
+    Postgres (app/llmconfig.py).
+    """
+    cfg.validate(require_endpoints=False)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_render(cfg), encoding="utf-8")
@@ -278,9 +289,11 @@ def _render(cfg: AppConfig) -> str:
         "# key derived from their own passphrase and stored per endpoint name — so",
         "# two people can use the same endpoint with entirely different accounts.",
         "#",
-        "# This file is still INSTALL-WIDE: the endpoints and task routes below are",
-        "# shared by everyone. Until the registry moves per-user, a second person",
-        "# completing setup overwrites the routing chosen by the first.",
+        "# The LLM endpoint registry and task routing are NOT here either — those",
+        "# are per-user too, in Postgres, because an install-wide registry meant the",
+        "# second person to finish setup silently rewrote the first one's routing.",
+        "# What remains here is install-wide on purpose: the project registry and",
+        "# the MCP servers.",
         "",
     ]
     for name, ep in cfg.endpoints.items():

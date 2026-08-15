@@ -32,7 +32,7 @@ from blpl.core.llm_chat import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from conftest import sign_in
+from conftest import give_endpoint, sign_in
 
 
 # -- fixtures -----------------------------------------------------------------
@@ -280,6 +280,7 @@ def chat_client(client):
 
 def _ready(chat_client) -> None:
     sign_in(chat_client)
+    give_endpoint()
     chat_client.put("/api/settings/secrets/anthropic", json={"value": "sk-test"})
     chat_client.post("/api/projects/init", json={"name": "scratch"})
     chat_client.put("/api/projects/scratch/files/overview.md", json={"content": "# Board\n"})

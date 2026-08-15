@@ -52,6 +52,7 @@ from . import (
     clerk_auth,
     importer,
     keystore,
+    llmconfig,
     llm_resolver,
     profile as profile_mod,
     providers as provider_catalog,
@@ -229,6 +230,12 @@ def require_master_key(request: Request, user: User = Depends(require_user)) -> 
 
 
 def _load_config() -> AppConfig:
+    """The install-wide file config: the project registry and the MCP servers.
+
+    NOT the LLM registry. Endpoints and task routes are per-user in Postgres
+    (app/llmconfig.py) — reading them from here is the bug where the second
+    person to finish setup silently rewrote the first one's routing.
+    """
     return appconfig.load(CONFIG_PATH)
 
 
@@ -336,7 +343,7 @@ def complete_onboarding(
     # later becomes a second endpoint with its own name and its own key, which
     # is what the registry is for.
     endpoint_name = body.provider
-    cfg = _load_config()
+    cfg = llmconfig.load(session, user)
     cfg.endpoints[endpoint_name] = appconfig.Endpoint(
         name=endpoint_name,
         kind=info.kind,
@@ -349,7 +356,7 @@ def complete_onboarding(
     # setup screen; splitting tasks across several is a Settings decision made
     # once there is more than one to split between.
     cfg.tasks["default"] = [endpoint_name]
-    appconfig.save(CONFIG_PATH, cfg)
+    llmconfig.save(session, user, cfg)
 
     if info.needs_key:
         keystore.put(session, master_key, user, endpoint_name, body.api_key)
@@ -418,7 +425,7 @@ def auth_config() -> dict:
 def get_settings(
     user: User = Depends(require_onboarded), session: Session = Depends(session_scope)
 ) -> dict:
-    cfg = _load_config()
+    cfg = llmconfig.load(session, user)
     with_keys = keystore.endpoints_with_keys(session, user)
     return {
         # The registry: what exists, and which endpoints serve which job.
@@ -477,8 +484,12 @@ class LlmSettingsBody(BaseModel):
 
 
 @app.put("/api/settings/llm")
-def put_llm_settings(body: LlmSettingsBody, _: User = Depends(require_onboarded)) -> dict:
-    cfg = _load_config()
+def put_llm_settings(
+    body: LlmSettingsBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    cfg = llmconfig.load(session, user)
 
     if body.endpoints is not None:
         cfg.endpoints = {
@@ -510,7 +521,7 @@ def put_llm_settings(body: LlmSettingsBody, _: User = Depends(require_onboarded)
         cfg.tasks["default"] = list(body.priority)
 
     try:
-        appconfig.save(CONFIG_PATH, cfg)
+        llmconfig.save(session, user, cfg)
     except ValueError as exc:  # unknown kind/endpoint, empty chain, blind vision task
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True}
@@ -1120,7 +1131,7 @@ def _chat_endpoint(session: Session, user: User, master_key: bytes) -> chat_mod.
     pure — it is handed the set of endpoints this user can authenticate and
     never learns whose keys they are.
     """
-    cfg = _load_config()
+    cfg = llmconfig.load(session, user)
     try:
         primary = llm_resolver.resolve_primary(
             cfg, keystore.endpoints_with_keys(session, user), "chat"
@@ -1164,7 +1175,7 @@ def _task_endpoint(session: Session, user: User, master_key: bytes, task: str):
     None rather than a fallback: a tool that needs vision must not quietly run
     on a model that cannot see.
     """
-    cfg = _load_config()
+    cfg = llmconfig.load(session, user)
     try:
         rp = llm_resolver.resolve_primary(cfg, keystore.endpoints_with_keys(session, user), task)
     except llm_resolver.NoUsableProvider:
@@ -1427,7 +1438,7 @@ def _inject_llm_env(
     NoUsableProvider if nothing routed to the task has one, which the caller
     turns into a clear 400.
     """
-    cfg = _load_config()
+    cfg = llmconfig.load(session, user)
     with_keys = keystore.endpoints_with_keys(session, user)
     chain = llm_resolver.resolve_chain(cfg, with_keys, task)
     if not chain:

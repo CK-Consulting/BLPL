@@ -148,6 +148,47 @@ def sign_in(client, clerk_id: str = "user_test", email: str = "test@example.com"
     return client
 
 
+def give_endpoint(
+    clerk_id: str = "user_test",
+    *,
+    name: str = "anthropic",
+    kind: str = "anthropic",
+    model: str = "",
+    base_url: str = "",
+    auth: str = "vault",
+    vision=None,
+    tasks: dict | None = None,
+):
+    """Configure one endpoint for a user, where the app now keeps them.
+
+    Tests used to write blpl.toml for this. That file no longer carries the LLM
+    registry — it was install-wide, which is precisely the bug — so writing it
+    configures nothing and the test fails for a reason unrelated to what it is
+    checking.
+    """
+    from sqlalchemy import select
+
+    import app.db
+    from app.models import LlmEndpoint, LlmTaskRoute, User
+
+    with app.db.SessionFactory() as s:
+        user = s.scalar(select(User).where(User.clerk_user_id == clerk_id))
+        s.add(
+            LlmEndpoint(
+                user_id=user.id,
+                name=name,
+                kind=kind,
+                model=model,
+                base_url=base_url,
+                auth=auth,
+                vision=vision,
+            )
+        )
+        for task, chain in (tasks or {"default": [name]}).items():
+            s.add(LlmTaskRoute(user_id=user.id, task=task, endpoints=list(chain)))
+        s.commit()
+
+
 @pytest.fixture
 def unlocked(client):
     """A client whose requests arrive as a signed-in user.

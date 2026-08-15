@@ -16,46 +16,40 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import sign_in
+from conftest import give_endpoint, sign_in
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app" / "backend"))
 
-_CONFIG = """
-[llm.endpoints.anthropic]
-kind = "anthropic"
-
-[llm.tasks]
-default = ["anthropic"]
-"""
-
-
 @pytest.fixture
-def configured(client, tmp_path):
-    """One anthropic endpoint routed to everything — the deployed shape."""
-    config = tmp_path / "data" / "blpl.toml"
-    config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text(_CONFIG)
+def configured(client):
+    """One anthropic endpoint routed to everything — the deployed shape.
+
+    Registered against the signed-in user, because the registry is per-user now.
+    """
+    sign_in(client)
+    give_endpoint()
     return client
 
 
 def test_a_key_is_visible_only_to_the_user_who_stored_it(configured, second_user):
     """The property the vault could not have. Two users, one endpoint name, two
     different keys, and neither can see the other's."""
-    sign_in(configured)
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-mine"})
 
     assert [s["provider"] for s in configured.get("/api/settings").json()["secrets"]] == ["anthropic"]
-    # The other user sees an endpoint with no key of their own.
+    # The other user sees nothing of this at all — not the key, and not even the
+    # endpoint. That is stronger than it was: while the registry lived in the
+    # shared blpl.toml they saw the same endpoint with has_key false, which
+    # leaked the fact that someone had configured it.
     other = second_user.get("/api/settings").json()
     assert other["secrets"] == []
-    assert [e["has_key"] for e in other["endpoints"]] == [False]
+    assert other["endpoints"] == []
 
 
 def test_one_users_key_does_not_let_another_user_run(configured, second_user):
     """has_key is per-user because *running* is per-user. Someone else holding a
     key for the same endpoint must not make your run start — it would spend
     their credit under their account."""
-    sign_in(configured)
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-mine"})
     configured.post("/api/projects/init", json={"name": "scratch"})
 
@@ -70,7 +64,6 @@ def test_the_servers_environment_is_not_a_fallback(configured, monkeypatch):
     not brought their own."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-operators-key")
     monkeypatch.setenv("BLPL_LLM_KEY__ANTHROPIC", "sk-operators-key")
-    sign_in(configured)
     configured.post("/api/projects/init", json={"name": "scratch"})
 
     refused = configured.post("/api/projects/scratch/stages/stage1")
@@ -105,7 +98,6 @@ def test_a_stored_key_reaches_the_stage_subprocess(configured, monkeypatch):
 
     monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
 
-    sign_in(configured)
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-mine"})
     configured.post("/api/projects/init", json={"name": "scratch"})
 
@@ -120,7 +112,6 @@ def test_a_key_is_never_returned_by_the_api(configured):
     """Write-only by design: you can see that a key exists and when it changed,
     never what it is. A settings screen that could echo it back would put the
     plaintext in every browser cache and proxy log along the way."""
-    sign_in(configured)
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-VERY-SECRET"})
 
     assert "sk-VERY-SECRET" not in configured.get("/api/settings").text
@@ -131,7 +122,6 @@ def test_the_stored_form_is_ciphertext(configured, tmp_path):
     import app.db
     from app.models import ProviderKey
 
-    sign_in(configured)
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-VERY-SECRET"})
 
     with app.db.SessionFactory() as s:
@@ -141,7 +131,6 @@ def test_the_stored_form_is_ciphertext(configured, tmp_path):
 
 
 def test_deleting_a_key_only_deletes_your_own(configured, second_user):
-    sign_in(configured)
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-mine"})
     second_user.put("/api/settings/secrets/anthropic", json={"value": "sk-theirs"})
 
@@ -151,14 +140,11 @@ def test_deleting_a_key_only_deletes_your_own(configured, second_user):
     assert second_user.get("/api/settings").json()["secrets"] == []
 
 
-def test_a_keyless_endpoint_needs_nobody_to_bring_anything(client, tmp_path):
+def test_a_keyless_endpoint_needs_nobody_to_bring_anything(client):
     """ollama takes no key from anyone, so it must not start needing one — it is
     the route that makes the app usable without a provider account at all."""
-    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "data" / "blpl.toml").write_text(
-        '[llm.endpoints.local]\nkind = "ollama"\n\n[llm.tasks]\ndefault = ["local"]\n'
-    )
     sign_in(client)
+    give_endpoint(name="local", kind="ollama")
 
     endpoints = client.get("/api/settings").json()["endpoints"]
     assert endpoints[0]["needs_key"] is False

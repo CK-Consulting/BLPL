@@ -9,7 +9,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, LargeBinary, String, UniqueConstraint, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    LargeBinary,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -56,6 +66,12 @@ class User(Base):
         back_populates="user", cascade="all, delete-orphan", uselist=False
     )
     credentials: Mapped[list["UserKeyCredential"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    endpoints: Mapped[list["LlmEndpoint"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    task_routes: Mapped[list["LlmTaskRoute"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -156,3 +172,65 @@ class UserKeyCredential(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     user: Mapped[User] = relationship(back_populates="credentials")
+
+
+class LlmEndpoint(Base):
+    """One user's named place to send an LLM request.
+
+    This lived in blpl.toml until it turned out to be install-wide: a second
+    person finishing setup rewrote the first person's routing, and the symptom
+    was someone else's provider quietly becoming your default. Keys were already
+    per-user; the registry naming them was not, which is a mismatch that only
+    shows up once there are two people.
+
+    The columns mirror appconfig.Endpoint exactly, so the resolver and every
+    validation rule keep working on rows loaded from here — the storage moved,
+    the model did not.
+    """
+
+    __tablename__ = "llm_endpoint"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_llm_endpoint_user_name"),
+        Index("ix_llm_endpoint_user", "user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(128))
+    kind: Mapped[str] = mapped_column(String(32))
+    model: Mapped[str] = mapped_column(String(128), default="")
+    base_url: Mapped[str] = mapped_column(String(512), default="")
+    auth: Mapped[str] = mapped_column(String(16), default="vault")
+    # Null means "infer from kind" — the same tri-state appconfig.Endpoint uses,
+    # because a local server's vision support genuinely cannot be guessed and a
+    # wrong guess makes the datasheet extractor read nothing at all.
+    vision: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    user: Mapped[User] = relationship(back_populates="endpoints")
+
+
+class LlmTaskRoute(Base):
+    """Which of a user's endpoints serve one task, in fallback order.
+
+    The chain is a JSON array rather than a row per position. Order is the whole
+    content of this table — index 0 is tried first — and an array keeps that
+    order as one atomic value instead of something maintained across rows, where
+    a partial write would silently reorder a fallback chain.
+    """
+
+    __tablename__ = "llm_task_route"
+    __table_args__ = (UniqueConstraint("user_id", "task", name="uq_llm_task_user_task"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    task: Mapped[str] = mapped_column(String(64))
+    endpoints: Mapped[list] = mapped_column(JSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    user: Mapped[User] = relationship(back_populates="task_routes")
