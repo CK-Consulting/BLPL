@@ -74,6 +74,9 @@ class User(Base):
     task_routes: Mapped[list["LlmTaskRoute"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    memberships: Mapped[list["ProjectMember"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class ProviderKey(Base):
@@ -234,3 +237,62 @@ class LlmTaskRoute(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="task_routes")
+
+
+class Project(Base):
+    """A design, and who it belongs to.
+
+    Lived in blpl.toml until projects needed owners. The file records a name, a
+    remote and a branch, and nothing about *whose* it is — which is why both
+    sign-ins landed in the same project and could have edited it.
+
+    ``name`` is globally unique because it is the directory name on disk. Two
+    users cannot each have a "baseboard" until working copies are namespaced per
+    user, which is the worktree work in the worker-pool phase. Until then the
+    constraint is honest about what the filesystem allows.
+    """
+
+    __tablename__ = "project"
+    __table_args__ = (UniqueConstraint("name", name="uq_project_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(128))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    remote: Mapped[str] = mapped_column(String(512), default="")
+    branch: Mapped[str] = mapped_column(String(128), default="main")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    owner: Mapped[User] = relationship(foreign_keys=[owner_id])
+    members: Mapped[list["ProjectMember"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class ProjectMember(Base):
+    """Who may see and change one project.
+
+    The owner gets a row here too, rather than being implied by
+    ``Project.owner_id`` alone. One table answers "may this person touch this
+    project", so no permission check has to remember to also consider ownership
+    — the case that gets forgotten exactly once and then silently allows or
+    denies the wrong person.
+
+    ``role`` distinguishes what only an owner may do: share, unshare, delete.
+    Everything else a member can do, which matches "an allowlist of who has
+    permission" rather than a permissions matrix nobody asked for.
+    """
+
+    __tablename__ = "project_member"
+    __table_args__ = (
+        UniqueConstraint("project_id", "user_id", name="uq_project_member"),
+        Index("ix_project_member_user", "user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("project.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    role: Mapped[str] = mapped_column(String(16), default="member")  # owner | member
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    project: Mapped[Project] = relationship(back_populates="members")
+    user: Mapped[User] = relationship(back_populates="memberships")

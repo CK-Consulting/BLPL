@@ -205,6 +205,23 @@ export type Project = {
   has_pcb: boolean;
   is_git: boolean;
   fab: FabReadiness | null;
+  /** You own it, as opposed to it having been shared with you. Only the owner
+   *  can change who has access. */
+  owned: boolean;
+  /** How many people besides the owner can open it. */
+  shared_with: number;
+};
+
+export type ProjectMember = {
+  id: number;
+  email: string;
+  role: string;
+  is_you: boolean;
+};
+
+export type ProjectMembers = {
+  owned_by_me: boolean;
+  members: ProjectMember[];
 };
 
 export type ImportResult = {

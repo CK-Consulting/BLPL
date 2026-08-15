@@ -189,6 +189,26 @@ def give_endpoint(
         s.commit()
 
 
+def own_project(name: str, clerk_id: str = "user_test"):
+    """Register an on-disk project directory as belonging to a user.
+
+    A directory under PROJECTS_ROOT is no longer a project — projects have
+    owners now, and a route that cannot find a membership row returns 404 by
+    design. Tests that create a directory and expect to read it back need this
+    too, which is the point: the filesystem knows what exists, never whose it is.
+    """
+    from sqlalchemy import select
+
+    import app.db
+    import app.projectacl as projectacl
+    from app.models import User
+
+    with app.db.SessionFactory() as s:
+        user = s.scalar(select(User).where(User.clerk_user_id == clerk_id))
+        projectacl.create(s, user, name)
+        s.commit()
+
+
 @pytest.fixture
 def unlocked(client):
     """A client whose requests arrive as a signed-in user.

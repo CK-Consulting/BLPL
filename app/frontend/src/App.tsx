@@ -4,6 +4,7 @@ import { DesignView, type Highlight } from "./components/Visualizer";
 import { StageRunner } from "./components/StageRunner";
 import { RunHistory } from "./components/RunHistory";
 import { SettingsPanel } from "./components/Settings";
+import { Sharing } from "./components/Sharing";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
 import { Editor } from "./components/Editor";
 import { Reports } from "./components/Reports";
@@ -30,6 +31,7 @@ function Workspace() {
   const [selected, setSelected] = useState<string | null>(null);
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showSharing, setShowSharing] = useState(false);
   const [tab, setTab] = useState<"board" | "preflight" | "edit" | "bom" | "modules" | "reports" | "release" | "artifacts" | "changes">("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
   const chat = useResizable("blpl.chatWidth", 420);
@@ -106,6 +108,9 @@ function Workspace() {
         </span>
         <button className={showChat ? "link on" : "link"} onClick={toggleChat}>
           Chat
+        </button>
+        <button className="link" onClick={() => setShowSharing(true)} disabled={!selected}>
+          Share
         </button>
         <button className="link" onClick={() => setShowSettings(true)}>
           Settings
@@ -206,6 +211,21 @@ function Workspace() {
       )}
 
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {showSharing && selected && (
+        <div className="modal-backdrop" onClick={() => setShowSharing(false)}>
+          <div className="modal small" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-head">
+              <h2>Share {selected}</h2>
+              <button className="link" onClick={() => setShowSharing(false)}>
+                Close
+              </button>
+            </header>
+            <div className="modal-body">
+              <Sharing projectId={selected} />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -219,7 +219,9 @@ def test_the_release_route_serves_the_package_even_when_it_was_refused(client) -
 
     import app.main as main
 
-    proj = main._project_dir("scratch")
+    # PROJECTS_ROOT directly, not main._project_dir: that resolver now enforces
+    # membership and needs a session and a user. This test only wants the path.
+    proj = main.PROJECTS_ROOT / "scratch"
     (proj / "dev.kicad_pcb").write_text("(kicad_pcb)\n", encoding="utf-8")
     manifest = release.build(proj, now="2026-08-12_120000Z")
     assert not manifest["quotable"]

@@ -47,15 +47,17 @@ def test_a_key_is_visible_only_to_the_user_who_stored_it(configured, second_user
 
 
 def test_one_users_key_does_not_let_another_user_run(configured, second_user):
-    """has_key is per-user because *running* is per-user. Someone else holding a
-    key for the same endpoint must not make your run start — it would spend
-    their credit under their account."""
+    """Someone else's key must not make your run start — it would spend their
+    credit under their account.
+
+    Since projects gained owners this is refused a step earlier and more
+    firmly: the other user is not a member of the project, so it is 404 rather
+    than "you have no key". Both are refusals; the 404 is the better one,
+    because it does not confirm the project exists."""
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-mine"})
     configured.post("/api/projects/init", json={"name": "scratch"})
 
-    refused = second_user.post("/api/projects/scratch/stages/stage1")
-    assert refused.status_code == 400
-    assert "key" in refused.json()["detail"].lower()
+    assert second_user.post("/api/projects/scratch/stages/stage1").status_code == 404
 
 
 def test_the_servers_environment_is_not_a_fallback(configured, monkeypatch):

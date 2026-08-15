@@ -154,15 +154,22 @@ def test_manifest_roundtrip_json(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _seed_project(client, name: str = "alpha") -> Path:
-    """Create a project directory under the app's projects root."""
+def _seed_project(client, name: str = "alpha", owner: str = "user_test") -> Path:
+    """Create a project directory AND register who owns it.
+
+    The directory alone used to be enough. It is not any more: every project
+    route resolves membership first and answers 404 to a non-member, so an
+    unowned directory is invisible to everyone.
+    """
     import app.main as main
+    from conftest import own_project
 
     proj = main.PROJECTS_ROOT / name
     (proj / ".pipeline").mkdir(parents=True, exist_ok=True)
     (proj / ".pipeline" / "bom.json").write_text(
         json.dumps({"project_id": name, "schema_version": 1, "rows": []})
     )
+    own_project(name, owner)
     return proj
 
 

@@ -381,3 +381,7 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
 .onboarding-card .field { display: flex; flex-direction: column; gap: .25rem; }
 .onboarding-card .field > span { font-size: 12px; color: #9aa4b0; }
 .onboarding-card a { color: #8ab4f8; }
+
+/* --- project sharing --- */
+.member-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .3rem; }
+.member-list li { display: flex; align-items: center; gap: .5rem; padding: .35rem .5rem; background: #0f1115; border: 1px solid #2a2e36; border-radius: 6px; font-size: 13px; }

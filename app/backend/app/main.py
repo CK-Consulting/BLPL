@@ -45,6 +45,11 @@ from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
+# Annotations are lazy (from __future__), which hid that these were never
+# imported — Session only ever appeared in a type hint. select() is a runtime
+# call and would have raised NameError on the first clashing project name.
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from . import (
     appconfig,
@@ -54,6 +59,7 @@ from . import (
     keystore,
     llmconfig,
     llm_resolver,
+    projectacl,
     profile as profile_mod,
     providers as provider_catalog,
     runs,
@@ -62,9 +68,9 @@ from . import (
     userkey,
     users,
 )
-from .appconfig import AppConfig, ProjectEntry
+from .appconfig import AppConfig
 from .db import session_scope
-from .models import User
+from .models import Project, User
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
 from .references import (
@@ -561,13 +567,45 @@ def delete_secret(
 # --------------------------------------------------------------------------
 
 
-def _project_dir(project_id: str) -> Path:
+def _refuse_taken_name(session: Session, name: str) -> None:
+    """Refuse a name someone else already has.
+
+    Names are globally unique because they are directory names on disk, so a
+    clash is not "you already have one" — it may be a project you cannot see.
+    The message says only that the name is taken, because saying who has it
+    would leak exactly what the 404-not-403 rule exists to hide.
+    """
+    if session.scalar(select(Project).where(Project.name == name)) is not None:
+        raise HTTPException(status_code=409, detail=f"the name {name!r} is already taken")
+
+
+def _project_dir(session: Session, user: User, project_id: str) -> Path:
+    """The working copy, if this user may open it.
+
+    The one place project permission is enforced, which is why every route
+    reaches the filesystem through here rather than through projects.project_dir
+    directly. A check that some routes perform and others skip is worse than
+    none: it reads as enforced.
+
+    A non-member gets the same 404 as a project that does not exist. 403 would
+    confirm it does, which is enough to enumerate other people's project names
+    one guess at a time.
+    """
+    try:
+        projectacl.require_member(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
     try:
         d = projects.project_dir(project_id)
     except ProjectError:
         raise HTTPException(status_code=400, detail="invalid project id")
     if not d.is_dir():
-        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+        # Registered but not on disk: a real inconsistency rather than a
+        # permission problem, and worth saying so instead of pretending it is
+        # missing.
+        raise HTTPException(
+            status_code=409, detail=f"project {project_id!r} is registered but has no working copy"
+        )
     return d
 
 
@@ -624,22 +662,31 @@ def _fab_readiness(pipeline_dir: Path) -> dict | None:
 
 
 @app.get("/api/projects")
-def list_projects(_: User = Depends(require_onboarded)) -> list[dict]:
-    if not PROJECTS_ROOT.is_dir():
-        return []
+def list_projects(
+    user: User = Depends(require_onboarded), session: Session = Depends(session_scope)
+) -> list[dict]:
+    """The projects this user owns or has been shared into.
+
+    Driven by membership, not by scanning PROJECTS_ROOT. The directory listing
+    is what showed every user every project — the filesystem knows what exists,
+    not who it belongs to, and it never will.
+    """
     out = []
-    for d in sorted(PROJECTS_ROOT.iterdir()):
-        if not d.is_dir() or d.name.startswith("."):
-            continue
+    for project in projectacl.visible(session, user):
+        d = PROJECTS_ROOT / project.name
+        if not d.is_dir():
+            continue  # registered but no working copy; not this endpoint's problem
         pipeline = d / ".pipeline"
         out.append(
             {
-                "id": d.name,
+                "id": project.name,
                 "markdown_files": len(list(d.glob("*.md"))),
                 "has_schematic": _latest(pipeline, ".kicad_sch") is not None,
                 "has_pcb": _latest(pipeline, ".kicad_pcb") is not None,
                 "is_git": (d / ".git").is_dir(),
                 "fab": _fab_readiness(pipeline),
+                "owned": project.owner_id == user.id,
+                "shared_with": len(project.members) - 1,
             }
         )
     return out
@@ -652,16 +699,18 @@ class CloneBody(BaseModel):
 
 
 @app.post("/api/projects/clone")
-def clone_project(body: CloneBody, _: User = Depends(require_onboarded)) -> dict:
-    """Clone a remote into a new working copy, and register it in blpl.toml so the
-    server remembers where it came from."""
+def clone_project(
+    body: CloneBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Clone a remote into a new working copy, owned by whoever cloned it."""
+    _refuse_taken_name(session, body.name)
     try:
         projects.clone(body.name, body.remote, body.branch)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    cfg = _load_config()
-    cfg.projects[body.name] = ProjectEntry(name=body.name, remote=body.remote, branch=body.branch)
-    appconfig.save(CONFIG_PATH, cfg)
+    projectacl.create(session, user, body.name, remote=body.remote, branch=body.branch)
     return {"ok": True, "id": body.name}
 
 
@@ -670,23 +719,105 @@ class InitBody(BaseModel):
 
 
 @app.post("/api/projects/init")
-def init_project(body: InitBody, _: User = Depends(require_onboarded)) -> dict:
-    """Create a new, empty, local git project. A remote can be attached later."""
+def init_project(
+    body: InitBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Create a new, empty, local git project, owned by its creator."""
+    _refuse_taken_name(session, body.name)
     try:
         projects.init_local(body.name)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    cfg = _load_config()
-    cfg.projects[body.name] = ProjectEntry(name=body.name)
-    appconfig.save(CONFIG_PATH, cfg)
+    projectacl.create(session, user, body.name)
     return {"ok": True, "id": body.name}
+
+
+class ShareBody(BaseModel):
+    email: str
+
+
+@app.get("/api/projects/{project_id}/members")
+def list_members(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Who can open this project. Any member may see the list — you are entitled
+    to know who else can read what you are working on."""
+    try:
+        project = projectacl.require_member(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    return {
+        "owned_by_me": project.owner_id == user.id,
+        "members": [
+            {"id": u.id, "email": u.email, "role": role, "is_you": u.id == user.id}
+            for u, role in projectacl.members(session, project)
+        ],
+    }
+
+
+@app.post("/api/projects/{project_id}/members")
+def add_member(
+    project_id: str,
+    body: ShareBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Share a project with someone, by the email their account signed in with.
+
+    They must already have signed in at least once. Inviting an address that has
+    never been here would mean storing a pending grant against a string, and a
+    grant that attaches to whoever later claims that address is a way to hand a
+    project to the wrong person.
+    """
+    try:
+        project = projectacl.require_owner(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    except projectacl.NotTheOwner:
+        raise HTTPException(status_code=403, detail="only the owner can share this project")
+
+    target = session.scalar(select(User).where(User.email == body.email.strip().lower()))
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"nobody has signed in with {body.email!r} yet — they need an account first",
+        )
+    added = projectacl.share(session, project, target)
+    return {"ok": True, "added": added, "email": target.email}
+
+
+@app.delete("/api/projects/{project_id}/members/{user_id}")
+def remove_member(
+    project_id: str,
+    user_id: int,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    try:
+        project = projectacl.require_owner(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    except projectacl.NotTheOwner:
+        raise HTTPException(status_code=403, detail="only the owner can change who has access")
+    try:
+        removed = projectacl.unshare(session, project, user_id)
+    except projectacl.NotTheOwner as exc:
+        # Removing the owner would strand the project: nobody left who can
+        # share it, delete it, or grant anyone else access.
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "removed": removed}
 
 
 @app.post("/api/projects/import")
 async def import_project(
     name: str = Form(...),
     files: list[UploadFile] = File(...),
-    _: User = Depends(require_onboarded),
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
 ) -> dict:
     """Bring an existing design into the app from the browser: a selection of
     files, or a single .zip of the project folder. The server creates a local
@@ -737,9 +868,7 @@ async def import_project(
         shutil.rmtree(dest, ignore_errors=True)
         raise
 
-    cfg = _load_config()
-    cfg.projects[name] = ProjectEntry(name=name)
-    appconfig.save(CONFIG_PATH, cfg)
+    projectacl.create(session, user, name)
     return {
         "ok": True,
         "id": name,
@@ -750,8 +879,9 @@ async def import_project(
 
 
 @app.get("/api/projects/{project_id}/git/status")
-def git_status(project_id: str, _: User = Depends(require_onboarded)) -> dict:
-    _project_dir(project_id)
+def git_status(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
+    _project_dir(session, user, project_id)
     try:
         st = projects.status(project_id)
     except ProjectError as exc:
@@ -767,8 +897,9 @@ class CommitBody(BaseModel):
 
 
 @app.post("/api/projects/{project_id}/git/commit")
-def git_commit(project_id: str, body: CommitBody, _: User = Depends(require_onboarded)) -> dict:
-    _project_dir(project_id)
+def git_commit(project_id: str, body: CommitBody, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
+    _project_dir(session, user, project_id)
     try:
         out = projects.commit_all(project_id, body.message)
     except ProjectError as exc:
@@ -777,10 +908,11 @@ def git_commit(project_id: str, body: CommitBody, _: User = Depends(require_onbo
 
 
 @app.get("/api/projects/{project_id}/git/diff")
-def git_diff(project_id: str, _: User = Depends(require_onboarded)) -> dict:
+def git_diff(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
     """What changed in the working copy since the last commit — the 'what did that
     run do' view. Diffs are size-capped server-side."""
-    _project_dir(project_id)
+    _project_dir(session, user, project_id)
     try:
         return projects.diff(project_id)
     except ProjectError as exc:
@@ -788,8 +920,9 @@ def git_diff(project_id: str, _: User = Depends(require_onboarded)) -> dict:
 
 
 @app.post("/api/projects/{project_id}/git/pull")
-def git_pull(project_id: str, _: User = Depends(require_onboarded)) -> dict:
-    _project_dir(project_id)
+def git_pull(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
+    _project_dir(session, user, project_id)
     try:
         out = projects.pull(project_id)
     except ProjectError as exc:
@@ -798,8 +931,9 @@ def git_pull(project_id: str, _: User = Depends(require_onboarded)) -> dict:
 
 
 @app.post("/api/projects/{project_id}/git/push")
-def git_push(project_id: str, _: User = Depends(require_onboarded)) -> dict:
-    _project_dir(project_id)
+def git_push(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
+    _project_dir(session, user, project_id)
     try:
         out = projects.push(project_id)
     except ProjectError as exc:
@@ -814,7 +948,7 @@ def git_push(project_id: str, _: User = Depends(require_onboarded)) -> dict:
 _EDITABLE_SUFFIXES = {".md", ".yaml", ".yml"}
 
 
-def _editable_file(project_id: str, name: str) -> Path:
+def _editable_file(session: Session, user: User, project_id: str, name: str) -> Path:
     """Resolve a filename to an editable file directly under the project root.
 
     The name comes from the client, so it is held to three rules: a bare filename
@@ -822,7 +956,7 @@ def _editable_file(project_id: str, name: str) -> Path:
     that is exactly the project root. That last check is what stops ``foo/../..``
     or a symlink from reaching outside the design inputs.
     """
-    proj = _project_dir(project_id)
+    proj = _project_dir(session, user, project_id)
     if "/" in name or "\\" in name or name.startswith("."):
         raise HTTPException(status_code=400, detail="invalid filename")
     target = (proj / name).resolve()
@@ -836,9 +970,10 @@ class FileBody(BaseModel):
 
 
 @app.get("/api/projects/{project_id}/files")
-def list_files(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
+def list_files(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> list[dict]:
     """The editable design inputs in the project root, markdown and config."""
-    proj = _project_dir(project_id)
+    proj = _project_dir(session, user, project_id)
     out = []
     for f in sorted(proj.iterdir()):
         if f.is_file() and not f.name.startswith(".") and f.suffix.lower() in _EDITABLE_SUFFIXES:
@@ -847,25 +982,28 @@ def list_files(project_id: str, _: User = Depends(require_onboarded)) -> list[di
 
 
 @app.get("/api/projects/{project_id}/files/{name}")
-def read_file(project_id: str, name: str, _: User = Depends(require_onboarded)):
-    target = _editable_file(project_id, name)
+def read_file(project_id: str, name: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)):
+    target = _editable_file(session, user, project_id, name)
     if not target.is_file():
         raise HTTPException(status_code=404, detail=f"no file {name!r}")
     return {"name": name, "content": target.read_text(encoding="utf-8", errors="replace")}
 
 
 @app.put("/api/projects/{project_id}/files/{name}")
-def write_file(project_id: str, name: str, body: FileBody, _: User = Depends(require_onboarded)) -> dict:
+def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
-    target = _editable_file(project_id, name)
+    target = _editable_file(session, user, project_id, name)
     target.write_text(body.content, encoding="utf-8")
     return {"ok": True, "name": name, "bytes": target.stat().st_size}
 
 
 @app.get("/api/projects/{project_id}/artifacts/{name}")
-def read_artifact(project_id: str, name: str, _: User = Depends(require_onboarded)):
-    proj = _project_dir(project_id)
+def read_artifact(project_id: str, name: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)):
+    proj = _project_dir(session, user, project_id)
     target = (proj / ".pipeline" / name).resolve()
     if not target.is_relative_to(proj / ".pipeline") or not target.is_file():
         raise HTTPException(status_code=404, detail=f"no artifact {name!r}")
@@ -879,8 +1017,9 @@ def read_artifact(project_id: str, name: str, _: User = Depends(require_onboarde
 
 
 @app.get("/api/projects/{project_id}/design")
-def design_sources(project_id: str, _: User = Depends(require_onboarded)) -> dict:
-    proj = _project_dir(project_id)
+def design_sources(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
+    proj = _project_dir(session, user, project_id)
     pipeline = proj / ".pipeline"
     sources = []
     archived = False
@@ -909,27 +1048,27 @@ def design_sources(project_id: str, _: User = Depends(require_onboarded)) -> dic
 # --------------------------------------------------------------------------
 
 
-def _blpl_dir(project_id: str) -> Path:
-    return _project_dir(project_id) / ".blpl"
+def _blpl_dir(session: Session, user: User, project_id: str) -> Path:
+    return _project_dir(session, user, project_id) / ".blpl"
 
 
-def _references_path(project_id: str) -> Path:
-    return _blpl_dir(project_id) / "references.json"
+def _references_path(session: Session, user: User, project_id: str) -> Path:
+    return _blpl_dir(session, user, project_id) / "references.json"
 
 
-def _conversations_dir(project_id: str) -> Path:
-    return _blpl_dir(project_id) / "conversations"
+def _conversations_dir(session: Session, user: User, project_id: str) -> Path:
+    return _blpl_dir(session, user, project_id) / "conversations"
 
 
-def _load_manifest(project_id: str) -> ReferenceManifest:
+def _load_manifest(session: Session, user: User, project_id: str) -> ReferenceManifest:
     """The project's reference manifest, or an empty one rooted at the project.
 
     A corrupt manifest degrades to empty rather than 500ing the whole project:
     an unreadable references.json should cost you your external references, not
     access to your board.
     """
-    proj = _project_dir(project_id)
-    path = _references_path(project_id)
+    proj = _project_dir(session, user, project_id)
+    path = _references_path(session, user, project_id)
     if path.is_file():
         try:
             return ReferenceManifest.load(path)
@@ -938,9 +1077,9 @@ def _load_manifest(project_id: str) -> ReferenceManifest:
     return ReferenceManifest.empty(project_id=project_id, workspace_root=proj)
 
 
-def _sandbox_for(project_id: str) -> FilesystemSandbox:
+def _sandbox_for(session: Session, user: User, project_id: str) -> FilesystemSandbox:
     return FilesystemSandbox(
-        manifest=_load_manifest(project_id),
+        manifest=_load_manifest(session, user, project_id),
         global_allowlist=load_global_allowlist(),
         global_denylist=load_global_denylist(),
     )
@@ -960,8 +1099,9 @@ class ReferenceManifestInput(BaseModel):
 
 
 @app.get("/api/projects/{project_id}/references")
-def get_references(project_id: str, _: User = Depends(require_onboarded)) -> dict:
-    manifest = _load_manifest(project_id)
+def get_references(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
+    manifest = _load_manifest(session, user, project_id)
     return {
         "project_id": project_id,
         "workspace_root": str(manifest.workspace_root),
@@ -971,9 +1111,10 @@ def get_references(project_id: str, _: User = Depends(require_onboarded)) -> dic
 
 @app.put("/api/projects/{project_id}/references")
 def put_references(
-    project_id: str, payload: ReferenceManifestInput, _: User = Depends(require_onboarded)
+    project_id: str, payload: ReferenceManifestInput, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)
 ) -> dict:
-    manifest = _load_manifest(project_id)
+    manifest = _load_manifest(session, user, project_id)
     try:
         refs = [
             Reference(
@@ -1006,15 +1147,16 @@ def put_references(
             raise HTTPException(status_code=400, detail=f"reference {ref.name!r}: {exc}")
 
     manifest.references = refs
-    _conversations_dir(project_id).mkdir(parents=True, exist_ok=True)
-    path = _references_path(project_id)
+    _conversations_dir(session, user, project_id).mkdir(parents=True, exist_ok=True)
+    path = _references_path(session, user, project_id)
     manifest.save(path)
     return {"references": [r.to_dict() for r in refs], "saved_to": str(path)}
 
 
 @app.get("/api/projects/{project_id}/sandbox")
-def sandbox_summary(project_id: str, _: User = Depends(require_onboarded)) -> dict:
-    return _sandbox_for(project_id).summary()
+def sandbox_summary(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
+    return _sandbox_for(session, user, project_id).summary()
 
 
 def _artifact_meta(path: Path, pipeline: Path) -> dict:
@@ -1029,7 +1171,8 @@ def _artifact_meta(path: Path, pipeline: Path) -> dict:
 
 
 @app.get("/api/projects/{project_id}/artifacts")
-def list_artifacts(project_id: str, _: User = Depends(require_onboarded)) -> dict:
+def list_artifacts(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
     """Every artifact the pipeline has written, newest first.
 
     Top-level only. Rotated copies under archive/ are deliberately excluded —
@@ -1037,7 +1180,7 @@ def list_artifacts(project_id: str, _: User = Depends(require_onboarded)) -> dic
     list stops being useful. /design already falls back to the archive when it
     has to, and says so.
     """
-    pipeline = _project_dir(project_id) / ".pipeline"
+    pipeline = _project_dir(session, user, project_id) / ".pipeline"
     if not pipeline.is_dir():
         return {"artifacts": []}
     artifacts = [_artifact_meta(p, pipeline) for p in sorted(pipeline.iterdir()) if p.is_file()]
@@ -1046,7 +1189,8 @@ def list_artifacts(project_id: str, _: User = Depends(require_onboarded)) -> dic
 
 
 @app.get("/api/projects/{project_id}/modules")
-def list_project_modules(project_id: str, _: User = Depends(require_onboarded)) -> dict:
+def list_project_modules(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
     """Reusable function-set modules this project can compose.
 
     Both roots, project-local first, because a project that vendored a module
@@ -1055,7 +1199,7 @@ def list_project_modules(project_id: str, _: User = Depends(require_onboarded)) 
     from blpl.core.symbol_resolution import shared_modules_root
     from blpl.importer_kicad import list_modules
 
-    project_dir = _project_dir(project_id)
+    project_dir = _project_dir(session, user, project_id)
     modules = list_modules(project_dir, shared_modules_root())
     for m in modules:
         m["scope"] = "project" if Path(m["root"]) == project_dir else "shared"
@@ -1073,24 +1217,27 @@ class MessageInput(BaseModel):
 
 
 @app.get("/api/projects/{project_id}/conversations")
-def get_conversations(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
-    return [m.to_dict() for m in list_conversations(_conversations_dir(project_id))]
+def get_conversations(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> list[dict]:
+    return [m.to_dict() for m in list_conversations(_conversations_dir(session, user, project_id))]
 
 
 @app.post("/api/projects/{project_id}/conversations")
 def create_conversation(
-    project_id: str, payload: NewConversationInput, _: User = Depends(require_onboarded)
+    project_id: str, payload: NewConversationInput, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)
 ) -> dict:
-    d = _conversations_dir(project_id)
+    d = _conversations_dir(session, user, project_id)
     d.mkdir(parents=True, exist_ok=True)
     conv = Conversation.create(d, title=payload.title)
     return {"slug": conv.slug, "filename": conv.path.name, "started_at": conv.started_at}
 
 
 @app.get("/api/projects/{project_id}/conversations/{filename}")
-def read_conversation(project_id: str, filename: str, _: User = Depends(require_onboarded)) -> dict:
+def read_conversation(project_id: str, filename: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
     try:
-        conv = Conversation.open_existing(_conversations_dir(project_id), filename)
+        conv = Conversation.open_existing(_conversations_dir(session, user, project_id), filename)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return {
@@ -1103,10 +1250,11 @@ def read_conversation(project_id: str, filename: str, _: User = Depends(require_
 
 @app.post("/api/projects/{project_id}/conversations/{filename}/messages")
 def append_message(
-    project_id: str, filename: str, payload: MessageInput, _: User = Depends(require_onboarded)
+    project_id: str, filename: str, payload: MessageInput, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)
 ) -> dict:
     try:
-        conv = Conversation.open_existing(_conversations_dir(project_id), filename)
+        conv = Conversation.open_existing(_conversations_dir(session, user, project_id), filename)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return conv.append(payload.role, payload.content, payload.metadata)
@@ -1227,9 +1375,9 @@ async def start_chat_turn(
     The message is persisted before the turn starts, so a failure mid-answer
     costs the answer and never the question.
     """
-    proj = _project_dir(project_id)
+    proj = _project_dir(session, user, project_id)
     try:
-        conv = Conversation.open_existing(_conversations_dir(project_id), filename)
+        conv = Conversation.open_existing(_conversations_dir(session, user, project_id), filename)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     if not payload.content.strip():
@@ -1244,8 +1392,8 @@ async def start_chat_turn(
                 project_dir=proj,
                 conversation=conv,
                 endpoint=endpoint,
-                sandbox=_sandbox_for(project_id),
-                usage_ledger=_blpl_dir(project_id) / "llm_usage.jsonl",
+                sandbox=_sandbox_for(session, user, project_id),
+                usage_ledger=_blpl_dir(session, user, project_id) / "llm_usage.jsonl",
                 creds=_cred_resolver(),
                 endpoint_for=lambda task: _task_endpoint(session, user, master_key, task),
                 record_tool_call=lambda rec: run_manager.record_tool_call(
@@ -1261,14 +1409,15 @@ async def start_chat_turn(
 
 @app.get("/api/projects/{project_id}/chat/{turn_id}/events")
 def stream_chat_turn(
-    project_id: str, turn_id: str, _: User = Depends(require_onboarded)
+    project_id: str, turn_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)
 ) -> StreamingResponse:
     """Attach to a turn: replay what it has emitted, then follow it live.
 
     A turn that already finished replies with a single done event — its content
     is in the conversation, which the client reloads.
     """
-    _project_dir(project_id)
+    _project_dir(session, user, project_id)
 
     async def events():
         async for event in chat_sessions.stream(turn_id):
@@ -1284,7 +1433,8 @@ class ApprovalDecision(BaseModel):
 @app.post("/api/projects/{project_id}/chat/{turn_id}/approvals/{call_id}")
 def resolve_approval(
     project_id: str, turn_id: str, call_id: str, body: ApprovalDecision,
-    _: User = Depends(require_onboarded),
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
 ) -> dict:
     """Answer a tool call that is waiting on a human.
 
@@ -1292,7 +1442,7 @@ def resolve_approval(
     A 404 means the question already expired or was answered — which is
     information, not an error to swallow.
     """
-    _project_dir(project_id)
+    _project_dir(session, user, project_id)
     if not chat_sessions.resolve_approval(turn_id, call_id, body.approved):
         raise HTTPException(
             status_code=404, detail="no pending approval with that id — it may have timed out"
@@ -1322,16 +1472,18 @@ def kicad_bridge_status(_: User = Depends(require_onboarded)) -> dict:
 
 
 @app.get("/api/projects/{project_id}/tool-calls")
-def list_tool_calls(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
+def list_tool_calls(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> list[dict]:
     """What the agents have actually done in this project, newest first."""
-    _project_dir(project_id)
+    _project_dir(session, user, project_id)
     return run_manager.tool_calls_for_project(project_id)
 
 
 @app.get("/api/projects/{project_id}/proposals")
-def list_proposals(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
+def list_proposals(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> list[dict]:
     """Edits the assistant has proposed and nobody has ruled on yet."""
-    proj = _project_dir(project_id)
+    proj = _project_dir(session, user, project_id)
     return [p.to_dict() for p in chat_mod.ProposalStore(proj).pending()]
 
 
@@ -1341,7 +1493,8 @@ class ProposalDecision(BaseModel):
 
 @app.post("/api/projects/{project_id}/proposals/{proposal_id}")
 def decide_proposal(
-    project_id: str, proposal_id: str, body: ProposalDecision, _: User = Depends(require_onboarded)
+    project_id: str, proposal_id: str, body: ProposalDecision, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)
 ) -> dict:
     """Accept an edit (write it, then commit it) or reject it.
 
@@ -1349,7 +1502,7 @@ def decide_proposal(
     pipeline reads these very files, and changing an input underneath a running
     stage produces artifacts that match no version of the design.
     """
-    proj = _project_dir(project_id)
+    proj = _project_dir(session, user, project_id)
     store = chat_mod.ProposalStore(proj)
     try:
         proposal = store.get(proposal_id)
@@ -1372,7 +1525,7 @@ def decide_proposal(
             detail="a pipeline run is in flight for this project — accept the edit once it finishes",
         )
 
-    applied, detail = chat_mod.apply_proposal(proposal, proj, _sandbox_for(project_id))
+    applied, detail = chat_mod.apply_proposal(proposal, proj, _sandbox_for(session, user, project_id))
     if not applied:
         store.set_status(proposal, "stale")
         raise HTTPException(status_code=409, detail=detail)
@@ -1511,7 +1664,7 @@ async def run_stage(
     """Run a pipeline stage, streaming its output to the browser as it happens."""
     if stage_name not in VALID_STAGES:
         raise HTTPException(status_code=400, detail=f"unknown stage {stage_name!r}")
-    proj = _project_dir(project_id)
+    proj = _project_dir(session, user, project_id)
     try:
         env = _stage_env(session, user, master_key, stage_name)
     except llm_resolver.NoUsableProvider as exc:
@@ -1521,22 +1674,24 @@ async def run_stage(
 
 
 @app.post("/api/projects/{project_id}/release")
-async def build_release(project_id: str, _: User = Depends(require_onboarded)) -> StreamingResponse:
+async def build_release(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> StreamingResponse:
     """Build the package a contract fab quotes from, gate included.
 
     No LLM in this path: the gate reads what the analyzers already found and the
     exports are kicad-cli. A release that depended on a model being reachable
     would be a release you could not cut in a hurry.
     """
-    proj = _project_dir(project_id)
+    proj = _project_dir(session, user, project_id)
     cmd = [sys.executable, "-m", "blpl.core.release", "--project-dir", str(proj)]
     return _start_run(project_id, "release", cmd, dict(os.environ))
 
 
 @app.get("/api/projects/{project_id}/release")
-def latest_release(project_id: str, _: User = Depends(require_onboarded)) -> dict:
+def latest_release(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
     """The manifest of the most recent release, or why there is none."""
-    manifest = _project_dir(project_id) / "release" / "latest.json"
+    manifest = _project_dir(session, user, project_id) / "release" / "latest.json"
     if not manifest.is_file():
         return {"exists": False}
     try:
@@ -1548,7 +1703,8 @@ def latest_release(project_id: str, _: User = Depends(require_onboarded)) -> dic
 
 
 @app.get("/api/projects/{project_id}/preflight")
-def preflight(project_id: str, _: User = Depends(require_onboarded)) -> dict:
+def preflight(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
     """What Stage 0 would drop or misread, without running anything.
 
     Served synchronously rather than through the SSE stage runner because the
@@ -1559,20 +1715,21 @@ def preflight(project_id: str, _: User = Depends(require_onboarded)) -> dict:
     from blpl.core import doctor
 
     try:
-        return doctor.run(_project_dir(project_id)).to_dict()
+        return doctor.run(_project_dir(session, user, project_id)).to_dict()
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"could not read the project: {exc}")
 
 
 @app.get("/api/projects/{project_id}/release/latest.zip")
-def download_release(project_id: str, _: User = Depends(require_onboarded)) -> Response:
+def download_release(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> Response:
     """The package itself.
 
     Served whether or not the gate passed — a refused package carries a
     READ-ME-FIRST saying so, which is more useful than a download that silently
     does not exist.
     """
-    archive = _project_dir(project_id) / "release" / "latest.zip"
+    archive = _project_dir(session, user, project_id) / "release" / "latest.zip"
     if not archive.is_file():
         raise HTTPException(status_code=404, detail="no release has been built for this project")
     return Response(
@@ -1595,7 +1752,7 @@ async def run_review_panel(
     order": a panel of one is just a review, and the value comes from members
     with different blind spots disagreeing.
     """
-    proj = _project_dir(project_id)
+    proj = _project_dir(session, user, project_id)
     try:
         env = _inject_llm_env(dict(os.environ), session, user, master_key, "review_panel")
     except llm_resolver.NoUsableProvider as exc:
@@ -1636,7 +1793,7 @@ async def run_pipeline(
         raise HTTPException(status_code=400, detail="from/to must be stage0…stage8")
     if _PIPELINE_STAGES.index(from_stage) > _PIPELINE_STAGES.index(to_stage):
         raise HTTPException(status_code=400, detail="from stage is after to stage")
-    proj = _project_dir(project_id)
+    proj = _project_dir(session, user, project_id)
 
     env = dict(os.environ)
     lo, hi = _PIPELINE_STAGES.index(from_stage), _PIPELINE_STAGES.index(to_stage)
@@ -1661,9 +1818,10 @@ async def run_pipeline(
 
 
 @app.get("/api/projects/{project_id}/runs")
-def list_runs(project_id: str, _: User = Depends(require_onboarded)) -> list[dict]:
+def list_runs(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> list[dict]:
     """Past and live runs for a project, newest first."""
-    _project_dir(project_id)
+    _project_dir(session, user, project_id)
     return [r.to_dict() for r in run_manager.list_for_project(project_id)]
 
 
