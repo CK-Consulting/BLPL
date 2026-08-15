@@ -362,7 +362,16 @@ def test_the_panel_route_dispatches_every_routed_endpoint(client, monkeypatch) -
     monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
 
     sign_in(client)
-    client.put("/api/settings/llm", json={"priority": ["anthropic", "openai"], "models": {}})
+    client.put(
+        "/api/settings/llm",
+        json={
+            "endpoints": [
+                {"name": "anthropic", "kind": "anthropic"},
+                {"name": "openai", "kind": "openai"},
+            ],
+            "tasks": {"default": ["anthropic", "openai"], "review_panel": ["anthropic", "openai"]},
+        },
+    )
     client.put("/api/settings/secrets/anthropic", json={"value": "sk-ant-KEY"})
     client.put("/api/settings/secrets/openai", json={"value": "sk-oai-KEY"})
     client.post("/api/projects/init", json={"name": "scratch"})

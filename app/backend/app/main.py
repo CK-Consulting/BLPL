@@ -456,10 +456,6 @@ def get_settings(
         "known_kinds": list(appconfig.KNOWN_KINDS),
         "known_tasks": list(appconfig.KNOWN_TASKS),
         "vision_tasks": sorted(appconfig.VISION_TASKS),
-        # Kept while the UI still speaks in providers.
-        "llm_priority": cfg.llm_priority,
-        "llm_models": cfg.llm_models,
-        "known_providers": list(appconfig.KNOWN_PROVIDERS),
         # Presence and timestamps only, and only this user's. The values never
         # leave the database except into a subprocess environment.
         "secrets": [
@@ -479,14 +475,16 @@ class EndpointBody(BaseModel):
 
 
 class LlmSettingsBody(BaseModel):
-    """Either shape is accepted. ``endpoints``/``tasks`` is the registry;
-    ``priority``/``models`` is the older provider view, kept so an existing
-    client keeps working while the UI moves over."""
+    """The registry: which endpoints exist, and which serve which task.
+
+    The older ``priority``/``models`` shape is gone. It existed so a settings
+    screen that thought in providers kept working; that screen now speaks in
+    named endpoints, and keeping a second way to say the same thing meant two
+    code paths that could disagree about what was configured.
+    """
 
     endpoints: list[EndpointBody] | None = None
     tasks: dict[str, list[str]] | None = None
-    priority: list[str] | None = None
-    models: dict[str, str] | None = None
 
 
 @app.put("/api/settings/llm")
@@ -511,20 +509,6 @@ def put_llm_settings(
         }
     if body.tasks is not None:
         cfg.tasks = {t: list(chain) for t, chain in body.tasks.items() if chain}
-
-    # Legacy path: a priority list names endpoints (which, after migration, are
-    # named after the providers they replaced), and models patch those endpoints.
-    if body.models:
-        for name, model in body.models.items():
-            if name in cfg.endpoints:
-                cfg.endpoints[name].model = model
-            elif name in appconfig.KNOWN_PROVIDERS:
-                cfg.endpoints[name] = appconfig.Endpoint(name=name, kind=name, model=model)
-    if body.priority is not None:
-        for name in body.priority:
-            if name not in cfg.endpoints and name in appconfig.KNOWN_PROVIDERS:
-                cfg.endpoints[name] = appconfig.Endpoint(name=name, kind=name)
-        cfg.tasks["default"] = list(body.priority)
 
     try:
         llmconfig.save(session, user, cfg)

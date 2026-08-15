@@ -41,7 +41,7 @@ def _cfg(**kw) -> AppConfig:
 def test_a_missing_file_yields_working_defaults(tmp_path: Path) -> None:
     cfg = appconfig.load(tmp_path / "does-not-exist.toml")
     assert cfg.chain_for("default") == ["anthropic"]
-    assert cfg.model_for("anthropic")  # a default model, not empty
+    assert cfg.endpoints["anthropic"].resolved_model()  # a default model, not empty
 
 
 def test_save_then_load_round_trips(tmp_path: Path) -> None:
@@ -141,7 +141,7 @@ def test_a_legacy_priority_config_still_loads(tmp_path: Path) -> None:
     cfg = appconfig.load(p)
     assert cfg.chain_for("default") == ["openai", "anthropic"]
     assert cfg.endpoints["anthropic"].kind == "anthropic"
-    assert cfg.model_for("openai") == "gpt-4o-2024-08-06"
+    assert cfg.endpoints["openai"].resolved_model() == "gpt-4o-2024-08-06"
 
 
 def test_the_rendered_file_is_plain_toml_without_secrets(tmp_path: Path) -> None:

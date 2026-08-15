@@ -6,6 +6,7 @@ import { RunHistory } from "./components/RunHistory";
 import { SettingsPanel } from "./components/Settings";
 import { Sharing } from "./components/Sharing";
 import { Invitations } from "./components/Invitations";
+import { Logo } from "./components/Logo";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
 import { Editor } from "./components/Editor";
 import { Reports } from "./components/Reports";
@@ -73,7 +74,7 @@ function Workspace() {
     <div className="app">
       <Invitations onChanged={refresh} />
       <header>
-        <strong>BLPL</strong>
+        <Logo size={22} withText />
         <span className="sep">/</span>
         <select
           value={selected ?? ""}

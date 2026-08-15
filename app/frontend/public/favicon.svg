@@ -1,0 +1,12 @@
+<!-- The BLPL mark, matching src/components/Logo.tsx. Kept in sync by hand:
+     two copies is one too many, but a React component cannot be a favicon. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="10" fill="#14161a"/>
+  <rect x="1.5" y="1.5" width="61" height="61" rx="10" fill="none" stroke="#e8edf3" stroke-width="3"/>
+  <path d="M32 3 V61 M3 32 H61" stroke="#e8edf3" stroke-width="2" opacity="0.55"/>
+  <g fill="#e8edf3" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+     font-size="24" font-weight="700" text-anchor="middle" dominant-baseline="central">
+    <text x="17" y="18">B</text><text x="47" y="18">L</text>
+    <text x="17" y="47">P</text><text x="47" y="47">L</text>
+  </g>
+</svg>

@@ -82,13 +82,33 @@ def test_settings_shows_key_presence_never_values(client) -> None:
     assert "sk-ant-SECRET" not in client.get("/api/settings").text
 
 
-def test_llm_priority_round_trips_and_rejects_nonsense(client) -> None:
+def test_the_registry_round_trips_and_rejects_nonsense(client) -> None:
+    """The provider-shaped priority/models body is gone; endpoints and tasks are
+    the only way to say this now, so there is one code path rather than two that
+    could disagree about what is configured."""
     sign_in(client)
-    ok = client.put("/api/settings/llm", json={"priority": ["openai", "anthropic"], "models": {}})
+    ok = client.put(
+        "/api/settings/llm",
+        json={
+            "endpoints": [
+                {"name": "openai", "kind": "openai"},
+                {"name": "anthropic", "kind": "anthropic"},
+            ],
+            "tasks": {"default": ["openai", "anthropic"]},
+        },
+    )
     assert ok.status_code == 200
-    assert client.get("/api/settings").json()["llm_priority"] == ["openai", "anthropic"]
+    assert client.get("/api/settings").json()["tasks"]["default"] == ["openai", "anthropic"]
 
-    bad = client.put("/api/settings/llm", json={"priority": ["made-up"], "models": {}})
+    # A chain naming an endpoint that does not exist would silently shorten the
+    # fallback list, so it is refused rather than trimmed.
+    bad = client.put(
+        "/api/settings/llm",
+        json={
+            "endpoints": [{"name": "openai", "kind": "openai"}],
+            "tasks": {"default": ["made-up"]},
+        },
+    )
     assert bad.status_code == 400
 
 
@@ -169,7 +189,16 @@ def test_an_llm_stage_injects_the_full_fallback_chain(tmp_path, client, monkeypa
     monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
 
     sign_in(client)
-    client.put("/api/settings/llm", json={"priority": ["anthropic", "openai"], "models": {}})
+    client.put(
+        "/api/settings/llm",
+        json={
+            "endpoints": [
+                {"name": "anthropic", "kind": "anthropic"},
+                {"name": "openai", "kind": "openai"},
+            ],
+            "tasks": {"default": ["anthropic", "openai"], "review_panel": ["anthropic", "openai"]},
+        },
+    )
     client.put("/api/settings/secrets/anthropic", json={"value": "sk-ant-KEY"})
     client.put("/api/settings/secrets/openai", json={"value": "sk-oai-KEY"})
     client.post("/api/projects/init", json={"name": "scratch"})

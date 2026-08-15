@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { ProviderInfo, getJSON, postJSON } from "../api";
+import { Logo } from "./Logo";
 
 /**
  * First run. Nothing else in the app is reachable until this is finished — the
@@ -107,6 +108,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
       )}
 
       <form className="onboarding-card" onSubmit={submit}>
+        <Logo size={48} withText />
         <h1>Set up your account</h1>
         <div className="onboarding-notice">
           EACH ITEM ON THIS PAGE MUST BE FILLED IN. YOU WILL NOT BE ABLE TO USE THE APP UNTIL THEN.

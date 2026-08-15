@@ -8,6 +8,7 @@ import {
   useAuth,
 } from "@clerk/react";
 import { AuthConfig, LockState, OnboardingState, getJSON, setLockedHandler, setTokenGetter } from "../api";
+import { Logo } from "./Logo";
 import { Onboarding } from "./Onboarding";
 import { UnlockScreen } from "./UnlockScreen";
 
@@ -68,7 +69,7 @@ export function AuthGate({ children }: Props) {
     return (
       <div className="gate">
         <div className="gate-card">
-          <h1>BLPL</h1>
+          <Logo size={48} withText />
           <p className="gate-sub">
             This server has no Clerk issuer configured, so nobody can sign in yet. Set{" "}
             <code>BLPL_CLERK_ISSUER</code> on the backend and restart it.
@@ -88,7 +89,8 @@ export function AuthGate({ children }: Props) {
       </ClerkLoading>
       <ClerkLoaded>
         <Show when="signed-out">
-          <div className="gate">
+          <div className="gate gate-column">
+            <Logo size={64} withText />
             <SignIn />
           </div>
         </Show>
@@ -96,7 +98,7 @@ export function AuthGate({ children }: Props) {
           {rejected ? (
             <div className="gate">
               <div className="gate-card">
-                <h1>BLPL</h1>
+                <Logo size={48} withText />
                 <p className="gate-sub">
                   You are signed in to Clerk, but this server rejected the session. That
                   usually means it is configured for a different Clerk instance than the one

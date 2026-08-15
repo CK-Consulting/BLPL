@@ -186,10 +186,6 @@ export type Settings = {
   known_tasks: string[];
   vision_tasks: string[];
   secrets: SecretMeta[];
-  // Older provider view, still returned while anything speaks it.
-  llm_priority: string[];
-  llm_models: Record<string, string>;
-  known_providers: string[];
 };
 
 export type FabReadiness = {

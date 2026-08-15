@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { postJSON } from "../api";
+import { Logo } from "./Logo";
 
 /**
  * Signed in, but locked.
@@ -32,10 +33,15 @@ export function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
   return (
     <div className="gate">
       <form className="gate-card" onSubmit={submit}>
-        <h1>Unlock</h1>
+        {/* Branded on purpose. Arriving here mid-session with no mark and no
+            name reads as a stray password prompt from somewhere — you have to
+            check the URL bar to work out what is asking. */}
+        <Logo size={56} withText />
+        <h1>Unlock your data</h1>
         <p className="gate-sub">
           Your encryption key is held only in memory, so it is dropped whenever the server
-          restarts. Enter your passphrase to unlock this session.
+          restarts. This is <strong>not</strong> your sign-in password — it is the passphrase that
+          decrypts your API keys and project files.
         </p>
         <input
           type="password"
@@ -49,7 +55,7 @@ export function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
           {busy ? "…" : "Unlock"}
         </button>
         <div className="gate-hint">
-          This is not your sign-in password — it is the key to your own encrypted data.
+          Signed in already? That is Clerk. This unlocks the data only you can read.
         </div>
       </form>
     </div>

@@ -15,15 +15,20 @@ It holds:
     extraction reads PDF pages and *must* be vision-capable; a review panel
     deliberately runs several endpoints at once so their disagreements surface.
     One global priority list cannot express any of that.
-  - the *project registry*: name → git remote, so the server knows what to clone
-    and pull. No credentials — auth to the remote is the deploy's business.
+What it no longer holds, and where those went:
 
-Keys are never here; only which endpoints exist and in what order to try them.
+  - **API keys** — per user, in Postgres, sealed under a key derived from that
+    user's passphrase (app/keystore.py).
+  - **The endpoint registry and task routes** — per user, in Postgres
+    (app/llmconfig.py). They were install-wide here, which meant the second
+    person to finish setup rewrote the first one's routing.
+  - **The project registry** — in Postgres, because a project now has an owner
+    and a member list, and a file that records a name and a remote can express
+    neither (app/projectacl.py).
 
 Older configs declared a flat ``[llm] priority`` over three fixed providers.
 Those still load: each named provider becomes an endpoint of the same name, and
-the priority list becomes the default task chain. Because the endpoint keeps the
-provider's name, the vault entry it already had keeps working untouched.
+the priority list becomes the default task chain.
 """
 
 from __future__ import annotations
@@ -132,24 +137,6 @@ class AppConfig:
 
     def endpoint(self, name: str) -> Endpoint | None:
         return self.endpoints.get(name)
-
-    # -- legacy view ---------------------------------------------------------
-    #
-    # Older code and the current settings screen think in "providers". While
-    # both shapes exist, present the default chain that way rather than making
-    # every caller learn the registry at once.
-
-    @property
-    def llm_priority(self) -> list[str]:
-        return self.chain_for("default")
-
-    @property
-    def llm_models(self) -> dict[str, str]:
-        return {name: ep.resolved_model() for name, ep in self.endpoints.items()}
-
-    def model_for(self, name: str) -> str:
-        ep = self.endpoints.get(name)
-        return ep.resolved_model() if ep else _DEFAULT_MODELS.get(name, "")
 
     # -- validation ----------------------------------------------------------
 
