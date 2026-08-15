@@ -1,5 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { del, readSSE } from "../api";
+import { RunLog } from "./RunLog";
+import { RunProgress } from "./RunProgress";
+import { Verbosity, classifyAll, progress } from "../runlog";
+import { expandRange } from "../stages";
 
 /**
  * Runs pipeline work and streams its log to the screen as it happens — either a
@@ -43,17 +47,20 @@ export function StageRunner({ projectId, onFinished }: Props) {
   const [lines, setLines] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
   const [exitCode, setExitCode] = useState<number | null>(null);
+  const [verbosity, setVerbosity] = useState<Verbosity>("normal");
+  const [explain, setExplain] = useState(false);
+  // What was actually launched, not what the controls currently say — changing
+  // the dropdown after a run must not relabel the run you are looking at.
+  const [ranStages, setRanStages] = useState<string[]>([]);
   const runIdRef = useRef<string | null>(null);
-  const logRef = useRef<HTMLPreElement | null>(null);
 
-  // Follow the tail of a long pipeline run — but only if you're already near the
-  // bottom, so scrolling up to read an earlier stage isn't yanked back down.
-  useEffect(() => {
-    const el = logRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    if (nearBottom) el.scrollTop = el.scrollHeight;
-  }, [lines]);
+  // Classification is over the whole log and runs on every appended line, so it
+  // is memoised on the line count rather than redone per render.
+  const classified = useMemo(() => classifyAll(lines), [lines]);
+  const states = useMemo(
+    () => progress(ranStages, classified, exitCode !== null),
+    [ranStages, classified, exitCode],
+  );
 
   const run = useCallback(async () => {
     setLines([]);
@@ -62,6 +69,11 @@ export function StageRunner({ projectId, onFinished }: Props) {
 
     const label =
       mode === "single" ? stage : mode === "panel" ? "review panel" : `${from}→${to}`;
+    // The stages this run will announce, so the progress panel knows what it is
+    // waiting for before the first header arrives.
+    setRanStages(
+      mode === "single" ? [stage] : mode === "panel" ? ["review panel"] : expandRange(from, to),
+    );
     const url =
       mode === "single"
         ? `/api/projects/${projectId}/stages/${stage}`
@@ -149,10 +161,20 @@ export function StageRunner({ projectId, onFinished }: Props) {
         </div>
       )}
 
-      {exitCode !== null && (
-        <span className={exitCode === 0 ? "badge ok" : "badge fail"}>exit {exitCode}</span>
+      {/* Two panels, deliberately separate: "where is it" is a glanceable
+          question that a scrolling log answers badly, and "what did it say" is
+          a reading question that a progress bar cannot answer at all. */}
+      {ranStages.length > 0 && (
+        <RunProgress
+          states={states}
+          running={running}
+          finished={exitCode !== null}
+          exitCode={exitCode}
+          explain={explain}
+          onExplainChange={setExplain}
+        />
       )}
-      {lines.length > 0 && <pre className="log" ref={logRef}>{lines.join("\n")}</pre>}
+      <RunLog lines={classified} verbosity={verbosity} onVerbosityChange={setVerbosity} />
     </div>
   );
 }

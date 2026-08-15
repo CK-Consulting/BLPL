@@ -114,13 +114,23 @@ export BLPL_LLM_MODEL=claude-opus-4-7
 The app routes each task to a *named endpoint* rather than to a provider, so a
 key belongs to an endpoint. It looks for one in two places, in this order:
 
-1. **The vault** — what you type into Settings, encrypted under your passphrase.
+1. **The vault** — what you type into Settings, encrypted at rest (under your
+   passphrase, or under the server key as well once SSO is enabled).
 2. **The server's environment** — `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, which
    `app/docker-compose.yml` passes through from `app/.env`. Enough on its own:
    a container started with one runs without anything typed into Settings.
 
 Settings shows which of the two is in play per endpoint, so an endpoint keyed
 from the environment reads as `from environment` rather than as unconfigured.
+
+**Prefer the vault for anything real.** Neither source is per-user — the vault is
+install-wide, so today every key is shared by everyone who can unlock the app,
+and moving a key between the two changes nothing about who may use it. What it
+does change is exposure: `.env` values are plaintext on disk, are printed by
+`docker inspect`, and are inherited by *every* stage subprocess including the
+deterministic ones that never call a model, whereas a vaulted key is decrypted
+only for the stages that need it. Store the key in Settings before removing it
+from `.env`, or the next run has no key at all.
 
 One shared `ANTHROPIC_API_KEY` cannot distinguish two Anthropic endpoints on
 different accounts — both would use it. Name them individually instead, either
