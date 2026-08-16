@@ -29,7 +29,18 @@ alembic==1.14.0
 # Verifying Clerk session tokens. The backend cannot use Clerk's JS SDK, so it
 # checks the JWT against Clerk's published JWKS itself; PyJWT's crypto extra
 # brings the RSA verification that needs.
-pyjwt[crypto]==2.10.1
+#
+# 2.13.0 is a security floor, and two of the six advisories it closes land on
+# exactly the flow clerk_auth.py uses — PyJWKClient.get_signing_key_from_jwt
+# feeding jwt.decode():
+#   * GHSA-jq35-7prp-9v3f — the algorithms allow-list was checked against the
+#     token header but verification used the algorithm bound to the PyJWK, so a
+#     disallowed algorithm could be used while advertising an allowed one.
+#   * GHSA-fhv5-28vv-h8m8 — an unknown `kid` forced a fresh JWKS fetch every
+#     time, and `kid` comes from the unverified header.
+# Also closed: unvalidated `crit` headers, non-HTTP JWKS URI schemes, a public
+# JWK accepted as an HMAC secret, and a b64=false decode amplifier.
+pyjwt[crypto]==2.13.0
 # WebAuthn ceremonies for the passkey unlock slot (app/passkeys.py). Signature
 # verification and CBOR attestation parsing are exactly the kind of
 # security-critical parsing not to hand-roll. Note the library does not model the
