@@ -75,6 +75,7 @@ from . import (
     llm_resolver,
     mailer,
     projectacl,
+    projectkey,
     profile as profile_mod,
     providers as provider_catalog,
     runs,
@@ -816,6 +817,10 @@ def init_project(
 
 class ShareBody(BaseModel):
     email: str
+    # The owner has seen the "this address has no account" screen and typed the
+    # address again. Without it, an unknown address is refused with a 404 so the
+    # confirmation cannot be skipped by a client that forgets to ask.
+    confirmed_new_account: bool = False
 
 
 @app.get("/api/projects/{project_id}/members")
@@ -850,25 +855,54 @@ def list_members(
     }
 
 
-def _invitation_email(project_name: str, invited_by: str, expires) -> tuple[str, str]:
-    """The notice an invitee gets. Deliberately says what they must do next,
-    because an invitation they cannot act on is just noise."""
-    where = os.environ.get("BLPL_PUBLIC_URL", "").strip()
-    opening = f"Open {where}" if where else "Open BLPL"
-    return (
-        f"{invited_by} shared the project \u201c{project_name}\u201d with you",
-        f"""{invited_by} has invited you to the BLPL project "{project_name}".
+def _invitation_email(
+    project_name: str, invited_by: str, expires, invitation_id: int, secret: str | None
+) -> tuple[str, str]:
+    """The notice an invitee gets.
 
-{opening} and sign in with this address to accept or decline. The invitation is
-waiting for you at the top of the page.
+    Two versions, because the recipients are in different situations. Someone
+    with an account only needs telling; someone without needs a link, and needs
+    to understand what that link is before they forward it to anyone.
+
+    The secret rides in the URL *fragment*. Fragments are never sent to a server
+    in a request line, so it stays out of access logs, Referer headers and
+    anything sitting in front of the app — the page reads it and posts it back
+    deliberately.
+    """
+    where = os.environ.get("BLPL_PUBLIC_URL", "").strip() or "your BLPL server"
+    subject = f"{invited_by} shared the project \u201c{project_name}\u201d with you"
+
+    if secret is None:
+        return subject, f"""{invited_by} has invited you to the BLPL project "{project_name}".
+
+Open {where} and sign in with this address to accept or decline. The invitation
+is waiting for you on your dashboard.
 
 You will not have access until you accept, and the invitation expires on
 {expires:%d %B %Y}.
 
 If you were not expecting this, you can ignore it — declining costs nothing and
 nothing is shared with you in the meantime.
-""",
-    )
+"""
+
+    link = f"{where}/invite/{invitation_id}#{secret}"
+    return subject, f"""{invited_by} has invited you to the BLPL project "{project_name}".
+
+You do not have an account yet, so this link both creates one and accepts the
+invitation:
+
+{link}
+
+THIS LINK EXPIRES IN 24 HOURS.
+
+Please note: ANYONE WHO HAS THIS LINK CAN USE IT, so do not forward it. Creating
+the account is limited to {invited_by}'s intended recipient — you will have to
+enter a verification code sent to this address — but the link itself is the key
+to the project, so treat it like one.
+
+If you were not expecting this, ignore it. The invitation lapses on its own and
+nothing is shared with you in the meantime.
+"""
 
 
 @app.post("/api/projects/{project_id}/members")
@@ -894,31 +928,50 @@ def add_member(
     except projectacl.NotTheOwner:
         raise HTTPException(status_code=403, detail="only the owner can share this project")
 
-    target = session.scalar(select(User).where(User.email == body.email.strip().lower()))
-    if target is None:
+    address = body.email.strip().lower()
+    target = session.scalar(select(User).where(User.email == address))
+    if target is not None and target.id == user.id:
+        raise HTTPException(status_code=400, detail="you already own this project")
+
+    # Two paths, and which one applies is not the owner's choice — it depends on
+    # whether the address already has a usable account.
+    known = target is not None and grants.public_key_of(session, target) is not None
+    if not known and not body.confirmed_new_account:
+        # Refused rather than silently taking the weaker path. The owner is shown
+        # what emailing a secret means and has to type the address again, so the
+        # tradeoff is one they made rather than one that happened to them.
         raise HTTPException(
             status_code=404,
-            detail=f"nobody has signed in with {body.email!r} yet — they need an account first",
+            detail=f"{address} has no account here yet",
         )
-    if target.id == user.id:
-        raise HTTPException(status_code=400, detail="you already own this project")
-    if grants.public_key_of(session, target) is None:
-        # They have an account but have never unlocked, so there is no address to
-        # send the key to. Refused now with the reason, rather than accepted and
-        # then failing silently when they try to open the project.
-        raise HTTPException(
-            status_code=409,
-            detail=f"{target.email} has not finished setting up their encryption yet",
-        )
-    try:
-        invitation = projectacl.invite(session, project, user, target)
-    except projectacl.AlreadyAMember:
-        raise HTTPException(status_code=409, detail=f"{target.email} can already open this project")
 
-    # Wrapped now, while the owner is unlocked and present. This is what lets the
-    # invitee accept tomorrow without needing the owner back: the key is already
-    # sealed to them, waiting behind a membership row they do not yet have.
-    if grants.has_key(session, project):
+    secret = None
+    wrapped = None
+    if not known:
+        target = users.placeholder_for(session, address)
+        if grants.has_key(session, project):
+            # No keypair exists to seal to, so the key is wrapped under a secret
+            # that lives only in the emailed link. Weaker on purpose, and bounded
+            # by a 24-hour life and by being destroyed on first use.
+            secret = projectkey.new_invitation_secret()
+            project_key = grants.project_key_for(session, project, user, master_key)
+            wrapped = projectkey.seal_under_secret(secret, project_key)
+
+    try:
+        invitation = projectacl.invite(
+            session,
+            project,
+            user,
+            target,
+            ttl=projectacl.SECRET_INVITATION_TTL if not known else None,
+            wrapped_key=wrapped,
+        )
+    except projectacl.AlreadyAMember:
+        raise HTTPException(status_code=409, detail=f"{address} can already open this project")
+
+    # For someone who already has a key, seal straight to it — strictly better
+    # than a secret in an email, and it needs no link.
+    if known and grants.has_key(session, project):
         project_key = grants.project_key_for(session, project, user, master_key)
         grants.grant_to(session, project, target, project_key)
     # Sent in the background, and failure is logged rather than raised. A relay
@@ -927,7 +980,7 @@ def add_member(
     # recipient may already have it.
     if target.email:
         subject, body_text = _invitation_email(
-            project.name, user.email or "Someone", invitation.expires_at
+            project.name, user.email or "Someone", invitation.expires_at, invitation.id, secret
         )
         background.add_task(mailer.send, target.email, subject, body_text)
 
@@ -937,6 +990,9 @@ def add_member(
         "invited": target.email,
         "invitation_id": invitation.id,
         "expires_at": invitation.expires_at.isoformat(),
+        # So the UI can say which kind of invitation went out. They differ in
+        # what the recipient has to do and in how long they have to do it.
+        "new_account": not known,
         # So the UI can say "they have been emailed" or "tell them yourself"
         # instead of implying a notice that was never sent.
         "emailed": bool(target.email) and mailer.configured(),
@@ -1027,6 +1083,78 @@ def accept_invitation(
         # "there is nothing here for you to accept", and distinguishing them
         # would report on a project the caller still cannot see.
         raise HTTPException(status_code=404, detail="no invitation waiting for you")
+    return {"ok": True, "project": project.name}
+
+
+class RedeemBody(BaseModel):
+    secret: str
+
+
+@app.get("/api/invitations/{invitation_id}/preview")
+def preview_invitation(invitation_id: int, session: Session = Depends(session_scope)) -> dict:
+    """What an invitation link points at, before anyone signs in.
+
+    Unauthenticated on purpose: the person following it has, by construction, no
+    account yet. It reveals only the project name and who sent it — enough to
+    decide whether to go on, and nothing that identifies the invitee, so a
+    guessed id tells a stranger nothing about who was invited.
+    """
+    row = projectacl.live_by_id(session, invitation_id)
+    if row is None:
+        return {"valid": False}
+    return {
+        "valid": True,
+        "project": row.project.name,
+        "invited_by": row.invited_by.email,
+        "expires_at": row.expires_at.isoformat(),
+        "needs_secret": row.key_ciphertext is not None,
+    }
+
+
+@app.post("/api/invitations/{invitation_id}/redeem")
+def redeem_invitation(
+    invitation_id: int,
+    body: RedeemBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Accept an invitation that arrived as a link, with its secret.
+
+    Three things must all hold, and the order matters. The invitation must be
+    live; the caller's *verified* address must be the one invited, so a leaked
+    link cannot be redeemed by whoever finds it into an account of their own; and
+    the secret must open the wrapped key, which is what proves they hold the link
+    rather than merely knowing an id.
+    """
+    row = projectacl.live_by_id(session, invitation_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="this invitation is no longer valid")
+
+    invited_address = (row.invitee.email or "").strip().lower()
+    if not user.email or user.email.strip().lower() != invited_address:
+        # The link is not a bearer token for the project. It carries the key, but
+        # the address it was sent to is still who it is for, and Clerk verified
+        # that address at sign-up.
+        raise HTTPException(
+            status_code=403,
+            detail=f"this invitation was sent to {invited_address}; you are signed in as {user.email}",
+        )
+
+    if row.key_ciphertext is not None:
+        try:
+            project_key = projectkey.open_with_secret(
+                body.secret, row.key_nonce, row.key_ciphertext
+            )
+        except projectkey.GrantError:
+            raise HTTPException(status_code=403, detail="that invitation link is not valid")
+        # Re-sealed to a key only this account holds, before the secret-wrapped
+        # copy is destroyed by accept(). From here on the link is worthless.
+        grants.ensure_keypair(session, user, master_key)
+        grants.grant_to(session, row.project, user, project_key)
+
+    project = projectacl.accept(session, user, invitation_id)
+    activity.record(session, project, user, activity.JOINED, "accepted an invitation")
     return {"ok": True, "project": project.name}
 
 

@@ -9,6 +9,7 @@ import {
 } from "@clerk/react";
 import { AuthConfig, LockState, OnboardingState, getJSON, setLockedHandler, setTokenGetter } from "../api";
 import { Logo } from "./Logo";
+import { InviteLanding } from "./InviteLanding";
 import { Onboarding } from "./Onboarding";
 import { UnlockScreen } from "./UnlockScreen";
 
@@ -23,8 +24,16 @@ import { UnlockScreen } from "./UnlockScreen";
 
 type Props = { children: React.ReactNode };
 
+/** /invite/123 → 123. Read once: the URL is rewritten to drop the secret from
+ *  the address bar, so re-parsing later would find nothing. */
+function invitationIdFromPath(): number | null {
+  const m = /^\/invite\/(\d+)/.exec(window.location.pathname);
+  return m ? Number(m[1]) : null;
+}
+
 export function AuthGate({ children }: Props) {
   const { isSignedIn, getToken } = useAuth();
+  const [inviteId] = useState<number | null>(invitationIdFromPath);
   const [config, setConfig] = useState<AuthConfig | null>(null);
   const [rejected, setRejected] = useState(false);
   // Three states past sign-in, and they are not the same: not set up, set up
@@ -90,7 +99,19 @@ export function AuthGate({ children }: Props) {
       <ClerkLoaded>
         <Show when="signed-out">
           <div className="gate gate-column">
-            <Logo size={64} withText />
+            {inviteId !== null ? (
+              // The invitation is shown *above* the sign-in, so someone
+              // following a link knows what they are signing up for before they
+              // are asked for an address that has to match.
+              <InviteLanding
+                invitationId={inviteId}
+                signedIn={false}
+                onboarded={false}
+                onJoined={() => {}}
+              />
+            ) : (
+              <Logo size={64} withText />
+            )}
             <SignIn />
           </div>
         </Show>
@@ -116,6 +137,18 @@ export function AuthGate({ children }: Props) {
             <Onboarding onDone={refreshState} />
           ) : !state.unlocked ? (
             <UnlockScreen onUnlocked={refreshState} />
+          ) : inviteId !== null ? (
+            // Last, not first: redeeming needs an unlocked session, because the
+            // project key is re-sealed to this account's own key as it happens.
+            <InviteLanding
+              invitationId={inviteId}
+              signedIn
+              onboarded
+              onJoined={() => {
+                window.history.replaceState(null, "", "/");
+                window.location.reload();
+              }}
+            />
           ) : (
             children
           )}

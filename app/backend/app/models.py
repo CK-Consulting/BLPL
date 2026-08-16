@@ -46,8 +46,14 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    clerk_user_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    email: Mapped[str] = mapped_column(String(320), default="")
+    # Null for a *placeholder*: someone invited by email who has never signed in.
+    # They exist so an invitation has something to point at, and are claimed by
+    # the first Clerk account that proves control of the address. Nothing about a
+    # placeholder is trusted — it holds an email and nothing else.
+    clerk_user_id: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
+    email: Mapped[str] = mapped_column(String(320), default="", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -345,6 +351,16 @@ class ProjectInvitation(Base):
     responded_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
+    # Set only when the invitee had no account. The project key is wrapped under
+    # a key derived from a secret that exists nowhere but the emailed link, so
+    # the invitee can take it up alone — no keypair of theirs existed to seal to,
+    # and requiring the owner back later would defeat the point of inviting.
+    #
+    # Cleared the moment it is redeemed: the wrapped copy is re-sealed to the new
+    # account's real key, and this one is destroyed so the link cannot be used
+    # twice.
+    key_nonce: Mapped[bytes | None] = mapped_column(LargeBinary(12), nullable=True)
+    key_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     project: Mapped[Project] = relationship()
     invitee: Mapped[User] = relationship(foreign_keys=[invitee_id])

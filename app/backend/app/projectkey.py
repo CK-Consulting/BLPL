@@ -136,3 +136,54 @@ def _derive(shared: bytes) -> bytes:
 def _check(raw: bytes, what: str) -> None:
     if len(raw) != _KEY_LEN:
         raise GrantError(f"{what} must be {_KEY_LEN} bytes, got {len(raw)}")
+
+
+# ---------------------------------------------------------------------------
+# Wrapping under a secret nobody stores
+# ---------------------------------------------------------------------------
+#
+# For inviting someone who has no keypair yet. The secret lives in the emailed
+# link and nowhere else — not in the database, not in a log — so the wrapped key
+# is inert to anyone who only has the database.
+#
+# Be honest about what this costs. Anyone who reads that mailbox can take the
+# project, which is strictly weaker than sealing to a key only the recipient
+# holds. It is bounded two ways: the invitation expires in a day, and the
+# wrapped copy is destroyed the moment it is redeemed.
+
+_SECRET_AAD = b"blpl-invitation-key"
+
+
+def new_invitation_secret() -> str:
+    """A fresh secret for one invitation. urlsafe so it survives a URL fragment
+    without escaping, and 32 bytes because it is the only thing standing between
+    a leaked link and the project."""
+    import secrets
+
+    return secrets.token_urlsafe(32)
+
+
+def seal_under_secret(secret: str, payload: bytes) -> tuple[bytes, bytes]:
+    """Wrap under a key derived from ``secret``. Returns (nonce, ciphertext)."""
+    key = _key_from_secret(secret)
+    nonce = os.urandom(_NONCE_LEN)
+    return nonce, AESGCM(key).encrypt(nonce, payload, _SECRET_AAD)
+
+
+def open_with_secret(secret: str, nonce: bytes, ciphertext: bytes) -> bytes:
+    """Unwrap, or GrantError.
+
+    There is no separate check that the secret is right: a wrong one derives a
+    wrong key and AES-GCM's tag fails. That failure *is* the verification, so
+    there is nothing stored that could be attacked offline.
+    """
+    try:
+        return AESGCM(_key_from_secret(secret)).decrypt(nonce, ciphertext, _SECRET_AAD)
+    except InvalidTag as exc:
+        raise GrantError("that invitation link is not valid") from exc
+
+
+def _key_from_secret(secret: str) -> bytes:
+    return HKDF(
+        algorithm=hashes.SHA256(), length=_KEY_LEN, salt=None, info=_SECRET_AAD
+    ).derive(secret.encode("utf-8"))

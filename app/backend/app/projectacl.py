@@ -36,6 +36,12 @@ REVOKED = "revoked"
 # stops being a standing grant into someone's project.
 INVITATION_TTL = timedelta(days=14)
 
+# Much shorter, because this one is different in kind. An invitation to someone
+# without an account carries the project key wrapped under a secret that travels
+# in an email, so anyone who reads that mailbox can take the project. Fourteen
+# days of that is a fortnight of exposure for a message nobody is watching.
+SECRET_INVITATION_TTL = timedelta(hours=24)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -168,12 +174,22 @@ class NoSuchInvitation(LookupError):
     """No pending invitation by that id for this user."""
 
 
-def invite(session: Session, project: Project, invited_by: User, invitee: User) -> ProjectInvitation:
+def invite(
+    session: Session,
+    project: Project,
+    invited_by: User,
+    invitee: User,
+    *,
+    ttl: timedelta | None = None,
+    wrapped_key: tuple[bytes, bytes] | None = None,
+) -> ProjectInvitation:
     """Offer access. The invitee decides whether to take it.
 
     Re-inviting someone who declined replaces the old row rather than adding a
     second one — otherwise a declined invitation could be re-sent indefinitely
-    and each would need revoking separately.
+    and each would need revoking separately. Re-inviting also *replaces* any
+    wrapped key, which is what makes a fresh secret invalidate the previous
+    link: the old secret no longer opens what is stored.
     """
     if any(m.user_id == invitee.id for m in project.members):
         raise AlreadyAMember(invitee.email or str(invitee.id))
@@ -190,8 +206,12 @@ def invite(session: Session, project: Project, invited_by: User, invitee: User) 
     existing.invited_by_id = invited_by.id
     existing.status = PENDING
     existing.created_at = _now()
-    existing.expires_at = _now() + INVITATION_TTL
+    existing.expires_at = _now() + (ttl or INVITATION_TTL)
     existing.responded_at = None
+    # Overwritten, not merged: a re-invitation mints a fresh secret, and the
+    # previous link must stop working the moment it does.
+    existing.key_nonce = wrapped_key[0] if wrapped_key else None
+    existing.key_ciphertext = wrapped_key[1] if wrapped_key else None
     session.flush()
     return existing
 
@@ -231,9 +251,32 @@ def accept(session: Session, user: User, invitation_id: int) -> Project:
     row = _live_invitation(session, user, invitation_id)
     row.status = ACCEPTED
     row.responded_at = _now()
+    # The secret-wrapped copy has served its purpose by now; the caller has
+    # re-sealed the key to this user's own. Destroying it here is what makes the
+    # link single-use.
+    row.key_nonce = None
+    row.key_ciphertext = None
     session.add(ProjectMember(project_id=row.project_id, user_id=user.id, role=MEMBER))
     session.flush()
     return row.project
+
+
+def live_by_id(session: Session, invitation_id: int) -> ProjectInvitation | None:
+    """A pending, unexpired invitation, regardless of who is asking.
+
+    For the link path, where the person redeeming has just created their account
+    and may not yet be the invitee row the invitation points at. The *caller*
+    must still prove the link's secret and that their verified address matches —
+    this only finds the row.
+    """
+    row = session.scalar(
+        select(ProjectInvitation).where(
+            ProjectInvitation.id == invitation_id, ProjectInvitation.status == PENDING
+        )
+    )
+    if row is None or _aware(row.expires_at) <= _now():
+        return None
+    return row
 
 
 def decline(session: Session, user: User, invitation_id: int) -> Project:

@@ -445,3 +445,11 @@ header .logo-lockup { font-size: 13px; }
 .activity-when { font-size: 11px; color: #7d8590; margin-top: .2rem; }
 
 .dash-back { display: flex; align-items: center; gap: .4rem; color: #cfd6df; }
+
+/* --- invite confirmation --- */
+/* The attention colour again: this screen exists because the owner is about to
+   accept a weaker tradeoff, and it should not read like ordinary chrome. */
+.invite-confirm { display: flex; flex-direction: column; gap: .8rem; }
+.invite-confirm p { margin: 0; font-size: 13px; line-height: 1.6; color: #c3ccd6; }
+.invite-warn { padding: .7rem .9rem; background: var(--blpl-attention-bg); border: 1px solid var(--blpl-attention-edge); border-left: 4px solid var(--blpl-attention); border-radius: 8px; color: #ffd9c2 !important; }
+.invite-confirm input { background: #0f1115; color: #f2f5f8; border: 1px solid #414a57; border-radius: 8px; padding: .55rem .7rem; font: inherit; flex: 1; }

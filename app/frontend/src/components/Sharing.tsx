@@ -14,6 +14,11 @@ export function Sharing({ projectId }: { projectId: string }) {
   const [email, setEmail] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // The address the server said has no account, and the re-typed confirmation.
+  // Deliberately a separate field: re-typing is the point, so pre-filling it
+  // would turn a decision into a click-through.
+  const [needsAccount, setNeedsAccount] = useState<string | null>(null);
+  const [confirmEmail, setConfirmEmail] = useState("");
 
   const refresh = () =>
     getJSON<ProjectMembers>(`/api/projects/${projectId}/members`)
@@ -31,6 +36,33 @@ export function Sharing({ projectId }: { projectId: string }) {
     setBusy(true);
     try {
       await postJSON(`/api/projects/${projectId}/members`, { email });
+      setEmail("");
+      await refresh();
+    } catch (err) {
+      const message = (err as Error).message;
+      // The server refuses an unknown address rather than quietly taking the
+      // weaker path, so this is the branch into the confirmation screen.
+      if (message.includes("no account here yet")) {
+        setNeedsAccount(email.trim().toLowerCase());
+        setConfirmEmail("");
+      } else {
+        setError(message);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const sendToNewAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      await postJSON(`/api/projects/${projectId}/members`, {
+        email: confirmEmail,
+        confirmed_new_account: true,
+      });
+      setNeedsAccount(null);
       setEmail("");
       await refresh();
     } catch (err) {
@@ -61,6 +93,51 @@ export function Sharing({ projectId }: { projectId: string }) {
   };
 
   if (!data) return <section>{error ?? "Loading…"}</section>;
+
+  if (needsAccount !== null) {
+    return (
+      <section className="invite-confirm">
+        <h3>That address has no account here</h3>
+        <p>
+          The email address you entered does not have an account on this system.{" "}
+          <strong>Please enter the email address again.</strong> After you press{" "}
+          <strong>Send invitation</strong>, the invited person will get an email with a secure
+          link and directions on how to register and accept the project invitation.
+        </p>
+        <p className="invite-warn">
+          It is important to note that <strong>ANYONE WHO HAS THE LINK CAN USE IT</strong>, but
+          account creation will be limited to that specific email address, because they will have
+          to enter a verification code to register.{" "}
+          <strong>THE LINK WILL BE ACTIVE FOR 24 HOURS ONLY</strong>, so it is a good idea to let
+          the invited person know to accept it.
+        </p>
+        <form className="row" onSubmit={sendToNewAccount}>
+          <input
+            type="email"
+            autoFocus
+            placeholder="type the email address again"
+            value={confirmEmail}
+            onChange={(e) => setConfirmEmail(e.target.value)}
+          />
+          <button
+            type="submit"
+            disabled={busy || confirmEmail.trim().toLowerCase() !== needsAccount}
+          >
+            {busy ? "Sending…" : "Send invitation"}
+          </button>
+        </form>
+        {confirmEmail && confirmEmail.trim().toLowerCase() !== needsAccount && (
+          <div className="gate-hint">
+            That does not match <span className="mono">{needsAccount}</span>.
+          </div>
+        )}
+        {error && <div className="gate-error">{error}</div>}
+        <button className="link" onClick={() => setNeedsAccount(null)}>
+          ← Back
+        </button>
+      </section>
+    );
+  }
 
   return (
     <section>
