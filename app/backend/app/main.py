@@ -84,6 +84,7 @@ from . import (
     unlock as unlock_mod,
     userkey,
     users,
+    worktrees,
 )
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
@@ -628,11 +629,16 @@ def _project_dir(session: Session, user: User, project_id: str) -> Path:
     confirm it does, which is enough to enumerate other people's project names
     one guess at a time.
     """
-    _project_or_404(session, user, project_id)
+    project = _project_or_404(session, user, project_id)
     try:
-        d = projects.project_dir(project_id)
-    except ProjectError:
-        raise HTTPException(status_code=400, detail="invalid project id")
+        # Validates the name before it reaches the filesystem — the guard against
+        # ../ lives there, and a worktree path is built from the same name.
+        projects.project_dir(project_id)
+        d = worktrees.ensure(
+            PROJECTS_ROOT, project_id, user.id, is_owner=project.owner_id == user.id
+        )
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not d.is_dir():
         # Registered but not on disk: a real inconsistency rather than a
         # permission problem, and worth saying so instead of pretending it is
@@ -1031,6 +1037,12 @@ def remove_member(
     try:
         removed = projectacl.unshare(session, project, user_id)
         grants.revoke_grant(session, project, user_id)
+        # Their checkout goes; their branch stays. Being removed from a project
+        # should not also mean losing unmerged work.
+        try:
+            worktrees.remove(PROJECTS_ROOT, project.name, user_id)
+        except ProjectError as exc:
+            logger.warning("could not remove worktree for %s: %s", project.name, exc)
     except projectacl.NotTheOwner as exc:
         # Removing the owner would strand the project: nobody left who can
         # share it, delete it, or grant anyone else access.
@@ -1904,9 +1916,12 @@ def decide_proposal(
         raise HTTPException(status_code=400, detail="action must be 'accept' or 'reject'")
 
     project = _project_or_404(session, user, project_id)
+    # This user's runs only: their edit lands in their own worktree, so someone
+    # else's run cannot be disturbed by it.
     in_flight = session.scalar(
         select(Run).where(
             Run.project_id == project.id,
+            Run.user_id == user.id,
             Run.status.in_([runqueue.QUEUED, runqueue.RUNNING, runqueue.CANCELLING]),
         )
     )

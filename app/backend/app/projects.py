@@ -92,6 +92,13 @@ class Projects:
         dest.mkdir(parents=True)
         self._git(dest, "init", "-b", "main")
         self._ensure_identity(dest)
+        # An empty initial commit, so HEAD exists from the start. `git init`
+        # alone leaves an unborn HEAD, which reads as a repository right up until
+        # something asks it for a commit — and a worktree cannot be branched from
+        # a HEAD that points at nothing, so sharing a brand-new project failed
+        # with a git error nobody would connect to "it has never been committed".
+        # The docstring above always claimed this; now it is true.
+        self._git(dest, "commit", "--allow-empty", "-m", "Create project")
         return dest
 
     # -- sync ----------------------------------------------------------------

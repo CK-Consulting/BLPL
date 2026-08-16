@@ -52,8 +52,17 @@ INTERRUPTED = -1
 
 
 class RunActive(RuntimeError):
-    """The project already has a run in flight. Stages share .pipeline/, so a
-    second one would race the first over the same files."""
+    """This user already has a run in flight on this project.
+
+    Scoped per user, not per project, because each member now works in their own
+    git worktree — two people running stages on one project write to different
+    ``.pipeline/`` directories and cannot collide. Before worktrees this had to be
+    per project, and a colleague's stage 6 blocked yours: a lock standing in for
+    an isolation boundary that did not exist.
+
+    Still per user, because one person running two stages on their own checkout
+    would race themselves over the same files.
+    """
 
 
 @dataclass(frozen=True)
@@ -85,12 +94,14 @@ def enqueue(
     """
     active = session.scalar(
         select(Run).where(
-            Run.project_id == project.id, Run.status.in_([QUEUED, RUNNING, CANCELLING])
+            Run.project_id == project.id,
+            Run.user_id == (user.id if user else None),
+            Run.status.in_([QUEUED, RUNNING, CANCELLING]),
         )
     )
     if active is not None:
         raise RunActive(
-            f"project {project.name!r} already has a run in flight ({active.id}); "
+            f"you already have a run in flight on {project.name!r} ({active.id}); "
             "stop it or wait for it to finish"
         )
 
