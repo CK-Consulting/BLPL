@@ -113,6 +113,10 @@ The table above is for the **CLI**, which is single-user and reads its keys from
 your own environment. The hosted app works differently — keys there belong to a
 signed-in user; see "Provider API keys" below.
 
+Running the model on separate hardware — a Jetson AGX Thor, say — is covered
+in [`thor-runbook.md`](thor-runbook.md), including why BLPL itself has to stay
+on amd64.
+
 ## Signing in
 
 The app uses [Clerk](https://clerk.com) for authentication. The frontend gets
