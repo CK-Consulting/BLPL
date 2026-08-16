@@ -456,3 +456,14 @@ header .logo-lockup { font-size: 13px; }
 .invite-confirm p { margin: 0; font-size: 13px; line-height: 1.6; color: #c3ccd6; }
 .invite-warn { padding: .7rem .9rem; background: var(--blpl-attention-bg); border: 1px solid var(--blpl-attention-edge); border-left: 4px solid var(--blpl-attention); border-radius: 8px; color: #ffd9c2 !important; }
 .invite-confirm input { background: #0f1115; color: #f2f5f8; border: 1px solid #414a57; border-radius: 8px; padding: .55rem .7rem; font: inherit; flex: 1; }
+
+/* --- Passkeys --- */
+/* The passkey button leads on the unlock screen, so it carries the accent the
+   submit button would otherwise own. */
+.gate-passkey { width: 100%; background: #1b2b45; border: 1px solid #34507f; color: #cfe0ff; padding: .6rem; border-radius: 8px; font-size: 15px; cursor: pointer; }
+.gate-passkey:hover:not(:disabled) { background: #22385a; }
+.gate-or { text-align: center; color: #6b7280; font-size: 12px; margin: .1rem 0; }
+.passkey-list { margin: .5rem 0; }
+.passkey-list .chip { display: inline-flex; align-items: center; gap: .4rem; }
+.passkey-list .chip .link { color: #8b95a1; font-size: 15px; line-height: 1; }
+.passkey-list .chip .link:hover { color: #f0a0a0; }

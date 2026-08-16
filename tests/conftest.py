@@ -120,6 +120,11 @@ def sign_in_only(client, clerk_id: str = "user_test", email: str = "test@example
     return client
 
 
+# The passphrase every test account is created with. Named because the passkey
+# tests need to prove both slots open the same key.
+PASSPHRASE = "a-test-passphrase"
+
+
 def sign_in(client, clerk_id: str = "user_test", email: str = "test@example.com"):
     """Signed in, onboarded, and unlocked — what most tests mean by "in".
 
@@ -140,7 +145,7 @@ def sign_in(client, clerk_id: str = "user_test", email: str = "test@example.com"
     sign_in_only(client, clerk_id, email)
     with app.db.SessionFactory() as s:
         user = s.scalar(select(User).where(User.clerk_user_id == clerk_id))
-        master = profile_mod.set_passphrase(s, user, "a-test-passphrase")
+        master = profile_mod.set_passphrase(s, user, PASSPHRASE)
         # Onboarding creates this too: without a keypair there is no address for
         # anyone to seal a project key to, and sharing refuses.
         import app.grants as grants

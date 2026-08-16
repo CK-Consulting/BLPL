@@ -107,6 +107,14 @@ services:
       # Where an invitation email should point people. Falls back to nothing,
       # in which case the mail says to open the app rather than guessing a URL.
       - BLPL_PUBLIC_URL=${BLPL_PUBLIC_URL:-}
+      # Passkeys. The RP ID is the domain credentials are bound to, and the
+      # origin is what the browser must be served from — usually the same
+      # hostname with a scheme. Set both in production: if they are unset the
+      # server infers them from the request origin, which works but drops a
+      # defence-in-depth check, and changing the RP ID later invalidates every
+      # passkey already enrolled.
+      - BLPL_WEBAUTHN_RP_ID=${BLPL_WEBAUTHN_RP_ID:-}
+      - BLPL_WEBAUTHN_ORIGIN=${BLPL_WEBAUTHN_ORIGIN:-}
       #
       # The vars below are for kicad-happy features for pulling datasheet and quotes.
       # DigiKey authenticates with the two-legged client_credentials grant — the ID

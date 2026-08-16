@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { EndpointConfig, Settings as SettingsData, del, getJSON, putJSON } from "../api";
+import { PasskeyInfo, enrolPasskey, passkeysAvailable } from "../passkey";
 
 /**
  * Where you declare *where* requests go and *which job* each endpoint serves.
@@ -42,6 +43,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
           {error && <div className="gate-error">{error}</div>}
           <Endpoints data={data} onChanged={refresh} onError={setError} />
           <Routing data={data} onChanged={refresh} onError={setError} />
+          <Passkeys onError={setError} />
         </div>
       </div>
     </div>
@@ -349,6 +351,99 @@ function Routing({
           </div>
         );
       })}
+    </section>
+  );
+}
+
+
+// -- passkeys ----------------------------------------------------------------
+
+/**
+ * A second way to unlock, so the passphrase stops being a thing you type daily.
+ *
+ * The key material comes from the authenticator's PRF extension rather than
+ * from the signature — see app/backend/app/passkeys.py. What matters in this
+ * screen is what the copy tells the user: adding one is additive, and losing
+ * one costs nothing, because both slots open the same key.
+ */
+function Passkeys({ onError }: { onError: (msg: string | null) => void }) {
+  const [keys, setKeys] = useState<PasskeyInfo[] | null>(null);
+  const [label, setLabel] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = () => getJSON<PasskeyInfo[]>("/api/passkeys").then(setKeys).catch(() => {});
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  const add = async () => {
+    onError(null);
+    setBusy(true);
+    try {
+      await enrolPasskey(label.trim() || "Passkey");
+      setLabel("");
+      await refresh();
+    } catch (err) {
+      // Pressing Escape on the browser prompt is not an error worth shouting.
+      if ((err as Error).name !== "NotAllowedError") {
+        onError((err as Error).message || "Could not add that passkey.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (id: number) => {
+    onError(null);
+    try {
+      await del(`/api/passkeys/${id}`);
+      await refresh();
+    } catch (err) {
+      onError((err as Error).message);
+    }
+  };
+
+  if (!passkeysAvailable()) {
+    return (
+      <section>
+        <h3>Passkeys</h3>
+        <p className="muted small">
+          This browser does not support passkeys, so unlocking here uses your passphrase.
+        </p>
+      </section>
+    );
+  }
+
+  return (
+    <section>
+      <h3>Passkeys</h3>
+      <p className="muted small">
+        Unlock with Touch ID, Windows Hello or a security key instead of typing your
+        passphrase. Your passphrase keeps working either way — both open the same key, so
+        adding a passkey is safe and losing one locks you out of nothing.
+      </p>
+      {keys && keys.length > 0 && (
+        <ul className="chip-row passkey-list">
+          {keys.map((k) => (
+            <li key={k.id} className="chip">
+              🔑 {k.label}
+              <button className="link" onClick={() => remove(k.id)} title="Remove this passkey">
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="row">
+        <input
+          placeholder="Name this device (optional)"
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+        />
+        <button disabled={busy} onClick={add}>
+          {busy ? "Waiting for your key…" : "Add a passkey"}
+        </button>
+      </div>
     </section>
   );
 }

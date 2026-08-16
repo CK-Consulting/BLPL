@@ -30,3 +30,9 @@ alembic==1.14.0
 # checks the JWT against Clerk's published JWKS itself; PyJWT's crypto extra
 # brings the RSA verification that needs.
 pyjwt[crypto]==2.10.1
+# WebAuthn ceremonies for the passkey unlock slot (app/passkeys.py). Signature
+# verification and CBOR attestation parsing are exactly the kind of
+# security-critical parsing not to hand-roll. Note the library does not model the
+# PRF extension — PRF is a client extension whose output never reaches a server
+# in verifiable form — so app/passkeys.py adds that block to the options itself.
+webauthn==3.0.0

@@ -14,6 +14,7 @@ for a different reason. None of them makes the one below unnecessary.
 |---|---|---|
 | Full-volume encryption (**you**, at the OS) | A drive leaving the building | Anything while the machine is running |
 | Per-user secrets (§ Provider keys) | A stolen database | An operator on a live server |
+| Passkey unlock (§ Unlocking with a passkey) | Guessed, reused or keylogged passphrases | An operator on a live server |
 | Per-project keys (§ Sharing) | One member reading another's project | A member reading their own |
 | Sealed workspaces (§ Storage at rest) | Backups, snapshots, a stolen disk | A project someone has open |
 
@@ -126,12 +127,51 @@ is not a check being skipped: a client only learns a project is sealed by asking
 for it, so the intent is already established, and the key is in the session
 either way. A second click would add friction and no security.
 
+## Unlocking with a passkey
+
+Clerk proves who you are; a touch proves it is still you at this keyboard and
+produces the key material. Two factors doing two different jobs, rather than one
+prompt asked twice.
+
+**The key does not come from the signature.** A WebAuthn assertion proves
+possession and produces no secret — which is exactly why an SSO login cannot
+open an encrypted vault on its own. It comes from the **PRF extension**: the
+authenticator evaluates a pseudo-random function over a stored salt and returns
+32 bytes, stable for that credential, that salt and this relying party, existing
+nowhere until someone touches the key.
+
+```
+touch ──▶ authenticator ──▶ PRF(salt) ──HKDF──▶ KEK ──unwrap──▶ master key
+```
+
+The salt is stored in the clear. It selects which key, it is not the secret.
+
+**Both slots open the same master key.** A passphrase and a passkey are two
+doors to one key, not two keys — so adding a passkey re-encrypts nothing, losing
+one locks you out of nothing, and you cannot delete your way out of your own
+data. Removing your last passkey is therefore allowed.
+
+**The PRF output crosses the wire.** The browser posts those 32 bytes to the
+server, which derives the KEK and unwraps. That is the same trust model the
+passphrase already has, for the same unavoidable reason: stage runs are
+server-side subprocesses that need the key. What the passkey improves is real
+but narrower than it looks — the secret is hardware-generated rather than
+human-chosen, it is bound to this relying party so a phishing origin cannot
+obtain it, and it cannot be shoulder-surfed or keylogged. What it does not
+change: an operator of a running server still sees the key in memory.
+
+Assertions are verified against a stored public key with a server-issued
+challenge that is burned on use. Strictly, the AES-GCM tag is what protects the
+master key — a forged assertion yields no PRF output, so the unwrap fails
+regardless — but checking the signature stops the endpoint being a free oracle
+and stops a captured request being replayed.
+
+Set `BLPL_WEBAUTHN_RP_ID` and `BLPL_WEBAUTHN_ORIGIN`. Unset, the server infers
+them from the request origin, which works and drops a defence-in-depth check.
+**Changing the RP ID invalidates every enrolled passkey** — pick it once.
+
 ## Known gaps
 
-* **The PRF (passkey) wrapping slot exists in the schema; the WebAuthn ceremony
-  is not built.** The intent is Cloudflare-style step-up — sign in with Clerk,
-  then touch a key — so the passphrase becomes the recovery path rather than the
-  daily one.
 * **A stuck run blocks sealing.** A run whose worker died is reclaimed after its
   heartbeat goes stale, but while it is queued the project stays open. This fails
   in the safe direction — files intact, not encrypted — and is worth knowing.

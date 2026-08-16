@@ -15,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     LargeBinary,
     String,
     UniqueConstraint,
@@ -178,6 +179,15 @@ class UserKeyCredential(Base):
     label: Mapped[str] = mapped_column(String(128), default="")
     # Base64url of the WebAuthn credential id.
     credential_id: Mapped[str] = mapped_column(String(512))
+    # COSE public key from registration, for verifying later assertions. Not
+    # what protects the master key — a forged assertion yields no PRF output, so
+    # the unwrap fails regardless — but checking the signature stops this
+    # endpoint being a free oracle.
+    public_key: Mapped[bytes] = mapped_column(LargeBinary, default=b"")
+    # The authenticator's signature counter. Zero forever on most platform
+    # authenticators, which is legitimate; it only detects cloning for the ones
+    # that implement it.
+    sign_count: Mapped[int] = mapped_column(Integer, default=0)
     prf_salt: Mapped[bytes] = mapped_column(LargeBinary(32))
     nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary)

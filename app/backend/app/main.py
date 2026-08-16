@@ -31,6 +31,7 @@ way back in.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -71,6 +72,7 @@ from . import (
     grants,
     importer,
     keystore,
+    passkeys,
     llmconfig,
     llm_resolver,
     mailer,
@@ -92,6 +94,7 @@ from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, Run, User
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
+from .vault import VaultError
 from .references import (
     FilesystemSandbox,
     Reference,
@@ -451,10 +454,22 @@ def auth_unlock(
         raise HTTPException(status_code=401, detail="wrong passphrase")
     except profile_mod.NotSetUp as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    # Also here, so accounts that onboarded before keypairs existed acquire one
-    # the next time they unlock rather than needing a migration that could not
-    # have run — sealing a private key needs a master key, which a migration
-    # never has.
+    _open_session(session, request, user, master_key)
+    return {"unlocked": True}
+
+
+def _open_session(session: Session, request: Request, user: User, master_key: bytes) -> None:
+    """Everything that must happen when a session gains a master key.
+
+    One function because there are now two doors into it — passphrase and
+    passkey — and the backfills below are the kind of thing that gets added to
+    whichever door the author was looking at. A passkey unlock that skipped them
+    would leave an account without a keypair, which surfaces much later as a
+    colleague being told they cannot be shared with.
+    """
+    # Accounts that onboarded before keypairs existed acquire one the next time
+    # they unlock, rather than needing a migration that could not have run —
+    # sealing a private key needs a master key, which a migration never has.
     grants.ensure_keypair(session, user, master_key)
     # Projects that predate per-project keys get one here, for the same reason
     # the keypair does: this is the first moment a master key exists.
@@ -465,7 +480,183 @@ def auth_unlock(
         unlock_mod.session_key_for(user.clerk_user_id, getattr(request.state, "clerk_claims", {})),
         master_key,
     )
+
+
+# --- Passkeys -----------------------------------------------------------------
+#
+# The ceremony is two round trips by design: the server issues a challenge, the
+# authenticator signs it, the server checks the one it issued. Anything shorter
+# is replayable.
+#
+# Challenges live in this process (see passkeys.Challenges) keyed by Clerk
+# session, so two browsers can be part-way through their own ceremonies without
+# colliding.
+
+challenges = passkeys.Challenges()
+
+
+def _ceremony_key(request: Request, user: User) -> str:
+    return unlock_mod.session_key_for(
+        user.clerk_user_id, getattr(request.state, "clerk_claims", {})
+    )
+
+
+def _relying_party(request: Request) -> passkeys.RelyingParty:
+    try:
+        return passkeys.relying_party(request.headers.get("origin", ""))
+    except passkeys.PasskeyError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/passkeys")
+def list_passkeys(
+    user: User = Depends(require_user), session: Session = Depends(session_scope)
+) -> list[dict]:
+    return [
+        {
+            "id": c.id,
+            "label": c.label or "Passkey",
+            "created_at": _iso(c.created_at),
+        }
+        for c in passkeys.list_for(session, user)
+    ]
+
+
+class PasskeyRegisterBegin(BaseModel):
+    label: str = ""
+
+
+@app.post("/api/passkeys/register/begin")
+def passkey_register_begin(
+    request: Request,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Options for creating a passkey.
+
+    Requires an unlocked session, and that is the whole security of enrolment:
+    the new credential wraps the master key, so whoever adds one must already be
+    able to produce it. Signing in with Clerk alone cannot enrol a key.
+    """
+    rp = _relying_party(request)
+    options, challenge = passkeys.registration_options(
+        user, passkeys.list_for(session, user), rp
+    )
+    salt = base64.urlsafe_b64decode(options["extensions"]["prf"]["eval"]["first"] + "==")
+    challenges.issue(_ceremony_key(request, user), challenge, salt)
+    return options
+
+
+class PasskeyRegisterFinish(BaseModel):
+    credential: dict
+    # Base64url of the authenticator's PRF output. See app/passkeys.py for why
+    # this crosses the wire at all: the same reason the passphrase does.
+    prf_output: str
+    label: str = ""
+
+
+@app.post("/api/passkeys/register/finish")
+def passkey_register_finish(
+    body: PasskeyRegisterFinish,
+    request: Request,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    rp = _relying_party(request)
+    try:
+        pending = challenges.take(_ceremony_key(request, user))
+        row = passkeys.register(
+            session,
+            user,
+            body.credential,
+            _b64url(body.prf_output),
+            master_key,
+            pending.challenge,
+            pending.salt or b"",
+            rp,
+            body.label,
+        )
+    except passkeys.PasskeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "id": row.id, "label": row.label or "Passkey"}
+
+
+@app.post("/api/passkeys/auth/begin")
+def passkey_auth_begin(
+    request: Request,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Options for unlocking with a passkey.
+
+    Deliberately behind Clerk like every other route: this is the second factor,
+    not the first, and it answers "which credentials does this account have" —
+    which is not a question an anonymous caller gets to ask.
+    """
+    rp = _relying_party(request)
+    try:
+        options, challenge = passkeys.authentication_options(
+            passkeys.list_for(session, user), rp
+        )
+    except passkeys.NoPasskeys as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    challenges.issue(_ceremony_key(request, user), challenge)
+    return options
+
+
+class PasskeyAuthFinish(BaseModel):
+    credential: dict
+    prf_output: str
+
+
+@app.post("/api/passkeys/auth/finish")
+def passkey_auth_finish(
+    body: PasskeyAuthFinish,
+    request: Request,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
+) -> dict:
+    try:
+        pending = challenges.take(_ceremony_key(request, user))
+        master_key = passkeys.authenticate(
+            session, user, body.credential, _b64url(body.prf_output), pending.challenge, rp=_relying_party(request)
+        )
+    except passkeys.PasskeyError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except VaultError as exc:
+        # The unwrap failed: a verified assertion whose PRF output does not open
+        # the blob. Re-registering the key is the fix, so say that rather than
+        # "wrong passkey".
+        raise HTTPException(
+            status_code=401,
+            detail=f"{exc} — remove this passkey and add it again",
+        )
+    _open_session(session, request, user, master_key)
     return {"unlocked": True}
+
+
+@app.delete("/api/passkeys/{credential_row_id}")
+def delete_passkey(
+    credential_row_id: int,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Removing the last passkey is allowed — the passphrase slot always exists,
+    so nobody can delete their way out of their own data."""
+    if not passkeys.forget(session, user, credential_row_id):
+        raise HTTPException(status_code=404, detail="no such passkey")
+    return {"ok": True}
+
+
+def _b64url(value: str) -> bytes:
+    """Decode base64url from the browser, which omits padding."""
+    padding = "=" * (-len(value) % 4)
+    try:
+        return base64.urlsafe_b64decode(value + padding)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"malformed base64url: {exc}")
 
 
 @app.post("/api/auth/lock")
