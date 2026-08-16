@@ -67,6 +67,7 @@ from . import (
     appconfig,
     chat as chat_mod,
     clerk_auth,
+    grants,
     importer,
     keystore,
     llmconfig,
@@ -83,7 +84,7 @@ from . import (
 )
 from .appconfig import AppConfig
 from .db import session_scope
-from .models import Project, User
+from .models import Project, ProjectInvitation, User
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
 from .references import (
@@ -380,6 +381,11 @@ def complete_onboarding(
     if info.needs_key:
         keystore.put(session, master_key, user, endpoint_name, body.api_key)
 
+    # The address other people seal project keys to. Made here rather than on
+    # first use because "has finished setting up" and "can be shared with"
+    # should be the same state — otherwise an owner is told their colleague has
+    # not finished, when from that colleague's side everything looks done.
+    grants.ensure_keypair(session, user, master_key)
     profile_mod.mark_complete(session, user)
     unlocked.put(
         unlock_mod.session_key_for(user.clerk_user_id, getattr(request.state, "clerk_claims", {})),
@@ -390,7 +396,10 @@ def complete_onboarding(
 
 @app.post("/api/auth/unlock")
 def auth_unlock(
-    body: PassphraseBody, request: Request, user: User = Depends(require_user)
+    body: PassphraseBody,
+    request: Request,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
 ) -> dict:
     """Open this session with the encryption passphrase."""
     try:
@@ -399,6 +408,16 @@ def auth_unlock(
         raise HTTPException(status_code=401, detail="wrong passphrase")
     except profile_mod.NotSetUp as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Also here, so accounts that onboarded before keypairs existed acquire one
+    # the next time they unlock rather than needing a migration that could not
+    # have run — sealing a private key needs a master key, which a migration
+    # never has.
+    grants.ensure_keypair(session, user, master_key)
+    # Projects that predate per-project keys get one here, for the same reason
+    # the keypair does: this is the first moment a master key exists.
+    touched = grants.backfill_for_owner(session, user, master_key)
+    if touched:
+        logger.info("minted or completed project keys for %d project(s)", touched)
     unlocked.put(
         unlock_mod.session_key_for(user.clerk_user_id, getattr(request.state, "clerk_claims", {})),
         master_key,
@@ -700,6 +719,7 @@ def clone_project(
     body: CloneBody,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> dict:
     """Clone a remote into a new working copy, owned by whoever cloned it."""
     _refuse_taken_name(session, body.name)
@@ -707,7 +727,8 @@ def clone_project(
         projects.clone(body.name, body.remote, body.branch)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    projectacl.create(session, user, body.name, remote=body.remote, branch=body.branch)
+    project = projectacl.create(session, user, body.name, remote=body.remote, branch=body.branch)
+    grants.create_project_key(session, project, user, master_key)
     return {"ok": True, "id": body.name}
 
 
@@ -720,6 +741,7 @@ def init_project(
     body: InitBody,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> dict:
     """Create a new, empty, local git project, owned by its creator."""
     _refuse_taken_name(session, body.name)
@@ -727,7 +749,8 @@ def init_project(
         projects.init_local(body.name)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    projectacl.create(session, user, body.name)
+    project = projectacl.create(session, user, body.name)
+    grants.create_project_key(session, project, user, master_key)
     return {"ok": True, "id": body.name}
 
 
@@ -795,6 +818,7 @@ def add_member(
     background: BackgroundTasks,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> dict:
     """Share a project with someone, by the email their account signed in with.
 
@@ -818,10 +842,25 @@ def add_member(
         )
     if target.id == user.id:
         raise HTTPException(status_code=400, detail="you already own this project")
+    if grants.public_key_of(session, target) is None:
+        # They have an account but have never unlocked, so there is no address to
+        # send the key to. Refused now with the reason, rather than accepted and
+        # then failing silently when they try to open the project.
+        raise HTTPException(
+            status_code=409,
+            detail=f"{target.email} has not finished setting up their encryption yet",
+        )
     try:
         invitation = projectacl.invite(session, project, user, target)
     except projectacl.AlreadyAMember:
         raise HTTPException(status_code=409, detail=f"{target.email} can already open this project")
+
+    # Wrapped now, while the owner is unlocked and present. This is what lets the
+    # invitee accept tomorrow without needing the owner back: the key is already
+    # sealed to them, waiting behind a membership row they do not yet have.
+    if grants.has_key(session, project):
+        project_key = grants.project_key_for(session, project, user, master_key)
+        grants.grant_to(session, project, target, project_key)
     # Sent in the background, and failure is logged rather than raised. A relay
     # being briefly unreachable must not roll back the invitation the owner just
     # made — they would see an error and assume nothing happened, while the
@@ -858,6 +897,7 @@ def remove_member(
         raise HTTPException(status_code=403, detail="only the owner can change who has access")
     try:
         removed = projectacl.unshare(session, project, user_id)
+        grants.revoke_grant(session, project, user_id)
     except projectacl.NotTheOwner as exc:
         # Removing the owner would strand the project: nobody left who can
         # share it, delete it, or grant anyone else access.
@@ -879,7 +919,16 @@ def revoke_invitation(
         raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
     except projectacl.NotTheOwner:
         raise HTTPException(status_code=403, detail="only the owner can withdraw an invitation")
-    return {"ok": True, "revoked": projectacl.revoke(session, project, invitation_id)}
+    revoked = projectacl.revoke(session, project, invitation_id)
+    if revoked:
+        # The wrapped key went out with the invitation; withdrawing it has to take
+        # that back too, or a declined invitee still holds a readable copy.
+        invitee_id = session.scalar(
+            select(ProjectInvitation.invitee_id).where(ProjectInvitation.id == invitation_id)
+        )
+        if invitee_id is not None:
+            grants.revoke_grant(session, project, invitee_id)
+    return {"ok": True, "revoked": revoked}
 
 
 @app.get("/api/invitations")
@@ -926,9 +975,12 @@ def decline_invitation(
     session: Session = Depends(session_scope),
 ) -> dict:
     try:
-        projectacl.decline(session, user, invitation_id)
+        project = projectacl.decline(session, user, invitation_id)
     except projectacl.NoSuchInvitation:
         raise HTTPException(status_code=404, detail="no invitation waiting for you")
+    # Give back the key that came with the offer. Saying no should leave you with
+    # no more than you had before it arrived.
+    grants.revoke_grant(session, project, user.id)
     return {"ok": True}
 
 
@@ -938,6 +990,7 @@ async def import_project(
     files: list[UploadFile] = File(...),
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> dict:
     """Bring an existing design into the app from the browser: a selection of
     files, or a single .zip of the project folder. The server creates a local
@@ -988,7 +1041,8 @@ async def import_project(
         shutil.rmtree(dest, ignore_errors=True)
         raise
 
-    projectacl.create(session, user, name)
+    project = projectacl.create(session, user, name)
+    grants.create_project_key(session, project, user, master_key)
     return {
         "ok": True,
         "id": name,

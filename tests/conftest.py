@@ -140,6 +140,11 @@ def sign_in(client, clerk_id: str = "user_test", email: str = "test@example.com"
     with app.db.SessionFactory() as s:
         user = s.scalar(select(User).where(User.clerk_user_id == clerk_id))
         master = profile_mod.set_passphrase(s, user, "a-test-passphrase")
+        # Onboarding creates this too: without a keypair there is no address for
+        # anyone to seal a project key to, and sharing refuses.
+        import app.grants as grants
+
+        grants.ensure_keypair(s, user, master)
         profile_mod.mark_complete(s, user)
         s.commit()
     # The stub verifier returns no claims, so there is no sid and the session key

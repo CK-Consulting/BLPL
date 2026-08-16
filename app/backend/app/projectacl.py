@@ -236,13 +236,19 @@ def accept(session: Session, user: User, invitation_id: int) -> Project:
     return row.project
 
 
-def decline(session: Session, user: User, invitation_id: int) -> None:
+def decline(session: Session, user: User, invitation_id: int) -> Project:
     """Turn one down. Recorded rather than deleted, so the answer is remembered
-    and the same invitation is not quietly re-offered on a loop."""
+    and the same invitation is not quietly re-offered on a loop.
+
+    Returns the project so the caller can take back the wrapped key that went
+    out with the invitation — declining must give up the means as well as the
+    offer, or someone who said no still holds a readable copy.
+    """
     row = _live_invitation(session, user, invitation_id)
     row.status = DECLINED
     row.responded_at = _now()
     session.flush()
+    return row.project
 
 
 def revoke(session: Session, project: Project, invitation_id: int) -> bool:

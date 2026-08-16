@@ -77,6 +77,9 @@ class User(Base):
     memberships: Mapped[list["ProjectMember"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    keypair: Mapped["UserKeypair | None"] = relationship(
+        back_populates="user", cascade="all, delete-orphan", uselist=False
+    )
 
 
 class ProviderKey(Base):
@@ -346,3 +349,65 @@ class ProjectInvitation(Base):
     project: Mapped[Project] = relationship()
     invitee: Mapped[User] = relationship(foreign_keys=[invitee_id])
     invited_by: Mapped[User] = relationship(foreign_keys=[invited_by_id])
+
+
+class UserKeypair(Base):
+    """One user's X25519 keypair — the address others can send them a key at.
+
+    The public half is stored in the clear, deliberately: it is what makes it
+    possible to grant somebody access while they are offline. The private half is
+    sealed under that user's master key, so it is readable only while they have
+    an unlocked session, exactly like their provider keys.
+
+    Symmetric crypto alone could not do this. Granting would need both people
+    unlocked at the same instant — the owner to read the project key, the
+    recipient to have theirs derived — which makes "invite now, accept tomorrow"
+    impossible.
+    """
+
+    __tablename__ = "user_keypair"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    public_key: Mapped[bytes] = mapped_column(LargeBinary(32))
+    private_nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
+    private_ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    user: Mapped[User] = relationship(back_populates="keypair")
+
+
+class ProjectKeyGrant(Base):
+    """One project's key, wrapped for one member.
+
+    Every grant for a project wraps the *same* key — that is what makes a shared
+    project readable by several people without re-encrypting anything when the
+    membership changes. Adding a member is an INSERT here; removing one is a
+    DELETE.
+
+    Removing a grant does not make already-copied data unreadable, and nothing
+    here pretends otherwise: someone who held the project key can have kept it.
+    What it does is stop them getting the *next* version. Rotating the project
+    key after a removal is the stronger answer and is deliberately not automatic,
+    because it means rewriting every encrypted artefact.
+    """
+
+    __tablename__ = "project_key_grant"
+    __table_args__ = (
+        UniqueConstraint("project_id", "user_id", name="uq_grant_project_user"),
+        Index("ix_grant_user", "user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("project.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # The sealed-box ephemeral public key. Fresh per grant, so two grants of one
+    # project key look unrelated.
+    ephemeral_public: Mapped[bytes] = mapped_column(LargeBinary(32))
+    nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    project: Mapped[Project] = relationship()
+    user: Mapped[User] = relationship()
