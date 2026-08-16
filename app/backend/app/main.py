@@ -84,6 +84,7 @@ from . import (
     unlock as unlock_mod,
     userkey,
     users,
+    workspace,
     worktrees,
 )
 from .appconfig import AppConfig
@@ -122,7 +123,39 @@ async def _lifespan(_app: FastAPI):
             "Back it up separately from the database; together they are the lock and its key.",
             key_path,
         )
-    yield
+    sweeper = asyncio.create_task(_seal_idle_workspaces())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+
+
+async def _seal_idle_workspaces() -> None:
+    """Seal workspaces nobody has touched for a while.
+
+    The other half of the answer to "when does it re-seal". Locking covers the
+    people who say they are done; this covers the far more common case of
+    closing a laptop without saying anything, which would otherwise leave a
+    project decrypted until someone came back to it.
+
+    Runs here rather than in a worker because the key lives here: an open
+    workspace's key is held in this process, and a worker has no way to obtain
+    one.
+    """
+    while True:
+        try:
+            await asyncio.sleep(60)
+            idle = workspaces.idle()
+            if not idle:
+                continue
+            with SessionFactory() as session:
+                for entry in idle:
+                    _seal_workspace(session, entry.workspace)
+                session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a sweep that fails must not stop the next
+            logger.exception("idle workspace sweep failed")
 
 
 app = FastAPI(title="BLPL", version="0.5.0", lifespan=_lifespan)
@@ -139,6 +172,9 @@ projects = Projects(PROJECTS_ROOT)
 # restart drops them, which is the correct behaviour for derived key
 # material — see app/unlock.py.
 unlocked = unlock_mod.Unlocked()
+# Which project workspaces are currently unsealed, and the key that will seal
+# them again. In this process because the key must be: see app/workspace.py.
+workspaces = workspace.Registry()
 # Run history is plaintext facts-about-what-happened, deliberately NOT in
 # vault.db — that file's contract is "a dump of it is a dump of ciphertext".
 # Kept only for chat tool-call history, which is written by the API process
@@ -433,14 +469,28 @@ def auth_unlock(
 
 
 @app.post("/api/auth/lock")
-def auth_lock(request: Request, user: User = Depends(require_user)) -> dict:
+def auth_lock(
+    request: Request,
+    user: User = Depends(require_user),
+    session: Session = Depends(session_scope),
+) -> dict:
     """Forget this session's key without signing out of Clerk. Two separate
     things: you can be signed in and locked, which is the state after a server
     restart."""
     unlocked.drop(
         unlock_mod.session_key_for(user.clerk_user_id, getattr(request.state, "clerk_claims", {}))
     )
-    return {"unlocked": False}
+    # Locking says "I am done", so the workspaces this user could reach go back
+    # to sealed. Only the ones nobody else is in: a project open because a
+    # colleague is working on it is not yours to close.
+    sealed = []
+    for project in projectacl.visible(session, user):
+        # release() is false while a colleague is still in there — one project is
+        # one directory tree shared by its members, so sealing on your lock alone
+        # would delete the files out from under them mid-edit.
+        if workspaces.release(project.name, user.id) and _seal_workspace(session, project.name):
+            sealed.append(project.name)
+    return {"unlocked": False, "sealed": sealed}
 
 
 @app.get("/api/auth/lock-state")
@@ -630,6 +680,14 @@ def _project_dir(session: Session, user: User, project_id: str) -> Path:
     one guess at a time.
     """
     project = _project_or_404(session, user, project_id)
+    if workspace.is_sealed(PROJECTS_ROOT, project_id):
+        # Encrypted at rest and nobody has opened it. Not an error and not a
+        # permission problem — 423 so the client offers to open it rather than
+        # reporting a project that appears to have vanished.
+        raise HTTPException(
+            status_code=423, detail=f"{project_id!r} is sealed; open it to decrypt it"
+        )
+    workspaces.touch(project_id, user.id)
     try:
         # Validates the name before it reaches the filesystem — the guard against
         # ../ lives there, and a worktree path is built from the same name.
@@ -714,17 +772,24 @@ def list_projects(
     out = []
     for project in projectacl.visible(session, user):
         d = PROJECTS_ROOT / project.name
-        if not d.is_dir():
+        sealed = workspace.is_sealed(PROJECTS_ROOT, project.name)
+        if not d.is_dir() and not sealed:
             continue  # registered but no working copy; not this endpoint's problem
         pipeline = d / ".pipeline"
         out.append(
             {
                 "id": project.name,
-                "markdown_files": len(list(d.glob("*.md"))),
-                "has_schematic": _latest(pipeline, ".kicad_sch") is not None,
-                "has_pcb": _latest(pipeline, ".kicad_pcb") is not None,
-                "is_git": (d / ".git").is_dir(),
-                "fab": _fab_readiness(pipeline),
+                # A sealed project is encrypted, not gone, and it must keep its
+                # place in the list — skipping it made "seal" look like "delete"
+                # to anyone watching the dashboard. What is unknown while sealed
+                # is reported as unknown rather than as absent: reading these
+                # would mean decrypting, which is exactly what has not happened.
+                "sealed": sealed,
+                "markdown_files": None if sealed else len(list(d.glob("*.md"))),
+                "has_schematic": None if sealed else _latest(pipeline, ".kicad_sch") is not None,
+                "has_pcb": None if sealed else _latest(pipeline, ".kicad_pcb") is not None,
+                "is_git": None if sealed else (d / ".git").is_dir(),
+                "fab": None if sealed else _fab_readiness(pipeline),
                 "owned": project.owner_id == user.id,
                 "shared_with": len(project.members) - 1,
             }
@@ -763,6 +828,10 @@ def dashboard(
                 "id": project.name,
                 "owned": project.owner_id == user.id,
                 "members": len(project.members),
+                # Sealed reads as an ordinary state here — a project waiting to
+                # be opened, with a lock on the card rather than a row of zeroes
+                # that would suggest an empty project.
+                "sealed": workspace.is_sealed(PROJECTS_ROOT, project.name),
                 "markdown_files": len(list(d.glob("*.md"))) if exists else 0,
                 "has_schematic": exists and _latest(pipeline, ".kicad_sch") is not None,
                 "has_pcb": exists and _latest(pipeline, ".kicad_pcb") is not None,
@@ -809,7 +878,11 @@ def clone_project(
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     project = projectacl.create(session, user, body.name, remote=body.remote, branch=body.branch)
-    grants.create_project_key(session, project, user, master_key)
+    workspaces.note_open(
+        project.name, PROJECTS_ROOT / project.name,
+        grants.create_project_key(session, project, user, master_key),
+        user.id,
+    )
     activity.record(session, project, user, activity.IMPORTED, f"cloned from {body.remote}")
     return {"ok": True, "id": body.name}
 
@@ -832,7 +905,11 @@ def init_project(
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     project = projectacl.create(session, user, body.name)
-    grants.create_project_key(session, project, user, master_key)
+    workspaces.note_open(
+        project.name, PROJECTS_ROOT / project.name,
+        grants.create_project_key(session, project, user, master_key),
+        user.id,
+    )
     activity.record(session, project, user, activity.IMPORTED, "created empty")
     return {"ok": True, "id": body.name}
 
@@ -843,6 +920,84 @@ class ShareBody(BaseModel):
     # address again. Without it, an unknown address is refused with a 404 so the
     # confirmation cannot be skipped by a client that forgets to ask.
     confirmed_new_account: bool = False
+
+
+@app.post("/api/projects/{project_id}/open")
+def open_project(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Decrypt a project's files so they can be worked on.
+
+    A deliberate act, and the only route that needs the project key: once a
+    workspace is open, every other route reads ordinary files. That is what keeps
+    the master key out of twenty-eight signatures.
+    """
+    project = _project_or_404(session, user, project_id)
+    if not workspace.is_sealed(PROJECTS_ROOT, project_id):
+        workspaces.touch(project_id, user.id)
+        return {"ok": True, "already_open": True}
+
+    try:
+        project_key = grants.project_key_for(session, project, user, master_key)
+    except grants.NoGrant:
+        # A member without a wrapped copy — possible for a project that predates
+        # the key machinery, and worth naming rather than failing to decrypt.
+        raise HTTPException(
+            status_code=409,
+            detail="you have no key for this project; ask its owner to re-share it",
+        )
+    try:
+        workspace.unseal(PROJECTS_ROOT, project_id, project_key)
+    except workspace.WorkspaceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    workspaces.note_open(project_id, PROJECTS_ROOT / project_id, project_key, user.id)
+    activity.record(session, project, user, activity.OPENED, "")
+    return {"ok": True, "already_open": False}
+
+
+@app.post("/api/projects/{project_id}/seal")
+def seal_project(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Put a project back to sealed now, rather than waiting for the timeout."""
+    _project_or_404(session, user, project_id)
+    return {"ok": True, "sealed": _seal_workspace(session, project_id)}
+
+
+def _seal_workspace(session: Session, project_id: str) -> bool:
+    """Seal one workspace, unless something is still using it.
+
+    Refuses while a run is in flight, and that is not politeness: the worker is
+    another container reading those files, and sealing would delete the project
+    out from under a stage mid-write.
+    """
+    key = workspaces.key_for(project_id)
+    if key is None:
+        return False
+    project = session.scalar(select(Project).where(Project.name == project_id))
+    if project is not None:
+        busy = session.scalar(
+            select(Run).where(
+                Run.project_id == project.id,
+                Run.status.in_([runqueue.QUEUED, runqueue.RUNNING, runqueue.CANCELLING]),
+            )
+        )
+        if busy is not None:
+            return False
+    try:
+        size = workspace.seal(PROJECTS_ROOT, project_id, key)
+    except workspace.WorkspaceError as exc:
+        logger.warning("could not seal %s: %s", project_id, exc)
+        return False
+    workspaces.forget(project_id)
+    logger.info("sealed %s (%d bytes)", project_id, size)
+    return True
 
 
 @app.get("/api/projects/{project_id}/members")
@@ -1260,7 +1415,11 @@ async def import_project(
         raise
 
     project = projectacl.create(session, user, name)
-    grants.create_project_key(session, project, user, master_key)
+    workspaces.note_open(
+        project.name, PROJECTS_ROOT / project.name,
+        grants.create_project_key(session, project, user, master_key),
+        user.id,
+    )
     activity.record(session, project, user, activity.IMPORTED, f"{len(imported)} files uploaded")
     return {
         "ok": True,

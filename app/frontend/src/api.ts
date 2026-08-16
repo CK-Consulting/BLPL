@@ -20,9 +20,9 @@ export function setLockedHandler(fn: () => void) {
   onLocked = fn;
 }
 
-async function request(path: string, init?: RequestInit): Promise<Response> {
+async function send(path: string, init?: RequestInit): Promise<Response> {
   const token = await getToken();
-  const res = await fetch(path, {
+  return fetch(path, {
     ...init,
     // Same-origin in prod (nginx) and dev (Vite proxy). The __session cookie
     // rides along too and the backend accepts either, but the explicit header
@@ -36,6 +36,30 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
       ...init?.headers,
     },
   });
+}
+
+async function request(path: string, init?: RequestInit): Promise<Response> {
+  let res = await send(path, init);
+
+  // 423: the project's files are encrypted at rest and nobody has them open.
+  // Decrypt and retry, rather than showing an error or a "decrypt" button.
+  //
+  // This is not skipping a check. A 423 only ever arrives in response to a
+  // request the user just made *to that project*, so the intent is already
+  // established, and the key that opens it is in their session either way — a
+  // second click would add friction and no security. Sealing protects a stolen
+  // disk, not a signed-in user asking for their own files, and the UI should
+  // say the same thing the threat model does.
+  if (res.status === 423) {
+    const project = path.match(/^\/api\/projects\/([^/]+)/)?.[1];
+    // Once. A second 423 means opening did not work, and retrying in a loop
+    // would turn one bad state into a request storm.
+    if (project && !path.endsWith("/open")) {
+      const opened = await send(`/api/projects/${project}/open`, { method: "POST" });
+      if (opened.ok) res = await send(path, init);
+    }
+  }
+
   // 401 anywhere means the session is gone — surface it once, centrally, and
   // let the gate show the sign-in.
   if (res.status === 401) onLocked();
@@ -196,10 +220,16 @@ export type FabReadiness = {
 
 export type Project = {
   id: string;
-  markdown_files: number;
-  has_schematic: boolean;
-  has_pcb: boolean;
-  is_git: boolean;
+  /** Encrypted at rest, with nobody in it. */
+  sealed: boolean;
+  /** Null while sealed, and typed that way on purpose: answering these would
+   *  mean decrypting the project, which is precisely what has not happened.
+   *  Typing them as numbers and sending zeroes would describe every sealed
+   *  project as an empty one. */
+  markdown_files: number | null;
+  has_schematic: boolean | null;
+  has_pcb: boolean | null;
+  is_git: boolean | null;
   fab: FabReadiness | null;
   /** You own it, as opposed to it having been shared with you. Only the owner
    *  can change who has access. */
@@ -224,6 +254,10 @@ export type DashboardProject = {
   id: string;
   owned: boolean;
   members: number;
+  /** Encrypted at rest with nobody in it. The counts below are what the server
+   *  could see without decrypting, so they are zeroes rather than truth while
+   *  this is set — the card must not present them as a description. */
+  sealed: boolean;
   markdown_files: number;
   has_schematic: boolean;
   has_pcb: boolean;

@@ -104,6 +104,8 @@ blpl-repo-root/
 - [Skills](docs/skills.md) — the Claude Code skill set, and how the kicad-happy scripts are wired into the pipeline
 - [References](docs/references.md) — pointing a project at external folders, and the sandbox that polices it
 - [Workbench](docs/workbench.md) — chat, endpoints, modules, the review panel, and the release package
+- [Security](docs/security.md) — what is encrypted, who can read what, and what none of it protects
+- [Thor runbook](docs/thor-runbook.md) — running the model on a Jetson AGX Thor, and why BLPL stays on amd64
 - [Roadmap](docs/roadmap.md) — what is shipped, and what is next
 
 ## License

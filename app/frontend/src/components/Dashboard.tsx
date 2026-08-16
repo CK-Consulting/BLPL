@@ -130,13 +130,25 @@ export function Dashboard({ onOpen }: { onOpen: (projectId: string) => void }) {
                     <div className="project-card-top">
                       <strong className="mono">{p.id}</strong>
                       {!p.owned && <span className="chip">shared with you</span>}
+                      {p.sealed && <span className="chip chip-sealed">🔒 encrypted</span>}
                       {p.fab?.blocked && <span className="badge fail">fab blocked</span>}
                     </div>
+                    {/* A sealed project's contents cannot be counted without
+                        decrypting it, so the card says what it knows instead of
+                        printing zeroes that would read as an empty project.
+                        Opening is still one click: the card decrypts on the way
+                        in. */}
                     <div className="project-card-meta muted small">
-                      {p.markdown_files} md
-                      {p.has_pcb ? " · board" : ""}
-                      {p.has_schematic ? " · schematic" : ""}
-                      {p.members > 1 ? ` · ${p.members} people` : ""}
+                      {p.sealed ? (
+                        "encrypted at rest · opens when you do"
+                      ) : (
+                        <>
+                          {p.markdown_files} md
+                          {p.has_pcb ? " · board" : ""}
+                          {p.has_schematic ? " · schematic" : ""}
+                          {p.members > 1 ? ` · ${p.members} people` : ""}
+                        </>
+                      )}
                     </div>
                     <div className="project-card-when muted small">
                       {p.last_touched_by_me
