@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import sign_in
+from conftest import enqueue_only, queued_env, running_worker, sign_in
 
 
 def _seed_remote(tmp_path: Path) -> str:
@@ -165,28 +165,6 @@ def test_an_llm_stage_injects_the_full_fallback_chain(tmp_path, client, monkeypa
     rather than actually invoking the pipeline."""
     import app.main as main
 
-    captured: dict = {}
-
-    class _FakeProc:
-        returncode = 0
-
-        def __init__(self):
-            self.stdout = self
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            raise StopAsyncIteration
-
-        async def wait(self):
-            return 0
-
-    async def fake_exec(*cmd, env=None, **kw):
-        captured["env"] = env
-        return _FakeProc()
-
-    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
 
     sign_in(client)
     client.put(
@@ -203,11 +181,8 @@ def test_an_llm_stage_injects_the_full_fallback_chain(tmp_path, client, monkeypa
     client.put("/api/settings/secrets/openai", json={"value": "sk-oai-KEY"})
     client.post("/api/projects/init", json={"name": "scratch"})
 
-    with client.stream("POST", "/api/projects/scratch/stages/stage1") as r:
-        assert r.status_code == 200
-        "".join(r.iter_text())
-
-    env = captured["env"]
+    enqueue_only(client, "/api/projects/scratch/stages/stage1")
+    env = queued_env("scratch")
     import json as _json
     chain = _json.loads(env["HDM_LLM_CHAIN"])
     assert [c["provider"] for c in chain] == ["anthropic", "openai"]
@@ -231,9 +206,10 @@ def test_a_deterministic_stage_runs_without_any_key(tmp_path, client) -> None:
     exit non-zero on an empty project, but the request itself must stream, not 400."""
     sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
-    with client.stream("POST", "/api/projects/scratch/stages/doctor") as r:
-        assert r.status_code == 200
-        body = "".join(r.iter_text())
+    with running_worker():
+        with client.stream("POST", "/api/projects/scratch/stages/doctor") as r:
+            assert r.status_code == 200
+            body = "".join(r.iter_text())
     assert "event: done" in body
 
 
@@ -299,10 +275,11 @@ def test_pipeline_range_streams_and_needs_no_key_when_llm_excluded(client) -> No
     it will exit non-zero on an unbuilt project, but the request itself streams."""
     sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
-    with client.stream("POST", "/api/projects/scratch/pipeline?from_stage=stage5&to_stage=stage8") as r:
-        assert r.status_code == 200
-        body = "".join(r.iter_text())
-    assert "event: done" in body
+    with running_worker():
+        with client.stream("POST", "/api/projects/scratch/pipeline?from_stage=stage5&to_stage=stage8") as r:
+            assert r.status_code == 200
+            body = "".join(r.iter_text())
+        assert "event: done" in body
 
 
 def test_pipeline_range_including_stage1_requires_a_key(client) -> None:

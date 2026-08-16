@@ -14,6 +14,7 @@ from pathlib import Path
 
 from blpl.agent import review_panel as rp
 from conftest import sign_in
+from conftest import enqueue_only, queued_env
 
 
 def _finding(rule="missing-decoupling", sev="warning", summary="U1 has no decoupling capacitor",
@@ -337,29 +338,6 @@ def test_the_panel_route_dispatches_every_routed_endpoint(client, monkeypatch) -
     every review_panel endpoint, not just the primary."""
     import app.main as main
 
-    captured: dict = {}
-
-    class _FakeProc:
-        returncode = 0
-
-        def __init__(self):
-            self.stdout = self
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            raise StopAsyncIteration
-
-        async def wait(self):
-            return 0
-
-    async def fake_exec(*cmd, env=None, **kw):
-        captured["cmd"] = list(cmd)
-        captured["env"] = env
-        return _FakeProc()
-
-    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
 
     sign_in(client)
     client.put(
@@ -376,16 +354,29 @@ def test_the_panel_route_dispatches_every_routed_endpoint(client, monkeypatch) -
     client.put("/api/settings/secrets/openai", json={"value": "sk-oai-KEY"})
     client.post("/api/projects/init", json={"name": "scratch"})
 
-    with client.stream("POST", "/api/projects/scratch/review-panel") as r:
-        assert r.status_code == 200
-        "".join(r.iter_text())
+    enqueue_only(client, "/api/projects/scratch/review-panel")
 
-    assert "blpl.agent.dispatch" in captured["cmd"] and "review-panel" in captured["cmd"]
-    chain = json.loads(captured["env"]["HDM_LLM_CHAIN"])
+    # Asserted on the queued job rather than a mocked launch: the API hands work
+    # to a worker now, so what matters is what crosses that boundary.
+    from sqlalchemy import select
+
+    import app.db
+    from app.models import Project, Run
+
+    with app.db.SessionFactory() as s:
+        project = s.scalar(select(Project).where(Project.name == "scratch"))
+        run = s.scalars(
+            select(Run).where(Run.project_id == project.id).order_by(Run.created_at.desc())
+        ).first()
+        cmd = list(run.cmd)
+    assert "blpl.agent.dispatch" in cmd and "review-panel" in cmd
+    chain = json.loads(queued_env("scratch")["HDM_LLM_CHAIN"])
     assert [c["provider"] for c in chain] == ["anthropic", "openai"]
     # Keys travel in the environment, one variable per endpoint, never on the
     # command line where a `ps` listing would show them.
-    assert not any("sk-" in part for part in captured["cmd"])
+    # Keys ride in the environment, never on a command line — a command line is
+    # visible in ps output and in any log that echoes the argv.
+    assert not any("sk-" in part for part in cmd)
 
 
 def test_the_panel_route_refuses_up_front_when_nothing_can_review(client) -> None:

@@ -468,3 +468,66 @@ class ProjectActivity(Base):
 
     project: Mapped[Project] = relationship()
     user: Mapped["User | None"] = relationship()
+
+
+class Run(Base):
+    """One stage invocation: queued, claimed, executed, recorded.
+
+    This was SQLite plus an in-memory fan-out, which is exactly what pinned the
+    server to a single worker. A second API process could not see the first's
+    runs, and an SSE reader attached to the wrong process saw nothing — so the
+    fix is not "share the queue", it is to stop the API executing anything at
+    all. It enqueues; workers claim and run.
+
+    Claiming is SELECT ... FOR UPDATE SKIP LOCKED, which is a queue Postgres
+    already knows how to be. Two workers racing for the same row is the normal
+    case, not an error: one wins, the other skips to the next.
+
+    Logs stay files on the shared volume. They are append-heavy streaming text,
+    which a database is a poor home for, and a file can be tailed by any process
+    that can see it — which removes the need for a broker entirely.
+    """
+
+    __tablename__ = "run"
+    __table_args__ = (
+        # The claim query orders by this and filters on status, and it runs on
+        # every worker poll.
+        Index("ix_run_status_created", "status", "created_at"),
+        Index("ix_run_project", "project_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("project.id", ondelete="CASCADE"))
+    # Who asked for it. Kept even after they leave the project, because a run
+    # that happened is a fact about the past.
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(64))
+    cmd: Mapped[list] = mapped_column(JSON)
+    # The subprocess environment, sealed under the server key.
+    #
+    # It carries the user's provider API keys, which a worker cannot obtain any
+    # other way: they are sealed under that user's master key, which exists only
+    # in an unlocked API session. So the API resolves them while the user is
+    # present and hands them to the job. Sealed rather than plain because this
+    # row outlives the request, and cleared the moment the run finishes so the
+    # window is the run's lifetime rather than forever.
+    env_nonce: Mapped[bytes | None] = mapped_column(LargeBinary(12), nullable=True)
+    env_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # queued | running | done | cancelling | cancelled
+    status: Mapped[str] = mapped_column(String(16), default="queued")
+    # Which worker holds it. Only for operators reading the table — nothing
+    # depends on it, because a worker that dies must not leave a row that only
+    # it could have released.
+    claimed_by: Mapped[str] = mapped_column(String(64), default="")
+    exit_code: Mapped[int | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Refreshed while running, so a worker that vanishes can be told apart from
+    # one that is merely slow.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped[Project] = relationship()
+    user: Mapped["User | None"] = relationship()

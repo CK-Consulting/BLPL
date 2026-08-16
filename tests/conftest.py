@@ -10,6 +10,7 @@ backend under ``app/backend`` is the single backend, so its fixture is shared
 setup, not one file's private helper.
 """
 
+import contextlib
 import importlib
 import importlib.util
 import sys
@@ -212,6 +213,123 @@ def own_project(name: str, clerk_id: str = "user_test"):
         user = s.scalar(select(User).where(User.clerk_user_id == clerk_id))
         projectacl.create(s, user, name)
         s.commit()
+
+
+def drain_runs(server_key: bytes | None = None) -> int:
+    """Execute every queued run, here and now.
+
+    The API no longer runs stages — a worker container does — so a test that
+    posts a stage and then reads its stream would wait forever for a worker that
+    does not exist in the suite. This is that worker, inline and synchronous, so
+    a test can say "and then it ran" without a second process.
+
+    Returns how many it executed.
+    """
+    import subprocess
+
+    import app.db
+    import app.main as main
+    from app import runqueue, serverkey
+
+    key = server_key or serverkey.load_or_create(main._DATA)
+    logs = main._DATA / "runs"
+    logs.mkdir(parents=True, exist_ok=True)
+    done = 0
+    while True:
+        with app.db.SessionFactory() as session:
+            job = runqueue.claim_one(session, "test-worker", key)
+            session.commit()
+        if job is None:
+            return done
+        result = subprocess.run(job.cmd, env=job.env, capture_output=True, text=True)
+        runqueue.log_path(logs, job.run_id).write_text(result.stdout + result.stderr)
+        with app.db.SessionFactory() as session:
+            runqueue.finish(session, job.run_id, result.returncode)
+            session.commit()
+        done += 1
+
+
+def queued_env(project_name: str) -> dict:
+    """The environment sealed into the run queued for a project.
+
+    Tests used to mock create_subprocess_exec in the API and read the env it was
+    handed. The API no longer launches anything, so that hook is gone — and this
+    is the better assertion anyway: it checks what a *worker* will actually
+    receive, across the boundary, rather than what one process passed to itself.
+    """
+    import json
+
+    from sqlalchemy import select
+
+    import app.db
+    import app.main as main
+    from app import runqueue, serverkey, vault
+    from app.models import Project, Run
+
+    key = serverkey.load_or_create(main._DATA)
+    with app.db.SessionFactory() as s:
+        project = s.scalar(select(Project).where(Project.name == project_name))
+        run = s.scalars(
+            select(Run)
+            .where(Run.project_id == project.id, Run.status == runqueue.QUEUED)
+            .order_by(Run.created_at.desc())
+        ).first()
+        assert run is not None, f"no run queued for {project_name!r}"
+        return json.loads(
+            vault.decrypt_secret(key, "run-env", run.env_nonce, run.env_ciphertext)
+        )
+
+
+def enqueue_only(client, path: str) -> None:
+    """POST a run route and let go of the stream.
+
+    The response is an SSE stream that does not end until a worker finishes the
+    job, and TestClient drives the app to completion — so a test that wants only
+    to inspect the queued row must not read it.
+    """
+    import threading
+
+    def fire():
+        try:
+            with client.stream("POST", path):
+                pass
+        except Exception:  # noqa: BLE001 — closing early is the point
+            pass
+
+    thread = threading.Thread(target=fire, daemon=True)
+    thread.start()
+    thread.join(timeout=3)
+
+
+@contextlib.contextmanager
+def running_worker():
+    """A worker executing jobs in the background, for the length of the block.
+
+    Needed because TestClient drives the ASGI app to completion: a request that
+    returns a stream does not come back until that stream ends, and the stream
+    does not end until something runs the job. A worker really is concurrent
+    with the reader in production, so this is the faithful shape rather than a
+    convenience.
+    """
+    import threading
+
+    stop = threading.Event()
+
+    def loop():
+        while not stop.is_set():
+            try:
+                if drain_runs() == 0:
+                    stop.wait(0.05)
+            except Exception:  # noqa: BLE001 — a dying test worker must not hang the suite
+                stop.wait(0.1)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=5)
 
 
 @pytest.fixture

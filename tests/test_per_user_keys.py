@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import give_endpoint, sign_in
+from conftest import enqueue_only, give_endpoint, queued_env, sign_in
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app" / "backend"))
 
@@ -77,37 +77,13 @@ def test_a_stored_key_reaches_the_stage_subprocess(configured, monkeypatch):
     """End to end: what the user typed is what the child process gets."""
     import app.main as main
 
-    captured: dict = {}
-
-    class _FakeProc:
-        returncode = 0
-
-        def __init__(self):
-            self.stdout = self
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            raise StopAsyncIteration
-
-        async def wait(self):
-            return 0
-
-    async def fake_exec(*cmd, env=None, **kw):
-        captured["env"] = env
-        return _FakeProc()
-
-    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_exec)
 
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-mine"})
     configured.post("/api/projects/init", json={"name": "scratch"})
 
-    with configured.stream("POST", "/api/projects/scratch/stages/stage1") as r:
-        assert r.status_code == 200
-        "".join(r.iter_text())
+    enqueue_only(configured, "/api/projects/scratch/stages/stage1")
 
-    assert captured["env"]["BLPL_LLM_KEY__ANTHROPIC"] == "sk-mine"
+    assert queued_env("scratch")["BLPL_LLM_KEY__ANTHROPIC"] == "sk-mine"
 
 
 def test_a_key_is_never_returned_by_the_api(configured):

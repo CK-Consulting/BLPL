@@ -154,6 +154,64 @@ services:
       # local-only projects and https remotes with a token helper don't need it.
       - ./data/ssh:/root/.ssh:ro
 
+  # The container with KiCad in it, and the only thing that executes a stage.
+  #
+  # The API used to run them in-process with an in-memory subscriber list, which
+  # is what pinned it to a single worker: a second API process could not see the
+  # first's runs. Now the API enqueues and one of these claims the job, so runs
+  # scale by adding replicas here rather than by making the API bigger.
+  #
+  # Same image as the backend on purpose. Splitting it would trim the API's size
+  # but change nothing about where work happens, and one image means one KiCad
+  # version across the deployment — two would be a way for a stage to behave
+  # differently depending on which container ran it.
+  worker:
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: app/backend/Dockerfile
+      platforms:
+        - linux/amd64
+    restart: unless-stopped
+    networks:
+      - blpl
+    depends_on:
+      db:
+        condition: service_healthy
+    # No container_name: `docker compose up --scale worker=4` needs to be able
+    # to make more than one.
+    command: ["python", "-m", "app.worker"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - BLPL_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-blpl}:${POSTGRES_PASSWORD:-blpl}@db:5432/${POSTGRES_DB:-blpl}
+      - BLPL_DATA_ROOT=/app/data
+      - BLPL_PROJECTS_ROOT=/app/data/projects
+      - BLPL_CONFIG=/app/data/blpl.toml
+      - BLPL_KICAD_HAPPY=/app/kicad-happy
+      # Needed to open the environment sealed into each job. A worker without it
+      # refuses to start rather than failing one job at a time.
+      - BLPL_SERVER_KEY=${BLPL_SERVER_KEY:-}
+      - OLLAMA_HOST=${OLLAMA_HOST:-}
+      - DIGIKEY_OAUTH_CLIENT_ID=${DIGIKEY_OAUTH_CLIENT_ID:-}
+      - DIGIKEY_OAUTH_CLIENT_SECRET=${DIGIKEY_OAUTH_CLIENT_SECRET:-}
+      - MOUSER_SEARCH_API_KEY=${MOUSER_SEARCH_API_KEY:-}
+      - ELEMENT14_API_KEY=${ELEMENT14_API_KEY:-}
+    volumes:
+      # The same project files and log directory the API serves from. This is
+      # what lets an SSE reader in the API tail a log a worker is writing,
+      # without a broker between them.
+      - ./data:/app/data
+      - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
+      - ../kicad-packages3D-source:/usr/share/kicad/3dmodels-source:ro
+      - ../kicad-symbols:/app/kicad-symbols:ro
+      - ../kicad-footprints:/app/kicad-footprints:ro
+      - ../kicad-happy:/app/kicad-happy
+      - ../kicad-packages:/app/kicad-packages
+      - ../kicad-templates:/app/kicad-templates:ro
+      - ../KiCAD-Prism:/app/kicad-prism:ro
+      - ./data/ssh:/root/.ssh:ro
+
   frontend:
     build:
       context: ./frontend
@@ -170,6 +228,53 @@ services:
       - backend
     networks:
       - blpl
+  # Interactive KiCad, in a browser. A KasmVNC desktop, not part of the
+  # pipeline — nothing here runs a stage, and it makes nothing faster. It is for
+  # the times a person needs to open a board and look at it, drag something, or
+  # use a dialog the CLI has no equivalent for.
+  #
+  # OFF BY DEFAULT, and the reason matters. This container has no idea who Clerk
+  # says you are: anyone who reaches it gets a desktop holding whatever is
+  # mounted into it, which would walk straight past the project ownership and
+  # membership rules the rest of the app enforces. Start it deliberately, put it
+  # behind your tunnel's access control, and mount only what that person should
+  # see:
+  #
+  #     docker compose --profile desktop up -d kicad-desktop
+  #
+  # A GPU helps here and only here — the 3D viewer's OpenGL, for a human
+  # spinning a board. Uncomment the device passthrough on a host that has one.
+  kicad-desktop:
+    profiles: ["desktop"]
+    image: lscr.io/linuxserver/kicad:latest
+    container_name: blpl-kicad-desktop
+    restart: unless-stopped
+    networks:
+      - blpl
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - ./data/kicad-desktop:/config
+      # Deliberately ONE project, named explicitly, rather than the projects
+      # root. Mounting the root would hand every project to whoever opens this
+      # desktop, which is precisely the boundary the app spent this phase
+      # building.
+      - ./data/projects/${KICAD_DESKTOP_PROJECT:-none}:/config/project
+      - ../kicad-symbols:/usr/share/kicad/symbols:ro
+      - ../kicad-footprints:/usr/share/kicad/footprints:ro
+      - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
+    ports:
+      - "${KICAD_DESKTOP_PORT:-3010}:3000"
+    # KasmVNC needs a larger shared memory segment than Docker's 64 MB default;
+    # without it the desktop dies as soon as anything opens a real window.
+    shm_size: "1gb"
+    security_opt:
+      - seccomp:unconfined
+    # devices:
+    #   - /dev/dri:/dev/dri   # GPU for the 3D viewer, on a host that has one
+
 networks:
   blpl:
     external: true

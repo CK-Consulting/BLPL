@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from conftest import running_worker
 
 
 def _manager(tmp_path: Path):
@@ -157,11 +158,15 @@ def _unlock(client) -> None:
 
 
 def test_a_stage_run_lands_in_history_with_its_log(client) -> None:
+    """The API only queues now, so this posts, lets an inline worker execute,
+    and then reads the record — which is what the browser does too, except that
+    its worker is a container."""
     _unlock(client)
     client.post("/api/projects/init", json={"name": "scratch"})
 
-    with client.stream("POST", "/api/projects/scratch/stages/doctor") as r:
-        body = "".join(r.iter_text())
+    with running_worker():
+        with client.stream("POST", "/api/projects/scratch/stages/doctor") as r:
+            body = "".join(r.iter_text())
     assert "event: done" in body
     assert '"run_id"' in body  # the start event names the run
 
@@ -169,6 +174,7 @@ def test_a_stage_run_lands_in_history_with_its_log(client) -> None:
     assert len(listing) == 1
     run = listing[0]
     assert run["kind"] == "doctor" and run["running"] is False
+    assert run["status"] == "done"
     assert run["exit_code"] is not None and run["ended_at"] is not None
 
     # The full log is durable and fetchable after the stream is long gone.

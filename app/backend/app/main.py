@@ -78,6 +78,7 @@ from . import (
     projectkey,
     profile as profile_mod,
     providers as provider_catalog,
+    runqueue,
     runs,
     serverkey,
     unlock as unlock_mod,
@@ -85,8 +86,8 @@ from . import (
     users,
 )
 from .appconfig import AppConfig
-from .db import session_scope
-from .models import Project, ProjectInvitation, User
+from .db import SessionFactory, session_scope
+from .models import Project, ProjectInvitation, Run, User
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
 from .references import (
@@ -139,6 +140,9 @@ projects = Projects(PROJECTS_ROOT)
 unlocked = unlock_mod.Unlocked()
 # Run history is plaintext facts-about-what-happened, deliberately NOT in
 # vault.db — that file's contract is "a dump of it is a dump of ciphertext".
+# Kept only for chat tool-call history, which is written by the API process
+# itself and is not part of the run queue. Stage execution moved to
+# app/runqueue.py and the worker container; this no longer starts anything.
 run_manager = runs.RunManager(_DATA / "runs.db", _DATA / "runs")
 # Chat turns are in-process and in-memory: a turn needs sub-second first tokens
 # and (soon) approval round-trips, neither of which survives a pipe. What is
@@ -597,6 +601,21 @@ def _refuse_taken_name(session: Session, name: str) -> None:
         raise HTTPException(status_code=409, detail=f"the name {name!r} is already taken")
 
 
+def _project_or_404(session: Session, user: User, project_id: str) -> Project:
+    """The project row, or a 404 — never a raw NoSuchProject.
+
+    projectacl raises a plain LookupError, which is right for a library and
+    wrong at a route boundary: it escapes as a 500, so a non-member gets "the
+    server broke" instead of "there is no such project", and the 404-not-403
+    rule quietly stops holding. One helper rather than a try/except at each of
+    five call sites, because the sixth is the one that gets forgotten.
+    """
+    try:
+        return projectacl.require_member(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+
+
 def _project_dir(session: Session, user: User, project_id: str) -> Path:
     """The working copy, if this user may open it.
 
@@ -609,10 +628,7 @@ def _project_dir(session: Session, user: User, project_id: str) -> Path:
     confirm it does, which is enough to enumerate other people's project names
     one guess at a time.
     """
-    try:
-        projectacl.require_member(session, user, project_id)
-    except projectacl.NoSuchProject:
-        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    _project_or_404(session, user, project_id)
     try:
         d = projects.project_dir(project_id)
     except ProjectError:
@@ -832,7 +848,7 @@ def list_members(
     """Who can open this project. Any member may see the list — you are entitled
     to know who else can read what you are working on."""
     try:
-        project = projectacl.require_member(session, user, project_id)
+        project = _project_or_404(session, user, project_id)
     except projectacl.NoSuchProject:
         raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
     return {
@@ -1363,7 +1379,7 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     target = _editable_file(session, user, project_id, name)
     target.write_text(body.content, encoding="utf-8")
     activity.record(
-        session, projectacl.require_member(session, user, project_id), user, activity.EDITED, name
+        session, _project_or_404(session, user, project_id), user, activity.EDITED, name
     )
     return {"ok": True, "name": name, "bytes": target.stat().st_size}
 
@@ -1887,7 +1903,14 @@ def decide_proposal(
     if body.action != "accept":
         raise HTTPException(status_code=400, detail="action must be 'accept' or 'reject'")
 
-    if any(r.running for r in run_manager.list_for_project(project_id, limit=5)):
+    project = _project_or_404(session, user, project_id)
+    in_flight = session.scalar(
+        select(Run).where(
+            Run.project_id == project.id,
+            Run.status.in_([runqueue.QUEUED, runqueue.RUNNING, runqueue.CANCELLING]),
+        )
+    )
+    if in_flight is not None:
         raise HTTPException(
             status_code=409,
             detail="a pipeline run is in flight for this project — accept the edit once it finishes",
@@ -1996,29 +2019,108 @@ def _inject_llm_env(
     return env
 
 
+async def _stream_run(run_id: str, logs_dir: Path):
+    """Replay a run's log from the top, then follow it live.
+
+    A tail rather than a subscription, and that is the point: the run is in
+    another container, so there is no in-process queue to attach to. Any API
+    process that can see the volume can serve any run's stream, which is exactly
+    what having more than one API process requires.
+
+    Completion is read from the row, not inferred from the file. A log that has
+    stopped growing is indistinguishable from a stage that is thinking.
+    """
+    path = runqueue.log_path(logs_dir, run_id)
+    offset = 0
+    yield "start", {"run_id": run_id}
+    announced_running = False
+    waited = 0.0
+
+    while True:
+        if path.exists():
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(offset)
+                chunk = fh.read()
+                offset = fh.tell()
+            for line in chunk.splitlines():
+                yield "log", {"line": line}
+
+        with SessionFactory() as session:
+            run = session.get(Run, run_id)
+            if run is None:
+                yield "done", {"exit_code": runqueue.INTERRUPTED, "run_id": run_id}
+                return
+            finished = run.status in (runqueue.DONE, runqueue.CANCELLED)
+            exit_code = run.exit_code
+            status = run.status
+
+        # A queued run has no output yet, and a stream that says nothing is
+        # indistinguishable from one that has broken. Say what it is waiting for
+        # instead — and keep saying it, because "no worker is running" is a real
+        # state an operator has to be able to see from the UI.
+        if status == runqueue.QUEUED and waited > 0 and waited % 5 < 0.3:
+            yield "queued", {"waiting_for": "a worker to pick this up", "seconds": int(waited)}
+        if status == runqueue.RUNNING and not announced_running:
+            announced_running = True
+            yield "running", {"run_id": run_id}
+
+        if finished:
+            # One last read: the worker writes the final lines and only then
+            # records the exit, so stopping at the status check would truncate
+            # the end of every log.
+            if path.exists():
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(offset)
+                    for line in fh.read().splitlines():
+                        yield "log", {"line": line}
+            yield "done", {"exit_code": exit_code if exit_code is not None else runqueue.INTERRUPTED,
+                           "run_id": run_id}
+            return
+
+        await asyncio.sleep(0.25)
+        waited += 0.25
+
+
 def _run_stream_response(run_id: str) -> StreamingResponse:
-    """SSE over a run's event stream: full replay from the top, then live tail.
+    """SSE over a run's log.
 
     The argv echoed in the start event is safe — keys ride in the environment,
-    never on the command line. A client disconnect closes only this reader; the
-    run itself keeps going and keeps recording (see app/runs.py). Stopping a
-    run is an explicit DELETE /api/runs/{id}, not a dropped connection.
+    never on a command line. A client disconnect closes only this reader; the
+    run keeps going in its worker, and stopping one is an explicit
+    DELETE /api/runs/{id} rather than a dropped connection.
     """
 
     async def events():
-        async for ev, payload in run_manager.stream(run_id):
+        async for ev, payload in _stream_run(run_id, _DATA / "runs"):
             yield f"event: {ev}\ndata: {json.dumps(payload)}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-def _start_run(project_id: str, kind: str, cmd: list[str], env: dict[str, str]) -> StreamingResponse:
-    """Register + launch a run, then attach the caller to its stream."""
+def _start_run(
+    session: Session,
+    user: User,
+    project_id: str,
+    kind: str,
+    cmd: list[str],
+    env: dict[str, str],
+) -> StreamingResponse:
+    """Queue a run and attach the caller to its stream.
+
+    The API does not execute it. That is the whole change: a stage now runs in a
+    worker container, so more than one API process can exist without a reader
+    landing on the process that cannot see the run.
+    """
+    project = _project_or_404(session, user, project_id)
+    key = serverkey.load(_DATA)
+    if key is None:
+        raise HTTPException(status_code=503, detail="no server key; cannot dispatch runs")
     try:
-        rec = run_manager.start(project_id, kind, cmd, env)
-    except runs.RunActive as exc:
+        run = runqueue.enqueue(session, project, user, kind, cmd, env, key)
+    except runqueue.RunActive as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return _run_stream_response(rec.id)
+    session.commit()  # the worker must be able to see it
+    return _run_stream_response(run.id)
 
 
 @app.post("/api/projects/{project_id}/stages/{stage_name}")
@@ -2039,9 +2141,9 @@ async def run_stage(
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
     activity.record(
-        session, projectacl.require_member(session, user, project_id), user, activity.RAN, stage_name
+        session, _project_or_404(session, user, project_id), user, activity.RAN, stage_name
     )
-    return _start_run(project_id, stage_name, cmd, env)
+    return _start_run(session, user, project_id, stage_name, cmd, env)
 
 
 @app.post("/api/projects/{project_id}/release")
@@ -2055,7 +2157,7 @@ async def build_release(project_id: str, user: User = Depends(require_onboarded)
     """
     proj = _project_dir(session, user, project_id)
     cmd = [sys.executable, "-m", "blpl.core.release", "--project-dir", str(proj)]
-    return _start_run(project_id, "release", cmd, dict(os.environ))
+    return _start_run(session, user, project_id, "release", cmd, dict(os.environ))
 
 
 @app.get("/api/projects/{project_id}/release")
@@ -2132,7 +2234,7 @@ async def run_review_panel(
         sys.executable, "-m", "blpl.agent.dispatch", "review-panel",
         "--project-dir", str(proj),
     ]
-    return _start_run(project_id, "review-panel", cmd, env)
+    return _start_run(session, user, project_id, "review-panel", cmd, env)
 
 
 # The stages the whole-pipeline runner understands, in order. The CLI `run`
@@ -2180,7 +2282,7 @@ async def run_pipeline(
         "--from", from_stage, "--to", to_stage,
         "--continue-on-error",
     ]
-    return _start_run(project_id, f"pipeline {from_stage}→{to_stage}", cmd, env)
+    return _start_run(session, user, project_id, f"pipeline {from_stage}→{to_stage}", cmd, env)
 
 
 # --------------------------------------------------------------------------
@@ -2192,38 +2294,88 @@ async def run_pipeline(
 def list_runs(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> list[dict]:
     """Past and live runs for a project, newest first."""
-    _project_dir(session, user, project_id)
-    return [r.to_dict() for r in run_manager.list_for_project(project_id)]
+    project = _project_or_404(session, user, project_id)
+    rows = session.scalars(
+        select(Run).where(Run.project_id == project.id).order_by(Run.created_at.desc()).limit(50)
+    )
+    return [_run_json(r) for r in rows]
+
+
+def _run_json(run: Run) -> dict:
+    return {
+        "id": run.id,
+        "project": run.project.name,
+        "kind": run.kind,
+        "status": run.status,
+        "running": run.status in (runqueue.QUEUED, runqueue.RUNNING, runqueue.CANCELLING),
+        "exit_code": run.exit_code,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "ended_at": run.ended_at.isoformat() if run.ended_at else None,
+        "by": run.user.email if run.user else "",
+    }
+
+
+def _visible_run(session: Session, user: User, run_id: str) -> Run:
+    """A run, if its project is one this user may open.
+
+    Runs are reached by an opaque id rather than through a project path, so the
+    permission check has to be made here explicitly — the id alone must not be a
+    way around project membership.
+    """
+    run = session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+    try:
+        projectacl.require_member(session, user, run.project.name)
+    except projectacl.NoSuchProject:
+        # 404 naming the *run*, not the project: the caller asked about a run id
+        # and telling them a project exists that they cannot see would leak the
+        # thing the id was meant to hide.
+        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+    return run
 
 
 @app.get("/api/runs/{run_id}/stream")
-def stream_run(run_id: str, _: User = Depends(require_onboarded)) -> StreamingResponse:
+def stream_run(
+    run_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> StreamingResponse:
     """Attach to a run: full log replay, then the live tail if it's still going.
 
     This is what makes a mid-run browser refresh a non-event — reattach here
     and catch up. On a finished run it replays and ends.
     """
-    if run_manager.get(run_id) is None:
-        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+    _visible_run(session, user, run_id)
     return _run_stream_response(run_id)
 
 
 @app.get("/api/runs/{run_id}/log")
-def run_log(run_id: str, _: User = Depends(require_onboarded)) -> PlainTextResponse:
-    if run_manager.get(run_id) is None:
-        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
-    path = run_manager.log_path(run_id)
+def run_log(
+    run_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> PlainTextResponse:
+    _visible_run(session, user, run_id)
+    path = runqueue.log_path(_DATA / "runs", run_id)
     text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
     return PlainTextResponse(text)
 
 
 @app.delete("/api/runs/{run_id}")
-def stop_run(run_id: str, _: User = Depends(require_onboarded)) -> dict:
-    """Stop a live run. Stopping is an explicit, recorded act now — closing the
-    browser no longer kills anything."""
-    if run_manager.get(run_id) is None:
-        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
-    return {"ok": True, "stopped": run_manager.stop(run_id)}
+def stop_run(
+    run_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Ask a run to stop.
+
+    A request rather than a kill: the process is in another container, so this
+    sets a flag its next heartbeat reads. Reporting it as already dead would be
+    claiming something that has not happened yet.
+    """
+    _visible_run(session, user, run_id)
+    return {"ok": True, "stopped": runqueue.request_cancel(session, run_id)}
 
 
 # --------------------------------------------------------------------------
