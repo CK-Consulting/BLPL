@@ -62,14 +62,47 @@ Then on the BLPL server, in `app/.env`:
 OLLAMA_HOST=http://<thor-address>:11434
 ```
 
-### Ollama has no authentication
+### Ollama has no authentication — put a gateway in front
 
-None. Anyone who can reach that port can use the GPU, list the models, and pull
-new ones. Do not put it on a network you do not control. Either keep it on a
-private link between the two machines, or front it with something that requires a
-credential — in which case configure it in BLPL as an `openai-compatible`
-endpoint with a key rather than as Ollama, since that is the shape that carries
-one.
+None at all. Anyone who reaches that port can use the GPU, list the models, and
+pull new ones. A tunnel with access control in front of the *whole host* does not
+solve this either: BLPL has to make API calls, and an interactive access
+challenge is not something a server-to-server request can answer.
+
+The fix is a gateway that speaks OpenAI and owns the credentials, with the runner
+bound to localhost behind it. **LiteLLM proxy** is the one to reach for, because
+it does more than bolt on a password:
+
+* **Virtual keys** — generated, revocable, one per user rather than one shared
+  secret. That matters here specifically: BLPL already stores provider keys per
+  user, so each person pastes *their own* LiteLLM key into Settings and a shared
+  GPU gets the same per-user accounting a cloud provider gives you.
+* **Budgets and rate limits per key.** A local model has no bill to cap usage
+  naturally, so one person running a review panel in a loop is otherwise
+  everybody else's problem.
+* **It decouples auth from the runner.** Swap Ollama for vLLM later and nothing
+  in BLPL changes — same base URL, same keys. Without a gateway, changing runner
+  means every user re-entering credentials.
+
+In BLPL, LiteLLM is an **`openai-compatible`** endpoint with a base URL and a
+key, not an `ollama` one. Ollama is the keyless shape; the whole point here is
+that this one carries a credential.
+
+```
+BLPL  ──HTTPS + virtual key──▶  LiteLLM  ──localhost──▶  Ollama / vLLM
+                                (auth, budgets)          (bound to 127.0.0.1)
+```
+
+Bind the runner to localhost once the gateway is in front of it — otherwise the
+unauthenticated port is still open beside the authenticated one, which is the
+version of this that looks solved and is not.
+
+**Other runners.** vLLM serves the OpenAI endpoints directly
+(`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` and more), so it can
+be spoken to without a gateway — but check its current authentication support
+before relying on it, as the serving documentation does not describe any. That
+uncertainty is itself an argument for the gateway: with LiteLLM in front, the
+runner's own auth story stops mattering.
 
 ## Which model
 
