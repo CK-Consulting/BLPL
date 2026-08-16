@@ -41,7 +41,19 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Cookie,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
@@ -59,6 +71,7 @@ from . import (
     keystore,
     llmconfig,
     llm_resolver,
+    mailer,
     projectacl,
     profile as profile_mod,
     providers as provider_catalog,
@@ -754,10 +767,32 @@ def list_members(
     }
 
 
+def _invitation_email(project_name: str, invited_by: str, expires) -> tuple[str, str]:
+    """The notice an invitee gets. Deliberately says what they must do next,
+    because an invitation they cannot act on is just noise."""
+    where = os.environ.get("BLPL_PUBLIC_URL", "").strip()
+    opening = f"Open {where}" if where else "Open BLPL"
+    return (
+        f"{invited_by} shared the project \u201c{project_name}\u201d with you",
+        f"""{invited_by} has invited you to the BLPL project "{project_name}".
+
+{opening} and sign in with this address to accept or decline. The invitation is
+waiting for you at the top of the page.
+
+You will not have access until you accept, and the invitation expires on
+{expires:%d %B %Y}.
+
+If you were not expecting this, you can ignore it — declining costs nothing and
+nothing is shared with you in the meantime.
+""",
+    )
+
+
 @app.post("/api/projects/{project_id}/members")
 def add_member(
     project_id: str,
     body: ShareBody,
+    background: BackgroundTasks,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
 ) -> dict:
@@ -787,11 +822,24 @@ def add_member(
         invitation = projectacl.invite(session, project, user, target)
     except projectacl.AlreadyAMember:
         raise HTTPException(status_code=409, detail=f"{target.email} can already open this project")
+    # Sent in the background, and failure is logged rather than raised. A relay
+    # being briefly unreachable must not roll back the invitation the owner just
+    # made — they would see an error and assume nothing happened, while the
+    # recipient may already have it.
+    if target.email:
+        subject, body_text = _invitation_email(
+            project.name, user.email or "Someone", invitation.expires_at
+        )
+        background.add_task(mailer.send, target.email, subject, body_text)
+
     return {
         "ok": True,
         "invited": target.email,
         "invitation_id": invitation.id,
         "expires_at": invitation.expires_at.isoformat(),
+        # So the UI can say "they have been emailed" or "tell them yourself"
+        # instead of implying a notice that was never sent.
+        "emailed": bool(target.email) and mailer.configured(),
     }
 
 

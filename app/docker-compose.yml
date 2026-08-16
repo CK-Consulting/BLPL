@@ -93,6 +93,20 @@ services:
       # the database: together they are the lock and its key, and losing it
       # makes every stored key unreadable.
       - BLPL_SERVER_KEY=${BLPL_SERVER_KEY:-}
+      # Mail, for invitation notices. Plain SMTP relay rather than a provider's
+      # HTTP API: hostname, credentials and a sender is the whole configuration
+      # surface, so changing provider is an env change rather than a rewrite.
+      # Unset means nobody is notified — a valid state for a single-user install,
+      # never an error.
+      - SMTP_RELAY=${SMTP_RELAY:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SMTP_SENDER_NAME=${SMTP_SENDER_NAME:-}
+      - SMTP_SENDER_ADDR=${SMTP_SENDER_ADDR:-}
+      # Where an invitation email should point people. Falls back to nothing,
+      # in which case the mail says to open the app rather than guessing a URL.
+      - BLPL_PUBLIC_URL=${BLPL_PUBLIC_URL:-}
       #
       # The vars below are for kicad-happy features for pulling datasheet and quotes.
       # DigiKey authenticates with the two-legged client_credentials grant — the ID
