@@ -5,6 +5,7 @@ import { StageRunner } from "./components/StageRunner";
 import { RunHistory } from "./components/RunHistory";
 import { SettingsPanel } from "./components/Settings";
 import { Sharing } from "./components/Sharing";
+import { Dashboard } from "./components/Dashboard";
 import { Invitations } from "./components/Invitations";
 import { Logo } from "./components/Logo";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
@@ -21,16 +22,24 @@ import { useResizable } from "./useResizable";
 import { Project, getJSON } from "./api";
 
 export default function App() {
+  // Null means the dashboard. Opening a project is always a deliberate act:
+  // reopening whatever was last open quietly puts someone else's shared design
+  // on screen because you happened to look at it on Friday.
+  const [open, setOpen] = useState<string | null>(null);
   return (
     <AuthGate>
-      <Workspace />
+      {open === null ? (
+        <Dashboard onOpen={setOpen} />
+      ) : (
+        <Workspace projectId={open} onLeave={() => setOpen(null)} />
+      )}
     </AuthGate>
   );
 }
 
-function Workspace() {
+function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(projectId);
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showSharing, setShowSharing] = useState(false);
@@ -60,7 +69,10 @@ function Workspace() {
   const refresh = () =>
     getJSON<Project[]>("/api/projects").then((p) => {
       setProjects(p);
-      setSelected((cur) => cur ?? p[0]?.id ?? null);
+      // Never falls back to p[0]: the project on screen is the one that was
+      // chosen, and silently substituting another is how you end up editing
+      // something you did not open.
+      setSelected((cur) => cur ?? projectId);
     });
 
   useEffect(() => {
@@ -74,7 +86,9 @@ function Workspace() {
     <div className="app">
       <Invitations onChanged={refresh} />
       <header>
-        <Logo size={22} withText />
+        <button className="link dash-back" onClick={onLeave} title="All projects">
+          ← <Logo size={20} />
+        </button>
         <span className="sep">/</span>
         <select
           value={selected ?? ""}

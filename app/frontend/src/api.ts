@@ -208,6 +208,40 @@ export type Project = {
   shared_with: number;
 };
 
+export type ActivityEntry = {
+  id: number;
+  project: string;
+  kind: string;
+  /** How to read the kind aloud. Comes from the server so a new kind cannot
+   *  surface here as a raw enum nobody recognises. */
+  verb: string;
+  detail: string;
+  who: string;
+  at: string;
+};
+
+export type DashboardProject = {
+  id: string;
+  owned: boolean;
+  members: number;
+  markdown_files: number;
+  has_schematic: boolean;
+  has_pcb: boolean;
+  is_git: boolean;
+  fab: FabReadiness | null;
+  /** Where you left off. Personal — a colleague's busy afternoon must not
+   *  reorder your list. */
+  last_touched_by_me: string | null;
+  /** What moved while you were away. The useful one for a shared project. */
+  last_activity: string | null;
+};
+
+export type Dashboard = {
+  projects: DashboardProject[];
+  activity: ActivityEntry[];
+  invitations: Invitation[];
+};
+
 export type ProjectMember = {
   id: number;
   email: string;

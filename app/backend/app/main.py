@@ -64,6 +64,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import (
+    activity,
     appconfig,
     chat as chat_mod,
     clerk_auth,
@@ -714,6 +715,63 @@ class CloneBody(BaseModel):
     branch: str = "main"
 
 
+@app.get("/api/dashboard")
+def dashboard(
+    user: User = Depends(require_onboarded), session: Session = Depends(session_scope)
+) -> dict:
+    """Everything the landing screen needs, in one request.
+
+    One call rather than three, because the dashboard is the first thing after
+    unlock and three round trips is three chances to render half a page. The
+    sort keys come down with the projects so the client can reorder without
+    asking again.
+    """
+    projects_ = projectacl.visible(session, user)
+    mine = activity.last_touched_by(session, user)
+    theirs = activity.last_activity(session, [p.id for p in projects_])
+
+    out = []
+    for project in projects_:
+        d = PROJECTS_ROOT / project.name
+        pipeline = d / ".pipeline"
+        exists = d.is_dir()
+        out.append(
+            {
+                "id": project.name,
+                "owned": project.owner_id == user.id,
+                "members": len(project.members),
+                "markdown_files": len(list(d.glob("*.md"))) if exists else 0,
+                "has_schematic": exists and _latest(pipeline, ".kicad_sch") is not None,
+                "has_pcb": exists and _latest(pipeline, ".kicad_pcb") is not None,
+                "is_git": exists and (d / ".git").is_dir(),
+                "fab": _fab_readiness(pipeline) if exists else None,
+                # Two different questions, so two different keys. "When did I
+                # last touch this" is where you left off; "when did anything
+                # happen" is what moved while you were away, which is the useful
+                # one for a project somebody shared with you.
+                "last_touched_by_me": _iso(mine.get(project.id)),
+                "last_activity": _iso(theirs.get(project.id)),
+            }
+        )
+    return {
+        "projects": out,
+        "activity": [activity.as_json(a) for a in activity.feed_for(session, user)],
+        "invitations": [
+            {
+                "id": inv.id,
+                "project": inv.project.name,
+                "invited_by": inv.invited_by.email,
+                "expires_at": inv.expires_at.isoformat(),
+            }
+            for inv in projectacl.pending_for(session, user)
+        ],
+    }
+
+
+def _iso(when) -> str | None:
+    return when.isoformat() if when is not None else None
+
+
 @app.post("/api/projects/clone")
 def clone_project(
     body: CloneBody,
@@ -729,6 +787,7 @@ def clone_project(
         raise HTTPException(status_code=400, detail=str(exc))
     project = projectacl.create(session, user, body.name, remote=body.remote, branch=body.branch)
     grants.create_project_key(session, project, user, master_key)
+    activity.record(session, project, user, activity.IMPORTED, f"cloned from {body.remote}")
     return {"ok": True, "id": body.name}
 
 
@@ -751,6 +810,7 @@ def init_project(
         raise HTTPException(status_code=400, detail=str(exc))
     project = projectacl.create(session, user, body.name)
     grants.create_project_key(session, project, user, master_key)
+    activity.record(session, project, user, activity.IMPORTED, "created empty")
     return {"ok": True, "id": body.name}
 
 
@@ -871,6 +931,7 @@ def add_member(
         )
         background.add_task(mailer.send, target.email, subject, body_text)
 
+    activity.record(session, project, user, activity.SHARED, f"invited {target.email}")
     return {
         "ok": True,
         "invited": target.email,
@@ -960,6 +1021,7 @@ def accept_invitation(
 ) -> dict:
     try:
         project = projectacl.accept(session, user, invitation_id)
+        activity.record(session, project, user, activity.JOINED, "accepted an invitation")
     except projectacl.NoSuchInvitation:
         # Covers withdrawn, already answered, and expired alike. They are all
         # "there is nothing here for you to accept", and distinguishing them
@@ -1043,6 +1105,7 @@ async def import_project(
 
     project = projectacl.create(session, user, name)
     grants.create_project_key(session, project, user, master_key)
+    activity.record(session, project, user, activity.IMPORTED, f"{len(imported)} files uploaded")
     return {
         "ok": True,
         "id": name,
@@ -1171,6 +1234,9 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     is empty, and this is how the first design doc gets written."""
     target = _editable_file(session, user, project_id, name)
     target.write_text(body.content, encoding="utf-8")
+    activity.record(
+        session, projectacl.require_member(session, user, project_id), user, activity.EDITED, name
+    )
     return {"ok": True, "name": name, "bytes": target.stat().st_size}
 
 
@@ -1844,6 +1910,9 @@ async def run_stage(
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
+    activity.record(
+        session, projectacl.require_member(session, user, project_id), user, activity.RAN, stage_name
+    )
     return _start_run(project_id, stage_name, cmd, env)
 
 

@@ -395,8 +395,9 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
    error and must not block what you came to do. It renders nothing when there
    is nothing waiting, which is almost always. */
 .invite-strip { display: flex; flex-direction: column; }
-.invite { display: flex; align-items: center; gap: .6rem; padding: .5rem 1rem; background: #1d2530; border-bottom: 1px solid #2a3a4a; font-size: 13px; }
-.invite button { padding: .25rem .7rem; font-size: 12px; }
+.invite { display: flex; align-items: center; gap: .6rem; padding: .6rem 1rem; background: var(--blpl-attention-bg); border-bottom: 2px solid var(--blpl-attention); color: #ffd9c2; font-size: 13px; }
+.invite button { padding: .25rem .7rem; font-size: 12px; background: var(--blpl-attention); border: 1px solid #d4661f; }
+.invite .link { background: transparent; border: none; color: #f0b58c; }
 
 /* --- brand --- */
 .logo-lockup { display: flex; align-items: center; gap: .55rem; color: #e8edf3; }
@@ -405,3 +406,42 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8b8b; }
    own widget, which brings its own container and cannot be styled from here. */
 .gate-column { flex-direction: column; gap: 1.5rem; }
 header .logo-lockup { font-size: 13px; }
+
+/* --- dashboard --- */
+.dashboard { display: flex; flex-direction: column; height: 100vh; overflow: auto; background: #14161a; }
+.dash-head { display: flex; align-items: center; gap: .8rem; padding: .9rem 1.4rem; border-bottom: 1px solid #2a2e36; background: #191c22; }
+.dash-head .seg button { padding: .3rem .7rem; font-size: 12px; }
+.dash-body { display: grid; grid-template-columns: 1fr 340px; gap: 1.6rem; padding: 1.4rem; align-items: start; }
+@media (max-width: 900px) { .dash-body { grid-template-columns: 1fr; } }
+.dashboard h2 { font-size: 14px; margin: 0 0 .7rem; color: #9aa4b0; text-transform: uppercase; letter-spacing: .09em; }
+
+.project-cards { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .8rem; }
+.project-card { display: flex; flex-direction: column; gap: .4rem; width: 100%; text-align: left; padding: .9rem 1rem; background: #191c22; border: 1px solid #2a2e36; border-radius: 10px; }
+.project-card:hover { border-color: #46505f; background: #1c2027; }
+.project-card-top { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.project-card-top strong { font-size: 14px; color: #e8edf3; }
+.project-card-when { font-size: 11px; }
+
+/* Burnt orange, used nowhere else in the app on purpose. The top strip alone
+   was easy to look past — people read the middle of the screen — so the same
+   invitation appears in the body, in a colour that belongs to nothing else and
+   therefore cannot be mistaken for ordinary chrome. */
+:root { --blpl-attention: #c2571f; --blpl-attention-bg: #3a1f0d; --blpl-attention-edge: #7a3a15; }
+.notice-block { margin: 1.4rem 1.4rem 0; }
+.notice { display: flex; align-items: center; gap: .8rem; padding: .8rem 1rem; margin-bottom: .5rem;
+  background: var(--blpl-attention-bg); border: 1px solid var(--blpl-attention-edge);
+  border-left: 4px solid var(--blpl-attention); border-radius: 8px; }
+.notice strong { color: #ffd9c2; }
+.notice-sub { font-size: 12px; color: #e0b193; margin-top: .15rem; }
+.notice button { background: var(--blpl-attention); border: 1px solid #d4661f; }
+.notice button:hover:not(:disabled) { background: #d4661f; }
+.notice .link { background: transparent; border: none; color: #f0b58c; }
+
+.activity-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .5rem; }
+.activity-list li { padding: .5rem .7rem; background: #191c22; border: 1px solid #2a2e36; border-radius: 8px; font-size: 13px; }
+/* Sharing and joining get the attention colour too, so the same event reads the
+   same way whether you meet it in the banner or scrolling the feed. */
+.activity-list li.notable { border-left: 3px solid var(--blpl-attention); }
+.activity-when { font-size: 11px; color: #7d8590; margin-top: .2rem; }
+
+.dash-back { display: flex; align-items: center; gap: .4rem; color: #cfd6df; }

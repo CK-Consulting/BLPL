@@ -411,3 +411,44 @@ class ProjectKeyGrant(Base):
 
     project: Mapped[Project] = relationship()
     user: Mapped[User] = relationship()
+
+
+class ProjectActivity(Base):
+    """What happened to a project, and when.
+
+    Exists because "most recently worked on" has to be answerable. The
+    filesystem knows when a file changed but not who changed it or whether
+    anyone merely looked; git knows about commits but not about runs, imports or
+    shares. Neither can order a dashboard the way someone actually thinks about
+    their own work.
+
+    Deliberately append-only and deliberately coarse. This is a feed and a sort
+    key, not an audit log — it records that a run started, not the argv, and it
+    is not consulted for any permission decision. Treating it as evidence later
+    would be a mistake; it is written on a best-effort basis and a failure to
+    record must never fail the thing being recorded.
+    """
+
+    __tablename__ = "project_activity"
+    __table_args__ = (
+        # The dashboard's two questions: "what did I touch last" and "what
+        # happened in this project", so both directions get an index.
+        Index("ix_activity_user_time", "user_id", "created_at"),
+        Index("ix_activity_project_time", "project_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("project.id", ondelete="CASCADE"))
+    # Nullable: some things happen to a project without a person doing them, and
+    # attributing those to whoever happened to trigger the request would be a
+    # lie the feed then repeats.
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # opened | edited | ran | imported | shared | joined
+    kind: Mapped[str] = mapped_column(String(24))
+    detail: Mapped[str] = mapped_column(String(512), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    project: Mapped[Project] = relationship()
+    user: Mapped["User | None"] = relationship()
