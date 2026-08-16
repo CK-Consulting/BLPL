@@ -50,14 +50,16 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
   // second click would add friction and no security. Sealing protects a stolen
   // disk, not a signed-in user asking for their own files, and the UI should
   // say the same thing the threat model does.
-  if (res.status === 423) {
-    const project = path.match(/^\/api\/projects\/([^/]+)/)?.[1];
+  //
+  // The header, not the status: these routes also answer 423 for "your session
+  // has no key", which needs the opposite response — send the user to unlock,
+  // do not retry. Only the sealed case names a project to open.
+  const sealed = res.status === 423 ? res.headers.get("X-BLPL-Sealed") : null;
+  if (sealed) {
     // Once. A second 423 means opening did not work, and retrying in a loop
     // would turn one bad state into a request storm.
-    if (project && !path.endsWith("/open")) {
-      const opened = await send(`/api/projects/${project}/open`, { method: "POST" });
-      if (opened.ok) res = await send(path, init);
-    }
+    const opened = await send(`/api/projects/${sealed}/open`, { method: "POST" });
+    if (opened.ok) res = await send(path, init);
   }
 
   // 401 anywhere means the session is gone — surface it once, centrally, and

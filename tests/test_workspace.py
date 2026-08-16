@@ -66,6 +66,9 @@ def test_a_sealed_project_is_423_not_404(unlocked):
     r = unlocked.get("/api/projects/mine/files")
     assert r.status_code == 423
     assert "sealed" in r.json()["detail"]
+    # Named in a header, because these routes also answer 423 for "your session
+    # has no key" and the two want opposite responses from the client.
+    assert r.headers["X-BLPL-Sealed"] == "mine"
 
     # And it is still listed: a project you cannot currently read is not a
     # project that has disappeared.
@@ -309,3 +312,15 @@ def test_unsealing_over_an_open_project_does_not_overwrite_it(unlocked):
     blob.parent.mkdir(parents=True, exist_ok=True)
 
     assert (main.PROJECTS_ROOT / "mine" / "a.md").read_text() == "newest\n"
+
+
+def test_a_locked_session_is_not_mistaken_for_a_sealed_project(unlocked):
+    """Both answer 423 on these routes and they mean different things: one is
+    "decrypt this", the other is "go and unlock". A client that confuses them
+    tries to open a project it has no key for, on every request."""
+    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/auth/lock")
+
+    r = unlocked.post("/api/projects/mine/stages/doctor")
+    assert r.status_code == 423
+    assert "X-BLPL-Sealed" not in r.headers

@@ -875,8 +875,16 @@ def _project_dir(session: Session, user: User, project_id: str) -> Path:
         # Encrypted at rest and nobody has opened it. Not an error and not a
         # permission problem — 423 so the client offers to open it rather than
         # reporting a project that appears to have vanished.
+        #
+        # The header is what separates this from the other 423 on these routes,
+        # which means "your session has no key". They want opposite responses —
+        # decrypt and retry versus send the user to unlock — and telling them
+        # apart by matching on the prose of a message would break the first time
+        # somebody reworded it.
         raise HTTPException(
-            status_code=423, detail=f"{project_id!r} is sealed; open it to decrypt it"
+            status_code=423,
+            detail=f"{project_id!r} is sealed; open it to decrypt it",
+            headers={"X-BLPL-Sealed": project_id},
         )
     workspaces.touch(project_id, user.id)
     try:
