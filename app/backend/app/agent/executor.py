@@ -185,9 +185,19 @@ class ToolExecutor:
                 if arg in spec.write_args:
                     self.ctx.sandbox.check_write(target)
                 else:
+                    # Reading is unrestricted across the project on purpose: a
+                    # mate cannot be checked without reading the board on the
+                    # other end of it.
                     self.ctx.sandbox.check_read(target)
             except ReferencePolicyError as exc:
                 raise ToolDenied(str(exc)) from exc
+
+            if arg in spec.write_args and self.ctx.write_scope is not None:
+                allowed, why = self.ctx.write_scope.may_write(target)
+                if not allowed:
+                    # Phrased as what to do instead, not just what was refused.
+                    # A denial the model cannot act on becomes a retry loop.
+                    raise ToolDenied(why)
 
     def _resolve(self, raw: str) -> Path:
         p = Path(raw)

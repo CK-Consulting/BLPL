@@ -58,6 +58,15 @@ class ToolContext:
     # A channel to the user's screen, for tools whose whole effect is visual —
     # highlighting the part being discussed rather than describing where to look.
     on_ui: Callable[[dict], None] | None = None
+    # Which board this agent owns, when the project has more than one. The
+    # sandbox already answers "is this path inside the project and writable at
+    # all"; this answers the separate question of whether it is *yours*. Both
+    # have to pass, and neither subsumes the other — a perfectly writable design
+    # file on someone else's board is still not yours to edit.
+    #
+    # None means single-agent, which is every session today: one agent owning
+    # the whole project needs no boundary drawn inside it.
+    write_scope: Any | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def note(self, message: str) -> None:
