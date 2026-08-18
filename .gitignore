@@ -27,3 +27,4 @@ blpl/webapp/static/assets/
 .env.local
 *.env.local
 *.swp
+blpl-db
