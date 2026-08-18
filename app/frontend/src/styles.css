@@ -489,6 +489,15 @@ header .logo-lockup { font-size: 13px; }
 .mate-line, .config-line { padding: .12rem 0; color: #9aa4b0; }
 .board-warnings { margin-top: .5rem; color: #c8a94e; }
 
+/* --- file tree --- */
+.file-tree { padding: 0 .4rem; }
+.tree-filter { width: 100%; font-size: 12px; padding: .25rem .4rem; margin-bottom: .4rem; }
+.tree-group { margin-bottom: .5rem; }
+.tree-item { display: flex; align-items: center; gap: .4rem; width: 100%; text-align: left; padding: .22rem .4rem; background: none; border: 0; border-radius: 5px; font-size: 12px; }
+.tree-item:hover { background: #1c2027; }
+.tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cfd6de; }
+.tree-size { font-size: 11px; flex: none; }
+
 /* A lost answer is not an error the user caused, and not a warning about the
    design — it is a status with one obvious action. Amber, and it carries that
    action rather than making them retype the question. */

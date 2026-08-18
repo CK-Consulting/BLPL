@@ -1752,6 +1752,120 @@ def get_boards(
     return man.to_dict()
 
 
+# Directories that are noise in a tree rather than content: history, machinery,
+# and anything a package manager owns.
+# .blpl is the app's own state — conversations, proposals, the usage ledger.
+# It is project data in the sense that it is committed with the project, but it
+# is not project *content*: every file in it already has a screen that renders
+# it properly, and offering the raw JSONL in a file tree invites opening a
+# 120 kB transcript in a text editor instead of the chat panel.
+_TREE_SKIP = {".git", ".history", ".blpl", "node_modules", "__pycache__", ".venv"}
+
+# What a file is *for*, which is what a reader actually wants to sort by. The
+# extension alone does not say it — a .md under .notes/ is correspondence, a .md
+# beside it is design intent, and the pipeline treats them very differently.
+def _tree_role(rel: Path) -> str:
+    parts = rel.parts
+    if ".notes" in parts:
+        return "note"
+    if parts and parts[0] == ".pipeline":
+        return "artifact"
+    if parts and parts[0] == "datasheets":
+        return "datasheet"
+    if rel.suffix.lower() in {".md", ".markdown"}:
+        return "design"
+    if rel.suffix.lower() in {".kicad_pcb", ".kicad_sch", ".kicad_pro"}:
+        return "kicad"
+    return "other"
+
+
+def _walk_tree(root: Path, base: Path, depth: int = 0) -> list[dict]:
+    """Everything in a project, as a flat list of nodes with relative paths.
+
+    Flat rather than nested: the client groups it, and a flat list is far easier
+    to filter, sort and diff than a tree of dicts. Depth-limited because a
+    runaway directory should cost a truncated listing rather than a hung request.
+    """
+    if depth > 6:
+        return []
+    out: list[dict] = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except OSError:
+        return out
+    for p in entries:
+        if p.name in _TREE_SKIP:
+            continue
+        rel = p.relative_to(base)
+        if p.is_dir():
+            out.append({"path": str(rel), "name": p.name, "dir": True, "role": _tree_role(rel)})
+            out.extend(_walk_tree(p, base, depth + 1))
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out.append(
+            {
+                "path": str(rel),
+                "name": p.name,
+                "dir": False,
+                "role": _tree_role(rel),
+                "bytes": st.st_size,
+                "modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+            }
+        )
+    return out
+
+
+@app.get("/api/projects/{project_id}/tree")
+def get_tree(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Every file in the project, whatever produced it.
+
+    The artifact list only ever covered ``.pipeline/``, so anything written
+    anywhere else was invisible — a datasheet the assistant fetched sat on disk
+    with no screen in the app that would show it. A project is more than its
+    pipeline output, and the tree is the only view that says so.
+    """
+    proj = _project_dir(session, user, project_id)
+    return {"project_id": project_id, "nodes": _walk_tree(proj, proj)}
+
+
+def _tree_target(proj: Path, rel: str) -> Path:
+    """Resolve a client-supplied project-relative path, or refuse it.
+
+    The path comes from the browser, so it is untrusted: resolve first, then
+    confirm the result is still inside the project. Checking the string for
+    ".." instead would miss a symlink pointing out of the tree.
+    """
+    target = (proj / rel).resolve()
+    try:
+        target.relative_to(proj.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="path is outside the project")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"{rel} is not a file in this project")
+    return target
+
+
+@app.get("/api/projects/{project_id}/blob")
+def get_blob(
+    project_id: str,
+    path: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> FileResponse:
+    """Serve any one file from the project, by its tree path."""
+    proj = _project_dir(session, user, project_id)
+    return FileResponse(_tree_target(proj, path))
+
+
 @app.get("/api/projects/{project_id}/files")
 def list_files(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> list[dict]:

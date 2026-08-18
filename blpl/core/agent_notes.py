@@ -322,6 +322,81 @@ def append_note(board_dir: Path, note: Note) -> Path:
     return path
 
 
+# The reader's own ledger of what it has seen. Named with a leading underscore
+# so it can never be mistaken for a mailbox: identifiers are lowercase hex and
+# cannot start with one. Owned by the board's own agent — the one file in
+# .notes/ that the receiving agent writes rather than reads.
+ACK_FILENAME = "_acknowledged.md"
+
+
+def ack_path(board_dir: Path) -> Path:
+    return notes_dir(board_dir) / ACK_FILENAME
+
+
+def block_key(sender: str, stamp: str) -> str:
+    """What identifies one note for acknowledgement.
+
+    Sender plus the block's own timestamp. Stable across edits to the file and
+    across reordering, and already present in the marker — nothing new has to be
+    generated or stored to make a note referenceable.
+    """
+    return f"{sender}@{stamp}"
+
+
+def acknowledge(board_dir: Path, blocks: list[tuple[str, Block]]) -> Path:
+    """Record that this board's agent has read these notes.
+
+    Append-only like everything else, so the ledger is a history of when things
+    were seen rather than a mutable set. Two agents never write it — only the
+    board's own.
+    """
+    path = ack_path(board_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    seen = _acknowledged_keys(path)
+    fresh = [(s, b) for s, b in blocks if block_key(s, b.stamp) not in seen]
+    if not fresh:
+        return path
+    at = _stamp()
+    lines = [f"- {block_key(s, b.stamp)} read {at}" for s, b in fresh]
+    text = "\n".join(lines) + "\n"
+    if not path.exists():
+        text = (
+            "# Notes acknowledged\n\n"
+            "Written by this board's own agent. One line per note read, so a\n"
+            "note cannot be silently skipped and a re-read is visible as such.\n\n"
+        ) + text
+    with path.open("a", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    return path
+
+
+def _acknowledged_keys(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return set(re.findall(r"^- (\S+@\S+) read ", text, re.MULTILINE))
+
+
+def unacknowledged(board_dir: Path) -> list[tuple[str, Block]]:
+    """Notes this board's agent has not recorded reading, oldest first.
+
+    This is what the gate consults. A note that arrives mid-session shows up
+    here on the next check, so the gate is not only a dispatch-time formality.
+    """
+    seen = _acknowledged_keys(ack_path(board_dir))
+    out: list[tuple[str, Block]] = []
+    for sender, blocks in read_mailbox(board_dir).items():
+        for b in blocks:
+            if block_key(sender, b.stamp) not in seen:
+                out.append((sender, b))
+    return sorted(out, key=lambda sb: (sb[1].stamp, sb[0]))
+
+
 def read_mailbox(board_dir: Path) -> dict[str, list[Block]]:
     """Everything other agents have said about this board, by sender.
 
@@ -372,8 +447,23 @@ class WriteScope:
             return False
 
     def may_write(self, path: str | Path) -> tuple[bool, str]:
-        """Whether this agent may write ``path``, and why not when it may not."""
+        """Whether this agent may write ``path``, and why not when it may not.
+
+        Unread notes block everything. Another board's agent has said something
+        about work this agent is about to change, and letting it write first
+        means the note is answered by a diff that never considered it. Reading
+        is not left to the agent's judgement, because an agent that skips it
+        looks exactly like one with an empty mailbox.
+        """
         p = Path(path)
+        pending = unacknowledged(self.board_dir)
+        if pending:
+            senders = ", ".join(sorted({s for s, _ in pending}))
+            return False, (
+                f"{len(pending)} unread note(s) in {notes_dir(self.board_dir)} from "
+                f"{senders}. Read them and acknowledge before changing anything on this "
+                "board — they are about work you are about to touch."
+            )
         if self._within(self.board_dir, p):
             return True, ""
         for other in self.other_boards:

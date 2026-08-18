@@ -20,6 +20,7 @@ import { Artifacts } from "./components/Artifacts";
 import { ChatPanel } from "./components/ChatPanel";
 import { BoardPanel } from "./components/BoardPanel";
 import { RailToggle, Section } from "./components/Rail";
+import { FileTree, isEditable, type TreeNode } from "./components/FileTree";
 import { useResizable } from "./useResizable";
 import { Project, getJSON } from "./api";
 
@@ -50,6 +51,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   // Which board everything below the board panel is about. Null until the
   // board list loads; a single-board project settles on its one implicit board.
   const [board, setBoard] = useState<string | null>(null);
+  // What the tree last asked the centre panel to show. The tree is the detail
+  // half of the layout; the tabs stay the project-wide half.
+  const [openFile, setOpenFile] = useState<TreeNode | null>(null);
   const [railCollapsed, setRailCollapsed] = useState(
     () => localStorage.getItem("blpl.railCollapsed") === "1",
   );
@@ -172,6 +176,27 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                       BOM and a file are all statements about one board, so the
                       control that decides which board sits above them. */}
                   <BoardPanel projectId={selected} board={board} onBoard={setBoard} />
+                  <Section id="files" title="Files">
+                    <FileTree
+                      projectId={selected}
+                      reloadToken={reloadToken}
+                      onOpen={(n) => {
+                        // Editable text goes to the editor; anything else —
+                        // a datasheet PDF, a gerber — opens in a tab, because
+                        // the app has no viewer for it and pretending
+                        // otherwise just shows bytes.
+                        if (isEditable(n)) {
+                          setOpenFile(n);
+                          setTab("edit");
+                        } else {
+                          window.open(
+                            `/api/projects/${selected}/blob?path=${encodeURIComponent(n.path)}`,
+                            "_blank",
+                          );
+                        }
+                      }}
+                    />
+                  </Section>
                   <Section id="pipeline" title="Pipeline" defaultOpen={false}>
                     <StageRunner
                       projectId={selected}
@@ -230,7 +255,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                 <DesignView projectId={selected} reloadToken={reloadToken} highlight={highlight} />
               )}
               {tab === "preflight" && <Preflight projectId={selected} reloadToken={reloadToken} />}
-              {tab === "edit" && <Editor projectId={selected} onSaved={refresh} />}
+              {tab === "edit" && (
+                <Editor projectId={selected} onSaved={refresh} select={openFile?.path ?? null} />
+              )}
               {tab === "bom" && <BomTable projectId={selected} reloadToken={reloadToken} />}
               {tab === "modules" && <ModuleLibrary projectId={selected} reloadToken={reloadToken} />}
               {tab === "reports" && <Reports projectId={selected} reloadToken={reloadToken} />}

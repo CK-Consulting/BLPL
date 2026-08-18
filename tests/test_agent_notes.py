@@ -314,3 +314,61 @@ def test_the_boundary_is_enforced_on_a_real_tool_call(tmp_path):
     assert other.is_error
     assert "another board's file" in other.content
     assert "Append a note" in other.content
+
+
+# -- the gate ----------------------------------------------------------------
+
+
+def test_an_unread_note_blocks_every_write(scope):
+    """Not a prompt instruction. An agent that skips the read looks exactly
+    like one with an empty mailbox, so the boundary has to enforce it."""
+    an.append_note(scope.board_dir, _note(sender=B, message="check J3"))
+    ok, why = scope.may_write(scope.board_dir / "power.md")
+    assert not ok
+    assert "unread note" in why and B in why
+
+
+def test_acknowledging_opens_the_gate(scope):
+    an.append_note(scope.board_dir, _note(sender=B))
+    pending = an.unacknowledged(scope.board_dir)
+    assert len(pending) == 1
+    an.acknowledge(scope.board_dir, pending)
+    assert an.unacknowledged(scope.board_dir) == []
+    ok, _ = scope.may_write(scope.board_dir / "power.md")
+    assert ok
+
+
+def test_a_note_arriving_mid_session_closes_the_gate_again(scope):
+    """The gate is not a dispatch-time formality — a note that lands while the
+    agent is working has to stop it too."""
+    an.acknowledge(scope.board_dir, an.unacknowledged(scope.board_dir))
+    ok, _ = scope.may_write(scope.board_dir / "power.md")
+    assert ok
+    an.append_note(scope.board_dir, _note(sender=B, message="one more thing"))
+    ok, why = scope.may_write(scope.board_dir / "power.md")
+    assert not ok and "unread note" in why
+
+
+def test_acknowledgement_is_append_only_and_idempotent(scope):
+    an.append_note(scope.board_dir, _note(sender=B))
+    pending = an.unacknowledged(scope.board_dir)
+    an.acknowledge(scope.board_dir, pending)
+    first = an.ack_path(scope.board_dir).read_text()
+    an.acknowledge(scope.board_dir, pending)          # same notes again
+    assert an.ack_path(scope.board_dir).read_text() == first
+
+
+def test_the_ledger_cannot_be_mistaken_for_a_mailbox(scope):
+    """Identifiers are lowercase hex, so a leading underscore is unreachable."""
+    an.append_note(scope.board_dir, _note(sender=B))
+    an.acknowledge(scope.board_dir, an.unacknowledged(scope.board_dir))
+    assert an.ACK_FILENAME.startswith("_")
+    assert set(an.read_mailbox(scope.board_dir)) == {B}
+
+
+def test_the_gate_names_who_is_waiting(scope):
+    """A refusal that does not say who to read is a refusal the agent cannot
+    act on."""
+    an.append_note(scope.board_dir, _note(sender=B))
+    _, why = scope.may_write(scope.board_dir / "power.md")
+    assert B in why and str(an.notes_dir(scope.board_dir)) in why
