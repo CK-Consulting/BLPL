@@ -18,6 +18,8 @@ import { ReleasePanel } from "./components/ReleasePanel";
 import { DiffView } from "./components/DiffView";
 import { Artifacts } from "./components/Artifacts";
 import { ChatPanel } from "./components/ChatPanel";
+import { BoardPanel } from "./components/BoardPanel";
+import { RailToggle, Section } from "./components/Rail";
 import { useResizable } from "./useResizable";
 import { Project, getJSON } from "./api";
 
@@ -45,7 +47,20 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   const [showSharing, setShowSharing] = useState(false);
   const [tab, setTab] = useState<"board" | "preflight" | "edit" | "bom" | "modules" | "reports" | "release" | "artifacts" | "changes">("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
-  const chat = useResizable("blpl.chatWidth", 420);
+  // Which board everything below the board panel is about. Null until the
+  // board list loads; a single-board project settles on its one implicit board.
+  const [board, setBoard] = useState<string | null>(null);
+  const [railCollapsed, setRailCollapsed] = useState(
+    () => localStorage.getItem("blpl.railCollapsed") === "1",
+  );
+  const toggleRail = () =>
+    setRailCollapsed((v) => {
+      localStorage.setItem("blpl.railCollapsed", v ? "0" : "1");
+      return !v;
+    });
+  // Right-anchored: the chat dock grows leftward, so its handle has to measure
+  // from the right edge or the drag reads backwards.
+  const chat = useResizable("blpl.chatWidth", 420, 260, 1000, "right");
   // Off by default so the workspace opens exactly as it did before; the
   // preference sticks per browser once you turn it on.
   const [showChat, setShowChat] = useState(
@@ -141,16 +156,43 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
         <>
           <ProjectSync projectId={selected} onChanged={bump} />
           <main>
-            <aside style={{ width: sidebar.width }}>
-              <StageRunner projectId={selected} onFinished={() => { bump(); refresh(); }} />
-              <RunHistory projectId={selected} reloadToken={reloadToken} />
-            </aside>
-            <div
-              className="resizer"
-              onMouseDown={sidebar.onMouseDown}
-              onDoubleClick={sidebar.reset}
-              title="Drag to resize · double-click to reset"
-            />
+            {railCollapsed ? (
+              // A gutter, not nothing: the control that brings the rail back
+              // has to stay somewhere you can click.
+              <div className="rail-gutter">
+                <RailToggle collapsed onToggle={toggleRail} />
+              </div>
+            ) : (
+              <>
+                <aside className="rail" style={{ width: sidebar.width }}>
+                  <div className="rail-top">
+                    <RailToggle collapsed={false} onToggle={toggleRail} />
+                  </div>
+                  {/* Board first: it scopes everything under it. A stage run, a
+                      BOM and a file are all statements about one board, so the
+                      control that decides which board sits above them. */}
+                  <BoardPanel projectId={selected} board={board} onBoard={setBoard} />
+                  <Section id="pipeline" title="Pipeline" defaultOpen={false}>
+                    <StageRunner
+                      projectId={selected}
+                      onFinished={() => {
+                        bump();
+                        refresh();
+                      }}
+                    />
+                  </Section>
+                  <Section id="runs" title="Runs" defaultOpen={false}>
+                    <RunHistory projectId={selected} reloadToken={reloadToken} />
+                  </Section>
+                </aside>
+                <div
+                  className="resizer"
+                  onMouseDown={sidebar.onMouseDown}
+                  onDoubleClick={sidebar.reset}
+                  title="Drag to resize · double-click to reset"
+                />
+              </>
+            )}
             <section className="viewer">
               <div className="tabs">
                 <button className={tab === "board" ? "on" : ""} onClick={() => setTab("board")}>

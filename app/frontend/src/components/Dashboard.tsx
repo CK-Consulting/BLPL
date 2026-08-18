@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Dashboard as DashboardData, getJSON, postJSON } from "../api";
 import { Logo } from "./Logo";
+import { NewProject } from "./ProjectControls";
 
 /**
  * Where you land after unlocking.
@@ -70,6 +71,11 @@ export function Dashboard({ onOpen }: { onOpen: (projectId: string) => void }) {
       <header className="dash-head">
         <Logo size={30} withText />
         <span className="spacer" />
+        {/* The only way into the workspace is opening a project, so creating
+            one has to live here too. It used to sit solely in the workspace
+            header, which a fresh account can never reach: no projects, no
+            cards, no way in. */}
+        <NewProject onCreated={onOpen} />
         <div className="seg small">
           {SORTS.map((s) => (
             <button
@@ -119,9 +125,15 @@ export function Dashboard({ onOpen }: { onOpen: (projectId: string) => void }) {
         <section className="dash-projects">
           <h2>Projects</h2>
           {projects.length === 0 ? (
-            <p className="muted">
-              Nothing here yet. Create a project or import one to get started.
-            </p>
+            <div className="dash-empty">
+              <p className="muted">
+                Nothing here yet. Create a project or import one to get started.
+              </p>
+              {/* Same control as the header. People read the middle of the
+                  screen, not the top strip, and this is the one screen where
+                  the reader has nothing else to click. */}
+              <NewProject onCreated={onOpen} />
+            </div>
           ) : (
             <ul className="project-cards">
               {projects.map((p) => (

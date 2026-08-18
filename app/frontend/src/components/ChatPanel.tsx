@@ -1,7 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ChatMessage, ConversationMeta, Proposal, getJSON, postJSON, readSSE } from "../api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ApiError, ChatMessage, ConversationMeta, Proposal, getJSON, postJSON, readSSE } from "../api";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
+import { SlashCommand, SlashPopover, useSlashCommands } from "./SlashCommands";
+import {
+  ACCEPTED,
+  Attachment,
+  dragHasFiles,
+  filesFromTransfer,
+  humanSize,
+  upload,
+} from "../attachments";
 
 /**
  * The design conversation, next to the project it is about.
@@ -30,6 +39,46 @@ type LiveTool = { id: string; name: string; input: Record<string, unknown>; done
  *  resumes the moment this is answered, and expires as a denial. */
 type Approval = { call_id: string; tool: string; kind: string; summary: string };
 
+// Short, and bounded. A turn nobody is watching still finishes and still lands
+// in the transcript, so the job here is to ride out a blip, not to guarantee
+// delivery — after this the panel says where the answer went and stops.
+const RECONNECT_ATTEMPTS = 4;
+const RECONNECT_BACKOFF_MS = [400, 1000, 2000, 4000];
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** How a turn stopped being watchable. */
+type TurnOutcome = "ended" | "not_live";
+
+/** Why a question ended up with no answer — the two cases read differently. */
+type LostReason = "not_live" | "transient";
+
+/** The last thing said, if the transcript ends on the user — i.e. nothing answered. */
+function unansweredTail(messages: ChatMessage[]): ChatMessage | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    // tool_results are bookkeeping between an assistant turn and its
+    // continuation; they say nothing about whether the user got an answer.
+    if (m.role === "tool_results") continue;
+    if (m.role === "error") {
+      // A stop was the user's own decision — offering to undo it would be
+      // arguing with them. A failure is not an answer, so keep looking back
+      // for the question it failed to answer.
+      if ((m.metadata as any)?.cancelled) return null;
+      continue;
+    }
+    return m.role === "user" ? m : null;
+  }
+  return null;
+}
+
+/** The turn id a 409 is pointing at, or null if this is some other failure. */
+function turnInFlightId(e: unknown): string | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  const detail = e.detail as { error?: string; turn_id?: string } | undefined;
+  return detail?.error === "turn_in_flight" && detail.turn_id ? detail.turn_id : null;
+}
+
 export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [filename, setFilename] = useState<string | null>(null);
@@ -38,6 +87,12 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [decided, setDecided] = useState<Record<string, string>>({});
 
   const [input, setInput] = useState("");
+  // Uploaded and waiting to ride along with the next message. Upload happens on
+  // pick/paste/drop rather than on send, so a slow datasheet does not sit in
+  // front of the send button.
+  const [attached, setAttached] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(0);
+  const [dragging, setDragging] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [liveText, setLiveText] = useState("");
   // Segments already closed this turn. A loop that reads a file, thinks, then
@@ -50,8 +105,25 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [progress, setProgress] = useState<string | null>(null);
   const [model, setModel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A question the server was answering when it stopped existing. Held so the
+  // panel can say so and offer to ask it again, rather than leaving it looking
+  // like the assistant simply had nothing to say.
+  const [lost, setLost] = useState<{ message: ChatMessage; reason: LostReason } | null>(
+    null,
+  );
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Set below. The open effect must not depend on `watch` directly: `watch`
+  // changes identity whenever the conversation does, and depending on it would
+  // re-run the effect mid-turn and reload the conversation underneath itself.
+  const watchRef = useRef<((id: string) => Promise<void>) | null>(null);
+  // Read inside the reconnect loop, which is a plain async loop and would
+  // otherwise close over a stale copy of any state value.
+  const cancelledRef = useRef(false);
+  // Set when the failure the stream reported is already written to the
+  // transcript, and whether asking again could plausibly work.
+  const persistedErrorRef = useRef(false);
+  const retryableRef = useRef(false);
 
   // Follow the tail while an answer streams, but never yank the view back down
   // if the user has scrolled up to read something earlier.
@@ -62,14 +134,27 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     if (nearBottom) el.scrollTop = el.scrollHeight;
   }, [messages, liveText, liveSegments, liveTools, proposals, approvals]);
 
+  const fetchConversation = useCallback(
+    (name: string) =>
+      getJSON<{ events: ChatMessage[]; active_turn?: string | null }>(
+        `/api/projects/${projectId}/conversations/${name}`,
+      ),
+    [projectId],
+  );
+
   const loadConversation = useCallback(
     async (name: string) => {
-      const convo = await getJSON<{ events: ChatMessage[] }>(
-        `/api/projects/${projectId}/conversations/${name}`,
-      );
+      const convo = await fetchConversation(name);
       setMessages(convo.events);
+      return convo.active_turn ?? null;
     },
-    [projectId],
+    [fetchConversation],
+  );
+
+  /** The transcript as the server has it, for a caller that needs to inspect it. */
+  const loadMessages = useCallback(
+    async (name: string) => (await fetchConversation(name)).events,
+    [fetchConversation],
   );
 
   const refreshProposals = useCallback(
@@ -97,15 +182,41 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           title: "design",
         });
       }
-      setConversations(chosen && !list.length ? [chosen] : list);
+      setConversations(list.length ? list : [chosen]);
       setFilename(chosen.filename);
-      await loadConversation(chosen.filename);
+      const live = await loadConversation(chosen.filename);
       await refreshProposals();
+      // An answer already in progress — this tab reloaded, or another one
+      // started it. Attaching replays it from the top, so it reads as though
+      // the panel had been open the whole time.
+      if (live && !cancelled) void watchRef.current?.(live);
     })().catch((e) => !cancelled && setError((e as Error).message));
     return () => {
       cancelled = true;
     };
   }, [projectId, loadConversation, refreshProposals]);
+
+  /** Open a different conversation in this project. */
+  const openConversation = useCallback(
+    async (name: string) => {
+      if (name === filename || streaming) return;
+      setFilename(name);
+      setMessages([]);
+      setLiveText("");
+      setLiveSegments([]);
+      setLiveTools([]);
+      setAttached([]);
+      setError(null);
+      const live = await loadConversation(name).catch((e) => {
+        setError((e as Error).message);
+        return null;
+      });
+      // Each conversation has its own turn. Switching into one with an answer
+      // in progress should show that answer, not a frozen transcript.
+      if (live) void watchRef.current?.(live);
+    },
+    [filename, streaming, loadConversation],
+  );
 
   const newConversation = async () => {
     const created = await postJSON<ConversationMeta>(`/api/projects/${projectId}/conversations`, {
@@ -116,69 +227,330 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     setMessages([]);
     setLiveText("");
     setLiveTools([]);
+    setAttached([]);
+  };
+
+  /**
+   * Watch a turn until it ends, reattaching if the connection drops.
+   *
+   * The turn runs on the server, not in this tab. Losing the stream is
+   * therefore a viewing problem, not a turn problem — the answer is still being
+   * written, and the server replays it from the top to whoever attaches. What
+   * used to happen instead: the fetch body broke, the panel printed the
+   * browser's "network error", and the only offered move — send it again — was
+   * refused, because the turn it collided with was the one whose output had
+   * just gone missing.
+   *
+   * Each attach replays the whole turn, so state is rebuilt from scratch on
+   * every attempt rather than resumed. That is what makes a reconnect
+   * idempotent, and it is why the buffers are cleared here and not by the
+   * caller.
+   */
+  const follow = useCallback(
+    async (id: string): Promise<TurnOutcome> => {
+      setTurnId(id);
+      cancelledRef.current = false;
+      persistedErrorRef.current = false;
+      retryableRef.current = false;
+      let outcome: TurnOutcome = "ended";
+      let attempt = 0;
+      for (;;) {
+        // Replay is from the top every time; start from an empty slate so a
+        // reconnect cannot double the text it already showed.
+        setLiveText("");
+        setLiveSegments([]);
+        setLiveTools([]);
+        setApprovals([]);
+        let sawEnd = false;
+        outcome = "ended";
+        try {
+          await readSSE(
+            `/api/projects/${projectId}/chat/${id}/events`,
+            { method: "GET" },
+            (event, payload) => {
+              if (event === "text_delta") setLiveText((t) => t + payload.text);
+              else if (event === "segment")
+                setLiveText((t) => {
+                  if (t.trim()) setLiveSegments((s) => [...s, t]);
+                  return "";
+                });
+              else if (event === "tool_call")
+                setLiveTools((t) => [
+                  ...t,
+                  { id: payload.id, name: payload.name, input: payload.input },
+                ]);
+              else if (event === "tool_result")
+                setLiveTools((t) =>
+                  t.map((x) =>
+                    x.id === payload.id ? { ...x, done: true, error: payload.is_error } : x,
+                  ),
+                );
+              // Replay means the same proposal can arrive twice; key on its id
+              // rather than appending, or a reconnect shows every card double.
+              else if (event === "proposal")
+                setProposals((p) =>
+                  p.some((x) => x.id === payload.proposal.id) ? p : [...p, payload.proposal],
+                );
+              else if (event === "progress") setProgress(payload.message);
+              else if (event === "ui" && payload.type === "highlight")
+                onHighlight?.(payload.designators ?? [], payload.nets ?? []);
+              else if (event === "approval_required")
+                setApprovals((a) =>
+                  a.some((x) => x.call_id === payload.call_id) ? a : [...a, payload as Approval],
+                );
+              else if (event === "approval_resolved")
+                setApprovals((a) => a.filter((x) => x.call_id !== payload.call_id));
+              else if (event === "error") {
+                setError(payload.detail);
+                // The server persists this same text into the conversation, so
+                // once the transcript reloads it is on screen from there too.
+                // Without this the user reads the identical provider error
+                // twice, which looks like it happened twice.
+                persistedErrorRef.current = true;
+                retryableRef.current = Boolean(payload.retryable);
+                sawEnd = true;
+              } else if (event === "done") {
+                sawEnd = true;
+                // "not_live" means the server has no such turn: it was lost in
+                // a restart, or it finished long enough ago to have aged out of
+                // the retained buffer. Those need opposite things said about
+                // them, and only the transcript can tell them apart — so the
+                // reason is carried out to the caller, which reloads it.
+                if (payload.stop_reason === "not_live") outcome = "not_live";
+              }
+              else if (event === "cancelled") {
+                sawEnd = true;
+                cancelledRef.current = true;
+              }
+              if (event === "start" && payload.model) setModel(payload.model);
+            },
+          );
+          // A stream that ends without a terminal event ended early — the turn
+          // is still running and this reader simply lost it.
+          if (sawEnd) return outcome;
+        } catch (e) {
+          // A 4xx is an answer, not a broken pipe: the turn is gone, or this
+          // client may not watch it. Retrying cannot change either.
+          if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
+            setError(e.message);
+            return "ended";
+          }
+        }
+        // Stop was pressed. Whether the cancelled event arrived or the stream
+        // died first, reattaching to a turn the user just ended is the one
+        // thing they definitely did not ask for.
+        if (cancelledRef.current) return "ended";
+        attempt += 1;
+        if (attempt > RECONNECT_ATTEMPTS) {
+          setError(
+            "Lost the connection to this answer. It is still running on the server — " +
+              "reopen the project or reload to pick it back up.",
+          );
+          return "ended";
+        }
+        setProgress(`Connection dropped — reattaching (${attempt}/${RECONNECT_ATTEMPTS})…`);
+        await sleep(RECONNECT_BACKOFF_MS[attempt - 1] ?? 4000);
+      }
+    },
+    [projectId, onHighlight],
+  );
+
+  /** Run a turn to completion, then reconcile against what was persisted. */
+  const watch = useCallback(
+    async (id: string) => {
+      setStreaming(true);
+      let outcome: TurnOutcome = "ended";
+      try {
+        outcome = await follow(id);
+      } finally {
+        setStreaming(false);
+        setLiveText("");
+        setLiveSegments([]);
+        setLiveTools([]);
+        setApprovals([]);
+        setProgress(null);
+        setTurnId(null);
+        // The persisted turn is authoritative — reload rather than trusting the
+        // deltas we happened to see.
+        const reloaded = filename ? await loadMessages(filename).catch(() => null) : null;
+        if (reloaded) setMessages(reloaded);
+        await refreshProposals();
+
+        // A turn the server no longer has is either an answer that was lost —
+        // the process restarted while it was running — or one that finished so
+        // long ago it aged out of the retained buffer. The transcript is what
+        // tells them apart: if the last thing in it is still the question,
+        // nothing ever answered it.
+        //
+        // This is the case that made a lost answer look like a working app.
+        // The stream ended with a well-formed `done`, so the panel treated it
+        // as success, reloaded, and showed the question sitting there with no
+        // reply and no explanation.
+        if (outcome === "not_live" && reloaded) {
+          const orphan = unansweredTail(reloaded);
+          if (orphan) setLost({ message: orphan, reason: "not_live" });
+        }
+
+        // The transcript is now showing the failure; the live copy would be a
+        // second one. A transient failure (the provider briefly out of
+        // capacity) additionally gets the same one-click retry a lost turn
+        // gets — the question is still sitting there unanswered, and asking it
+        // again is the whole remedy.
+        if (persistedErrorRef.current) {
+          setError(null);
+          if (retryableRef.current && reloaded) {
+            const orphan = unansweredTail(reloaded);
+            if (orphan) setLost({ message: orphan, reason: "transient" });
+          }
+        }
+      }
+    },
+    [follow, filename, loadMessages, refreshProposals],
+  );
+  watchRef.current = watch;
+
+  /**
+   * Ask an orphaned question again.
+   *
+   * The question is already in the transcript — it was persisted before the
+   * turn started, which is the whole reason nothing the user typed is ever
+   * lost. So this does not re-post the message; it starts a fresh turn with the
+   * same words and the same files, and lets the server append the answer.
+   */
+  const retryLost = async () => {
+    if (!lost || !filename || streaming) return;
+    const ids = (lost.message.metadata?.blocks ?? [])
+      .filter((b) => b.type === "image" || b.type === "document")
+      .map((b) => b.attachment)
+      .filter((x): x is string => Boolean(x));
+    setLost(null);
+    setError(null);
+    try {
+      const started = await postJSON<{ turn_id: string; model: string }>(
+        `/api/projects/${projectId}/conversations/${filename}/chat`,
+        { content: lost.message.content, attachments: ids },
+      );
+      setModel(started.model);
+      await watch(started.turn_id);
+    } catch (e) {
+      const inFlight = turnInFlightId(e);
+      if (inFlight) {
+        await watch(inFlight);
+        return;
+      }
+      setError((e as Error).message);
+      setLost(lost);
+    }
   };
 
   const send = async () => {
     const text = input.trim();
-    if (!text || !filename || streaming) return;
+    // An attachment alone is a message: dropping in a datasheet and asking
+    // nothing is a normal opening move, and the server agrees.
+    if ((!text && attached.length === 0) || !filename || streaming) return;
+    const sent = attached;
     setInput("");
+    setAttached([]);
     setError(null);
-    setStreaming(true);
-    setLiveText("");
-    setLiveSegments([]);
-    setLiveTools([]);
+    setLost(null);
     // Show the question immediately; the server has already persisted it.
-    setMessages((m) => [...m, { role: "user", content: text, timestamp: "" }]);
+    setMessages((m) => [
+      ...m,
+      {
+        role: "user",
+        content: text,
+        timestamp: "",
+        metadata: {
+          blocks: sent.map((a) => ({
+            type: a.kind,
+            attachment: a.id,
+            media_type: a.media_type,
+            name: a.name,
+          })),
+        },
+      } as ChatMessage,
+    ]);
 
+    let id: string;
     try {
       const started = await postJSON<{ turn_id: string; model: string }>(
         `/api/projects/${projectId}/conversations/${filename}/chat`,
-        { content: text },
+        { content: text, attachments: sent.map((a) => a.id) },
       );
       setModel(started.model);
-      setTurnId(started.turn_id);
-      await readSSE(
-        `/api/projects/${projectId}/chat/${started.turn_id}/events`,
-        { method: "GET" },
-        (event, payload) => {
-          if (event === "text_delta") setLiveText((t) => t + payload.text);
-          else if (event === "segment")
-            setLiveText((t) => {
-              if (t.trim()) setLiveSegments((s) => [...s, t]);
-              return "";
-            });
-          else if (event === "tool_call")
-            setLiveTools((t) => [...t, { id: payload.id, name: payload.name, input: payload.input }]);
-          else if (event === "tool_result")
-            setLiveTools((t) =>
-              t.map((x) => (x.id === payload.id ? { ...x, done: true, error: payload.is_error } : x)),
-            );
-          else if (event === "proposal") setProposals((p) => [...p, payload.proposal]);
-          else if (event === "progress") setProgress(payload.message);
-          else if (event === "ui" && payload.type === "highlight")
-            onHighlight?.(payload.designators ?? [], payload.nets ?? []);
-          else if (event === "approval_required")
-            setApprovals((a) => [...a, payload as Approval]);
-          else if (event === "approval_resolved")
-            setApprovals((a) => a.filter((x) => x.call_id !== payload.call_id));
-          else if (event === "error") setError(payload.detail);
-        },
-      );
+      id = started.turn_id;
     } catch (e) {
+      // 409 means a turn is already running here — nearly always this tab's own,
+      // whose stream died. The server names it, so the right move is to go and
+      // watch it rather than report a collision the user cannot act on. The
+      // message was not persisted (the server checks before it writes), so put
+      // it back in the box instead of losing what they typed.
+      const inFlight = turnInFlightId(e);
+      if (inFlight) {
+        setMessages((m) => m.filter((x, i) => !(i === m.length - 1 && x.content === text)));
+        setInput(text);
+        setAttached(sent);
+        setError(null);
+        await watch(inFlight);
+        return;
+      }
+      setMessages((m) => m.filter((x, i) => !(i === m.length - 1 && x.content === text)));
+      setInput(text);
+      setAttached(sent);
       setError((e as Error).message);
-    } finally {
-      setStreaming(false);
-      setLiveText("");
-      setLiveSegments([]);
-      setLiveTools([]);
-      setApprovals([]);
-      setProgress(null);
-      setTurnId(null);
-      // The persisted turn is authoritative — reload rather than trusting the
-      // deltas we happened to see.
-      if (filename) await loadConversation(filename).catch(() => {});
-      await refreshProposals();
+      return;
     }
+    await watch(id);
+  };
+
+  const attach = useCallback(
+    async (files: File[]) => {
+      if (!files.length || !filename) return;
+      setUploading((n) => n + files.length);
+      setError(null);
+      try {
+        const saved = await upload(projectId, filename, files);
+        // Content-addressed, so attaching the same file twice is the same id.
+        // Dedupe rather than showing one file as two chips that cannot be told
+        // apart and remove together.
+        setAttached((cur) => {
+          const have = new Set(cur.map((a) => a.id));
+          return [...cur, ...saved.filter((a) => !have.has(a.id))];
+        });
+      } catch (e) {
+        setError((e as Error).message);
+      } finally {
+        setUploading((n) => Math.max(0, n - files.length));
+      }
+    },
+    [projectId, filename],
+  );
+
+  const fileInput = useRef<HTMLInputElement | null>(null);
+  const textarea = useRef<HTMLTextAreaElement | null>(null);
+  const slash = useSlashCommands(input);
+
+  /** Replace the typed `/cmd` with its text and put the caret where it belongs. */
+  const applyCommand = (cmd: SlashCommand) => {
+    setInput(cmd.expand);
+    const caret = cmd.expand.length - (cmd.caretFromEnd ?? 0);
+    // After React has painted the new value, or the selection is set on the
+    // old one and immediately overwritten.
+    requestAnimationFrame(() => {
+      const el = textarea.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(caret, caret);
+    });
+  };
+
+  const stop = async () => {
+    if (!turnId) return;
+    cancelledRef.current = true;
+    setProgress("Stopping…");
+    // The server confirms by ending the stream, which unwinds `watch` and
+    // reloads the transcript; nothing to do here but ask.
+    await postJSON(`/api/projects/${projectId}/chat/${turnId}/cancel`).catch(() => {});
   };
 
   const onDecided = (id: string, status: string) => {
@@ -189,10 +561,47 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
 
   const pending = proposals.filter((p) => !decided[p.id]);
 
+  // Which questions are re-asks of an earlier one, by transcript position.
+  //
+  // This exists because of a specific way the app misled people. A message is
+  // persisted the moment it arrives — before the answer is attempted — so a
+  // failed turn leaves the question saved. The failure said nothing about
+  // that, so the natural reading was "it did not send", and the natural
+  // response was to send it again. Nothing on screen contradicted either
+  // belief: a long paste renders as a wall of text, and four walls look much
+  // like one. Saying it plainly is the only reliable fix.
+  const repeats = useMemo(() => {
+    const firstSeen = new Map<string, number>();
+    const out = new Map<number, number>();
+    messages.forEach((m, i) => {
+      if (m.role !== "user" || !m.content.trim()) return;
+      const prior = firstSeen.get(m.content);
+      if (prior === undefined) firstSeen.set(m.content, i);
+      else out.set(i, prior);
+    });
+    return out;
+  }, [messages]);
+
   return (
     <div className="chat">
       <div className="chat-head">
-        <strong>Design chat</strong>
+        {/* Every conversation in this project, not just the newest. "New" has
+            always worked; getting back to what it replaced did not — the list
+            was fetched and then never shown, so past design conversations were
+            reachable only by reading the JSONL on disk. */}
+        <select
+          className="chat-picker"
+          value={filename ?? ""}
+          disabled={streaming || conversations.length === 0}
+          title="Switch conversation"
+          onChange={(e) => void openConversation(e.target.value)}
+        >
+          {conversations.map((c) => (
+            <option key={c.filename} value={c.filename}>
+              {c.slug} · {c.message_count} msg
+            </option>
+          ))}
+        </select>
         {model && <span className="muted small">{model}</span>}
         <span className="spacer" />
         <button className="link" onClick={newConversation} disabled={streaming}>
@@ -210,7 +619,12 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         )}
 
         {messages.map((m, i) => (
-          <Message key={i} message={m} />
+          <Message
+            key={i}
+            message={m}
+            projectId={projectId}
+            repeatOf={repeats.get(i)}
+          />
         ))}
 
         {liveSegments.map((seg, i) => (
@@ -249,16 +663,139 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           <ProposalCard key={p.id} projectId={projectId} proposal={p} onDecided={onDecided} />
         ))}
 
+        {lost && (
+          <div className="turn-lost">
+            <div>
+              <strong>
+                {lost.reason === "transient"
+                  ? "The model provider was busy."
+                  : "That answer was lost."}
+              </strong>
+              <div className="muted small">
+                {lost.reason === "transient"
+                  ? "This is a capacity problem at the provider, not a problem with your " +
+                    "question — nothing about the message needs changing. Asking again " +
+                    "usually works."
+                  : "The server stopped holding this turn — usually because it restarted " +
+                    "mid-answer. Your question is safe and still here; nothing replied to it."}
+              </div>
+            </div>
+            <span className="spacer" />
+            <button onClick={() => void retryLost()} disabled={streaming}>
+              Ask again
+            </button>
+            <button className="link" onClick={() => setLost(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {error && <div className="gate-error">{error}</div>}
       </div>
 
-      <div className="chat-composer">
+      <div
+        className={dragging ? "chat-composer dropping" : "chat-composer"}
+        // Drop is handled on the whole composer, not just the textarea: aiming
+        // at a one-line input to drop a datasheet is a needless test of motor
+        // control, and the obvious target is the box as a whole.
+        onDragOver={(e) => {
+          if (!dragHasFiles(e.dataTransfer)) return;
+          e.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={(e) => {
+          // Fires for every child crossed on the way in; only the one that
+          // actually leaves the composer counts.
+          if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+          setDragging(false);
+        }}
+        onDrop={(e) => {
+          const files = filesFromTransfer(e.dataTransfer);
+          setDragging(false);
+          if (!files.length) return;
+          e.preventDefault();
+          void attach(files);
+        }}
+      >
+        {(attached.length > 0 || uploading > 0) && (
+          <div className="chat-attachments">
+            {attached.map((a) => (
+              <span className="attach-chip" key={a.id} title={`${a.name} · ${humanSize(a.bytes)}`}>
+                {a.kind === "image" ? (
+                  // The thumbnail is the label: one screenshot looks much like
+                  // another by filename, and this is the only way to see which
+                  // one is about to be sent.
+                  <img
+                    src={`/api/projects/${projectId}/attachments/${a.id}`}
+                    alt={a.name}
+                  />
+                ) : (
+                  <span className="attach-doc">PDF</span>
+                )}
+                <span className="attach-name">{a.name}</span>
+                <button
+                  className="link"
+                  title="Remove"
+                  onClick={() => setAttached((cur) => cur.filter((x) => x.id !== a.id))}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            {uploading > 0 && <span className="muted small">uploading {uploading}…</span>}
+          </div>
+        )}
+        {slash.open && (
+          <SlashPopover query={slash.query ?? ""} active={slash.active} onPick={applyCommand} />
+        )}
         <textarea
+          ref={textarea}
           value={input}
-          placeholder="Describe the board, or ask about this design…"
+          placeholder={
+            attached.length
+              ? "Ask about what you attached…"
+              : "Describe the board, or ask about this design…"
+          }
           disabled={streaming || !filename}
           onChange={(e) => setInput(e.target.value)}
+          // Screenshot straight into the conversation. This is the common case
+          // for a board — a scope trace, a datasheet page, a photo of the
+          // bench — and saving it to disk first just to pick it again is the
+          // step worth deleting.
+          onPaste={(e) => {
+            const files = filesFromTransfer(e.clipboardData);
+            if (!files.length) return;
+            e.preventDefault();
+            void attach(files);
+          }}
           onKeyDown={(e) => {
+            // While the command list is up it owns Enter, Tab and the arrows —
+            // otherwise Enter would send "/rea" as a message and Tab would
+            // leave the composer entirely.
+            if (slash.open) {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                slash.setActive((a) => (a + 1) % slash.list.length);
+                return;
+              }
+              if (e.key === "ArrowUp") {
+                e.preventDefault();
+                slash.setActive((a) => (a - 1 + slash.list.length) % slash.list.length);
+                return;
+              }
+              if (e.key === "Enter" || e.key === "Tab") {
+                e.preventDefault();
+                applyCommand(slash.list[slash.active % slash.list.length]);
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                // Nothing to close — dismissing means the text is no longer a
+                // bare command, so clearing it is the honest way out.
+                setInput("");
+                return;
+              }
+            }
             // Enter sends; Shift+Enter is a newline — the convention every chat
             // UI uses, and design questions are usually one line.
             if (e.key === "Enter" && !e.shiftKey) {
@@ -267,25 +804,105 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             }
           }}
         />
-        <button onClick={() => void send()} disabled={streaming || !input.trim() || !filename}>
-          {streaming ? "…" : "Send"}
+        <input
+          ref={fileInput}
+          type="file"
+          multiple
+          accept={ACCEPTED}
+          style={{ display: "none" }}
+          onChange={(e) => {
+            void attach(Array.from(e.target.files ?? []));
+            // Reset, or picking the same file twice in a row fires nothing.
+            e.target.value = "";
+          }}
+        />
+        <button
+          className="link attach-btn"
+          title="Attach an image or PDF — you can also paste or drop one"
+          disabled={streaming || !filename}
+          onClick={() => fileInput.current?.click()}
+        >
+          +
         </button>
+        {streaming ? (
+          // Occupies the same spot as Send rather than sitting beside it: while
+          // a turn runs, stopping it is the only thing this button can do, and
+          // a disabled "…" was a status readout offered where an action belongs.
+          <button className="stop" onClick={() => void stop()} disabled={!turnId}>
+            Stop
+          </button>
+        ) : (
+          <button
+            onClick={() => void send()}
+            disabled={(!input.trim() && attached.length === 0) || !filename}
+          >
+            Send
+          </button>
+        )}
       </div>
     </div>
   );
 }
 
-function Message({ message }: { message: ChatMessage }) {
+/** How much of a long message to show before folding it. */
+const COLLAPSE_CHARS = 900;
+
+function Message({
+  message,
+  projectId,
+  repeatOf,
+}: {
+  message: ChatMessage;
+  projectId: string;
+  /** Index of the earlier message this one repeats, when it does. */
+  repeatOf?: number;
+}) {
   if (message.role === "tool_results") {
     // The call itself is already shown; the raw result body is noise in the
     // transcript, and the assistant's next message says what it found.
     return null;
   }
   if (message.role === "error") {
+    // A stop is recorded on the same line as a failure — both are "this turn
+    // produced no answer" — but only one of them is something going wrong.
+    if ((message.metadata as any)?.cancelled) {
+      return <div className="muted small pad">■ stopped</div>;
+    }
     return <div className="gate-error">{message.content}</div>;
   }
   if (message.role === "user") {
-    return <div className="msg user">{message.content}</div>;
+    const files = (message.metadata?.blocks ?? []).filter(
+      (b: any) => b.type === "image" || b.type === "document",
+    ) as any[];
+    return (
+      <div className={repeatOf === undefined ? "msg user" : "msg user repeat"}>
+        {repeatOf !== undefined && (
+          <div className="repeat-tag" title="Identical to an earlier message in this conversation">
+            ↑ same question asked earlier — the assistant sees it more than once
+          </div>
+        )}
+        {files.length > 0 && (
+          <div className="msg-attachments">
+            {files.map((f, i) => {
+              const href = `/api/projects/${projectId}/attachments/${f.attachment}`;
+              return f.type === "image" ? (
+                // Opens full size in a tab. A thumbnail is enough to remember
+                // which image this was; reading a datasheet page needs the
+                // real thing.
+                <a key={i} href={href} target="_blank" rel="noreferrer">
+                  <img src={href} alt={f.name || "attachment"} />
+                </a>
+              ) : (
+                <a key={i} className="attach-doc-link" href={href} target="_blank" rel="noreferrer">
+                  {f.name || "document.pdf"}
+                </a>
+              );
+            })}
+          </div>
+        )}
+        <Foldable text={message.content} />
+      </div>
+    );
   }
   const calls = (message.metadata?.blocks ?? []).filter((b) => b.type === "tool_use");
   return (
@@ -298,6 +915,27 @@ function Message({ message }: { message: ChatMessage }) {
           <Markdown text={message.content} />
         </div>
       )}
+    </>
+  );
+}
+
+/**
+ * A long pasted message, folded.
+ *
+ * A 16,000-character paste rendered whole is a wall you scroll past rather than
+ * read, which is how four copies of one can sit in a transcript unnoticed.
+ * Folding turns each message back into something with a visible beginning and
+ * end, so the shape of the conversation is legible again.
+ */
+function Foldable({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  if (text.length <= COLLAPSE_CHARS) return <>{text}</>;
+  return (
+    <>
+      {open ? text : text.slice(0, COLLAPSE_CHARS).trimEnd() + "…"}
+      <button className="link fold" onClick={() => setOpen((v) => !v)}>
+        {open ? "Show less" : `Show all ${text.length.toLocaleString()} characters`}
+      </button>
     </>
   );
 }

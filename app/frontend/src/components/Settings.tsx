@@ -16,6 +16,16 @@ import { PasskeyInfo, enrolPasskey, passkeysAvailable } from "../passkey";
  * model, and datasheet extraction must be able to see."
  */
 
+type SectionId = "endpoints" | "routing" | "security";
+
+// "Security" rather than "Passkeys": you go looking for where the lock lives,
+// not for the name of the mechanism that opens it.
+const SECTIONS: { id: SectionId; label: string }[] = [
+  { id: "endpoints", label: "Endpoints" },
+  { id: "routing", label: "Task routing" },
+  { id: "security", label: "Security" },
+];
+
 export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const [data, setData] = useState<SettingsData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -24,6 +34,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
     getJSON<SettingsData>("/api/settings")
       .then(setData)
       .catch((e) => setError(String(e.message)));
+  const [tab, setTab] = useState<SectionId>("endpoints");
   useEffect(() => {
     refresh();
   }, []);
@@ -35,15 +46,36 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <header className="modal-head">
           <h2>Settings</h2>
+          {/* Tabs, not one long scroll. Everything here was reachable before,
+              but "reachable by scrolling past two unrelated sections" is how
+              passkeys went unnoticed by the person who most wanted them —
+              settings are looked up by name, and a name you cannot see is a
+              feature you do not have. */}
+          <div className="seg small settings-tabs">
+            {SECTIONS.map((s) => (
+              <button
+                key={s.id}
+                className={tab === s.id ? "on" : ""}
+                onClick={() => setTab(s.id)}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+          <span className="spacer" />
           <button className="link" onClick={onClose}>
             Close
           </button>
         </header>
         <div className="modal-body">
           {error && <div className="gate-error">{error}</div>}
-          <Endpoints data={data} onChanged={refresh} onError={setError} />
-          <Routing data={data} onChanged={refresh} onError={setError} />
-          <Passkeys onError={setError} />
+          {tab === "endpoints" && (
+            <Endpoints data={data} onChanged={refresh} onError={setError} />
+          )}
+          {tab === "routing" && (
+            <Routing data={data} onChanged={refresh} onError={setError} />
+          )}
+          {tab === "security" && <Passkeys onError={setError} />}
         </div>
       </div>
     </div>

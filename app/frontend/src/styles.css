@@ -417,6 +417,90 @@ header .logo-lockup { font-size: 13px; }
 .dash-body { display: grid; grid-template-columns: 1fr 340px; gap: 1.6rem; padding: 1.4rem; align-items: start; }
 @media (max-width: 900px) { .dash-body { grid-template-columns: 1fr; } }
 .dashboard h2 { font-size: 14px; margin: 0 0 .7rem; color: #9aa4b0; text-transform: uppercase; letter-spacing: .09em; }
+/* The first-run state: nothing to click but the one thing you came to do, so
+   the create control gets card-sized weight rather than header-strip weight. */
+.dash-empty { display: flex; flex-direction: column; align-items: flex-start; gap: .8rem; padding: 1.4rem; background: #191c22; border: 1px dashed #2a2e36; border-radius: 10px; }
+.dash-empty p { margin: 0; }
+.dash-empty > button.link { font-size: 14px; padding: .5rem .9rem; border: 1px solid #46505f; border-radius: 8px; }
+
+/* Stop sits where Send was, so it must not read as the same button in a
+   different mood. Red enough to be unmistakable, quiet enough that a running
+   turn does not look like an error. */
+.chat-composer button.stop { background: #3a1f24; border-color: #7a3b45; color: #f2c9cf; }
+.chat-composer button.stop:hover:not(:disabled) { background: #4a262c; border-color: #9a4b57; }
+
+/* --- chat attachments --- */
+/* The composer becomes a drop target for the whole message, so the outline
+   goes on the box rather than on the textarea inside it. */
+.chat-composer { flex-wrap: wrap; }
+.chat-composer.dropping { outline: 2px dashed #6f8bb5; outline-offset: -3px; background: #1b2029; }
+.chat-attachments { display: flex; flex-wrap: wrap; gap: .4rem; width: 100%; margin-bottom: .4rem; }
+.attach-chip { display: flex; align-items: center; gap: .4rem; max-width: 220px; padding: .25rem .4rem; background: #1c2027; border: 1px solid #2a2e36; border-radius: 8px; font-size: 12px; }
+.attach-chip img { width: 28px; height: 28px; object-fit: cover; border-radius: 4px; display: block; }
+.attach-chip .attach-doc { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 4px; background: #33261f; color: #e0a878; font-size: 9px; font-weight: 600; }
+/* The filename is the least important part of a chip that already shows a
+   thumbnail — it truncates rather than pushing the remove button off. */
+.attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #9aa4b0; }
+.attach-btn { font-size: 18px; line-height: 1; padding: 0 .5rem; }
+.msg-attachments { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .4rem; }
+.msg-attachments img { max-width: 190px; max-height: 190px; border-radius: 6px; display: block; }
+.attach-doc-link { display: inline-block; padding: .3rem .55rem; background: #33261f; border: 1px solid #5a4331; border-radius: 6px; color: #e0a878; font-size: 12px; }
+
+/* --- slash commands --- */
+/* Anchored to the composer (which is position: relative via .chat-composer's
+   own rule below) and opening upward: the composer sits at the bottom of the
+   panel, so a list growing downward would open off-screen. */
+.chat-composer { position: relative; }
+.slash-popover { position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; max-height: 240px; overflow-y: auto; z-index: 20; background: #191c22; border: 1px solid #2a2e36; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+.slash-popover button { display: flex; align-items: baseline; gap: .6rem; width: 100%; text-align: left; padding: .4rem .6rem; background: none; border: 0; border-radius: 0; }
+.slash-popover button.on, .slash-popover button:hover { background: #232833; }
+.slash-popover button .mono { color: #cfd6de; min-width: 92px; }
+.chat-picker { max-width: 190px; font-size: 12px; padding: .2rem .4rem; }
+
+/* Sits in the modal header beside the title, so the section names are visible
+   the moment the dialog opens rather than after a scroll. */
+.settings-tabs { margin-left: 1rem; }
+.settings-tabs button { padding: .25rem .6rem; font-size: 12px; }
+
+/* --- left rail --- */
+.rail { display: flex; flex-direction: column; overflow-y: auto; border-right: 1px solid #2a2e36; }
+.rail-top { display: flex; justify-content: flex-end; padding: .3rem .4rem 0; }
+/* Collapsed, the rail keeps a gutter wide enough for its own reopen button —
+   a panel that vanishes completely leaves nothing to click to get it back. */
+.rail-gutter { display: flex; flex-direction: column; align-items: center; padding: .4rem .2rem; border-right: 1px solid #2a2e36; background: #16191f; }
+.rail-toggle { background: none; border: 0; color: #6b7684; font-size: 13px; padding: .2rem .35rem; border-radius: 4px; }
+.rail-toggle:hover { color: #cfd6de; background: #232833; }
+
+.rail-section { border-top: 1px solid #23272f; }
+.rail-head { display: flex; align-items: center; gap: .45rem; width: 100%; padding: .5rem .7rem; background: none; border: 0; border-radius: 0; text-align: left; }
+.rail-head:hover { background: #1c2027; }
+.rail-caret { color: #6b7684; font-size: 10px; width: .7rem; }
+.rail-title { font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: #9aa4b0; }
+.rail-subtitle { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: #6b7684; margin: .5rem 0 .25rem; }
+.rail-body { padding: 0 .2rem .5rem; }
+
+/* --- board panel --- */
+.board-panel { padding: .5rem .7rem .7rem; }
+.board-single { font-size: 13px; color: #cfd6de; padding: .2rem 0; }
+.board-list { list-style: none; margin: .3rem 0 0; padding: 0; display: flex; flex-direction: column; gap: .15rem; }
+.board-item { display: flex; align-items: center; gap: .4rem; width: 100%; text-align: left; padding: .3rem .45rem; background: none; border: 0; border-radius: 6px; font-size: 13px; }
+.board-item:hover { background: #1c2027; }
+.board-item.on { background: #232833; color: #e8edf3; }
+.mate-line, .config-line { padding: .12rem 0; color: #9aa4b0; }
+.board-warnings { margin-top: .5rem; color: #c8a94e; }
+
+/* A lost answer is not an error the user caused, and not a warning about the
+   design — it is a status with one obvious action. Amber, and it carries that
+   action rather than making them retype the question. */
+.turn-lost { display: flex; align-items: center; gap: .6rem; margin: .5rem 0; padding: .6rem .8rem; background: #2a2317; border: 1px solid #6b5526; border-radius: 8px; }
+.turn-lost strong { color: #f0d18a; font-size: 13px; }
+
+/* A repeated question is not an error — the assistant handles it — so this is
+   a quiet marker, not a warning. It only needs to be noticeable enough that
+   nobody sends a fourth copy believing the first three vanished. */
+.msg.user.repeat { border-left: 3px solid #6b5526; }
+.repeat-tag { margin-bottom: .35rem; font-size: 11px; color: #c8a94e; }
+.link.fold { display: block; margin-top: .4rem; font-size: 12px; padding: 0; }
 
 .project-cards { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .8rem; }
 .project-card { display: flex; flex-direction: column; gap: .4rem; width: 100%; text-align: left; padding: .9rem 1rem; background: #191c22; border: 1px solid #2a2e36; border-radius: 10px; }

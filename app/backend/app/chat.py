@@ -49,8 +49,10 @@ from pathlib import Path
 from blpl.core import llm_chat
 from blpl.core.llm_chat import (
     ChatEvent,
+    DocumentBlock,
     Done,
     Endpoint,
+    ImageBlock,
     Msg,
     TextBlock,
     ToolDecl,
@@ -61,6 +63,7 @@ from blpl.core.llm_chat import (
     run_tool_loop,
 )
 
+from . import attachments as attachments_store
 from .agent import ToolContext, ToolExecutor, default_tools
 from .agent.toolspec import ApprovalRequest
 from .conversations import Conversation
@@ -117,6 +120,60 @@ def build_system_prompt() -> str:
 class ProposalError(RuntimeError):
     """A proposal could not be created or applied. Carries a message meant for
     the user, not a stack trace."""
+
+
+# Provider failures that are about the provider's moment rather than the
+# request. The SDK already retries these a couple of times inside the call; by
+# the time one reaches here that budget is spent, and the honest thing is to
+# tell the user it is worth asking again rather than presenting it as a fault
+# in what they typed.
+#
+# 529 `overloaded_error` is the one worth naming: it means Anthropic is briefly
+# at capacity. It carries no information about prompt size, and shortening the
+# conversation does not affect it.
+_TRANSIENT_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
+_TRANSIENT_NAMES = {
+    "APIConnectionError",
+    "APITimeoutError",
+    "InternalServerError",
+    "RateLimitError",
+}
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Whether asking the same question again could plausibly succeed.
+
+    Duck-typed rather than caught by class: the provider SDKs are optional
+    dependencies here, and this module must not import a vendor package just to
+    decide how to phrase an error message.
+    """
+    if type(exc).__name__ in _TRANSIENT_NAMES:
+        return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in _TRANSIENT_STATUS:
+        return True
+    # Some adapters flatten the provider's JSON into the message instead of
+    # raising a typed error, so the wire vocabulary is the last resort.
+    text = str(exc)
+    return "overloaded_error" in text or "rate_limit_error" in text
+
+
+class TurnInFlight(RuntimeError):
+    """A turn is already running for this conversation.
+
+    Carries the turn id rather than only a sentence about it. The browser that
+    hits this has almost always just lost its event stream — the turn it is
+    being refused is *its own* — so the id is what turns a dead end into a
+    reattach. Previously this was a ProposalError whose message happened to
+    mention the id, which meant the only way to recover it was to parse English.
+    """
+
+    def __init__(self, turn_id: str):
+        self.turn_id = turn_id
+        super().__init__(
+            f"this conversation already has a turn in flight ({turn_id}); "
+            "reattaching to it"
+        )
 
 
 def _sha(text: str) -> str:
@@ -296,15 +353,59 @@ def _blocks_to_json(msg: Msg) -> list[dict]:
                     "is_error": b.is_error,
                 }
             )
+        elif isinstance(b, (ImageBlock, DocumentBlock)):
+            # Only reachable for media the *model* produced or a tool returned,
+            # never for a user's attachment: those are written straight to the
+            # conversation as reference blocks by the upload route, and reach
+            # the provider through _blocks_from_json without passing here.
+            #
+            # There is no store id to write, and inlining the base64 is the one
+            # thing this format exists to avoid (see app/attachments.py), so
+            # what is persisted is the fact that it happened.
+            out.append(
+                {
+                    "type": "text",
+                    "text": f"[{b.media_type} generated in this turn; not stored]",
+                }
+            )
     return out
 
 
-def _blocks_from_json(raw: Iterable[dict]) -> list:
+def _blocks_from_json(raw: Iterable[dict], attachments_dir: Path | None = None) -> list:
     blocks: list = []
     for b in raw or []:
         kind = b.get("type")
         if kind == "text":
             blocks.append(TextBlock(b.get("text", "")))
+        elif kind in ("image", "document"):
+            # No store to read from means this is a caller that only wants the
+            # shape of the history (the UI). Skip rather than fabricate: an
+            # empty ImageBlock would be sent to the provider as a broken image.
+            if attachments_dir is None:
+                continue
+            data = attachments_store.read_b64(attachments_dir, b.get("attachment", ""))
+            if data is None:
+                # The reference outlived the bytes. Say so in the transcript
+                # rather than dropping it silently — the assistant answering
+                # "as you can see in the image" about an image it never
+                # received is worse than being told the image is gone.
+                blocks.append(
+                    TextBlock(f"[attachment {b.get('name') or 'file'} is no longer available]")
+                )
+                continue
+            if kind == "image":
+                blocks.append(ImageBlock(data=data, media_type=b.get("media_type", "image/png")))
+            else:
+                blocks.append(
+                    DocumentBlock(
+                        data=data,
+                        media_type=b.get("media_type", "application/pdf"),
+                        # Providers show this to the model; a datasheet that
+                        # arrives called "document 1" is worth less than one
+                        # that arrives called "TPS62840.pdf".
+                        filename=b.get("name") or None,
+                    )
+                )
         elif kind == "tool_use":
             blocks.append(ToolUseBlock(id=b.get("id", ""), name=b.get("name", ""), input=b.get("input") or {}))
         elif kind == "tool_result":
@@ -318,7 +419,9 @@ def _blocks_from_json(raw: Iterable[dict]) -> list:
     return blocks
 
 
-def history_to_messages(events: Iterable[dict]) -> list[Msg]:
+def history_to_messages(
+    events: Iterable[dict], attachments_dir: Path | None = None
+) -> list[Msg]:
     """Rebuild the chat history from the conversation's JSONL.
 
     Tool calls and their results are replayed too, not just prose. Dropping them
@@ -330,7 +433,7 @@ def history_to_messages(events: Iterable[dict]) -> list[Msg]:
     for ev in events:
         role = ev.get("role")
         meta = ev.get("metadata") or {}
-        blocks = _blocks_from_json(meta.get("blocks") or [])
+        blocks = _blocks_from_json(meta.get("blocks") or [], attachments_dir)
         if role == "user":
             messages.append(Msg(role="user", content=blocks or [TextBlock(ev.get("content", ""))]))
         elif role == "assistant":
@@ -424,6 +527,9 @@ class TurnRequest:
     record_tool_call: Callable[[dict], None] | None = None
     # Where the KiCad MCP server is, if the deploy has one.
     kicad_url: str | None = None
+    # The conversations directory, so attachments referenced in the transcript
+    # can be read back into the provider's message list.
+    conversations_dir: Path | None = None
 
 
 # Finished turns are kept briefly so a reader that arrives late still gets the
@@ -437,12 +543,25 @@ _RETAINED_TURNS = 32
 # session eventually unwinds instead of pinning a loop forever.
 APPROVAL_TIMEOUT_SECONDS = 600
 
+# How often an otherwise silent stream emits a keepalive. Comfortably under the
+# 60s idle timeout that proxies, load balancers and tunnels commonly default to,
+# and cheap enough that it costs nothing to be well inside it.
+HEARTBEAT_SECONDS = 15
+
 
 class ChatSessionManager:
     """Runs turns and fans their events out to any number of readers."""
 
     def __init__(self) -> None:
         self._turns: dict[str, _LiveTurn] = {}
+        # conversation filename → tools approved in it. Held here rather than on
+        # the executor because an executor lives for a single turn, which made
+        # a once-per-session question fire on every message.
+        #
+        # Deliberately not persisted: consent is scoped to a running server, so
+        # a restart asks again. That is a cheap question to answer once and the
+        # honest default for something granting network access.
+        self._approved: dict[str, set[str]] = {}
 
     def active_for(self, conversation_filename: str) -> str | None:
         for turn in self._turns.values():
@@ -459,10 +578,7 @@ class ChatSessionManager:
         """Launch a turn. The caller has already persisted the user's message."""
         existing = self.active_for(req.conversation.path.name)
         if existing:
-            raise ProposalError(
-                f"this conversation already has a turn in flight ({existing}); "
-                "wait for it to finish"
-            )
+            raise TurnInFlight(existing)
         turn_id = "turn_" + uuid.uuid4().hex[:12]
         live = _LiveTurn(turn_id, req.conversation.path.name)
         self._turns[turn_id] = live
@@ -489,13 +605,17 @@ class ChatSessionManager:
         live.publish({"type": "start", "turn_id": live.turn_id, "model": req.endpoint.model,
                       "endpoint": req.endpoint.name})
         try:
-            messages = history_to_messages(req.conversation.read_all())
+            messages = history_to_messages(
+                req.conversation.read_all(),
+                req.conversations_dir or req.conversation.path.parent,
+            )
             adapter = build_chat_adapter(req.endpoint)
             executor = ToolExecutor(
                 default_tools(req.kicad_url),
                 ctx,
                 approve=lambda request: self._ask(live, request),
                 record=req.record_tool_call,
+                session_approved=self._approved.setdefault(live.conversation, set()),
             )
 
             def on_event(event: ChatEvent) -> None:
@@ -542,16 +662,48 @@ class ChatSessionManager:
                     "usage": usage,
                 }
             )
+        except asyncio.CancelledError:
+            # Someone pressed Stop. This is a normal end to a turn, not a
+            # failure, and it gets recorded like one: the partial answer is
+            # already in the live buffer, and the conversation gets a marker so
+            # the transcript explains its own gap instead of just trailing off.
+            #
+            # Whatever the provider had produced before this point is lost on
+            # purpose. Persisting half an assistant message would put a
+            # truncated answer into the history every later turn reads as
+            # though it were complete.
+            try:
+                req.conversation.append(
+                    "error", "turn stopped by user", {"turn_id": live.turn_id, "cancelled": True}
+                )
+            except OSError:
+                pass
+            live.publish({"type": "cancelled", "turn_id": live.turn_id})
+            raise
         except Exception as exc:  # noqa: BLE001 — any failure must reach the user
             # The turn is lost either way; what must not be lost is the reason.
             # It is recorded in the conversation so it survives the page, and
             # published so whoever is watching sees it now.
             detail = f"{type(exc).__name__}: {exc}"
+            retryable = is_transient(exc)
             try:
-                req.conversation.append("error", detail, {"turn_id": live.turn_id})
+                req.conversation.append(
+                    "error", detail, {"turn_id": live.turn_id, "retryable": retryable}
+                )
             except OSError:
                 pass
-            live.publish({"type": "error", "turn_id": live.turn_id, "detail": detail})
+            live.publish(
+                {
+                    "type": "error",
+                    "turn_id": live.turn_id,
+                    "detail": detail,
+                    # Whether asking the same thing again has any chance of
+                    # working. A provider that is briefly out of capacity says
+                    # nothing about the request; a malformed request says
+                    # everything about it, and retrying it just fails again.
+                    "retryable": retryable,
+                }
+            )
         finally:
             live.finish()
 
@@ -575,6 +727,22 @@ class ChatSessionManager:
             return False
         finally:
             live.approvals.pop(request.call_id, None)
+
+    def cancel(self, turn_id: str) -> bool:
+        """Stop a running turn. False means there was nothing to stop.
+
+        Cancelling the task is enough: the tool loop is awaiting either the
+        provider or an approval, both of which unwind on cancellation, and
+        ``_run``'s ``finally`` still closes the turn out and releases every
+        reader. A turn parked on an approval is the common case — someone
+        started something they did not mean to and does not want to sit through
+        the ten-minute timeout to take it back.
+        """
+        live = self._turns.get(turn_id)
+        if live is None or live.done or live.task is None or live.task.done():
+            return False
+        live.task.cancel()
+        return True
 
     def resolve_approval(self, turn_id: str, call_id: str, approved: bool) -> bool:
         """Answer a pending approval. False means there was nothing to answer."""
@@ -616,7 +784,24 @@ class ChatSessionManager:
             if finished:
                 return
             while True:
-                item = await q.get()
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=HEARTBEAT_SECONDS)
+                except asyncio.TimeoutError:
+                    # Nothing to say, but the connection has to prove it is
+                    # still there. A turn can be silent for minutes — a slow
+                    # provider, a long tool call, an approval nobody has
+                    # answered — and a stream with no bytes on it is
+                    # indistinguishable from a dead one to every intermediary
+                    # between here and the browser. They close it, the browser
+                    # reports a network error, and the turn goes on running
+                    # with nobody watching. This is the byte that stops that.
+                    #
+                    # Not published: a heartbeat is a property of one reader's
+                    # connection, not an event in the turn, and putting it in
+                    # the buffer would replay a stale pile of them to whoever
+                    # attaches next.
+                    yield {"type": "ping"}
+                    continue
                 if item is None:
                     break
                 yield item

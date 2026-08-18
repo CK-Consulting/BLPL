@@ -685,7 +685,17 @@ def parts_tools() -> list[ToolSpec]:
             },
             kind="network",
             handler=_search_parts,
-            approval="ask",
+            # No approval: this reads a public distributor catalogue and changes
+            # nothing. Asking for it bought no safety and cost attention — and
+            # an approval prompt people learn to click through is worse than no
+            # prompt, because it also trains them through the ones that matter.
+            #
+            # The condition that makes this safe is provenance, and the result
+            # carries it: every hit names the distributor it came from and its
+            # datasheet URL, and `skipped` versus `not_found` separates "nobody
+            # asked" from "asked and told no". Where a number came from is
+            # always answerable after the fact.
+            approval="auto",
         ),
         ToolSpec(
             name="fetch_datasheet",
@@ -701,7 +711,13 @@ def parts_tools() -> list[ToolSpec]:
             },
             kind="network",
             handler=_fetch_datasheet,
-            approval="ask",
+            # Also auto, with one honest caveat: this writes, where search_parts
+            # does not. What it writes is a fetched PDF into the project's
+            # datasheets/ cache — it never touches a design file, so it does not
+            # cross the boundary the approval prompt exists to guard, and the
+            # path still goes through the sandbox first. The file on disk is its
+            # own provenance record.
+            approval="auto",
         ),
         ToolSpec(
             name="extract_datasheet_specs",

@@ -56,7 +56,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 # Annotations are lazy (from __future__), which hid that these were never
 # imported — Session only ever appeared in a type hint. select() is a runtime
@@ -67,6 +67,7 @@ from sqlalchemy.orm import Session
 from . import (
     activity,
     appconfig,
+    attachments,
     chat as chat_mod,
     clerk_auth,
     grants,
@@ -92,6 +93,7 @@ from . import (
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, Run, User
+from blpl.core import project_manifest
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
 from .vault import VaultError
@@ -1720,6 +1722,36 @@ class FileBody(BaseModel):
     content: str
 
 
+@app.get("/api/projects/{project_id}/boards")
+def get_boards(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """The project's boards, how they mate, and which combinations are built.
+
+    Always answers, even for the projects that predate multi-board: one with no
+    ``project.md`` reports a single implicit board named after itself, so the UI
+    has one shape to render and nothing existing had to be migrated to get it.
+    """
+    proj = _project_dir(session, user, project_id)
+    try:
+        man = project_manifest.discover(proj, project_id=project_id)
+    except project_manifest.ManifestError as exc:
+        # A malformed manifest should cost you the board list, not the project.
+        return {
+            "project_id": project_id,
+            "schema_version": 1,
+            "implicit": True,
+            "boards": [],
+            "mates": [],
+            "configurations": [],
+            "warnings": [str(exc)],
+        }
+    return man.to_dict()
+
+
 @app.get("/api/projects/{project_id}/files")
 def list_files(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> list[dict]:
@@ -1999,6 +2031,11 @@ def read_conversation(project_id: str, filename: str, user: User = Depends(requi
         "filename": conv.path.name,
         "started_at": conv.started_at,
         "events": conv.read_all(),
+        # A turn survives the browser that started it — it runs here, not there.
+        # Without this the only way to find a live turn was to already hold its
+        # id, so a refresh (or a dropped stream) left an answer streaming into
+        # nothing while the UI showed a finished-looking transcript.
+        "active_turn": chat_sessions.active_for(conv.path.name),
     }
 
 
@@ -2111,8 +2148,78 @@ def _kicad_bridge_url() -> str | None:
     return server.url if server else None
 
 
+@app.post("/api/projects/{project_id}/conversations/{filename}/attachments")
+async def upload_attachments(
+    project_id: str,
+    filename: str,
+    files: list[UploadFile] = File(...),
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> list[dict]:
+    """Store files for a message that has not been sent yet.
+
+    Upload and send are separate steps on purpose. A datasheet takes a moment to
+    arrive and the message it belongs to is usually still being typed; coupling
+    them would mean the send button blocks on the upload, and a failed upload
+    would take the typed message down with it. This way the composer shows the
+    file arriving, and the send that follows carries ids.
+
+    Content-addressed, so re-attaching a file already in the store costs one
+    hash and no disk.
+    """
+    conv_dir = _conversations_dir(session, user, project_id)
+    try:
+        Conversation.open_existing(conv_dir, filename)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    if len(files) > attachments.MAX_PER_MESSAGE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{len(files)} files; at most {attachments.MAX_PER_MESSAGE} per message",
+        )
+
+    saved: list[dict] = []
+    for upload in files:
+        data = await upload.read()
+        try:
+            saved.append(
+                attachments.save(conv_dir, upload.filename or "attachment", data).to_dict()
+            )
+        except attachments.AttachmentRejected as exc:
+            # One bad file fails the batch rather than half-attaching. The user
+            # is standing there watching; a partial result they have to
+            # reconcile is worse than a clear refusal they can retry.
+            raise HTTPException(status_code=400, detail=str(exc))
+    return saved
+
+
+@app.get("/api/projects/{project_id}/attachments/{attachment_id}")
+def get_attachment(
+    project_id: str, attachment_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> FileResponse:
+    """Serve stored bytes back so the transcript can show what was attached.
+
+    Behind the same project authorisation as everything else — attachments are
+    project data, and a raw sha256 is not an access token.
+    """
+    conv_dir = _conversations_dir(session, user, project_id)
+    path = attachments.path_of(conv_dir, attachment_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="attachment not found")
+    return FileResponse(path)
+
+
 class ChatInput(BaseModel):
     content: str
+    # Ids from the upload route above. Names are resolved server-side rather
+    # than trusted from the client, so the transcript cannot be made to claim a
+    # file is something it is not.
+    attachments: list[str] = []
 
 
 @app.post("/api/projects/{project_id}/conversations/{filename}/chat")
@@ -2130,15 +2237,56 @@ async def start_chat_turn(
     costs the answer and never the question.
     """
     proj = _project_dir(session, user, project_id)
+    conv_dir = _conversations_dir(session, user, project_id)
     try:
-        conv = Conversation.open_existing(_conversations_dir(session, user, project_id), filename)
+        conv = Conversation.open_existing(conv_dir, filename)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    if not payload.content.strip():
+    # An attachment on its own is a message — dropping a datasheet in and
+    # asking nothing is a normal way to start ("look at this"). Only a message
+    # with neither text nor files is empty.
+    if not payload.content.strip() and not payload.attachments:
         raise HTTPException(status_code=400, detail="message is empty")
 
+    blocks: list[dict] = []
+    for att_id in payload.attachments[: attachments.MAX_PER_MESSAGE]:
+        path = attachments.path_of(conv_dir, att_id)
+        if path is None:
+            raise HTTPException(status_code=400, detail=f"unknown attachment {att_id}")
+        media_type = attachments.media_type_of(path)
+        blocks.append(
+            {
+                "type": "image" if media_type.startswith("image/") else "document",
+                "attachment": att_id,
+                "media_type": media_type,
+                "name": path.name,
+            }
+        )
+    # Attachments first: providers read an image better when the question about
+    # it comes after, and it matches how the message was composed.
+    if payload.content.strip():
+        blocks.append({"type": "text", "text": payload.content})
+
+    # Checked before the message is written, not after. The append used to come
+    # first and the in-flight check second, so a retry after a dropped stream
+    # persisted the question a second time and then refused — leaving the user
+    # asking twice in a transcript they never got an answer in.
+    live = chat_sessions.active_for(conv.path.name)
+    if live:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "turn_in_flight",
+                "turn_id": live,
+                "message": (
+                    "this conversation already has a turn in flight; "
+                    "reattaching to it"
+                ),
+            },
+        )
+
     endpoint = _chat_endpoint(session, user, master_key)
-    conv.append("user", payload.content, {"blocks": [{"type": "text", "text": payload.content}]})
+    conv.append("user", payload.content, {"blocks": blocks})
     try:
         turn_id = chat_sessions.start(
             chat_mod.TurnRequest(
@@ -2154,7 +2302,20 @@ async def start_chat_turn(
                     project_id, rec, conversation=conv.path.name
                 ),
                 kicad_url=_kicad_bridge_url(),
+                conversations_dir=conv_dir,
             )
+        )
+    except chat_mod.TurnInFlight as exc:
+        # The pre-check above catches this in every case that matters; this is
+        # the narrow race where two sends land together. Same shape of answer,
+        # so the client has one path to handle rather than two.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "turn_in_flight",
+                "turn_id": exc.turn_id,
+                "message": str(exc),
+            },
         )
     except chat_mod.ProposalError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -2175,9 +2336,36 @@ def stream_chat_turn(
 
     async def events():
         async for event in chat_sessions.stream(turn_id):
+            # A heartbeat is framed as an SSE comment: it keeps the connection
+            # (and every proxy on it) awake without the client needing to know
+            # about a message type that carries nothing.
+            if event.get("type") == "ping":
+                yield ": ping\n\n"
+                continue
             yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@app.post("/api/projects/{project_id}/chat/{turn_id}/cancel")
+def cancel_chat_turn(
+    project_id: str, turn_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)
+) -> dict:
+    """Stop a running turn.
+
+    The turn lives on the server, so closing the tab never stopped one — it only
+    stopped watching. Until this existed the sole way out of a turn you did not
+    want (a wrong question, a tool loop grinding away, an approval you would
+    rather withdraw) was to wait it out, and while it ran the conversation was
+    locked to it and refused the next message.
+
+    Idempotent: a turn that already finished reports stopped=False rather than
+    404ing, because "it is not running" is the state the caller wanted either
+    way.
+    """
+    _project_dir(session, user, project_id)
+    return {"stopped": chat_sessions.cancel(turn_id)}
 
 
 class ApprovalDecision(BaseModel):

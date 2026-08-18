@@ -465,7 +465,20 @@ class _AnthropicChat:
     def _client(self):
         import anthropic  # lazy import; optional dep
 
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {
+            # The SDK's own default is 2, which is tuned for a short request.
+            # A chat turn is not short: it carries the whole design conversation
+            # and whatever the assistant was part-way through, so losing one to
+            # a few seconds of provider capacity is expensive in a way a
+            # one-shot completion is not. Four attempts rides out a brief 529
+            # without turning a real outage into a long hang.
+            "max_retries": 4,
+            # Well past the longest turn observed, and only a ceiling: a turn
+            # that finishes sooner is unaffected. The SDK's 10-minute default
+            # can expire mid-answer on a genuinely long agentic turn, which
+            # reads as a failure rather than as the timeout it is.
+            "timeout": 900.0,
+        }
         if self.endpoint.api_key:
             kwargs["api_key"] = self.endpoint.api_key
         if self.endpoint.base_url:

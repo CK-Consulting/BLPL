@@ -7,7 +7,8 @@ The order matters and is not arbitrary.
    be permitted must not become a dialog someone clicks through; approval
    fatigue is a real attack surface, and every question that did not need
    asking makes the next one cheaper to wave past.
-3. **Ask, if policy says so.** ``ask`` remembers the answer for the session;
+3. **Ask, if policy says so.** ``ask`` remembers the answer for the conversation
+   (the caller owns the set, since an executor lives only for one turn);
    ``ask_always`` does not, because a mutation you approved an hour ago is not
    consent for the next one.
 4. **Execute**, catching everything: a tool that throws returns an error result
@@ -60,12 +61,21 @@ class ToolExecutor:
         *,
         approve: ApprovalFn | None = None,
         record: RecordFn | None = None,
+        session_approved: set[str] | None = None,
     ):
         self.specs = {s.name: s for s in specs}
         self.ctx = ctx
         self._approve = approve
         self._record = record
-        self._session_approved: set[str] = set()
+        # Owned by the caller when supplied, because an executor lives for one
+        # turn and "the session" means the conversation. Keeping this set here
+        # made `ask` behave exactly like `ask_always`: the memory was thrown
+        # away with the executor, so every message re-asked to look up the same
+        # part. An approval prompt that appears on every message is one people
+        # learn to dismiss without reading, which is worse than not asking.
+        self._session_approved: set[str] = (
+            session_approved if session_approved is not None else set()
+        )
         self._seq = 0
 
     def declarations(self):
