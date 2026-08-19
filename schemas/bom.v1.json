@@ -174,6 +174,16 @@
     "no_substitutions_reason": {
      "type": "string",
      "description": "Why substitution is barred \u2014 safety approval, qualification, sole-source, a footprint that only this vendor honours. A flag without a reason gets overridden by whoever is under deadline; a reason is what makes the conversation possible instead."
+    },
+    "attribute_provenance": {
+     "type": "string",
+     "enum": [
+      "",
+      "manual",
+      "design_document",
+      "vendor"
+     ],
+     "description": "Where the electrical attributes came from. 'design_document' means a stage read them out of the design markdown, 'vendor' means a distributor confirmed them, 'manual' means a person entered them. Absent means unknown, which is treated as the weakest. Grouping parts for an order rests on these attributes, so how much they can be trusted has to travel with them."
     }
    }
   }

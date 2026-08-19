@@ -321,3 +321,31 @@ def test_single_vendor_lines_are_not_shown_as_consolidations():
     """A line with one MPN is the MPN grouping under a different heading."""
     agg = _passive_agg()
     assert all(len(e.mpns) > 1 for e in agg.equivalence)
+
+
+def test_an_order_line_is_only_as_good_as_its_weakest_member():
+    """A line mixing a vendor-confirmed part with a regex-guessed one is a
+    guessed line; reporting otherwise would launder the guess."""
+    man = parse(MANIFEST, project_id="shield")
+    good = dict(package="0402", value="100nF", voltage_v=50, dielectric="X7R", tolerance=10)
+    boms = {
+        "base": {"rows": [
+            dict(refdes="C1", mpn="A", **good, attribute_provenance="vendor"),
+            dict(refdes="C2", mpn="B", package="0402", description="100nF X7R 50V ±10%"),
+        ]},
+    }
+    line = ba.aggregate_all(man, boms, DES)["minimal"].equivalence[0]
+    assert line.provenance == "inferred"
+
+
+def test_a_fully_declared_line_says_so():
+    man = parse(MANIFEST, project_id="shield")
+    good = dict(package="0402", value="100nF", voltage_v=50, dielectric="X7R", tolerance=10)
+    boms = {
+        "base": {"rows": [
+            dict(refdes="C1", mpn="A", **good, attribute_provenance="vendor"),
+            dict(refdes="C2", mpn="B", **good, attribute_provenance="vendor"),
+        ]},
+    }
+    line = ba.aggregate_all(man, boms, DES)["minimal"].equivalence[0]
+    assert line.provenance == "vendor" and not line.inferred_from_text

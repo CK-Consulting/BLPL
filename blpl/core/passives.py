@@ -54,6 +54,18 @@ from dataclasses import dataclass, field
 # on that gets flagged, because it is an assumption rather than a fact.
 MUST_MATCH = ("safety_class", "special")
 
+# Weakest first. An order line is only as good as the least-supported attribute
+# behind it, so a line mixing a vendor-confirmed part with a regex-guessed one
+# reports itself as guessed.
+PROVENANCE_RANK = ("inferred", "unknown", "design_document", "manual", "vendor")
+
+
+def weakest_provenance(values) -> str:
+    ranked = [v for v in values if v in PROVENANCE_RANK]
+    if not ranked:
+        return "unknown"
+    return min(ranked, key=PROVENANCE_RANK.index)
+
 # Attributes that must be *known* before two parts can be shown equivalent, per
 # component class. Requiring a power rating on a capacitor or a dielectric on a
 # resistor is not caution, it is a bug: it makes every line ungroupable and the
@@ -127,6 +139,10 @@ class PassiveSpec:
     # the one thing this flag exists to forbid.
     no_substitutions: bool = False
     no_substitutions_reason: str = ""
+    # How much the attributes above can be leaned on. Ranked in PROVENANCE_RANK;
+    # a grouping is only as trustworthy as its weakest member, so this has to
+    # travel with the part rather than being recomputed at the end.
+    provenance: str = "unknown"
     # Which fields were read out of free text rather than declared. A hint is
     # not a fact, and the difference has to survive to whoever orders the parts.
     inferred: frozenset[str] = field(default_factory=frozenset)
@@ -149,6 +165,7 @@ class PassiveSpec:
             "package": self.package,
             "no_substitutions": self.no_substitutions,
             "no_substitutions_reason": self.no_substitutions_reason,
+            "provenance": self.provenance,
             "inferred": sorted(self.inferred),
         }
 
@@ -189,19 +206,30 @@ def extract(row: dict) -> PassiveSpec:
     recorded in ``inferred``, because a grouping built on parsed prose has to
     announce itself as provisional wherever it surfaces.
     """
-    text = " ".join(
-        str(row.get(k) or "") for k in ("description", "notes", "value")
-    ).strip()
+    # Free text is the fallback source, and only the fallback: `value` is not in
+    # here, because reading the field a person filled in is not inference.
+    text = " ".join(str(row.get(k) or "") for k in ("description", "notes")).strip()
     inferred: set[str] = set()
 
     def declared(key: str):
         v = row.get(key)
         return v if v not in (None, "") else None
 
+    # A declared value still has to be parsed — the schema holds it as written
+    # ("10k", "100nF") because that is what an engineer types and what a
+    # silkscreen shows. Parsing a declared field is reading it, not guessing it;
+    # the same regex over a description is a guess. Same code, different
+    # provenance, and the difference is the whole point of the distinction.
     value, value_text, unit = None, "", ""
-    if declared("value") is not None and not isinstance(row.get("value"), str):
-        value = float(row["value"])
-    else:
+    raw_value = declared("value")
+    if raw_value is not None:
+        if isinstance(raw_value, (int, float)):
+            value, value_text, unit = float(raw_value), str(raw_value), ""
+        else:
+            value, value_text, unit = _parse_value(str(raw_value))
+            if value is None:
+                inferred.add("value")     # the field was there and unreadable
+    if value is None:
         value, value_text, unit = _parse_value(text)
         if value is not None:
             inferred.add("value")
@@ -258,6 +286,13 @@ def extract(row: dict) -> PassiveSpec:
         package=str(row.get("package") or ""),
         no_substitutions=bool(row.get("no_substitutions")),
         no_substitutions_reason=str(row.get("no_substitutions_reason") or ""),
+        # Anything read out of prose here is inferred whatever the row claims —
+        # a row cannot vouch for a field it did not actually carry.
+        provenance=(
+            "inferred"
+            if inferred
+            else str(row.get("attribute_provenance") or "unknown")
+        ),
         inferred=frozenset(inferred),
     )
 

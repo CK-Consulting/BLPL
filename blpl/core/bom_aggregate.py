@@ -87,10 +87,15 @@ class EquivalenceLine:
     mpns: list[str] = field(default_factory=list)
     designators: list[str] = field(default_factory=list)
     inferred_from_text: bool = False
+    provenance: str = "unknown"
 
     def to_dict(self) -> dict:
         return {
             "key": self.key,
+            # Weakest member wins: a line mixing a vendor-confirmed part with a
+            # regex-guessed one is a guessed line, and saying otherwise would
+            # launder the guess.
+            "provenance": self.provenance,
             "value": self.value_text,
             "package": self.package,
             "quantity": self.quantity,
@@ -410,6 +415,9 @@ def _equivalence(bom: AggregateBom) -> None:
         if q.mpn and q.mpn not in line.mpns:
             line.mpns.append(q.mpn)
         line.inferred_from_text = line.inferred_from_text or spec.is_inferred
+        line.provenance = passives.weakest_provenance([line.provenance, spec.provenance])
+        if len(line.designators) == 1:
+            line.provenance = spec.provenance
 
     # Only lines that actually consolidate something are worth showing: a
     # one-vendor line is the MPN grouping again under a different heading.

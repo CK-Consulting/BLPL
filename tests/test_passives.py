@@ -156,3 +156,42 @@ def test_a_locked_line_without_a_reason_still_refuses():
     locked = _c("100nF X7R 50V", no_substitutions=True)
     ok, why = may_merge(locked, _c("100nF X7R 50V"), "C")
     assert not ok and "no reason recorded" in why
+
+
+# -- provenance --------------------------------------------------------------
+
+
+def test_parsing_a_declared_field_is_not_inference():
+    """The schema holds value as written ('100nF') because that is what an
+    engineer types. Reading that field is reading it; the same regex over a
+    description is a guess."""
+    declared = extract({"value": "100nF", "package": "0402"})
+    assert declared.value == pytest.approx(100e-9)
+    assert "value" not in declared.inferred
+
+    guessed = extract({"description": "100nF decoupling", "package": "0402"})
+    assert guessed.value == pytest.approx(100e-9)
+    assert "value" in guessed.inferred
+
+
+def test_a_row_cannot_vouch_for_a_field_it_did_not_carry():
+    """Claiming vendor provenance while the attributes were scraped out of
+    prose would launder the guess."""
+    spec = extract(
+        {"description": "100nF X7R 50V ±10%", "package": "0402",
+         "attribute_provenance": "vendor"}
+    )
+    assert spec.provenance == "inferred"
+
+
+def test_declared_attributes_keep_the_provenance_they_claim():
+    spec = extract(
+        {"value": "100nF", "voltage_v": 50, "dielectric": "X7R", "tolerance": 10,
+         "package": "0402", "attribute_provenance": "vendor"}
+    )
+    assert spec.provenance == "vendor" and not spec.is_inferred
+
+
+def test_an_unreadable_declared_value_is_marked_as_a_guess():
+    spec = extract({"value": "about ten k", "package": "0402"})
+    assert "value" in spec.inferred
