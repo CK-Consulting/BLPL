@@ -78,8 +78,22 @@ def _cmd_datasheets(args: argparse.Namespace) -> int:
 def _cmd_review_panel(args: argparse.Namespace) -> int:
     from blpl.agent import review_panel
 
+    from blpl.core import project_manifest
+
     project = Path(args.project_dir).resolve()
-    pipeline = project / ".pipeline"
+    pipeline = project_manifest.pipeline_dir(project)
+    man = project_manifest.discover(project)
+    board = None if man.implicit else getattr(args, "board", None)
+    if not man.implicit and board is None:
+        names = ", ".join(b.name for b in man.boards)
+        print(
+            f"error: {project.name} has more than one board ({names}). Say which with --board.",
+            file=sys.stderr,
+        )
+        return 2
+    if board is not None and man.board(board) is None:
+        print(f"error: no board {board!r} in {project.name}", file=sys.stderr)
+        return 2
     entries = review_panel.panel_entries()
     print(
         f"panel: {len(entries)} reviewer(s): "
@@ -95,8 +109,10 @@ def _cmd_review_panel(args: argparse.Namespace) -> int:
         # the strongest model on the panel.
         adjudicator = _make_adjudicator(entries[-1])
 
-    report = review_panel.run(pipeline, entries=entries, adjudicator=adjudicator)
-    path = review_panel.write_report(pipeline, report)
+    report = review_panel.run(
+        pipeline, entries=entries, adjudicator=adjudicator, board=board
+    )
+    path = review_panel.write_report(pipeline, report, board)
 
     for member in report["panel"]:
         state = f"failed: {member['error']}" if member["error"] else f"{member['findings']} finding(s)"
@@ -165,6 +181,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Review the pipeline artifacts with every endpoint routed to review_panel.",
     )
     r.add_argument("--project-dir", required=True)
+    r.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. The panel reads "
+            "that board's artifacts and writes that board's report."
+        ),
+    )
     r.add_argument(
         "--no-adjudicator",
         action="store_true",

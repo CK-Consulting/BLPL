@@ -8,6 +8,7 @@
 # Bring up:   docker compose -f app/docker-compose.yml up -d --build
 # First run:  open http://<host>:1800 and sign in. Provider API keys are
 #             per-user — add yours under Settings.
+name: blpl
 services:
   # Who exists and whose provider key is whose. The SQLite vault this replaces
   # was structurally single-tenant — one DEK from one passphrase, one secret
@@ -74,6 +75,11 @@ services:
       - BLPL_PROJECTS_ROOT=/app/data/projects
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
+      # Where to find the malware scanner, if the `scanning` profile is up.
+      # Unresolvable when it is not, which blpl.core.av reports as `unscanned`
+      # rather than treating as clean.
+      - BLPL_CLAMD_HOST=${BLPL_CLAMD_HOST:-clamav}
+      - BLPL_CLAMD_PORT=${BLPL_CLAMD_PORT:-3310}
       # No provider API keys here, deliberately. Keys belong to a signed-in user
       # and live in Postgres sealed under BLPL_SERVER_KEY; a shared one in this
       # file would mean every user of the deployment spending the operator's
@@ -173,8 +179,46 @@ services:
   # but change nothing about where work happens, and one image means one KiCad
   # version across the deployment — two would be a way for a stage to behave
   # differently depending on which container ran it.
+  # Malware scanning for retrieved files. Optional, and off unless you start it:
+  #
+  #   docker compose --profile scanning up -d
+  #
+  # A profile rather than a plain service because clamd holds its whole
+  # signature database in memory (~1.5-2 GB) and updates it on a schedule. That
+  # is a fair price for a deployment that fetches datasheets from the internet
+  # and a silly one for a laptop running the test suite, so it is a decision
+  # rather than a default.
+  #
+  # Nothing breaks when this is absent: blpl.core.av reports `unscanned`, the
+  # quarantine ledger records that nothing checked the file, and the structural
+  # inspection in blpl.core.pdf_inspect — which is the check that actually stops
+  # a datasheet phoning home — runs either way.
+  #
+  # Once it is running, consider also setting BLPL_QUARANTINE_REQUIRE_SCAN=1 on
+  # backend and worker, which holds anything the scanner did not see. Leave it
+  # off until then, or every datasheet is held.
+  clamav:
+    image: clamav/clamav:stable
+    container_name: blpl-clamav
+    profiles: ["scanning"]
+    restart: unless-stopped
+    environment:
+      - BLPL_QUARANTINE_REQUIRE_SCAN=1
+    networks:
+      - blpl
+    volumes:
+      # Persist the signature database. Without it every restart re-downloads
+      # ~1 GB from the ClamAV mirrors, which is rude to them and slow for you.
+      - clamav-db:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 60s
+      retries: 3
+      start_period: 120s
+
   worker:
     platform: linux/amd64
+    container_name: blpl-worker
     build:
       context: ..
       dockerfile: app/backend/Dockerfile
@@ -197,6 +241,11 @@ services:
       - BLPL_PROJECTS_ROOT=/app/data/projects
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
+      # Where to find the malware scanner, if the `scanning` profile is up.
+      # Unresolvable when it is not, which blpl.core.av reports as `unscanned`
+      # rather than treating as clean.
+      - BLPL_CLAMD_HOST=${BLPL_CLAMD_HOST:-clamav}
+      - BLPL_CLAMD_PORT=${BLPL_CLAMD_PORT:-3310}
       # Needed to open the environment sealed into each job. A worker without it
       # refuses to start rather than failing one job at a time.
       - BLPL_SERVER_KEY=${BLPL_SERVER_KEY:-}
@@ -288,6 +337,7 @@ networks:
     external: true
 
 volumes:
+  clamav-db:
   # A named volume, not a bind mount under ./data like the rest of the app's
   # state. Postgres owns its data directory's permissions and ownership, and a
   # bind mount onto a macOS filesystem is exactly where that goes wrong.

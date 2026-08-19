@@ -234,11 +234,28 @@ def test_lcsc_needs_no_credentials() -> None:
 def test_costly_tools_ask_and_reads_do_not() -> None:
     by_name = {s.name: s for s in default_tools()}
     assert by_name["read_project_file"].approval == "auto"
-    assert by_name["search_parts"].approval == "ask"          # network egress with your keys
+    # Looking a part up in a distributor catalogue changes nothing and carries
+    # its own provenance — every hit names the distributor it came from. It used
+    # to ask; the prompt bought no safety and spent the attention that the
+    # prompts below depend on.
+    assert by_name["search_parts"].approval == "auto"
+    # Writes, but only a fetched PDF into the datasheets/ cache. It never
+    # touches a design file, so it is on the read side of the boundary the
+    # prompt exists to guard.
+    assert by_name["fetch_datasheet"].approval == "auto"
     assert by_name["extract_datasheet_specs"].approval == "ask_always"  # spends money per call
     # A proposal writes nothing on its own — the accept step is the approval,
     # and asking twice for one decision trains people to click.
     assert by_name["propose_file_edit"].approval == "auto"
+
+
+def test_everything_that_mutates_still_asks_every_time() -> None:
+    """The counterweight to the auto tools above. Relaxing the read side is only
+    defensible while the write side stays strict, so it is asserted rather than
+    assumed."""
+    by_name = {s.name: s for s in default_tools()}
+    for name in ("bulk_autoroute", "extract_module"):
+        assert by_name[name].approval == "ask_always", name
 
 
 def test_extraction_refuses_without_a_vision_endpoint(project) -> None:

@@ -39,6 +39,12 @@ _LLM_OUTPUT_SCHEMA: dict = {
                     "footprint_hint",
                     "confidence",
                     "notes",
+                    "value",
+                    "tolerance",
+                    "voltage_v",
+                    "power_w",
+                    "dielectric",
+                    "safety_class",
                 ],
                 "properties": {
                     "local_id": {"type": "string"},
@@ -53,6 +59,16 @@ _LLM_OUTPUT_SCHEMA: dict = {
                     "footprint_hint": {"type": ["string", "null"]},
                     "confidence": {"type": "number"},
                     "notes": {"type": ["string", "null"]},
+                    # Passive attributes, reported only where the design document
+                    # states them. Null is the correct answer far more often than
+                    # a number is — see the prompt for why guessing one here is
+                    # worse than leaving it out.
+                    "value": {"type": ["string", "null"]},
+                    "tolerance": {"type": ["number", "null"]},
+                    "voltage_v": {"type": ["number", "null"]},
+                    "power_w": {"type": ["number", "null"]},
+                    "dielectric": {"type": ["string", "null"]},
+                    "safety_class": {"type": ["string", "null"]},
                 },
             },
         }
@@ -69,8 +85,23 @@ _SYSTEM_PROMPT = (
     "Connector_FFC-FPC, Power_Management, etc.). "
     "Set confidence in [0, 1]: 1.0 for parts you are certain of, 0.9 for close-certain, "
     "below 0.7 if you had to guess. Do not invent MPNs — if you can't resolve, set "
-    "mpn to the closest hint and confidence below 0.5 with a note explaining why."
+    "mpn to the closest hint and confidence below 0.5 with a note explaining why.\n\n"
+    "For passive components also report value, tolerance, voltage_v, power_w, "
+    "dielectric and safety_class — but ONLY where the design document actually "
+    "states them. Report null for anything it does not say. This is the one place "
+    "in this task where a plausible guess is worse than no answer: these fields "
+    "decide whether two parts can be ordered as one line, and a capacitor wrongly "
+    "recorded as an ordinary 50V part when it is a Y2 mains-rated one produces an "
+    "order that is wrong in a way nothing downstream can detect. Filling a blank "
+    "with the value a part of that type usually has is exactly the failure to "
+    "avoid. A null costs one line of review; a wrong number costs a board.\n"
+    "Read values as written ('10k', '4k7', '100nF'); give tolerance as a percent "
+    "number (1 for +/-1%), power_w in watts (0.25 for 1/4W), and safety_class only "
+    "as one of X1, X2, Y1, Y2."
 )
+
+
+_PASSIVE_ATTRS = ("value", "tolerance", "voltage_v", "power_w", "dielectric", "safety_class")
 
 
 class ComponentsDropped(RuntimeError):
@@ -100,6 +131,16 @@ def _post_process(raw: dict, project_id: str) -> dict:
     rows: list[dict] = []
     for r in raw.get("rows", []):
         cleaned = {k: v for k, v in r.items() if v is not None}
+        # Where these attributes came from, not just what they are. A number the
+        # model read out of the design document is worth more than one a regex
+        # guessed from a description and less than one a distributor confirmed,
+        # and whoever places the order needs to be able to tell the three apart.
+        if any(k in cleaned for k in _PASSIVE_ATTRS):
+            cleaned["attribute_provenance"] = "design_document"
+        # An empty safety_class is meaningful — it means the document did not say
+        # — so it must not survive as a string that looks like a rating.
+        if cleaned.get("safety_class") in ("", "none", "None"):
+            cleaned.pop("safety_class", None)
         rows.append(cleaned)
     return {"project_id": project_id, "schema_version": 1, "rows": rows}
 

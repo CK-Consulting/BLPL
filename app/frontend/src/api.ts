@@ -20,6 +20,25 @@ export function setLockedHandler(fn: () => void) {
   onLocked = fn;
 }
 
+/**
+ * An HTTP failure that still knows what the server said.
+ *
+ * `throw new Error(detail)` flattened every response to a sentence, which is
+ * fine for showing and useless for acting on: the 409 that means "your own turn
+ * is still running, here is its id" arrived as prose the caller could only
+ * print. FastAPI's `detail` is allowed to be an object, so this keeps it.
+ */
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+  constructor(message: string, status: number, detail: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function send(path: string, init?: RequestInit): Promise<Response> {
   const token = await getToken();
   return fetch(path, {
@@ -70,7 +89,7 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
 
 export async function getJSON<T>(path: string): Promise<T> {
   const res = await request(path);
-  if (!res.ok) throw new Error((await errorDetail(res)) || res.statusText);
+  if (!res.ok) await fail(res);
   return res.json();
 }
 
@@ -79,25 +98,25 @@ export async function postJSON<T>(path: string, body?: unknown): Promise<T> {
     method: "POST",
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!res.ok) throw new Error((await errorDetail(res)) || res.statusText);
+  if (!res.ok) await fail(res);
   return res.json();
 }
 
 export async function putJSON<T>(path: string, body: unknown): Promise<T> {
   const res = await request(path, { method: "PUT", body: JSON.stringify(body) });
-  if (!res.ok) throw new Error((await errorDetail(res)) || res.statusText);
+  if (!res.ok) await fail(res);
   return res.json();
 }
 
 export async function postForm<T>(path: string, form: FormData): Promise<T> {
   const res = await request(path, { method: "POST", body: form });
-  if (!res.ok) throw new Error((await errorDetail(res)) || res.statusText);
+  if (!res.ok) await fail(res);
   return res.json();
 }
 
 export async function del(path: string): Promise<void> {
   const res = await request(path, { method: "DELETE" });
-  if (!res.ok) throw new Error((await errorDetail(res)) || res.statusText);
+  if (!res.ok) await fail(res);
 }
 
 // Read an SSE body and dispatch each frame. Used for run streams, which are
@@ -112,7 +131,12 @@ export async function readSSE(
 ): Promise<void> {
   const res = await request(url, init);
   if (!res.ok || !res.body) {
-    throw new Error((await errorDetail(res)) || `stream failed to start: ${res.status}`);
+    const { message, detail } = await errorParts(res);
+    throw new ApiError(
+      message || `stream failed to start: ${res.status}`,
+      res.status,
+      detail,
+    );
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -135,13 +159,27 @@ export async function readSSE(
   }
 }
 
-async function errorDetail(res: Response): Promise<string> {
+/** The detail as sent, plus the best sentence available for a human. */
+async function errorParts(res: Response): Promise<{ message: string; detail: unknown }> {
   try {
     const body = await res.clone().json();
-    return typeof body?.detail === "string" ? body.detail : "";
+    const detail = body?.detail;
+    if (typeof detail === "string") return { message: detail, detail };
+    // A structured detail still owes the user a sentence; `message` is the
+    // field this codebase puts it in.
+    if (detail && typeof detail === "object") {
+      const msg = (detail as any).message;
+      return { message: typeof msg === "string" ? msg : "", detail };
+    }
+    return { message: "", detail: undefined };
   } catch {
-    return "";
+    return { message: "", detail: undefined };
   }
+}
+
+async function fail(res: Response): Promise<never> {
+  const { message, detail } = await errorParts(res);
+  throw new ApiError(message || res.statusText, res.status, detail);
 }
 
 // --- typed shapes the UI consumes ---
@@ -335,7 +373,15 @@ export type ChatMessage = {
   content: string;
   timestamp: string;
   metadata?: {
-    blocks?: { type: string; name?: string; input?: unknown; is_error?: boolean }[];
+    blocks?: {
+      type: string;
+      name?: string;
+      input?: unknown;
+      is_error?: boolean;
+      /** Set on image/document blocks: the id the attachment store filed it under. */
+      attachment?: string;
+      media_type?: string;
+    }[];
     model?: string;
     usage?: { input_tokens: number; output_tokens: number };
   };

@@ -4,6 +4,7 @@ import { RunLog } from "./RunLog";
 import { RunProgress } from "./RunProgress";
 import { Verbosity, classifyAll, progress } from "../runlog";
 import { expandRange } from "../stages";
+import { withBoard } from "../board";
 
 /**
  * Runs pipeline work and streams its log to the screen as it happens — either a
@@ -36,9 +37,13 @@ const PIPELINE_STAGES = [
   "stage5", "stage6", "stage7", "stage8",
 ];
 
-type Props = { projectId: string; onFinished: (label: string, exitCode: number) => void };
+type Props = {
+  projectId: string;
+  board: string | null;
+  onFinished: (label: string, exitCode: number) => void;
+};
 
-export function StageRunner({ projectId, onFinished }: Props) {
+export function StageRunner({ projectId, board, onFinished }: Props) {
   const [mode, setMode] = useState<"single" | "pipeline" | "panel">("single");
   const [stage, setStage] = useState("doctor");
   const [from, setFrom] = useState("stage0");
@@ -74,12 +79,16 @@ export function StageRunner({ projectId, onFinished }: Props) {
     setRanStages(
       mode === "single" ? [stage] : mode === "panel" ? ["review panel"] : expandRange(from, to),
     );
-    const url =
+    // Every one of these resolves a board server-side and answers 400 without
+    // one on a multi-board project, rather than guessing which board you meant.
+    const url = withBoard(
       mode === "single"
         ? `/api/projects/${projectId}/stages/${stage}`
         : mode === "panel"
           ? `/api/projects/${projectId}/review-panel`
-          : `/api/projects/${projectId}/pipeline?from_stage=${from}&to_stage=${to}`;
+          : `/api/projects/${projectId}/pipeline?from_stage=${from}&to_stage=${to}`,
+      board,
+    );
 
     try {
       await readSSE(url, { method: "POST" }, (event, payload) => {

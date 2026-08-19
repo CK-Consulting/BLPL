@@ -13,7 +13,18 @@ import { getJSON, putJSON } from "../api";
 
 type FileMeta = { name: string; bytes: number };
 
-export function Editor({ projectId, onSaved }: { projectId: string; onSaved: () => void }) {
+export function Editor({
+  projectId,
+  onSaved,
+  select,
+}: {
+  projectId: string;
+  onSaved: () => void;
+  /** A file the tree asked for. Ignored when it is not one this editor can
+   *  open — the tree lists everything on disk, the editor only text it can
+   *  save back. */
+  select?: string | null;
+}) {
   const [files, setFiles] = useState<FileMeta[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [content, setContent] = useState("");
@@ -36,6 +47,16 @@ export function Editor({ projectId, onSaved }: { projectId: string; onSaved: () 
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
+
+  // The tree is the detail half of the layout, so a click there has to land
+  // here. Guarded on the file being one the editor knows about: opening a
+  // path it cannot save would offer a save button that fails.
+  useEffect(() => {
+    if (!select || select === active) return;
+    if (!files.some((f) => f.name === select)) return;
+    void open(select);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [select, files]);
 
   const open = async (name: string) => {
     if (dirty && !confirm("Discard unsaved changes?")) return;

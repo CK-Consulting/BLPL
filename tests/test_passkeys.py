@@ -21,7 +21,13 @@ import sys
 from pathlib import Path
 
 import pytest
-from webauthn.helpers import bytes_to_base64url
+
+# The whole file is about WebAuthn, so skipping it wholesale is honest. Without
+# this an absent optional dep fails at *collection*, which aborts the run and
+# takes every other test in the suite with it.
+pytest.importorskip("webauthn")
+
+from webauthn.helpers import bytes_to_base64url  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app" / "backend"))
 

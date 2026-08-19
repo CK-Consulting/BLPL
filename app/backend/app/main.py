@@ -56,7 +56,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 # Annotations are lazy (from __future__), which hid that these were never
 # imported — Session only ever appeared in a type hint. select() is a runtime
@@ -67,6 +67,7 @@ from sqlalchemy.orm import Session
 from . import (
     activity,
     appconfig,
+    attachments,
     chat as chat_mod,
     clerk_auth,
     grants,
@@ -92,6 +93,7 @@ from . import (
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, Run, User
+from blpl.core import project_manifest, quarantine
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
 from .vault import VaultError
@@ -922,15 +924,28 @@ def _latest(pipeline_dir: Path, suffix: str) -> Path | None:
     return found
 
 
-def _latest_with_origin(pipeline_dir: Path, suffix: str) -> tuple[Path | None, bool]:
-    """``(path, is_archived)`` — is_archived is True when only a rotated copy exists."""
+def _latest_with_origin(
+    pipeline_dir: Path, suffix: str, stem_contains: str | None = None
+) -> tuple[Path | None, bool]:
+    """``(path, is_archived)`` — is_archived is True when only a rotated copy exists.
+
+    ``stem_contains`` narrows to one board. Without it a multi-board project
+    returns whichever emitted file is newest, which is a different board than
+    the one on screen with nothing on the page saying so.
+    """
     if not pipeline_dir.is_dir():
         return None, False
-    live = sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True)
+
+    def match(paths: list[Path]) -> list[Path]:
+        if stem_contains is None:
+            return paths
+        return [p for p in paths if stem_contains in p.name]
+
+    live = match(sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True))
     if live:
         return live[0], False
     # rglob so any rotation layout is caught, not just archive/ specifically.
-    archived = sorted(pipeline_dir.rglob(f"*{suffix}"), reverse=True)
+    archived = match(sorted(pipeline_dir.rglob(f"*{suffix}"), reverse=True))
     return (archived[0], True) if archived else (None, False)
 
 
@@ -1700,18 +1715,33 @@ _EDITABLE_SUFFIXES = {".md", ".yaml", ".yml"}
 
 
 def _editable_file(session: Session, user: User, project_id: str, name: str) -> Path:
-    """Resolve a filename to an editable file directly under the project root.
+    """Resolve a client-supplied path to an editable file inside the project.
 
-    The name comes from the client, so it is held to three rules: a bare filename
-    with no path separators, an editable suffix, and — after resolving — a parent
-    that is exactly the project root. That last check is what stops ``foo/../..``
-    or a symlink from reaching outside the design inputs.
+    Multi-board projects put each board's design document in its own directory,
+    so ``base/design.md`` has to be addressable — a root-only rule made every
+    board's actual design document unopenable in the workbench.
+
+    Widening *what* may be named does not widen *where* it may land. The path is
+    held to: no backslashes, not absolute, no segment that is ``..`` or begins
+    with a dot, an editable suffix, and — after resolving symlinks — a location
+    still inside the project root. The resolve-then-contain check is the one
+    that matters; the segment rules just refuse the obvious cases early with a
+    clearer error.
     """
     proj = _project_dir(session, user, project_id)
-    if "/" in name or "\\" in name or name.startswith("."):
+    parts = [seg for seg in name.split("/") if seg]
+    if (
+        not parts
+        or "\\" in name
+        or name.startswith("/")
+        or any(seg == ".." or seg.startswith(".") for seg in parts)
+    ):
         raise HTTPException(status_code=400, detail="invalid filename")
-    target = (proj / name).resolve()
-    if target.parent != proj.resolve() or target.suffix.lower() not in _EDITABLE_SUFFIXES:
+    target = proj.joinpath(*parts).resolve()
+    root = proj.resolve()
+    if not target.is_relative_to(root) or target == root:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if target.suffix.lower() not in _EDITABLE_SUFFIXES:
         raise HTTPException(status_code=400, detail="invalid filename")
     return target
 
@@ -1720,19 +1750,243 @@ class FileBody(BaseModel):
     content: str
 
 
-@app.get("/api/projects/{project_id}/files")
-def list_files(project_id: str, user: User = Depends(require_onboarded),
-    session: Session = Depends(session_scope)) -> list[dict]:
-    """The editable design inputs in the project root, markdown and config."""
+def _resolve_board(proj: Path, requested: str | None) -> str | None:
+    """Which board a request is about, or None for a single-board project.
+
+    Mirrors blpl.core.cli._board so the app and the command line refuse the same
+    things for the same reasons. Guessing is the failure to avoid: picking a
+    board would run the wrong one and write a perfectly plausible artifact that
+    nobody would think to question.
+    """
+    try:
+        man = project_manifest.discover(proj)
+    except project_manifest.ManifestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if man.implicit:
+        if requested and requested != man.boards[0].name:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{proj.name} is a single-board project; it has no board {requested!r}",
+            )
+        return None
+    if not requested:
+        names = ", ".join(b.name for b in man.boards)
+        raise HTTPException(
+            status_code=400,
+            detail=f"{proj.name} has more than one board ({names}); say which with ?board=",
+        )
+    if man.board(requested) is None:
+        names = ", ".join(b.name for b in man.boards)
+        raise HTTPException(
+            status_code=404, detail=f"no board {requested!r} in {proj.name}. Known: {names}"
+        )
+    return requested
+
+
+@app.get("/api/projects/{project_id}/boards")
+def get_boards(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """The project's boards, how they mate, and which combinations are built.
+
+    Always answers, even for the projects that predate multi-board: one with no
+    ``project.md`` reports a single implicit board named after itself, so the UI
+    has one shape to render and nothing existing had to be migrated to get it.
+    """
     proj = _project_dir(session, user, project_id)
-    out = []
-    for f in sorted(proj.iterdir()):
-        if f.is_file() and not f.name.startswith(".") and f.suffix.lower() in _EDITABLE_SUFFIXES:
-            out.append({"name": f.name, "bytes": f.stat().st_size})
+    try:
+        man = project_manifest.discover(proj, project_id=project_id)
+    except project_manifest.ManifestError as exc:
+        # A malformed manifest should cost you the board list, not the project.
+        return {
+            "project_id": project_id,
+            "schema_version": 1,
+            "implicit": True,
+            "boards": [],
+            "mates": [],
+            "configurations": [],
+            "warnings": [str(exc)],
+        }
+    return man.to_dict()
+
+
+# Directories that are noise in a tree rather than content: history, machinery,
+# and anything a package manager owns.
+# .blpl is the app's own state — conversations, proposals, the usage ledger.
+# It is project data in the sense that it is committed with the project, but it
+# is not project *content*: every file in it already has a screen that renders
+# it properly, and offering the raw JSONL in a file tree invites opening a
+# 120 kB transcript in a text editor instead of the chat panel.
+_TREE_SKIP = {".git", ".history", ".blpl", "node_modules", "__pycache__", ".venv"}
+
+# What a file is *for*, which is what a reader actually wants to sort by. The
+# extension alone does not say it — a .md under .notes/ is correspondence, a .md
+# beside it is design intent, and the pipeline treats them very differently.
+def _tree_role(rel: Path) -> str:
+    parts = rel.parts
+    if ".notes" in parts:
+        return "note"
+    if parts and parts[0] == ".pipeline":
+        return "artifact"
+    if parts and parts[0] == "datasheets":
+        return "datasheet"
+    if parts and parts[0] == quarantine.QUARANTINE_DIRNAME:
+        # Shown, not hidden. Hiding retrieved files would mean the only place
+        # anything untrusted lives is also the only place nobody looks.
+        return "quarantined"
+    if rel.suffix.lower() in {".md", ".markdown"}:
+        return "design"
+    if rel.suffix.lower() in {".kicad_pcb", ".kicad_sch", ".kicad_pro"}:
+        return "kicad"
+    return "other"
+
+
+def _walk_tree(root: Path, base: Path, depth: int = 0) -> list[dict]:
+    """Everything in a project, as a flat list of nodes with relative paths.
+
+    Flat rather than nested: the client groups it, and a flat list is far easier
+    to filter, sort and diff than a tree of dicts. Depth-limited because a
+    runaway directory should cost a truncated listing rather than a hung request.
+    """
+    if depth > 6:
+        return []
+    out: list[dict] = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except OSError:
+        return out
+    for p in entries:
+        if p.name in _TREE_SKIP:
+            continue
+        rel = p.relative_to(base)
+        if p.is_dir():
+            out.append({"path": str(rel), "name": p.name, "dir": True, "role": _tree_role(rel)})
+            out.extend(_walk_tree(p, base, depth + 1))
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out.append(
+            {
+                "path": str(rel),
+                "name": p.name,
+                "dir": False,
+                "role": _tree_role(rel),
+                "bytes": st.st_size,
+                "modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+            }
+        )
     return out
 
 
-@app.get("/api/projects/{project_id}/files/{name}")
+@app.get("/api/projects/{project_id}/tree")
+def get_tree(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Every file in the project, whatever produced it.
+
+    The artifact list only ever covered ``.pipeline/``, so anything written
+    anywhere else was invisible — a datasheet the assistant fetched sat on disk
+    with no screen in the app that would show it. A project is more than its
+    pipeline output, and the tree is the only view that says so.
+    """
+    proj = _project_dir(session, user, project_id)
+    return {"project_id": project_id, "nodes": _walk_tree(proj, proj)}
+
+
+def _tree_target(proj: Path, rel: str) -> Path:
+    """Resolve a client-supplied project-relative path, or refuse it.
+
+    The path comes from the browser, so it is untrusted: resolve first, then
+    confirm the result is still inside the project. Checking the string for
+    ".." instead would miss a symlink pointing out of the tree.
+    """
+    target = (proj / rel).resolve()
+    try:
+        target.relative_to(proj.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="path is outside the project")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"{rel} is not a file in this project")
+    return target
+
+
+@app.get("/api/projects/{project_id}/blob")
+def get_blob(
+    project_id: str,
+    path: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> FileResponse:
+    """Serve any one file from the project, by its tree path.
+
+    A retrieved file is served as an opaque download rather than as what it
+    claims to be. A PDF handed to the browser inline goes straight into a
+    viewer, and a viewer is precisely the thing an `/OpenAction` is written to
+    talk to — so anything under ``retrieved/`` comes back as
+    ``application/octet-stream`` with an attachment disposition, and opening it
+    becomes a deliberate act on a file the user has been told is unverified.
+    """
+    proj = _project_dir(session, user, project_id)
+    target = _tree_target(proj, path)
+    if _is_quarantined(proj, target):
+        return FileResponse(
+            target,
+            media_type="application/octet-stream",
+            filename=target.name,
+            headers={
+                "Content-Disposition": f'attachment; filename="{target.name}"',
+                # Without this the browser is free to sniff the bytes, decide it
+                # is a PDF after all, and render it — undoing the whole point.
+                "X-Content-Type-Options": "nosniff",
+                "X-BLPL-Quarantined": "1",
+            },
+        )
+    return FileResponse(target)
+
+
+def _is_quarantined(proj: Path, target: Path) -> bool:
+    try:
+        return target.resolve().is_relative_to(
+            quarantine.quarantine_dir(proj).resolve()
+        )
+    except (OSError, ValueError):
+        return False
+
+
+@app.get("/api/projects/{project_id}/files")
+def list_files(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> list[dict]:
+    """Every editable design input in the project, markdown and config.
+
+    Recursive, because a board's design document lives in the board's directory.
+    The editor treats a name it cannot find here as unopenable, so anything the
+    file tree offers to edit has to appear in this list or clicking it does
+    nothing.
+
+    Names are project-relative with forward slashes — the same string
+    ``_editable_file`` accepts back.
+    """
+    proj = _project_dir(session, user, project_id)
+    out = []
+    for f in sorted(proj.rglob("*")):
+        rel = f.relative_to(proj)
+        if any(part in _TREE_SKIP or part.startswith(".") for part in rel.parts):
+            continue
+        if f.is_file() and f.suffix.lower() in _EDITABLE_SUFFIXES:
+            out.append({"name": rel.as_posix(), "bytes": f.stat().st_size})
+    return out
+
+
+@app.get("/api/projects/{project_id}/files/{name:path}")
 def read_file(project_id: str, name: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)):
     target = _editable_file(session, user, project_id, name)
@@ -1741,12 +1995,15 @@ def read_file(project_id: str, name: str, user: User = Depends(require_onboarded
     return {"name": name, "content": target.read_text(encoding="utf-8", errors="replace")}
 
 
-@app.put("/api/projects/{project_id}/files/{name}")
+@app.put("/api/projects/{project_id}/files/{name:path}")
 def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
     target = _editable_file(session, user, project_id, name)
+    # A new board's directory may not exist yet; writing its first design
+    # document is how a board comes into being.
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body.content, encoding="utf-8")
     activity.record(
         session, _project_or_404(session, user, project_id), user, activity.EDITED, name
@@ -1771,14 +2028,21 @@ def read_artifact(project_id: str, name: str, user: User = Depends(require_onboa
 
 
 @app.get("/api/projects/{project_id}/design")
-def design_sources(project_id: str, user: User = Depends(require_onboarded),
+def design_sources(project_id: str, board: str | None = None,
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     proj = _project_dir(session, user, project_id)
     pipeline = proj / ".pipeline"
+    resolved = _resolve_board(proj, board)
     sources = []
     archived = False
     for suffix in (".kicad_sch", ".kicad_pcb"):
-        f, was_archived = _latest_with_origin(pipeline, suffix)
+        # Emitted boards carry their board in the stem, so a multi-board project
+        # would otherwise show whichever happened to be newest — a different
+        # board than the one on screen, with nothing saying so.
+        f, was_archived = _latest_with_origin(
+            pipeline, suffix, stem_contains=None if resolved is None else f"_{resolved}_"
+        )
         if f is not None:
             archived = archived or was_archived
             sources.append(
@@ -1925,7 +2189,8 @@ def _artifact_meta(path: Path, pipeline: Path) -> dict:
 
 
 @app.get("/api/projects/{project_id}/artifacts")
-def list_artifacts(project_id: str, user: User = Depends(require_onboarded),
+def list_artifacts(project_id: str, board: str | None = None,
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     """Every artifact the pipeline has written, newest first.
 
@@ -1937,9 +2202,26 @@ def list_artifacts(project_id: str, user: User = Depends(require_onboarded),
     pipeline = _project_dir(session, user, project_id) / ".pipeline"
     if not pipeline.is_dir():
         return {"artifacts": []}
-    artifacts = [_artifact_meta(p, pipeline) for p in sorted(pipeline.iterdir()) if p.is_file()]
+    files = [p for p in sorted(pipeline.iterdir()) if p.is_file()]
+    if board:
+        # Board is a filename qualifier, so filtering is a substring test on the
+        # name. Project-level artifacts (crossboard.json) carry no board and are
+        # kept: they are about this board as much as any other.
+        files = [
+            p for p in files
+            if f".{board}." in p.name or f"_{board}_" in p.name or _is_project_level(p.name)
+        ]
+    artifacts = [_artifact_meta(p, pipeline) for p in files]
     artifacts.sort(key=lambda a: a["created"], reverse=True)
     return {"artifacts": artifacts}
+
+
+# Artifacts that describe the project rather than any one board.
+_PROJECT_LEVEL_ARTIFACTS = {"crossboard.json"}
+
+
+def _is_project_level(name: str) -> bool:
+    return name in _PROJECT_LEVEL_ARTIFACTS
 
 
 @app.get("/api/projects/{project_id}/modules")
@@ -1999,6 +2281,11 @@ def read_conversation(project_id: str, filename: str, user: User = Depends(requi
         "filename": conv.path.name,
         "started_at": conv.started_at,
         "events": conv.read_all(),
+        # A turn survives the browser that started it — it runs here, not there.
+        # Without this the only way to find a live turn was to already hold its
+        # id, so a refresh (or a dropped stream) left an answer streaming into
+        # nothing while the UI showed a finished-looking transcript.
+        "active_turn": chat_sessions.active_for(conv.path.name),
     }
 
 
@@ -2111,8 +2398,78 @@ def _kicad_bridge_url() -> str | None:
     return server.url if server else None
 
 
+@app.post("/api/projects/{project_id}/conversations/{filename}/attachments")
+async def upload_attachments(
+    project_id: str,
+    filename: str,
+    files: list[UploadFile] = File(...),
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> list[dict]:
+    """Store files for a message that has not been sent yet.
+
+    Upload and send are separate steps on purpose. A datasheet takes a moment to
+    arrive and the message it belongs to is usually still being typed; coupling
+    them would mean the send button blocks on the upload, and a failed upload
+    would take the typed message down with it. This way the composer shows the
+    file arriving, and the send that follows carries ids.
+
+    Content-addressed, so re-attaching a file already in the store costs one
+    hash and no disk.
+    """
+    conv_dir = _conversations_dir(session, user, project_id)
+    try:
+        Conversation.open_existing(conv_dir, filename)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    if len(files) > attachments.MAX_PER_MESSAGE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{len(files)} files; at most {attachments.MAX_PER_MESSAGE} per message",
+        )
+
+    saved: list[dict] = []
+    for upload in files:
+        data = await upload.read()
+        try:
+            saved.append(
+                attachments.save(conv_dir, upload.filename or "attachment", data).to_dict()
+            )
+        except attachments.AttachmentRejected as exc:
+            # One bad file fails the batch rather than half-attaching. The user
+            # is standing there watching; a partial result they have to
+            # reconcile is worse than a clear refusal they can retry.
+            raise HTTPException(status_code=400, detail=str(exc))
+    return saved
+
+
+@app.get("/api/projects/{project_id}/attachments/{attachment_id}")
+def get_attachment(
+    project_id: str, attachment_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> FileResponse:
+    """Serve stored bytes back so the transcript can show what was attached.
+
+    Behind the same project authorisation as everything else — attachments are
+    project data, and a raw sha256 is not an access token.
+    """
+    conv_dir = _conversations_dir(session, user, project_id)
+    path = attachments.path_of(conv_dir, attachment_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="attachment not found")
+    return FileResponse(path)
+
+
 class ChatInput(BaseModel):
     content: str
+    # Ids from the upload route above. Names are resolved server-side rather
+    # than trusted from the client, so the transcript cannot be made to claim a
+    # file is something it is not.
+    attachments: list[str] = []
 
 
 @app.post("/api/projects/{project_id}/conversations/{filename}/chat")
@@ -2130,15 +2487,57 @@ async def start_chat_turn(
     costs the answer and never the question.
     """
     proj = _project_dir(session, user, project_id)
+    conv_dir = _conversations_dir(session, user, project_id)
     try:
-        conv = Conversation.open_existing(_conversations_dir(session, user, project_id), filename)
+        conv = Conversation.open_existing(conv_dir, filename)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    if not payload.content.strip():
+    # An attachment on its own is a message — dropping a datasheet in and
+    # asking nothing is a normal way to start ("look at this"). Only a message
+    # with neither text nor files is empty.
+    if not payload.content.strip() and not payload.attachments:
         raise HTTPException(status_code=400, detail="message is empty")
 
+    blocks: list[dict] = []
+    for att_id in payload.attachments[: attachments.MAX_PER_MESSAGE]:
+        path = attachments.path_of(conv_dir, att_id)
+        if path is None:
+            raise HTTPException(status_code=400, detail=f"unknown attachment {att_id}")
+        media_type = attachments.media_type_of(path)
+        blocks.append(
+            {
+                "type": "image" if media_type.startswith("image/") else "document",
+                "attachment": att_id,
+                "media_type": media_type,
+                # Not path.name — that is the sha256 the bytes are stored under.
+                "name": attachments.name_of(path),
+            }
+        )
+    # Attachments first: providers read an image better when the question about
+    # it comes after, and it matches how the message was composed.
+    if payload.content.strip():
+        blocks.append({"type": "text", "text": payload.content})
+
+    # Checked before the message is written, not after. The append used to come
+    # first and the in-flight check second, so a retry after a dropped stream
+    # persisted the question a second time and then refused — leaving the user
+    # asking twice in a transcript they never got an answer in.
+    live = chat_sessions.active_for(conv.path.name)
+    if live:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "turn_in_flight",
+                "turn_id": live,
+                "message": (
+                    "this conversation already has a turn in flight; "
+                    "reattaching to it"
+                ),
+            },
+        )
+
     endpoint = _chat_endpoint(session, user, master_key)
-    conv.append("user", payload.content, {"blocks": [{"type": "text", "text": payload.content}]})
+    conv.append("user", payload.content, {"blocks": blocks})
     try:
         turn_id = chat_sessions.start(
             chat_mod.TurnRequest(
@@ -2154,7 +2553,20 @@ async def start_chat_turn(
                     project_id, rec, conversation=conv.path.name
                 ),
                 kicad_url=_kicad_bridge_url(),
+                conversations_dir=conv_dir,
             )
+        )
+    except chat_mod.TurnInFlight as exc:
+        # The pre-check above catches this in every case that matters; this is
+        # the narrow race where two sends land together. Same shape of answer,
+        # so the client has one path to handle rather than two.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "turn_in_flight",
+                "turn_id": exc.turn_id,
+                "message": str(exc),
+            },
         )
     except chat_mod.ProposalError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -2175,9 +2587,36 @@ def stream_chat_turn(
 
     async def events():
         async for event in chat_sessions.stream(turn_id):
+            # A heartbeat is framed as an SSE comment: it keeps the connection
+            # (and every proxy on it) awake without the client needing to know
+            # about a message type that carries nothing.
+            if event.get("type") == "ping":
+                yield ": ping\n\n"
+                continue
             yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@app.post("/api/projects/{project_id}/chat/{turn_id}/cancel")
+def cancel_chat_turn(
+    project_id: str, turn_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)
+) -> dict:
+    """Stop a running turn.
+
+    The turn lives on the server, so closing the tab never stopped one — it only
+    stopped watching. Until this existed the sole way out of a turn you did not
+    want (a wrong question, a tool loop grinding away, an approval you would
+    rather withdraw) was to wait it out, and while it ran the conversation was
+    locked to it and refused the next message.
+
+    Idempotent: a turn that already finished reports stopped=False rather than
+    404ing, because "it is not running" is the state the caller wanted either
+    way.
+    """
+    _project_dir(session, user, project_id)
+    return {"stopped": chat_sessions.cancel(turn_id)}
 
 
 class ApprovalDecision(BaseModel):
@@ -2500,6 +2939,7 @@ def _start_run(
 async def run_stage(
     project_id: str,
     stage_name: str,
+    board: str | None = None,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -2513,8 +2953,15 @@ async def run_stage(
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
+    resolved = _resolve_board(proj, board)
+    if resolved is not None:
+        cmd += ["--board", resolved]
     activity.record(
-        session, _project_or_404(session, user, project_id), user, activity.RAN, stage_name
+        session,
+        _project_or_404(session, user, project_id),
+        user,
+        activity.RAN,
+        stage_name if resolved is None else f"{stage_name} ({resolved})",
     )
     return _start_run(session, user, project_id, stage_name, cmd, env)
 
@@ -2558,10 +3005,48 @@ def preflight(project_id: str, user: User = Depends(require_onboarded),
     wants the findings *structured*, which a log stream cannot give it. Running
     it is free and mutates nothing, so the panel can ask on every visit.
     """
-    from blpl.core import doctor
+    from blpl.core import crossboard, doctor
+
+    proj = _project_dir(session, user, project_id)
+    try:
+        man = project_manifest.discover(proj)
+    except project_manifest.ManifestError:
+        man = None
 
     try:
-        return doctor.run(_project_dir(session, user, project_id)).to_dict()
+        if man is None or man.implicit:
+            return doctor.run(proj).to_dict()
+        # A multi-board project has two kinds of finding, and they answer
+        # different questions: the doctor says what one board's markdown would
+        # drop, the cross-board report says what happens where boards meet. The
+        # second is the one no per-board check can reach, so it is not hidden
+        # behind a board selection.
+        per_board = {}
+        artifacts: dict[str, dict] = {}
+        for b in (x.name for x in man.boards):
+            bdir = project_manifest.board_dir(proj, man, b)
+            if bdir.is_dir():
+                per_board[b] = doctor.run(bdir).to_dict()
+            art = project_manifest.artifact_path(
+                proj, "design_artifact.deterministic", board=b
+            )
+            if art.is_file():
+                try:
+                    artifacts[b] = json.loads(art.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    pass
+        report = crossboard.check(man, artifacts) if artifacts else None
+        return {
+            "multi_board": True,
+            "boards": per_board,
+            "crossboard": report.to_dict() if report else None,
+            # Named so the panel can say why the cross-board section is empty
+            # rather than implying everything passed.
+            "crossboard_ready": sorted(artifacts),
+            "crossboard_missing": sorted(
+                b.name for b in man.boards if b.name not in artifacts
+            ),
+        }
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"could not read the project: {exc}")
 
@@ -2588,6 +3073,7 @@ def download_release(project_id: str, user: User = Depends(require_onboarded),
 @app.post("/api/projects/{project_id}/review-panel")
 async def run_review_panel(
     project_id: str,
+    board: str | None = None,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -2599,6 +3085,11 @@ async def run_review_panel(
     with different blind spots disagreeing.
     """
     proj = _project_dir(session, user, project_id)
+    # Which board, before which model: not saying which board is a malformed
+    # request, while having no provider configured is a deployment that needs
+    # setting up. Answering the second when the first is also true sends people
+    # off configuring keys for a request that would still be rejected.
+    resolved = _resolve_board(proj, board)
     try:
         env = _inject_llm_env(dict(os.environ), session, user, master_key, "review_panel")
     except llm_resolver.NoUsableProvider as exc:
@@ -2607,7 +3098,13 @@ async def run_review_panel(
         sys.executable, "-m", "blpl.agent.dispatch", "review-panel",
         "--project-dir", str(proj),
     ]
-    return _start_run(session, user, project_id, "review-panel", cmd, env)
+    if resolved is not None:
+        cmd += ["--board", resolved]
+    return _start_run(
+        session, user, project_id,
+        "review-panel" if resolved is None else f"review-panel ({resolved})",
+        cmd, env,
+    )
 
 
 # The stages the whole-pipeline runner understands, in order. The CLI `run`
@@ -2623,6 +3120,7 @@ async def run_pipeline(
     project_id: str,
     from_stage: str = "stage0",
     to_stage: str = "stage8",
+    board: str | None = None,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -2640,6 +3138,11 @@ async def run_pipeline(
     if _PIPELINE_STAGES.index(from_stage) > _PIPELINE_STAGES.index(to_stage):
         raise HTTPException(status_code=400, detail="from stage is after to stage")
     proj = _project_dir(session, user, project_id)
+    # Every stage in the range resolves a board, so the range needs one too.
+    # Without it "run the pipeline" is the one control on a multi-board project
+    # that cannot work, while each stage individually can. Asked before the
+    # provider lookup, for the same reason as the panel above.
+    resolved = _resolve_board(proj, board)
 
     env = dict(os.environ)
     lo, hi = _PIPELINE_STAGES.index(from_stage), _PIPELINE_STAGES.index(to_stage)
@@ -2655,7 +3158,12 @@ async def run_pipeline(
         "--from", from_stage, "--to", to_stage,
         "--continue-on-error",
     ]
-    return _start_run(session, user, project_id, f"pipeline {from_stage}→{to_stage}", cmd, env)
+    if resolved is not None:
+        cmd += ["--board", resolved]
+    label = f"pipeline {from_stage}→{to_stage}"
+    if resolved is not None:
+        label += f" ({resolved})"
+    return _start_run(session, user, project_id, label, cmd, env)
 
 
 # --------------------------------------------------------------------------

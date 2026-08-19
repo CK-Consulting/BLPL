@@ -407,3 +407,34 @@ def test_agent_sourcing_tool_needs_an_emitted_board(tmp_path: Path) -> None:
 def test_assembly_package_serialises(board: Path, tmp_path: Path) -> None:
     pkg = bom.build_assembly(board / "board-bom.csv", None, tmp_path, house="pcbway")
     json.loads(bom.dumps(pkg.to_dict()))
+
+
+def test_stage1_marks_where_passive_attributes_came_from():
+    """A number a model read out of the design document is worth more than one
+    a regex guessed and less than one a distributor confirmed."""
+    from blpl.core import stage1_resolve_bom as s1
+
+    out = s1._post_process(
+        {"rows": [
+            {"local_id": "C1", "mpn": "X", "package": "0402", "value": "100nF",
+             "voltage_v": 50, "dielectric": "X7R", "tolerance": 10, "safety_class": None},
+            {"local_id": "U1", "mpn": "Y", "package": "QFN", "value": None},
+        ]},
+        "p",
+    )
+    assert out["rows"][0]["attribute_provenance"] == "design_document"
+    # A part with no passive attributes makes no claim about them.
+    assert "attribute_provenance" not in out["rows"][1]
+
+
+def test_an_empty_safety_class_is_not_recorded_as_a_rating():
+    """Blank means the document did not say, and must not survive as a string
+    that looks like an answer."""
+    from blpl.core import stage1_resolve_bom as s1
+
+    out = s1._post_process(
+        {"rows": [{"local_id": "C1", "mpn": "X", "package": "0402",
+                   "value": "100nF", "safety_class": ""}]},
+        "p",
+    )
+    assert "safety_class" not in out["rows"][0]

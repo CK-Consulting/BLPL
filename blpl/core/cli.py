@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import (
     llm_adapter,
+    project_manifest,
     schema,
     stage0_compare,
     stage0_deterministic,
@@ -64,14 +65,65 @@ def _project_dir(args: argparse.Namespace) -> Path:
     return p
 
 
-def _md_inputs(project_dir: Path) -> list[Path]:
-    """Return the Markdown input files for a project.
+def _board(args: argparse.Namespace, proj: Path) -> str | None:
+    """Which board this invocation is about, or None for a single-board project.
 
-    Default: all *.md files directly under project_dir, excluding anything under
-    .pipeline/ or .history/ subdirs.
+    None is not a missing value — it is the answer for every project that has
+    one board, which is every project written before boards existed. It also
+    keeps their artifact names unchanged: ``bom.json`` stays ``bom.json``
+    rather than becoming ``bom.<something>.json`` and orphaning what is already
+    on disk and in git.
     """
-    files = [p for p in sorted(project_dir.glob("*.md"))]
-    return files
+    man = project_manifest.discover(proj)
+    requested = getattr(args, "board", None)
+    if man.implicit:
+        if requested and requested != man.boards[0].name:
+            raise SystemExit(
+                f"error: {proj.name} is a single-board project; it has no board "
+                f"{requested!r}. Add a project.md with a ## Boards section to split it."
+            )
+        return None
+    if not requested:
+        names = ", ".join(b.name for b in man.boards)
+        raise SystemExit(
+            f"error: {proj.name} has more than one board ({names}). "
+            "Say which with --board."
+        )
+    if man.board(requested) is None:
+        names = ", ".join(b.name for b in man.boards)
+        raise SystemExit(f"error: no board {requested!r} in {proj.name}. Known: {names}")
+    return requested
+
+
+def _artifact(
+    args: argparse.Namespace, proj: Path, name: str, *, suffix: str = "json"
+) -> Path:
+    """Where one stage artifact lives for the board being worked on.
+
+    One ``.pipeline/`` per project, with the board as a filename qualifier — not
+    one pipeline per board. Splitting them would fragment ``datasheets/``,
+    ``modules/`` and part resolution, so two boards in one project could end up
+    holding different absolute maximums for the same part. See
+    project_manifest.pipeline_dir for the full argument.
+    """
+    return project_manifest.artifact_path(proj, name, board=_board(args, proj), suffix=suffix)
+
+
+def _md_inputs(project_dir: Path, board: str | None = None) -> list[Path]:
+    """Return the Markdown input files for a board.
+
+    Default: all *.md files directly under the board's directory. Non-recursive,
+    which is what keeps ``.notes/`` correspondence and ``.pipeline/`` output from
+    being read as design intent.
+
+    A single-board project's directory *is* the project directory, so this
+    behaves exactly as it always did when there is no board.
+    """
+    root = Path(project_dir)
+    if board is not None:
+        man = project_manifest.discover(root)
+        root = project_manifest.board_dir(root, man, board)
+    return [p for p in sorted(root.glob("*.md"))]
 
 
 def _make_adapter(args: argparse.Namespace) -> llm_adapter.LLMAdapter:
@@ -80,11 +132,11 @@ def _make_adapter(args: argparse.Namespace) -> llm_adapter.LLMAdapter:
 
 def _cmd_stage0_det(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    md_files = _md_inputs(proj)
+    md_files = _md_inputs(proj, _board(args, proj))
     if not md_files:
         print(f"error: no .md files found under {proj}", file=sys.stderr)
         return 2
-    out = proj / ".pipeline" / "design_artifact.deterministic.json"
+    out = _artifact(args, proj, "design_artifact.deterministic")
     artifact = stage0_deterministic.run(md_files, out)
     print(
         f"stage0-det: {len(artifact['components'])} components, "
@@ -96,12 +148,12 @@ def _cmd_stage0_det(args: argparse.Namespace) -> int:
 
 def _cmd_stage0_llm(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    md_files = _md_inputs(proj)
+    md_files = _md_inputs(proj, _board(args, proj))
     if not md_files:
         print(f"error: no .md files found under {proj}", file=sys.stderr)
         return 2
     adapter = _make_adapter(args)
-    out = proj / ".pipeline" / "design_artifact.llm.json"
+    out = _artifact(args, proj, "design_artifact.llm")
     print(f"stage0-llm: using {adapter.provider}/{adapter.model} on {len(md_files)} files…", file=sys.stderr)
     artifact = stage0_llm.run(md_files, out, adapter=adapter)
     print(
@@ -114,14 +166,14 @@ def _cmd_stage0_llm(args: argparse.Namespace) -> int:
 
 def _cmd_stage0_compare(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    a = proj / ".pipeline" / "design_artifact.deterministic.json"
-    b = proj / ".pipeline" / "design_artifact.llm.json"
+    a = _artifact(args, proj, "design_artifact.deterministic")
+    b = _artifact(args, proj, "design_artifact.llm")
     if not a.exists() or not b.exists():
         missing = [str(p) for p in (a, b) if not p.exists()]
         print(f"error: missing input artifact(s): {missing}", file=sys.stderr)
         print("       run stage0-det and stage0-llm first", file=sys.stderr)
         return 2
-    out = proj / ".pipeline" / "design_artifact.compare.md"
+    out = _artifact(args, proj, "design_artifact.compare", suffix="md")
     diff = stage0_compare.run(a, b, out)
     c = diff["components"]
     print(
@@ -136,13 +188,13 @@ def _cmd_stage0_compare(args: argparse.Namespace) -> int:
 def _cmd_stage1(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
     source = args.source  # "det" | "llm"
-    src_path = proj / ".pipeline" / f"design_artifact.{source}.json"
+    src_path = _artifact(args, proj, f"design_artifact.{source}")
     if source == "det":
-        src_path = proj / ".pipeline" / "design_artifact.deterministic.json"
+        src_path = _artifact(args, proj, "design_artifact.deterministic")
     if not src_path.exists():
         print(f"error: {src_path} does not exist (run stage0-{source} first)", file=sys.stderr)
         return 2
-    out = proj / ".pipeline" / "bom.json"
+    out = _artifact(args, proj, "bom")
     adapter = _make_adapter(args)
     print(f"stage1: resolving BOM from {src_path.name} via {adapter.provider}/{adapter.model}…", file=sys.stderr)
     bom = stage1_resolve_bom.run(src_path, out, adapter=adapter)
@@ -154,8 +206,8 @@ def _cmd_stage1(args: argparse.Namespace) -> int:
 
 def _cmd_stage3(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    coverage = proj / ".pipeline" / "coverage_report.json"
-    bom = proj / ".pipeline" / "bom.json"
+    coverage = _artifact(args, proj, "coverage_report")
+    bom = _artifact(args, proj, "bom")
     for p, label in [(coverage, "coverage_report"), (bom, "bom")]:
         if not p.exists():
             print(f"error: {label} missing at {p}", file=sys.stderr)
@@ -176,10 +228,10 @@ def _cmd_stage3(args: argparse.Namespace) -> int:
 def _cmd_stage1_synthesize_connectors(args: argparse.Namespace) -> int:
     """Append synthesized connector rows to an existing bom.json (no LLM call)."""
     proj = _project_dir(args)
-    artifact_path = proj / ".pipeline" / f"design_artifact.{args.source}.json"
+    artifact_path = _artifact(args, proj, f"design_artifact.{args.source}")
     if args.source == "det":
-        artifact_path = proj / ".pipeline" / "design_artifact.deterministic.json"
-    bom_path = proj / ".pipeline" / "bom.json"
+        artifact_path = _artifact(args, proj, "design_artifact.deterministic")
+    bom_path = _artifact(args, proj, "bom")
     for p, label in [(artifact_path, "design_artifact"), (bom_path, "bom")]:
         if not p.exists():
             print(f"error: {label} missing at {p}", file=sys.stderr)
@@ -233,7 +285,7 @@ def _resolve_kicad_python(cli_value: str | None) -> Path | None:
 def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     """Run the PCB plugin in standalone mode via KiCad's bundled Python."""
     proj = _project_dir(args)
-    hdm_path = proj / ".pipeline" / "hdm.yaml"
+    hdm_path = _artifact(args, proj, "hdm", suffix="yaml")
     if not hdm_path.exists():
         print(f"error: hdm.yaml missing at {hdm_path} — run stage5 first", file=sys.stderr)
         return 2
@@ -254,9 +306,14 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     stamp = args.stamp or datetime.now(tz=timezone.utc).strftime("%Y-%m-%d_%H%M%SZ")
     import re as _re
 
+    # The emitted board is named for what it *is*. On a multi-board project the
+    # project name alone would give two boards the same stem and let the second
+    # overwrite the first, so the board joins the name when there is one.
     project_name = proj.name or "project"
-    base = _re.sub(r"[^A-Za-z0-9._-]+", "_", project_name.strip()) or "project"
-    out_path = proj / ".pipeline" / f"{base}_{stamp}.kicad_pcb"
+    board_name = _board(args, proj)
+    stem = f"{project_name}_{board_name}" if board_name else project_name
+    base = _re.sub(r"[^A-Za-z0-9._-]+", "_", stem.strip()) or "project"
+    out_path = project_manifest.pipeline_dir(proj) / f"{base}_{stamp}.kicad_pcb"
 
     # The plugin lives inside blpl/; PYTHONPATH needs the parent so
     # `-m blpl.plugin_kicad.build_pcb` resolves under KiCad's Python.
@@ -268,7 +325,7 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     import json as _json
     import yaml as _yaml
 
-    hdm_json_path = proj / ".pipeline" / "hdm.plugin.json"
+    hdm_json_path = _artifact(args, proj, "hdm.plugin")
     with hdm_path.open() as f:
         hdm_data = _yaml.safe_load(f) or {}
     with hdm_json_path.open("w") as f:
@@ -398,7 +455,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 def _cmd_resolve_pin_map(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    bom = proj / ".pipeline" / "bom.json"
+    bom = _artifact(args, proj, "bom")
     if not bom.exists():
         print(f"error: bom.json missing at {bom}", file=sys.stderr)
         return 2
@@ -430,14 +487,14 @@ def _cmd_resolve_pin_map(args: argparse.Namespace) -> int:
 
 def _cmd_stage4(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    da_path = proj / ".pipeline" / f"design_artifact.{args.source}.json"
+    da_path = _artifact(args, proj, f"design_artifact.{args.source}")
     if args.source == "det":
-        da_path = proj / ".pipeline" / "design_artifact.deterministic.json"
-    bom_path = proj / ".pipeline" / "bom.json"
+        da_path = _artifact(args, proj, "design_artifact.deterministic")
+    bom_path = _artifact(args, proj, "bom")
     if not da_path.exists():
         print(f"error: {da_path} missing — run stage0-{args.source} first", file=sys.stderr)
         return 2
-    out = proj / ".pipeline" / "nets.json"
+    out = _artifact(args, proj, "nets")
     nets = stage4_synthesize_nets.run(
         design_artifact_path=da_path,
         bom_path=bom_path if bom_path.exists() else None,
@@ -452,26 +509,26 @@ def _cmd_stage4(args: argparse.Namespace) -> int:
 
 def _cmd_stage5(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    da_path = proj / ".pipeline" / "design_artifact.deterministic.json"
+    da_path = _artifact(args, proj, "design_artifact.deterministic")
     if args.source == "llm":
-        da_path = proj / ".pipeline" / "design_artifact.llm.json"
-    bom_path = proj / ".pipeline" / "bom.json"
-    nets_path = proj / ".pipeline" / "nets.json"
+        da_path = _artifact(args, proj, "design_artifact.llm")
+    bom_path = _artifact(args, proj, "bom")
+    nets_path = _artifact(args, proj, "nets")
     # project.yaml is hand-authored (or `blpl init`-generated) config, not a
     # build artifact — so it belongs beside the design markdown where it gets
     # committed, not in .pipeline/ which is generated and gitignored. Prefer the
     # durable location; fall back to the legacy one so existing projects keep working.
     proj_cfg = proj / "project.yaml"
     if not proj_cfg.exists():
-        proj_cfg = proj / ".pipeline" / "project.yaml"
-    coverage = proj / ".pipeline" / "coverage_report.json"
+        proj_cfg = _artifact(args, proj, "project", suffix="yaml")
+    coverage = _artifact(args, proj, "coverage_report")
 
     for p, label in [(da_path, "design_artifact"), (bom_path, "bom"), (nets_path, "nets")]:
         if not p.exists():
             print(f"error: {label} missing at {p}", file=sys.stderr)
             return 2
 
-    out = proj / ".pipeline" / "hdm.yaml"
+    out = _artifact(args, proj, "hdm", suffix="yaml")
     try:
         hdm = stage5_emit_yaml_hdm.run(
             bom_path=bom_path,
@@ -529,8 +586,8 @@ def _cmd_stage5(args: argparse.Namespace) -> int:
 
 def _cmd_stage2(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    bom_path = proj / ".pipeline" / "bom.json"
-    output_path = proj / ".pipeline" / "coverage_report.json"
+    bom_path = _artifact(args, proj, "bom")
+    output_path = _artifact(args, proj, "coverage_report")
     if not bom_path.exists():
         print(f"error: no bom.json at {bom_path}", file=sys.stderr)
         return 2
@@ -570,6 +627,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         project_dir=args.project_dir,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
+        # Every stage resolves its own board through `_board`, which reads this.
+        # Leaving it out made `run --board base` parse the flag and then drop
+        # it, so stage0 saw no board and refused the whole pipeline on any
+        # multi-board project.
+        board=getattr(args, "board", None),
     )
 
     for i in range(start, end + 1):
@@ -629,11 +691,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _cmd_stage6(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    hdm = proj / ".pipeline" / "hdm.yaml"
+    hdm = _artifact(args, proj, "hdm", suffix="yaml")
     if not hdm.exists():
         print(f"error: hdm.yaml missing at {hdm} — run stage5 first", file=sys.stderr)
         return 2
-    outputs = stage6_compile_kicad.run(hdm, proj / ".pipeline", project_dir=proj)
+    outputs = stage6_compile_kicad.run(
+        hdm, project_manifest.pipeline_dir(proj), project_dir=proj, board=_board(args, proj)
+    )
     file_outputs = {k: v for k, v in outputs.items() if k != "base"}
     print(f"stage6: compiled KiCad project ({len(file_outputs)} files, base={outputs['base']})")
     for kind, path in file_outputs.items():
@@ -643,12 +707,24 @@ def _cmd_stage6(args: argparse.Namespace) -> int:
 
 def _cmd_stage7(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    pipeline_dir = proj / ".pipeline"
-    # Pick the most recent timestamped compile when several exist.
-    pcb_candidates = sorted(pipeline_dir.glob("*.kicad_pcb"), reverse=True)
-    sch_candidates = sorted(pipeline_dir.glob("*.kicad_sch"), reverse=True)
-    pcb = pcb_candidates[0] if pcb_candidates else None
-    sch = sch_candidates[0] if sch_candidates else None
+    pipeline_dir = project_manifest.pipeline_dir(proj)
+    board = _board(args, proj)
+
+    def _newest(suffix: str) -> Path | None:
+        """The most recent compile of *this* board.
+
+        Without the board filter a multi-board project validates whichever file
+        is newest, so running stage7 on `sensor` right after compiling `base`
+        reports on `base` and calls it `sensor` — a clean report for a board
+        nobody checked.
+        """
+        found = sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True)
+        if board is not None:
+            found = [p for p in found if f"_{board}_" in p.name]
+        return found[0] if found else None
+
+    pcb = _newest(".kicad_pcb")
+    sch = _newest(".kicad_sch")
     report = stage7_validate.run(
         proj,
         pcb_path=pcb,
@@ -812,7 +888,8 @@ def _cmd_spice(args: argparse.Namespace) -> int:
     from ..agent.tools.spice import find_simulator, simulate
 
     proj = _project_dir(args)
-    review_dir = proj / ".pipeline" / "review"
+    _rb = _board(args, proj)
+    review_dir = project_manifest.pipeline_dir(proj) / ("review" if _rb is None else f"review.{_rb}")
     schematic_json = review_dir / "schematic.json"
     if not schematic_json.is_file():
         print(
@@ -956,19 +1033,47 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("stage0-det", help="Deterministic Markdown -> design_artifact.json.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.set_defaults(func=_cmd_stage0_det)
 
     p = sub.add_parser("stage0-llm", help="LLM Markdown -> design_artifact.json.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     _add_llm_flags(p)
     p.set_defaults(func=_cmd_stage0_llm)
 
     p = sub.add_parser("stage0-compare", help="Diff deterministic vs LLM design_artifact outputs.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.set_defaults(func=_cmd_stage0_compare)
 
     p = sub.add_parser("stage1", help="LLM design_artifact -> bom.json.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument(
         "--source",
         default="det",
@@ -984,6 +1089,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--project-dir", required=True)
     p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
+    p.add_argument(
         "--source",
         default="det",
         choices=("det", "llm"),
@@ -993,12 +1105,26 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("stage2", help="Scan KiCad libraries for symbol/footprint coverage.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument("--symbols-root", default=str(_DEFAULT_SYMBOLS))
     p.add_argument("--footprints-root", default=str(_DEFAULT_FOOTPRINTS))
     p.set_defaults(func=_cmd_stage2)
 
     p = sub.add_parser("stage6", help="Compile hdm.yaml to .kicad_pcb + .kicad_pro via yaml_to_kicad.py.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.set_defaults(func=_cmd_stage6)
 
     p = sub.add_parser(
@@ -1006,6 +1132,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Build .kicad_pcb via the KiCad plugin (pcbnew Python API). Requires KiCad installed.",
     )
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument(
         "--kicad-python",
         default=None,
@@ -1026,6 +1159,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("stage7", help="Run KLC + DRC + coverage validation, write validation_report.json.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.set_defaults(func=_cmd_stage7)
 
     p = sub.add_parser(
@@ -1033,6 +1173,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Generate project.yaml from the design markdown (identity/stackup/net-class tables).",
     )
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument("--force", action="store_true", help="Overwrite an existing project.yaml.")
     p.set_defaults(func=_cmd_init)
 
@@ -1041,6 +1188,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Preflight: report what Stage 0 would silently discard. Run this first.",
     )
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument("--json", action="store_true", help="Emit the report as JSON.")
     p.set_defaults(func=_cmd_doctor)
 
@@ -1049,6 +1203,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Design review (kicad-happy): schematic + PCB + EMC analysis, write review_report.json.",
     )
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument(
         "--no-emc",
         action="store_true",
@@ -1066,6 +1227,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Simulate the subcircuits stage8 detected (needs ngspice/LTspice/Xyce).",
     )
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument(
         "--types",
         help="Comma-separated subcircuit types to simulate (default: all supported).",
@@ -1093,6 +1261,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Sourcing readiness of the emitted schematic: which parts cannot be ordered yet.",
     )
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument("--json", action="store_true", help="Emit the analyzer report as JSON.")
     p.set_defaults(func=_cmd_bom_check)
 
@@ -1101,6 +1276,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Write JLCPCB / PCBWay upload files (BOM + CPL) from the latest release package.",
     )
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument(
         "--house",
         default="both",
@@ -1117,6 +1299,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("run", help="Run the full pipeline end-to-end (stages 0–8).")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument(
         "--from",
         dest="start_stage",
@@ -1204,6 +1393,13 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("stage3", help="Emit gap prompts (and optionally auto-generate generic symbols).")
     p.add_argument("--project-dir", required=True)
     p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
+    p.add_argument(
         "--auto-fill-gaps",
         action="store_true",
         help="Also auto-generate generic rectangular symbols for rows whose pin_count is known. Off by default per decision #3.",
@@ -1215,6 +1411,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Fill or overwrite a single BOM row's pin_map from a library symbol (fast path) or a CSV (manual).",
     )
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument(
         "--local-id",
         required=True,
@@ -1243,11 +1446,25 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("stage4", help="Synthesize nets.json from design_artifact + bom.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument("--source", default="det", choices=("det", "llm"), help="Which Stage 0 artifact to use (default: det).")
     p.set_defaults(func=_cmd_stage4)
 
     p = sub.add_parser("stage5", help="Emit YAML HDM (hdm.yaml) consumable by yaml_to_kicad.py.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
     p.add_argument("--source", default="det", choices=("det", "llm"))
     p.set_defaults(func=_cmd_stage5)
 

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getJSON } from "../api";
+import { withBoard } from "../board";
 
 /**
  * Every artifact the pipeline wrote, rendered by type instead of dumped as raw
@@ -22,18 +23,28 @@ function human(bytes: number): string {
 // rotated .kicad_pcb can be megabytes, and nobody reads that in a side panel.
 const MAX_INLINE = 1_500_000;
 
-export function Artifacts({ projectId, reloadToken }: { projectId: string; reloadToken: number }) {
+export function Artifacts({
+  projectId,
+  board,
+  reloadToken,
+}: {
+  projectId: string;
+  board: string | null;
+  reloadToken: number;
+}) {
   const [metas, setMetas] = useState<Meta[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
 
   useEffect(() => {
-    getJSON<{ artifacts: Meta[] }>(`/api/projects/${projectId}/artifacts`)
+    getJSON<{ artifacts: Meta[] }>(
+      withBoard(`/api/projects/${projectId}/artifacts`, board),
+    )
       .then((r) => {
         setMetas(r.artifacts);
         setSelected((cur) => (cur && r.artifacts.some((a) => a.name === cur) ? cur : null));
       })
       .catch(() => setMetas([]));
-  }, [projectId, reloadToken]);
+  }, [projectId, board, reloadToken]);
 
   if (metas.length === 0)
     return (

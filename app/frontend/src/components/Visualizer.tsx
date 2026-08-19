@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CrossProbeRequest } from "../types/ecad-viewer";
+import { withBoard } from "../board";
 
 /**
  * Browser-side KiCad renderer.
@@ -117,10 +118,12 @@ export type Highlight = { designators: string[]; nets: string[]; seq: number };
 
 export function DesignView({
   projectId,
+  board,
   reloadToken,
   highlight,
 }: {
   projectId: string;
+  board: string | null;
   reloadToken: number;
   highlight?: Highlight | null;
 }) {
@@ -132,7 +135,9 @@ export function DesignView({
     let cancelled = false;
     setError(null);
 
-    fetch(`/api/projects/${projectId}/design`, { credentials: "same-origin" })
+    fetch(withBoard(`/api/projects/${projectId}/design`, board), {
+      credentials: "same-origin",
+    })
       .then(async (r) => {
         if (r.status === 401) {
           window.location.reload();

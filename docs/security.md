@@ -170,6 +170,123 @@ Set `BLPL_WEBAUTHN_RP_ID` and `BLPL_WEBAUTHN_ORIGIN`. Unset, the server infers
 them from the request origin, which works and drops a defence-in-depth check.
 **Changing the RP ID invalidates every enrolled passkey** — pick it once.
 
+## Files retrieved from the internet
+
+A datasheet is the only thing in a project that arrives from outside it.
+Everything else is written by the people working on the board or generated from
+what they wrote. Retrieved files therefore get their own directory and their own
+rules.
+
+```
+project/
+  retrieved/                 arrives here, untrusted
+    quarantine.json          the ledger: what came in, from where, what was found
+    <sha256[:12]>-<mpn>.pdf
+  datasheets/                only files that have passed live here
+```
+
+The two-directory shape is the control. Code reading `datasheets/` is reading
+files that were inspected; code reading `retrieved/` knows what it is touching.
+Nothing has to remember a policy, because the path states it.
+
+### Two checks, asking different questions
+
+**What will the file do?** (`blpl/core/pdf_inspect.py`) PDF is a container
+format with an action model attached: a file can carry JavaScript, name a
+program to launch, submit a form to a URL, or pull in a remote document — and
+`/OpenAction` and `/AA` make any of that happen *when the file is opened*, with
+no click.
+
+For a hardware programme that last part deserves stating plainly. A datasheet
+that phones home on open is not only a malware risk; it tells whoever sent it
+that this organisation is looking at this part, on this day. A BOM is a
+competitive secret and a part list is most of one.
+
+Two evasions are handled explicitly, because a check that misses them is
+theatre:
+
+* **Hex-escaped names.** PDF allows `#xx` for any character in a name, so
+  `/JavaScript` may be written `/J#61vaScript`. Names are normalised before
+  comparison.
+* **Compressed object streams.** Since PDF 1.5 most structure lives in
+  Flate-compressed object streams, so `b"/OpenAction" in data` is a test that a
+  modern hostile file passes. Every stream that decompresses is scanned too.
+
+One case is reported rather than papered over: an **encrypted** PDF has its
+streams enciphered, so there is nothing to match. That is `cannot_inspect`, not
+clean, and the file is held.
+
+Hyperlinks (`/URI`) are recorded and *not* held against a file. Vendor
+datasheets are full of them, a link is inert until clicked, and refusing them
+all would refuse the entire corpus. A `/URI` reached from an `/OpenAction` is a
+different matter and is caught by the `/OpenAction` finding.
+
+**Is the file known bad?** (`blpl/core/av.py`) Optional, external, ClamAV by
+default. See below.
+
+Neither check substitutes for the other. A scanner's silence means "not a known
+threat", which is not the same as "does nothing" — in testing, a PDF crafted to
+submit a form on open was called clean by ClamAV and held by the inspector. The
+inspector is the control that stops a datasheet phoning home; the scanner is the
+control that recognises yesterday's malware.
+
+### The invariant that makes the scanner optional
+
+> An absent scanner reports `unscanned`. It never reports `clean`.
+
+`clean` is a claim that something looked and found nothing. `unscanned` is an
+admission that nothing looked. Collapsing them is how a control becomes
+decoration: the ledger fills with ticks that mean "we did not check", and a year
+later nobody remembers the difference. A configured-but-dead scanner reports
+`unscanned` too, so a daemon that quietly died shows up as files nobody checked
+rather than as files that passed.
+
+### Running the scanner
+
+ClamAV ships as a compose profile, off by default:
+
+```
+docker compose --profile scanning up -d
+```
+
+It is a profile rather than a plain service because clamd holds its signature
+database in memory (~1.5–2 GB) and refreshes it on a schedule. That is a fair
+price for a deployment that fetches from the internet and a silly one for a
+laptop running tests, so it is a decision rather than a default.
+
+Once it is running, set `BLPL_QUARANTINE_REQUIRE_SCAN=1` on `backend` and
+`worker` to hold anything the scanner did not see. Leave it off until then, or
+every datasheet is held.
+
+### What happens to a file that does not pass
+
+It is kept, not deleted. It is evidence — which part, which distributor, what
+was in it — and deleting it destroys the only record of an event worth knowing
+about while guaranteeing the same download happens again tomorrow. The fetch
+reports that it was held and why, rather than reporting that the part has no
+datasheet, which is a different and misleading sentence.
+
+Retrieved files are served over `/blob` as `application/octet-stream` with an
+attachment disposition and `X-Content-Type-Options: nosniff`. A PDF handed to a
+browser inline goes straight into a viewer, and a viewer is exactly what an
+`/OpenAction` is written to talk to. Opening a held file has to be a deliberate
+act. Files that passed are served normally — the restriction is on unverified
+files, not on datasheets.
+
+### What this does not cover
+
+* **Non-PDF retrievals.** There is one inspector and it reads PDFs. Anything
+  else is `cannot_inspect` and is held.
+* **The renderer.** `pdftotext`, where installed, parses untrusted input. It is
+  not in the backend image today, so kicad-happy falls back to scanning raw
+  bytes for strings — less capable and, as it happens, less exposed.
+* **Content disarm.** Nothing is rewritten. A file with active content is held
+  whole rather than stripped and released, because a rewritten PDF is a new
+  file whose fidelity nobody has checked.
+* **Third-party scanning services.** Deliberately not used. Uploading a
+  project's datasheets to a multi-scanner service would publish the part list,
+  which is the thing this section is partly trying to protect.
+
 ## Known gaps
 
 * **A stuck run blocks sealing.** A run whose worker died is reclaimed after its
@@ -177,6 +294,10 @@ them from the request origin, which works and drops a defence-in-depth check.
   in the safe direction — files intact, not encrypted — and is worth knowing.
 * **Key rotation is not implemented.** Changing a passphrase re-wraps the master
   key; there is no path to re-key a project.
+* **Quarantined files are sealed with the project.** A held file stays inside
+  the encrypted archive. That is deliberate — it is evidence and it belongs with
+  the project — but it does mean a sealed project can contain something that was
+  refused.
 
 ## If a key leaks
 
