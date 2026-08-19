@@ -42,6 +42,15 @@ The markdown stays the source, as everywhere else in the pipeline::
     - minimal: base
     - sensing: base, sensor
     - full: base, sensor, radio
+
+    ## Rules
+
+    - rf across boards: forbid
+
+The ``Rules`` section is where a project states a standard it wants held to.
+Nothing there is a default the tool imposes — an engineer who has decided to
+carry RF across a connector, and knows what that costs, should not have to argue
+with their tooling about it.
 """
 
 from __future__ import annotations
@@ -135,6 +144,10 @@ class ProjectManifest:
     # True when there is no project.md and the project is the single implicit
     # board every pre-existing project already is.
     implicit: bool = False
+    # How hard this project is on RF crossing a board boundary. Advisory by
+    # default: the tool should hold the standard its owner chose, not the one
+    # whoever wrote the checker happened to prefer.
+    rf_severity: str = "warning"
 
     def board(self, name: str) -> Board | None:
         return next((b for b in self.boards if b.name == name), None)
@@ -158,6 +171,7 @@ class ProjectManifest:
             "boards": [b.to_dict() for b in self.boards],
             "mates": [m.to_dict() for m in self.mates],
             "configurations": [c.to_dict() for c in self.configurations],
+            "rules": {"rf_across_boards": self.rf_severity},
             "warnings": self.warnings,
         }
 
@@ -238,6 +252,22 @@ def parse(text: str, *, project_id: str) -> ProjectManifest:
                 note=note,
             )
         )
+
+    for item in sec.get("rules", []):
+        decl, _ = _split_note(item)
+        low = decl.lower()
+        if "rf" in low and "board" in low:
+            if "forbid" in low or "error" in low or "block" in low:
+                man.rf_severity = "error"
+            elif "allow" in low or "ignore" in low or "off" in low:
+                man.rf_severity = "info"
+            else:
+                man.warnings.append(
+                    f"rules: {item!r} mentions RF across boards but not what to do "
+                    "about it — say 'forbid', 'warn' or 'allow'"
+                )
+        else:
+            man.warnings.append(f"rules: {item!r} is not a rule this version knows")
 
     for item in sec.get("configurations", []):
         if ":" not in item:

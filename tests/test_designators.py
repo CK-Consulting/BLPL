@@ -18,6 +18,7 @@ from blpl.core.designators import (
 @pytest.mark.parametrize(
     "text,proj,depth",
     [
+        ("1.1r0", 1, 1),       # unreleased — the common case
         ("2.1r3", 2, 1),       # single-board project, project rev 2, board rev 3
         ("1.1r5", 1, 1),
         ("1.2r19", 1, 1),
@@ -43,10 +44,26 @@ def test_a_project_revision_alone_is_incomplete():
         parse("2")
 
 
-def test_the_scheme_counts_from_one():
-    for bad in ("0.1r1", "1.0r1", "1.1r0"):
+def test_position_counts_from_one_but_revision_counts_from_zero():
+    """r0 is where almost everything lives. A revision number records that a
+    design was released for a production run, not that a file changed — so
+    requiring r1 would force every in-progress board to claim a production
+    revision it does not have."""
+    assert str(parse("1.1r0")) == "1.1r0"
+    assert str(parse("1.2r0.1r0")) == "1.2r0.1r0"
+    for bad in ("0.1r1", "1.0r1"):
         with pytest.raises(DesignatorError):
             parse(bad)
+
+
+def test_each_level_revises_independently():
+    """A new enclosure takes the project from 1 to 2 and leaves every board
+    where it was. The path is a compatibility statement, not a new identity for
+    the same physical thing."""
+    d = parse("1.2r19.2r5")
+    rolled = d.at_project_revision(2)
+    assert str(rolled) == "2.2r19.2r5"
+    assert rolled.path == d.path
 
 
 def test_leading_zeros_normalise():

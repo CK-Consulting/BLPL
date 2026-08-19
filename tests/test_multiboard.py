@@ -293,9 +293,10 @@ def test_report_round_trips_to_a_dict():
 # -- RF never crosses a board boundary ---------------------------------------
 
 
-def test_rf_crossing_a_mate_is_an_error_even_when_both_sides_agree():
-    """The one rule agreement must not excuse. A connector in an RF path adds an
-    impedance discontinuity and a return-path break whichever way it is wired."""
+def test_rf_crossing_is_advisory_by_default():
+    """RF across a connector is a thing plenty of designs do deliberately and
+    get right. It earns scrutiny, not a refusal — the tool should not enforce
+    whichever preference the checker's author happened to hold."""
     man = parse("## Boards\n- base\n- radio (optional)\n\n## Mates\n"
                 "- base.J4 <-> radio.J1\n\n## Configurations\n- full: base, radio\n",
                 project_id="p")
@@ -306,8 +307,39 @@ def test_rf_crossing_a_mate_is_an_error_even_when_both_sides_agree():
     }
     report = crossboard.check(man, arts)
     rf = [f for f in report.findings if f.kind == "rf_crosses_boards"]
-    assert rf and rf[0].severity == "error"
+    assert rf and rf[0].severity == "warning"
+    assert not report.blocked
+
+
+def test_a_project_can_forbid_rf_across_boards():
+    """The standard is the project's to set, and stating it makes it binding."""
+    man = parse("## Boards\n- base\n- radio (optional)\n\n## Mates\n"
+                "- base.J4 <-> radio.J1\n\n## Configurations\n- full: base, radio\n"
+                "\n## Rules\n- rf across boards: forbid\n", project_id="p")
+    pins = [("1", "3V3"), ("2", "GND"), ("3", "SPI_MOSI"), ("4", "RF_OUT")]
+    arts = {
+        "base": {"project_id": "p", "connectors": [_conn("J4", pins)]},
+        "radio": {"project_id": "p", "connectors": [_conn("J1", pins)]},
+    }
+    report = crossboard.check(man, arts)
     assert report.blocked
+    assert man.rf_severity == "error"
+
+
+def test_a_project_can_wave_it_through():
+    man = parse("## Boards\n- base\n- radio (optional)\n\n## Mates\n"
+                "- base.J4 <-> radio.J1\n\n## Configurations\n- full: base, radio\n"
+                "\n## Rules\n- rf across boards: allow\n", project_id="p")
+    assert man.rf_severity == "info"
+
+
+def test_an_unreadable_rule_warns_rather_than_guessing():
+    man = parse("## Boards\n- base\n\n## Rules\n- rf across boards: maybe\n",
+                project_id="p")
+    assert man.rf_severity == "warning"
+    assert any("not what to do" in w for w in man.warnings)
+
+
 
 
 def test_digital_buses_crossing_are_exactly_what_mates_are_for():

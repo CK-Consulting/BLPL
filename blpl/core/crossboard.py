@@ -13,7 +13,7 @@ connectors up pin by pin, and compare the signals. It reports disagreements
 rather than resolving them, because the correct resolution is a decision about
 the design and belongs to the person making it.
 
-Three findings, in descending order of how much they should worry you:
+The findings, in descending order of how much they should worry you:
 
 ``signal_mismatch``
     Facing pins carry different signals. Either the pinout is wrong or the
@@ -49,17 +49,22 @@ from .project_manifest import Configuration, Mate, ProjectManifest
 # be absent without meaning anything is wrong.
 _DONT_CARE = {"NC", "N/C", "DNC", "RESERVED", "KEY", ""}
 
-# Signals that must never cross a board boundary.
+# Signals worth a second look when they cross a board boundary.
 #
-# Not a preference. A controlled-impedance trace is hard enough to get right
-# inside one stackup; carrying it across a connector adds an impedance
-# discontinuity, a return-path break, and a mechanical joint whose parasitics
-# change with every mating cycle. The realistic outcome is a board that passes
-# on the bench and fails in the field, which is the worst kind.
+# Deliberately *not* a prohibition. Carrying a controlled-impedance trace across
+# a connector adds an impedance discontinuity, a return-path break, and a
+# mechanical joint whose parasitics move with every mating cycle — so it earns
+# scrutiny. It does not earn a refusal: plenty of designs do it on purpose and
+# get it right, and an engineer who has decided to should not have to argue with
+# their tools about it.
 #
-# Digital buses are the opposite case and are why boards mate at all: I2C, SPI
-# and friends were designed to be extended, tolerate a connector, and fail
-# loudly rather than subtly when they do not.
+# So the default is a warning, and a project that wants it enforced says so:
+#
+#     ## Rules
+#     - rf across boards: forbid
+#
+# That way the tool holds the standard its owner chose, rather than the one
+# whoever wrote the checker happened to prefer.
 _RF_MARKERS = (
     "RF", "ANT", "ANTENNA", "LNA", "PA_OUT", "BALUN", "COAX", "UFL", "IPEX", "SMA",
     "2G4", "5G8", "868M", "915M", "433M", "SUBGHZ", "GNSS_IN", "GPS_IN",
@@ -181,6 +186,7 @@ def check_mate(
     configuration: str,
     *,
     order: str = "straight",
+    rf_severity: str = "warning",
 ) -> list[Finding]:
     """Compare one pair of mating connectors, pin by pin."""
     label = f"{mate.a_board}.{mate.a_connector} <-> {mate.b_board}.{mate.b_connector}"
@@ -246,19 +252,26 @@ def check_mate(
         for sig, board, conn in ((a_sig, mate.a_board, mate.a_connector),
                                  (b_sig, mate.b_board, mate.b_connector)):
             if is_rf(sig):
+                forbidden = rf_severity == "error"
                 out.append(
                     Finding(
                         kind="rf_crosses_boards",
-                        severity="error",
+                        severity=rf_severity,
                         configuration=configuration,
                         mate=label,
                         pin=a_pin,
                         message=(
                             f"{sig} on {board}.{conn} pin {a_pin} is a radio-frequency "
-                            "signal crossing a board boundary. Route it on one board, or "
-                            "move the radio onto the board that needs it — a connector in "
-                            "an RF path adds an impedance discontinuity and a return-path "
-                            "break that will pass on the bench and fail in the field."
+                            "signal crossing a board boundary."
+                            + (
+                                " This project forbids that."
+                                if forbidden
+                                else " That can be done well and is done deliberately all"
+                                " the time; it just carries an impedance discontinuity and"
+                                " a return-path break, so it wants more scrutiny than a"
+                                " digital net would. Add 'rf across boards: forbid' under"
+                                " ## Rules to make this an error."
+                            )
                         ),
                     )
                 )
@@ -289,6 +302,7 @@ def check(
     artifacts: dict[str, dict],
     *,
     configurations: Iterable[Configuration] | None = None,
+    rf_severity: str | None = None,
 ) -> CrossBoardReport:
     """Check every declared mate in every configuration.
 
@@ -298,6 +312,9 @@ def check(
     """
     report = CrossBoardReport(project_id=man.project_id)
     configs = list(configurations if configurations is not None else man.configurations)
+    # The project's own standard wins; the caller can override for a one-off
+    # check, and the default is advisory.
+    severity = rf_severity or getattr(man, "rf_severity", None) or "warning"
 
     for cfg in configs:
         report.checked.append(cfg.name)
@@ -321,6 +338,8 @@ def check(
             a, b = artifacts.get(mate.a_board), artifacts.get(mate.b_board)
             if a is None or b is None:
                 continue  # already reported as board_not_built
-            report.findings.extend(check_mate(mate, a, b, cfg.name))
+            report.findings.extend(
+                check_mate(mate, a, b, cfg.name, rf_severity=severity)
+            )
 
     return report

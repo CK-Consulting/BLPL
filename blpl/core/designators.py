@@ -12,11 +12,30 @@ board within it, which sub-board within that. Every project has at least one
 board, so the second element is always present — a single-board project is not a
 special case with a shorter name, it is the ordinary case with one board.
 
+    1.1r0          project rev 1, its only board, unreleased — the common case
     2.1r3          project rev 2, its only board, board rev 3
-    1.1r5          project rev 1, board 1, board rev 5
     1.2r19         project rev 1, board 2, board rev 19
     1.2r19.1r2     …and that board's first sub-board, sub rev 2
     1.2r19.2r5     …and its second, sub rev 5
+
+**Revisions start at zero and mostly stay there.** A revision number records
+that a design was released for a production run, not that a file changed. Most
+boards live their whole design life at r0, and a released one rarely passes r3.
+
+**Each level revises independently.** A project revision does not renumber or
+re-revise what is inside it: a new enclosure or a silkscreen change for a
+different market takes the project from 1 to 2 and leaves every board where it
+was. On the functional side the path reads as a compatibility statement — this
+sub-board revision, as fitted to that carrier revision — rather than as a new
+identity for the same physical thing.
+
+**Indexes are allocated once and never reused.** Retiring board 2 leaves a gap;
+board 3 stays board 3. Sliding it down would silently repoint every reference
+that already named it.
+
+This is a design-and-iteration scheme, not a PLM or an inventory system. It says
+where a part sits in a design; what a part *is* across projects, and how many of
+them are on a shelf, are different questions for different tools.
 
 **Where the prefix appears is the point.** On the board itself a part is ``R26``,
 because that is what fits on a silkscreen and what someone holding the board
@@ -53,13 +72,17 @@ class Segment:
     revision: int
 
     def __post_init__(self) -> None:
-        # Everything in this scheme counts from one — the first board is board 1
-        # and its first revision is r1. A zero would read as "no board" or "not
-        # yet revised", both of which are states the string cannot mean.
+        # Position counts from one: the first board is board 1, and index 0
+        # would read as "no board", which the string cannot mean.
         if self.index < 1:
             raise DesignatorError(f"board index starts at 1, got {self.index}")
-        if self.revision < 1:
-            raise DesignatorError(f"revision starts at 1, got r{self.revision}")
+        # Revision counts from *zero*, and r0 is where almost everything lives.
+        # A revision number is a statement that a design was released for a
+        # production run, not a change counter — most boards never leave r0, and
+        # a released one rarely passes r3. Requiring r1 would have forced every
+        # in-progress board to claim a production revision it does not have.
+        if self.revision < 0:
+            raise DesignatorError(f"revision cannot be negative, got r{self.revision}")
 
     def __str__(self) -> str:
         return f"{self.index}r{self.revision}"
