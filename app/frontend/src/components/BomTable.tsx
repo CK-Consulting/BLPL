@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getJSON } from "../api";
+import { boardArtifact } from "../board";
 
 // The bill of materials as a table, from Stage 1's bom.json. This is the sourcing
 // view — refdes, MPN, manufacturer, package — plus the library hints and the
@@ -22,13 +23,23 @@ type Row = {
 };
 type Bom = { project_id: string; rows: Row[] };
 
-export function BomTable({ projectId, reloadToken }: { projectId: string; reloadToken: number }) {
+export function BomTable({
+  projectId,
+  board,
+  reloadToken,
+}: {
+  projectId: string;
+  board: string | null;
+  reloadToken: number;
+}) {
   const [bom, setBom] = useState<Bom | null | "missing">(null);
   const [q, setQ] = useState("");
 
   useEffect(() => {
     setBom(null);
-    getJSON<Bom>(`/api/projects/${projectId}/artifacts/bom.json`)
+    getJSON<Bom>(
+      `/api/projects/${projectId}/artifacts/${boardArtifact("bom.json", board)}`,
+    )
       .then(setBom)
       .catch(() => setBom("missing"));
   }, [projectId, reloadToken]);

@@ -1715,18 +1715,33 @@ _EDITABLE_SUFFIXES = {".md", ".yaml", ".yml"}
 
 
 def _editable_file(session: Session, user: User, project_id: str, name: str) -> Path:
-    """Resolve a filename to an editable file directly under the project root.
+    """Resolve a client-supplied path to an editable file inside the project.
 
-    The name comes from the client, so it is held to three rules: a bare filename
-    with no path separators, an editable suffix, and — after resolving — a parent
-    that is exactly the project root. That last check is what stops ``foo/../..``
-    or a symlink from reaching outside the design inputs.
+    Multi-board projects put each board's design document in its own directory,
+    so ``base/design.md`` has to be addressable — a root-only rule made every
+    board's actual design document unopenable in the workbench.
+
+    Widening *what* may be named does not widen *where* it may land. The path is
+    held to: no backslashes, not absolute, no segment that is ``..`` or begins
+    with a dot, an editable suffix, and — after resolving symlinks — a location
+    still inside the project root. The resolve-then-contain check is the one
+    that matters; the segment rules just refuse the obvious cases early with a
+    clearer error.
     """
     proj = _project_dir(session, user, project_id)
-    if "/" in name or "\\" in name or name.startswith("."):
+    parts = [seg for seg in name.split("/") if seg]
+    if (
+        not parts
+        or "\\" in name
+        or name.startswith("/")
+        or any(seg == ".." or seg.startswith(".") for seg in parts)
+    ):
         raise HTTPException(status_code=400, detail="invalid filename")
-    target = (proj / name).resolve()
-    if target.parent != proj.resolve() or target.suffix.lower() not in _EDITABLE_SUFFIXES:
+    target = proj.joinpath(*parts).resolve()
+    root = proj.resolve()
+    if not target.is_relative_to(root) or target == root:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if target.suffix.lower() not in _EDITABLE_SUFFIXES:
         raise HTTPException(status_code=400, detail="invalid filename")
     return target
 
@@ -1915,16 +1930,28 @@ def get_blob(
 @app.get("/api/projects/{project_id}/files")
 def list_files(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> list[dict]:
-    """The editable design inputs in the project root, markdown and config."""
+    """Every editable design input in the project, markdown and config.
+
+    Recursive, because a board's design document lives in the board's directory.
+    The editor treats a name it cannot find here as unopenable, so anything the
+    file tree offers to edit has to appear in this list or clicking it does
+    nothing.
+
+    Names are project-relative with forward slashes — the same string
+    ``_editable_file`` accepts back.
+    """
     proj = _project_dir(session, user, project_id)
     out = []
-    for f in sorted(proj.iterdir()):
-        if f.is_file() and not f.name.startswith(".") and f.suffix.lower() in _EDITABLE_SUFFIXES:
-            out.append({"name": f.name, "bytes": f.stat().st_size})
+    for f in sorted(proj.rglob("*")):
+        rel = f.relative_to(proj)
+        if any(part in _TREE_SKIP or part.startswith(".") for part in rel.parts):
+            continue
+        if f.is_file() and f.suffix.lower() in _EDITABLE_SUFFIXES:
+            out.append({"name": rel.as_posix(), "bytes": f.stat().st_size})
     return out
 
 
-@app.get("/api/projects/{project_id}/files/{name}")
+@app.get("/api/projects/{project_id}/files/{name:path}")
 def read_file(project_id: str, name: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)):
     target = _editable_file(session, user, project_id, name)
@@ -1933,12 +1960,15 @@ def read_file(project_id: str, name: str, user: User = Depends(require_onboarded
     return {"name": name, "content": target.read_text(encoding="utf-8", errors="replace")}
 
 
-@app.put("/api/projects/{project_id}/files/{name}")
+@app.put("/api/projects/{project_id}/files/{name:path}")
 def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
     target = _editable_file(session, user, project_id, name)
+    # A new board's directory may not exist yet; writing its first design
+    # document is how a board comes into being.
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body.content, encoding="utf-8")
     activity.record(
         session, _project_or_404(session, user, project_id), user, activity.EDITED, name
@@ -2444,7 +2474,8 @@ async def start_chat_turn(
                 "type": "image" if media_type.startswith("image/") else "document",
                 "attachment": att_id,
                 "media_type": media_type,
-                "name": path.name,
+                # Not path.name — that is the sha256 the bytes are stored under.
+                "name": attachments.name_of(path),
             }
         )
     # Attachments first: providers read an image better when the question about
@@ -3007,6 +3038,7 @@ def download_release(project_id: str, user: User = Depends(require_onboarded),
 @app.post("/api/projects/{project_id}/review-panel")
 async def run_review_panel(
     project_id: str,
+    board: str | None = None,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -3018,6 +3050,11 @@ async def run_review_panel(
     with different blind spots disagreeing.
     """
     proj = _project_dir(session, user, project_id)
+    # Which board, before which model: not saying which board is a malformed
+    # request, while having no provider configured is a deployment that needs
+    # setting up. Answering the second when the first is also true sends people
+    # off configuring keys for a request that would still be rejected.
+    resolved = _resolve_board(proj, board)
     try:
         env = _inject_llm_env(dict(os.environ), session, user, master_key, "review_panel")
     except llm_resolver.NoUsableProvider as exc:
@@ -3026,7 +3063,13 @@ async def run_review_panel(
         sys.executable, "-m", "blpl.agent.dispatch", "review-panel",
         "--project-dir", str(proj),
     ]
-    return _start_run(session, user, project_id, "review-panel", cmd, env)
+    if resolved is not None:
+        cmd += ["--board", resolved]
+    return _start_run(
+        session, user, project_id,
+        "review-panel" if resolved is None else f"review-panel ({resolved})",
+        cmd, env,
+    )
 
 
 # The stages the whole-pipeline runner understands, in order. The CLI `run`
@@ -3042,6 +3085,7 @@ async def run_pipeline(
     project_id: str,
     from_stage: str = "stage0",
     to_stage: str = "stage8",
+    board: str | None = None,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -3059,6 +3103,11 @@ async def run_pipeline(
     if _PIPELINE_STAGES.index(from_stage) > _PIPELINE_STAGES.index(to_stage):
         raise HTTPException(status_code=400, detail="from stage is after to stage")
     proj = _project_dir(session, user, project_id)
+    # Every stage in the range resolves a board, so the range needs one too.
+    # Without it "run the pipeline" is the one control on a multi-board project
+    # that cannot work, while each stage individually can. Asked before the
+    # provider lookup, for the same reason as the panel above.
+    resolved = _resolve_board(proj, board)
 
     env = dict(os.environ)
     lo, hi = _PIPELINE_STAGES.index(from_stage), _PIPELINE_STAGES.index(to_stage)
@@ -3074,7 +3123,12 @@ async def run_pipeline(
         "--from", from_stage, "--to", to_stage,
         "--continue-on-error",
     ]
-    return _start_run(session, user, project_id, f"pipeline {from_stage}→{to_stage}", cmd, env)
+    if resolved is not None:
+        cmd += ["--board", resolved]
+    label = f"pipeline {from_stage}→{to_stage}"
+    if resolved is not None:
+        label += f" ({resolved})"
+    return _start_run(session, user, project_id, label, cmd, env)
 
 
 # --------------------------------------------------------------------------

@@ -69,11 +69,16 @@ def run(
     footprints_root: Path = _DEFAULT_FOOTPRINTS,
     project_dir: Path | None = None,
     stamp: str | None = None,
+    board: str | None = None,
 ) -> dict[str, Path]:
     """Compile hdm.yaml → .kicad_sch + .kicad_pcb + .kicad_pro in output_dir.
 
     All three files share a common basename of ``{sanitized_project}_{stamp}``
-    so KiCad resolves them as one project.
+    so KiCad resolves them as one project. ``board``, when given, joins that
+    stem: two boards compiled from one project would otherwise produce the same
+    name, and the second would overwrite the first if both ran inside the same
+    second. The board also has to be *in* the stem because that is how the
+    design route tells one board's emitted files from another's.
 
     ``project_dir`` (when given) adds that project's ``libraries/`` and
     ``generated/`` symbol libraries to the search path ahead of the stock root, so
@@ -85,7 +90,8 @@ def run(
         hdm = yaml.safe_load(f)
     project_name = _sanitize_filename(hdm.get("project", {}).get("name", "project"))
     stamp = stamp or _utc_stamp()
-    base_name = f"{project_name}_{stamp}"
+    stem = project_name if board is None else f"{project_name}_{_sanitize_filename(board)}"
+    base_name = f"{stem}_{stamp}"
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

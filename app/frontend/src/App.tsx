@@ -200,6 +200,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                   <Section id="pipeline" title="Pipeline" defaultOpen={false}>
                     <StageRunner
                       projectId={selected}
+                      board={board}
                       onFinished={() => {
                         bump();
                         refresh();
@@ -252,17 +253,28 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                 </button>
               </div>
               {tab === "board" && (
-                <DesignView projectId={selected} reloadToken={reloadToken} highlight={highlight} />
+                <DesignView
+                  projectId={selected}
+                  board={board}
+                  reloadToken={reloadToken}
+                  highlight={highlight}
+                />
               )}
               {tab === "preflight" && <Preflight projectId={selected} reloadToken={reloadToken} />}
               {tab === "edit" && (
                 <Editor projectId={selected} onSaved={refresh} select={openFile?.path ?? null} />
               )}
-              {tab === "bom" && <BomTable projectId={selected} reloadToken={reloadToken} />}
+              {tab === "bom" && (
+                <BomTable projectId={selected} board={board} reloadToken={reloadToken} />
+              )}
               {tab === "modules" && <ModuleLibrary projectId={selected} reloadToken={reloadToken} />}
-              {tab === "reports" && <Reports projectId={selected} reloadToken={reloadToken} />}
+              {tab === "reports" && (
+                <Reports projectId={selected} board={board} reloadToken={reloadToken} />
+              )}
               {tab === "release" && <ReleasePanel projectId={selected} reloadToken={reloadToken} />}
-              {tab === "artifacts" && <Artifacts projectId={selected} reloadToken={reloadToken} />}
+              {tab === "artifacts" && (
+                <Artifacts projectId={selected} board={board} reloadToken={reloadToken} />
+              )}
               {tab === "changes" && <DiffView projectId={selected} reloadToken={reloadToken} />}
             </section>
             {showChat && (

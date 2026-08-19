@@ -133,6 +133,7 @@ def save(conversations_dir: Path, name: str, data: bytes) -> Attachment:
 
     digest = hashlib.sha256(data).hexdigest()
     target = store_dir(conversations_dir) / f"{digest}{SUPPORTED_TYPES[media_type]}"
+    _remember_name(target, Path(name).name)
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
         # Same write-then-move discipline the rest of the app uses: a crash
@@ -164,6 +165,53 @@ def path_of(conversations_dir: Path, attachment_id: str) -> Path | None:
         if candidate.is_file():
             return candidate
     return None
+
+
+def _name_sidecar(blob: Path) -> Path:
+    return blob.with_suffix(blob.suffix + ".name")
+
+
+def _remember_name(blob: Path, original: str) -> None:
+    """Keep the name the file arrived under, beside the bytes.
+
+    Stored names are content hashes, so without this the only surviving name is
+    ``<sha256>.pdf`` — which is what the model would be told the document is
+    called. "Compare TPS62840.pdf against the design" is a question it can use;
+    the same sentence with a hash in it is not.
+
+    One small file per blob rather than one shared index: two uploads landing at
+    once then need no locking and cannot corrupt each other's entry. First
+    writer wins, matching the blob — the same bytes under a second name are the
+    same document, and the name it was first introduced by is the honest one.
+    """
+    sidecar = _name_sidecar(blob)
+    if sidecar.exists() or not original:
+        return
+    try:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        # Explicit, not with_suffix(".tmp"): that resolves to the *blob's*
+        # temp name, so two uploads of one file racing could move this text
+        # over the bytes it describes.
+        tmp = sidecar.with_name(sidecar.name + ".tmp")
+        tmp.write_text(original, encoding="utf-8")
+        tmp.replace(sidecar)
+    except OSError:
+        # A missing name costs the model a nicety; failing the upload over it
+        # would cost the user their datasheet.
+        pass
+
+
+def name_of(path: Path) -> str:
+    """What the file was called when it was uploaded, or its stored name.
+
+    Falling back to the stored name keeps attachments saved before this existed
+    working — they show a hash, which is what they always did.
+    """
+    try:
+        remembered = _name_sidecar(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return path.name
+    return remembered or path.name
 
 
 def media_type_of(path: Path) -> str:

@@ -62,6 +62,18 @@ EVIDENCE = (
 
 _MAX_ARTIFACT_CHARS = 60_000
 
+
+def _qualified(name: str, board: str | None) -> str:
+    """``bom_resolved.json`` on board ``base`` is ``bom_resolved.base.json``.
+
+    Matches ``project_manifest.artifact_path``; a single-board project keeps the
+    unqualified name it already has on disk.
+    """
+    if not board:
+        return name
+    stem, _, suffix = name.rpartition(".")
+    return f"{stem}.{board}.{suffix}" if stem else f"{name}.{board}"
+
 FINDINGS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -143,19 +155,24 @@ def panel_entries() -> list[dict]:
     return [c for c in chain if isinstance(c, dict) and (c.get("provider") or c.get("kind"))]
 
 
-def build_evidence(pipeline_dir: Path) -> tuple[str, list[str]]:
+def build_evidence(pipeline_dir: Path, board: str | None = None) -> tuple[str, list[str]]:
     """Assemble the pack every panelist sees, and the list of what is in it.
 
     Returns the text and the artifact names included. A missing artifact is
     reported rather than skipped, because "no coverage report" changes how much
     weight a reviewer should give the rest.
+
+    ``board`` qualifies the names the way the rest of the pipeline does, so a
+    multi-board project reviews the board it was asked about. Without it every
+    artifact reads as missing — the panel would answer, honestly but uselessly,
+    that there is nothing to review.
     """
     parts: list[str] = []
     included: list[str] = []
     missing: list[str] = []
 
     for name in EVIDENCE:
-        path = Path(pipeline_dir) / name
+        path = Path(pipeline_dir) / _qualified(name, board)
         if not path.is_file():
             missing.append(name)
             continue
@@ -386,6 +403,7 @@ def run(
     entries: list[dict] | None = None,
     adjudicator=None,
     now: str = "",
+    board: str | None = None,
 ) -> dict:
     """Run the panel over a project's artifacts and return the report.
 
@@ -394,7 +412,7 @@ def run(
     saying why rather than an empty file.
     """
     entries = panel_entries() if entries is None else entries
-    evidence, included = build_evidence(Path(pipeline_dir))
+    evidence, included = build_evidence(Path(pipeline_dir), board)
 
     if not entries:
         return _envelope(
@@ -467,13 +485,15 @@ def _envelope(
     return report
 
 
-def write_report(pipeline_dir: Path, report: dict) -> Path:
+def write_report(pipeline_dir: Path, report: dict, board: str | None = None) -> Path:
     """Write the timestamped report, plus the stable name the UI reads."""
     pipeline_dir = Path(pipeline_dir)
     pipeline_dir.mkdir(parents=True, exist_ok=True)
     stamp = report["generated_at"].replace(":", "").replace("-", "")
     body = json.dumps(report, indent=2) + "\n"
-    (pipeline_dir / f"review_panel_{stamp}.json").write_text(body, encoding="utf-8")
-    latest = pipeline_dir / "review_panel.json"
+    (pipeline_dir / _qualified(f"review_panel_{stamp}.json", board)).write_text(
+        body, encoding="utf-8"
+    )
+    latest = pipeline_dir / _qualified("review_panel.json", board)
     latest.write_text(body, encoding="utf-8")
     return latest

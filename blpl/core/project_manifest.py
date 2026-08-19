@@ -75,6 +75,21 @@ _MATE = re.compile(
 _WHEN = re.compile(r"\(\s*when\s+(?P<board>[\w.-]+)\s*\)", re.IGNORECASE)
 _OPTIONAL = re.compile(r"\(\s*optional\s*\)", re.IGNORECASE)
 
+# A board name is not just a label — ``board_dir`` turns it into a directory and
+# ``artifact_path`` turns it into part of a filename. So it is held to what a
+# single path segment may be: letters, digits, dot, underscore, hyphen, and no
+# leading dot. That rejects ``../other-project`` and ``/etc``, which otherwise
+# resolve outside the project entirely and let a stage read a sibling project's
+# markdown into this project's artifact. It also rejects the quieter cases —
+# a name with a slash silently splits an artifact path, and ``.`` or ``..``
+# name the wrong directory without looking like they do.
+_BOARD_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def is_safe_board_name(name: str) -> bool:
+    """Whether a name may be used as a directory and a filename component."""
+    return bool(_BOARD_NAME.match(name)) and name not in (".", "..")
+
 
 class ManifestError(ValueError):
     """The project manifest cannot be understood. Carries a sentence for the
@@ -218,6 +233,16 @@ def parse(text: str, *, project_id: str) -> ProjectManifest:
         name = _OPTIONAL.sub("", decl).strip()
         if not name:
             man.warnings.append(f"boards: could not read a name from {item!r}")
+            continue
+        if not is_safe_board_name(name):
+            # Refused rather than sanitised. Quietly rewriting ``../shared`` to
+            # ``shared`` would invent a board the author never declared and
+            # bury the fact that the manifest asked for something else.
+            man.warnings.append(
+                f"boards: {name!r} is not a usable board name — a board becomes a "
+                "directory, so it must be letters, digits, dot, underscore or "
+                "hyphen, and may not start with a dot or contain a path separator"
+            )
             continue
         if man.board(name):
             man.warnings.append(f"boards: {name!r} listed more than once; keeping the first")
@@ -408,4 +433,9 @@ def board_dir(project_dir: Path, man: ProjectManifest, board: str) -> Path:
     """
     if man.implicit:
         return Path(project_dir)
+    # Belt as well as braces. `parse` refuses an unusable name, but `board` can
+    # also arrive straight from a CLI flag or a query string, and this is the
+    # function that turns it into a filesystem path.
+    if not is_safe_board_name(board):
+        raise ValueError(f"unusable board name {board!r}")
     return Path(project_dir) / board

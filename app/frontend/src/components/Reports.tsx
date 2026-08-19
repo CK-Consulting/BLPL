@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getJSON } from "../api";
+import { boardArtifact } from "../board";
 
 // The Reports tab renders what the pipeline already knows but only ever said in
 // terminal text: is this board fabricable, did validation pass, and — the app's
@@ -98,14 +99,24 @@ type Validation = {
   coverage?: Check & { total?: number; hit?: number; needs_variant?: number; miss?: number };
 };
 
-export function Reports({ projectId, reloadToken }: { projectId: string; reloadToken: number }) {
+export function Reports({
+  projectId,
+  board,
+  reloadToken,
+}: {
+  projectId: string;
+  board: string | null;
+  reloadToken: number;
+}) {
   const [review, setReview] = useState<Review | null | "missing">(null);
   const [validation, setValidation] = useState<Validation | null | "missing">(null);
   const [panel, setPanel] = useState<Panel | null | "missing">(null);
 
   useEffect(() => {
     const load = <T,>(name: string, set: (v: T | "missing") => void) =>
-      getJSON<T>(`/api/projects/${projectId}/artifacts/${name}`)
+      getJSON<T>(
+        `/api/projects/${projectId}/artifacts/${boardArtifact(name, board)}`,
+      )
         .then(set)
         .catch(() => set("missing"));
     setReview(null);
@@ -114,7 +125,7 @@ export function Reports({ projectId, reloadToken }: { projectId: string; reloadT
     load<Validation>("validation_report.json", setValidation);
     setPanel(null);
     load<Panel>("review_panel.json", setPanel);
-  }, [projectId, reloadToken]);
+  }, [projectId, board, reloadToken]);
 
   return (
     <div className="reports">

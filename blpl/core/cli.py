@@ -627,6 +627,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         project_dir=args.project_dir,
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
+        # Every stage resolves its own board through `_board`, which reads this.
+        # Leaving it out made `run --board base` parse the flag and then drop
+        # it, so stage0 saw no board and refused the whole pipeline on any
+        # multi-board project.
+        board=getattr(args, "board", None),
     )
 
     for i in range(start, end + 1):
@@ -690,7 +695,9 @@ def _cmd_stage6(args: argparse.Namespace) -> int:
     if not hdm.exists():
         print(f"error: hdm.yaml missing at {hdm} — run stage5 first", file=sys.stderr)
         return 2
-    outputs = stage6_compile_kicad.run(hdm, proj / ".pipeline", project_dir=proj)
+    outputs = stage6_compile_kicad.run(
+        hdm, project_manifest.pipeline_dir(proj), project_dir=proj, board=_board(args, proj)
+    )
     file_outputs = {k: v for k, v in outputs.items() if k != "base"}
     print(f"stage6: compiled KiCad project ({len(file_outputs)} files, base={outputs['base']})")
     for kind, path in file_outputs.items():
@@ -700,12 +707,24 @@ def _cmd_stage6(args: argparse.Namespace) -> int:
 
 def _cmd_stage7(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    pipeline_dir = proj / ".pipeline"
-    # Pick the most recent timestamped compile when several exist.
-    pcb_candidates = sorted(pipeline_dir.glob("*.kicad_pcb"), reverse=True)
-    sch_candidates = sorted(pipeline_dir.glob("*.kicad_sch"), reverse=True)
-    pcb = pcb_candidates[0] if pcb_candidates else None
-    sch = sch_candidates[0] if sch_candidates else None
+    pipeline_dir = project_manifest.pipeline_dir(proj)
+    board = _board(args, proj)
+
+    def _newest(suffix: str) -> Path | None:
+        """The most recent compile of *this* board.
+
+        Without the board filter a multi-board project validates whichever file
+        is newest, so running stage7 on `sensor` right after compiling `base`
+        reports on `base` and calls it `sensor` — a clean report for a board
+        nobody checked.
+        """
+        found = sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True)
+        if board is not None:
+            found = [p for p in found if f"_{board}_" in p.name]
+        return found[0] if found else None
+
+    pcb = _newest(".kicad_pcb")
+    sch = _newest(".kicad_sch")
     report = stage7_validate.run(
         proj,
         pcb_path=pcb,

@@ -247,11 +247,63 @@ def test_only_editable_suffixes_are_allowed(client) -> None:
 
 
 def test_file_names_cannot_traverse_out_of_the_project(client) -> None:
+    """A subdirectory is allowed; leaving the project is not.
+
+    `sub/dir.md` used to be refused along with the rest, back when every design
+    document sat in the project root. Multi-board projects put each board's
+    design document in the board's own directory, so refusing a subdirectory
+    made the real design document of every board unopenable. Widening what may
+    be *named* is not the same as widening where it may *land*, which is what
+    the rest of this list is here to hold.
+    """
     sign_in(client)
     client.post("/api/projects/init", json={"name": "scratch"})
-    for bad in ("../secret.md", "sub/dir.md", ".hidden.md"):
+    for bad in ("../secret.md", ".hidden.md", "sub/../../secret.md", ".git/config.yaml"):
         r = client.put(f"/api/projects/scratch/files/{bad}", json={"content": "x"})
         assert r.status_code in (400, 404), f"{bad!r} should be rejected, got {r.status_code}"
+
+
+def test_a_board_keeps_its_design_document_in_its_own_directory(client) -> None:
+    """The multi-board shape, end to end: create it, find it in the listing,
+    read it back. The editor ignores a selection missing from the listing, so
+    a file that can be written but not listed is a click that does nothing."""
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "scratch"})
+
+    w = client.put("/api/projects/scratch/files/base/design.md", json={"content": "# base\n"})
+    assert w.status_code == 200, w.text
+
+    listing = [f["name"] for f in client.get("/api/projects/scratch/files").json()]
+    assert "base/design.md" in listing
+
+    r = client.get("/api/projects/scratch/files/base/design.md")
+    assert r.status_code == 200 and r.json()["content"] == "# base\n"
+
+
+def test_everything_the_listing_offers_can_actually_be_opened(client) -> None:
+    """The listing and the reader must agree on what a name means, or the
+    workbench shows files it cannot open."""
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "scratch"})
+    for rel in ("overview.md", "base/design.md", "sensor/design.md", "sensor/notes.yaml"):
+        assert client.put(f"/api/projects/scratch/files/{rel}", json={"content": "x"}).status_code == 200
+
+    for entry in client.get("/api/projects/scratch/files").json():
+        got = client.get(f"/api/projects/scratch/files/{entry['name']}")
+        assert got.status_code == 200, f"{entry['name']} listed but not readable"
+
+
+def test_the_listing_does_not_wander_into_git_or_the_pipeline(client) -> None:
+    """Recursing is what makes board directories visible; recursing everywhere
+    would bury the design inputs under machinery."""
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "scratch"})
+    client.put("/api/projects/scratch/files/base/design.md", json={"content": "x"})
+
+    names = {f["name"] for f in client.get("/api/projects/scratch/files").json()}
+    assert "base/design.md" in names
+    assert not any(n.startswith(".") or "/." in n for n in names), names
+    assert not any(n.startswith(".pipeline/") for n in names), names
 
 
 def test_generated_pipeline_files_are_not_editable(client) -> None:

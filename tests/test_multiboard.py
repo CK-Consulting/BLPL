@@ -141,6 +141,46 @@ def test_default_configurations_are_the_two_that_matter():
     assert cfgs[1].boards == ("base", "sensor", "radio")
 
 
+# -- a board name becomes a directory ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../other-project", "/etc", "base/../..", ".hidden", "..", ".", "a/b"],
+)
+def test_a_board_that_cannot_be_a_directory_is_refused(name):
+    """`board_dir` turns this string into a path and `artifact_path` into part
+    of a filename. `- ../other-project` otherwise resolves outside the project,
+    so `stage0-det --board ../other-project` reads a sibling project's markdown
+    and writes it into this project's artifact — with nothing on either side
+    saying a boundary was crossed."""
+    man = parse(f"## Boards\n- base\n- {name}\n", project_id="p")
+    assert [b.name for b in man.boards] == ["base"]
+    assert any(repr(name) in w for w in man.warnings), man.warnings
+
+
+def test_a_refused_name_is_not_quietly_repaired():
+    """Rewriting `../shared` to `shared` would invent a board nobody declared
+    and hide that the manifest asked for something else."""
+    man = parse("## Boards\n- base\n- ../shared\n", project_id="p")
+    assert man.board("shared") is None
+
+
+def test_ordinary_names_still_pass():
+    man = parse(
+        "## Boards\n- base\n- lora-frontend\n- sensor_v2\n- rev1.2\n", project_id="p"
+    )
+    assert [b.name for b in man.boards] == ["base", "lora-frontend", "sensor_v2", "rev1.2"]
+
+
+def test_board_dir_refuses_a_bad_name_even_when_the_manifest_never_saw_it(tmp_path):
+    """`board` also arrives straight from a CLI flag and a query string, and
+    this is the function that turns it into a filesystem path."""
+    man = parse("## Boards\n- base\n- sensor\n", project_id="p")
+    with pytest.raises(ValueError):
+        board_dir(tmp_path, man, "../evil")
+
+
 # -- backwards compatibility -------------------------------------------------
 
 
@@ -471,3 +511,27 @@ def test_emitted_boards_do_not_collide(tmp_path):
         name = _board(_args(tmp_path, b), tmp_path)
         stems.add(f"{tmp_path.name}_{name}")
     assert len(stems) == 2
+
+
+# -- the naming rule the frontend also implements -----------------------------
+
+
+def test_the_artifact_naming_rule_the_frontend_mirrors(tmp_path):
+    """`app/frontend/src/board.ts` builds these names too, because the browser
+    asks for artifacts by filename.
+
+    It cannot import this module, so the rule is written twice — and a rule
+    written twice drifts. If this test has to change, `boardArtifact` in
+    board.ts changes with it, or the UI asks for files that are never written
+    and reports every board as empty.
+    """
+    cases = {
+        ("bom", "base"): "bom.base.json",
+        ("review_report", "sensor"): "review_report.sensor.json",
+        ("validation_report", "base"): "validation_report.base.json",
+    }
+    for (name, board), expected in cases.items():
+        assert artifact_path(tmp_path, name, board=board).name == expected
+
+    # …and a single-board project keeps the name already on disk and in git.
+    assert artifact_path(tmp_path, "bom").name == "bom.json"

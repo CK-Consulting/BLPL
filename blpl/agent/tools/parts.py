@@ -143,6 +143,11 @@ class DatasheetFetch:
     distributor: str = ""
     verification: str = ""
     detail: str = ""
+    # Where a person can go and get it by hand. The distributor knows the part
+    # and shows the datasheet on the product page; it is only the automated
+    # download that was blocked, so a failure that names the page is a minute's
+    # work and one that does not is a dead end.
+    manual_urls: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -150,6 +155,7 @@ class DatasheetFetch:
             "mpn": self.mpn,
             "path": self.path,
             "distributor": self.distributor,
+            "manual_urls": dict(self.manual_urls),
             # kicad-happy re-reads the downloaded PDF and checks the MPN really
             # appears in it. A "wrong" here means we fetched somebody else's
             # datasheet — worth surfacing rather than filing quietly.
@@ -178,6 +184,8 @@ def fetch_datasheet(
         )
 
     tried: list[str] = []
+    reasons: list[str] = []
+    manual: dict[str, str] = {}
     for dist in distributors or list(DISTRIBUTORS):
         if creds.missing_for(dist):
             continue
@@ -195,6 +203,13 @@ def fetch_datasheet(
             timeout=timeout,
         )
         data = res.data if isinstance(res.data, dict) else {}
+        if url := str(data.get("manual_url") or ""):
+            manual[dist] = url
+        if reason := str(data.get("error") or "").strip():
+            reasons.append(f"{dist}: {reason}")
+        elif not res.ok and not data:
+            # No JSON at all means it did not get far enough to explain itself.
+            reasons.append(f"{dist}: exited {res.exit_code} without a result")
         if res.ok and out.is_file() and out.stat().st_size > 0:
             ver = (data.get("verification") or {}) if isinstance(data, dict) else {}
             return DatasheetFetch(
@@ -206,12 +221,20 @@ def fetch_datasheet(
                 detail=str(ver.get("details") or ""),
             )
 
-    return DatasheetFetch(
-        ok=False,
-        mpn=mpn,
-        detail=(
-            f"no datasheet found via {', '.join(tried)}"
-            if tried
-            else "no distributor is configured — add a key in Settings"
-        ),
-    )
+    if not tried:
+        return DatasheetFetch(
+            ok=False, mpn=mpn,
+            detail="no distributor is configured — add a key in Settings",
+        )
+    # Say what happened, not just that nothing happened. "no datasheet found"
+    # reads as "this part has no datasheet", which is almost never true — the
+    # usual cause is a distributor blocking the download, and that is a
+    # different problem with a different fix.
+    detail = f"no datasheet downloaded for {mpn} — tried {', '.join(tried)}"
+    if reasons:
+        detail += "; " + "; ".join(reasons)
+    if manual:
+        detail += ". Reachable by hand at: " + ", ".join(
+            f"{d} {u}" for d, u in sorted(manual.items())
+        )
+    return DatasheetFetch(ok=False, mpn=mpn, detail=detail, manual_urls=manual)

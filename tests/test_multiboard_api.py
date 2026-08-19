@@ -79,3 +79,62 @@ def test_project_level_artifacts_survive_a_board_filter():
 
     assert _is_project_level("crossboard.json")
     assert not _is_project_level("bom.base.json")
+
+
+MULTI = """
+## Boards
+
+- base
+- sensor (optional)
+
+## Configurations
+
+- full: base, sensor
+"""
+
+
+def _multi_board_project(unlocked, name="shield"):
+    unlocked.post("/api/projects/init", json={"name": name})
+    unlocked.put(f"/api/projects/{name}/files/project.md", json={"content": MULTI})
+    unlocked.put(f"/api/projects/{name}/files/base/design.md", json={"content": "# base\n"})
+    unlocked.put(f"/api/projects/{name}/files/sensor/design.md", json={"content": "# sensor\n"})
+    return name
+
+
+def test_running_the_whole_pipeline_needs_a_board_too(unlocked) -> None:
+    """Each stage resolved a board but the range did not, so "run the pipeline"
+    was the one control on a multi-board project that could not work — while
+    every stage inside it individually could."""
+    p = _multi_board_project(unlocked)
+    # stage5→8 needs no LLM, so a 400 here is about the board and nothing else.
+    r = unlocked.post(f"/api/projects/{p}/pipeline?from_stage=stage5&to_stage=stage8")
+    assert r.status_code == 400
+    assert "board" in str(r.json().get("detail", "")).lower()
+
+
+def test_the_review_panel_needs_a_board(unlocked) -> None:
+    """The panel reads fixed artifact names out of .pipeline. Unqualified, it
+    finds nothing on a multi-board project and reports there is nothing to
+    review — true of the names it looked for, misleading about the board."""
+    p = _multi_board_project(unlocked)
+    r = unlocked.post(f"/api/projects/{p}/review-panel")
+    assert r.status_code == 400
+    assert "board" in str(r.json().get("detail", "")).lower()
+
+
+def test_the_review_panel_reads_and_writes_the_board_it_was_asked_about(tmp_path):
+    """Artifact naming is shared with the rest of the pipeline; the panel had
+    its own hardcoded names."""
+    from blpl.agent import review_panel
+
+    pipeline = tmp_path / ".pipeline"
+    pipeline.mkdir()
+    (pipeline / "nets.base.json").write_text('{"nets": "base"}')
+    (pipeline / "nets.sensor.json").write_text('{"nets": "sensor"}')
+
+    evidence, included = review_panel.build_evidence(pipeline, "sensor")
+    assert '"sensor"' in evidence and '"base"' not in evidence
+    assert "nets.json" in included   # the logical name, not the file on disk
+
+    plain, _ = review_panel.build_evidence(pipeline, None)
+    assert "nets.base.json" not in plain
