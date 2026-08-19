@@ -288,3 +288,55 @@ def test_report_round_trips_to_a_dict():
     assert d["project_id"] == "p"
     assert d["checked_configurations"] == ["minimal", "sensing", "full"]
     assert d["blocked"] is False
+
+
+# -- RF never crosses a board boundary ---------------------------------------
+
+
+def test_rf_crossing_a_mate_is_an_error_even_when_both_sides_agree():
+    """The one rule agreement must not excuse. A connector in an RF path adds an
+    impedance discontinuity and a return-path break whichever way it is wired."""
+    man = parse("## Boards\n- base\n- radio (optional)\n\n## Mates\n"
+                "- base.J4 <-> radio.J1\n\n## Configurations\n- full: base, radio\n",
+                project_id="p")
+    pins = [("1", "3V3"), ("2", "GND"), ("3", "SPI_MOSI"), ("4", "RF_OUT")]
+    arts = {
+        "base": {"project_id": "p", "connectors": [_conn("J4", pins)]},
+        "radio": {"project_id": "p", "connectors": [_conn("J1", pins)]},
+    }
+    report = crossboard.check(man, arts)
+    rf = [f for f in report.findings if f.kind == "rf_crosses_boards"]
+    assert rf and rf[0].severity == "error"
+    assert report.blocked
+
+
+def test_digital_buses_crossing_are_exactly_what_mates_are_for():
+    man = parse("## Boards\n- base\n- sensor (optional)\n\n## Mates\n"
+                "- base.J3 <-> sensor.J1\n\n## Configurations\n- full: base, sensor\n",
+                project_id="p")
+    pins = [("1", "3V3"), ("2", "GND"), ("3", "I2C_SDA"), ("4", "SPI_SCK")]
+    arts = {
+        "base": {"project_id": "p", "connectors": [_conn("J3", pins)]},
+        "sensor": {"project_id": "p", "connectors": [_conn("J1", pins)]},
+    }
+    report = crossboard.check(man, arts)
+    assert not report.blocked
+    assert not [f for f in report.findings if f.kind == "rf_crosses_boards"]
+
+
+@pytest.mark.parametrize(
+    "signal,rf",
+    [
+        ("RF_OUT", True), ("ANT1", True), ("ANT_FEED", True), ("UFL_IN", True),
+        ("LNA_OUT", True), ("SUBGHZ_TX", True),
+        ("I2C_SDA", False), ("SPI_MOSI", False), ("3V3", False), ("GND", False),
+        ("UART_RX", False), ("GPIO4", False),
+        # A second antenna is normally ANT2, and missing it costs a board spin.
+        ("ANT2", True), ("ANTENNA", True),
+        # RFID is a digital interface to a reader, not a controlled-impedance
+        # trace — the marker must not match on an arbitrary letter suffix.
+        ("RFID_CS", False),
+    ],
+)
+def test_rf_detection_reads_the_name(signal, rf):
+    assert crossboard.is_rf(signal) is rf

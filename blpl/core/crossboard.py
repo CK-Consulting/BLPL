@@ -39,6 +39,7 @@ because that is what the overwhelming majority of board-to-board connectors do.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -47,6 +48,48 @@ from .project_manifest import Configuration, Mate, ProjectManifest
 # Signals that are expected to appear on both sides under different names, or to
 # be absent without meaning anything is wrong.
 _DONT_CARE = {"NC", "N/C", "DNC", "RESERVED", "KEY", ""}
+
+# Signals that must never cross a board boundary.
+#
+# Not a preference. A controlled-impedance trace is hard enough to get right
+# inside one stackup; carrying it across a connector adds an impedance
+# discontinuity, a return-path break, and a mechanical joint whose parasitics
+# change with every mating cycle. The realistic outcome is a board that passes
+# on the bench and fails in the field, which is the worst kind.
+#
+# Digital buses are the opposite case and are why boards mate at all: I2C, SPI
+# and friends were designed to be extended, tolerate a connector, and fail
+# loudly rather than subtly when they do not.
+_RF_MARKERS = (
+    "RF", "ANT", "ANTENNA", "LNA", "PA_OUT", "BALUN", "COAX", "UFL", "IPEX", "SMA",
+    "2G4", "5G8", "868M", "915M", "433M", "SUBGHZ", "GNSS_IN", "GPS_IN",
+)
+
+
+def is_rf(signal: str) -> bool:
+    """Whether a signal name reads as radio-frequency.
+
+    Name-based and therefore imperfect, which is the right trade here: a false
+    positive costs one line in a report that a human dismisses in a second, and
+    a false negative costs a board spin. Anything genuinely ambiguous should be
+    renamed — a net whose name does not say it is RF is a problem on its own.
+    """
+    up = (signal or "").strip().upper()
+    if not up:
+        return False
+    tokens = [t for t in re.split(r"[^A-Z0-9]+", up) if t]
+    for m in _RF_MARKERS:
+        for t in tokens:
+            # Whole token, or the marker with a bare index after it. ANT1 and
+            # ANT2 are the common way a second antenna gets named, and missing
+            # them is the failure that costs a board spin — where a false
+            # positive costs one line somebody dismisses.
+            #
+            # Digits only, deliberately: RFID_CS should not read as RF, and
+            # allowing arbitrary trailing letters would make it.
+            if t == m or re.fullmatch(rf"{re.escape(m)}\d+", t):
+                return True
+    return False
 
 
 @dataclass
@@ -196,6 +239,31 @@ def check_mate(
                 )
             continue
         b_sig = _norm(b.get("signal", ""))
+
+        # Checked before the don't-care skip and before the match: an RF signal
+        # crossing a connector is wrong even when both sides agree perfectly on
+        # the name, so agreement must not be allowed to excuse it.
+        for sig, board, conn in ((a_sig, mate.a_board, mate.a_connector),
+                                 (b_sig, mate.b_board, mate.b_connector)):
+            if is_rf(sig):
+                out.append(
+                    Finding(
+                        kind="rf_crosses_boards",
+                        severity="error",
+                        configuration=configuration,
+                        mate=label,
+                        pin=a_pin,
+                        message=(
+                            f"{sig} on {board}.{conn} pin {a_pin} is a radio-frequency "
+                            "signal crossing a board boundary. Route it on one board, or "
+                            "move the radio onto the board that needs it — a connector in "
+                            "an RF path adds an impedance discontinuity and a return-path "
+                            "break that will pass on the bench and fail in the field."
+                        ),
+                    )
+                )
+                break
+
         if a_sig in _DONT_CARE or b_sig in _DONT_CARE:
             continue
         if a_sig != b_sig:
