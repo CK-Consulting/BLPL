@@ -235,3 +235,89 @@ def test_the_aggregate_round_trips_to_a_dict():
     assert d["configuration"] == "full"
     assert d["line_count"] == 5 and d["part_count"] == 8
     assert d["grouped"][0]["designators"]
+
+
+# -- equivalence: what procurement wants, and what it must not get -----------
+
+
+def _passive_boms():
+    P = ("refdes", "mpn", "manufacturer", "package", "description")
+    def rows(rs, extra=None):
+        out = [dict(zip(P, r)) for r in rs]
+        if extra:
+            out.append(extra)
+        return {"rows": out}
+    return {
+        "base": rows(
+            [
+                ("C1", "GRM155R71H104KE14D", "Murata", "0402", "100nF X7R 50V ±10%"),
+                ("C2", "CL05B104KO5NNNC", "Samsung", "0402", "100nF X7R 50V ±10%"),
+                ("C9", "R413I31050000M", "Kemet", "0402", "100nF Y2 305VAC X7R ±10% mains"),
+                ("R1", "RC0402FR-0710KL", "Yageo", "0402", "10k ±1% 1/16W"),
+                ("R2", "ERJ-2RKF1002X", "Panasonic", "0402", "10k ±1% 1/16W"),
+                ("R9", "PCF0402-10K", "TT", "0402", "10k ±1% 1/4W"),
+            ],
+            extra=dict(
+                refdes="C10", mpn="ECQ-U2A104ML", manufacturer="Panasonic",
+                package="0402", description="100nF X7R 50V ±10%",
+                no_substitutions=True,
+                no_substitutions_reason="VDE approval on this exact part",
+            ),
+        ),
+        "sensor": rows([("C1", "GRM155R71H104KE14D", "Murata", "0402", "100nF X7R 50V ±10%")]),
+    }
+
+
+def _passive_agg():
+    man = parse(MANIFEST, project_id="shield")
+    return ba.aggregate_all(man, _passive_boms(), DES)["full"]
+
+
+def test_equivalent_parts_from_two_vendors_become_one_line():
+    agg = _passive_agg()
+    cap = next(e for e in agg.equivalence if e.value_text == "100nF")
+    assert cap.quantity == 3
+    assert set(cap.mpns) == {"GRM155R71H104KE14D", "CL05B104KO5NNNC"}
+
+
+def test_a_safety_cap_is_never_absorbed_into_an_equivalence_line():
+    """Same value, same package. This is the merge that would be silent."""
+    agg = _passive_agg()
+    for line in agg.equivalence:
+        assert "R413I31050000M" not in line.mpns
+
+
+def test_a_higher_wattage_resistor_stays_its_own_line():
+    agg = _passive_agg()
+    for line in agg.equivalence:
+        assert "PCF0402-10K" not in line.mpns
+
+
+def test_a_no_substitutions_part_is_held_out_with_its_reason():
+    agg = _passive_agg()
+    held = next(n for n in agg.not_grouped if n["mpn"] == "ECQ-U2A104ML")
+    assert "no-substitutions" in held["reason"]
+    assert "VDE approval" in held["reason"]
+    for line in agg.equivalence:
+        assert "ECQ-U2A104ML" not in line.mpns
+
+
+def test_lines_built_from_parsed_text_say_so():
+    """The reviewer has to be able to tell a declared grouping from a guessed
+    one before ordering from it."""
+    agg = _passive_agg()
+    assert all(e.inferred_from_text for e in agg.equivalence)
+
+
+def test_mpn_grouping_is_untouched_by_any_of_this():
+    """The safe view stays the safe view; equivalence is offered beside it, not
+    instead of it."""
+    agg = _passive_agg()
+    murata = next(g for g in agg.grouped if g.mpn == "GRM155R71H104KE14D")
+    assert murata.quantity == 2      # base C1 + sensor C1, by part number alone
+
+
+def test_single_vendor_lines_are_not_shown_as_consolidations():
+    """A line with one MPN is the MPN grouping under a different heading."""
+    agg = _passive_agg()
+    assert all(len(e.mpns) > 1 for e in agg.equivalence)

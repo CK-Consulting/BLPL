@@ -29,6 +29,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
+from . import passives
 from .designators import ComponentRef, Designator, qualify
 from .project_manifest import Configuration, ProjectManifest
 
@@ -44,6 +45,7 @@ class QualifiedRow:
     package: str = ""
     description: str = ""
     friendly_name: str = ""
+    spec: passives.PassiveSpec | None = None
 
     @property
     def designator(self) -> str:
@@ -64,6 +66,40 @@ class QualifiedRow:
             "package": self.package,
             "description": self.description,
             "friendly_name": self.friendly_name,
+            "spec": self.spec.to_dict() if self.spec else None,
+        }
+
+
+@dataclass
+class EquivalenceLine:
+    """Parts from different vendors that could be ordered as one line.
+
+    Advisory, always. This is the view procurement wants and the view that can
+    do harm, so it is offered for confirmation rather than presented as the
+    order — and anything that cannot be *shown* equivalent is left out of it
+    entirely rather than being quietly folded in.
+    """
+
+    key: str
+    value_text: str
+    package: str
+    quantity: int = 0
+    mpns: list[str] = field(default_factory=list)
+    designators: list[str] = field(default_factory=list)
+    inferred_from_text: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "value": self.value_text,
+            "package": self.package,
+            "quantity": self.quantity,
+            "mpns": list(self.mpns),
+            "designators": list(self.designators),
+            # True when any attribute behind this grouping was read out of prose
+            # rather than declared. The line still needs a human before it is
+            # ordered from, and this is how it says so.
+            "inferred_from_text": self.inferred_from_text,
         }
 
 
@@ -109,6 +145,14 @@ class AggregateBom:
     # warning: a missing nickname blocks nothing, and dressing it as a problem
     # trains people past the warnings that matter.
     naming_suggestions: list[dict] = field(default_factory=list)
+    # Value-level grouping across vendors, for procurement. Separate from
+    # `grouped` rather than replacing it, because the MPN grouping is the one
+    # that is always safe and this one is the one that needs eyes.
+    equivalence: list[EquivalenceLine] = field(default_factory=list)
+    # Parts that could not be shown equivalent to anything, each with the reason.
+    # Kept visible so an absent line reads as "not confirmed" rather than
+    # "nothing to consolidate".
+    not_grouped: list[dict] = field(default_factory=list)
     schema_version: int = 1
 
     @property
@@ -126,6 +170,8 @@ class AggregateBom:
             "schema_version": self.schema_version,
             "warnings": self.warnings,
             "naming_suggestions": self.naming_suggestions,
+            "equivalence": [e.to_dict() for e in self.equivalence],
+            "not_grouped": self.not_grouped,
             "line_count": self.line_count,
             "part_count": self.part_count,
             "grouped": [g.to_dict() for g in self.grouped],
@@ -284,11 +330,13 @@ def aggregate(
                     package=str(raw.get("package") or ""),
                     description=str(raw.get("description") or ""),
                     friendly_name=str(raw.get("friendly_name") or ""),
+                    spec=passives.extract(raw),
                 )
             )
 
     out.qualified.sort(key=lambda q: q.ref.sort_key())
     _group(out)
+    _equivalence(out)
     _suggest_names(out, naming_style)
     return out
 
@@ -323,6 +371,52 @@ def _group(bom: AggregateBom) -> None:
         g.friendly_name = g.friendly_name or q.friendly_name
         g.description = g.description or q.description
     bom.grouped = sorted(by_mpn.values(), key=lambda g: (g.mpn.upper(),))
+
+
+def _equivalence(bom: AggregateBom) -> None:
+    """Group across vendors by what a part *is*, not who made it.
+
+    Only where equivalence can be demonstrated. Everything else lands in
+    ``not_grouped`` with the reason, because the dangerous failure here is a
+    line that silently absorbed a part it should not have — after the merge
+    there is nothing left to notice.
+    """
+    lines: dict[str, EquivalenceLine] = {}
+    for q in bom.qualified:
+        spec = q.spec
+        if spec is None:
+            continue
+        cls = q.ref.component_class
+        key = passives.equivalence_key(spec, cls)
+        if key is None:
+            bom.not_grouped.append(
+                {
+                    "designator": q.designator,
+                    "mpn": q.mpn,
+                    "reason": passives.why_unmergeable(spec, cls),
+                }
+            )
+            continue
+        line = lines.get(key)
+        if line is None:
+            line = EquivalenceLine(
+                key=key,
+                value_text=spec.value_text or (f"{spec.value:g}{spec.unit}" if spec.value else ""),
+                package=spec.package,
+            )
+            lines[key] = line
+        line.quantity += 1
+        line.designators.append(q.designator)
+        if q.mpn and q.mpn not in line.mpns:
+            line.mpns.append(q.mpn)
+        line.inferred_from_text = line.inferred_from_text or spec.is_inferred
+
+    # Only lines that actually consolidate something are worth showing: a
+    # one-vendor line is the MPN grouping again under a different heading.
+    bom.equivalence = sorted(
+        (l for l in lines.values() if len(l.mpns) > 1),
+        key=lambda l: (l.package, l.value_text),
+    )
 
 
 def _suggest_names(bom: AggregateBom, style: str) -> None:
