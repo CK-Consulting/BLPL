@@ -9,6 +9,8 @@
 # First run:  open http://<host>:1800 and sign in. Provider API keys are
 #             per-user — add yours under Settings.
 services:
+  name:
+    - blpl
   # Who exists and whose provider key is whose. The SQLite vault this replaces
   # was structurally single-tenant — one DEK from one passphrase, one secret
   # table with no owner column — so there was no version of "several people, each
@@ -201,6 +203,8 @@ services:
     container_name: blpl-clamav
     profiles: ["scanning"]
     restart: unless-stopped
+    environment:
+      - BLPL_QUARANTINE_REQUIRE_SCAN=1
     networks:
       - blpl
     volumes:
