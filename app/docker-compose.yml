@@ -8,9 +8,8 @@
 # Bring up:   docker compose -f app/docker-compose.yml up -d --build
 # First run:  open http://<host>:1800 and sign in. Provider API keys are
 #             per-user — add yours under Settings.
+name: blpl
 services:
-  name:
-    - blpl
   # Who exists and whose provider key is whose. The SQLite vault this replaces
   # was structurally single-tenant — one DEK from one passphrase, one secret
   # table with no owner column — so there was no version of "several people, each
@@ -219,6 +218,7 @@ services:
 
   worker:
     platform: linux/amd64
+    container_name: blpl-worker
     build:
       context: ..
       dockerfile: app/backend/Dockerfile
