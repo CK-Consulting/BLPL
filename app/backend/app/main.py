@@ -924,15 +924,28 @@ def _latest(pipeline_dir: Path, suffix: str) -> Path | None:
     return found
 
 
-def _latest_with_origin(pipeline_dir: Path, suffix: str) -> tuple[Path | None, bool]:
-    """``(path, is_archived)`` — is_archived is True when only a rotated copy exists."""
+def _latest_with_origin(
+    pipeline_dir: Path, suffix: str, stem_contains: str | None = None
+) -> tuple[Path | None, bool]:
+    """``(path, is_archived)`` — is_archived is True when only a rotated copy exists.
+
+    ``stem_contains`` narrows to one board. Without it a multi-board project
+    returns whichever emitted file is newest, which is a different board than
+    the one on screen with nothing on the page saying so.
+    """
     if not pipeline_dir.is_dir():
         return None, False
-    live = sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True)
+
+    def match(paths: list[Path]) -> list[Path]:
+        if stem_contains is None:
+            return paths
+        return [p for p in paths if stem_contains in p.name]
+
+    live = match(sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True))
     if live:
         return live[0], False
     # rglob so any rotation layout is caught, not just archive/ specifically.
-    archived = sorted(pipeline_dir.rglob(f"*{suffix}"), reverse=True)
+    archived = match(sorted(pipeline_dir.rglob(f"*{suffix}"), reverse=True))
     return (archived[0], True) if archived else (None, False)
 
 
@@ -1722,6 +1735,39 @@ class FileBody(BaseModel):
     content: str
 
 
+def _resolve_board(proj: Path, requested: str | None) -> str | None:
+    """Which board a request is about, or None for a single-board project.
+
+    Mirrors blpl.core.cli._board so the app and the command line refuse the same
+    things for the same reasons. Guessing is the failure to avoid: picking a
+    board would run the wrong one and write a perfectly plausible artifact that
+    nobody would think to question.
+    """
+    try:
+        man = project_manifest.discover(proj)
+    except project_manifest.ManifestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if man.implicit:
+        if requested and requested != man.boards[0].name:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{proj.name} is a single-board project; it has no board {requested!r}",
+            )
+        return None
+    if not requested:
+        names = ", ".join(b.name for b in man.boards)
+        raise HTTPException(
+            status_code=400,
+            detail=f"{proj.name} has more than one board ({names}); say which with ?board=",
+        )
+    if man.board(requested) is None:
+        names = ", ".join(b.name for b in man.boards)
+        raise HTTPException(
+            status_code=404, detail=f"no board {requested!r} in {proj.name}. Known: {names}"
+        )
+    return requested
+
+
 @app.get("/api/projects/{project_id}/boards")
 def get_boards(
     project_id: str,
@@ -1917,14 +1963,21 @@ def read_artifact(project_id: str, name: str, user: User = Depends(require_onboa
 
 
 @app.get("/api/projects/{project_id}/design")
-def design_sources(project_id: str, user: User = Depends(require_onboarded),
+def design_sources(project_id: str, board: str | None = None,
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     proj = _project_dir(session, user, project_id)
     pipeline = proj / ".pipeline"
+    resolved = _resolve_board(proj, board)
     sources = []
     archived = False
     for suffix in (".kicad_sch", ".kicad_pcb"):
-        f, was_archived = _latest_with_origin(pipeline, suffix)
+        # Emitted boards carry their board in the stem, so a multi-board project
+        # would otherwise show whichever happened to be newest — a different
+        # board than the one on screen, with nothing saying so.
+        f, was_archived = _latest_with_origin(
+            pipeline, suffix, stem_contains=None if resolved is None else f"_{resolved}_"
+        )
         if f is not None:
             archived = archived or was_archived
             sources.append(
@@ -2071,7 +2124,8 @@ def _artifact_meta(path: Path, pipeline: Path) -> dict:
 
 
 @app.get("/api/projects/{project_id}/artifacts")
-def list_artifacts(project_id: str, user: User = Depends(require_onboarded),
+def list_artifacts(project_id: str, board: str | None = None,
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     """Every artifact the pipeline has written, newest first.
 
@@ -2083,9 +2137,26 @@ def list_artifacts(project_id: str, user: User = Depends(require_onboarded),
     pipeline = _project_dir(session, user, project_id) / ".pipeline"
     if not pipeline.is_dir():
         return {"artifacts": []}
-    artifacts = [_artifact_meta(p, pipeline) for p in sorted(pipeline.iterdir()) if p.is_file()]
+    files = [p for p in sorted(pipeline.iterdir()) if p.is_file()]
+    if board:
+        # Board is a filename qualifier, so filtering is a substring test on the
+        # name. Project-level artifacts (crossboard.json) carry no board and are
+        # kept: they are about this board as much as any other.
+        files = [
+            p for p in files
+            if f".{board}." in p.name or f"_{board}_" in p.name or _is_project_level(p.name)
+        ]
+    artifacts = [_artifact_meta(p, pipeline) for p in files]
     artifacts.sort(key=lambda a: a["created"], reverse=True)
     return {"artifacts": artifacts}
+
+
+# Artifacts that describe the project rather than any one board.
+_PROJECT_LEVEL_ARTIFACTS = {"crossboard.json"}
+
+
+def _is_project_level(name: str) -> bool:
+    return name in _PROJECT_LEVEL_ARTIFACTS
 
 
 @app.get("/api/projects/{project_id}/modules")
@@ -2802,6 +2873,7 @@ def _start_run(
 async def run_stage(
     project_id: str,
     stage_name: str,
+    board: str | None = None,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -2815,8 +2887,15 @@ async def run_stage(
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
+    resolved = _resolve_board(proj, board)
+    if resolved is not None:
+        cmd += ["--board", resolved]
     activity.record(
-        session, _project_or_404(session, user, project_id), user, activity.RAN, stage_name
+        session,
+        _project_or_404(session, user, project_id),
+        user,
+        activity.RAN,
+        stage_name if resolved is None else f"{stage_name} ({resolved})",
     )
     return _start_run(session, user, project_id, stage_name, cmd, env)
 
@@ -2860,10 +2939,48 @@ def preflight(project_id: str, user: User = Depends(require_onboarded),
     wants the findings *structured*, which a log stream cannot give it. Running
     it is free and mutates nothing, so the panel can ask on every visit.
     """
-    from blpl.core import doctor
+    from blpl.core import crossboard, doctor
+
+    proj = _project_dir(session, user, project_id)
+    try:
+        man = project_manifest.discover(proj)
+    except project_manifest.ManifestError:
+        man = None
 
     try:
-        return doctor.run(_project_dir(session, user, project_id)).to_dict()
+        if man is None or man.implicit:
+            return doctor.run(proj).to_dict()
+        # A multi-board project has two kinds of finding, and they answer
+        # different questions: the doctor says what one board's markdown would
+        # drop, the cross-board report says what happens where boards meet. The
+        # second is the one no per-board check can reach, so it is not hidden
+        # behind a board selection.
+        per_board = {}
+        artifacts: dict[str, dict] = {}
+        for b in (x.name for x in man.boards):
+            bdir = project_manifest.board_dir(proj, man, b)
+            if bdir.is_dir():
+                per_board[b] = doctor.run(bdir).to_dict()
+            art = project_manifest.artifact_path(
+                proj, "design_artifact.deterministic", board=b
+            )
+            if art.is_file():
+                try:
+                    artifacts[b] = json.loads(art.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    pass
+        report = crossboard.check(man, artifacts) if artifacts else None
+        return {
+            "multi_board": True,
+            "boards": per_board,
+            "crossboard": report.to_dict() if report else None,
+            # Named so the panel can say why the cross-board section is empty
+            # rather than implying everything passed.
+            "crossboard_ready": sorted(artifacts),
+            "crossboard_missing": sorted(
+                b.name for b in man.boards if b.name not in artifacts
+            ),
+        }
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"could not read the project: {exc}")
 
