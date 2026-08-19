@@ -184,6 +184,13 @@
       "vendor"
      ],
      "description": "Where the electrical attributes came from. 'design_document' means a stage read them out of the design markdown, 'vendor' means a distributor confirmed them, 'manual' means a person entered them. Absent means unknown, which is treated as the weakest. Grouping parts for an order rests on these attributes, so how much they can be trusted has to travel with them."
+    },
+    "attribute_conflicts": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Attributes where the design document and a distributor disagree, or two distributors disagree with each other. The row keeps its designed values \u2014 writing the vendor's over them would settle by fiat the question a person needs to answer \u2014 and is held out of equivalence grouping, because a part whose rating is in dispute cannot be shown equivalent to anything."
     }
    }
   }

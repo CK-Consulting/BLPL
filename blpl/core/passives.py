@@ -143,6 +143,9 @@ class PassiveSpec:
     # a grouping is only as trustworthy as its weakest member, so this has to
     # travel with the part rather than being recomputed at the end.
     provenance: str = "unknown"
+    # Attributes a distributor contradicts. A disputed rating cannot be shown to
+    # match anything, so it falls under the same rule as a missing one.
+    conflicts: tuple[str, ...] = ()
     # Which fields were read out of free text rather than declared. A hint is
     # not a fact, and the difference has to survive to whoever orders the parts.
     inferred: frozenset[str] = field(default_factory=frozenset)
@@ -166,6 +169,7 @@ class PassiveSpec:
             "no_substitutions": self.no_substitutions,
             "no_substitutions_reason": self.no_substitutions_reason,
             "provenance": self.provenance,
+            "conflicts": list(self.conflicts),
             "inferred": sorted(self.inferred),
         }
 
@@ -288,6 +292,7 @@ def extract(row: dict) -> PassiveSpec:
         no_substitutions_reason=str(row.get("no_substitutions_reason") or ""),
         # Anything read out of prose here is inferred whatever the row claims —
         # a row cannot vouch for a field it did not actually carry.
+        conflicts=tuple(row.get("attribute_conflicts") or ()),
         provenance=(
             "inferred"
             if inferred
@@ -307,6 +312,13 @@ def may_merge(
     to notice.
     """
     for side in (a, b):
+        if side.conflicts:
+            names = ", ".join(c.replace("_", " ") for c in side.conflicts)
+            return False, (
+                f"one of them has an unresolved disagreement about {names} between the "
+                "design and a distributor. Until that is settled it cannot be shown to "
+                "match anything."
+            )
         if side.no_substitutions:
             why = side.no_substitutions_reason or "no reason recorded"
             return False, (
@@ -358,7 +370,7 @@ def equivalence_key(spec: PassiveSpec, component_class: str = "") -> str | None:
     # Never groupable, however completely it is specified. A perfectly
     # characterised part that must not be substituted still must not be
     # substituted.
-    if spec.no_substitutions:
+    if spec.no_substitutions or spec.conflicts:
         return None
     if spec.value is None or not spec.package:
         return None
@@ -376,6 +388,9 @@ def equivalence_key(spec: PassiveSpec, component_class: str = "") -> str | None:
 
 def why_unmergeable(spec: PassiveSpec, component_class: str = "") -> str:
     """What is missing before this part could be grouped by value."""
+    if spec.conflicts:
+        names = ", ".join(c.replace("_", " ") for c in spec.conflicts)
+        return f"design and distributor disagree on {names}"
     if spec.no_substitutions:
         return (
             "marked no-substitutions"

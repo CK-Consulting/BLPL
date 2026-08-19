@@ -28,15 +28,26 @@ class PartHit:
     manufacturer: str = ""
     description: str = ""
     datasheet_url: str = ""
+    # Parametric data as the distributor states it — voltage rating, tolerance,
+    # dielectric, power. Distributor APIs return these (Mouser as
+    # ProductAttributes, DigiKey as Parameters), but the resolver scripts in the
+    # kicad-happy submodule currently keep only manufacturer, description and
+    # datasheet URL. Read here so the moment those scripts pass the field
+    # through, everything downstream already uses it; empty until then, which
+    # costs nothing and breaks nothing.
+    attributes: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "distributor": self.distributor,
             "mpn": self.mpn,
             "manufacturer": self.manufacturer,
             "description": self.description,
             "datasheet_url": self.datasheet_url,
         }
+        if self.attributes:
+            out["attributes"] = dict(self.attributes)
+        return out
 
 
 @dataclass
@@ -118,6 +129,7 @@ def search_parts(
                 manufacturer=str(data.get("manufacturer") or ""),
                 description=str(data.get("description") or ""),
                 datasheet_url=str(data.get("datasheet_url") or ""),
+                attributes=dict(data.get("attributes") or {}),
             )
         )
     return result
