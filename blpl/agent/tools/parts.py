@@ -15,9 +15,13 @@ averaging away. Distributors we have no key for are reported as named skips, so
 
 from __future__ import annotations
 
+import os
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ...core import quarantine
 from ..kicad_happy import DISTRIBUTORS, CredResolver, run_script, script_path
 
 
@@ -55,6 +59,8 @@ class PartSearch:
     query: str
     hits: list[PartHit] = field(default_factory=list)
     skipped: dict[str, str] = field(default_factory=dict)   # distributor → why
+    # What the lookup brought back with it, and what quarantine made of it.
+    retrieved: list[dict] = field(default_factory=list)
     not_found: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -66,6 +72,7 @@ class PartSearch:
             # and told no.
             "skipped": self.skipped,
             "not_found": self.not_found,
+            "retrieved": self.retrieved,
             "agreement": self.agreement(),
         }
 
@@ -86,8 +93,18 @@ def search_parts(
     creds: CredResolver | None = None,
     distributors: list[str] | None = None,
     timeout: int = 60,
+    project_dir: Path | None = None,
 ) -> PartSearch:
-    """Resolve an MPN across distributors. Never raises for a missing part."""
+    """Resolve an MPN across distributors. Never raises for a missing part.
+
+    The resolver scripts download the datasheet as part of answering, and for a
+    long time this pointed them at ``/dev/null`` — paying for the download,
+    including the scrape and browser fallbacks, and discarding the result. Given
+    ``project_dir`` the file is kept instead, through ``quarantine``: the bytes
+    land in ``retrieved/``, get inspected and scanned, and only reach
+    ``datasheets/`` if they pass. Keeping a file we already fetched costs
+    nothing; fetching it twice costs a minute and a page-scrape each time.
+    """
     creds = creds or CredResolver()
     result = PartSearch(query=mpn)
 
@@ -108,15 +125,19 @@ def search_parts(
         try:
             # --search resolves the part without downloading the PDF; the
             # download is a separate, explicitly-approved step.
-            res = run_script(
-                path,
-                ["--search", mpn, "--json", "-o", "/dev/null"],
-                env=creds.env_for(dist),
-                timeout=timeout,
-            )
+            with _download_target(project_dir) as target:
+                res = run_script(
+                    path,
+                    ["--search", mpn, "--json", "-o", str(target)],
+                    env=creds.env_for(dist),
+                    timeout=timeout,
+                )
+                kept = _keep(target, project_dir, mpn=mpn, distributor=dist)
         except Exception as exc:  # subprocess/timeout
             result.skipped[dist] = f"{type(exc).__name__}: {exc}"
             continue
+        if kept is not None:
+            result.retrieved.append(kept)
 
         data = res.data if isinstance(res.data, dict) else None
         if not data or not (data.get("mpn") or data.get("datasheet_url")):
@@ -148,6 +169,11 @@ class DatasheetFetch:
     # download that was blocked, so a failure that names the page is a minute's
     # work and one that does not is a dead end.
     manual_urls: dict[str, str] = field(default_factory=dict)
+    # What quarantine made of the file that was released, and of any that were
+    # not. A caller that wants to know *why* it has no datasheet should not have
+    # to go and read a ledger to find out.
+    quarantine: dict = field(default_factory=dict)
+    held: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -156,12 +182,64 @@ class DatasheetFetch:
             "path": self.path,
             "distributor": self.distributor,
             "manual_urls": dict(self.manual_urls),
+            "quarantine": dict(self.quarantine),
+            "held": list(self.held),
             # kicad-happy re-reads the downloaded PDF and checks the MPN really
             # appears in it. A "wrong" here means we fetched somebody else's
             # datasheet — worth surfacing rather than filing quietly.
             "verification": self.verification,
             "detail": self.detail,
         }
+
+
+# ---------------------------------------------------------------------------
+# Taking delivery
+#
+# Every path that downloads a file routes through here, so there is exactly one
+# place where retrieved bytes become project bytes — and it is the place that
+# inspects and scans them first.
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _download_target(project_dir: Path | None):
+    """Somewhere for a resolver script to write, that is not the project.
+
+    Even the temporary file is kept out of ``datasheets/``: a partial download
+    sitting under the name that means "checked" — even for a second, even on a
+    crash — is the state this whole arrangement exists to prevent.
+    """
+    if project_dir is None:
+        # Nowhere to keep it, so the old behaviour: let the script write to the
+        # bit bucket. Returned before the try/finally below on purpose — the
+        # cleanup there must never be pointed at /dev/null.
+        yield Path(os.devnull)
+        return
+    staging = quarantine.quarantine_dir(project_dir) / ".incoming"
+    staging.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(suffix=".pdf", dir=staging)
+    os.close(fd)
+    target = Path(name)
+    try:
+        yield target
+    finally:
+        target.unlink(missing_ok=True)
+
+
+def _keep(
+    target: Path, project_dir: Path | None, *, mpn: str, distributor: str, source_url: str = ""
+) -> dict | None:
+    """Hand a downloaded file to quarantine, if there is one to hand it to."""
+    if project_dir is None or not target.is_file() or target.stat().st_size == 0:
+        return None
+    try:
+        data = target.read_bytes()
+    except OSError:
+        return None
+    rec = quarantine.accept_and_release(
+        data, project_dir, mpn=mpn, distributor=distributor, source_url=source_url,
+    )
+    return rec.to_dict()
 
 
 def fetch_datasheet(
@@ -172,10 +250,21 @@ def fetch_datasheet(
     distributors: list[str] | None = None,
     timeout: int = 180,
 ) -> DatasheetFetch:
-    """Download one datasheet into ``dest_dir``, trying distributors in order."""
+    """Download one datasheet, trying distributors in order.
+
+    The file does not arrive in ``dest_dir``. It arrives in ``retrieved/``,
+    where it is inspected for things a document has no business doing and — if a
+    scanner is configured — scanned, and it reaches ``dest_dir`` only if it
+    passes. A file that does not pass is kept where it landed and reported, not
+    deleted: which part it was for and what was in it is worth knowing, and
+    throwing it away only means downloading it again tomorrow.
+    """
     creds = creds or CredResolver()
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
+    # The project is the directory holding datasheets/, which is where
+    # retrieved/ sits beside it.
+    project_dir = dest_dir.parent
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in mpn)
     out = dest_dir / f"{safe}.pdf"
     if out.is_file() and out.stat().st_size > 0:
@@ -186,6 +275,7 @@ def fetch_datasheet(
     tried: list[str] = []
     reasons: list[str] = []
     manual: dict[str, str] = {}
+    held: list[dict] = []
     for dist in distributors or list(DISTRIBUTORS):
         if creds.missing_for(dist):
             continue
@@ -196,13 +286,18 @@ def fetch_datasheet(
         if not path.exists():
             continue
         tried.append(dist)
-        res = run_script(
-            path,
-            ["--search", mpn, "--json", "-o", str(out)],
-            env=creds.env_for(dist),
-            timeout=timeout,
-        )
-        data = res.data if isinstance(res.data, dict) else {}
+        with _download_target(project_dir) as target:
+            res = run_script(
+                path,
+                ["--search", mpn, "--json", "-o", str(target)],
+                env=creds.env_for(dist),
+                timeout=timeout,
+            )
+            data = res.data if isinstance(res.data, dict) else {}
+            record = _keep(
+                target, project_dir, mpn=mpn, distributor=dist,
+                source_url=str(data.get("datasheet_url") or ""),
+            )
         if url := str(data.get("manual_url") or ""):
             manual[dist] = url
         if reason := str(data.get("error") or "").strip():
@@ -210,16 +305,23 @@ def fetch_datasheet(
         elif not res.ok and not data:
             # No JSON at all means it did not get far enough to explain itself.
             reasons.append(f"{dist}: exited {res.exit_code} without a result")
-        if res.ok and out.is_file() and out.stat().st_size > 0:
+        if record is not None and record.get("state") == quarantine.RELEASED:
             ver = (data.get("verification") or {}) if isinstance(data, dict) else {}
             return DatasheetFetch(
                 ok=True,
                 mpn=mpn,
-                path=str(out),
+                path=str(dest_dir / record["released_as"]),
                 distributor=dist,
                 verification=str(ver.get("confidence") or "unverified"),
                 detail=str(ver.get("details") or ""),
+                quarantine=record,
             )
+        if record is not None:
+            # Downloaded and held. Not a failure to find the datasheet — a
+            # refusal to hand this one over, which is a different sentence and
+            # needs to read like one.
+            held.append(record)
+            reasons.append(f"{dist}: held in quarantine — " + "; ".join(record["reasons"]))
 
     if not tried:
         return DatasheetFetch(
@@ -237,4 +339,11 @@ def fetch_datasheet(
         detail += ". Reachable by hand at: " + ", ".join(
             f"{d} {u}" for d, u in sorted(manual.items())
         )
-    return DatasheetFetch(ok=False, mpn=mpn, detail=detail, manual_urls=manual)
+    if held:
+        detail += (
+            f". {len(held)} file(s) were downloaded and are being held in "
+            f"{quarantine.QUARANTINE_DIRNAME}/ — see {quarantine.LEDGER_NAME} for what was found"
+        )
+    return DatasheetFetch(
+        ok=False, mpn=mpn, detail=detail, manual_urls=manual, held=held
+    )

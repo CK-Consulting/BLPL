@@ -93,7 +93,7 @@ from . import (
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, Run, User
-from blpl.core import project_manifest
+from blpl.core import project_manifest, quarantine
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
 from .vault import VaultError
@@ -1833,6 +1833,10 @@ def _tree_role(rel: Path) -> str:
         return "artifact"
     if parts and parts[0] == "datasheets":
         return "datasheet"
+    if parts and parts[0] == quarantine.QUARANTINE_DIRNAME:
+        # Shown, not hidden. Hiding retrieved files would mean the only place
+        # anything untrusted lives is also the only place nobody looks.
+        return "quarantined"
     if rel.suffix.lower() in {".md", ".markdown"}:
         return "design"
     if rel.suffix.lower() in {".kicad_pcb", ".kicad_sch", ".kicad_pro"}:
@@ -1922,9 +1926,40 @@ def get_blob(
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
 ) -> FileResponse:
-    """Serve any one file from the project, by its tree path."""
+    """Serve any one file from the project, by its tree path.
+
+    A retrieved file is served as an opaque download rather than as what it
+    claims to be. A PDF handed to the browser inline goes straight into a
+    viewer, and a viewer is precisely the thing an `/OpenAction` is written to
+    talk to — so anything under ``retrieved/`` comes back as
+    ``application/octet-stream`` with an attachment disposition, and opening it
+    becomes a deliberate act on a file the user has been told is unverified.
+    """
     proj = _project_dir(session, user, project_id)
-    return FileResponse(_tree_target(proj, path))
+    target = _tree_target(proj, path)
+    if _is_quarantined(proj, target):
+        return FileResponse(
+            target,
+            media_type="application/octet-stream",
+            filename=target.name,
+            headers={
+                "Content-Disposition": f'attachment; filename="{target.name}"',
+                # Without this the browser is free to sniff the bytes, decide it
+                # is a PDF after all, and render it — undoing the whole point.
+                "X-Content-Type-Options": "nosniff",
+                "X-BLPL-Quarantined": "1",
+            },
+        )
+    return FileResponse(target)
+
+
+def _is_quarantined(proj: Path, target: Path) -> bool:
+    try:
+        return target.resolve().is_relative_to(
+            quarantine.quarantine_dir(proj).resolve()
+        )
+    except (OSError, ValueError):
+        return False
 
 
 @app.get("/api/projects/{project_id}/files")

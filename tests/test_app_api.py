@@ -445,3 +445,46 @@ def test_the_spa_fallback_refuses_to_escape_the_static_root(client) -> None:
         r = client.get(f"/{attempt}")
         assert r.status_code == 200
         assert "root:" not in r.text
+
+
+def test_a_quarantined_file_is_never_served_as_a_pdf(client) -> None:
+    """A PDF handed to the browser inline goes straight into a viewer, and a
+    viewer is exactly what an `/OpenAction` is written to talk to. Retrieved
+    files come back opaque, so opening one is a deliberate act."""
+    import app.main as main
+    from blpl.core import quarantine
+
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "scratch"})
+    proj = main.PROJECTS_ROOT / "scratch"
+
+    qdir = quarantine.quarantine_dir(proj)
+    qdir.mkdir(parents=True, exist_ok=True)
+    (qdir / "deadbeef1234-EVIL.pdf").write_bytes(b"%PDF-1.4\nheld\n%%EOF\n")
+
+    r = client.get(
+        "/api/projects/scratch/blob",
+        params={"path": f"{quarantine.QUARANTINE_DIRNAME}/deadbeef1234-EVIL.pdf"},
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/octet-stream"
+    assert "attachment" in r.headers["content-disposition"]
+    assert r.headers["x-content-type-options"] == "nosniff"
+
+
+def test_a_released_datasheet_still_opens_in_the_browser(client) -> None:
+    """The restriction is on unverified files, not on datasheets. A passed one
+    is meant to be read."""
+    import app.main as main
+
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "scratch"})
+    proj = main.PROJECTS_ROOT / "scratch"
+
+    sheets = proj / "datasheets"
+    sheets.mkdir(parents=True, exist_ok=True)
+    (sheets / "TPS62840.pdf").write_bytes(b"%PDF-1.4\nfine\n%%EOF\n")
+
+    r = client.get("/api/projects/scratch/blob", params={"path": "datasheets/TPS62840.pdf"})
+    assert r.status_code == 200
+    assert "attachment" not in r.headers.get("content-disposition", "")
