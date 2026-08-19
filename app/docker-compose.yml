@@ -179,42 +179,6 @@ services:
   # but change nothing about where work happens, and one image means one KiCad
   # version across the deployment — two would be a way for a stage to behave
   # differently depending on which container ran it.
-  # Malware scanning for retrieved files. Optional, and off unless you start it:
-  #
-  #   docker compose --profile scanning up -d
-  #
-  # A profile rather than a plain service because clamd holds its whole
-  # signature database in memory (~1.5-2 GB) and updates it on a schedule. That
-  # is a fair price for a deployment that fetches datasheets from the internet
-  # and a silly one for a laptop running the test suite, so it is a decision
-  # rather than a default.
-  #
-  # Nothing breaks when this is absent: blpl.core.av reports `unscanned`, the
-  # quarantine ledger records that nothing checked the file, and the structural
-  # inspection in blpl.core.pdf_inspect — which is the check that actually stops
-  # a datasheet phoning home — runs either way.
-  #
-  # Once it is running, consider also setting BLPL_QUARANTINE_REQUIRE_SCAN=1 on
-  # backend and worker, which holds anything the scanner did not see. Leave it
-  # off until then, or every datasheet is held.
-  clamav:
-    image: clamav/clamav:stable
-    container_name: blpl-clamav
-    profiles: ["scanning"]
-    restart: unless-stopped
-    environment:
-      - BLPL_QUARANTINE_REQUIRE_SCAN=1
-    networks:
-      - blpl
-    volumes:
-      # Persist the signature database. Without it every restart re-downloads
-      # ~1 GB from the ClamAV mirrors, which is rude to them and slow for you.
-      - clamav-db:/var/lib/clamav
-    healthcheck:
-      test: ["CMD", "clamdcheck.sh"]
-      interval: 60s
-      retries: 3
-      start_period: 120s
 
   worker:
     platform: linux/amd64
@@ -278,6 +242,8 @@ services:
         # it. Changing the key therefore needs a rebuild, not a restart.
         - VITE_CLERK_PUBLISHABLE_KEY=${VITE_CLERK_PUBLISHABLE_KEY:-}
     container_name: blpl-frontend
+    environment:
+        - BLPL_CLERK_ISSUER=${BLPL_CLERK_ISSUER:-}
     restart: unless-stopped
     ports:
       - "1800:80"
@@ -302,7 +268,7 @@ services:
   # A GPU helps here and only here — the 3D viewer's OpenGL, for a human
   # spinning a board. Uncomment the device passthrough on a host that has one.
   kicad-desktop:
-    profiles: ["desktop"]
+ #   profiles: ["desktop"]
     image: lscr.io/linuxserver/kicad:latest
     container_name: blpl-kicad-desktop
     restart: unless-stopped
@@ -331,6 +297,45 @@ services:
       - seccomp:unconfined
     # devices:
     #   - /dev/dri:/dev/dri   # GPU for the 3D viewer, on a host that has one
+
+
+  # Malware scanning for retrieved files. Optional, and off unless you start it:
+  #
+  #   docker compose --profile scanning up -d
+  #
+  # A profile rather than a plain service because clamd holds its whole
+  # signature database in memory (~1.5-2 GB) and updates it on a schedule. That
+  # is a fair price for a deployment that fetches datasheets from the internet
+  # and a silly one for a laptop running the test suite, so it is a decision
+  # rather than a default.
+  #
+  # Nothing breaks when this is absent: blpl.core.av reports `unscanned`, the
+  # quarantine ledger records that nothing checked the file, and the structural
+  # inspection in blpl.core.pdf_inspect — which is the check that actually stops
+  # a datasheet phoning home — runs either way.
+  #
+  # Once it is running, consider also setting BLPL_QUARANTINE_REQUIRE_SCAN=1 on
+  # backend and worker, which holds anything the scanner did not see. Leave it
+  # off until then, or every datasheet is held.
+  clamav:
+    image: clamav/clamav:stable
+    container_name: blpl-clamav
+#    profiles: ["scanning"]
+    restart: unless-stopped
+    environment:
+      - BLPL_QUARANTINE_REQUIRE_SCAN=1
+    networks:
+      - blpl
+    volumes:
+      # Persist the signature database. Without it every restart re-downloads
+      # ~1 GB from the ClamAV mirrors, which is rude to them and slow for you.
+      - clamav-db:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 60s
+      retries: 3
+      start_period: 120s
+
 
 networks:
   blpl:
