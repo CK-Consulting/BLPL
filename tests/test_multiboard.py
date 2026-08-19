@@ -372,3 +372,102 @@ def test_digital_buses_crossing_are_exactly_what_mates_are_for():
 )
 def test_rf_detection_reads_the_name(signal, rf):
     assert crossboard.is_rf(signal) is rf
+
+
+# -- the plumbing ------------------------------------------------------------
+
+
+def _args(project_dir, board=None):
+    import argparse
+
+    return argparse.Namespace(project_dir=str(project_dir), board=board)
+
+
+def test_a_single_board_project_writes_the_same_names_as_before(tmp_path):
+    """The backwards-compatibility guarantee. Existing projects have bom.json
+    on disk and in git; renaming it would orphan both."""
+    from blpl.core.cli import _artifact, _board
+
+    (tmp_path / "design.md").write_text("# a board\n")
+    assert _board(_args(tmp_path), tmp_path) is None
+    assert _artifact(_args(tmp_path), tmp_path, "bom").name == "bom.json"
+
+
+def test_a_multi_board_project_qualifies_by_board(tmp_path):
+    from blpl.core.cli import _artifact
+
+    (tmp_path / "project.md").write_text(MANIFEST)
+    got = {
+        b: _artifact(_args(tmp_path, b), tmp_path, "bom").name
+        for b in ("base", "sensor")
+    }
+    assert got == {"base": "bom.base.json", "sensor": "bom.sensor.json"}
+
+
+def test_two_boards_share_one_pipeline_directory(tmp_path):
+    from blpl.core.cli import _artifact
+
+    (tmp_path / "project.md").write_text(MANIFEST)
+    a = _artifact(_args(tmp_path, "base"), tmp_path, "bom")
+    b = _artifact(_args(tmp_path, "sensor"), tmp_path, "bom")
+    assert a.parent == b.parent == tmp_path / ".pipeline"
+
+
+def test_omitting_the_board_on_a_multi_board_project_is_refused(tmp_path):
+    """Guessing would run the wrong board and write a plausible artifact."""
+    from blpl.core.cli import _board
+
+    (tmp_path / "project.md").write_text(MANIFEST)
+    with pytest.raises(SystemExit, match="more than one board"):
+        _board(_args(tmp_path), tmp_path)
+
+
+def test_an_unknown_board_is_refused_with_the_known_ones(tmp_path):
+    from blpl.core.cli import _board
+
+    (tmp_path / "project.md").write_text(MANIFEST)
+    with pytest.raises(SystemExit, match="Known: base, sensor, radio"):
+        _board(_args(tmp_path, "ghost"), tmp_path)
+
+
+def test_a_board_flag_on_a_single_board_project_is_refused(tmp_path):
+    """Silently ignoring it would run something other than what was asked."""
+    from blpl.core.cli import _board
+
+    (tmp_path / "design.md").write_text("# a board\n")
+    with pytest.raises(SystemExit, match="single-board project"):
+        _board(_args(tmp_path, "nope"), tmp_path)
+
+
+def test_each_board_reads_only_its_own_markdown(tmp_path):
+    from blpl.core.cli import _md_inputs
+
+    (tmp_path / "project.md").write_text(MANIFEST)
+    for b in ("base", "sensor"):
+        (tmp_path / b).mkdir()
+        (tmp_path / b / f"{b}.md").write_text(f"# {b}\n")
+    assert [p.name for p in _md_inputs(tmp_path, "base")] == ["base.md"]
+    assert [p.name for p in _md_inputs(tmp_path, "sensor")] == ["sensor.md"]
+
+
+def test_the_project_manifest_is_not_read_as_board_design(tmp_path):
+    """project.md sits at the project root, so a board never ingests it."""
+    from blpl.core.cli import _md_inputs
+
+    (tmp_path / "project.md").write_text(MANIFEST)
+    (tmp_path / "base").mkdir()
+    (tmp_path / "base" / "power.md").write_text("# power\n")
+    assert [p.name for p in _md_inputs(tmp_path, "base")] == ["power.md"]
+
+
+def test_emitted_boards_do_not_collide(tmp_path):
+    """Two boards under one project name would give the same stem and let the
+    second overwrite the first."""
+    from blpl.core.cli import _board
+
+    (tmp_path / "project.md").write_text(MANIFEST)
+    stems = set()
+    for b in ("base", "sensor"):
+        name = _board(_args(tmp_path, b), tmp_path)
+        stems.add(f"{tmp_path.name}_{name}")
+    assert len(stems) == 2
