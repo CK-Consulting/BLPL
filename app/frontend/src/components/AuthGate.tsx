@@ -34,7 +34,13 @@ function invitationIdFromPath(): number | null {
 export function AuthGate({ children }: Props) {
   const { isSignedIn, getToken } = useAuth();
   const [inviteId] = useState<number | null>(invitationIdFromPath);
+  // Three answers, not two. "Clerk is not configured" is a claim about the
+  // server's settings; "the server did not answer" is a claim about the server
+  // being up. Reporting the second as the first sends whoever is on call to
+  // check an environment variable that was correct all along — which is exactly
+  // what it did, while the backend was in a crash loop behind it.
   const [config, setConfig] = useState<AuthConfig | null>(null);
+  const [unreachable, setUnreachable] = useState(false);
   const [rejected, setRejected] = useState(false);
   // Three states past sign-in, and they are not the same: not set up, set up
   // but locked, and ready. Collapsing any two of them produces a screen that
@@ -60,9 +66,25 @@ export function AuthGate({ children }: Props) {
   // Asked unauthenticated, so a server with no Clerk issuer can say so instead
   // of showing a sign-in that cannot possibly succeed.
   useEffect(() => {
-    getJSON<AuthConfig>("/api/auth/config")
-      .then(setConfig)
-      .catch(() => setConfig({ clerk_configured: false }));
+    let cancelled = false;
+    const ask = () =>
+      getJSON<AuthConfig>("/api/auth/config")
+        .then((c) => {
+          if (cancelled) return;
+          setConfig(c);
+          setUnreachable(false);
+        })
+        .catch(() => {
+          if (!cancelled) setUnreachable(true);
+        });
+    ask();
+    // A backend that is restarting comes back on its own, so keep asking rather
+    // than stranding whoever is watching on an error page that never clears.
+    const timer = window.setInterval(ask, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
   // Signing in again clears a stale rejection; without this a single expired
@@ -73,6 +95,25 @@ export function AuthGate({ children }: Props) {
       refreshState();
     }
   }, [isSignedIn]);
+
+  if (unreachable) {
+    return (
+      <div className="gate">
+        <div className="gate-card">
+          <Logo size={48} withText />
+          <p className="gate-sub">
+            The server is not answering. This is not a sign-in problem and not a
+            setting you can change here — the backend is down, still starting, or
+            failing to start.
+          </p>
+          <div className="gate-hint">
+            <code>docker compose logs backend</code> will say why. This page retries
+            on its own and will continue as soon as the server is back.
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (config && !config.clerk_configured) {
     return (

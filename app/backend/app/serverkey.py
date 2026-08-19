@@ -114,9 +114,24 @@ def _decode(value: str) -> bytes:
         if len(candidate) == _KEY_LEN:
             raw = candidate
     if raw is None or len(raw) != _KEY_LEN:
+        # Say what arrived, not just what was wanted. The value is not a usable
+        # key, so describing its shape leaks nothing — and the shape is usually
+        # the whole diagnosis. The case this was written for: someone sets the
+        # variable to the *path* of the key file, which is a sentence the old
+        # message had no way to say.
+        looks_like_path = "/" in value or value.endswith(".key")
+        hint = (
+            f" — got {len(value)} characters"
+            + (
+                ", which looks like a file path rather than a key. This variable "
+                "holds the key itself; leave it unset to use a key file instead"
+                if looks_like_path
+                else f", decoding to {len(raw) if raw else 0} bytes"
+            )
+        )
         raise ServerKeyError(
-            f"{_ENV_VAR} must decode to {_KEY_LEN} bytes (base64 or hex); "
-            "generate one with: python -c \"import os,base64; "
+            f"{_ENV_VAR} must decode to {_KEY_LEN} bytes (base64 or hex){hint}. "
+            "Generate one with: python -c \"import os,base64; "
             "print(base64.urlsafe_b64encode(os.urandom(32)).rstrip(b'=').decode())\""
         )
     return raw
