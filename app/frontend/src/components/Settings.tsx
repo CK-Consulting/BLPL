@@ -462,24 +462,43 @@ function Routing({
     }
   };
 
-  const toggle = (task: string, name: string) => {
-    // Start from what this task *resolves* to, so the first click on an
-    // inherited task keeps what was already in effect rather than starting
-    // from nothing.
-    const chain = data.tasks[task] ?? data.effective[task] ?? [];
-    const next = chain.includes(name) ? chain.filter((n) => n !== name) : [...chain, name];
-    // Only the task being edited is sent. The server merges, so the other
-    // tasks keep whatever they had — and an empty chain means "unset this,
-    // inherit again", which is how a task gets back to having no route.
-    save({ [task]: next });
+  const chainOf = (task: string) => data.tasks[task] ?? data.effective[task] ?? [];
+
+  // Order is set as a value rather than performed as a sequence. Expressing
+  // priority as "click them in the order you want" made the current order hard
+  // to read and reordering a matter of deselecting everything and starting
+  // again — and it put "revert this task to the default" one accidental click
+  // away, since removing the last endpoint is indistinguishable from clearing
+  // the route.
+  const setRank = (task: string, name: string, rank: number) => {
+    const chain = chainOf(task).filter((n) => n !== name);
+    if (rank <= 0) {
+      // Explicit removal, and never silently a reset: a task keeps its own
+      // route until the last endpoint is taken out of it, and that case is
+      // spelled out rather than inferred.
+      if (!chain.length) {
+        onError(
+          `${task} would have no endpoint. Use "reset to default" if that is what you meant.`,
+        );
+        return;
+      }
+      save({ [task]: chain });
+      return;
+    }
+    chain.splice(Math.min(rank, chain.length + 1) - 1, 0, name);
+    save({ [task]: chain });
   };
+
+  const reset = (task: string) => save({ [task]: [] });
 
   return (
     <section>
       <h3>Task routing</h3>
-      <p className="muted">
-        Which endpoints serve which job, in fallback order. Click to add or remove; the order is the
-        order you add them.
+      <p className="routing-help">
+        Each job is tried against its endpoints in priority order: 1 first, then 2 if that
+        fails, and so on. Set a number to use an endpoint, or “not used” to drop it. A job
+        with no numbers of its own inherits whatever <span className="mono">default</span>
+        is set to.
       </p>
       {data.warnings?.map((w) => (
         <p className="gate-hint" key={w}>
@@ -488,7 +507,7 @@ function Routing({
       ))}
       {data.known_tasks.map((task) => {
         const stored = data.tasks[task];
-        const chain = stored ?? data.effective[task] ?? [];
+        const chain = chainOf(task);
         const inherited = stored === undefined;
         const visionTask = data.vision_tasks.includes(task);
         // A task that reads images can only be served by an endpoint that can
@@ -502,21 +521,35 @@ function Routing({
               <span className="mono">{task}</span>
               {task === "review_panel" && <span className="status-tag renamed">all run</span>}
               {visionTask && <span className="status-tag modified">vision</span>}
-              {inherited && <span className="status-tag renamed">inherits default</span>}
+              {inherited && task !== "default" && (
+                <span className="status-tag renamed">inherits default</span>
+              )}
             </div>
             <div className="muted small">{TASK_HELP[task]}</div>
-            <div className="chip-row">
+            <div className="rank-list">
               {offered.map((ep) => {
                 const at = chain.indexOf(ep.name);
+                const used = at >= 0;
                 return (
-                  <button
-                    key={ep.name}
-                    className={`chip toggle ${at >= 0 ? "on" : ""}`}
-                    onClick={() => toggle(task, ep.name)}
-                  >
-                    {at >= 0 && <span className="ord">{at + 1}</span>}
+                  <div className={`rank-row ${used ? "on" : ""}`} key={ep.name}>
+                    <select
+                      aria-label={`priority of ${ep.name} for ${task}`}
+                      value={used ? String(at + 1) : "0"}
+                      onChange={(e) => setRank(task, ep.name, Number(e.target.value))}
+                    >
+                      <option value="0">not used</option>
+                      {Array.from({ length: used ? chain.length : chain.length + 1 }, (_, i) => (
+                        <option key={i + 1} value={i + 1}>
+                          {i + 1}
+                        </option>
+                      ))}
+                    </select>
                     <span className="mono">{ep.name}</span>
-                  </button>
+                    {used && at === 0 && <span className="muted small">tried first</span>}
+                    {used && at > 0 && (
+                      <span className="muted small">fallback {at}</span>
+                    )}
+                  </div>
                 );
               })}
               {!offered.length && (
@@ -526,6 +559,11 @@ function Routing({
                 </span>
               )}
             </div>
+            {stored && (
+              <button className="link" onClick={() => reset(task)}>
+                reset to default
+              </button>
+            )}
             {hidden > 0 && (
               <div className="muted small">
                 {hidden} endpoint{hidden > 1 ? "s" : ""} not shown here: this task reads
