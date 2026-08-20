@@ -120,15 +120,24 @@ def _decode(value: str) -> bytes:
         # variable to the *path* of the key file, which is a sentence the old
         # message had no way to say.
         looks_like_path = "/" in value or value.endswith(".key")
-        hint = (
-            f" — got {len(value)} characters"
-            + (
-                ", which looks like a file path rather than a key. This variable "
-                "holds the key itself; leave it unset to use a key file instead"
-                if looks_like_path
-                else f", decoding to {len(raw) if raw else 0} bytes"
+        if looks_like_path:
+            # Deliberately not "leave it unset". Unsetting does not make the app
+            # read *that* path — `load` only ever reads
+            # $BLPL_DATA_ROOT/server.key, and `load_or_create` generates a fresh
+            # key when that file is absent. So the obvious-sounding advice would
+            # quietly mint a new key and orphan everything sealed under the old
+            # one. Say the two things that actually work instead.
+            hint = (
+                f" — got {len(value)} characters, which looks like a file path "
+                "rather than a key. This variable holds the key itself, so either "
+                "read the file into it (BLPL_SERVER_KEY=$(cat <path>)) or mount "
+                "that file at $BLPL_DATA_ROOT/server.key, which is the only path "
+                "this app reads. Do not simply unset it: with no key at that path "
+                "a new one is generated, and anything sealed under the old key "
+                "becomes unreadable"
             )
-        )
+        else:
+            hint = f" — got {len(value)} characters, decoding to {len(raw) if raw else 0} bytes"
         raise ServerKeyError(
             f"{_ENV_VAR} must decode to {_KEY_LEN} bytes (base64 or hex){hint}. "
             "Generate one with: python -c \"import os,base64; "

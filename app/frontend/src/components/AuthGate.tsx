@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ClerkLoaded,
   ClerkLoading,
@@ -41,6 +41,12 @@ export function AuthGate({ children }: Props) {
   // what it did, while the backend was in a crash loop behind it.
   const [config, setConfig] = useState<AuthConfig | null>(null);
   const [unreachable, setUnreachable] = useState(false);
+  // Whether the gate has ever opened. Once it has, this screen must never come
+  // back: it renders instead of `children`, so showing it would unmount the
+  // whole workspace — and the editor keeps unsaved content in component state,
+  // which would be gone on remount with no prompt, because nothing the user did
+  // caused the unmount.
+  const opened = useRef(false);
   const [rejected, setRejected] = useState(false);
   // Three states past sign-in, and they are not the same: not set up, set up
   // but locked, and ready. Collapsing any two of them produces a screen that
@@ -67,20 +73,27 @@ export function AuthGate({ children }: Props) {
   // of showing a sign-in that cannot possibly succeed.
   useEffect(() => {
     let cancelled = false;
+    let timer = 0;
     const ask = () =>
       getJSON<AuthConfig>("/api/auth/config")
         .then((c) => {
           if (cancelled) return;
+          opened.current = true;
           setConfig(c);
           setUnreachable(false);
+          // Stop. This probe exists to get past the gate, not to monitor the
+          // server for the rest of the session — a background poll that can
+          // replace a running application is a worse failure than the blank
+          // error page it was added to avoid.
+          window.clearInterval(timer);
         })
         .catch(() => {
-          if (!cancelled) setUnreachable(true);
+          if (!cancelled && !opened.current) setUnreachable(true);
         });
     ask();
-    // A backend that is restarting comes back on its own, so keep asking rather
-    // than stranding whoever is watching on an error page that never clears.
-    const timer = window.setInterval(ask, 5000);
+    // A backend that is still starting comes back on its own, so keep asking
+    // rather than stranding whoever is watching on an error that never clears.
+    timer = window.setInterval(ask, 5000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -96,7 +109,10 @@ export function AuthGate({ children }: Props) {
     }
   }, [isSignedIn]);
 
-  if (unreachable) {
+  // Guarded on `opened` as well as the flag: two independent reasons this can
+  // never displace a mounted workspace is the right number for a screen that
+  // returns instead of the application.
+  if (unreachable && !opened.current) {
     return (
       <div className="gate">
         <div className="gate-card">
