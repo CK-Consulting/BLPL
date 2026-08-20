@@ -202,7 +202,7 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: blpl-ollama
-    profiles: ["local-models"]
+#    profiles: ["local-models"]
     restart: unless-stopped
     networks:
       - blpl
