@@ -161,3 +161,35 @@ def test_project_names_with_dots_are_quoted(tmp_path: Path) -> None:
     appconfig.save(p, _cfg(projects={"dev.04": ProjectEntry(name="dev.04")}))
     assert '[projects."dev.04"]' in p.read_text()
     assert "dev.04" in appconfig.load(p).projects
+
+
+# -- stored routes vs inherited ones ------------------------------------------
+
+
+def test_an_unset_vision_task_is_not_an_invalid_config():
+    """`datasheet_vision` with no route of its own inherits the default chain.
+    That is a legal configuration even when the default is blind — the default
+    serves every other task perfectly well — so it must not be refused. It is
+    reported instead, by the settings endpoint."""
+    from app.appconfig import AppConfig, Endpoint
+
+    cfg = AppConfig(
+        endpoints={"ollama": Endpoint(name="ollama", kind="ollama", vision=False)},
+        tasks={"default": ["ollama"]},
+    )
+    cfg.validate()   # must not raise
+    assert cfg.chain_for("datasheet_vision") == ["ollama"]
+
+
+def test_an_explicit_blind_vision_route_is_still_refused():
+    """Saying it out loud is different from inheriting it."""
+    import pytest
+
+    from app.appconfig import AppConfig, Endpoint
+
+    cfg = AppConfig(
+        endpoints={"ollama": Endpoint(name="ollama", kind="ollama", vision=False)},
+        tasks={"default": ["ollama"], "datasheet_vision": ["ollama"]},
+    )
+    with pytest.raises(ValueError, match="vision-capable"):
+        cfg.validate()

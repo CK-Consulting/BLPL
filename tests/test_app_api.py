@@ -540,3 +540,60 @@ def test_unsetting_a_key_that_is_elsewhere_would_mint_a_new_one(tmp_path) -> Non
     assert serverkey.load(data_root) is None          # it does not look there
     minted = serverkey.load_or_create(data_root)      # …it makes a new one
     assert minted != real
+
+
+def test_settings_survive_a_round_trip(unlocked) -> None:
+    """A GET whose result cannot be PUT back unchanged is the bug.
+
+    The screen used to receive every task with fallbacks already applied, then
+    echo the whole map back on the next click. That turned a legal
+    "datasheet_vision is unset" into an illegal "datasheet_vision routes to a
+    blind endpoint", and validation refused it — including refusing the very
+    edit that would have fixed it. Nothing in the routing tab could be changed.
+    """
+    unlocked.put("/api/settings/llm", json={"endpoints": [
+        {"name": "ollama", "kind": "ollama", "model": "qwen", "vision": False},
+        {"name": "opus", "kind": "anthropic", "vision": True},
+    ]})
+    unlocked.put("/api/settings/llm", json={"tasks": {"default": ["ollama"]}})
+
+    got = unlocked.get("/api/settings").json()
+    # Stored routes are what was stored; inherited ones are not invented into it.
+    assert got["tasks"] == {"default": ["ollama"]}
+    assert got["effective"]["datasheet_vision"] == ["ollama"]   # …but shown
+    assert any("datasheet_vision" in w for w in got["warnings"])
+
+    # The round trip that used to deadlock.
+    back = unlocked.put("/api/settings/llm", json={"tasks": got["tasks"]})
+    assert back.status_code == 200, back.text
+
+
+def test_one_task_can_be_changed_without_resending_the_rest(unlocked) -> None:
+    """Edits are merged, so a click on one task cannot be refused because of
+    what some other task happens to hold."""
+    unlocked.put("/api/settings/llm", json={"endpoints": [
+        {"name": "ollama", "kind": "ollama", "model": "qwen", "vision": False},
+        {"name": "opus", "kind": "anthropic", "vision": True},
+    ]})
+    unlocked.put("/api/settings/llm", json={"tasks": {"default": ["ollama"]}})
+
+    r = unlocked.put("/api/settings/llm", json={"tasks": {"datasheet_vision": ["opus"]}})
+    assert r.status_code == 200, r.text
+    got = unlocked.get("/api/settings").json()
+    assert got["tasks"]["datasheet_vision"] == ["opus"]
+    assert got["tasks"]["default"] == ["ollama"]        # untouched
+    assert not got["warnings"]                           # and the warning clears
+
+
+def test_a_task_can_be_unset_so_it_inherits_again(unlocked) -> None:
+    """An empty chain means "give this task no route of its own" — the only way
+    back for a route that should never have existed."""
+    unlocked.put("/api/settings/llm", json={"endpoints": [
+        {"name": "opus", "kind": "anthropic", "vision": True},
+    ]})
+    unlocked.put("/api/settings/llm", json={"tasks": {"default": ["opus"], "chat": ["opus"]}})
+    unlocked.put("/api/settings/llm", json={"tasks": {"chat": []}})
+
+    got = unlocked.get("/api/settings").json()
+    assert "chat" not in got["tasks"]
+    assert got["effective"]["chat"] == ["opus"]

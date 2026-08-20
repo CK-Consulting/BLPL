@@ -34,6 +34,7 @@ import asyncio
 import base64
 import json
 import os
+import urllib.request
 import shutil
 import subprocess
 import sys
@@ -734,7 +735,38 @@ def get_settings(
             }
             for ep in cfg.endpoints.values()
         ],
-        "tasks": {t: cfg.chain_for(t) for t in appconfig.KNOWN_TASKS},
+        # Two maps, because they answer different questions and conflating them
+        # deadlocked the settings screen.
+        #
+        # `tasks` is what is actually *stored*: a task absent here inherits the
+        # default chain and has no route of its own. `effective` is what a
+        # request would resolve to today, fallbacks applied, which is what the
+        # screen should show.
+        #
+        # Returning only the effective map meant the client echoed inherited
+        # values back as explicit routes on the next save. That turned a
+        # perfectly legal "datasheet_vision is unset" into an illegal
+        # "datasheet_vision routes to a blind endpoint", which validation then
+        # refused — including refusing the very edit that would have fixed it.
+        # A GET whose result cannot be PUT back unchanged is the bug.
+        "tasks": {t: list(chain) for t, chain in cfg.tasks.items() if chain},
+        "effective": {t: cfg.chain_for(t) for t in appconfig.KNOWN_TASKS},
+        # An inherited chain can be invalid in a way validation cannot refuse:
+        # `datasheet_vision` unset falls back to `default`, and if that is a
+        # blind endpoint the task breaks at request time rather than at save
+        # time. Refusing the config outright would be wrong — the default chain
+        # is legitimate for every other task — so it is reported instead.
+        "warnings": [
+            f"{t} reads images, but with no route of its own it falls back to "
+            f"{cfg.chain_for(t)}, which cannot see. Give it its own route."
+            for t in appconfig.VISION_TASKS
+            if t not in cfg.tasks
+            and any(
+                not cfg.endpoints[n].can_see
+                for n in cfg.chain_for(t)
+                if n in cfg.endpoints
+            )
+        ],
         "known_kinds": list(appconfig.KNOWN_KINDS),
         "known_tasks": list(appconfig.KNOWN_TASKS),
         "vision_tasks": sorted(appconfig.VISION_TASKS),
@@ -744,6 +776,72 @@ def get_settings(
             {"provider": m.endpoint, "updated_at": m.updated_at}
             for m in keystore.list_meta(session, user)
         ],
+    }
+
+
+@app.get("/api/settings/llm/endpoints/{name}/models")
+def list_endpoint_models(
+    name: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """The model names a local endpoint will actually answer to.
+
+    Ollama serves every model it holds on one port, so the port identifies the
+    server and the *model name* identifies the model — and the name has to match
+    exactly, tag included. `hf.co/21world/KiCAD-MCP-Qwen3.5-4B-GGUF:latest` is
+    not something anyone should be expected to type from memory, and a typo
+    produces a run that fails at request time rather than at save time.
+
+    So the server is asked what it has. Read-only, no key needed for the kinds
+    that support it, and a failure here is reported as "could not ask" rather
+    than as an empty list — a server that is down has models, it just is not
+    saying which.
+    """
+    cfg = llmconfig.load(session, user)
+    ep = cfg.endpoints.get(name)
+    if ep is None:
+        raise HTTPException(status_code=404, detail=f"no endpoint {name!r}")
+
+    if ep.kind == "ollama":
+        # Same precedence as blpl.core.llm_chat uses to actually send a
+        # request, so discovery cannot end up asking a different server than
+        # the one that will serve the model it finds.
+        base = ep.base_url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+        url = base.rstrip("/") + "/api/tags"
+        key = "models"
+    elif ep.kind == "openai-compatible":
+        if not ep.base_url:
+            raise HTTPException(status_code=400, detail=f"{name} has no base_url")
+        url = ep.base_url.rstrip("/") + "/models"
+        key = "data"
+    else:
+        # Hosted providers publish a fixed catalogue that is not worth probing
+        # per user, and asking costs a billable call.
+        return {"endpoint": name, "kind": ep.kind, "models": [], "asked": False,
+                "detail": f"{ep.kind} models are not discovered from the server"}
+
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            payload = json.loads(r.read())
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"could not ask {name} for its models ({type(exc).__name__}: {exc})",
+        )
+
+    rows = payload.get(key) or []
+    names = sorted(
+        str(m.get("model") or m.get("name") or m.get("id") or "").strip()
+        for m in rows
+        if isinstance(m, dict)
+    )
+    return {
+        "endpoint": name,
+        "kind": ep.kind,
+        "models": [n for n in names if n],
+        "asked": True,
+        "current": ep.resolved_model(),
     }
 
 
@@ -790,7 +888,16 @@ def put_llm_settings(
             for e in body.endpoints
         }
     if body.tasks is not None:
-        cfg.tasks = {t: list(chain) for t, chain in body.tasks.items() if chain}
+        # Merge. An empty chain means "unset this task, let it inherit again",
+        # which is the only way back for a task that should never have had a
+        # route of its own.
+        merged = dict(cfg.tasks)
+        for t, chain in body.tasks.items():
+            if chain:
+                merged[t] = list(chain)
+            else:
+                merged.pop(t, None)
+        cfg.tasks = merged
 
     try:
         llmconfig.save(session, user, cfg)

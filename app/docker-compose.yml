@@ -75,6 +75,12 @@ services:
       - BLPL_PROJECTS_ROOT=/app/data/projects
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
+      # Where the local model server is, for both inference and for the
+      # settings screen's model discovery. The compose service name, not
+      # localhost: inside this container localhost is this container. Unset
+      # or unresolvable when the `local-models` profile is down, which the
+      # discovery endpoint reports as "could not ask" rather than as no models.
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       # Where to find the malware scanner, if the `scanning` profile is up.
       # Unresolvable when it is not, which blpl.core.av reports as `unscanned`
       # rather than treating as clean.
@@ -86,7 +92,6 @@ services:
       # quota on the operator's account. Users bring their own, or route a task
       # to something keyless. OLLAMA_HOST is not a key — it is an address, and a
       # sensible default for the whole deployment.
-      - OLLAMA_HOST=${OLLAMA_HOST:-}
       # Clerk is the front door. The backend has no Clerk SDK, so it verifies
       # session tokens against this issuer's published JWKS itself — and pins
       # the issuer, because a correctly-signed token from anyone else's Clerk
@@ -251,6 +256,12 @@ services:
       - BLPL_PROJECTS_ROOT=/app/data/projects
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
+      # Where the local model server is, for both inference and for the
+      # settings screen's model discovery. The compose service name, not
+      # localhost: inside this container localhost is this container. Unset
+      # or unresolvable when the `local-models` profile is down, which the
+      # discovery endpoint reports as "could not ask" rather than as no models.
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       # Where to find the malware scanner, if the `scanning` profile is up.
       # Unresolvable when it is not, which blpl.core.av reports as `unscanned`
       # rather than treating as clean.
@@ -259,7 +270,6 @@ services:
       # Needed to open the environment sealed into each job. A worker without it
       # refuses to start rather than failing one job at a time.
       - BLPL_SERVER_KEY=${BLPL_SERVER_KEY:-}
-      - OLLAMA_HOST=${OLLAMA_HOST:-}
       - DIGIKEY_OAUTH_CLIENT_ID=${DIGIKEY_OAUTH_CLIENT_ID:-}
       - DIGIKEY_OAUTH_CLIENT_SECRET=${DIGIKEY_OAUTH_CLIENT_SECRET:-}
       - MOUSER_SEARCH_API_KEY=${MOUSER_SEARCH_API_KEY:-}

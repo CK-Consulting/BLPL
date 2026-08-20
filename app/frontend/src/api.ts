@@ -244,8 +244,17 @@ export type EndpointConfig = {
 
 export type Settings = {
   endpoints: EndpointConfig[];
-  /** task → endpoint names, in fallback order. */
+  /**
+   * Routes that are actually *stored*. A task absent here has no route of its
+   * own and inherits `default` — which is a different statement from routing it
+   * explicitly, and the distinction is load-bearing: echoing an inherited value
+   * back as an explicit route is what deadlocked this screen.
+   */
   tasks: Record<string, string[]>;
+  /** What each task resolves to today, fallbacks applied. For display. */
+  effective: Record<string, string[]>;
+  /** Configurations that are legal but will fail at request time. */
+  warnings: string[];
   known_kinds: string[];
   known_tasks: string[];
   vision_tasks: string[];

@@ -335,13 +335,15 @@ function Routing({
   };
 
   const toggle = (task: string, name: string) => {
-    const chain = data.tasks[task] ?? [];
+    // Start from what this task *resolves* to, so the first click on an
+    // inherited task keeps what was already in effect rather than starting
+    // from nothing.
+    const chain = data.tasks[task] ?? data.effective[task] ?? [];
     const next = chain.includes(name) ? chain.filter((n) => n !== name) : [...chain, name];
-    if (!next.length) {
-      onError(`${task} needs at least one endpoint`);
-      return;
-    }
-    save({ ...data.tasks, [task]: next });
+    // Only the task being edited is sent. The server merges, so the other
+    // tasks keep whatever they had — and an empty chain means "unset this,
+    // inherit again", which is how a task gets back to having no route.
+    save({ [task]: next });
   };
 
   return (
@@ -351,27 +353,37 @@ function Routing({
         Which endpoints serve which job, in fallback order. Click to add or remove; the order is the
         order you add them.
       </p>
+      {data.warnings?.map((w) => (
+        <p className="gate-hint" key={w}>
+          {w}
+        </p>
+      ))}
       {data.known_tasks.map((task) => {
-        const chain = data.tasks[task] ?? [];
+        const stored = data.tasks[task];
+        const chain = stored ?? data.effective[task] ?? [];
+        const inherited = stored === undefined;
         const visionTask = data.vision_tasks.includes(task);
+        // A task that reads images can only be served by an endpoint that can
+        // see, so the others are not offered. Showing a control that is
+        // guaranteed to be refused is just a slower way to deliver an error.
+        const offered = visionTask ? data.endpoints.filter((e) => e.vision) : data.endpoints;
+        const hidden = data.endpoints.length - offered.length;
         return (
           <div className="task-row" key={task}>
             <div className="task-name">
               <span className="mono">{task}</span>
               {task === "review_panel" && <span className="status-tag renamed">all run</span>}
               {visionTask && <span className="status-tag modified">vision</span>}
+              {inherited && <span className="status-tag renamed">inherits default</span>}
             </div>
             <div className="muted small">{TASK_HELP[task]}</div>
             <div className="chip-row">
-              {data.endpoints.map((ep) => {
+              {offered.map((ep) => {
                 const at = chain.indexOf(ep.name);
-                const blocked = visionTask && !ep.vision;
                 return (
                   <button
                     key={ep.name}
                     className={`chip toggle ${at >= 0 ? "on" : ""}`}
-                    disabled={blocked && at < 0}
-                    title={blocked ? "this endpoint cannot read images" : undefined}
                     onClick={() => toggle(task, ep.name)}
                   >
                     {at >= 0 && <span className="ord">{at + 1}</span>}
@@ -379,7 +391,19 @@ function Routing({
                   </button>
                 );
               })}
+              {!offered.length && (
+                <span className="muted small">
+                  no vision-capable endpoint is declared — add one, or mark an existing
+                  endpoint <code>vision</code> if its model really can see
+                </span>
+              )}
             </div>
+            {hidden > 0 && (
+              <div className="muted small">
+                {hidden} endpoint{hidden > 1 ? "s" : ""} not shown here: this task reads
+                images and they cannot.
+              </div>
+            )}
           </div>
         );
       })}
