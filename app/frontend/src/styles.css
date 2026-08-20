@@ -589,3 +589,11 @@ header .logo-lockup { font-size: 13px; }
 /* Never remove it. A control that cannot be seen while focused cannot be used
    from a keyboard, which is the whole point of the criterion. */
 *:focus:not(:focus-visible) { outline: none; }
+
+/* Model capabilities. Colour is a second signal, never the only one — each
+   chip is also labelled, so the distinction survives any colour deficiency. */
+.cap-row { display: flex; flex-wrap: wrap; gap: .35rem; }
+.cap { font-size: 12px; padding: .1rem .4rem; border-radius: 4px;
+  background: #22262e; color: #e6e6e6; border: 1px solid #6b6f75; }
+.cap.cap-vision { background: #16351f; color: #9ff0c0; border-color: #3f7d58; }
+.cap.cap-thinking { background: #2f2740; color: #caa7ff; border-color: #7d6aa8; }

@@ -109,6 +109,28 @@ function Endpoints({
     await save(data.endpoints.map((e) => (e.name === name ? { ...e, model } : e)));
   };
 
+  const setVision = async (name: string, vision: boolean) => {
+    // Clearing the flag on an endpoint a vision task still routes to would be
+    // refused server-side; drop it from those routes here so the message is
+    // about what you did rather than a reference you cannot see.
+    const endpoints = data.endpoints.map((e) => (e.name === name ? { ...e, vision } : e));
+    if (!vision) {
+      const tasks = Object.fromEntries(
+        Object.entries(data.tasks)
+          .filter(([t]) => data.vision_tasks.includes(t))
+          .map(([t, chain]) => [t, chain.filter((n) => n !== name)]),
+      );
+      try {
+        await putJSON("/api/settings/llm", { endpoints, tasks });
+        onChanged();
+      } catch (e) {
+        onError((e as Error).message);
+      }
+      return;
+    }
+    await save(endpoints);
+  };
+
   const remove = async (name: string) => {
     // Dropping an endpoint that a task still routes to would fail validation
     // server-side; clear it from the routes here so the message is about what
@@ -141,6 +163,7 @@ function Endpoints({
           onChanged={onChanged}
           onError={onError}
           onModel={setModel}
+          onVision={setVision}
         />
       ))}
       {adding ? (
@@ -181,6 +204,7 @@ function EndpointRow({
   onChanged,
   onError,
   onModel,
+  onVision,
 }: {
   endpoint: EndpointConfig;
   keyedAt?: string;
@@ -188,10 +212,12 @@ function EndpointRow({
   onChanged: () => void;
   onError: (m: string) => void;
   onModel: (name: string, model: string) => Promise<void>;
+  onVision: (name: string, vision: boolean) => Promise<void>;
 }) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [models, setModels] = useState<string[]>([]);
+  const [caps, setCaps] = useState<Record<string, string[]> | null>(null);
   const [probing, setProbing] = useState(false);
 
   // A saved endpoint could not have its model corrected at all: the row showed
@@ -200,11 +226,17 @@ function EndpointRow({
   const listModels = async () => {
     setProbing(true);
     try {
-      const r = await postJSON<{ models: string[]; detail?: string }>(
-        "/api/settings/llm/models",
-        { kind: endpoint.kind, base_url: endpoint.base_url, name: endpoint.name },
-      );
+      const r = await postJSON<{
+        models: string[];
+        capabilities: Record<string, string[]>;
+        detail?: string;
+      }>("/api/settings/llm/models", {
+        kind: endpoint.kind,
+        base_url: endpoint.base_url,
+        name: endpoint.name,
+      });
       setModels(r.models);
+      setCaps(r.capabilities ?? {});
       if (!r.models.length) onError(r.detail ?? "no models listed");
     } catch (e) {
       onError((e as Error).message);
@@ -244,6 +276,7 @@ function EndpointRow({
             {models.map((m) => (
               <option key={m} value={m}>
                 {m}
+                {caps?.[m]?.length ? `  —  ${caps[m].join(", ")}` : ""}
               </option>
             ))}
           </select>
@@ -253,7 +286,14 @@ function EndpointRow({
         <button className="link" onClick={listModels} disabled={probing}>
           {probing ? "asking…" : models.length ? "refresh" : "list models"}
         </button>
-        {endpoint.vision && <span className="status-tag modified">vision</span>}
+        <label className="muted small" title="whether this endpoint's model can read images and PDF pages">
+          <input
+            type="checkbox"
+            checked={endpoint.vision}
+            onChange={(e) => onVision(endpoint.name, e.target.checked)}
+          />{" "}
+          reads images
+        </label>
         <span className="spacer" />
         <button className="link" onClick={onRemove}>
           Remove
@@ -264,6 +304,38 @@ function EndpointRow({
         // documents actually go, and that is worth seeing at a glance.
         <div className="muted small mono">→ {endpoint.base_url}</div>
       )}
+      {caps?.[endpoint.model]?.length ? (
+        // Visible because the differences matter and are otherwise invisible:
+        // a `thinking` model emits chain-of-thought a caller has to strip, and
+        // one without `tools` will not call a tool however the prompt is
+        // written. Both look like the model misbehaving.
+        <div className="cap-row">
+          {caps[endpoint.model].map((c) => (
+            <span className={`cap ${CAP_CLASS[c] ?? ""}`} key={c} title={CAP_HELP[c] ?? c}>
+              {c}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {caps !== null && (() => {
+        const known = models.includes(endpoint.model);
+        const seen = caps[endpoint.model];
+        if (!known || !seen) return null;      // unknown is not incapable
+        const canSee = seen.includes("vision");
+        if (canSee === endpoint.vision) return null;
+        // The flag is a claim about the model; the server just answered the
+        // same question directly. Where they disagree, say so and offer the
+        // correction rather than leaving a route that fails at request time.
+        return (
+          <div className="muted small">
+            {endpoint.model} {canSee ? "can" : "cannot"} read images, but this
+            endpoint is marked {endpoint.vision ? "vision-capable" : "text-only"}.{" "}
+            <button className="link" onClick={() => onVision(endpoint.name, canSee)}>
+              mark it {canSee ? "vision-capable" : "text-only"}
+            </button>
+          </div>
+        );
+      })()}
       {endpoint.needs_key ? (
         <div className="row">
           <input
@@ -433,15 +505,27 @@ function NewEndpoint({
   );
 }
 
+// What each capability means for how a model behaves here. Written out because
+// the consequences are concrete and none of them are guessable from the name.
+const CAP_HELP: Record<string, string> = {
+  vision: "can read images and PDF pages — required for the datasheet_vision task",
+  tools: "can call tools; without this it will not, however the prompt is written",
+  thinking: "emits chain-of-thought that has to be parsed out of the reply",
+  completion: "ordinary text generation",
+  embedding: "produces embeddings rather than replies",
+  insert: "supports fill-in-the-middle",
+};
+const CAP_CLASS: Record<string, string> = { vision: "cap-vision", thinking: "cap-thinking" };
+
 // -- task routing ------------------------------------------------------------
 
 const TASK_HELP: Record<string, string> = {
   default: "Anything without its own route.",
-  chat: "The design chat in the workbench.",
+  chat: "The design chat in the workbench. A model with the thinking capability reasons before answering, which suits open-ended design questions.",
   stage0: "Markdown re-read — mechanical, a cheap model is fine.",
   stage1: "MPN → package → library hints. Hallucinated footprints are expensive here.",
-  datasheet_vision: "Reads PDF pages. Must be vision-capable.",
-  review_panel: "Every endpoint listed runs, and their findings are merged with attribution.",
+  datasheet_vision: "Reads PDF pages. Must be vision-capable — a model without the vision capability cannot serve this at all.",
+  review_panel: "Every endpoint listed runs, and their findings are merged with attribution — so its value comes from listing models that differ, not several of the same one.",
 };
 
 function Routing({
@@ -545,6 +629,16 @@ function Routing({
                       ))}
                     </select>
                     <span className="mono">{ep.name}</span>
+                    {(data.endpoint_capabilities?.[ep.name] ?? []).map((c) => (
+                      <span
+                        className={`cap ${CAP_CLASS[c] ?? ""}`}
+                        key={c}
+                        title={CAP_HELP[c] ?? c}
+                      >
+                        {c}
+                      </span>
+                    ))}
+                    <span className="spacer" />
                     {used && at === 0 && <span className="muted small">tried first</span>}
                     {used && at > 0 && (
                       <span className="muted small">fallback {at}</span>

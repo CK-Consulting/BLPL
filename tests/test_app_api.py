@@ -7,6 +7,7 @@ lives in conftest.py — it is shared with the reference/conversation API tests.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -650,3 +651,45 @@ def test_a_key_can_be_checked_before_it_is_stored(unlocked) -> None:
     assert "could not reach" in r.json()["detail"]
     # …and nothing was written.
     assert unlocked.get("/api/settings").json()["secrets"] == []
+
+
+def test_capabilities_are_reported_per_model(unlocked, monkeypatch) -> None:
+    """Ollama publishes what each model can do. Asked rather than inferred: a
+    `thinking` model emits chain-of-thought a caller has to strip, and one
+    without `tools` will not call a tool however the prompt is written — both
+    of which look like the model misbehaving if you cannot see the difference.
+    """
+    import app.main as main
+
+    shown = {
+        "qwen2.5vl:7b": ["completion", "vision"],
+        "kicad-4b": ["completion", "thinking", "tools"],
+    }
+
+    class FakeResp:
+        def __init__(self, payload): self._p = payload
+        def read(self): return json.dumps(self._p).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_open(req, timeout=0):
+        body = json.loads(req.data)
+        return FakeResp({"capabilities": shown[body["model"]]})
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", fake_open)
+    caps = main._model_capabilities(
+        "ollama", "http://ollama:11434/api/tags", list(shown), {}
+    )
+    assert caps["qwen2.5vl:7b"] == ["completion", "vision"]
+    assert caps["kicad-4b"] == ["completion", "thinking", "tools"]
+
+
+def test_a_model_that_will_not_answer_is_unknown_not_incapable(unlocked, monkeypatch) -> None:
+    """The distinction this codebase keeps everywhere: silence is not a no."""
+    import app.main as main
+
+    def boom(*a, **k):
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", boom)
+    assert main._model_capabilities("ollama", "http://x/api/tags", ["m"], {}) == {}

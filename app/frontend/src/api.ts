@@ -255,6 +255,8 @@ export type Settings = {
   effective: Record<string, string[]>;
   /** Configurations that are legal but will fail at request time. */
   warnings: string[];
+  /** endpoint name → what its chosen model can do, where the server will say. */
+  endpoint_capabilities: Record<string, string[]>;
   known_kinds: string[];
   known_tasks: string[];
   vision_tasks: string[];

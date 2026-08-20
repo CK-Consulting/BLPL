@@ -756,6 +756,13 @@ def get_settings(
         # blind endpoint the task breaks at request time rather than at save
         # time. Refusing the config outright would be wrong — the default chain
         # is legitimate for every other task — so it is reported instead.
+        # What each endpoint's chosen model can actually do. Surfaced here, not
+        # only in the endpoint editor, because task routing is where the
+        # difference bites: review_panel wants several genuinely different
+        # models, chat is better with one that reasons, and datasheet_vision
+        # simply cannot be served by a model that does not see. None of that is
+        # guessable from an endpoint's name.
+        "endpoint_capabilities": _endpoint_capabilities(cfg),
         "warnings": [
             f"{t} reads images, but with no route of its own it falls back to "
             f"{cfg.chain_for(t)}, which cannot see. Give it its own route."
@@ -892,7 +899,127 @@ def probe_models(
             if isinstance(m, dict)
         }
     )
-    return {"kind": kind, "asked": True, "url": url, "models": [n for n in names if n]}
+    names = [n for n in names if n]
+    return {
+        "kind": kind,
+        "asked": True,
+        "url": url,
+        "models": names,
+        # Which of them can actually read an image. Asked rather than assumed:
+        # `vision = true` on an endpoint whose model is blind produces a
+        # datasheet_vision route that validates fine and then fails at request
+        # time, which is the least useful place to discover it.
+        "capabilities": _model_capabilities(kind, url, names, headers),
+    }
+
+
+def _endpoint_capabilities(cfg) -> dict[str, list[str]]:
+    """Capabilities per configured endpoint, for the kinds that will say.
+
+    Cheap enough to do on a settings load: one local HTTP call per endpoint,
+    against a server on the same host or LAN. Hosted providers are skipped —
+    probing them is a billable call and their catalogues are documented.
+
+    An endpoint missing from the result is *unknown*, not incapable.
+    """
+    out: dict[str, list[str]] = {}
+    for name, ep in cfg.endpoints.items():
+        if ep.kind not in ("ollama", "openai-compatible"):
+            continue
+        model = ep.resolved_model()
+        if not model:
+            continue
+        try:
+            if ep.kind == "ollama":
+                base = ep.base_url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+                url = _normalise_base(base).rstrip("/") + "/api/tags"
+            else:
+                if not ep.base_url:
+                    continue
+                url = _normalise_base(ep.base_url).rstrip("/") + "/models"
+            caps = _model_capabilities(ep.kind, url, [model], {})
+            if caps.get(model):
+                out[name] = caps[model]
+        except Exception:
+            continue
+    return out
+
+
+def _model_capabilities(
+    kind: str, url: str, names: list[str], headers: dict
+) -> dict[str, list[str]]:
+    """What each model can do, asked of the server rather than inferred.
+
+    Ollama publishes this directly: ``/api/show`` returns a capability list —
+    ``vision``, ``tools``, ``thinking``, ``completion``, ``embedding`` — which
+    is free, authoritative, and explains behaviour that is otherwise puzzling.
+    A model tagged ``thinking`` emits chain-of-thought that a caller has to
+    parse out; one without ``tools`` will not call a tool no matter how the
+    prompt is written.
+
+    An OpenAI-compatible server does not publish capabilities, so vision is
+    established the only definitive way: send a one-pixel image and see whether
+    it refuses. vLLM answers "is not a multimodal model" with a 400, which
+    beats guessing from the model's name.
+
+    A model absent from the result is *unknown*, not incapable — the same
+    distinction the rest of this codebase keeps. Hosted providers are left
+    unknown deliberately: their catalogues are large, probing is a billable
+    call per model, and their capabilities are documented.
+    """
+    caps: dict[str, list[str]] = {}
+
+    if kind == "ollama":
+        base = url[: -len("/api/tags")]
+        for n in names:
+            try:
+                req = urllib.request.Request(
+                    base + "/api/show",
+                    data=json.dumps({"model": n}).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    got = json.loads(r.read()).get("capabilities") or []
+                if got:
+                    caps[n] = sorted(str(c) for c in got)
+            except Exception:
+                continue
+        return caps
+
+    if kind == "openai-compatible" and len(names) <= 4:
+        # Bounded: a server hosting one or two models is worth probing; a
+        # gateway fronting two hundred is not.
+        base = url[: -len("/models")]
+        for n in names:
+            body = {
+                "model": n, "max_tokens": 1,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "."},
+                    {"type": "image_url", "image_url": {"url": _ONE_PIXEL_PNG}},
+                ]}],
+            }
+            try:
+                req = urllib.request.Request(
+                    base + "/chat/completions", data=json.dumps(body).encode(),
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=20):
+                    caps[n] = ["completion", "vision"]
+            except urllib.error.HTTPError:
+                caps[n] = ["completion"]     # answered, and refused the image
+            except Exception:
+                continue                      # no answer — unknown, not blind
+        return caps
+
+    return caps
+
+
+# A 1x1 red PNG. Small enough that probing costs nothing and any server that
+# can decode an image at all will accept it.
+_ONE_PIXEL_PNG = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAA"
+    "DUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 
 def _normalise_base(base: str) -> str:
