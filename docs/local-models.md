@@ -55,12 +55,50 @@ through the `datasheet_vision` task.
 
 ## Thor — one large model
 
-Thor is **not** a DGX Spark, and the difference decides whether NVIDIA's Spark
-cookbook applies: Thor is compute capability **11.0** (sm_110), Spark's GB10 is
-**12.1** (sm_121). NVFP4 kernels are compiled per-arch. The cookbook already
-forces `marlin` for both the GEMM and MoE paths, which is the portable route
-rather than the cutlass FP4 one, so it is plausible — but it is not the same
-chip and this is the thing to check first if it will not start.
+Thor is **not** a DGX Spark: Thor is compute capability **11.0** (sm_110),
+Spark's GB10 is **12.1** (sm_121), and NVFP4 kernels compile per-arch. That
+looked like the risk. It is not — `vllm/vllm-openai:v0.20.0` (arm64) reports
+
+```
+archs: ['sm_80', 'sm_90', 'sm_100', 'sm_110', 'sm_120']
+NVIDIA Thor sm_110 — 28.9 TFLOP/s bf16 (4096³ matmul)
+```
+
+so the stock image already carries kernels for this chip and needs no
+Jetson-specific build.
+
+**Two L4T differences do stand in the way, and both masquerade as the
+architecture problem.**
+
+*`--gpus` is rejected.* The hook answers "invoking the NVIDIA Container Runtime
+Hook directly is not supported. Please use the NVIDIA Container Runtime". Use
+`--runtime=nvidia`. The cookbook says `--gpus all` because it targets Spark.
+
+*No driver library is injected.* Neither
+`/etc/nvidia-container-runtime/host-files-for-container.d/drivers.csv` nor the
+CDI spec at `/var/run/cdi/nvidia.yaml` mentions `libcuda` — `grep -c` returns 0
+for both. The container therefore resolves `libcuda` to the CUDA **compat** stub
+baked into the image, which is built for discrete GPUs (driver 580.95.05) and
+cannot drive Tegra.
+
+The symptom is what makes this expensive: there is no error. Torch reports
+
+```
+cuda available: False
+archs: []
+```
+
+An empty arch list reads exactly like "this image has no kernels for your GPU",
+which points at rebuilding for sm_110 — the one thing that was never wrong. The
+fix is a bind mount:
+
+```
+-v $(readlink -f /usr/lib/aarch64-linux-gnu/libcuda.so.1):/usr/lib/aarch64-linux-gnu/libcuda.so.1:ro
+-e LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/local/cuda/lib64
+```
+
+On this machine that symlink resolves to
+`/opt/nvidia/l4t-gpu-libs/openrm/libcuda.so.1.1`.
 
 Memory is not the constraint people expect. Only 8 of 88 layers are attention
 (the rest are Mamba and MoE) with 2 KV heads, so the KV cache is **4 KB/token**
