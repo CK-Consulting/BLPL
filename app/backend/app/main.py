@@ -779,11 +779,30 @@ def get_settings(
     }
 
 
-@app.get("/api/settings/llm/models")
+class ProbeBody(BaseModel):
+    """What to ask, and optionally the key to ask with.
+
+    ``api_key`` exists for the sequence that otherwise cannot be completed: a
+    hosted provider will not list its catalogue without a key, and until this
+    existed a key could only be attached to an endpoint that had already been
+    saved — which meant saving a guessed model name first, which is the thing
+    the listing is for.
+
+    The key is used for this one request and never stored. It travels in a body
+    rather than a query string because query strings end up in access logs,
+    proxy logs and browser history, and none of those are places for a
+    credential.
+    """
+
+    kind: str
+    base_url: str = ""
+    name: str = ""
+    api_key: str = ""
+
+
+@app.post("/api/settings/llm/models")
 def probe_models(
-    kind: str,
-    base_url: str = "",
-    name: str = "",
+    body: ProbeBody,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -806,13 +825,19 @@ def probe_models(
     empty list. A server that is down still has models; it just is not saying
     which, and those two answers must not look the same in a dropdown.
     """
+    kind, base_url, name = body.kind, body.base_url, body.name
     if name:
         saved = llmconfig.load(session, user).endpoints.get(name)
         if saved is not None:
             kind = kind or saved.kind
             base_url = base_url or saved.base_url
 
-    key = keystore.get(session, master_key, user, name) if name else None
+    # A key typed into the form wins over a stored one, so a key can be checked
+    # before it is committed — and a replacement can be verified before it
+    # replaces one that currently works.
+    key = body.api_key or (
+        keystore.get(session, master_key, user, name) if name else None
+    )
     headers: dict[str, str] = {}
     field = "data"
 
@@ -830,7 +855,7 @@ def probe_models(
         if not key:
             raise HTTPException(
                 status_code=400,
-                detail="add this endpoint's API key first — OpenAI will not list models without one",
+                detail="OpenAI will not list models without a key — paste one above and try again",
             )
         url = (_normalise_base(base_url).rstrip("/") if base_url else "https://api.openai.com/v1") + "/models"
         headers["Authorization"] = f"Bearer {key}"
@@ -838,7 +863,7 @@ def probe_models(
         if not key:
             raise HTTPException(
                 status_code=400,
-                detail="add this endpoint's API key first — Anthropic will not list models without one",
+                detail="Anthropic will not list models without a key — paste one above and try again",
             )
         url = (_normalise_base(base_url).rstrip("/") if base_url else "https://api.anthropic.com/v1") + "/models"
         headers["x-api-key"] = key

@@ -617,17 +617,36 @@ def test_listing_models_needs_a_key_for_hosted_providers(unlocked) -> None:
     """Anthropic and OpenAI will not enumerate their catalogue anonymously, and
     saying so beats a 401 relayed from upstream."""
     for kind in ("anthropic", "openai"):
-        r = unlocked.get("/api/settings/llm/models", params={"kind": kind})
+        r = unlocked.post("/api/settings/llm/models", json={"kind": kind})
         assert r.status_code == 400, r.text
-        assert "API key" in r.json()["detail"]
+        assert "without a key" in r.json()["detail"]
 
 
 def test_an_unreachable_server_is_not_an_empty_catalogue(unlocked) -> None:
     """"No models" and "could not ask" are different answers. Collapsing them
     would show an empty dropdown for a server that simply is not running."""
-    r = unlocked.get(
+    r = unlocked.post(
         "/api/settings/llm/models",
-        params={"kind": "ollama", "base_url": "127.0.0.1:1"},
+        json={"kind": "ollama", "base_url": "127.0.0.1:1"},
     )
     assert r.status_code == 502
     assert "could not reach" in r.json()["detail"]
+
+
+def test_a_key_can_be_checked_before_it_is_stored(unlocked) -> None:
+    """The sequence that was impossible: a hosted provider will not list models
+    without a key, and a key could only be attached to an endpoint that already
+    existed — so the model name had to be guessed before it could be looked up.
+
+    A key in the body is used for the request and not stored; the 502 here is
+    the upstream refusing a fake key, which proves it got that far rather than
+    being turned away locally for having none.
+    """
+    r = unlocked.post(
+        "/api/settings/llm/models",
+        json={"kind": "anthropic", "api_key": "sk-ant-not-a-real-key"},
+    )
+    assert r.status_code == 502, r.text
+    assert "could not reach" in r.json()["detail"]
+    # …and nothing was written.
+    assert unlocked.get("/api/settings").json()["secrets"] == []

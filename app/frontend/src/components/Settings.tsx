@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { EndpointConfig, Settings as SettingsData, del, getJSON, putJSON } from "../api";
+import { EndpointConfig, Settings as SettingsData, del, getJSON, postJSON, putJSON } from "../api";
 import { PasskeyInfo, enrolPasskey, passkeysAvailable } from "../passkey";
 
 /**
@@ -104,6 +104,11 @@ function Endpoints({
     }
   };
 
+  const setModel = async (name: string, model: string) => {
+    if (!model) return;
+    await save(data.endpoints.map((e) => (e.name === name ? { ...e, model } : e)));
+  };
+
   const remove = async (name: string) => {
     // Dropping an endpoint that a task still routes to would fail validation
     // server-side; clear it from the routes here so the message is about what
@@ -135,6 +140,7 @@ function Endpoints({
           onRemove={() => remove(ep.name)}
           onChanged={onChanged}
           onError={onError}
+          onModel={setModel}
         />
       ))}
       {adding ? (
@@ -142,8 +148,20 @@ function Endpoints({
           kinds={data.known_kinds}
           existing={data.endpoints.map((e) => e.name)}
           onCancel={() => setAdding(false)}
-          onAdd={async (ep) => {
+          onAdd={async (ep, apiKey) => {
             await save([...data.endpoints, ep]);
+            // Saved after the endpoint exists, because the secret is stored
+            // under the endpoint's name. A key typed to list models would
+            // otherwise be discarded on Add, and the endpoint would arrive
+            // unusable for the same reason it was unusable before.
+            if (apiKey) {
+              try {
+                await putJSON(`/api/settings/secrets/${ep.name}`, { value: apiKey });
+                onChanged();
+              } catch (e) {
+                onError((e as Error).message);
+              }
+            }
             setAdding(false);
           }}
         />
@@ -162,15 +180,38 @@ function EndpointRow({
   onRemove,
   onChanged,
   onError,
+  onModel,
 }: {
   endpoint: EndpointConfig;
   keyedAt?: string;
   onRemove: () => void;
   onChanged: () => void;
   onError: (m: string) => void;
+  onModel: (name: string, model: string) => Promise<void>;
 }) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
+  const [models, setModels] = useState<string[]>([]);
+  const [probing, setProbing] = useState(false);
+
+  // A saved endpoint could not have its model corrected at all: the row showed
+  // the name and offered no way to change it, so a guessed or stale model meant
+  // deleting the endpoint and its key and starting again.
+  const listModels = async () => {
+    setProbing(true);
+    try {
+      const r = await postJSON<{ models: string[]; detail?: string }>(
+        "/api/settings/llm/models",
+        { kind: endpoint.kind, base_url: endpoint.base_url, name: endpoint.name },
+      );
+      setModels(r.models);
+      if (!r.models.length) onError(r.detail ?? "no models listed");
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setProbing(false);
+    }
+  };
 
   const setKey = async () => {
     setBusy(true);
@@ -192,7 +233,26 @@ function EndpointRow({
         <span className="chip">
           <span className="mono">{endpoint.kind}</span>
         </span>
-        <span className="muted mono small">{endpoint.model}</span>
+        {models.length ? (
+          <select
+            value={models.includes(endpoint.model) ? endpoint.model : ""}
+            onChange={(e) => onModel(endpoint.name, e.target.value)}
+          >
+            <option value="">
+              {endpoint.model ? `${endpoint.model} (not offered)` : "choose a model…"}
+            </option>
+            {models.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="muted mono small">{endpoint.model}</span>
+        )}
+        <button className="link" onClick={listModels} disabled={probing}>
+          {probing ? "asking…" : models.length ? "refresh" : "list models"}
+        </button>
         {endpoint.vision && <span className="status-tag modified">vision</span>}
         <span className="spacer" />
         <button className="link" onClick={onRemove}>
@@ -232,7 +292,7 @@ function NewEndpoint({
 }: {
   kinds: string[];
   existing: string[];
-  onAdd: (ep: EndpointConfig) => void;
+  onAdd: (ep: EndpointConfig, apiKey: string) => void;
   onCancel: () => void;
 }) {
   const [name, setName] = useState("");
@@ -244,6 +304,7 @@ function NewEndpoint({
   const [models, setModels] = useState<string[]>([]);
   const [probing, setProbing] = useState(false);
   const [probeNote, setProbeNote] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState("");
 
   const compatible = kind === "openai-compatible";
   const clash = existing.includes(name);
@@ -257,9 +318,12 @@ function NewEndpoint({
     setProbing(true);
     setProbeNote(null);
     try {
-      const q = new URLSearchParams({ kind, base_url: baseUrl, name });
-      const r = await getJSON<{ models: string[]; asked: boolean; detail?: string }>(
-        `/api/settings/llm/models?${q}`,
+      // POSTed, not queried: a key in a URL ends up in access logs, proxy logs
+      // and browser history. It is used for this one request and not stored —
+      // saving it is a separate, deliberate step below.
+      const r = await postJSON<{ models: string[]; asked: boolean; detail?: string }>(
+        "/api/settings/llm/models",
+        { kind, base_url: baseUrl, name, api_key: apiKey },
       );
       setModels(r.models);
       if (!r.models.length) {
@@ -303,6 +367,16 @@ function NewEndpoint({
         </button>
       </div>
       {probeNote && <div className="muted small">{probeNote}</div>}
+      {!keyless && (
+        <div className="row wrap">
+          <input
+            type="password"
+            placeholder="API key — needed to list models, and saved with the endpoint"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+          />
+        </div>
+      )}
       {(compatible || kind === "ollama") && (
         <div className="row wrap">
           <input
@@ -333,18 +407,20 @@ function NewEndpoint({
         <button
           disabled={!ok}
           onClick={() =>
-            onAdd({
-              name,
-              kind,
-              model,
-              base_url: baseUrl,
-              auth: keyless ? "none" : auth,
-              vision,
-              needs_key: auth !== "none" && kind !== "ollama",
-              // A brand-new endpoint has nothing typed into it yet; the reload
-              // after Add replaces this with the server's answer.
-              has_key: auth === "none" || kind === "ollama",
-            })
+            onAdd(
+              {
+                name,
+                kind,
+                model,
+                base_url: baseUrl,
+                auth: keyless ? "none" : auth,
+                vision,
+                needs_key: !keyless && auth !== "none",
+                // The reload after Add replaces this with the server's answer.
+                has_key: keyless || Boolean(apiKey),
+              },
+              apiKey,
+            )
           }
         >
           Add
