@@ -488,3 +488,55 @@ def test_a_released_datasheet_still_opens_in_the_browser(client) -> None:
     r = client.get("/api/projects/scratch/blob", params={"path": "datasheets/TPS62840.pdf"})
     assert r.status_code == 200
     assert "attachment" not in r.headers.get("content-disposition", "")
+
+
+def test_a_server_key_error_says_what_it_received(monkeypatch) -> None:
+    """The message used to state the requirement and never what arrived, so a
+    variable set to the key *file's path* produced a correct-but-unhelpful
+    sentence and a crash loop. The shape of a rejected value leaks nothing —
+    it is not a usable key — and it is usually the whole diagnosis."""
+    from app import serverkey
+
+    with pytest.raises(serverkey.ServerKeyError) as path_like:
+        serverkey._decode("data/server.key")
+    said = str(path_like.value)
+    assert "looks like a file path" in said
+    # Not "leave it unset": `load` only ever reads $BLPL_DATA_ROOT/server.key,
+    # and `load_or_create` mints a fresh key when that file is absent — so the
+    # obvious-sounding advice would orphan whatever the referenced key sealed.
+    assert "unset" in said and "unreadable" in said
+    assert "$BLPL_DATA_ROOT/server.key" in said
+
+    with pytest.raises(serverkey.ServerKeyError) as short:
+        serverkey._decode("deadbeef")
+    assert "8 characters" in str(short.value)
+
+
+def test_a_hex_server_key_is_accepted() -> None:
+    """64 hex characters are also valid base64, which decodes to 48 bytes and
+    would be rejected if the decoder stopped at the first thing that parsed."""
+    from app import serverkey
+
+    assert len(serverkey._decode("ab" * 32)) == 32
+    assert len(serverkey._decode(serverkey.encode(serverkey.generate()))) == 32
+
+
+def test_unsetting_a_key_that_is_elsewhere_would_mint_a_new_one(tmp_path) -> None:
+    """The reason the diagnostic no longer says "leave it unset".
+
+    An operator whose key lives at /run/secrets/server.key, told to unset the
+    variable, gets a brand-new key — and everything the old one sealed becomes
+    unreadable. This is that sequence, so the advice cannot drift back.
+    """
+    from app import serverkey
+
+    elsewhere = tmp_path / "secrets" / "server.key"
+    elsewhere.parent.mkdir(parents=True)
+    real = serverkey.generate()
+    elsewhere.write_text(serverkey.encode(real) + "\n")
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    assert serverkey.load(data_root) is None          # it does not look there
+    minted = serverkey.load_or_create(data_root)      # …it makes a new one
+    assert minted != real

@@ -114,9 +114,33 @@ def _decode(value: str) -> bytes:
         if len(candidate) == _KEY_LEN:
             raw = candidate
     if raw is None or len(raw) != _KEY_LEN:
+        # Say what arrived, not just what was wanted. The value is not a usable
+        # key, so describing its shape leaks nothing — and the shape is usually
+        # the whole diagnosis. The case this was written for: someone sets the
+        # variable to the *path* of the key file, which is a sentence the old
+        # message had no way to say.
+        looks_like_path = "/" in value or value.endswith(".key")
+        if looks_like_path:
+            # Deliberately not "leave it unset". Unsetting does not make the app
+            # read *that* path — `load` only ever reads
+            # $BLPL_DATA_ROOT/server.key, and `load_or_create` generates a fresh
+            # key when that file is absent. So the obvious-sounding advice would
+            # quietly mint a new key and orphan everything sealed under the old
+            # one. Say the two things that actually work instead.
+            hint = (
+                f" — got {len(value)} characters, which looks like a file path "
+                "rather than a key. This variable holds the key itself, so either "
+                "read the file into it (BLPL_SERVER_KEY=$(cat <path>)) or mount "
+                "that file at $BLPL_DATA_ROOT/server.key, which is the only path "
+                "this app reads. Do not simply unset it: with no key at that path "
+                "a new one is generated, and anything sealed under the old key "
+                "becomes unreadable"
+            )
+        else:
+            hint = f" — got {len(value)} characters, decoding to {len(raw) if raw else 0} bytes"
         raise ServerKeyError(
-            f"{_ENV_VAR} must decode to {_KEY_LEN} bytes (base64 or hex); "
-            "generate one with: python -c \"import os,base64; "
+            f"{_ENV_VAR} must decode to {_KEY_LEN} bytes (base64 or hex){hint}. "
+            "Generate one with: python -c \"import os,base64; "
             "print(base64.urlsafe_b64encode(os.urandom(32)).rstrip(b'=').decode())\""
         )
     return raw
