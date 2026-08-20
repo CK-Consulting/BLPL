@@ -779,70 +779,111 @@ def get_settings(
     }
 
 
-@app.get("/api/settings/llm/endpoints/{name}/models")
-def list_endpoint_models(
-    name: str,
+@app.get("/api/settings/llm/models")
+def probe_models(
+    kind: str,
+    base_url: str = "",
+    name: str = "",
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
 ) -> dict:
-    """The model names a local endpoint will actually answer to.
+    """Ask a provider which models it will actually answer to.
 
-    Ollama serves every model it holds on one port, so the port identifies the
-    server and the *model name* identifies the model — and the name has to match
-    exactly, tag included. `hf.co/21world/KiCAD-MCP-Qwen3.5-4B-GGUF:latest` is
-    not something anyone should be expected to type from memory, and a typo
-    produces a run that fails at request time rather than at save time.
+    Every kind here publishes a list, and every kind here has names that are not
+    guessable. Ollama serves everything it holds on one port, so the port
+    identifies the *server* and the name identifies the *model* —
+    `hf.co/21world/KiCAD-MCP-Qwen3.5-4B-GGUF:latest` is not a string anyone
+    should type from memory, and a typo becomes a run that fails at request
+    time rather than at save time. The hosted providers have the opposite
+    problem: their catalogues change under you, so a name that was right last
+    quarter quietly stops being right.
 
-    So the server is asked what it has. Read-only, no key needed for the kinds
-    that support it, and a failure here is reported as "could not ask" rather
-    than as an empty list — a server that is down has models, it just is not
-    saying which.
+    Asked by kind and URL rather than by saved endpoint, because the moment this
+    is most needed is while *adding* one, when there is nothing saved to look up.
+
+    A provider that cannot be reached is reported as such rather than as an
+    empty list. A server that is down still has models; it just is not saying
+    which, and those two answers must not look the same in a dropdown.
     """
-    cfg = llmconfig.load(session, user)
-    ep = cfg.endpoints.get(name)
-    if ep is None:
-        raise HTTPException(status_code=404, detail=f"no endpoint {name!r}")
+    if name:
+        saved = llmconfig.load(session, user).endpoints.get(name)
+        if saved is not None:
+            kind = kind or saved.kind
+            base_url = base_url or saved.base_url
 
-    if ep.kind == "ollama":
-        # Same precedence as blpl.core.llm_chat uses to actually send a
-        # request, so discovery cannot end up asking a different server than
-        # the one that will serve the model it finds.
-        base = ep.base_url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
-        url = base.rstrip("/") + "/api/tags"
-        key = "models"
-    elif ep.kind == "openai-compatible":
-        if not ep.base_url:
-            raise HTTPException(status_code=400, detail=f"{name} has no base_url")
-        url = ep.base_url.rstrip("/") + "/models"
-        key = "data"
+    key = keystore.get(session, master_key, user, name) if name else None
+    headers: dict[str, str] = {}
+    field = "data"
+
+    if kind == "ollama":
+        base = base_url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+        url = _normalise_base(base).rstrip("/") + "/api/tags"
+        field = "models"
+    elif kind == "openai-compatible":
+        if not base_url:
+            raise HTTPException(status_code=400, detail="openai-compatible needs a base_url")
+        url = _normalise_base(base_url).rstrip("/") + "/models"
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+    elif kind == "openai":
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="add this endpoint's API key first — OpenAI will not list models without one",
+            )
+        url = (_normalise_base(base_url).rstrip("/") if base_url else "https://api.openai.com/v1") + "/models"
+        headers["Authorization"] = f"Bearer {key}"
+    elif kind == "anthropic":
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="add this endpoint's API key first — Anthropic will not list models without one",
+            )
+        url = (_normalise_base(base_url).rstrip("/") if base_url else "https://api.anthropic.com/v1") + "/models"
+        headers["x-api-key"] = key
+        # Required on every Anthropic request; without it the API refuses
+        # rather than defaulting to anything.
+        headers["anthropic-version"] = "2023-06-01"
     else:
-        # Hosted providers publish a fixed catalogue that is not worth probing
-        # per user, and asking costs a billable call.
-        return {"endpoint": name, "kind": ep.kind, "models": [], "asked": False,
-                "detail": f"{ep.kind} models are not discovered from the server"}
+        return {"kind": kind, "models": [], "asked": False,
+                "detail": f"no model listing is defined for kind {kind!r}"}
 
     try:
-        with urllib.request.urlopen(url, timeout=8) as r:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as r:
             payload = json.loads(r.read())
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"could not ask {name} for its models ({type(exc).__name__}: {exc})",
+            detail=f"could not reach {url} ({type(exc).__name__}: {exc})",
         )
 
-    rows = payload.get(key) or []
+    rows = payload.get(field) or []
     names = sorted(
-        str(m.get("model") or m.get("name") or m.get("id") or "").strip()
-        for m in rows
-        if isinstance(m, dict)
+        {
+            str(m.get("model") or m.get("name") or m.get("id") or "").strip()
+            for m in rows
+            if isinstance(m, dict)
+        }
     )
-    return {
-        "endpoint": name,
-        "kind": ep.kind,
-        "models": [n for n in names if n],
-        "asked": True,
-        "current": ep.resolved_model(),
-    }
+    return {"kind": kind, "asked": True, "url": url, "models": [n for n in names if n]}
+
+
+def _normalise_base(base: str) -> str:
+    """Accept what an operator actually types.
+
+    `ollama:11434`, `blpl-ollama` and `172.18.0.8:11434` are all reasonable
+    things to write in a box labelled "base URL", and every one of them fails as
+    a URL because it has no scheme — urllib reads the host as a relative path
+    and the request goes nowhere, with an error naming neither problem. A
+    missing scheme is not ambiguous here, so it is filled in rather than
+    refused.
+    """
+    base = base.strip()
+    if base and "://" not in base:
+        base = "http://" + base
+    return base
 
 
 class EndpointBody(BaseModel):

@@ -597,3 +597,37 @@ def test_a_task_can_be_unset_so_it_inherits_again(unlocked) -> None:
     got = unlocked.get("/api/settings").json()
     assert "chat" not in got["tasks"]
     assert got["effective"]["chat"] == ["opus"]
+
+
+def test_a_scheme_is_filled_in_rather_than_refused(client) -> None:
+    """`ollama:11434`, `blpl-ollama` and a bare IP are all reasonable things to
+    type in a box labelled "base URL", and every one fails as a URL because it
+    has no scheme — urllib reads the host as a relative path and the request
+    goes nowhere, naming neither problem."""
+    from app.main import _normalise_base
+
+    for typed in ("ollama:11434", "blpl-ollama", "172.18.0.8:11434"):
+        assert _normalise_base(typed).startswith("http://"), typed
+    # An explicit scheme is left alone.
+    assert _normalise_base("https://api.openai.com/v1") == "https://api.openai.com/v1"
+    assert _normalise_base("") == ""
+
+
+def test_listing_models_needs_a_key_for_hosted_providers(unlocked) -> None:
+    """Anthropic and OpenAI will not enumerate their catalogue anonymously, and
+    saying so beats a 401 relayed from upstream."""
+    for kind in ("anthropic", "openai"):
+        r = unlocked.get("/api/settings/llm/models", params={"kind": kind})
+        assert r.status_code == 400, r.text
+        assert "API key" in r.json()["detail"]
+
+
+def test_an_unreachable_server_is_not_an_empty_catalogue(unlocked) -> None:
+    """"No models" and "could not ask" are different answers. Collapsing them
+    would show an empty dropdown for a server that simply is not running."""
+    r = unlocked.get(
+        "/api/settings/llm/models",
+        params={"kind": "ollama", "base_url": "127.0.0.1:1"},
+    )
+    assert r.status_code == 502
+    assert "could not reach" in r.json()["detail"]

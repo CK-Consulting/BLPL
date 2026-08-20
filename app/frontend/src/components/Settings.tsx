@@ -241,10 +241,39 @@ function NewEndpoint({
   const [baseUrl, setBaseUrl] = useState("");
   const [auth, setAuth] = useState("vault");
   const [vision, setVision] = useState(false);
+  const [models, setModels] = useState<string[]>([]);
+  const [probing, setProbing] = useState(false);
+  const [probeNote, setProbeNote] = useState<string | null>(null);
 
   const compatible = kind === "openai-compatible";
   const clash = existing.includes(name);
   const ok = name && !clash && (!compatible || baseUrl);
+
+  // Ollama needs no key, so it is the one kind that cannot be locked out of
+  // its own model list by an auth setting that does not apply to it.
+  const keyless = kind === "ollama";
+
+  const probe = async () => {
+    setProbing(true);
+    setProbeNote(null);
+    try {
+      const q = new URLSearchParams({ kind, base_url: baseUrl, name });
+      const r = await getJSON<{ models: string[]; asked: boolean; detail?: string }>(
+        `/api/settings/llm/models?${q}`,
+      );
+      setModels(r.models);
+      if (!r.models.length) {
+        // "None" and "could not ask" are different answers and must not look
+        // the same in a dropdown.
+        setProbeNote(r.detail ?? "the server answered, but listed no models");
+      }
+    } catch (e) {
+      setModels([]);
+      setProbeNote((e as Error).message);
+    } finally {
+      setProbing(false);
+    }
+  };
 
   return (
     <div className="endpoint-row new">
@@ -257,19 +286,42 @@ function NewEndpoint({
             </option>
           ))}
         </select>
-        <input placeholder="model" value={model} onChange={(e) => setModel(e.target.value)} />
+        {models.length ? (
+          <select value={model} onChange={(e) => setModel(e.target.value)}>
+            <option value="">choose a model…</option>
+            {models.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input placeholder="model" value={model} onChange={(e) => setModel(e.target.value)} />
+        )}
+        <button className="link" onClick={probe} disabled={probing || (compatible && !baseUrl)}>
+          {probing ? "asking…" : models.length ? "refresh list" : "list models"}
+        </button>
       </div>
+      {probeNote && <div className="muted small">{probeNote}</div>}
       {(compatible || kind === "ollama") && (
         <div className="row wrap">
           <input
-            placeholder={compatible ? "base URL (required, e.g. http://127.0.0.1:8080/v1)" : "base URL (optional)"}
+            placeholder={
+              compatible
+                ? "base URL (required, e.g. http://127.0.0.1:8080/v1)"
+                : "base URL — leave blank to use OLLAMA_HOST (http://ollama:11434)"
+            }
             value={baseUrl}
             onChange={(e) => setBaseUrl(e.target.value)}
           />
-          <select value={auth} onChange={(e) => setAuth(e.target.value)}>
-            <option value="vault">needs a key</option>
-            <option value="none">no auth</option>
-          </select>
+          {keyless ? (
+            <span className="muted small">no key — Ollama does not authenticate</span>
+          ) : (
+            <select value={auth} onChange={(e) => setAuth(e.target.value)}>
+              <option value="vault">needs a key</option>
+              <option value="none">no auth</option>
+            </select>
+          )}
         </div>
       )}
       <label className="muted small">
@@ -286,7 +338,7 @@ function NewEndpoint({
               kind,
               model,
               base_url: baseUrl,
-              auth,
+              auth: keyless ? "none" : auth,
               vision,
               needs_key: auth !== "none" && kind !== "ollama",
               // A brand-new endpoint has nothing typed into it yet; the reload
