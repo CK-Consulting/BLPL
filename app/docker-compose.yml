@@ -180,6 +180,52 @@ services:
   # version across the deployment — two would be a way for a stage to behave
   # differently depending on which container ran it.
 
+  # Local model serving on the host GPU. Ollama rather than vLLM or NIM for
+  # this box, for three reasons that are specific rather than preference:
+  #
+  #   * It keeps several models resident and swaps them on demand
+  #     (OLLAMA_MAX_LOADED_MODELS). vLLM and NIM are one model per process, so
+  #     three specialised models would mean three servers splitting 32 GB and
+  #     three sets of weights pinned whether or not anything is asking.
+  #   * Most community fine-tunes for this domain ship as GGUF, which is what
+  #     llama.cpp reads and what neither vLLM nor NIM will load.
+  #   * It speaks the OpenAI API at /v1, which is what blpl already routes to.
+  #
+  # The 5090 has 32 GB. That is the budget every model here shares, and it is
+  # the reason the mix is small specialised models rather than one large one —
+  # the large one lives on the Thor.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: blpl-ollama
+    profiles: ["local-models"]
+    restart: unless-stopped
+    networks:
+      - blpl
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      # Keep more than one resident so a text model and the vision model are
+      # both warm; a cold load of an 8 GB model is several seconds of latency
+      # on a request that was supposed to be quick.
+      - OLLAMA_MAX_LOADED_MODELS=3
+      - OLLAMA_KEEP_ALIVE=30m
+      # Serve concurrently rather than queueing, since stage runs and the chat
+      # can both be in flight.
+      - OLLAMA_NUM_PARALLEL=2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   worker:
     platform: linux/amd64
     container_name: blpl-worker
@@ -342,6 +388,7 @@ networks:
     external: true
 
 volumes:
+  ollama-models:
   clamav-db:
   # A named volume, not a bind mount under ./data like the rest of the app's
   # state. Postgres owns its data directory's permissions and ownership, and a
