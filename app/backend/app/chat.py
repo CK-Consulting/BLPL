@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -413,7 +414,13 @@ def _blocks_to_json(msg: Msg) -> list[dict]:
     return out
 
 
-def _blocks_from_json(raw: Iterable[dict], attachments_dir: Path | None = None) -> list:
+def _blocks_from_json(
+    raw: Iterable[dict],
+    attachments_dir: Path | None = None,
+    *,
+    keep: set[tuple[int, str]] | None = None,
+    index: int = 0,
+) -> list:
     blocks: list = []
     for b in raw or []:
         kind = b.get("type")
@@ -424,6 +431,21 @@ def _blocks_from_json(raw: Iterable[dict], attachments_dir: Path | None = None) 
             # shape of the history (the UI). Skip rather than fabricate: an
             # empty ImageBlock would be sent to the provider as a broken image.
             if attachments_dir is None:
+                continue
+            if keep is not None and (index, str(b.get("attachment", ""))) not in keep:
+                # Left out of this request by the budget, or already carried by
+                # a later message. Named, not dropped: the assistant has to know
+                # it is reasoning without the file rather than assume it has it.
+                name = b.get("name") or "file"
+                blocks.append(
+                    TextBlock(
+                        f"[{name} was attached earlier in this conversation and is not "
+                        "included again here, to keep the request within the provider's "
+                        "size limit. What was read from it is in the transcript above. "
+                        "If you need the file itself again, say so and ask for it to be "
+                        "re-attached, or read it from the project if it was saved there.]"
+                    )
+                )
                 continue
             data = attachments_store.read_b64(attachments_dir, b.get("attachment", ""))
             if data is None:
@@ -461,6 +483,92 @@ def _blocks_from_json(raw: Iterable[dict], attachments_dir: Path | None = None) 
     return blocks
 
 
+# How many bytes of base64-encoded attachment one request may carry.
+#
+# Every turn resends the whole conversation, attachments included, because that
+# is what a stateless chat API requires. What it does not require is sending the
+# same PDF twice in one request, or carrying a datasheet from twenty turns ago
+# that has already been read and written up.
+#
+# A real measurement, from the conversation that prompted this: 57k tokens of
+# text and **79.7 MB** of base64 PDFs, of which 34 MB was three files included
+# twice over. Anthropic's request limit is 32 MB. Every turn failed, and the
+# error said "request too large" without saying what was large about it.
+#
+# 16 MB leaves room for a long transcript under a 32 MB cap and still carries
+# several datasheets. Attachments on the newest message are always included:
+# dropping what someone just attached would be worse than a clear failure.
+_ATTACHMENT_BUDGET = int(os.environ.get("BLPL_ATTACHMENT_BUDGET_BYTES") or 16 * 1024 * 1024)
+
+
+def _attachment_budget(events: list[dict], attachments_dir: Path | None) -> set[tuple[int, str]]:
+    """Which (message index, attachment id) pairs are sent as bytes this turn.
+
+    Walked newest-first, because recency is the best available proxy for
+    relevance: the datasheet under discussion is the one just attached, and the
+    one from twenty turns ago has usually been read and its findings written
+    into the transcript — which is still there, and is a hundredth of the size.
+
+    Duplicates lose regardless of budget. The same file in two messages is the
+    same bytes twice in one request, and the provider gains nothing from the
+    second copy.
+    """
+    keep, _ = _plan_attachments(events, attachments_dir)
+    return keep
+
+
+def _plan_attachments(
+    events: list[dict], attachments_dir: Path | None
+) -> tuple[set[tuple[int, str]], list[str]]:
+    """The pairs to send, and the names of the files left behind."""
+    if attachments_dir is None:
+        return set(), []
+    keep: set[tuple[int, str]] = set()
+    seen: set[str] = set()
+    # Named once each. A file the user attached twice is one file, and listing
+    # it twice in "not sending X, X" reads like two separate problems.
+    dropped: set[str] = set()
+    left: list[str] = []
+    spent = 0
+    for i in range(len(events) - 1, -1, -1):
+        blocks = (events[i].get("metadata") or {}).get("blocks") or []
+        refs = [b for b in blocks if b.get("type") in ("image", "document") and b.get("attachment")]
+        for b in refs:
+            aid = str(b["attachment"])
+            name = str(b.get("name") or "file")
+            if aid in seen or aid in dropped:
+                continue  # already decided; a later message spoke for this file
+            path = attachments_store.path_of(attachments_dir, aid)
+            if path is None:
+                continue
+            # base64 is 4 bytes out for every 3 in, which is what actually
+            # travels; the size on disk understates the request by a third.
+            cost = (path.stat().st_size + 2) // 3 * 4
+            # The budget binds even the message just sent. Keeping one file
+            # regardless means attaching something is never a no-op; keeping all
+            # of them regardless was how three 8 MB datasheets on one message
+            # produced a 34 MB request against a 32 MB limit, every turn,
+            # forever.
+            if spent + cost > _ATTACHMENT_BUDGET and keep:
+                dropped.add(aid)
+                left.append(name)
+                continue
+            seen.add(aid)
+            spent += cost
+            keep.add((i, aid))
+    return keep, left
+
+
+def attachments_left_out(events: Iterable[dict], attachments_dir: Path | None) -> list[str]:
+    """Names of attachments this turn will not carry, newest-relevant first.
+
+    Separate from building the messages so the turn can *say* so. A request
+    silently missing the datasheet it is being asked about is the failure mode
+    to avoid — worse than the size error, because it looks like it worked.
+    """
+    return _plan_attachments(list(events), attachments_dir)[1]
+
+
 def history_to_messages(
     events: Iterable[dict], attachments_dir: Path | None = None
 ) -> list[Msg]:
@@ -470,12 +578,24 @@ def history_to_messages(
     would leave assistant turns referring to tool calls the provider can no
     longer see — which providers reject outright, and which would in any case
     strip the evidence the conversation was reasoning from.
+
+    Attachments are the exception, and have to be: they are bytes rather than
+    words, they are resent in full on every turn, and a handful of datasheets
+    outweighs the entire conversation by three orders of magnitude. What is left
+    behind is named rather than dropped silently — the assistant is told the
+    file was provided earlier and how to get it back, because an assistant
+    answering "as the datasheet shows" about a datasheet it did not receive is
+    the failure this is avoiding.
     """
+    events = list(events)
+    keep = _attachment_budget(events, attachments_dir)
     messages: list[Msg] = []
-    for ev in events:
+    for i, ev in enumerate(events):
         role = ev.get("role")
         meta = ev.get("metadata") or {}
-        blocks = _blocks_from_json(meta.get("blocks") or [], attachments_dir)
+        blocks = _blocks_from_json(
+            meta.get("blocks") or [], attachments_dir, keep=keep, index=i
+        )
         if role == "user":
             messages.append(Msg(role="user", content=blocks or [TextBlock(ev.get("content", ""))]))
         elif role == "assistant":
@@ -652,10 +772,22 @@ class ChatSessionManager:
         live.publish({"type": "start", "turn_id": live.turn_id, "model": req.endpoint.model,
                       "endpoint": req.endpoint.name})
         try:
-            messages = history_to_messages(
-                req.conversation.read_all(),
-                req.conversations_dir or req.conversation.path.parent,
-            )
+            events = list(req.conversation.read_all())
+            attachments_dir = req.conversations_dir or req.conversation.path.parent
+            messages = history_to_messages(events, attachments_dir)
+            # Said out loud, because the alternative is an answer written
+            # without a file the user believes was in front of it.
+            left = attachments_left_out(events, attachments_dir)
+            if left:
+                live.publish({
+                    "type": "note",
+                    "text": (
+                        f"Not sending {', '.join(left)} with this message — the request would "
+                        "be over the provider's size limit. What was already read from them is "
+                        "still in the transcript. Ask about one at a time, or save them into "
+                        "the project so they can be read from there."
+                    ),
+                })
             executor = ToolExecutor(
                 default_tools(req.kicad_url),
                 ctx,
