@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .appconfig import AppConfig
+from .appconfig import VISION_TASKS, AppConfig
 
 
 def key_env_var(endpoint_name: str) -> str:
@@ -65,16 +65,29 @@ def resolve_chain(
     """The ordered list of endpoints to try for a task, best first.
 
     An endpoint makes the cut if it needs no key (ollama, or ``auth = "none"``)
-    or the vault holds one under its name. Config order is preserved; unusable
-    endpoints are dropped, not reordered — so the chain is always a
-    sub-sequence of what you declared.
+    or the vault holds one under its name, **and** it can actually do what the
+    task requires. Config order is preserved; unusable endpoints are dropped,
+    not reordered — so the chain is always a sub-sequence of what you declared.
+
+    The capability filter is what makes an inherited route work. A task with no
+    route of its own falls back to ``default``, and a default chain is ordered
+    for general work — cheap local models first. For ``datasheet_vision`` that
+    put two text-only models at the head of the chain, and the caller, taking
+    only the first, concluded there was no vision endpoint at all. There was:
+    it was third. Dropping endpoints that cannot serve the task means the chain
+    handed back contains only endpoints that can, so its head is always usable.
     """
+    needs_vision = task in VISION_TASKS
     chain: list[ResolvedProvider] = []
     for name in config.chain_for(task):
         ep = config.endpoint(name)
         if ep is None:
             continue
         if ep.needs_key and name not in endpoints_with_keys:
+            continue
+        if needs_vision and not ep.can_see:
+            # Not an error and not a warning: a text-only model in a general
+            # chain is perfectly correct, it just cannot serve this one task.
             continue
         chain.append(
             ResolvedProvider(
@@ -99,6 +112,14 @@ def resolve_primary(
     chain = resolve_chain(config, endpoints_with_keys, task)
     if not chain:
         route = config.chain_for(task)
+        if task in VISION_TASKS:
+            # Say which of the two problems it is. "No endpoint has a key" is
+            # wrong and misleading when the truth is "none of them can see".
+            raise NoUsableProvider(
+                f"{task!r} reads images, and none of the endpoints routed to it can. "
+                f"It is routed to {route or 'nothing'}. Give it its own route naming a "
+                "vision-capable endpoint, or mark one as vision-capable in Settings."
+            )
         raise NoUsableProvider(
             f"no endpoint routed to {task!r} has a key. That task is routed to "
             f"{route or 'nothing'}; endpoints with keys: "

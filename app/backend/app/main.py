@@ -2611,6 +2611,33 @@ def append_message(
 # --------------------------------------------------------------------------
 
 
+def _chat_chain(
+    session: Session, user: User, master_key: bytes, task: str = "chat"
+) -> list[chat_mod.Endpoint]:
+    """Every endpoint routed to a task, in order, keys decrypted for this request.
+
+    The whole chain rather than its head, because a chain used only for its
+    first entry is not a fallback chain. When the head cannot serve a turn — no
+    tool support, overloaded, model gone — the rest are what make the route
+    worth declaring.
+    """
+    cfg = llmconfig.load(session, user)
+    with_keys = keystore.endpoints_with_keys(session, user)
+    out: list[chat_mod.Endpoint] = []
+    for rp in llm_resolver.resolve_chain(cfg, with_keys, task):
+        name = rp.name or rp.provider
+        out.append(
+            chat_mod.Endpoint(
+                name=name,
+                kind=rp.provider,  # type: ignore[arg-type]
+                model=rp.model,
+                api_key=keystore.get(session, master_key, user, name) if rp.needs_key else None,
+                base_url=rp.base_url or None,
+            )
+        )
+    return out
+
+
 def _chat_endpoint(session: Session, user: User, master_key: bytes) -> chat_mod.Endpoint:
     """The endpoint *this user's* chat turn should use, key decrypted for this
     request only.
@@ -2666,11 +2693,22 @@ def _task_endpoint(session: Session, user: User, master_key: bytes, task: str):
     """
     cfg = llmconfig.load(session, user)
     try:
+        # resolve_primary already drops endpoints that cannot serve the task, so
+        # its answer is usable rather than merely first. This used to take the
+        # head of an unfiltered chain and return None when that head happened to
+        # be text-only — which reported "no vision endpoint is routed" while a
+        # perfectly good one sat third in the same chain.
         rp = llm_resolver.resolve_primary(cfg, keystore.endpoints_with_keys(session, user), task)
     except llm_resolver.NoUsableProvider:
-        return None
-    ep = cfg.endpoint(rp.name)
-    if task in appconfig.VISION_TASKS and ep is not None and not ep.can_see:
+        # Nothing is routed to the task. Before giving up, consider the model
+        # already driving this conversation: if the user has put a
+        # vision-capable model in the chair, refusing to read a PDF with it
+        # because a *different* route is unset is pedantry, not safety.
+        if task in appconfig.VISION_TASKS:
+            for ep in _chat_chain(session, user, master_key):
+                declared = cfg.endpoint(ep.name)
+                if declared is not None and declared.can_see:
+                    return ep
         return None
     return chat_mod.Endpoint(
         name=rp.name or rp.provider,
@@ -2837,6 +2875,8 @@ async def start_chat_turn(
         )
 
     endpoint = _chat_endpoint(session, user, master_key)
+    chain = _chat_chain(session, user, master_key)
+    fallbacks = tuple(e for e in chain if e.name != endpoint.name)
     conv.append("user", payload.content, {"blocks": blocks})
     try:
         turn_id = chat_sessions.start(
@@ -2845,6 +2885,7 @@ async def start_chat_turn(
                 project_dir=proj,
                 conversation=conv,
                 endpoint=endpoint,
+                fallbacks=fallbacks,
                 sandbox=_sandbox_for(session, user, project_id),
                 usage_ledger=_blpl_dir(session, user, project_id) / "llm_usage.jsonl",
                 creds=_cred_resolver(),

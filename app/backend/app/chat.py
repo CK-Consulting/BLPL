@@ -43,7 +43,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from blpl.core import llm_chat
@@ -156,6 +156,36 @@ def is_transient(exc: BaseException) -> bool:
     # raising a typed error, so the wire vocabulary is the last resort.
     text = str(exc)
     return "overloaded_error" in text or "rate_limit_error" in text
+
+
+def worth_another_endpoint(exc: BaseException) -> bool:
+    """Whether a *different* endpoint could plausibly succeed where this failed.
+
+    Broader than ``is_transient``, and for a different reason. Transient means
+    "ask again"; this means "ask someone else". The case that prompted it: a
+    model with no tool support answers 400 ``does not support tools`` — asking
+    it again is pointless, and asking the next endpoint in the chain works
+    immediately.
+
+    Deliberately not a catch-all. A tool that raised, a refusal, or a bad
+    request we constructed will fail identically everywhere, and retrying those
+    across four providers would turn one clear error into four slow ones.
+    """
+    if is_transient(exc):
+        return True
+    text = str(exc).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "does not support tools",
+            "does not support",
+            "not supported",
+            "unsupported",
+            "no endpoints available",
+            "model not found",
+            "is not a multimodal model",
+        )
+    )
 
 
 class TurnInFlight(RuntimeError):
@@ -517,7 +547,12 @@ class TurnRequest:
     project_dir: Path
     conversation: Conversation
     endpoint: Endpoint
-    sandbox: FilesystemSandbox
+    # The rest of the routed chain, in order. A chain that is only ever used
+    # for its head is not a fallback chain — it is a list with decoration, and
+    # that is what this was: an endpoint that could not serve the turn ended it
+    # rather than passing it on to the next one that could.
+    fallbacks: tuple[Endpoint, ...] = ()
+    sandbox: FilesystemSandbox = None  # type: ignore[assignment]
     usage_ledger: Path | None = None
     creds: object | None = None
     # task name → endpoint, so a tool that needs a different model (datasheet
@@ -609,7 +644,6 @@ class ChatSessionManager:
                 req.conversation.read_all(),
                 req.conversations_dir or req.conversation.path.parent,
             )
-            adapter = build_chat_adapter(req.endpoint)
             executor = ToolExecutor(
                 default_tools(req.kicad_url),
                 ctx,
@@ -636,14 +670,46 @@ class ChatSessionManager:
                 else:
                     live.publish(payload)
 
-            result = await run_tool_loop(
-                adapter,
-                messages,
-                system=build_system_prompt(),
-                tools=executor.declarations(),
-                execute=executor,
-                on_event=on_event,
-            )
+            # Walk the routed chain. Only the head was ever tried before, so a
+            # model that could not serve the turn ended it — the four endpoints
+            # behind it in the chain were never asked.
+            attempts = [req.endpoint, *req.fallbacks]
+            last: BaseException | None = None
+            result = None
+            for i, endpoint in enumerate(attempts):
+                try:
+                    result = await run_tool_loop(
+                        build_chat_adapter(endpoint),
+                        messages,
+                        system=build_system_prompt(),
+                        tools=executor.declarations(),
+                        execute=executor,
+                        on_event=on_event,
+                    )
+                    if i:
+                        # Say which model actually answered. A silent switch
+                        # would leave the transcript attributing an answer to a
+                        # model that never produced it.
+                        live.publish({
+                            "type": "note",
+                            "text": (
+                                f"{attempts[i - 1].name} could not serve this turn "
+                                f"({last}); answered by {endpoint.name} instead."
+                            ),
+                        })
+                    used = endpoint
+                    break
+                except Exception as exc:
+                    last = exc
+                    if i + 1 < len(attempts) and worth_another_endpoint(exc):
+                        live.publish({
+                            "type": "note",
+                            "text": f"{endpoint.name} failed ({exc}); trying {attempts[i + 1].name}.",
+                        })
+                        continue
+                    raise
+            assert result is not None
+            req = replace(req, endpoint=used)
 
             usage = _sum_usage(result.usage)
             persist_messages(req.conversation, result.new_messages, model=req.endpoint.model, usage=usage)

@@ -467,3 +467,19 @@ def test_chat_needs_a_provider_key_and_a_real_conversation(chat_client, monkeypa
 def test_chat_endpoints_respect_the_session_gate(client) -> None:
     assert client.get("/api/projects/scratch/proposals").status_code == 401
     assert client.post("/api/projects/scratch/proposals/prop_x", json={"action": "accept"}).status_code == 401
+
+
+def test_the_most_recently_active_conversation_comes_first(tmp_path) -> None:
+    """Reopening the workbench should land in the thread you were last working
+    in. The list was ordered newest-first by filename while the client took the
+    *tail*, so every reload dropped you into the first conversation the project
+    ever had."""
+    from app.conversations import Conversation, list_conversations
+
+    old = Conversation.create(tmp_path, title="old")
+    new = Conversation.create(tmp_path, title="new")
+    old.append("user", "still working here")   # older file, newer activity
+
+    order = [m.filename for m in list_conversations(tmp_path)]
+    assert order[0] == old.path.name, order
+    assert new.path.name in order

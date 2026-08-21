@@ -136,4 +136,10 @@ def list_conversations(dir_: Path) -> list[ConversationMeta]:
                 last_message_at=last,
             )
         )
+    # Most recently *active* first, not most recently created. Reopening the
+    # workbench should land you in the conversation you were last working in,
+    # and a long-running thread started yesterday is more likely that than an
+    # empty one opened by accident this morning. Filename (a timestamp) breaks
+    # the tie for conversations with no messages yet.
+    metas.sort(key=lambda m: (m.last_message_at or "", m.filename), reverse=True)
     return metas

@@ -176,7 +176,10 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     (async () => {
       const list = await getJSON<ConversationMeta[]>(`/api/projects/${projectId}/conversations`);
       if (cancelled) return;
-      let chosen = list[list.length - 1];
+      // The server returns most-recently-active first, so the newest thread is
+      // at the head. This took the tail, which is the *oldest* — so every
+      // reload dropped you into the first conversation the project ever had.
+      let chosen = list[0];
       if (!chosen) {
         chosen = await postJSON<ConversationMeta>(`/api/projects/${projectId}/conversations`, {
           title: "design",
