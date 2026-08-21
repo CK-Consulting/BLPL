@@ -239,3 +239,38 @@ def test_only_the_pages_a_task_is_about_are_sent(tmp_path, scripted, monkeypatch
     # The plan gives the mcu task page 1; the scout gets the front matter. The
     # point is that neither asks for the whole document.
     assert [1] in asked
+
+
+def test_a_run_that_extracted_nothing_is_not_ok(tmp_path, happy, monkeypatch) -> None:
+    """A green tick over an empty result is worse than an error. An error gets
+    read; a success gets believed.
+
+    The case: the scout declines a document because the exact MPN string is not
+    in it — the part is a module sold under a distributor SKU while the datasheet
+    calls it by its product name — the planner emits zero tasks, the merge has
+    nothing to object to, and the whole run came back ok.
+    """
+    calls: list[list[str]] = []
+
+    def run_script(path, args, **kw):
+        calls.append(list(args))
+        cache = Path(args[args.index("--cache-dir") + 1])
+        mpn = args[0]
+        if not (cache / f"{mpn}.plan.json").exists():
+            (cache / f"{mpn}.plan.json").write_text(json.dumps({"tasks": []}), encoding="utf-8")
+        return _Result(True, "")
+
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+        return ({"quality_verdict": {"verdict": "skip", "reason": "target MPN not found in PDF"}},
+                "", 10, 5)
+
+    monkeypatch.setattr(datasheets, "run_script", run_script)
+    monkeypatch.setattr(datasheets, "_one_task", one_task)
+    monkeypatch.setattr(datasheets, "has_text_layer", lambda p: True)
+    monkeypatch.setattr(datasheets, "page_text", lambda p, pages=(): "text")
+    run = asyncio.run(
+        datasheets.extract_datasheet("PART1", _pdf(tmp_path), tmp_path / "cache", [_endpoint("m")])
+    )
+    assert not run.ok
+    # And the scout's reason is carried out, not left in a cache file nobody opens.
+    assert "target MPN not found in PDF" in run.error

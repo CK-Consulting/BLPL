@@ -78,7 +78,23 @@ class ExtractionRun:
 
     @property
     def ok(self) -> bool:
-        return not self.error and all(r.status != "failed" for r in self.results)
+        """Whether this run produced something.
+
+        A run with no tasks is not a success. It used to report one: the scout
+        would decline a document — "target MPN not found in PDF", because the
+        part is a module sold under a distributor SKU and the datasheet calls it
+        by its product name — the planner would emit zero tasks, the merge would
+        have nothing to object to, and the whole thing came back ``ok: true``
+        with an empty result.
+
+        That is worse than an error. An error gets read; a green tick over
+        nothing gets believed.
+        """
+        if self.error:
+            return False
+        if not self.results:
+            return False
+        return all(r.status != "failed" for r in self.results)
 
     def to_dict(self) -> dict:
         return {
@@ -542,6 +558,19 @@ async def extract_datasheet(
             if result.status == "complete":
                 done.add(result.task_id)
         pending = [t for t in pending if t["task_id"] not in {r.task_id for r in run.results}]
+
+    if not run.results:
+        # The planner found nothing to do. Almost always the scout declining the
+        # document, and its reason is the useful part — so it is carried out
+        # rather than left in a cache file nobody opens.
+        verdict = {}
+        try:
+            verdict = json.loads(scout_file.read_text(encoding="utf-8")).get("quality_verdict") or {}
+        except (OSError, json.JSONDecodeError):
+            pass
+        why = verdict.get("reason") or "the planner produced no tasks"
+        run.error = f"nothing to extract from {pdf_path.name}: {why}"
+        return run
 
     # -- 4. merge (kicad-happy owns this) ------------------------------------
     #
