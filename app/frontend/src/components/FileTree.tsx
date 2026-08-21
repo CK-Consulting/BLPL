@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { getJSON } from "../api";
+import { getJSON, postJSON, putJSON } from "../api";
 
 /**
  * Everything in the project, grouped by what it is for.
@@ -97,20 +97,58 @@ export function FileTree({
   projectId,
   reloadToken,
   onOpen,
+  onChanged,
 }: {
   projectId: string;
   reloadToken: number;
   /** A file the centre panel can show — markdown goes to the editor. */
   onOpen: (node: TreeNode) => void;
+  /** Something was created here. */
+  onChanged?: () => void;
 }) {
   const [nodes, setNodes] = useState<TreeNode[]>([]);
   const [filter, setFilter] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [bump, setBump] = useState(0);
 
   useEffect(() => {
     getJSON<{ nodes: TreeNode[] }>(`/api/projects/${projectId}/tree`)
       .then((d) => setNodes(d.nodes))
       .catch(() => setNodes([]));
-  }, [projectId, reloadToken]);
+  }, [projectId, reloadToken, bump]);
+
+  // Creating lives with the tree, which is where the project's shape is. It
+  // used to be a "+ New" inside the editor's own file list — the only way to
+  // add anything, tucked inside a panel whose job is showing one file, and
+  // unable to make a folder at all.
+  const create = async (kind: "file" | "folder") => {
+    const raw = prompt(
+      kind === "file"
+        ? "New file (path relative to the project, e.g. sensor/board.md)"
+        : "New folder (path relative to the project, e.g. datasheets/NRF9151-LACA-R)",
+    );
+    const name = (raw ?? "").trim();
+    if (!name) return;
+    if (kind === "file" && !/\.(md|markdown|ya?ml)$/i.test(name)) {
+      setError("A new file must end in .md, .yaml or .yml — those are what the workbench edits.");
+      return;
+    }
+    try {
+      setError(null);
+      if (kind === "file") {
+        await putJSON(`/api/projects/${projectId}/files/${name}`, { content: "" });
+      } else {
+        await postJSON(`/api/projects/${projectId}/folders`, { path: name });
+      }
+      setBump((n) => n + 1);
+      onChanged?.();
+      if (kind === "file") {
+        onOpen({ path: name, name: name.split("/").pop() ?? name, dir: false, role: "design" });
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
 
   const files = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -135,9 +173,19 @@ export function FileTree({
 
   return (
     <div className="file-tree">
+      <div className="tree-actions">
+        <button className="link" onClick={() => void create("file")}>
+          + File
+        </button>
+        <button className="link" onClick={() => void create("folder")}>
+          + Folder
+        </button>
+      </div>
+      {error && <div className="gate-error small">{error}</div>}
       <input
         className="tree-filter"
         placeholder="Filter…"
+        aria-label="Filter files"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
       />
@@ -246,7 +294,28 @@ function Folder({
   );
 }
 
-/** Whether the centre panel can render this in the editor, or must hand it off. */
+/**
+ * Where a click on this file should land.
+ *
+ * KiCad's files are plain text underneath, which is exactly the trap: a
+ * .kicad_pcb opened as "text the panel can show" is forty thousand lines of
+ * s-expression, technically displayed and of no use to anyone. It has a
+ * renderer, so it goes there.
+ *
+ * Anything else the panel cannot render is handed to the browser, which knows
+ * what to do with a PDF and will offer to save what it does not.
+ */
+export function destinationFor(node: TreeNode): "text" | "kicad" | "browser" {
+  const name = node.name.toLowerCase();
+  if (/\.(kicad_pcb|kicad_sch)$/.test(name)) return "kicad";
+  if (/\.(md|markdown|ya?ml|toml|json|txt|csv|log|ini|cfg|net|nanorc)$/.test(name)) return "text";
+  // No extension and small enough to be a note rather than a blob: README,
+  // LICENSE, Makefile. Guessing wrong here costs a wasted tab, not data.
+  if (!name.includes(".") && (node.bytes ?? 0) < 512 * 1024) return "text";
+  return "browser";
+}
+
+/** Kept for callers that only ask the older question. */
 export function isEditable(node: TreeNode): boolean {
-  return /\.(md|markdown|ya?ml|toml|json|txt)$/i.test(node.name);
+  return destinationFor(node) === "text";
 }

@@ -2324,6 +2324,45 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     }
 
 
+class FolderBody(BaseModel):
+    path: str
+
+
+@app.post("/api/projects/{project_id}/folders")
+def make_folder(
+    project_id: str, body: FolderBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Create a directory in the project.
+
+    Git does not track directories, so this leaves nothing in the history until
+    something is put inside — which is fine, and is why it is worth having as
+    an action rather than a side effect of naming a file with slashes in it. A
+    per-MPN datasheet folder is a place you make *before* you have the file to
+    put in it.
+    """
+    proj = _project_dir(session, user, project_id)
+    parts = [seg for seg in body.path.replace("\\", "/").split("/") if seg]
+    if (
+        not parts
+        or body.path.startswith("/")
+        or any(seg == ".." or seg.startswith(".") for seg in parts)
+    ):
+        raise HTTPException(status_code=400, detail="invalid folder name")
+    target = proj.joinpath(*parts)
+    root = proj.resolve()
+    # Resolve the parent rather than the target: the target does not exist yet,
+    # and a symlinked parent is the way out of the project that a string check
+    # would not see.
+    if not target.parent.resolve().is_relative_to(root):
+        raise HTTPException(status_code=400, detail="invalid folder name")
+    if target.exists():
+        raise HTTPException(status_code=409, detail=f"{body.path} already exists")
+    target.mkdir(parents=True)
+    return {"ok": True, "path": "/".join(parts)}
+
+
 @app.get("/api/projects/{project_id}/artifacts/{name}")
 def read_artifact(project_id: str, name: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)):

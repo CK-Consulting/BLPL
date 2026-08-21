@@ -9,7 +9,8 @@ import { Dashboard } from "./components/Dashboard";
 import { Invitations } from "./components/Invitations";
 import { Logo } from "./components/Logo";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
-import { Editor } from "./components/Editor";
+import { FileView } from "./components/FileView";
+import { KicadFileView } from "./components/KicadFileView";
 import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
 import { Preflight } from "./components/Preflight";
@@ -20,7 +21,7 @@ import { Artifacts } from "./components/Artifacts";
 import { ChatPanel } from "./components/ChatPanel";
 import { BoardPanel } from "./components/BoardPanel";
 import { RailToggle, Section } from "./components/Rail";
-import { FileTree, isEditable, type TreeNode } from "./components/FileTree";
+import { FileTree, destinationFor, type TreeNode } from "./components/FileTree";
 import { useResizable } from "./useResizable";
 import { Project, getJSON } from "./api";
 
@@ -46,7 +47,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showSharing, setShowSharing] = useState(false);
-  const [tab, setTab] = useState<"board" | "preflight" | "edit" | "bom" | "modules" | "reports" | "release" | "artifacts" | "changes">("board");
+  const [tab, setTab] = useState<"board" | "preflight" | "edit" | "kicad" | "bom" | "modules" | "reports" | "release" | "artifacts" | "changes">("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
   // Which board everything below the board panel is about. Null until the
   // board list loads; a single-board project settles on its one implicit board.
@@ -180,14 +181,23 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                     <FileTree
                       projectId={selected}
                       reloadToken={reloadToken}
+                      onChanged={refresh}
                       onOpen={(n) => {
-                        // Editable text goes to the editor; anything else —
-                        // a datasheet PDF, a gerber — opens in a tab, because
-                        // the app has no viewer for it and pretending
-                        // otherwise just shows bytes.
-                        if (isEditable(n)) {
+                        // Three destinations, because there are three kinds of
+                        // file here. Text the panel can render goes to
+                        // View/Edit. A KiCad file has a renderer of its own —
+                        // it is plain text underneath, which is the trap:
+                        // "displayed" as forty thousand lines of s-expression
+                        // is technically true and no use to anyone. Everything
+                        // else goes to the browser, which knows what to do
+                        // with a PDF and will offer to save what it does not.
+                        const where = destinationFor(n);
+                        if (where === "text") {
                           setOpenFile(n);
                           setTab("edit");
+                        } else if (where === "kicad") {
+                          setOpenFile(n);
+                          setTab("kicad");
                         } else {
                           window.open(
                             `/api/projects/${selected}/blob?path=${encodeURIComponent(n.path)}`,
@@ -230,8 +240,17 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                 >
                   Preflight
                 </button>
+                {/* Only while a KiCad file is open. A tab that is empty most
+                    of the time is a tab people learn to skip past, and the
+                    Board tab already answers "show me this project's board" —
+                    this one answers "show me the file I just clicked". */}
+                {openFile && destinationFor(openFile) === "kicad" && (
+                  <button className={tab === "kicad" ? "on" : ""} onClick={() => setTab("kicad")}>
+                    KiCad
+                  </button>
+                )}
                 <button className={tab === "edit" ? "on" : ""} onClick={() => setTab("edit")}>
-                  Edit
+                  View/Edit
                 </button>
                 <button className={tab === "bom" ? "on" : ""} onClick={() => setTab("bom")}>
                   BOM
@@ -262,7 +281,16 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
               )}
               {tab === "preflight" && <Preflight projectId={selected} reloadToken={reloadToken} />}
               {tab === "edit" && (
-                <Editor projectId={selected} onSaved={refresh} select={openFile?.path ?? null} />
+                <FileView
+                  projectId={selected}
+                  onSaved={refresh}
+                  path={
+                    openFile && destinationFor(openFile) === "text" ? openFile.path : null
+                  }
+                />
+              )}
+              {tab === "kicad" && openFile && (
+                <KicadFileView projectId={selected} path={openFile.path} />
               )}
               {tab === "bom" && (
                 <BomTable projectId={selected} board={board} reloadToken={reloadToken} />

@@ -324,6 +324,31 @@ body.resizing-y * { pointer-events: none; }
    control on its own never does. */
 .menu-note { margin: 0; font-size: 12.5px; line-height: 1.45; color: #b9c3d0; }
 
+/* View/Edit. One file, two modes, and the rendered one first — a pipe table is
+   a table when it is rendered and a wall of pipes when it is not. */
+.fileview, .kicad-file { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.fileview-body { flex: 1; min-height: 0; overflow: auto; padding: 1rem 1.2rem; }
+.code-view { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; color: #cfd6de; }
+.tree-actions { display: flex; gap: .5rem; padding: 0 .1rem .35rem; }
+
+/* Syntax colours, named for the nano colour each one stands in for, so the
+   mapping stays readable. Every one is ≥7:1 against #0f1115 — measured, not
+   eyeballed, because a token colour is small text on a dark ground and that is
+   where contrast quietly fails. */
+.tok-brightwhite { color: #f2f4f7; font-weight: 600; }
+.tok-cyan { color: #7fd4e8; }
+.tok-brightcyan { color: #a8e6f5; }
+.tok-green { color: #8fd694; font-style: italic; }
+.tok-brightgreen { color: #b6e8b6; font-weight: 600; }
+.tok-yellow { color: #e8d38a; }
+.tok-brightyellow { color: #f2e3a8; }
+.tok-red { color: #ff9b9b; }
+.tok-magenta { color: #e5a8e0; }
+.tok-brightmagenta { color: #f0c2ec; }
+.tok-blue { color: #9ab8ff; }
+.tok-brightblue { color: #b7cbff; }
+.tok-brightblack { color: #9aa2ac; }
+
 /* A question nothing answered. Marked rather than hidden: it is still what the
    person typed, and four copies of it stacking up is the symptom that explains
    what went wrong. 9.14:1 on the message bubble, with a dashed edge so the
