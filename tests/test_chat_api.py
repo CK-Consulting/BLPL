@@ -622,3 +622,80 @@ def test_a_crafted_filename_cannot_move_files_around(tmp_path) -> None:
     for bad in ("../secret.jsonl", "nope.txt", "/etc/passwd"):
         with pytest.raises((ValueError, FileNotFoundError)):
             set_archived(tmp_path, bad, True)
+
+
+# -- per-part datasheet folders -----------------------------------------------
+
+
+def test_a_document_filed_under_a_part_number_needs_no_guessing(tmp_path) -> None:
+    """Filing a document under an MPN *is* the statement that it belongs to
+    that part. Everything else in the resolver is inference about a filename
+    somebody else chose."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    (proj / "datasheets" / "NRF9151-LACA-R").mkdir(parents=True)
+    (proj / "datasheets" / "NRF9151-LACA-R" / "whatever-they-called-it.pdf").write_bytes(b"%PDF")
+    found = datasheet_files.resolve(proj, "NRF9151-LACA-R")
+    assert found.ok and found.how == "folder"
+
+
+def test_the_folder_matches_the_way_part_numbers_compare(tmp_path) -> None:
+    """Case and punctuation are not load-bearing in a part number, so a folder
+    someone typed by hand still resolves."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    (proj / "datasheets" / "nrf9151_laca_r").mkdir(parents=True)
+    (proj / "datasheets" / "nrf9151_laca_r" / "ds.pdf").write_bytes(b"%PDF")
+    assert datasheet_files.resolve(proj, "NRF9151-LACA-R").how == "folder"
+
+
+def test_two_documents_of_different_kinds_rank_rather_than_refuse(tmp_path) -> None:
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    d = proj / "datasheets" / "PART1"
+    d.mkdir(parents=True)
+    (d / "PART1_Errata_v1.pdf").write_bytes(b"%PDF")
+    (d / "PART1_Datasheet_v2.pdf").write_bytes(b"%PDF")
+    found = datasheet_files.resolve(proj, "PART1")
+    assert found.ok and found.path.name == "PART1_Datasheet_v2.pdf"
+
+
+def test_two_revisions_of_one_document_refuse_and_name_both(tmp_path) -> None:
+    """Picking between revisions is picking a pinout."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    d = proj / "datasheets" / "PART1"
+    d.mkdir(parents=True)
+    (d / "PART1_Datasheet_v1.pdf").write_bytes(b"%PDF")
+    (d / "PART1_Datasheet_v2.pdf").write_bytes(b"%PDF")
+    found = datasheet_files.resolve(proj, "PART1")
+    assert not found.ok and len(found.candidates) == 2
+
+
+def test_a_folder_document_is_not_offered_to_a_different_part(tmp_path) -> None:
+    """The prefix pass is why this matters: PART1 and PART2 share a stem, and a
+    document filed under one must not become a candidate for the other."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    (proj / "datasheets" / "PART100").mkdir(parents=True)
+    (proj / "datasheets" / "PART100" / "PART1_family.pdf").write_bytes(b"%PDF")
+    assert not datasheet_files.resolve(proj, "PART200-XYZ").ok
+
+
+def test_a_family_datasheet_still_resolves_from_the_top_level(tmp_path) -> None:
+    """Folders do not take over storage. A datasheet covering three parts filed
+    under one of them would be a lie; a copy in each would be the same 13 MB
+    three times."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    sheets = proj / "datasheets"
+    sheets.mkdir(parents=True)
+    (sheets / "nRF54L15_nRF54L10_nRF54L05_Datasheet_v1.0.pdf").write_bytes(b"%PDF")
+    for part in ("NRF54L15-QFAA-R", "NRF54L10-QFAA-R", "NRF54L05-QFAA-R"):
+        assert datasheet_files.resolve(proj, part).how == "family", part

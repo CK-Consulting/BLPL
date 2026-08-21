@@ -303,8 +303,16 @@ async def _fetch_datasheet(ctx: ToolContext, args: dict) -> str:
     mpn = str(args.get("mpn", "")).strip()
     if not mpn:
         raise ToolDenied("mpn is required")
-    dest = ctx.project_dir / "datasheets"
+    from blpl.agent.tools import datasheet_files
+
+    # Into the part's own folder. A file this tool fetched for a specific MPN is
+    # the least ambiguous case there is, and filing it under the part number
+    # records that at the moment it is known — rather than writing
+    # "<MPN>.pdf" at the top level and having every later lookup re-derive it
+    # from the filename.
+    dest = datasheet_files.part_dir(ctx.project_dir, mpn)
     ctx.sandbox.check_write(dest)
+    dest.mkdir(parents=True, exist_ok=True)
     ctx.note(f"downloading datasheet for {mpn}")
     result = await _to_thread(fetch_datasheet, mpn, dest, creds=ctx.creds)
     return json.dumps(result.to_dict(), indent=2)

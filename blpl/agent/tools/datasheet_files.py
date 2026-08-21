@@ -33,18 +33,29 @@ Worse, naming the file in the request did not help: the tool took an MPN and
 nothing else, so "extract from nRF9151_datasheet_rev_v1.1.pdf" was heard as an
 MPN that resolved to no file at all.
 
-Three ways to bind a part to a file, in the order they are trusted:
+Ways to bind a part to a file, in the order they are trusted:
 
 1. **What the caller said.** An explicit filename is a statement, not a guess.
-2. **The project's map** (``datasheets/datasheets.md``), a markdown table the
+2. **A per-MPN folder** — ``datasheets/<MPN>/``. Filing a document under a part
+   number *is* the statement that it belongs to that part, and it needs no
+   heuristic to read it back. This is the mechanism to prefer: everything below
+   is inference about a filename somebody else chose.
+3. **The project's map** (``datasheets/datasheets.md``), a markdown table the
    same as every other input here. It is written by hand or recorded after a
-   successful bind, and it is the only mechanism that can handle a file whose
-   name shares nothing with the part number — the Wio module above.
-3. **A prefix match**, which covers the ordinary case where a vendor drops the
+   successful bind, and it handles a file whose name shares nothing with the
+   part number — the Wio module above.
+4. **A prefix match**, which covers the ordinary case where a vendor drops the
    package or temperature suffix. Held to a minimum overlap, and **ambiguity is
    an error rather than a coin toss**: two candidates for one MPN is exactly
    when a wrong pinout gets extracted silently, and that is the failure this
    whole module exists to avoid.
+
+One thing the folders deliberately do not do is take over storage. A family
+datasheet covers several parts — that is the premise of this whole module — so
+filing it under one of them would be a lie, and filing a copy under each would
+put the same 13 MB in the repository three times. Family documents stay at the
+top of ``datasheets/`` and are found the way they always were; a folder is for
+what is unambiguously about one part.
 """
 
 from __future__ import annotations
@@ -111,7 +122,7 @@ class Resolution:
     """What was found, and — when nothing was — what the caller could do."""
 
     path: Path | None
-    how: str = ""                       # explicit | map | exact | prefix
+    how: str = ""            # explicit | folder | map | exact | family | content
     candidates: tuple[str, ...] = ()    # when ambiguous or absent
     detail: str = ""
 
@@ -257,10 +268,54 @@ def _text_of(path: Path, pages: int) -> bytes | None:
 
 
 def _pdfs(project_dir: Path) -> list[Path]:
+    """Loose PDFs at the top of ``datasheets/`` — the family documents.
+
+    Files inside a per-MPN folder are excluded on purpose: they have already
+    said which part they are for, and letting them into the prefix and content
+    passes would put a document filed under one part in the running for
+    another.
+    """
     d = Path(project_dir) / "datasheets"
     if not d.is_dir():
         return []
     return sorted(f for f in d.iterdir() if f.is_file() and f.suffix.lower() == ".pdf")
+
+
+def folder_name(mpn: str) -> str:
+    """The directory a part's own documents live in.
+
+    The MPN as written, minus what a path cannot carry. Not slugified: the
+    folder name is the part number a BOM will show, and mangling it into
+    ``nrf9151-laca-r`` would mean the one place a person looks to check the
+    binding no longer matches the thing being bound.
+    """
+    name = (mpn or "").strip().replace("/", "_").replace("\\", "_")
+    name = re.sub(r"[\x00-\x1f]", "", name).strip(". ")
+    return name
+
+
+def part_dir(project_dir: Path, mpn: str) -> Path:
+    """Where ``mpn``'s own documents go. Not created here."""
+    return Path(project_dir) / "datasheets" / folder_name(mpn)
+
+
+def _part_folder(project_dir: Path, mpn: str) -> Path | None:
+    """An existing folder for this part, matched the way MPNs compare.
+
+    Case and punctuation are not load-bearing in a part number — NRF9151-LACA-R
+    and nrf9151_laca_r are the same part — so a folder someone typed by hand
+    still resolves.
+    """
+    sheets = Path(project_dir) / "datasheets"
+    if not sheets.is_dir():
+        return None
+    want = _norm(mpn)
+    if not want:
+        return None
+    for d in sorted(sheets.iterdir()):
+        if d.is_dir() and _norm(d.name) == want:
+            return d
+    return None
 
 
 def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
@@ -270,18 +325,49 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
     available = _pdfs(project_dir)
     names = tuple(f.name for f in available)
 
-    # 1. What the caller said.
+    # 1. What the caller said. Looked for in the part's own folder as well as
+    #    at the top level, because "use the errata" should work when the errata
+    #    is filed where it belongs.
     if file:
-        candidate = (sheets / Path(file).name).resolve()
-        if candidate.is_file() and candidate.parent == sheets.resolve():
-            return Resolution(path=candidate, how="explicit")
+        wanted = Path(file).name
+        folder = _part_folder(project_dir, mpn)
+        for parent in ([folder] if folder else []) + [sheets]:
+            candidate = (parent / wanted).resolve()
+            if candidate.is_file() and candidate.parent == parent.resolve():
+                return Resolution(path=candidate, how="explicit")
         return Resolution(
             path=None,
             candidates=names,
-            detail=f"no file named {Path(file).name!r} in datasheets/",
+            detail=f"no file named {wanted!r} in datasheets/",
         )
 
-    # 2. The project's map.
+    # 2. The part's own folder. Filing a document under a part number is a
+    #    statement about what it is for, so nothing here is inferred — the only
+    #    question left is which document, when there are several, and that is
+    #    the same ranking used everywhere else: a datasheet outranks an errata.
+    folder = _part_folder(project_dir, mpn)
+    if folder is not None:
+        inside = sorted(
+            f for f in folder.iterdir() if f.is_file() and f.suffix.lower() == ".pdf"
+        )
+        if len(inside) == 1:
+            return Resolution(path=inside[0], how="folder")
+        if inside:
+            ranked = sorted(inside, key=lambda f: (_kind_rank(f.name), f.name))
+            if _kind_rank(ranked[0].name) < _kind_rank(ranked[1].name):
+                return Resolution(path=ranked[0], how="folder")
+            # Two documents of the same kind for one part is the revision case,
+            # and picking one would be picking a pinout. Refuse, and say which.
+            return Resolution(
+                path=None,
+                candidates=tuple(f.name for f in ranked),
+                detail=(
+                    f"datasheets/{folder.name}/ holds {len(inside)} documents of the same "
+                    "kind and nothing distinguishes them — pass `file` to name one"
+                ),
+            )
+
+    # 3. The project's map.
     mapped = read_map(project_dir).get(_norm(mpn))
     if mapped:
         candidate = (sheets / Path(mapped).name).resolve()
@@ -296,12 +382,12 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
             ),
         )
 
-    # 3. Exact, which is what the fetcher writes.
+    # 4. Exact, which is what the fetcher used to write.
     exact = sheets / f"{mpn}.pdf"
     if exact.is_file():
         return Resolution(path=exact, how="exact")
 
-    # 4. Prefix, either direction: vendors drop package and temperature
+    # 5. Prefix, either direction: vendors drop package and temperature
     #    suffixes, and abbreviate.
     target = _norm(mpn)
     hits = []

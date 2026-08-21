@@ -572,7 +572,10 @@ header .logo-lockup { font-size: 13px; }
 .rail-head:hover { background: #1c2027; }
 .rail-caret { color: #6b7684; font-size: 10px; width: .7rem; }
 .rail-title { font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: #9aa4b0; }
-.rail-subtitle { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: #6b7684; margin: .5rem 0 .25rem; }
+/* 3.85:1 at 10px uppercase before — small, spaced-out, and the least legible
+   text on the screen, which for a group heading is precisely backwards. 9.98:1
+   at 11.5px. */
+.rail-subtitle { font-size: 11.5px; text-transform: uppercase; letter-spacing: .08em; color: #b9c3d0; margin: .5rem 0 .25rem; }
 .rail-body { padding: 0 .2rem .5rem; }
 
 /* --- board panel --- */
@@ -589,10 +592,15 @@ header .logo-lockup { font-size: 13px; }
 .file-tree { padding: 0 .4rem; }
 .tree-filter { width: 100%; font-size: 12px; padding: .25rem .4rem; margin-bottom: .4rem; }
 .tree-group { margin-bottom: .5rem; }
-.tree-item { display: flex; align-items: center; gap: .4rem; width: 100%; text-align: left; padding: .22rem .4rem; background: none; border: 0; border-radius: 5px; font-size: 12px; }
-.tree-item:hover { background: #1c2027; }
+.tree-item, .tree-folder { display: flex; align-items: center; gap: .4rem; width: 100%; text-align: left; padding: .24rem .4rem; background: none; border: 0; border-radius: 5px; font-size: 12.5px; }
+.tree-item:hover, .tree-folder:hover { background: #1c2027; }
+.tree-item:focus-visible, .tree-folder:focus-visible { outline: 3px solid #80a8ff; outline-offset: -2px; }
+/* A folder differs from a file by a caret four pixels wide, so it says so in
+   weight and colour too, and carries a count rather than a size. 10.7:1. */
+.tree-folder .tree-name { color: #d7c7a8; font-weight: 600; }
+.tree-caret { flex: none; width: .7rem; color: #b9c3d0; font-size: 10px; }
 .tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cfd6de; }
-.tree-size { font-size: 11px; flex: none; }
+.tree-size { font-size: 11.5px; flex: none; }
 
 /* A lost answer is not an error the user caused, and not a warning about the
    design — it is a status with one obvious action. Amber, and it carries that
