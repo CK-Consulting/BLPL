@@ -85,6 +85,27 @@ class ProjectEntry:
     branch: str = "main"
 
 
+# Substring → window, first match wins, so the more specific patterns come
+# first. "[1m]" ahead of "opus" is the whole reason this is ordered: the 1M
+# variant is the same model id with a suffix.
+_CONTEXT_BY_MODEL: tuple[tuple[str, int], ...] = (
+    ("[1m]", 1_000_000),
+    ("nemotron-3", 1_000_000),
+    ("gpt-5", 400_000),
+    ("gpt-4.1", 1_000_000),
+    ("claude", 200_000),
+    ("gemini", 1_000_000),
+    ("llama-4", 1_000_000),
+    ("qwen3", 128_000),
+    ("qwen2.5", 32_000),
+    ("gpt-4o", 128_000),
+    ("mistral", 128_000),
+    ("gemma", 128_000),
+)
+
+_CONTEXT_DEFAULT = 128_000
+
+
 @dataclass
 class Endpoint:
     name: str
@@ -93,6 +114,13 @@ class Endpoint:
     base_url: str = ""
     auth: str = "vault"          # vault | none
     vision: bool | None = None   # None → infer from kind
+    # How much this model can be told at once. None → infer from its name.
+    #
+    # Worth stating rather than assuming, because the app decides what to leave
+    # out of a request based on it, and because a self-hosted model's window is
+    # a deployment choice the model's name cannot express: the same Nemotron
+    # weights serve 128k or 1M depending on how vLLM was started.
+    context_tokens: int | None = None
 
     @property
     def needs_key(self) -> bool:
@@ -104,6 +132,24 @@ class Endpoint:
 
     def resolved_model(self) -> str:
         return self.model or _DEFAULT_MODELS.get(self.kind, "")
+
+    @property
+    def context(self) -> int:
+        """Best available figure for this endpoint's window.
+
+        Declared beats inferred, and inference is by substring on the model id
+        because that is the only signal there is. Every unknown falls to a
+        conservative default: overestimating a window produces a turn that
+        fails at the provider, underestimating it produces a note saying a file
+        was left out. Those are not equally bad.
+        """
+        if self.context_tokens:
+            return int(self.context_tokens)
+        model = (self.resolved_model() or "").lower()
+        for needle, size in _CONTEXT_BY_MODEL:
+            if needle in model:
+                return size
+        return _CONTEXT_DEFAULT
 
 
 @dataclass

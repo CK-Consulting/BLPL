@@ -41,6 +41,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -505,25 +506,77 @@ def _blocks_from_json(
     return blocks
 
 
-# How many bytes of base64-encoded attachment one request may carry.
+# What one request may carry, measured two ways, because two different limits
+# bite and neither predicts the other.
 #
-# Every turn resends the whole conversation, attachments included, because that
-# is what a stateless chat API requires. What it does not require is sending the
-# same PDF twice in one request, or carrying a datasheet from twenty turns ago
-# that has already been read and written up.
+# **Bytes** is the transport limit: Anthropic rejects a request body over 32 MB.
+# **Tokens** is the model limit, and it is the one that surprises people. A
+# 6 MB PDF passed a 16 MB byte budget comfortably and was 250 pages — around
+# 400,000 tokens on its own. Four such attachments and 54k tokens of actual
+# conversation came to 1,007,587 tokens against a 1,000,000 limit, and the
+# provider's answer named neither the file nor the number.
 #
-# A real measurement, from the conversation that prompted this: 57k tokens of
-# text and **79.7 MB** of base64 PDFs, of which 34 MB was three files included
-# twice over. Anthropic's request limit is 32 MB. Every turn failed, and the
-# error said "request too large" without saying what was large about it.
-#
-# 16 MB leaves room for a long transcript under a 32 MB cap and still carries
-# several datasheets. Attachments on the newest message are always included:
-# dropping what someone just attached would be worse than a clear failure.
+# Bytes are a terrible proxy for tokens: a scanned 6 MB PDF and a text-layer
+# 6 MB PDF differ by an order of magnitude in what they cost to read. So page
+# count is used for PDFs and character count for text, and both budgets are
+# enforced — a request has to clear the transport limit *and* fit the window of
+# whichever model is about to be asked.
 _ATTACHMENT_BUDGET = int(os.environ.get("BLPL_ATTACHMENT_BUDGET_BYTES") or 16 * 1024 * 1024)
 
+# Anthropic documents a PDF page as roughly 1,500–3,000 tokens once its image
+# and text are both counted. The high end, deliberately: an estimate that runs
+# under the truth turns a refusal we could explain into one the provider makes
+# for us.
+_TOKENS_PER_PDF_PAGE = 2_600
+_TOKENS_PER_IMAGE = 1_600
 
-def _attachment_budget(events: list[dict], attachments_dir: Path | None) -> set[tuple[int, str]]:
+# The share of a model's context an attachment may occupy. The rest is for the
+# conversation, the tools, and the answer — all of which have to fit too, and
+# none of which anybody would thank us for evicting to make room for a datasheet
+# that was read forty turns ago.
+_ATTACHMENT_SHARE = 0.35
+
+# Fallback when nothing says otherwise. Low rather than high: overestimating a
+# window produces a failed turn, underestimating it produces a note saying a
+# file was left out.
+_DEFAULT_CONTEXT = 128_000
+
+_PAGE_CACHE: dict[tuple[str, int], int] = {}
+
+
+def _pdf_pages(path: Path) -> int:
+    """Page count, cached on (path, mtime). Attachments are immutable — they are
+    content-addressed — so this only ever runs once per file per process."""
+    try:
+        key = (str(path), int(path.stat().st_mtime))
+    except OSError:
+        return 0
+    if key not in _PAGE_CACHE:
+        try:
+            out = subprocess.run(
+                ["pdfinfo", str(path)], capture_output=True, text=True, timeout=20
+            ).stdout
+            pages = next(
+                (int(line.split()[1]) for line in out.splitlines() if line.startswith("Pages")),
+                0,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # No poppler, or a PDF it will not open. Fall back to size, which is
+            # wrong but not zero — and zero would wave the file straight through.
+            pages = max(1, path.stat().st_size // 60_000)
+        _PAGE_CACHE[key] = pages
+    return _PAGE_CACHE[key]
+
+
+def _token_cost(path: Path, kind: str) -> int:
+    if kind == "image":
+        return _TOKENS_PER_IMAGE
+    return max(1, _pdf_pages(path)) * _TOKENS_PER_PDF_PAGE
+
+
+def _attachment_budget(
+    events: list[dict], attachments_dir: Path | None, context: int = _DEFAULT_CONTEXT
+) -> set[tuple[int, str]]:
     """Which (message index, attachment id) pairs are sent as bytes this turn.
 
     Walked newest-first, because recency is the best available proxy for
@@ -535,7 +588,7 @@ def _attachment_budget(events: list[dict], attachments_dir: Path | None) -> set[
     same bytes twice in one request, and the provider gains nothing from the
     second copy.
     """
-    keep, _ = _plan_attachments(events, attachments_dir)
+    keep, _ = _plan_attachments(events, attachments_dir, context)
     return keep
 
 
@@ -579,11 +632,19 @@ def unanswered_messages(events: list[dict]) -> set[int]:
 
 
 def _plan_attachments(
-    events: list[dict], attachments_dir: Path | None
+    events: list[dict], attachments_dir: Path | None, context: int = _DEFAULT_CONTEXT
 ) -> tuple[set[tuple[int, str]], list[str]]:
-    """The pairs to send, and the names of the files left behind."""
+    """The pairs to send, and the names of the files left behind.
+
+    ``context`` is the window of the model about to be asked. Both budgets are
+    enforced: a request has to clear the provider's transport limit and fit the
+    model's window, and which one binds depends entirely on the documents. A
+    scanned PDF hits the byte limit first; a 250-page text one sails past it and
+    costs 400,000 tokens.
+    """
     if attachments_dir is None:
         return set(), []
+    token_budget = max(20_000, int(context * _ATTACHMENT_SHARE))
     dead = unanswered_messages(events)
     keep: set[tuple[int, str]] = set()
     seen: set[str] = set()
@@ -592,6 +653,7 @@ def _plan_attachments(
     dropped: set[str] = set()
     left: list[str] = []
     spent = 0
+    spent_tokens = 0
     for i in range(len(events) - 1, -1, -1):
         if i in dead:
             continue  # never reached a model; its bytes buy nothing
@@ -608,33 +670,38 @@ def _plan_attachments(
             # base64 is 4 bytes out for every 3 in, which is what actually
             # travels; the size on disk understates the request by a third.
             cost = (path.stat().st_size + 2) // 3 * 4
-            # The budget binds even the message just sent. Keeping one file
-            # regardless means attaching something is never a no-op; keeping all
-            # of them regardless was how three 8 MB datasheets on one message
-            # produced a 34 MB request against a 32 MB limit, every turn,
-            # forever.
-            if spent + cost > _ATTACHMENT_BUDGET and keep:
+            tokens = _token_cost(path, str(b.get("type")))
+            # Both budgets bind, and they bind even on the message just sent.
+            # Keeping one file regardless means attaching something is never a
+            # no-op; keeping all of them regardless was how three 8 MB
+            # datasheets on one message produced a 34 MB request against a
+            # 32 MB limit on every turn thereafter.
+            over = spent + cost > _ATTACHMENT_BUDGET or spent_tokens + tokens > token_budget
+            if over and keep:
                 dropped.add(aid)
-                left.append(name)
+                left.append(f"{name} (~{tokens // 1000}k tokens)")
                 continue
             seen.add(aid)
             spent += cost
+            spent_tokens += tokens
             keep.add((i, aid))
     return keep, left
 
 
-def attachments_left_out(events: Iterable[dict], attachments_dir: Path | None) -> list[str]:
+def attachments_left_out(
+    events: Iterable[dict], attachments_dir: Path | None, context: int = _DEFAULT_CONTEXT
+) -> list[str]:
     """Names of attachments this turn will not carry, newest-relevant first.
 
     Separate from building the messages so the turn can *say* so. A request
     silently missing the datasheet it is being asked about is the failure mode
     to avoid — worse than the size error, because it looks like it worked.
     """
-    return _plan_attachments(list(events), attachments_dir)[1]
+    return _plan_attachments(list(events), attachments_dir, context)[1]
 
 
 def history_to_messages(
-    events: Iterable[dict], attachments_dir: Path | None = None
+    events: Iterable[dict], attachments_dir: Path | None = None, context: int = _DEFAULT_CONTEXT
 ) -> list[Msg]:
     """Rebuild the chat history from the conversation's JSONL.
 
@@ -652,7 +719,7 @@ def history_to_messages(
     the failure this is avoiding.
     """
     events = list(events)
-    keep = _attachment_budget(events, attachments_dir)
+    keep = _attachment_budget(events, attachments_dir, context)
     # Questions nothing ever answered. Four identical copies of the same
     # paragraph is not context; it is the wreckage of four attempts to send it.
     dead = unanswered_messages(events)
@@ -761,6 +828,8 @@ class TurnRequest:
     # conversation's.
     endpoints_for: Callable[[str], list[Endpoint]] | None = None
     library: object | None = None
+    # The chosen endpoint's context window, so the request can be sized to it.
+    context: int = 0
     record_tool_call: Callable[[dict], None] | None = None
     # Where the KiCad MCP server is, if the deploy has one.
     kicad_url: str | None = None
@@ -845,18 +914,25 @@ class ChatSessionManager:
         try:
             events = list(req.conversation.read_all())
             attachments_dir = req.conversations_dir or req.conversation.path.parent
-            messages = history_to_messages(events, attachments_dir)
+            # Sized to the model that is about to be asked, not to a fixed
+            # number. Switching endpoints mid-conversation changes what fits —
+            # a history that a 1M-token model carries comfortably is three
+            # times over the head of a 200k one — and the request is rebuilt
+            # per turn anyway, so this costs nothing to get right.
+            window = req.context or _DEFAULT_CONTEXT
+            messages = history_to_messages(events, attachments_dir, window)
             # Said out loud, because the alternative is an answer written
             # without a file the user believes was in front of it.
-            left = attachments_left_out(events, attachments_dir)
+            left = attachments_left_out(events, attachments_dir, window)
             if left:
                 live.publish({
                     "type": "note",
                     "text": (
-                        f"Not sending {', '.join(left)} with this message — the request would "
-                        "be over the provider's size limit. What was already read from them is "
-                        "still in the transcript. Ask about one at a time, or save them into "
-                        "the project so they can be read from there."
+                        f"Not sending {', '.join(left)} with this message — the request "
+                        f"would not fit {req.endpoint.name}'s {window // 1000}k-token window. "
+                        "What was already read from them is still in the transcript. Ask "
+                        "about one at a time, or save them into the project so they can be "
+                        "read from there instead of riding along in every request."
                     ),
                 })
             executor = ToolExecutor(

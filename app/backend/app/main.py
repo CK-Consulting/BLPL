@@ -2973,6 +2973,12 @@ def _cred_resolver():
     return CredResolver()
 
 
+def _context_of(session: Session, user: User, endpoint_name: str) -> int:
+    """The declared context window of one of this user's endpoints."""
+    declared = llmconfig.load(session, user).endpoint(endpoint_name)
+    return declared.context if declared else 0
+
+
 def _task_endpoints(
     session: Session, user: User, master_key: bytes, task: str
 ) -> list[chat_mod.Endpoint]:
@@ -3212,6 +3218,11 @@ async def start_chat_turn(
                 conversation=conv,
                 endpoint=endpoint,
                 fallbacks=fallbacks,
+                # What the chosen model can actually be told at once. Read from
+                # the declared config rather than guessed from the wire name,
+                # so a self-hosted model started with a 1M window is treated as
+                # having one.
+                context=_context_of(session, user, endpoint.name),
                 sandbox=_sandbox_for(session, user, project_id),
                 usage_ledger=_blpl_dir(session, user, project_id) / "llm_usage.jsonl",
                 creds=_cred_resolver(),

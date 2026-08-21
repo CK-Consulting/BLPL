@@ -85,7 +85,9 @@ def test_what_was_left_out_is_reported_not_only_substituted(convo, monkeypatch) 
     a = _put(convo, "a.pdf", 1.4)
     b = _put(convo, "b.pdf", 1.4)
     events = [_msg(a, "a.pdf"), _msg(b, "b.pdf")]
-    assert attachments_left_out(events, convo) == ["a.pdf"]
+    # Named with what it would have cost, because "too large" without a number
+    # leaves you guessing which file to take out.
+    assert [n.split(" (")[0] for n in attachments_left_out(events, convo)] == ["a.pdf"]
 
 
 def test_the_budget_binds_the_message_just_sent(convo, monkeypatch) -> None:
@@ -110,7 +112,9 @@ def test_the_budget_binds_the_message_just_sent(convo, monkeypatch) -> None:
     msgs = history_to_messages(events, convo)
     # The first attached fits; the two behind it do not, and are named.
     assert _kinds(msgs).count("DocumentBlock") == 1
-    assert sorted(attachments_left_out(events, convo)) == ["d1.pdf", "d2.pdf"]
+    assert sorted(n.split(" (")[0] for n in attachments_left_out(events, convo)) == [
+        "d1.pdf", "d2.pdf",
+    ]
 
 
 def test_attaching_something_is_never_a_no_op(convo, monkeypatch) -> None:
@@ -152,7 +156,7 @@ def test_a_file_attached_twice_is_named_once_when_it_is_dropped(convo, monkeypat
     old = _put(convo, "old.pdf", 1.4)
     new = _put(convo, "new.pdf", 1.4)
     events = [_msg(old, "old.pdf"), _msg(old, "old.pdf"), _msg(new, "new.pdf")]
-    assert attachments_left_out(events, convo) == ["old.pdf"]
+    assert [n.split(" (")[0] for n in attachments_left_out(events, convo)] == ["old.pdf"]
 
 
 # -- turns that produced nothing ---------------------------------------------
@@ -249,3 +253,64 @@ def test_only_a_message_that_produced_nothing_can_be_removed(tmp_path) -> None:
         {"role": "error", "content": "413"},
     ]
     assert unanswered_messages(events) == {2, 4}
+
+
+# -- the limit that actually bites -------------------------------------------
+
+
+def test_a_pdf_that_fits_the_byte_budget_can_still_blow_the_window(convo, monkeypatch) -> None:
+    """Bytes are a terrible proxy for tokens, and this is the measurement that
+    proved it: a 6 MB PDF cleared a 16 MB byte budget comfortably and was 250
+    pages — around 400,000 tokens on its own. Four of those plus 54k tokens of
+    conversation came to 1,007,587 against a 1,000,000 limit."""
+    from app import chat as chat_mod
+
+    aid = _put(convo, "small-but-long.pdf", 0.2)
+    keep = _put(convo, "recent.pdf", 0.2)
+    # Byte-wise both are trivial; token-wise the first is a 250-page document.
+    monkeypatch.setattr(
+        chat_mod, "_pdf_pages", lambda p: 250 if "small-but-long" in _name(convo, p) else 2
+    )
+    events = [_msg(aid, "small-but-long.pdf"), _msg(keep, "recent.pdf")]
+    left = attachments_left_out(events, convo, context=200_000)
+    assert left and left[0].startswith("small-but-long.pdf")
+    assert "650k tokens" in left[0]
+    msgs = history_to_messages(events, convo, context=200_000)
+    assert _kinds(msgs).count("DocumentBlock") == 1
+
+
+def _name(convo, path) -> str:
+    """Map a blob path back to the name it was stored under."""
+    from app import attachments as store
+
+    return store.name_of(path)
+
+
+def test_a_bigger_window_carries_more(convo, monkeypatch) -> None:
+    """Switching endpoints changes what fits. A history a 1M-token model carries
+    comfortably is three times over the head of a 200k one, and the request is
+    rebuilt per turn anyway — so it is sized to whoever is about to be asked."""
+    from app import chat as chat_mod
+
+    monkeypatch.setattr(chat_mod, "_pdf_pages", lambda p: 25)
+    ids = [(_put(convo, f"d{i}.pdf", 0.1), f"d{i}.pdf") for i in range(4)]
+    events = [_msg(a, n) for a, n in ids]
+    narrow = history_to_messages(events, convo, context=200_000)
+    wide = history_to_messages(events, convo, context=1_000_000)
+    assert _kinds(wide).count("DocumentBlock") > _kinds(narrow).count("DocumentBlock")
+
+
+def test_a_models_window_is_declared_or_inferred_from_its_name() -> None:
+    """A self-hosted model's window is a deployment choice its name cannot
+    express: the same Nemotron weights serve 128k or 1M depending on how vLLM
+    was started. Declared always wins."""
+    from app.appconfig import Endpoint
+
+    assert Endpoint(name="a", kind="anthropic", model="claude-opus-5[1m]").context == 1_000_000
+    assert Endpoint(name="b", kind="anthropic", model="claude-opus-5").context == 200_000
+    assert Endpoint(name="c", kind="ollama", model="qwen2.5vl:7b").context == 32_000
+    assert Endpoint(name="d", kind="ollama", model="something-nobody-knows").context == 128_000
+    assert (
+        Endpoint(name="e", kind="ollama", model="claude-opus-5", context_tokens=64_000).context
+        == 64_000
+    )
