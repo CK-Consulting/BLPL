@@ -71,6 +71,7 @@ from . import (
     attachments,
     chat as chat_mod,
     clerk_auth,
+    components,
     grants,
     importer,
     keystore,
@@ -2687,6 +2688,125 @@ def delete_failed_message(
     return {"ok": True, "removed": removed}
 
 
+# --------------------------------------------------------------------------
+# Component library
+# --------------------------------------------------------------------------
+
+
+class _Library:
+    """One user's component library, as the two operations a tool needs.
+
+    Closed over the user id rather than handed to tools as a path: a tool that
+    only has ``get`` and ``put`` cannot construct another user's library
+    location, even by accident, and the per-user boundary is the entirety of
+    the answer to "what about an NDA datasheet".
+    """
+
+    def __init__(self, user_id: int) -> None:
+        self._user_id = user_id
+
+    def get(self, mpn: str) -> dict | None:
+        return components.extraction(_DATA, self._user_id, mpn)
+
+    def put(self, mpn: str, payload: dict) -> None:
+        components.save_extraction(_DATA, self._user_id, mpn, payload)
+
+
+class ComponentDocBody(BaseModel):
+    mpn: str
+
+
+@app.get("/api/components")
+def list_components(
+    user: User = Depends(require_onboarded),
+) -> dict:
+    """This user's parts. Never anyone else's — the library is per-user, and
+    that scoping is the whole of the answer to "what about NDA documents"."""
+    return {"parts": components.parts(_DATA, user.id)}
+
+
+@app.get("/api/components/{mpn}")
+def read_component(mpn: str, user: User = Depends(require_onboarded)) -> dict:
+    return {
+        "mpn": mpn,
+        "documents": components.documents(_DATA, user.id, mpn),
+        "has_extraction": components.extraction(_DATA, user.id, mpn) is not None,
+    }
+
+
+@app.post("/api/components/{mpn}/documents")
+async def add_component_document(
+    mpn: str,
+    file: UploadFile = File(...),
+    user: User = Depends(require_onboarded),
+) -> dict:
+    data = await file.read()
+    if len(data) > attachments.MAX_DOCUMENT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{file.filename} is larger than {attachments.MAX_DOCUMENT_BYTES // (1024*1024)} MB",
+        )
+    try:
+        return components.add_document(_DATA, user.id, mpn, file.filename or "document.pdf", data)
+    except components.ComponentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/projects/{project_id}/components")
+def project_components(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Which parts this project references, and at which revision.
+
+    A bill of documents beside the bill of materials: the exact datasheet
+    revision the board was designed against, per part.
+    """
+    proj = _project_dir(session, user, project_id)
+    return {"attached": sorted(components.attached(proj))}
+
+
+@app.post("/api/projects/{project_id}/components")
+def attach_component(
+    project_id: str, body: ComponentDocBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    proj = _project_dir(session, user, project_id)
+    try:
+        return components.attach(proj, _DATA, user.id, body.mpn)
+    except components.ComponentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/projects/{project_id}/components/{mpn}/update")
+def update_component(
+    project_id: str, mpn: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    proj = _project_dir(session, user, project_id)
+    try:
+        return components.update(proj, mpn)
+    except components.ComponentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/projects/{project_id}/components/{mpn}")
+def detach_component(
+    project_id: str, mpn: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    proj = _project_dir(session, user, project_id)
+    try:
+        components.detach(proj, mpn)
+    except components.ComponentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True}
+
+
 @app.post("/api/projects/{project_id}/conversations")
 def create_conversation(
     project_id: str, payload: NewConversationInput, user: User = Depends(require_onboarded),
@@ -3057,6 +3177,7 @@ async def start_chat_turn(
                 usage_ledger=_blpl_dir(session, user, project_id) / "llm_usage.jsonl",
                 creds=_cred_resolver(),
                 endpoints_for=lambda task: _task_endpoints(session, user, master_key, task),
+                library=_Library(user.id),
                 record_tool_call=lambda rec: run_manager.record_tool_call(
                     project_id, rec, conversation=conv.path.name
                 ),

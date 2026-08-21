@@ -78,6 +78,14 @@ class ToolContext:
     # None means single-agent, which is every session today: one agent owning
     # the whole project needs no boundary drawn inside it.
     write_scope: Any | None = None
+    # The user's component library, when one is reachable. A part's pinout is a
+    # property of the part, so an extraction already paid for on another of this
+    # user's projects is the same answer — looked up before spending again.
+    #
+    # A pair rather than a path so the callable can stay a closure over the
+    # request's user; tools never see a user id and cannot construct another
+    # user's library path even by accident.
+    library: Any | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def note(self, message: str) -> None:

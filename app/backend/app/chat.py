@@ -760,6 +760,7 @@ class TurnRequest:
     # extraction needs one that can see) gets the routed one rather than this
     # conversation's.
     endpoints_for: Callable[[str], list[Endpoint]] | None = None
+    library: object | None = None
     record_tool_call: Callable[[dict], None] | None = None
     # Where the KiCad MCP server is, if the deploy has one.
     kicad_url: str | None = None
@@ -832,6 +833,7 @@ class ChatSessionManager:
             conversation=req.conversation.path.name,
             creds=req.creds or CredResolver(),
             endpoints_for=req.endpoints_for or (lambda _t: []),
+            library=req.library,
             on_progress=lambda m: live.publish({"type": "progress", "message": m}),
             # A tool whose whole effect is visual publishes straight to the
             # browser; highlighting the part under discussion beats describing

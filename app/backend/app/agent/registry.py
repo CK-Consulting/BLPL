@@ -324,6 +324,17 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
     mpn = str(args.get("mpn", "")).strip()
     if not mpn:
         raise ToolDenied("mpn is required")
+    # Before anything else, including the vision-endpoint requirement. An
+    # extraction already paid for on another of this user's projects is the same
+    # answer — a pinout is a property of the part, not of the board — and
+    # demanding a model that can see, in order to hand back a result that was
+    # read months ago, is a check standing in front of nothing.
+    if ctx.library is not None:
+        prior = ctx.library.get(mpn)
+        if prior is not None:
+            ctx.note(f"{mpn}: reusing the extraction already in your component library")
+            return json.dumps({"source": "component-library", "mpn": mpn, **prior}, indent=2)
+
     chain = ctx.endpoints_for("datasheet_vision")
     if not chain:
         raise ToolDenied(
@@ -361,6 +372,18 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
     # The whole chain, not its head. A model that cannot hold the output schema
     # fails every task the same way, so the endpoints behind it are the fix.
     run = await extract_datasheet(mpn, pdf, cache, chain, on_progress=ctx.note)
+    # Kept for next time, and for the next project. Only when something actually
+    # landed: filing a failed run would poison every later lookup with the
+    # answer "we already tried".
+    merged = cache / f"{mpn}.json"
+    if ctx.library is not None and merged.is_file():
+        try:
+            ctx.library.put(mpn, json.loads(merged.read_text(encoding="utf-8")))
+            ctx.note(f"{mpn}: saved to your component library for reuse")
+        except (OSError, json.JSONDecodeError, Exception):  # noqa: B014
+            # Never fatal: the extraction succeeded and is on disk in the
+            # project. Failing to file a copy is worth less than the result.
+            pass
     return json.dumps(run.to_dict(), indent=2)
 
 
