@@ -114,6 +114,15 @@ function turnInFlightId(e: unknown): string | null {
 export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [filename, setFilename] = useState<string | null>(null);
+  // Which conversation is on screen, readable from inside a running async loop.
+  //
+  // A turn belongs to a conversation and outlives being looked at: it runs on
+  // the server, and the user is free to go and read something else while it
+  // works. What must not happen is a turn writing into a conversation that is
+  // no longer open — its `finally` reloads the transcript, and with a stale
+  // closure that reload replaces whatever you switched to with what you left.
+  // Every state write from a turn is gated on this still naming its owner.
+  const openRef = useRef<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [decided, setDecided] = useState<Record<string, string>>({});
@@ -274,6 +283,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         });
       }
       setConversations(list.length ? list : [chosen]);
+      openRef.current = chosen.filename;
       setFilename(chosen.filename);
       const live = await loadConversation(chosen.filename);
       await refreshProposals();
@@ -290,23 +300,36 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   /** Open a different conversation in this project. */
   const openConversation = useCallback(
     async (name: string) => {
-      if (name === filename || streaming) return;
+      if (name === filename) return;
+      // No longer refused while a turn is running. The turn is on the server
+      // and keeps going; refusing only stopped you *looking* at anything else
+      // for as long as it took, which on a long extraction is minutes. What
+      // made it unsafe was the reload in `watch`'s finally reaching for a
+      // stale `filename` — that is now gated on ownership instead.
+      openRef.current = name;
       setFilename(name);
       setMessages([]);
       setLiveText("");
       setLiveSegments([]);
       setLiveTools([]);
+      setApprovals([]);
+      setProgress(null);
+      setTurnId(null);
+      setStreaming(false);
+      setLost(null);
       setAttached([]);
       setError(null);
       const live = await loadConversation(name).catch((e) => {
         setError((e as Error).message);
         return null;
       });
+      // They may have moved on again while that was in flight.
+      if (openRef.current !== name) return;
       // Each conversation has its own turn. Switching into one with an answer
       // in progress should show that answer, not a frozen transcript.
       if (live) void watchRef.current?.(live);
     },
-    [filename, streaming, loadConversation],
+    [filename, loadConversation],
   );
 
   const newConversation = async () => {
@@ -314,10 +337,17 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       title: "design",
     });
     setConversations((c) => [...c, created]);
+    openRef.current = created.filename;
     setFilename(created.filename);
     setMessages([]);
     setLiveText("");
+    setLiveSegments([]);
     setLiveTools([]);
+    setApprovals([]);
+    setProgress(null);
+    setTurnId(null);
+    setStreaming(false);
+    setLost(null);
     setAttached([]);
   };
 
@@ -338,8 +368,13 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
    * caller.
    */
   const follow = useCallback(
-    async (id: string): Promise<TurnOutcome> => {
-      setTurnId(id);
+    async (id: string, owner: string | null): Promise<TurnOutcome> => {
+      // The turn belongs to `owner`. If the reader has gone elsewhere, keep
+      // reading the stream — the terminal event still has to be seen so the
+      // loop ends and the transcript reconciles — but write nothing to a screen
+      // that is now showing a different conversation.
+      const mine = () => openRef.current === owner;
+      if (mine()) setTurnId(id);
       cancelledRef.current = false;
       persistedErrorRef.current = false;
       retryableRef.current = false;
@@ -347,11 +382,15 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       let attempt = 0;
       for (;;) {
         // Replay is from the top every time; start from an empty slate so a
-        // reconnect cannot double the text it already showed.
-        setLiveText("");
-        setLiveSegments([]);
-        setLiveTools([]);
-        setApprovals([]);
+        // reconnect cannot double the text it already showed. Only when this
+        // turn owns the screen — a background reconnect clearing these would
+        // wipe the conversation the reader moved to.
+        if (mine()) {
+          setLiveText("");
+          setLiveSegments([]);
+          setLiveTools([]);
+          setApprovals([]);
+        }
         let sawEnd = false;
         outcome = "ended";
         try {
@@ -359,6 +398,38 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             `/api/projects/${projectId}/chat/${id}/events`,
             { method: "GET" },
             (event, payload) => {
+              if (event === "done") {
+                sawEnd = true;
+                // "not_live" means the server has no such turn: it was lost in
+                // a restart, or it finished long enough ago to have aged out of
+                // the retained buffer. Those need opposite things said about
+                // them, and only the transcript can tell them apart — so the
+                // reason is carried out to the caller, which reloads it.
+                if (payload.stop_reason === "not_live") outcome = "not_live";
+                return;
+              }
+              if (event === "cancelled") {
+                sawEnd = true;
+                cancelledRef.current = true;
+                return;
+              }
+              if (event === "error") {
+                // Terminal, so the loop has to see it whether or not this turn
+                // is on screen — otherwise a turn the reader walked away from
+                // reconnects four times against a stream that is already over.
+                sawEnd = true;
+                if (mine()) {
+                  setError(payload.detail);
+                  // The server persists this same text into the conversation,
+                  // so once the transcript reloads it is on screen from there
+                  // too. Without this the user reads the identical provider
+                  // error twice, which looks like it happened twice.
+                  persistedErrorRef.current = true;
+                  retryableRef.current = Boolean(payload.retryable);
+                }
+                return;
+              }
+              if (!mine()) return;
               if (event === "text_delta") setLiveText((t) => t + payload.text);
               else if (event === "segment")
                 setLiveText((t) => {
@@ -391,28 +462,6 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
                 );
               else if (event === "approval_resolved")
                 setApprovals((a) => a.filter((x) => x.call_id !== payload.call_id));
-              else if (event === "error") {
-                setError(payload.detail);
-                // The server persists this same text into the conversation, so
-                // once the transcript reloads it is on screen from there too.
-                // Without this the user reads the identical provider error
-                // twice, which looks like it happened twice.
-                persistedErrorRef.current = true;
-                retryableRef.current = Boolean(payload.retryable);
-                sawEnd = true;
-              } else if (event === "done") {
-                sawEnd = true;
-                // "not_live" means the server has no such turn: it was lost in
-                // a restart, or it finished long enough ago to have aged out of
-                // the retained buffer. Those need opposite things said about
-                // them, and only the transcript can tell them apart — so the
-                // reason is carried out to the caller, which reloads it.
-                if (payload.stop_reason === "not_live") outcome = "not_live";
-              }
-              else if (event === "cancelled") {
-                sawEnd = true;
-                cancelledRef.current = true;
-              }
               if (event === "start" && payload.model) setModel(payload.model);
             },
           );
@@ -423,7 +472,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           // A 4xx is an answer, not a broken pipe: the turn is gone, or this
           // client may not watch it. Retrying cannot change either.
           if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
-            setError(e.message);
+            if (mine()) setError(e.message);
             return "ended";
           }
         }
@@ -433,13 +482,15 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         if (cancelledRef.current) return "ended";
         attempt += 1;
         if (attempt > RECONNECT_ATTEMPTS) {
-          setError(
-            "Lost the connection to this answer. It is still running on the server — " +
-              "reopen the project or reload to pick it back up.",
-          );
+          if (mine())
+            setError(
+              "Lost the connection to this answer. It is still running on the server — " +
+                "reopen the project or reload to pick it back up.",
+            );
           return "ended";
         }
-        setProgress(`Connection dropped — reattaching (${attempt}/${RECONNECT_ATTEMPTS})…`);
+        if (mine())
+          setProgress(`Connection dropped — reattaching (${attempt}/${RECONNECT_ATTEMPTS})…`);
         await sleep(RECONNECT_BACKOFF_MS[attempt - 1] ?? 4000);
       }
     },
@@ -449,22 +500,38 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   /** Run a turn to completion, then reconcile against what was persisted. */
   const watch = useCallback(
     async (id: string) => {
+      // Whose turn this is. Every caller points openRef at the conversation
+      // first, so reading it here needs no extra argument threaded through.
+      const owner = openRef.current;
+      const mine = () => openRef.current === owner;
       setStreaming(true);
       let outcome: TurnOutcome = "ended";
       try {
-        outcome = await follow(id);
+        outcome = await follow(id, owner);
       } finally {
-        setStreaming(false);
-        setLiveText("");
-        setLiveSegments([]);
-        setLiveTools([]);
-        setApprovals([]);
-        setProgress(null);
-        setTurnId(null);
+        // The reader may have moved to another conversation while this ran. The
+        // turn still finished, and its result is on disk — but none of the
+        // reconciliation below belongs on a screen showing something else. The
+        // reload in particular: it used to fetch whatever `filename` was closed
+        // over, which is the conversation you *left*, and paste it over the one
+        // you had opened.
+        if (mine()) {
+          setStreaming(false);
+          setLiveText("");
+          setLiveSegments([]);
+          setLiveTools([]);
+          setApprovals([]);
+          setProgress(null);
+          setTurnId(null);
+        }
         // The persisted turn is authoritative — reload rather than trusting the
         // deltas we happened to see.
-        const reloaded = filename ? await loadMessages(filename).catch(() => null) : null;
-        if (reloaded) setMessages(reloaded);
+        const reloaded = mine() && owner ? await loadMessages(owner).catch(() => null) : null;
+        if (reloaded && mine()) setMessages(reloaded);
+        // Not gated: proposals are the project's, not this conversation's, and
+        // one produced by a turn you walked away from is still an edit waiting
+        // on you. Hiding it until you happened to reload would be the same
+        // silent wait the approval card had.
         await refreshProposals();
 
         // A turn the server no longer has is either an answer that was lost —
@@ -499,9 +566,14 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         // after a turn that failed or was lost: the queued message was written
         // in the belief that an answer was coming, and sending it on top of a
         // failure buries the failure under a new question.
-        const next = queued.current;
-        queued.current = null;
-        setQueuedNote(null);
+        // Also only when this is still the open conversation: a message queued
+        // here was typed into *this* thread, and firing it after the reader has
+        // moved elsewhere would send it from a screen they are not looking at.
+        const next = mine() ? queued.current : null;
+        if (mine()) {
+          queued.current = null;
+          setQueuedNote(null);
+        }
         if (next && outcome === "ended" && !persistedErrorRef.current) {
           setInput(next.text);
           setAttached(next.attached);
@@ -514,7 +586,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         }
       }
     },
-    [follow, filename, loadMessages, refreshProposals],
+    [follow, loadMessages, refreshProposals],
   );
   watchRef.current = watch;
 
@@ -886,7 +958,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             <span>Conversation</span>
             <select
               value={filename ?? ""}
-              disabled={streaming || conversations.length === 0}
+              disabled={conversations.length === 0}
               onChange={(e) => void openConversation(e.target.value)}
             >
               {conversations.map((c) => (
@@ -932,15 +1004,29 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             <button
               className="menu-item"
               disabled={streaming}
-              title="Take this conversation off the list — it is kept, not deleted"
+              title={
+                streaming
+                  ? "Not while this session is being answered — archiving moves the file the answer is being written into"
+                  : "Take this conversation off the list — it is kept, not deleted"
+              }
               onClick={() => void archive(filename, !(here?.archived ?? false))}
             >
               {here?.archived ? "Unarchive this session" : "Archive this session"}
             </button>
           )}
-          <button className="menu-item" onClick={newConversation} disabled={streaming}>
+          <button className="menu-item" onClick={newConversation}>
             New session
           </button>
+          {/* The one thing still held back, and why. A disabled control with no
+              stated reason is the same silent failure as an error nobody can
+              see — you are left guessing whether it is broken or forbidden. */}
+          {streaming && (
+            <p className="menu-note">
+              This session is being answered. You can switch away and come back —
+              the answer keeps running and picks up where it left off. Archiving
+              waits until it finishes.
+            </p>
+          )}
         </Menu>
       </div>
 

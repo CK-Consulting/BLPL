@@ -320,6 +320,9 @@ body.resizing-y * { pointer-events: none; }
 .menu-sep { height: 1px; background: #6b6f75; margin: .15rem 0; }
 .menu-item { text-align: left; width: 100%; background: transparent; border: 1px solid transparent; padding: .35rem .4rem; border-radius: 6px; font-size: 13px; color: #e6e6e6; }
 .menu-item:hover:not(:disabled) { background: #2a303c; border-color: #6b6f75; }
+/* 9.15:1. Says why the control above it is unavailable, which a disabled
+   control on its own never does. */
+.menu-note { margin: 0; font-size: 12.5px; line-height: 1.45; color: #b9c3d0; }
 
 /* Anchored over the transcript at whichever end new material arrives at, so
    the arrow on it and the direction it takes you always agree. `.chat` is the
