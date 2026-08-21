@@ -693,3 +693,77 @@ def test_a_model_that_will_not_answer_is_unknown_not_incapable(unlocked, monkeyp
 
     monkeypatch.setattr(main.urllib.request, "urlopen", boom)
     assert main._model_capabilities("ollama", "http://x/api/tags", ["m"], {}) == {}
+
+
+def test_a_datasheet_is_found_when_the_file_is_not_named_after_the_part(tmp_path) -> None:
+    """Vendors do not name PDFs after the orderable part number, so building
+    `<MPN>.pdf` only ever worked for files the fetcher downloaded itself."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    sheets.mkdir()
+    for f in ("stm32u5g9nj.pdf", "NORA-B2_DataSheet_UBXDOC-102385.pdf", "MM8108-MF15457.pdf"):
+        (sheets / f).write_bytes(b"%PDF-1.4\n")
+
+    assert df.resolve(tmp_path, "MM8108-MF15457").how == "exact"
+    assert df.resolve(tmp_path, "STM32U5G9NJH6Q").path.name == "stm32u5g9nj.pdf"
+    assert df.resolve(tmp_path, "NORA-B206-00B").path.name.startswith("NORA-B2_")
+
+
+def test_two_revisions_of_one_part_refuse_rather_than_guess(tmp_path) -> None:
+    """The failure this exists to prevent. Silently picking v1.0 over v1.1 puts
+    a pinout from the wrong revision into a BOM, and nothing downstream would
+    question it."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    sheets.mkdir()
+    for f in ("nRF9151_datasheet_rev_v1.0.pdf", "nRF9151_datasheet_rev_v1.1.pdf"):
+        (sheets / f).write_bytes(b"%PDF-1.4\n")
+
+    got = df.resolve(tmp_path, "NRF9151-LACA-R")
+    assert not got.ok
+    assert len(got.candidates) == 2
+    assert "Say which" in got.detail
+
+    # Naming one is a statement, and it is honoured.
+    named = df.resolve(tmp_path, "NRF9151-LACA-R", file="nRF9151_datasheet_rev_v1.1.pdf")
+    assert named.ok and named.how == "explicit"
+
+
+def test_a_file_sharing_nothing_with_the_mpn_needs_the_map(tmp_path) -> None:
+    """A Seeed module ordered as 100058045 ships as Wio-LR2021_Module_Datasheet.
+    No amount of matching bridges that; the map is the only mechanism that can."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    sheets.mkdir()
+    (sheets / "Wio-LR2021_Module_Datasheet.pdf").write_bytes(b"%PDF-1.4\n")
+
+    assert not df.resolve(tmp_path, "100058045").ok
+    df.record(tmp_path, "100058045", "Wio-LR2021_Module_Datasheet.pdf")
+    found = df.resolve(tmp_path, "100058045")
+    assert found.ok and found.how == "map"
+
+
+def test_a_hand_written_binding_is_not_overwritten(tmp_path) -> None:
+    """A row a person corrected outranks anything matched automatically."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    sheets.mkdir()
+    (sheets / "a.pdf").write_bytes(b"%PDF-1.4\n")
+    (sheets / "b.pdf").write_bytes(b"%PDF-1.4\n")
+    df.record(tmp_path, "PART-1", "a.pdf")
+    df.record(tmp_path, "PART-1", "b.pdf")
+    assert df.resolve(tmp_path, "PART-1").path.name == "a.pdf"
+
+
+def test_a_datasheet_path_cannot_escape_the_project(tmp_path) -> None:
+    """`file` comes from a model reading a user's message."""
+    from blpl.agent.tools import datasheet_files as df
+
+    (tmp_path / "datasheets").mkdir()
+    (tmp_path / "secret.pdf").write_bytes(b"%PDF-1.4\n")
+    assert not df.resolve(tmp_path, "X", file="../secret.pdf").ok
+    assert not df.resolve(tmp_path, "X", file="/etc/passwd").ok

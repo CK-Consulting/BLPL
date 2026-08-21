@@ -154,9 +154,32 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
             "no vision-capable endpoint is routed to datasheet_vision — set one in Settings. "
             "Extraction reads PDF pages as images; a text-only model would read nothing."
         )
-    pdf = ctx.project_dir / "datasheets" / f"{mpn}.pdf"
-    if not pdf.is_file():
-        raise FileNotFoundError(f"no datasheet at {pdf.name} — call fetch_datasheet first")
+    from blpl.agent.tools import datasheet_files
+
+    # A vendor almost never names a PDF after the orderable part number, so
+    # `<MPN>.pdf` only ever worked for files this tool downloaded itself.
+    found = datasheet_files.resolve(ctx.project_dir, mpn, file=str(args.get("file") or ""))
+    if not found.ok:
+        raise FileNotFoundError(
+            f"no datasheet resolved for {mpn}: {found.detail}. "
+            + (
+                f"Files present: {', '.join(found.candidates)}. "
+                if found.candidates
+                else ""
+            )
+            + "Pass `file` to name one directly, add a row to "
+            f"datasheets/{datasheet_files.MAP_NAME}, or call fetch_datasheet first."
+        )
+    pdf = found.path
+    if found.how in ("explicit", "prefix"):
+        # Remember what was worked out, so the next run is a lookup rather than
+        # another guess — and so a person can see and correct the binding.
+        try:
+            datasheet_files.record(ctx.project_dir, mpn, pdf.name)
+        except OSError:
+            pass
+    if found.how != "exact":
+        ctx.note(f"{mpn}: reading {pdf.name} (matched by {found.how})")
     cache = ctx.project_dir / "datasheets" / "extracted"
     ctx.sandbox.check_write(cache)
     run = await extract_datasheet(mpn, pdf, cache, endpoint, on_progress=ctx.note)
@@ -729,7 +752,18 @@ def parts_tools() -> list[ToolSpec]:
             ),
             input_schema={
                 "type": "object",
-                "properties": {"mpn": {"type": "string"}},
+                "properties": {
+                    "mpn": {"type": "string"},
+                    "file": {
+                        "type": "string",
+                        "description": (
+                            "Optional filename in datasheets/ to read, when it is not "
+                            "named after the MPN. Vendors rarely name a PDF after the "
+                            "orderable part number, and the user naming a file is a "
+                            "statement rather than a guess — prefer it when they do."
+                        ),
+                    },
+                },
                 "required": ["mpn"],
             },
             kind="dispatch",

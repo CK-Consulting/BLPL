@@ -254,9 +254,16 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8e8e; }
    overflow:auto box (the proposal's diff) can shrink all the way to nothing —
    which collapsed the accept/reject card to 2px at the end of a long chat. */
 .chat-scroll > * { flex: none; }
-.chat-composer { display: flex; gap: .4rem; padding: .6rem; border-top: 1px solid #24262c; flex: none; }
-.chat-composer textarea { flex: 1; resize: none; min-height: 3.6rem; max-height: 12rem; background: #0f1115; color: #e6e6e6; border: 1px solid #6b6f75; border-radius: 6px; padding: .45rem .6rem; font: inherit; font-size: 13px; }
-.chat-composer textarea:focus { outline: 2px solid #34507f; outline-offset: -1px; }
+.chat-composer { display: flex; gap: .4rem; padding: .6rem; border-top: 1px solid #6b6f75; flex: none; align-items: stretch; }
+/* Vertically resizable, and taller by default. The dock resizes horizontally,
+   which widens the box but does not help when you are composing something long
+   — three lines of a twenty-line paste is a keyhole. `resize: vertical` costs
+   nothing and the browser's grip is already accessible; the max-height cap is
+   raised rather than removed so the transcript cannot be squeezed to nothing. */
+.chat-composer textarea { flex: 1; resize: vertical; min-height: 5.4rem; max-height: 60vh; background: #0f1115; color: #e6e6e6; border: 1px solid #6b6f75; border-radius: 6px; padding: .45rem .6rem; font: inherit; font-size: 13px; }
+/* 2.34:1 before — a focus ring that fails 1.4.11 is not a focus ring. Matches
+   the app-wide indicator so focus looks the same wherever it lands. */
+.chat-composer textarea:focus { outline: 3px solid #80a8ff; outline-offset: -1px; }
 
 .msg { border-radius: 8px; padding: .5rem .7rem; font-size: 13.5px; line-height: 1.5; }
 .msg.user { background: #1d2635; border: 1px solid #26344a; align-self: flex-end; max-width: 92%; white-space: pre-wrap; }
