@@ -406,6 +406,24 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             if (orphan) setLost({ message: orphan, reason: "transient" });
           }
         }
+
+        // Whatever was typed while this turn ran goes now. Deliberately not
+        // after a turn that failed or was lost: the queued message was written
+        // in the belief that an answer was coming, and sending it on top of a
+        // failure buries the failure under a new question.
+        const next = queued.current;
+        queued.current = null;
+        setQueuedNote(null);
+        if (next && outcome === "ended" && !persistedErrorRef.current) {
+          setInput(next.text);
+          setAttached(next.attached);
+          queueMicrotask(() => void sendRef.current?.());
+        } else if (next) {
+          // Put it back in the box rather than sending it into a broken state
+          // or dropping it. What they typed is theirs.
+          setInput(next.text);
+          setAttached(next.attached);
+        }
       }
     },
     [follow, filename, loadMessages, refreshProposals],
@@ -446,11 +464,33 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     }
   };
 
+  // Composed while a turn was running, waiting for it to end. Typing during a
+  // turn is the normal way a conversation goes — a correction, an extra
+  // constraint, the thing you forgot — and the input simply refused clicks,
+  // silently, with no explanation. Blocking it is defensible only because the
+  // server allows one turn per conversation; making the person hold the thought
+  // is not.
+  const queued = useRef<{ text: string; attached: Attachment[] } | null>(null);
+  const [queuedNote, setQueuedNote] = useState<{ text: string; count: number } | null>(null);
+
+  const sendRef = useRef<(() => Promise<void>) | null>(null);
+
   const send = async () => {
     const text = input.trim();
     // An attachment alone is a message: dropping in a datasheet and asking
     // nothing is a normal opening move, and the server agrees.
-    if ((!text && attached.length === 0) || !filename || streaming) return;
+    if ((!text && attached.length === 0) || !filename) return;
+    if (streaming) {
+      // Hold it and clear the box, so it reads as sent rather than ignored.
+      // One queued message, not a backlog: a queue you cannot see the end of
+      // turns a conversation into a batch job, and the answer to the second
+      // message usually depends on the answer to the first.
+      queued.current = { text, attached };
+      setQueuedNote({ text, count: attached.length });
+      setInput("");
+      setAttached([]);
+      return;
+    }
     const sent = attached;
     setInput("");
     setAttached([]);
@@ -546,6 +586,8 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       el.setSelectionRange(caret, caret);
     });
   };
+
+  sendRef.current = send;
 
   const stop = async () => {
     if (!turnId) return;
@@ -751,15 +793,42 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         {slash.open && (
           <SlashPopover query={slash.query ?? ""} active={slash.active} onPick={applyCommand} />
         )}
+        {queuedNote && (
+          <div className="queued-note">
+            <span>
+              Queued — sends when this answer finishes
+              {queuedNote.count ? ` (with ${queuedNote.count} attachment${queuedNote.count > 1 ? "s" : ""})` : ""}:{" "}
+              <span className="queued-text">{queuedNote.text.slice(0, 90)}
+                {queuedNote.text.length > 90 ? "…" : ""}</span>
+            </span>
+            <button
+              className="link"
+              onClick={() => {
+                // Back into the box, not deleted. It is still what they wrote.
+                const held = queued.current;
+                queued.current = null;
+                setQueuedNote(null);
+                if (held) {
+                  setInput(held.text);
+                  setAttached(held.attached);
+                }
+              }}
+            >
+              edit
+            </button>
+          </div>
+        )}
         <textarea
           ref={textarea}
           value={input}
           placeholder={
-            attached.length
-              ? "Ask about what you attached…"
-              : "Describe the board, or ask about this design…"
+            streaming
+              ? "Type now — this will send when the current answer finishes…"
+              : attached.length
+                ? "Ask about what you attached…"
+                : "Describe the board, or ask about this design…"
           }
-          disabled={streaming || !filename}
+          disabled={!filename}
           onChange={(e) => setInput(e.target.value)}
           // Screenshot straight into the conversation. This is the common case
           // for a board — a scope trace, a datasheet page, a photo of the
@@ -822,18 +891,25 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         <button
           className="link attach-btn"
           title="Attach an image or PDF — you can also paste or drop one"
-          disabled={streaming || !filename}
+          disabled={!filename}
           onClick={() => fileInput.current?.click()}
         >
           +
         </button>
         {streaming ? (
-          // Occupies the same spot as Send rather than sitting beside it: while
-          // a turn runs, stopping it is the only thing this button can do, and
-          // a disabled "…" was a status readout offered where an action belongs.
-          <button className="stop" onClick={() => void stop()} disabled={!turnId}>
-            Stop
-          </button>
+          // Two things are worth doing mid-turn, so both are offered. Queue is
+          // the ordinary one — you thought of something while it was working —
+          // and only appears when there is something to queue.
+          <>
+            {(input.trim() || attached.length > 0) && (
+              <button onClick={() => void send()} title="Send when this answer finishes">
+                Queue
+              </button>
+            )}
+            <button className="stop" onClick={() => void stop()} disabled={!turnId}>
+              Stop
+            </button>
+          </>
         ) : (
           <button
             onClick={() => void send()}

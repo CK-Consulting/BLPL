@@ -604,3 +604,11 @@ header .logo-lockup { font-size: 13px; }
   background: #22262e; color: #e6e6e6; border: 1px solid #6b6f75; }
 .cap.cap-vision { background: #16351f; color: #9ff0c0; border-color: #3f7d58; }
 .cap.cap-thinking { background: #2f2740; color: #caa7ff; border-color: #7d6aa8; }
+
+/* A message composed during a turn, waiting for it to end. Stated plainly
+   because the alternative — an input that silently refuses clicks — made the
+   app look broken at exactly the moment it was working hardest. */
+.queued-note { display: flex; align-items: center; gap: .5rem; padding: .35rem .5rem;
+  margin-bottom: .4rem; border: 1px dashed #6b6f75; border-radius: 6px;
+  background: #171d27; color: #e6e6e6; font-size: 13px; }
+.queued-note .queued-text { color: #adb1b6; font-style: italic; }
