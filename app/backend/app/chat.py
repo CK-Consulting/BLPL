@@ -68,6 +68,7 @@ from blpl.core.llm_chat import (
 from . import attachments as attachments_store
 from .agent import ToolContext, ToolExecutor, default_tools
 from .agent.toolspec import ApprovalRequest
+from . import compaction
 from .conversations import Conversation
 from .references import FilesystemSandbox
 
@@ -592,6 +593,27 @@ def _attachment_budget(
     return keep
 
 
+def _reserved_tokens(events: list[dict], attachments_dir: Path | None, window: int) -> int:
+    """What the request is already committed to, apart from conversation text.
+
+    The attachments that survived stage one, plus a flat allowance for the
+    system prompt and the tool declarations — both of which are sizeable here
+    and neither of which shrinks when the conversation does.
+    """
+    keep, _ = _plan_attachments(events, attachments_dir, window)
+    spent = 0
+    if attachments_dir is not None:
+        seen: set[str] = set()
+        for i, aid in keep:
+            if aid in seen:
+                continue
+            seen.add(aid)
+            path = attachments_store.path_of(attachments_dir, aid)
+            if path is not None:
+                spent += _token_cost(path, "document" if path.suffix == ".pdf" else "image")
+    return spent + 12_000
+
+
 def unanswered_messages(events: list[dict]) -> set[int]:
     """Indices of user messages whose turn produced nothing whatsoever.
 
@@ -723,9 +745,33 @@ def history_to_messages(
     # Questions nothing ever answered. Four identical copies of the same
     # paragraph is not context; it is the wreckage of four attempts to send it.
     dead = unanswered_messages(events)
+
+    # A stored summary stands in for everything it covers. Computed once by
+    # app/compaction.py and written into the conversation, so a later turn
+    # reuses it rather than re-summarising — a conversation that quietly
+    # rewords itself on every question is worse than one that is too long.
+    summary, covers = compaction.existing_summary(events)
     messages: list[Msg] = []
+    if summary:
+        messages.append(
+            Msg(
+                role="user",
+                content=[
+                    TextBlock(
+                        "[Summary of the earlier part of this conversation, which has been "
+                        "compacted to fit. Exact values below are quoted; anything not here "
+                        "may still be in the project's files and git history, which you can "
+                        "read.]\n\n" + summary
+                    )
+                ],
+            )
+        )
+        messages.append(
+            Msg(role="assistant", content=[TextBlock("Understood — carrying on from there.")])
+        )
+
     for i, ev in enumerate(events):
-        if i in dead:
+        if i in dead or (summary and i < covers):
             continue
         role = ev.get("role")
         meta = ev.get("metadata") or {}
@@ -746,8 +792,10 @@ def history_to_messages(
         elif role == "tool_results":
             if blocks:
                 messages.append(Msg(role="user", content=blocks))
-        # Any other role (e.g. the "error" marker conversations.py emits for a
-        # corrupt line) is skipped: it is a record for humans, not context.
+        # Any other role — the "error" marker conversations.py emits for a
+        # corrupt line, and the "summary" event, which was already placed above
+        # rather than replayed in sequence — is skipped: a record for humans,
+        # not context.
     return messages
 
 
@@ -920,6 +968,51 @@ class ChatSessionManager:
             # times over the head of a 200k one — and the request is rebuilt
             # per turn anyway, so this costs nothing to get right.
             window = req.context or _DEFAULT_CONTEXT
+
+            # Stage two, and only when stage one was not enough. Dropping
+            # attachments is free and loses nothing anybody wrote; summarising
+            # costs a call and loses detail unpredictably, so it runs last and
+            # only when the text alone will not fit.
+            reserved = _reserved_tokens(events, attachments_dir, window)
+            todo = compaction.plan(events, window, reserved)
+            if todo.worth_it:
+                live.publish({
+                    "type": "note",
+                    "text": (
+                        f"This conversation is about {todo.tokens_now // 1000}k tokens of text, "
+                        f"over the {todo.tokens_target // 1000}k that fits alongside everything "
+                        f"else in {req.endpoint.name}'s window. Summarising the earlier part "
+                        "now — it is written into the transcript, so you can read exactly what "
+                        "it says, and the project's files and history are untouched."
+                    ),
+                })
+                try:
+                    text = await compaction.summarise(events, todo.upto, req.endpoint)
+                    compaction.record(req.conversation, todo.upto, text, req.endpoint.model)
+                    events = list(req.conversation.read_all())
+                    if not todo.sufficient:
+                        # Compacting as far as it is allowed to did not get
+                        # under budget. Said plainly rather than left to the
+                        # provider, which will refuse without explaining that
+                        # the recent turns alone are the problem.
+                        live.publish({
+                            "type": "note",
+                            "text": (
+                                f"Even after summarising, the recent exchanges come to about "
+                                f"{todo.tokens_after // 1000}k tokens on their own — over what "
+                                "fits. This turn may be refused. Starting a new session keeps "
+                                "the project and its history; only the chat resets."
+                            ),
+                        })
+                except Exception as exc:  # noqa: BLE001 — never fatal
+                    # A failed compaction must not take the turn with it. The
+                    # request may still be too long, and the provider's refusal
+                    # is a better outcome than an answer nobody asked for.
+                    live.publish({
+                        "type": "note",
+                        "text": f"Could not summarise the earlier conversation ({exc}).",
+                    })
+
             messages = history_to_messages(events, attachments_dir, window)
             # Said out loud, because the alternative is an answer written
             # without a file the user believes was in front of it.

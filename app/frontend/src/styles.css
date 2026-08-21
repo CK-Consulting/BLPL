@@ -324,6 +324,13 @@ body.resizing-y * { pointer-events: none; }
    control on its own never does. */
 .menu-note { margin: 0; font-size: 12.5px; line-height: 1.45; color: #b9c3d0; }
 
+/* A compaction marker. Folded, because it is long and is rarely what you came
+   back for — and present, because the alternative is a conversation that
+   rewrote itself without saying so. 10.7:1. */
+.msg.summary { background: #1b2233; border: 1px dashed #6f7fa5; color: #cbd6e6; font-size: 13px; }
+.msg.summary > summary { cursor: pointer; padding: .15rem 0; font-size: 12.5px; }
+.msg.summary > summary:focus-visible { outline: 3px solid #80a8ff; outline-offset: 2px; }
+
 /* View/Edit. One file, two modes, and the rendered one first — a pipe table is
    a table when it is rendered and a wall of pipes when it is not. */
 .fileview, .kicad-file { display: flex; flex-direction: column; flex: 1; min-height: 0; }

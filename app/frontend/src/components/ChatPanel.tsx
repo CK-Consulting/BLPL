@@ -1346,6 +1346,23 @@ function Message({
     // transcript, and the assistant's next message says what it found.
     return null;
   }
+  if (message.role === "summary") {
+    // Shown, not hidden. Compaction changes what the assistant is working from,
+    // and a conversation that quietly rewrote itself under someone is worse
+    // than one that admits it. Collapsed by default because it is long and is
+    // usually not what you came back to read.
+    const covers = (message.metadata as any)?.covers ?? 0;
+    return (
+      <details className="msg summary">
+        <summary>
+          Earlier messages summarised to fit the model's context
+          {covers ? ` — ${covers} entries replaced` : ""}. The files and git history are
+          untouched.
+        </summary>
+        <Markdown text={message.content} />
+      </details>
+    );
+  }
   if (message.role === "error") {
     // A stop is recorded on the same line as a failure — both are "this turn
     // produced no answer" — but only one of them is something going wrong.
