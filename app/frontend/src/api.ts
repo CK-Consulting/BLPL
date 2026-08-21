@@ -375,6 +375,8 @@ export type ConversationMeta = {
   started_at: string;
   message_count: number;
   last_message_at: string | null;
+  /** Off the picker, but kept — a transcript is a record, so nothing deletes it. */
+  archived: boolean;
 };
 
 /** One persisted line of a conversation. `role` is free-form by design: user,

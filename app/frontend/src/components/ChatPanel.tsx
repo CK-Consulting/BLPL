@@ -104,6 +104,15 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [turnId, setTurnId] = useState<string | null>(null);
   const [progress, setProgress] = useState<string | null>(null);
   const [model, setModel] = useState<string | null>(null);
+  // Which endpoint answers, chosen per turn rather than stored. "Ask the big
+  // model about this one" is a decision about a question, not a change of
+  // configuration — persisting it is how a frontier model ends up billed for a
+  // week of small talk.
+  const [endpoints, setEndpoints] = useState<
+    { name: string; model: string; capabilities: string[]; default: boolean }[]
+  >([]);
+  const [chosenEndpoint, setChosenEndpoint] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // A question the server was answering when it stopped existing. Held so the
   // panel can say so and offer to ask it again, rather than leaving it looking
@@ -518,7 +527,11 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     try {
       const started = await postJSON<{ turn_id: string; model: string }>(
         `/api/projects/${projectId}/conversations/${filename}/chat`,
-        { content: text, attachments: sent.map((a) => a.id) },
+        {
+          content: text,
+          attachments: sent.map((a) => a.id),
+          endpoint: chosenEndpoint,
+        },
       );
       setModel(started.model);
       id = started.turn_id;
@@ -589,6 +602,32 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
 
   sendRef.current = send;
 
+  useEffect(() => {
+    getJSON<{ endpoints: typeof endpoints }>(`/api/projects/${projectId}/chat/endpoints`)
+      .then((r) => setEndpoints(r.endpoints))
+      .catch(() => setEndpoints([]));
+  }, [projectId]);
+
+  const archive = async (target: string, archived: boolean) => {
+    const filename2 = filename;
+    try {
+      await postJSON(`/api/projects/${projectId}/conversations/${target}/archive`, { archived });
+      const list = await getJSON<ConversationMeta[]>(
+        `/api/projects/${projectId}/conversations${showArchived ? "?include_archived=true" : ""}`,
+      );
+      setConversations(list);
+      // Archiving the open one moves you to whatever is now most recent, since
+      // staying in a conversation you just took off the list is a dead end.
+      if (archived && target === filename2) {
+        const next = list.find((c) => !c.archived);
+        if (next) await openConversation(next.filename);
+        else await newConversation();
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
   const stop = async () => {
     if (!turnId) return;
     cancelledRef.current = true;
@@ -643,12 +682,62 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         >
           {conversations.map((c) => (
             <option key={c.filename} value={c.filename}>
+              {c.archived ? "📦 " : ""}
               {c.slug} · {c.message_count} msg
+            </option>
+          ))}
+        </select>
+        {/* Beside the conversation picker, because they answer the same kind
+            of question: which thread, and who is answering in it. */}
+        <select
+          className="chat-picker"
+          value={chosenEndpoint}
+          disabled={endpoints.length === 0}
+          title="Which model answers — for this turn, not saved"
+          onChange={(e) => setChosenEndpoint(e.target.value)}
+        >
+          <option value="">
+            {endpoints.find((e) => e.default)
+              ? `routed (${endpoints.find((e) => e.default)!.name})`
+              : "routed"}
+          </option>
+          {endpoints.map((e) => (
+            <option key={e.name} value={e.name}>
+              {e.name}
+              {e.capabilities.includes("vision") ? " · sees" : ""}
+              {e.capabilities.includes("thinking") ? " · reasons" : ""}
             </option>
           ))}
         </select>
         {model && <span className="muted small">{model}</span>}
         <span className="spacer" />
+        <label className="muted small" title="Include archived conversations in the list">
+          <input
+            type="checkbox"
+            checked={showArchived}
+            onChange={async (e) => {
+              setShowArchived(e.target.checked);
+              const list = await getJSON<ConversationMeta[]>(
+                `/api/projects/${projectId}/conversations${e.target.checked ? "?include_archived=true" : ""}`,
+              ).catch(() => []);
+              setConversations(list);
+            }}
+          />{" "}
+          archived
+        </label>
+        {filename && (
+          <button
+            className="link"
+            disabled={streaming}
+            title="Take this conversation off the list — it is kept, not deleted"
+            onClick={() => {
+              const here = conversations.find((c) => c.filename === filename);
+              void archive(filename, !(here?.archived ?? false));
+            }}
+          >
+            {conversations.find((c) => c.filename === filename)?.archived ? "Unarchive" : "Archive"}
+          </button>
+        )}
         <button className="link" onClick={newConversation} disabled={streaming}>
           New
         </button>

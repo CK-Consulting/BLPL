@@ -95,6 +95,7 @@ from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, Run, User
 from blpl.core import project_manifest, quarantine
+from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
 from .vault import VaultError
@@ -2552,10 +2553,73 @@ class MessageInput(BaseModel):
     metadata: dict | None = None
 
 
+@app.get("/api/projects/{project_id}/chat/endpoints")
+def chat_endpoints(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
+    """Which endpoints can answer a chat turn here, in routed order.
+
+    Named separately from /api/settings because the picker beside the
+    conversation list is asking a narrower question — not "what exists" but
+    "what could answer this" — and an endpoint with no key cannot.
+    """
+    cfg = llmconfig.load(session, user)
+    with_keys = keystore.endpoints_with_keys(session, user)
+    chain = llm_resolver.resolve_chain(cfg, with_keys, "chat")
+    caps = _endpoint_capabilities(cfg)
+    return {
+        "endpoints": [
+            {
+                "name": rp.name,
+                "model": rp.model,
+                "kind": rp.provider,
+                "capabilities": caps.get(rp.name, []),
+                "default": i == 0,
+            }
+            for i, rp in enumerate(chain)
+        ]
+    }
+
+
 @app.get("/api/projects/{project_id}/conversations")
-def get_conversations(project_id: str, user: User = Depends(require_onboarded),
+def get_conversations(project_id: str, include_archived: bool = False,
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> list[dict]:
-    return [m.to_dict() for m in list_conversations(_conversations_dir(session, user, project_id))]
+    return [
+        m.to_dict()
+        for m in list_conversations(
+            _conversations_dir(session, user, project_id),
+            include_archived=include_archived,
+        )
+    ]
+
+
+class ArchiveBody(BaseModel):
+    archived: bool = True
+
+
+@app.post("/api/projects/{project_id}/conversations/{filename}/archive")
+def archive_conversation(
+    project_id: str, filename: str, body: ArchiveBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Take a conversation off the picker, or put it back.
+
+    Not a delete, and there is deliberately no delete: a transcript records
+    what was proposed and why a part was chosen, which outlives its usefulness
+    in a dropdown.
+    """
+    d = _conversations_dir(session, user, project_id)
+    if chat_sessions.active_for(filename):
+        raise HTTPException(
+            status_code=409,
+            detail="that conversation has a turn running — stop it first",
+        )
+    try:
+        conversations_mod.set_archived(d, filename, body.archived)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"ok": True, "filename": filename, "archived": body.archived}
 
 
 @app.post("/api/projects/{project_id}/conversations")
@@ -2808,6 +2872,12 @@ class ChatInput(BaseModel):
     # than trusted from the client, so the transcript cannot be made to claim a
     # file is something it is not.
     attachments: list[str] = []
+    # Which endpoint should answer, overriding the routed order for this turn.
+    # A per-turn choice rather than a stored setting: "ask the big model about
+    # this one" is a decision about a question, not a change of configuration,
+    # and having it silently persist is how people end up billing a frontier
+    # model for a week of small talk.
+    endpoint: str = ""
 
 
 @app.post("/api/projects/{project_id}/conversations/{filename}/chat")
@@ -2874,8 +2944,20 @@ async def start_chat_turn(
             },
         )
 
-    endpoint = _chat_endpoint(session, user, master_key)
     chain = _chat_chain(session, user, master_key)
+    endpoint = _chat_endpoint(session, user, master_key)
+    if payload.endpoint:
+        chosen = next((e for e in chain if e.name == payload.endpoint), None)
+        if chosen is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{payload.endpoint!r} is not routed to chat, or has no key. "
+                    f"Available: {[e.name for e in chain]}"
+                ),
+            )
+        endpoint = chosen
+    # The rest of the chain still backs it up, in its configured order.
     fallbacks = tuple(e for e in chain if e.name != endpoint.name)
     conv.append("user", payload.content, {"blocks": blocks})
     try:

@@ -483,3 +483,49 @@ def test_the_most_recently_active_conversation_comes_first(tmp_path) -> None:
     order = [m.filename for m in list_conversations(tmp_path)]
     assert order[0] == old.path.name, order
     assert new.path.name in order
+
+
+def test_archiving_takes_a_conversation_off_the_list_without_destroying_it(tmp_path) -> None:
+    """A transcript records what was proposed and why a part was chosen, which
+    outlives its usefulness in a dropdown. Archiving hides it; nothing deletes
+    it, and the file stays readable straight off disk."""
+    from app.conversations import Conversation, list_conversations, set_archived
+
+    keep = Conversation.create(tmp_path, title="keep")
+    done = Conversation.create(tmp_path, title="done")
+    done.append("user", "settled")
+
+    moved = set_archived(tmp_path, done.path.name, True)
+    assert moved.is_file() and moved.parent.name == "archived"
+    assert not (tmp_path / done.path.name).exists()
+
+    visible = [m.filename for m in list_conversations(tmp_path)]
+    assert visible == [keep.path.name]
+
+    everything = {m.filename: m.archived for m in list_conversations(tmp_path, include_archived=True)}
+    assert everything[done.path.name] is True
+    assert everything[keep.path.name] is False
+
+    # …and it comes back intact, messages included.
+    set_archived(tmp_path, done.path.name, False)
+    back = Conversation.open_existing(tmp_path, done.path.name)
+    assert [e["content"] for e in back.read_all()] == ["settled"]
+
+
+def test_archiving_something_twice_is_not_an_error(tmp_path) -> None:
+    """Two tabs, two clicks. The second should agree rather than 404."""
+    from app.conversations import Conversation, set_archived
+
+    conv = Conversation.create(tmp_path, title="x")
+    set_archived(tmp_path, conv.path.name, True)
+    assert set_archived(tmp_path, conv.path.name, True).parent.name == "archived"
+
+
+def test_a_crafted_filename_cannot_move_files_around(tmp_path) -> None:
+    import pytest
+
+    from app.conversations import set_archived
+
+    for bad in ("../secret.jsonl", "nope.txt", "/etc/passwd"):
+        with pytest.raises((ValueError, FileNotFoundError)):
+            set_archived(tmp_path, bad, True)
