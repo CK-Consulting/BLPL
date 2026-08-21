@@ -67,8 +67,22 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
             Close
           </button>
         </header>
+        {/* Outside the scrolling body on purpose. This sat at the top of the
+            body, which scrolls: a save rejected while you were looking at the
+            third task put its explanation somewhere you had no reason to look
+            and no indication existed. You could then press Close believing the
+            change had been saved. It is now pinned under the header, announced,
+            and dismissible only by fixing or acknowledging it. */}
+        {error && (
+          <div className="modal-notice error" role="alert">
+            <span>{error}</span>
+            <span className="spacer" />
+            <button className="link" onClick={() => setError(null)} title="Dismiss">
+              ×
+            </button>
+          </div>
+        )}
         <div className="modal-body">
-          {error && <div className="gate-error">{error}</div>}
           {tab === "endpoints" && (
             <Endpoints data={data} onChanged={refresh} onError={setError} />
           )}
@@ -594,10 +608,19 @@ function Routing({
         const chain = chainOf(task);
         const inherited = stored === undefined;
         const visionTask = data.vision_tasks.includes(task);
-        // A task that reads images can only be served by an endpoint that can
-        // see, so the others are not offered. Showing a control that is
-        // guaranteed to be refused is just a slower way to deliver an error.
-        const offered = visionTask ? data.endpoints.filter((e) => e.vision) : data.endpoints;
+        // A task that reads images is best served by an endpoint that can see,
+        // so the others are not offered — but anything already *in* the chain
+        // is always shown, whether or not it would be offered today.
+        //
+        // That second half was missing, and it closed the only exit. Three
+        // text-only endpoints were routed to datasheet_vision; the filter hid
+        // them, so they had no row and no way to be taken out, while the same
+        // condition made every save fail validation. The screen was reporting
+        // an error whose only fix was an edit the screen had removed.
+        const inChain = new Set(chain);
+        const offered = data.endpoints.filter(
+          (e) => !visionTask || e.vision || inChain.has(e.name),
+        );
         const hidden = data.endpoints.length - offered.length;
         return (
           <div className="task-row" key={task}>
@@ -629,6 +652,13 @@ function Routing({
                       ))}
                     </select>
                     <span className="mono">{ep.name}</span>
+                    {/* Named, not just implied by being unusable: this is the
+                        row you are looking for when the task will not run. */}
+                    {visionTask && !ep.vision && (
+                      <span className="status-tag deleted" title="This task will skip past it">
+                        cannot see
+                      </span>
+                    )}
                     {(data.endpoint_capabilities?.[ep.name] ?? []).map((c) => (
                       <span
                         className={`cap ${CAP_CLASS[c] ?? ""}`}
@@ -660,8 +690,9 @@ function Routing({
             )}
             {hidden > 0 && (
               <div className="muted small">
-                {hidden} endpoint{hidden > 1 ? "s" : ""} not shown here: this task reads
-                images and they cannot.
+                {hidden} endpoint{hidden > 1 ? "s" : ""} not offered here: this task reads
+                images and they cannot. One already routed to this task is still shown, so
+                it can be taken out.
               </div>
             )}
           </div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError, ChatMessage, ConversationMeta, Proposal, getJSON, postJSON, readSSE } from "../api";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
@@ -53,6 +53,36 @@ type TurnOutcome = "ended" | "not_live";
 
 /** Why a question ended up with no answer — the two cases read differently. */
 type LostReason = "not_live" | "transient";
+
+/**
+ * Which end of the transcript is the newest.
+ *
+ * Every messaging app puts the new message at the bottom; every inbox puts it
+ * at the top. Both conventions are entrenched and neither is wrong, so this is
+ * a setting rather than an argument — and it is remembered, because it is a
+ * habit rather than a per-conversation decision.
+ *
+ * What reverses is the *turn*, not the line. A turn — a question and everything
+ * that answered it — still reads top to bottom, the way a mail thread does
+ * inside an inbox that lists threads newest-first. Reversing the flat list
+ * instead would put each answer above its own question and run the tool calls
+ * backwards, which is not what "newest on top" means anywhere.
+ */
+type Order = "oldest" | "newest";
+
+const ORDER_KEY = "blpl.chatOrder";
+
+const readOrder = (): Order => (localStorage.getItem(ORDER_KEY) === "newest" ? "newest" : "oldest");
+
+/** Split a flat transcript into turns. A turn opens at each user message. */
+function toTurns(messages: ChatMessage[]): { key: number; items: { i: number; m: ChatMessage }[] }[] {
+  const out: { key: number; items: { i: number; m: ChatMessage }[] }[] = [];
+  messages.forEach((m, i) => {
+    if (m.role === "user" || out.length === 0) out.push({ key: i, items: [] });
+    out[out.length - 1].items.push({ i, m });
+  });
+  return out;
+}
 
 /** The last thing said, if the transcript ends on the user — i.e. nothing answered. */
 function unansweredTail(messages: ChatMessage[]): ChatMessage | null {
@@ -135,14 +165,61 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const persistedErrorRef = useRef(false);
   const retryableRef = useRef(false);
 
-  // Follow the tail while an answer streams, but never yank the view back down
-  // if the user has scrolled up to read something earlier.
-  useEffect(() => {
+  // Which end new material arrives at. Chat apps put it at the bottom; an inbox
+  // puts it at the top, and there is no reason the reader should not choose.
+  const [order, setOrder] = useState<Order>(readOrder);
+  const newestFirst = order === "newest";
+
+  // Whether the reader is parked at the end new material arrives at.
+  //
+  // Load-bearing that this is tracked from the scroll event rather than
+  // measured inside the effect. The old code measured *after* React had
+  // committed, so the new content was already in the box: anything taller than
+  // the 120px slack — an approval card, a tool block, a long answer — made the
+  // box look scrolled-away at the exact moment it had not been, and the view
+  // stayed put. Small streaming deltas stayed under the threshold, which is why
+  // following a plain answer worked and being asked a question did not.
+  const stick = useRef(true);
+  // Something arrived while they were reading elsewhere. Worth saying out loud
+  // rather than silently leaving it off-screen — a turn parked on an approval
+  // is stopped until it is answered, and nothing about the panel showed that.
+  const [missed, setMissed] = useState(false);
+
+  const anchored = useCallback(
+    (el: HTMLElement) =>
+      newestFirst ? el.scrollTop < 120 : el.scrollHeight - el.scrollTop - el.clientHeight < 120,
+    [newestFirst],
+  );
+
+  const toAnchor = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-    if (nearBottom) el.scrollTop = el.scrollHeight;
+    el.scrollTop = newestFirst ? 0 : el.scrollHeight;
+    stick.current = true;
+    setMissed(false);
+  }, [newestFirst]);
+
+  // Layout, not passive: scrolling in a plain effect lets the browser paint the
+  // pre-scroll frame first, which shows as a jump on every arrival.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (stick.current) {
+      el.scrollTop = newestFirst ? 0 : el.scrollHeight;
+      setMissed(false);
+    } else {
+      setMissed(true);
+    }
+    // `newestFirst` is deliberately absent: flipping the order is handled below,
+    // where it always re-anchors. Reacting to it here as well would fight that.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages, liveText, liveSegments, liveTools, proposals, approvals]);
+
+  // Reversing the transcript, or opening a different one, invalidates where the
+  // view was pointing. Both go back to the end things arrive at.
+  useLayoutEffect(() => {
+    toAnchor();
+  }, [order, filename, toAnchor]);
 
   const fetchConversation = useCallback(
     (name: string) =>
@@ -671,6 +748,88 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     return out;
   }, [messages]);
 
+  const turns = useMemo(() => toTurns(messages), [messages]);
+
+  // Flattened back out with no wrapper element: `.chat-scroll` is the flex
+  // container that gives user messages their right-hand alignment and every
+  // entry its gap, and a per-turn <div> would take both away.
+  const transcript = (newestFirst ? [...turns].reverse() : turns).flatMap((t) =>
+    t.items.map(({ i, m }) => (
+      <Message key={i} message={m} projectId={projectId} repeatOf={repeats.get(i)} />
+    )),
+  );
+
+  // The turn in progress, and everything still awaiting an answer. Newest by
+  // definition, so it sits at whichever end that is.
+  const liveTail = (
+    <>
+      {liveSegments.map((seg, i) => (
+        <div className="msg assistant" key={`seg${i}`}>
+          <Markdown text={seg} />
+        </div>
+      ))}
+      {liveTools.map((t) => (
+        <ToolLine key={t.id} tool={t} />
+      ))}
+      {approvals.map((a) => (
+        <ApprovalCard
+          key={a.call_id}
+          approval={a}
+          onDecide={async (approved) => {
+            if (!turnId) return;
+            await postJSON(
+              `/api/projects/${projectId}/chat/${turnId}/approvals/${a.call_id}`,
+              { approved },
+            ).catch((e) => setError((e as Error).message));
+            setApprovals((list) => list.filter((x) => x.call_id !== a.call_id));
+          }}
+        />
+      ))}
+      {progress && streaming && <div className="muted small pad">{progress}</div>}
+      {liveText && (
+        <div className="msg assistant">
+          <Markdown text={liveText} />
+        </div>
+      )}
+      {streaming && !liveText && liveTools.length === 0 && (
+        <div className="muted pad">Thinking…</div>
+      )}
+
+      {pending.map((p) => (
+        <ProposalCard key={p.id} projectId={projectId} proposal={p} onDecided={onDecided} />
+      ))}
+
+      {lost && (
+        <div className="turn-lost">
+          <div>
+            <strong>
+              {lost.reason === "transient"
+                ? "The model provider was busy."
+                : "That answer was lost."}
+            </strong>
+            <div className="muted small">
+              {lost.reason === "transient"
+                ? "This is a capacity problem at the provider, not a problem with your " +
+                  "question — nothing about the message needs changing. Asking again " +
+                  "usually works."
+                : "The server stopped holding this turn — usually because it restarted " +
+                  "mid-answer. Your question is safe and still here; nothing replied to it."}
+            </div>
+          </div>
+          <span className="spacer" />
+          <button onClick={() => void retryLost()} disabled={streaming}>
+            Ask again
+          </button>
+          <button className="link" onClick={() => setLost(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {error && <div className="gate-error">{error}</div>}
+    </>
+  );
+
   return (
     <div className="chat">
       <div className="chat-head">
@@ -716,6 +875,21 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         </select>
         {model && <span className="muted small">{model}</span>}
         <span className="spacer" />
+        {/* The order is shown as a value rather than hidden behind an icon that
+            has to be tried: which way this reads is the whole question. */}
+        <select
+          className="chat-picker"
+          value={order}
+          title="Which end new messages arrive at"
+          onChange={(e) => {
+            const next = e.target.value as Order;
+            setOrder(next);
+            localStorage.setItem(ORDER_KEY, next);
+          }}
+        >
+          <option value="oldest">Newest last ↓</option>
+          <option value="newest">Newest first ↑</option>
+        </select>
         <label className="muted small" title="Include archived conversations in the list">
           <input
             type="checkbox"
@@ -748,7 +922,15 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         </button>
       </div>
 
-      <div className="chat-scroll" ref={scrollRef}>
+      <div
+        className="chat-scroll"
+        ref={scrollRef}
+        onScroll={(e) => {
+          const at = anchored(e.currentTarget);
+          stick.current = at;
+          if (at) setMissed(false);
+        }}
+      >
         {messages.length === 0 && !streaming && (
           <div className="muted pad">
             Describe the board you want, or ask about this project. The assistant can read your
@@ -757,80 +939,38 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           </div>
         )}
 
-        {messages.map((m, i) => (
-          <Message
-            key={i}
-            message={m}
-            projectId={projectId}
-            repeatOf={repeats.get(i)}
-          />
-        ))}
-
-        {liveSegments.map((seg, i) => (
-          <div className="msg assistant" key={`seg${i}`}>
-            <Markdown text={seg} />
-          </div>
-        ))}
-        {liveTools.map((t) => (
-          <ToolLine key={t.id} tool={t} />
-        ))}
-        {approvals.map((a) => (
-          <ApprovalCard
-            key={a.call_id}
-            approval={a}
-            onDecide={async (approved) => {
-              if (!turnId) return;
-              await postJSON(
-                `/api/projects/${projectId}/chat/${turnId}/approvals/${a.call_id}`,
-                { approved },
-              ).catch((e) => setError((e as Error).message));
-              setApprovals((list) => list.filter((x) => x.call_id !== a.call_id));
-            }}
-          />
-        ))}
-        {progress && streaming && <div className="muted small pad">{progress}</div>}
-        {liveText && (
-          <div className="msg assistant">
-            <Markdown text={liveText} />
-          </div>
+        {newestFirst ? (
+          <>
+            {liveTail}
+            {transcript}
+          </>
+        ) : (
+          <>
+            {transcript}
+            {liveTail}
+          </>
         )}
-        {streaming && !liveText && liveTools.length === 0 && (
-          <div className="muted pad">Thinking…</div>
-        )}
-
-        {pending.map((p) => (
-          <ProposalCard key={p.id} projectId={projectId} proposal={p} onDecided={onDecided} />
-        ))}
-
-        {lost && (
-          <div className="turn-lost">
-            <div>
-              <strong>
-                {lost.reason === "transient"
-                  ? "The model provider was busy."
-                  : "That answer was lost."}
-              </strong>
-              <div className="muted small">
-                {lost.reason === "transient"
-                  ? "This is a capacity problem at the provider, not a problem with your " +
-                    "question — nothing about the message needs changing. Asking again " +
-                    "usually works."
-                  : "The server stopped holding this turn — usually because it restarted " +
-                    "mid-answer. Your question is safe and still here; nothing replied to it."}
-              </div>
-            </div>
-            <span className="spacer" />
-            <button onClick={() => void retryLost()} disabled={streaming}>
-              Ask again
-            </button>
-            <button className="link" onClick={() => setLost(null)}>
-              Dismiss
-            </button>
-          </div>
-        )}
-
-        {error && <div className="gate-error">{error}</div>}
       </div>
+
+      {/* Only while they are reading elsewhere. An approval is named, because a
+          turn parked on one is stopped until it is answered — leaving that
+          off-screen and unannounced is how a session ends up looking hung. */}
+      {missed && (
+        <button
+          className={[
+            "chat-jump",
+            newestFirst ? "top" : "",
+            approvals.length ? "waiting" : "",
+          ]
+            .filter(Boolean)
+            .join(" ")}
+          onClick={toAnchor}
+        >
+          {approvals.length
+            ? `Waiting for your approval ${newestFirst ? "↑" : "↓"}`
+            : `New ${newestFirst ? "above ↑" : "below ↓"}`}
+        </button>
+      )}
 
       <div
         className={dragging ? "chat-composer dropping" : "chat-composer"}

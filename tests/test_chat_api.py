@@ -108,12 +108,87 @@ def test_a_huge_artifact_keeps_both_ends_and_says_what_it_dropped(project) -> No
     assert "elided from the middle" in res.content
 
 
-@pytest.mark.parametrize(
-    "path", ["../secret.md", "sub/dir.md", ".hidden.md", "script.py", "/etc/passwd"]
-)
+@pytest.mark.parametrize("path", ["../secret.md", "../../etc/passwd", "/etc/passwd"])
 def test_tools_refuse_paths_that_leave_the_project(project, path) -> None:
+    """The project directory is the boundary, and it is the only one.
+
+    These must fail because they leave it — not because the file is missing.
+    Asserting the reason is the point: a check that only ever fires on
+    non-existent paths would pass just as happily with no check at all.
+    """
     res = _call(_ctx(project), "read_project_file", path=path)
     assert res.is_error
+    # Refused for leaving the boundary — the sandbox gets there first, before
+    # the handler is ever entered — and specifically not "no such file", which
+    # is what a check that had quietly stopped working would say.
+    assert "refused" in res.content and "no file" not in res.content
+
+
+def test_a_symlink_out_of_the_project_is_refused(project, tmp_path) -> None:
+    """The string check cannot see this one; the resolved path can."""
+    (tmp_path / "secret.md").write_text("elsewhere", encoding="utf-8")
+    (project / "escape.md").symlink_to(tmp_path / "secret.md")
+    res = _call(_ctx(project), "read_project_file", path="escape.md")
+    assert res.is_error and "elsewhere" not in res.content
+
+
+def test_files_in_subdirectories_are_readable(project) -> None:
+    """A multi-board project keeps each board in its own directory, so a rule of
+    'bare filenames in the project root' made the boards unreadable to the
+    assistant working on them."""
+    (project / "sensor").mkdir()
+    (project / "sensor" / "board.md").write_text("# Sensor\n", encoding="utf-8")
+    res = _call(_ctx(project), "read_project_file", path="sensor/board.md")
+    assert not res.is_error and "# Sensor" in res.content
+
+
+def test_non_markdown_text_in_the_project_is_readable(project) -> None:
+    (project / "power-budget.csv").write_text("rail,mA\n3V3,420\n", encoding="utf-8")
+    res = _call(_ctx(project), "read_project_file", path="power-budget.csv")
+    assert not res.is_error and "3V3,420" in res.content
+
+
+def test_binary_files_say_what_to_do_instead_of_returning_mojibake(project) -> None:
+    (project / "datasheets").mkdir()
+    (project / "datasheets" / "LM317.pdf").write_bytes(b"%PDF-1.4 \x00\x01binary")
+    res = _call(_ctx(project), "read_project_file", path="datasheets/LM317.pdf")
+    assert res.is_error and "extract_datasheet_specs" in res.content
+
+
+def test_an_oversized_file_is_refused_with_its_size(project) -> None:
+    (project / "huge.md").write_text("x" * (300 * 1024), encoding="utf-8")
+    res = _call(_ctx(project), "read_project_file", path="huge.md")
+    assert res.is_error and "300 KB" in res.content
+
+
+def test_context_ignore_is_listed_by_name_but_kept_out_of_the_project_files(project) -> None:
+    """The folder exists so files can stay in the project without joining the
+    design conversation. Names are listed — without them 'look at the enclosure
+    drawing' has nothing to resolve against — but they are separated, and the
+    note carries the instruction."""
+    (project / "context-ignore").mkdir()
+    (project / "context-ignore" / "enclosure.md").write_text("# Case\n", encoding="utf-8")
+    out = json.loads(_call(_ctx(project), "list_project_files").content)
+    assert out["context_ignore"]["files"] == ["context-ignore/enclosure.md"]
+    assert "unless the user asks" in out["context_ignore"]["note"]
+    assert not any("context-ignore" in p for p in out["other_project_files"])
+    assert out["design_documents"] == ["overview.md"]
+
+
+def test_context_ignore_files_are_still_readable_when_asked_for(project) -> None:
+    """Not a permission boundary — an attention boundary. Making it unreadable
+    would mean the one time the user does want it looked at, they cannot ask."""
+    (project / "context-ignore").mkdir()
+    (project / "context-ignore" / "enclosure.md").write_text("# Case\n", encoding="utf-8")
+    res = _call(_ctx(project), "read_project_file", path="context-ignore/enclosure.md")
+    assert not res.is_error and "# Case" in res.content
+
+
+def test_listing_reaches_into_sub_board_directories(project) -> None:
+    (project / "sensor").mkdir()
+    (project / "sensor" / "board.md").write_text("# Sensor\n", encoding="utf-8")
+    out = json.loads(_call(_ctx(project), "list_project_files").content)
+    assert "sensor/board.md" in out["other_project_files"]
 
 
 def test_tool_errors_come_back_as_results_so_the_model_can_recover(project) -> None:

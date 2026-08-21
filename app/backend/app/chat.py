@@ -83,9 +83,15 @@ project through a deterministic 9-stage pipeline.
 
 How you work here:
 
-- You can read the project's design markdown and its generated pipeline \
-artifacts with your tools. Read before you assert — the artifacts say what the \
-pipeline actually produced, and that is the ground truth about this board.
+- You can read anything in the project directory with your tools — design \
+markdown, sub-board directories, notes, generated pipeline artifacts. Reading \
+is free and needs nobody's permission, so read before you assert: the artifacts \
+say what the pipeline actually produced, and that is the ground truth about \
+this board. Call list_project_files when you do not know what is there.
+- One exception, and it is the user's instruction rather than a permission: \
+files under `context-ignore/` are things they keep in the project but have \
+declared irrelevant to the board. Do not read them, and do not reason from \
+them, unless the user asks about one by name. Then read it like any other file.
 - You cannot write files. To change one, call propose_file_edit; the user sees \
 your change as a diff and accepts or rejects it. Propose the complete new file \
 content, not a fragment. Say in the rationale what you changed and why.
@@ -558,7 +564,7 @@ class TurnRequest:
     # task name → endpoint, so a tool that needs a different model (datasheet
     # extraction needs one that can see) gets the routed one rather than this
     # conversation's.
-    endpoint_for: Callable[[str], Endpoint | None] | None = None
+    endpoints_for: Callable[[str], list[Endpoint]] | None = None
     record_tool_call: Callable[[dict], None] | None = None
     # Where the KiCad MCP server is, if the deploy has one.
     kicad_url: str | None = None
@@ -630,7 +636,7 @@ class ChatSessionManager:
             sandbox=req.sandbox,
             conversation=req.conversation.path.name,
             creds=req.creds or CredResolver(),
-            endpoint_for=req.endpoint_for or (lambda _t: None),
+            endpoints_for=req.endpoints_for or (lambda _t: []),
             on_progress=lambda m: live.publish({"type": "progress", "message": m}),
             # A tool whose whole effect is visual publishes straight to the
             # browser; highlighting the part under discussion beats describing

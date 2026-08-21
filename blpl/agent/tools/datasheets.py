@@ -35,6 +35,7 @@ import base64
 import json
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -232,14 +233,33 @@ async def extract_datasheet(
     mpn: str,
     pdf_path: Path,
     cache_dir: Path,
-    endpoint: Endpoint,
+    endpoint: Endpoint | Sequence[Endpoint],
     *,
     force: bool = False,
     retry_failed: bool = False,
     max_parallel: int = 4,
     on_progress=None,
 ) -> ExtractionRun:
-    """Scout, plan, dispatch, merge — the whole extraction for one part."""
+    """Scout, plan, dispatch, merge — the whole extraction for one part.
+
+    ``endpoint`` may be a chain, and when it is, each task walks it until one
+    model returns output that validates. This is not a retry for flakiness. A
+    model either holds a JSON schema under a long PDF or it does not, and when
+    it does not it fails the same way every time: a 7B vision model here
+    produced malformed JSON at the same byte offset on seven different
+    datasheets, emitted ``mA`` where the schema demanded base units, and
+    ``ceramic`` where it demanded a dielectric class. Asking it again is
+    pointless; asking a different model is the whole answer, and there was no
+    way to express that — a task got one endpoint and one attempt.
+    """
+    chain: tuple[Endpoint, ...] = (
+        (endpoint,) if isinstance(endpoint, Endpoint) else tuple(endpoint)
+    )
+    if not chain:
+        run = ExtractionRun(mpn=mpn)
+        run.error = "no vision endpoint supplied"
+        return run
+    endpoint = chain[0]
     run = ExtractionRun(mpn=mpn)
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -273,21 +293,29 @@ async def extract_datasheet(
             pages="all pages",
             schema_path=str(schemas / "scout.schema.json"),
         )
-        data, err, tin, tout = await _one_task(
-            endpoint=endpoint,
-            prompt=prompt,
-            pdf_bytes=pdf_b64,
-            filename=pdf_path.name,
-            schema=json.loads((schemas / "scout.schema.json").read_text(encoding="utf-8")),
-        )
-        _append_ledger(
-            cache_dir,
-            {
-                "run_id": run_id, "mpn": mpn, "task_id": "scout", "tier": "B",
-                "model_id": endpoint.model, "tokens_in": tin, "tokens_out": tout,
-                "success": data is not None, "extracted_at": _now(),
-            },
-        )
+        scout_schema = json.loads((schemas / "scout.schema.json").read_text(encoding="utf-8"))
+        data = None
+        err = ""
+        for i, ep in enumerate(chain):
+            data, err, tin, tout = await _one_task(
+                endpoint=ep,
+                prompt=prompt,
+                pdf_bytes=pdf_b64,
+                filename=pdf_path.name,
+                schema=scout_schema,
+            )
+            _append_ledger(
+                cache_dir,
+                {
+                    "run_id": run_id, "mpn": mpn, "task_id": "scout", "tier": "B",
+                    "model_id": ep.model, "tokens_in": tin, "tokens_out": tout,
+                    "success": data is not None, "extracted_at": _now(),
+                },
+            )
+            if data is not None:
+                break
+            if i + 1 < len(chain):
+                note(f"{mpn}: scout failed on {ep.name} ({err}) — trying {chain[i + 1].name}")
         if data is None:
             run.error = f"scout failed: {err}"
             return run
@@ -358,20 +386,49 @@ async def extract_datasheet(
                         "Correct it and try again."
                     )
 
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        data: Any = None
+        err = ""
+        tin = tout = 0
+        used = chain[0]
         async with semaphore:
-            note(f"{mpn}: extracting {task_id}")
-            data, err, tin, tout = await _one_task(
-                endpoint=endpoint,
-                prompt=prompt,
-                pdf_bytes=pdf_b64,
-                filename=pdf_path.name,
-                schema=json.loads(schema_path.read_text(encoding="utf-8")),
-            )
-
-        if data is not None and not err:
-            err = _validate(data, schema_path)
-            if err:
-                data = None
+            for i, ep in enumerate(chain):
+                note(
+                    f"{mpn}: extracting {task_id}"
+                    + (f" (attempt {i + 1}, {ep.name})" if i else "")
+                )
+                data, err, ti, to = await _one_task(
+                    endpoint=ep,
+                    prompt=prompt,
+                    pdf_bytes=pdf_b64,
+                    filename=pdf_path.name,
+                    schema=schema,
+                )
+                # Schema validation counts as failure for the purpose of moving
+                # on. Output that parses but does not validate is the signature
+                # failure of a model too small for the contract, and it is
+                # exactly the case a single-endpoint dispatch could not escape.
+                if data is not None and not err:
+                    err = _validate(data, schema_path)
+                    if err:
+                        data = None
+                used, tin, tout = ep, ti, to
+                # Billed per attempt, so recorded per attempt: a ledger that
+                # only notes the model that finally worked understates what the
+                # run cost and hides which model is burning the budget.
+                _append_ledger(
+                    cache_dir,
+                    {
+                        "run_id": run_id, "mpn": mpn, "task_id": task_id,
+                        "tier": task.get("tier", "B"), "model_id": ep.model,
+                        "tokens_in": ti, "tokens_out": to,
+                        "success": data is not None, "extracted_at": _now(),
+                    },
+                )
+                if data is not None:
+                    break
+                if i + 1 < len(chain):
+                    note(f"{mpn}: {task_id} failed on {ep.name} ({err}) — trying {chain[i + 1].name}")
 
         wrapped = {
             "task_id": task_id,
@@ -379,7 +436,7 @@ async def extract_datasheet(
             "status": "complete" if data is not None else "failed",
             "extracted_at": _now(),
             "model_tier": task.get("tier", "B"),
-            "model_id": endpoint.model,
+            "model_id": used.model,
             "data": data,
         }
         if data is None:
@@ -387,19 +444,11 @@ async def extract_datasheet(
         (cache_dir / f"{mpn}.{task_id}.result.json").write_text(
             json.dumps(wrapped, indent=2), encoding="utf-8"
         )
-        _append_ledger(
-            cache_dir,
-            {
-                "run_id": run_id, "mpn": mpn, "task_id": task_id, "tier": task.get("tier", "B"),
-                "model_id": endpoint.model, "tokens_in": tin, "tokens_out": tout,
-                "success": data is not None, "extracted_at": _now(),
-            },
-        )
         return TaskResult(
             task_id=task_id,
             status=wrapped["status"],
             error=wrapped.get("error", ""),
-            model_id=endpoint.model,
+            model_id=used.model,
             tokens_in=tin,
             tokens_out=tout,
         )
@@ -424,12 +473,32 @@ async def extract_datasheet(
         pending = [t for t in pending if t["task_id"] not in {r.task_id for r in run.results}]
 
     # -- 4. merge (kicad-happy owns this) ------------------------------------
+    #
+    # merge_results.py is a two-pass design and BLPL only ever ran the first
+    # pass. Without --retry-failed it refuses on the first failed task and
+    # writes nothing, expecting the caller to re-dispatch and come back; with
+    # it, the tasks that did succeed are spliced in and the ones that did not
+    # get an {"_extraction_failed": true} sentinel in their place.
+    #
+    # Running only the strict pass made the whole extraction all-or-nothing:
+    # one failed pinout discarded the mcu section that had extracted cleanly
+    # beside it, on the same part, in the same run. The re-dispatch that pass
+    # was waiting for has now happened — every task has already walked the
+    # endpoint chain above — so what is left is to keep what survived.
     note(f"{mpn}: merging results")
+    args = [mpn, "--cache-dir", str(cache_dir)]
     merge = run_script(
         script_path("datasheets", "merge_results.py"),
-        [mpn, "--cache-dir", str(cache_dir)] + (["--retry-failed"] if retry_failed else []),
+        args + (["--retry-failed"] if retry_failed else []),
         parse_json=False,
     )
+    if not merge.ok and not retry_failed and any(r.status == "failed" for r in run.results):
+        note(f"{mpn}: some tasks failed — merging what succeeded")
+        merge = run_script(
+            script_path("datasheets", "merge_results.py"),
+            args + ["--retry-failed"],
+            parse_json=False,
+        )
     if not merge.ok and not (cache_dir / f"{mpn}.json").exists():
         run.error = f"merge_results.py failed: {merge.error}"
     return run

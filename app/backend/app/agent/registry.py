@@ -2,13 +2,24 @@
 
 Grouped by what they touch, because that is what decides their policy:
 
-  *project* — read design documents and pipeline artifacts, propose an edit.
-              Reads are automatic; the "write" is a proposal a human accepts,
-              so it needs no approval of its own.
+  *project* — read anything in the project, propose an edit. Reads are
+              automatic; the "write" is a proposal a human accepts, so it needs
+              no approval of its own.
   *parts*   — reach distributor APIs. Network egress with your API keys on it,
               so it asks once per session.
-  *depth*   — datasheet download and extraction. These spend real money per
-              call and write into the project, so they ask every time.
+  *depth*   — datasheet download and extraction. Spends real money per call and
+              writes into the project's cache, but reads nothing the project
+              does not already contain, so it runs without asking.
+
+Reading is free inside the project directory, and that is the whole rule. The
+boundary this enforces is the project, the same shape as a web server rooted at
+a document directory: everything under it is reachable, nothing above it is.
+Confirming individual reads inside that boundary bought no safety — the files
+are the user's own, put there for this — and cost the thing approvals actually
+run on, which is someone still reading them.
+
+Writing is a separate question with a separate answer. It stays gated, and on a
+multi-board project the write scope narrows further to the board an agent owns.
 
 The descriptions are written for the model and say *when* to reach for a tool,
 not just what it does — a tool description that only states its function gets
@@ -29,6 +40,96 @@ from .toolspec import ToolContext, ToolDenied, ToolSpec
 # propose a file the user has no way to open.
 EDITABLE_SUFFIXES = {".md", ".markdown", ".yaml", ".yml"}
 
+# Files the user keeps in the project but does not want in the design
+# conversation. Not hidden, not git-ignored, not off-limits — the boundary the
+# app enforces is the project directory, and this folder is inside it. What it
+# changes is *default attention*: its contents are named in a listing but never
+# swept up as project context, and are read only when someone points at one.
+#
+# The distinction matters because the alternatives are all worse. Deleting the
+# files loses them; git-ignoring them takes them out of the history the project
+# depends on; making them unreadable means the one time you do want the
+# assistant to look at the mechanical drawing, you cannot ask.
+CONTEXT_IGNORE = "context-ignore"
+
+# Directories that are never part of a file listing: machinery, not content.
+_SKIP_DIRS = {".git", ".pipeline", ".worktrees", "__pycache__", "node_modules"}
+
+# Reading one of these as text produces mojibake, not information. Named
+# explicitly so the refusal can say what to do instead, rather than returning a
+# screenful of replacement characters and letting the model reason about it.
+_OPAQUE_SUFFIXES = {
+    ".pdf": "use fetch_datasheet / extract_datasheet_specs for datasheets",
+    ".zip": "an archive — ask the user to extract what you need",
+    ".png": "an image — attach it to the conversation to have it looked at",
+    ".jpg": "an image — attach it to the conversation to have it looked at",
+    ".jpeg": "an image — attach it to the conversation to have it looked at",
+    ".step": "a 3D model — not readable as text",
+    ".stp": "a 3D model — not readable as text",
+    ".xlsx": "a spreadsheet — export it to CSV first",
+    ".docx": "a Word document — export it to text or markdown first",
+}
+
+# Enough for any design document or netlist; short of pulling a generated
+# multi-megabyte artifact into the conversation whole.
+_READ_LIMIT = 256 * 1024
+
+
+def _readable_file(ctx: ToolContext, name: str) -> Path:
+    """Resolve a path for *reading*, anywhere inside the project.
+
+    The sandbox already treats the project directory as readable in full, and
+    that is the boundary the app actually maintains — the same shape as a web
+    server rooted at a document directory. What used to sit on top of it was a
+    second, much tighter rule in this module: bare filenames, project root,
+    markdown only. So a datasheet the user had put in the project, or any file
+    in a sub-board's directory, was unreachable by the assistant working on it.
+
+    Writing is unchanged and still goes through ``_project_file``: reading a
+    file and editing it are not the same permission, and only one of them is
+    recoverable by pressing undo.
+    """
+    raw = (name or "").strip().replace("\\", "/")
+    if not raw:
+        raise ToolDenied("path must name a file inside the project")
+    if ".." in Path(raw).parts:
+        raise ToolDenied(f"{name!r} must stay inside the project directory")
+    root = ctx.project_dir.resolve()
+    if raw.startswith("/"):
+        # An absolute path is accepted only when it is this project's own — a
+        # model that has seen the project root in an earlier tool result will
+        # sometimes echo it back. Anything else is refused outright rather than
+        # quietly reinterpreted as relative, which would turn '/etc/passwd' into
+        # a confusing "no such file in this project" instead of a straight no.
+        absolute = Path(raw)
+        if not absolute.is_relative_to(root):
+            raise ToolDenied(f"{name!r} is outside the project directory")
+        raw = str(absolute.relative_to(root))
+    target = (root / raw).resolve()
+    # Belt and braces with the sandbox: this catches a symlink pointing out of
+    # the project, which a string check on the input never would.
+    if not target.is_relative_to(root):
+        raise ToolDenied(f"{name!r} resolves outside the project directory")
+    return target
+
+
+def _read_text(target: Path) -> str:
+    """Read a project file as text, or say precisely why it cannot be."""
+    hint = _OPAQUE_SUFFIXES.get(target.suffix.lower())
+    if hint:
+        raise ToolDenied(f"{target.name} is not readable as text — {hint}")
+    size = target.stat().st_size
+    if size > _READ_LIMIT:
+        raise ToolDenied(
+            f"{target.name} is {size // 1024} KB, over the {_READ_LIMIT // 1024} KB read limit. "
+            "Read a generated artifact through read_pipeline_artifact, or ask the user which "
+            "part of it matters."
+        )
+    head = target.read_bytes()[:8192]
+    if b"\x00" in head:
+        raise ToolDenied(f"{target.name} looks binary — it has no text to read")
+    return target.read_text(encoding="utf-8", errors="replace")
+
 
 def _project_file(ctx: ToolContext, name: str) -> Path:
     if not name or "/" in name or "\\" in name or name.startswith("."):
@@ -48,29 +149,94 @@ def _project_file(ctx: ToolContext, name: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _walk(root: Path, *, skip: set[str], limit: int = 400) -> list[str]:
+    """Every file under ``root`` as a project-relative path, machinery omitted.
+
+    Bounded rather than complete. A listing that grows without limit is a
+    listing that one day arrives as fifty thousand paths and displaces the
+    conversation it was meant to inform, and truncating silently would read as
+    "that is everything" — so the caller reports the count it dropped.
+    """
+    out: list[str] = []
+    stack = [root]
+    while stack:
+        here = stack.pop()
+        try:
+            entries = sorted(here.iterdir())
+        except OSError:
+            continue
+        for f in entries:
+            if f.is_dir():
+                if f.name in skip or f.name.startswith("."):
+                    continue
+                stack.append(f)
+            elif f.is_file() and not f.name.startswith("."):
+                out.append(str(f.relative_to(root)))
+                if len(out) >= limit * 4:  # hard stop; the caller trims to limit
+                    return sorted(out)
+    return sorted(out)
+
+
 async def _list_files(ctx: ToolContext, args: dict) -> str:
+    root = ctx.project_dir.resolve()
     docs = sorted(
         f.name
-        for f in ctx.project_dir.iterdir()
+        for f in root.iterdir()
         if f.is_file() and not f.name.startswith(".") and f.suffix.lower() in EDITABLE_SUFFIXES
     )
-    pipeline = ctx.project_dir / ".pipeline"
+    pipeline = root / ".pipeline"
     arts = sorted(f.name for f in pipeline.iterdir() if f.is_file()) if pipeline.is_dir() else []
-    sheets = ctx.project_dir / "datasheets"
+    sheets = root / "datasheets"
     pdfs = sorted(f.name for f in sheets.glob("*.pdf")) if sheets.is_dir() else []
-    return json.dumps(
-        {"design_documents": docs, "pipeline_artifacts": arts, "datasheets": pdfs}, indent=2
-    )
+
+    # Everything else in the project, sub-board directories included. Previously
+    # absent, which made a multi-board project look empty below its root.
+    known = set(docs) | {f"datasheets/{p}" for p in pdfs}
+    others = [
+        p
+        for p in _walk(root, skip=_SKIP_DIRS | {CONTEXT_IGNORE})
+        if p not in known and not p.startswith("datasheets/")
+    ]
+    dropped = max(0, len(others) - 400)
+    payload: dict = {
+        "design_documents": docs,
+        "other_project_files": others[:400],
+        "pipeline_artifacts": arts,
+        "datasheets": pdfs,
+    }
+    if dropped:
+        payload["other_project_files_omitted"] = dropped
+
+    ignored = root / CONTEXT_IGNORE
+    if ignored.is_dir():
+        names = _walk(ignored, skip=_SKIP_DIRS)
+        # Names, not contents, and never swept up as context. Without the names
+        # the folder could not be used at all — "look at the enclosure drawing"
+        # needs something to resolve against — and a filename is cheap where the
+        # file behind it is the thing that would fill the conversation.
+        payload["context_ignore"] = {
+            "note": (
+                f"The user keeps these in {CONTEXT_IGNORE}/ because they are not part of the "
+                "board design work. Do not read them or reason from them unless the user asks "
+                "about one by name. They are readable when they do."
+            ),
+            "files": [f"{CONTEXT_IGNORE}/{n}" for n in names[:100]],
+            "omitted": max(0, len(names) - 100),
+        }
+    return json.dumps(payload, indent=2)
 
 
 async def _read_file(ctx: ToolContext, args: dict) -> str:
     from ..chat import sha_of  # local import: chat owns the proposal hashing
 
-    target = _project_file(ctx, str(args.get("path", "")))
+    target = _readable_file(ctx, str(args.get("path", "")))
     ctx.sandbox.check_read(target)
     if not target.is_file():
-        raise FileNotFoundError(f"no file {target.name!r} in this project")
-    text = target.read_text(encoding="utf-8", errors="replace")
+        raise FileNotFoundError(f"no file {args.get('path')!r} in this project")
+    text = _read_text(target)
+    # Keyed by the path as given, so a later proposal for the same file finds
+    # the hash of the bytes that were actually read. Root-level documents — the
+    # only ones a proposal can target — key the same way they always did.
     ctx.read_shas[target.name] = sha_of(text)
     return text
 
@@ -148,8 +314,8 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
     mpn = str(args.get("mpn", "")).strip()
     if not mpn:
         raise ToolDenied("mpn is required")
-    endpoint = ctx.endpoint_for("datasheet_vision")
-    if endpoint is None:
+    chain = ctx.endpoints_for("datasheet_vision")
+    if not chain:
         raise ToolDenied(
             "no vision-capable endpoint is routed to datasheet_vision — set one in Settings. "
             "Extraction reads PDF pages as images; a text-only model would read nothing."
@@ -182,7 +348,9 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
         ctx.note(f"{mpn}: reading {pdf.name} (matched by {found.how})")
     cache = ctx.project_dir / "datasheets" / "extracted"
     ctx.sandbox.check_write(cache)
-    run = await extract_datasheet(mpn, pdf, cache, endpoint, on_progress=ctx.note)
+    # The whole chain, not its head. A model that cannot hold the output schema
+    # fails every task the same way, so the endpoints behind it are the fix.
+    run = await extract_datasheet(mpn, pdf, cache, chain, on_progress=ctx.note)
     return json.dumps(run.to_dict(), indent=2)
 
 
@@ -628,8 +796,11 @@ def project_tools() -> list[ToolSpec]:
         ToolSpec(
             name="list_project_files",
             description=(
-                "List the project's design documents, its generated pipeline artifacts, and any "
-                "cached datasheet PDFs. Start here when you do not know what the project contains."
+                "List everything in the project: design documents, files in sub-board and other "
+                "directories, generated pipeline artifacts, and cached datasheet PDFs. Start here "
+                "when you do not know what the project contains. Anything listed under "
+                f"'context_ignore' is deliberately outside the design work — do not read those "
+                "unless the user asks about one."
             ),
             input_schema={"type": "object", "properties": {}},
             kind="query",
@@ -637,10 +808,23 @@ def project_tools() -> list[ToolSpec]:
         ),
         ToolSpec(
             name="read_project_file",
-            description="Read one design document from the project root, e.g. 'overview.md'.",
+            description=(
+                "Read any text file in the project by its path — 'overview.md', "
+                "'sensor/board.md', 'notes/power-budget.csv'. Use list_project_files if you do "
+                "not know what is there. Reads are free and need no permission; the project "
+                "directory is the boundary."
+            ),
             input_schema={
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "Filename in the project root."}},
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Path relative to the project root. May name a subdirectory, "
+                            "e.g. 'sensor/board.md'."
+                        ),
+                    }
+                },
                 "required": ["path"],
             },
             kind="file_read",
@@ -768,7 +952,21 @@ def parts_tools() -> list[ToolSpec]:
             },
             kind="dispatch",
             handler=_extract_datasheet,
-            approval="ask_always",
+            # Reading a file the project already contains is not a decision worth
+            # interrupting anyone for. This asked every single time, and the cost
+            # was not the seconds: the question arrives mid-answer, in a panel
+            # you may have scrolled away from, about a datasheet you put in the
+            # project yourself for exactly this purpose. A prompt like that is
+            # not a safety control, it is a control people learn to click
+            # through — which then spends the attention the prompts that
+            # matter were relying on.
+            #
+            # What it was really guarding was *spend*, not safety, and spend is
+            # answerable after the fact: the extraction is written to the
+            # project's cache with the model and page range that produced it,
+            # and the usage ledger records the call. read_datasheet_specs is
+            # cheap and is described as the thing to try first.
+            approval="auto",
         ),
         ToolSpec(
             name="read_datasheet_specs",

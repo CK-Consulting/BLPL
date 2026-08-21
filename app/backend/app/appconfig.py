@@ -179,16 +179,52 @@ class AppConfig:
                     f"task {task!r} routes to undeclared endpoint(s) {unknown}. "
                     f"Declared endpoints: {sorted(self.endpoints)}"
                 )
-            if task in VISION_TASKS:
-                blind = [n for n in chain if not self.endpoints[n].can_see]
-                if blind:
-                    raise ValueError(
-                        f"task {task!r} reads images or PDF pages, but endpoint(s) {blind} "
-                        "are not vision-capable. Route it elsewhere, or set vision = true "
-                        "on those endpoints if their model really can see."
-                    )
         if "default" in self.tasks and not self.tasks["default"]:
             raise ValueError("the default task chain must name at least one endpoint")
+
+    def warnings(self) -> list[str]:
+        """Things worth saying that are not reasons to refuse the config.
+
+        The distinction is the point. ``validate`` refuses configurations that
+        cannot run; this reports ones that will run in a way the user may not
+        have intended. Conflating the two is how the settings screen became
+        impossible to edit: a text-only endpoint sitting in a vision task's
+        chain was a hard error, so *every* save was rejected while it was there
+        — including the save that was reordering the chain to fix it. The only
+        escape was the exact edit the error made hardest to reach.
+
+        And it was refusing something the resolver already handles. It drops
+        endpoints that cannot serve a task, with a comment saying in as many
+        words that a text-only model in a chain is "not an error and not a
+        warning" — so the config layer was rejecting a state the runtime layer
+        considers ordinary. A chain with nothing left after that filter is the
+        case actually worth flagging, and it is flagged here.
+        """
+        out: list[str] = []
+        for task in sorted(VISION_TASKS):
+            # chain_for, not self.tasks: an unset vision task inherits the
+            # default chain, and inheriting a blind one breaks it just as
+            # thoroughly as routing it there on purpose. That case used to be
+            # reported from the settings endpoint and this one from validate,
+            # which is how they ended up disagreeing about whether it was fatal.
+            chain = self.chain_for(task)
+            inherited = "" if self.tasks.get(task) else " (inherited from default)"
+            blind = [n for n in chain if n in self.endpoints and not self.endpoints[n].can_see]
+            seeing = [n for n in chain if n in self.endpoints and self.endpoints[n].can_see]
+            if blind and seeing:
+                out.append(
+                    f"{task}{inherited}: {', '.join(blind)} cannot read images, so this task "
+                    f"skips past them to {seeing[0]}. Harmless, but the priority order shown "
+                    "is not the order this task will use."
+                )
+            elif blind and not seeing:
+                out.append(
+                    f"{task} reads images and PDF pages, and none of {', '.join(blind)}"
+                    f"{inherited} can see. This task will fail until a vision-capable "
+                    "endpoint is routed to it — or until 'sees images' is set on one of "
+                    "these, if its model really can."
+                )
+        return out
 
 
 def default_config() -> AppConfig:

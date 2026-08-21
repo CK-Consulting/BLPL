@@ -98,16 +98,45 @@ def test_an_openai_compatible_endpoint_needs_a_base_url() -> None:
         cfg.validate()
 
 
-def test_a_vision_task_cannot_route_to_an_endpoint_that_cannot_see() -> None:
-    """Datasheet extraction hands the model PDF pages. Routing it to a text-only
-    endpoint would read nothing and report success."""
-    cfg = _cfg(tasks={"default": ["claude-main"], "datasheet_vision": ["local-qwen"]})
-    with pytest.raises(ValueError, match="not vision-capable"):
-        cfg.validate()
+def test_a_blind_vision_route_warns_and_still_saves() -> None:
+    """Datasheet extraction hands the model PDF pages, so a text-only endpoint
+    cannot serve it. That is worth saying and is not worth refusing.
 
-    # …unless the operator says that model really can see.
+    It used to raise. The refusal made the routing screen impossible to edit:
+    the endpoints it objected to were already in the chain, so *every* save was
+    rejected while they were there — including the save that would take them
+    out. And the resolver drops them at request time anyway, with a comment
+    saying in as many words that a text-only model in a chain is not an error.
+    """
+    cfg = _cfg(tasks={"default": ["claude-main"], "datasheet_vision": ["local-qwen"]})
+    cfg.validate()
+    assert any("none of local-qwen" in w for w in cfg.warnings())
+
+    # …and nothing to say once the operator states that model really can see.
     cfg.endpoints["local-qwen"].vision = True
     cfg.validate()
+    assert cfg.warnings() == []
+
+
+def test_a_chain_that_can_still_see_says_the_order_is_not_what_it_looks_like() -> None:
+    """A blind endpoint ahead of a seeing one is harmless — it is skipped — but
+    the priority numbers on screen then do not describe what will happen, and
+    that is the whole reason someone reads them."""
+    cfg = _cfg(
+        tasks={"default": ["claude-main"], "datasheet_vision": ["local-qwen", "claude-main"]}
+    )
+    cfg.validate()
+    warning = " ".join(cfg.warnings())
+    assert "skips past" in warning and "claude-main" in warning
+
+
+def test_an_inherited_blind_default_warns_the_same_way() -> None:
+    """An unset vision task falls back to the default chain, and inheriting a
+    blind one breaks it exactly as thoroughly as routing it there on purpose.
+    Reported by the same code, so the two cannot disagree."""
+    cfg = _cfg(tasks={"default": ["local-qwen"]})
+    cfg.validate()
+    assert any("inherited from default" in w for w in cfg.warnings())
 
 
 def test_an_empty_config_is_rejected() -> None:
@@ -181,15 +210,16 @@ def test_an_unset_vision_task_is_not_an_invalid_config():
     assert cfg.chain_for("datasheet_vision") == ["ollama"]
 
 
-def test_an_explicit_blind_vision_route_is_still_refused():
-    """Saying it out loud is different from inheriting it."""
-    import pytest
-
+def test_an_explicit_blind_vision_route_warns_like_an_inherited_one():
+    """Saying it out loud used to be treated as different from inheriting it —
+    one raised, the other was merely reported. The distinction did not survive
+    contact with the screen: it is the same broken route either way, and making
+    one of them fatal is what stopped the route being editable at all."""
     from app.appconfig import AppConfig, Endpoint
 
     cfg = AppConfig(
         endpoints={"ollama": Endpoint(name="ollama", kind="ollama", vision=False)},
         tasks={"default": ["ollama"], "datasheet_vision": ["ollama"]},
     )
-    with pytest.raises(ValueError, match="vision-capable"):
-        cfg.validate()
+    cfg.validate()  # must not raise
+    assert any("none of ollama" in w for w in cfg.warnings())

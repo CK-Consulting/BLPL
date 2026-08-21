@@ -752,11 +752,6 @@ def get_settings(
         # A GET whose result cannot be PUT back unchanged is the bug.
         "tasks": {t: list(chain) for t, chain in cfg.tasks.items() if chain},
         "effective": {t: cfg.chain_for(t) for t in appconfig.KNOWN_TASKS},
-        # An inherited chain can be invalid in a way validation cannot refuse:
-        # `datasheet_vision` unset falls back to `default`, and if that is a
-        # blind endpoint the task breaks at request time rather than at save
-        # time. Refusing the config outright would be wrong — the default chain
-        # is legitimate for every other task — so it is reported instead.
         # What each endpoint's chosen model can actually do. Surfaced here, not
         # only in the endpoint editor, because task routing is where the
         # difference bites: review_panel wants several genuinely different
@@ -764,17 +759,11 @@ def get_settings(
         # simply cannot be served by a model that does not see. None of that is
         # guessable from an endpoint's name.
         "endpoint_capabilities": _endpoint_capabilities(cfg),
-        "warnings": [
-            f"{t} reads images, but with no route of its own it falls back to "
-            f"{cfg.chain_for(t)}, which cannot see. Give it its own route."
-            for t in appconfig.VISION_TASKS
-            if t not in cfg.tasks
-            and any(
-                not cfg.endpoints[n].can_see
-                for n in cfg.chain_for(t)
-                if n in cfg.endpoints
-            )
-        ],
+        # One source for these. A vision task routed at a blind endpoint and one
+        # that merely inherits a blind default are the same problem, and were
+        # reported by two separate pieces of code that disagreed about whether
+        # it was fatal — which is what made the routing screen unsaveable.
+        "warnings": cfg.warnings(),
         "known_kinds": list(appconfig.KNOWN_KINDS),
         "known_tasks": list(appconfig.KNOWN_TASKS),
         "vision_tasks": sorted(appconfig.VISION_TASKS),
@@ -1095,9 +1084,13 @@ def put_llm_settings(
 
     try:
         llmconfig.save(session, user, cfg)
-    except ValueError as exc:  # unknown kind/endpoint, empty chain, blind vision task
+    except ValueError as exc:  # unknown kind or endpoint, empty default chain
         raise HTTPException(status_code=400, detail=str(exc))
-    return {"ok": True}
+    # Saved, and here is what is odd about it. Warnings ride back on the success
+    # response rather than becoming a refusal: a configuration that will run in
+    # a way you may not have meant is worth saying, and is not worth making the
+    # screen unable to save.
+    return {"ok": True, "warnings": cfg.warnings()}
 
 
 class SecretBody(BaseModel):
@@ -2749,42 +2742,62 @@ def _cred_resolver():
     return CredResolver()
 
 
-def _task_endpoint(session: Session, user: User, master_key: bytes, task: str):
-    """The endpoint routed to a task for this user, or None if nothing usable is.
+def _task_endpoints(
+    session: Session, user: User, master_key: bytes, task: str
+) -> list[chat_mod.Endpoint]:
+    """Every endpoint routed to a task for this user, best first.
 
-    None rather than a fallback: a tool that needs vision must not quietly run
-    on a model that cannot see.
+    A list rather than one. ``resolve_chain`` has always known the fallbacks —
+    it drops endpoints that cannot serve the task, so what comes back is usable
+    rather than merely first — but this returned only its head, and the tool
+    behind it got one attempt at one model. When that model could not hold the
+    extraction schema, the endpoints sitting behind it in the very same chain
+    were never asked.
+
+    Empty rather than a loose fallback: a tool that needs vision must not
+    quietly run on a model that cannot see.
     """
     cfg = llmconfig.load(session, user)
-    try:
-        # resolve_primary already drops endpoints that cannot serve the task, so
-        # its answer is usable rather than merely first. This used to take the
-        # head of an unfiltered chain and return None when that head happened to
-        # be text-only — which reported "no vision endpoint is routed" while a
-        # perfectly good one sat third in the same chain.
-        rp = llm_resolver.resolve_primary(cfg, keystore.endpoints_with_keys(session, user), task)
-    except llm_resolver.NoUsableProvider:
-        # Nothing is routed to the task. Before giving up, consider the model
-        # already driving this conversation: if the user has put a
-        # vision-capable model in the chair, refusing to read a PDF with it
-        # because a *different* route is unset is pedantry, not safety.
-        if task in appconfig.VISION_TASKS:
-            for ep in _chat_chain(session, user, master_key):
-                declared = cfg.endpoint(ep.name)
-                if declared is not None and declared.can_see:
-                    return ep
-        return None
-    return chat_mod.Endpoint(
-        name=rp.name or rp.provider,
-        kind=rp.provider,  # type: ignore[arg-type]
-        model=rp.model,
-        api_key=(
-            keystore.get(session, master_key, user, rp.name or rp.provider)
-            if rp.needs_key
-            else None
-        ),
-        base_url=rp.base_url or None,
-    )
+
+    def build(rp) -> chat_mod.Endpoint:
+        return chat_mod.Endpoint(
+            name=rp.name or rp.provider,
+            kind=rp.provider,  # type: ignore[arg-type]
+            model=rp.model,
+            api_key=(
+                keystore.get(session, master_key, user, rp.name or rp.provider)
+                if rp.needs_key
+                else None
+            ),
+            base_url=rp.base_url or None,
+        )
+
+    chain = [
+        build(rp)
+        for rp in llm_resolver.resolve_chain(
+            cfg, keystore.endpoints_with_keys(session, user), task
+        )
+    ]
+    if chain:
+        return chain
+    # Nothing is routed to the task. Before giving up, consider the model
+    # already driving this conversation: if the user has put a vision-capable
+    # model in the chair, refusing to read a PDF with it because a *different*
+    # route is unset is pedantry, not safety.
+    if task in appconfig.VISION_TASKS:
+        seeing = []
+        for ep in _chat_chain(session, user, master_key):
+            declared = cfg.endpoint(ep.name)
+            if declared is not None and declared.can_see:
+                seeing.append(ep)
+        return seeing
+    return []
+
+
+def _task_endpoint(session: Session, user: User, master_key: bytes, task: str):
+    """The best endpoint routed to a task, or None. See ``_task_endpoints``."""
+    chain = _task_endpoints(session, user, master_key, task)
+    return chain[0] if chain else None
 
 
 def _kicad_bridge_url() -> str | None:
@@ -2971,7 +2984,7 @@ async def start_chat_turn(
                 sandbox=_sandbox_for(session, user, project_id),
                 usage_ledger=_blpl_dir(session, user, project_id) / "llm_usage.jsonl",
                 creds=_cred_resolver(),
-                endpoint_for=lambda task: _task_endpoint(session, user, master_key, task),
+                endpoints_for=lambda task: _task_endpoints(session, user, master_key, task),
                 record_tool_call=lambda rec: run_manager.record_tool_call(
                     project_id, rec, conversation=conv.path.name
                 ),

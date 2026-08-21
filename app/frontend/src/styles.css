@@ -50,7 +50,10 @@ header .kicad { margin-left: 0; }
 .gate-card button { padding: .65rem; font-size: 15px; background: #2f5db0; border: 1px solid #3d6cc4; border-radius: 8px; }
 .gate-card button:hover:not(:disabled) { background: #3768c4; }
 .gate-error { color: #ff9b9b; font-size: 14px; }
-.gate-hint { color: #97a1ad; font-size: 13px; }
+/* 6.52:1 before, which is AA and not AAA. This is help text — the text that
+   explains how to use the thing — so it is the worst candidate for being the
+   hardest thing on screen to read. 9.57:1. */
+.gate-hint { color: #b9c3d0; font-size: 13px; }
 /* An anchor, not a button — it must be a real top-level navigation so the
    provider can take the tab. Styled to sit alongside the unlock button without
    competing with it: the passphrase remains the primary path. */
@@ -64,11 +67,21 @@ header .kicad { margin-left: 0; }
 
 /* --- modal (settings, new project) --- */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: flex-start; justify-content: center; padding-top: 6vh; z-index: 10; }
-.modal { width: 640px; max-width: 92vw; max-height: 84vh; overflow: auto; background: #191c22; border: 1px solid #6b6f75; border-radius: 12px; }
+/* A column with one scrolling region, rather than one scrolling box. What
+   sits outside .modal-body — the header, and anything telling you a save was
+   refused — then stays put instead of scrolling away from the thing it is
+   about. */
+.modal { width: 640px; max-width: 92vw; max-height: 84vh; display: flex; flex-direction: column; overflow: hidden; background: #191c22; border: 1px solid #6b6f75; border-radius: 12px; }
 .modal.small { width: 440px; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.2rem; border-bottom: 1px solid #6b6f75; position: sticky; top: 0; background: #191c22; }
 .modal-head h2 { margin: 0; font-size: 16px; }
-.modal-body { padding: 1.2rem; display: flex; flex-direction: column; gap: 1.4rem; }
+/* Pinned under the header, never in the scroll. 11.19:1, and it carries a word
+   as well as a colour — "could not save" has to survive being looked at by
+   someone who cannot tell this red from the panel behind it. */
+.modal-notice { display: flex; align-items: flex-start; gap: .6rem; flex: none; padding: .7rem 1.2rem; font-size: 14px; line-height: 1.45; border-bottom: 1px solid #6b6f75; }
+.modal-notice.error { background: #2a1418; color: #ffc0c0; border-bottom-color: #a2444f; }
+.modal-notice button.link { color: inherit; font-size: 16px; line-height: 1; }
+.modal-body { padding: 1.2rem; display: flex; flex-direction: column; gap: 1.4rem; overflow: auto; flex: 1; min-height: 0; }
 .modal-body section { display: flex; flex-direction: column; gap: .5rem; }
 .modal-body h3 { margin: 0; font-size: 14px; }
 .muted { color: #adb1b6; font-size: 13px; margin: 0; }
@@ -279,6 +292,20 @@ body.resizing-y * { pointer-events: none; }
    its full height: `align-items: stretch` made Send as tall as the textarea,
    which was merely odd at three lines and absurd at twelve. */
 .chat-composer > button { align-self: flex-end; }
+
+/* Anchored over the transcript at whichever end new material arrives at, so
+   the arrow on it and the direction it takes you always agree. `.chat` is the
+   positioning context; the button is outside `.chat-scroll` so it does not
+   scroll away with the content it is announcing.
+   11.59:1 for the ordinary state and 12.24:1 for the approval one — both past
+   AAA's 7:1, because this is the text that says something is waiting. */
+.chat { position: relative; }
+.chat-jump { position: absolute; left: 50%; transform: translateX(-50%); z-index: 3; bottom: 5.2rem; padding: .4rem .8rem; font-size: 13px; background: #1d2a3d; color: #dce7f7; border: 1px solid #6f8bb5; border-radius: 999px; box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+.chat-jump.top { bottom: auto; top: 3rem; }
+/* Not colour alone: the wording changes to name the approval, and the shape
+   does not move. The warmer palette is the redundant signal, not the message. */
+.chat-jump.waiting { background: #2b1d10; color: #ffd9a8; border-color: #d4881f; }
+.chat-jump:focus-visible { outline: 3px solid #80a8ff; outline-offset: 2px; }
 /* 2.34:1 before — a focus ring that fails 1.4.11 is not a focus ring. Matches
    the app-wide indicator so focus looks the same wherever it lands. */
 .chat-composer textarea:focus { outline: 3px solid #80a8ff; outline-offset: -1px; }

@@ -243,7 +243,12 @@ def test_costly_tools_ask_and_reads_do_not() -> None:
     # touches a design file, so it is on the read side of the boundary the
     # prompt exists to guard.
     assert by_name["fetch_datasheet"].approval == "auto"
-    assert by_name["extract_datasheet_specs"].approval == "ask_always"  # spends money per call
+    # Also auto, and this is the one that changed. It spends money per call,
+    # which is a real cost — but it reads a file the project already contains,
+    # so the prompt was never guarding a boundary. What it guarded is answerable
+    # after the fact instead: the extraction records the model and pages that
+    # produced it, and the usage ledger records the call.
+    assert by_name["extract_datasheet_specs"].approval == "auto"
     # A proposal writes nothing on its own — the accept step is the approval,
     # and asking twice for one decision trains people to click.
     assert by_name["propose_file_edit"].approval == "auto"
