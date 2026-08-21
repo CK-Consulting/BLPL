@@ -97,7 +97,7 @@ def _run(tmp_path, chain, answers, monkeypatch):
     """Drive one extraction with ``answers`` keyed by endpoint name."""
     seen: list[str] = []
 
-    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema):
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
         seen.append(endpoint.name)
         return (answers.get(endpoint.name), "" if answers.get(endpoint.name) else "boom", 10, 5)
 
@@ -158,3 +158,84 @@ def test_no_endpoints_is_a_clear_refusal_not_a_crash(tmp_path, scripted) -> None
         datasheets.extract_datasheet("PART1", _pdf(tmp_path), tmp_path / "cache", [])
     )
     assert not run.ok and "no vision endpoint" in run.error
+
+
+# -- reading rather than looking ---------------------------------------------
+
+
+def test_a_document_with_a_text_layer_is_read_not_looked_at(tmp_path, scripted, monkeypatch) -> None:
+    """The measurement that changed the whole approach: reading rendered pages
+    produced 0 of 7 pinouts, all malformed JSON at near-identical byte offsets.
+    Reading the text layer produced 113 of 113 pins on the nRF9151 — including
+    the ones an OCR pass merged. Every one of the seven had a text layer."""
+    seen: list[bool] = []
+
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+        seen.append(bool(page_text))
+        return ({"family": "x"}, "", 10, 5)
+
+    monkeypatch.setattr(datasheets, "_one_task", one_task)
+    monkeypatch.setattr(datasheets, "has_text_layer", lambda p: True)
+    monkeypatch.setattr(datasheets, "page_text", lambda p, pages=(): "1  VDD  Power  Supply")
+    asyncio.run(
+        datasheets.extract_datasheet("PART1", _pdf(tmp_path), tmp_path / "cache", [_endpoint("m")])
+    )
+    assert seen and all(seen), "every task should have been given the document's own text"
+
+
+def test_a_scan_still_goes_as_pages(tmp_path, scripted, monkeypatch) -> None:
+    """The image path is the fallback, not the default — but it is still there,
+    because a scanned datasheet is a real thing and has no text to read."""
+    seen: list[bool] = []
+
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+        seen.append(bool(page_text))
+        return ({"family": "x"}, "", 10, 5)
+
+    monkeypatch.setattr(datasheets, "_one_task", one_task)
+    monkeypatch.setattr(datasheets, "has_text_layer", lambda p: False)
+    asyncio.run(
+        datasheets.extract_datasheet("PART1", _pdf(tmp_path), tmp_path / "cache", [_endpoint("m")])
+    )
+    assert seen and not any(seen)
+
+
+def test_a_page_of_form_feed_is_not_a_text_layer(tmp_path) -> None:
+    """A scanned page yields a form feed and nothing else. Judging on length
+    rather than printable characters would make a 900-page scan look like a
+    document with plenty of text."""
+    import subprocess as sp
+
+    class Fake:
+        stdout = "\f" * 40
+
+    orig = datasheets.subprocess.run
+    datasheets.subprocess.run = lambda *a, **k: Fake()
+    try:
+        assert datasheets.page_text(tmp_path / "x.pdf", range(1, 41)) == ""
+    finally:
+        datasheets.subprocess.run = orig
+    assert sp is not None
+
+
+def test_only_the_pages_a_task_is_about_are_sent(tmp_path, scripted, monkeypatch) -> None:
+    """A pin table read from its own six pages costs a few thousand tokens where
+    the whole 541-page document costs hundreds of thousands."""
+    asked: list[object] = []
+
+    def fake_page_text(pdf, pages=()):
+        asked.append(list(pages) if pages else [])
+        return "1  VDD  Power  Supply"
+
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+        return ({"family": "x"}, "", 10, 5)
+
+    monkeypatch.setattr(datasheets, "_one_task", one_task)
+    monkeypatch.setattr(datasheets, "has_text_layer", lambda p: True)
+    monkeypatch.setattr(datasheets, "page_text", fake_page_text)
+    asyncio.run(
+        datasheets.extract_datasheet("PART1", _pdf(tmp_path), tmp_path / "cache", [_endpoint("m")])
+    )
+    # The plan gives the mcu task page 1; the scout gets the front matter. The
+    # point is that neither asks for the whole document.
+    assert [1] in asked

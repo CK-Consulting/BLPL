@@ -69,13 +69,19 @@ KNOWN_TASKS = (
     "chat",
     "stage0",
     "stage1",
-    "datasheet_vision",
+    "vision",
     "review_panel",
 )
 
-# Tasks that hand the model an image or a PDF page. Routing one of these to an
-# endpoint that cannot see is a configuration error worth refusing up front.
-VISION_TASKS = frozenset({"datasheet_vision"})
+# Tasks that hand the model an image or a PDF page.
+#
+# One route, named for what it asks for. It used to be "datasheet_vision",
+# named for its only caller — but needing a model that can see is a property of
+# the request, not of datasheets, and the next thing needing one would have had
+# to either borrow a route named for something else or add a near-duplicate
+# beside it, with the settings screen listing both and nothing to say which
+# mattered.
+VISION_TASKS = frozenset({"vision"})
 
 
 @dataclass

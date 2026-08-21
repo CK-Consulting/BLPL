@@ -522,7 +522,7 @@ function NewEndpoint({
 // What each capability means for how a model behaves here. Written out because
 // the consequences are concrete and none of them are guessable from the name.
 const CAP_HELP: Record<string, string> = {
-  vision: "can read images and PDF pages — required for the datasheet_vision task",
+  vision: "can read images and PDF pages — needed only for scanned documents, since one with a text layer is read as text",
   tools: "can call tools; without this it will not, however the prompt is written",
   thinking: "emits chain-of-thought that has to be parsed out of the reply",
   completion: "ordinary text generation",
@@ -538,7 +538,7 @@ const TASK_HELP: Record<string, string> = {
   chat: "The design chat in the workbench. A model with the thinking capability reasons before answering, which suits open-ended design questions.",
   stage0: "Markdown re-read — mechanical, a cheap model is fine.",
   stage1: "MPN → package → library hints. Hallucinated footprints are expensive here.",
-  datasheet_vision: "Reads PDF pages. Must be vision-capable — a model without the vision capability cannot serve this at all.",
+  vision: "Anything that has to be looked at rather than read: a scanned datasheet, an image. A datasheet with a text layer never comes here — it is read as text by whatever serves chat.",
   review_panel: "Every endpoint listed runs, and their findings are merged with attribution — so its value comes from listing models that differ, not several of the same one.",
 };
 
@@ -613,7 +613,7 @@ function Routing({
         // is always shown, whether or not it would be offered today.
         //
         // That second half was missing, and it closed the only exit. Three
-        // text-only endpoints were routed to datasheet_vision; the filter hid
+        // text-only endpoints were routed to vision; the filter hid
         // them, so they had no row and no way to be taken out, while the same
         // condition made every save fail validation. The screen was reporting
         // an error whose only fix was an edit the screen had removed.

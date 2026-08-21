@@ -247,4 +247,4 @@ def test_extraction_reuses_the_library_instead_of_paying_again(data, tmp_path) -
     assert body["source"] == "component-library"
     assert body["pinout"][0]["name"] == "VDD"
     # No vision endpoint was configured, and it did not need one.
-    assert ctx.endpoints_for("datasheet_vision") == []
+    assert ctx.endpoints_for("vision") == []

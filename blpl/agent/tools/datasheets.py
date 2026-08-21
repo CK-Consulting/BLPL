@@ -18,7 +18,7 @@ The flow, with the piece this module owns marked:
 Why this needs Phase 2's task routing: a datasheet is read as images. Routing
 extraction at a text-only endpoint does not error — the model simply describes
 nothing and the schema validator rejects empty output, or worse, accepts a
-plausible hallucination. ``datasheet_vision`` is a declared vision task and the
+plausible hallucination. ``vision`` is a declared vision task and the
 config refuses to route it anywhere blind.
 
 Contract obligations kept here, because each one has a failure it prevents:
@@ -33,6 +33,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import shutil
+import subprocess
 import time
 import uuid
 from collections.abc import Sequence
@@ -94,6 +96,42 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def page_text(pdf: Path, pages: Sequence[int] = ()) -> str:
+    """The document's own text for these pages, with its column layout kept.
+
+    ``-layout`` rather than the default reading order, because a pin table is
+    columns: the whitespace *is* the structure, and a model can read
+    "4    SWDIO    Digital I/O" without any recogniser guessing at it.
+
+    Empty when the document has no text layer, which is the signal to fall back
+    to sending pages as images. Distinguishing those two is the only thing that
+    still needs deciding per document; everything else follows.
+    """
+    if not shutil.which("pdftotext"):
+        return ""
+    args = ["pdftotext", "-layout"]
+    if pages:
+        args += ["-f", str(min(pages)), "-l", str(max(pages))]
+    try:
+        out = subprocess.run(
+            args + [str(pdf), "-"], capture_output=True, text=True, timeout=180
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    text = out.stdout
+    # A page of a scanned PDF yields a form feed and nothing else. Judge on the
+    # printable characters rather than the length, or a 900-page scan looks like
+    # a document with plenty of text.
+    printable = sum(1 for ch in text if ch.strip())
+    span = len(pages) if pages else max(1, text.count("\f"))
+    return text if printable > 200 * span else ""
+
+
+def has_text_layer(pdf: Path) -> bool:
+    """Whether this document can be read rather than looked at."""
+    return bool(page_text(pdf, ()))
+
+
 def _pages_label(pages: list[int] | None) -> str:
     """"5, 6, 13-15" — the human-readable form the prompt placeholder expects."""
     if not pages:
@@ -144,12 +182,24 @@ async def _one_task(
     pdf_bytes: str,
     filename: str,
     schema: dict,
+    page_text: str = "",
 ) -> tuple[dict | None, str, int, int]:
     """Run one extractor. Returns (data, error, tokens_in, tokens_out).
 
-    The PDF rides as a document block rather than pre-rendered images: providers
-    that accept PDFs page them internally and see the vector text, which reads
-    small pin tables far better than a rasterized page.
+    ``page_text`` is the document's own text, laid out, when it has one. When it
+    is present the PDF is not sent at all: the model is asked to read text, not
+    to look at a page.
+
+    That is the whole difference between this working and not. Measured on the
+    same seven datasheets: reading rendered pages produced 0 of 7 pinouts, all
+    of them malformed JSON at near-identical byte offsets. Reading the text
+    layer produced 113 of 113 pins on the nRF9151, correct including the ones an
+    OCR pass merged. The text was there the entire time — every one of the seven
+    had a text layer — and it is *right*, where a recogniser guessing at it gave
+    "Digital l/O" for "Digital I/O" and "AINO" for "AIN0".
+
+    So the PDF-as-image path is now the fallback, for documents that genuinely
+    are scans.
     """
     adapter = build_chat_adapter(endpoint)
     instruction = (
@@ -159,15 +209,18 @@ async def _one_task(
         "reproduced here so you do not need to open it:\n\n"
         f"{json.dumps(schema, indent=2)[:20000]}"
     )
-    messages = [
-        Msg(
-            role="user",
-            content=[
-                DocumentBlock(data=pdf_bytes, filename=filename),
-                TextBlock(instruction),
-            ],
-        )
-    ]
+    if page_text:
+        content = [
+            TextBlock(
+                "The relevant pages of the datasheet, as text, with the original column "
+                "layout preserved by whitespace. Columns are separated by runs of spaces; "
+                "a row whose first column is blank continues the row above it.\n\n"
+                f"<<<{filename}>>>\n{page_text}\n<<<end>>>\n\n" + instruction
+            )
+        ]
+    else:
+        content = [DocumentBlock(data=pdf_bytes, filename=filename), TextBlock(instruction)]
+    messages = [Msg(role="user", content=content)]
     usage_in = usage_out = 0
     text_parts: list[str] = []
     try:
@@ -278,6 +331,12 @@ async def extract_datasheet(
     pdf_b64 = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
 
+    # Read the document rather than look at it, whenever it will let us. All
+    # seven datasheets in the corpus that prompted this had a text layer; not
+    # one of them needed a model that could see, and asking one to look at
+    # rendered pages is what produced 0 of 7 pinouts.
+    readable = has_text_layer(pdf_path)
+
     def note(msg: str) -> None:
         if on_progress:
             on_progress(msg)
@@ -296,6 +355,12 @@ async def extract_datasheet(
         scout_schema = json.loads((schemas / "scout.schema.json").read_text(encoding="utf-8"))
         data = None
         err = ""
+        # Scouting is about structure — which section is where — so the front
+        # matter and contents pages carry it, and the whole document does not
+        # need to travel.
+        scout_text = page_text(pdf_path, range(1, 41)) if readable else ""
+        if readable:
+            note(f"{mpn}: reading the document's own text (no vision needed)")
         for i, ep in enumerate(chain):
             data, err, tin, tout = await _one_task(
                 endpoint=ep,
@@ -303,6 +368,7 @@ async def extract_datasheet(
                 pdf_bytes=pdf_b64,
                 filename=pdf_path.name,
                 schema=scout_schema,
+                page_text=scout_text,
             )
             _append_ledger(
                 cache_dir,
@@ -391,6 +457,10 @@ async def extract_datasheet(
         err = ""
         tin = tout = 0
         used = chain[0]
+        # Only the pages this task is about. The plan already says which they
+        # are, and a pin table read from its own six pages costs a few thousand
+        # tokens where the whole 541-page document costs hundreds of thousands.
+        task_text = page_text(pdf_path, pages) if readable else ""
         async with semaphore:
             for i, ep in enumerate(chain):
                 note(
@@ -403,6 +473,7 @@ async def extract_datasheet(
                     pdf_bytes=pdf_b64,
                     filename=pdf_path.name,
                     schema=schema,
+                    page_text=task_text,
                 )
                 # Schema validation counts as failure for the purpose of moving
                 # on. Output that parses but does not validate is the signature

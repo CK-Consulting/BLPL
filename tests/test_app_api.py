@@ -548,7 +548,7 @@ def test_settings_survive_a_round_trip(unlocked) -> None:
 
     The screen used to receive every task with fallbacks already applied, then
     echo the whole map back on the next click. That turned a legal
-    "datasheet_vision is unset" into an illegal "datasheet_vision routes to a
+    "vision is unset" into an illegal "vision routes to a
     blind endpoint", and validation refused it — including refusing the very
     edit that would have fixed it. Nothing in the routing tab could be changed.
     """
@@ -561,8 +561,8 @@ def test_settings_survive_a_round_trip(unlocked) -> None:
     got = unlocked.get("/api/settings").json()
     # Stored routes are what was stored; inherited ones are not invented into it.
     assert got["tasks"] == {"default": ["ollama"]}
-    assert got["effective"]["datasheet_vision"] == ["ollama"]   # …but shown
-    assert any("datasheet_vision" in w for w in got["warnings"])
+    assert got["effective"]["vision"] == ["ollama"]   # …but shown
+    assert any("vision" in w for w in got["warnings"])
 
     # The round trip that used to deadlock.
     back = unlocked.put("/api/settings/llm", json={"tasks": got["tasks"]})
@@ -578,10 +578,10 @@ def test_one_task_can_be_changed_without_resending_the_rest(unlocked) -> None:
     ]})
     unlocked.put("/api/settings/llm", json={"tasks": {"default": ["ollama"]}})
 
-    r = unlocked.put("/api/settings/llm", json={"tasks": {"datasheet_vision": ["opus"]}})
+    r = unlocked.put("/api/settings/llm", json={"tasks": {"vision": ["opus"]}})
     assert r.status_code == 200, r.text
     got = unlocked.get("/api/settings").json()
-    assert got["tasks"]["datasheet_vision"] == ["opus"]
+    assert got["tasks"]["vision"] == ["opus"]
     assert got["tasks"]["default"] == ["ollama"]        # untouched
     assert not got["warnings"]                           # and the warning clears
 

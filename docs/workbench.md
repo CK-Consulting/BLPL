@@ -41,7 +41,7 @@ auth = "none"
 [llm.tasks]
 chat = ["claude-main"]
 stage0 = ["local-qwen", "claude-main"]
-datasheet_vision = ["claude-main"]
+vision = ["claude-main"]
 review_panel = ["claude-main", "local-qwen"]
 ```
 

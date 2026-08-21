@@ -71,7 +71,7 @@ def resolve_chain(
 
     The capability filter is what makes an inherited route work. A task with no
     route of its own falls back to ``default``, and a default chain is ordered
-    for general work — cheap local models first. For ``datasheet_vision`` that
+    for general work — cheap local models first. For ``vision`` that
     put two text-only models at the head of the chain, and the caller, taking
     only the first, concluded there was no vision endpoint at all. There was:
     it was third. Dropping endpoints that cannot serve the task means the chain

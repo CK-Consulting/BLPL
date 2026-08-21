@@ -114,7 +114,7 @@ do everything.
 |---|---|---|
 | `stage0` | Markdown → `design_artifact.json`, schema-validated | Instruction-following and reliable JSON. A mid-size model is enough, and it runs on every document you edit, so latency matters more than depth |
 | `stage1` | Component resolution and connector synthesis → BOM | The hardest reasoning in the pipeline. Worth the largest model you can hold |
-| `datasheet_vision` | Reads PDF pages | **Vision is mandatory.** A model without it silently reads nothing — BLPL refuses to route this task to an endpoint that has not declared `vision = true`, precisely because that failure is invisible |
+| `vision` | Reads PDF pages | **Vision is mandatory.** A model without it silently reads nothing — BLPL refuses to route this task to an endpoint that has not declared `vision = true`, precisely because that failure is invisible |
 | `review_panel` | Every routed endpoint reviews the same evidence | Diversity beats size. A local model alongside a cloud one produces disagreements worth reading |
 | `chat` | Interactive design conversation | First-token latency. The smallest model you find acceptable |
 
@@ -124,7 +124,7 @@ constraint — throughput will be.
 
 **On specific model names:** they date faster than anything else in this
 document, so treat the criteria above as the durable part. As of this writing the
-shapes that fit are a Qwen2.5-VL variant for `datasheet_vision`, a 70B-class
+shapes that fit are a Qwen2.5-VL variant for `vision`, a 70B-class
 instruct model for `stage1`, and something small and quick for `stage0` and
 `chat`. Check what is current before pulling — this list will be wrong before the
 rest of the page is.
@@ -137,7 +137,7 @@ Not everything has to be local. The routing exists so it does not have to be:
 chat              → local, small        (latency)
 stage0            → local, small        (runs constantly, cheap)
 stage1            → cloud               (hardest reasoning; local later)
-datasheet_vision  → cloud, or local VL  (vision is mandatory either way)
+vision  → cloud, or local VL  (vision is mandatory either way)
 review_panel      → cloud + local       (disagreement is the product)
 ```
 

@@ -63,9 +63,10 @@ So the position is stated rather than implied:
   of that assertion where they belong. A document you should not have shared
   is not reachable by another account.
 - **Content sent to a model provider is governed by that provider's terms.**
-  Extraction reads the document with whichever model is routed to
-  `datasheet_vision`. If a document may not leave your premises, route that
-  task at a local endpoint — or do not extract it.
+  Extraction reads the document with whichever model is routed to `chat` — or
+  to `vision`, if the document is a scan with no text layer. If a document may
+  not leave your premises, route those tasks at a local endpoint, or do not
+  extract it.
 - **BLPL accepts no liability for the provenance of documents you supply.**
 
 This is the same boundary that already applies to a project: anything in a

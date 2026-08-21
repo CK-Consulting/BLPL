@@ -51,7 +51,7 @@ community fine-tune the same way before building on it:
   `Qwen2.5-3B-Instruct.Q4_K_M.gguf` — the stock base model's filename.
 
 **None of them read images.** Vision is a separate model (`qwen2.5vl`), routed
-through the `datasheet_vision` task.
+through the `vision` task.
 
 ## Thor — one large model
 

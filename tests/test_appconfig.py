@@ -108,7 +108,7 @@ def test_a_blind_vision_route_warns_and_still_saves() -> None:
     out. And the resolver drops them at request time anyway, with a comment
     saying in as many words that a text-only model in a chain is not an error.
     """
-    cfg = _cfg(tasks={"default": ["claude-main"], "datasheet_vision": ["local-qwen"]})
+    cfg = _cfg(tasks={"default": ["claude-main"], "vision": ["local-qwen"]})
     cfg.validate()
     assert any("none of local-qwen" in w for w in cfg.warnings())
 
@@ -123,7 +123,7 @@ def test_a_chain_that_can_still_see_says_the_order_is_not_what_it_looks_like() -
     the priority numbers on screen then do not describe what will happen, and
     that is the whole reason someone reads them."""
     cfg = _cfg(
-        tasks={"default": ["claude-main"], "datasheet_vision": ["local-qwen", "claude-main"]}
+        tasks={"default": ["claude-main"], "vision": ["local-qwen", "claude-main"]}
     )
     cfg.validate()
     warning = " ".join(cfg.warnings())
@@ -196,7 +196,7 @@ def test_project_names_with_dots_are_quoted(tmp_path: Path) -> None:
 
 
 def test_an_unset_vision_task_is_not_an_invalid_config():
-    """`datasheet_vision` with no route of its own inherits the default chain.
+    """`vision` with no route of its own inherits the default chain.
     That is a legal configuration even when the default is blind — the default
     serves every other task perfectly well — so it must not be refused. It is
     reported instead, by the settings endpoint."""
@@ -207,7 +207,7 @@ def test_an_unset_vision_task_is_not_an_invalid_config():
         tasks={"default": ["ollama"]},
     )
     cfg.validate()   # must not raise
-    assert cfg.chain_for("datasheet_vision") == ["ollama"]
+    assert cfg.chain_for("vision") == ["ollama"]
 
 
 def test_an_explicit_blind_vision_route_warns_like_an_inherited_one():
@@ -219,7 +219,7 @@ def test_an_explicit_blind_vision_route_warns_like_an_inherited_one():
 
     cfg = AppConfig(
         endpoints={"ollama": Endpoint(name="ollama", kind="ollama", vision=False)},
-        tasks={"default": ["ollama"], "datasheet_vision": ["ollama"]},
+        tasks={"default": ["ollama"], "vision": ["ollama"]},
     )
     cfg.validate()  # must not raise
     assert any("none of ollama" in w for w in cfg.warnings())

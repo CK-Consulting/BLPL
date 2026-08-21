@@ -335,12 +335,6 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
             ctx.note(f"{mpn}: reusing the extraction already in your component library")
             return json.dumps({"source": "component-library", "mpn": mpn, **prior}, indent=2)
 
-    chain = ctx.endpoints_for("datasheet_vision")
-    if not chain:
-        raise ToolDenied(
-            "no vision-capable endpoint is routed to datasheet_vision — set one in Settings. "
-            "Extraction reads PDF pages as images; a text-only model would read nothing."
-        )
     from blpl.agent.tools import datasheet_files
 
     # A vendor almost never names a PDF after the orderable part number, so
@@ -367,6 +361,30 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
             pass
     if found.how != "exact":
         ctx.note(f"{mpn}: reading {pdf.name} (matched by {found.how})")
+
+    # Which kind of model this needs is a property of the document, not of the
+    # task. A datasheet with a text layer — which is nearly all of them — is
+    # read by any competent text model; only a scan needs one that can see.
+    #
+    # Deciding it here rather than demanding vision up front is what makes the
+    # ordinary case work at all. Requiring a vision endpoint for every
+    # extraction meant a perfectly readable PDF failed because no vision route
+    # was configured, and when one was, it was a small VL model that could not
+    # hold the output schema: 0 of 7 pinouts, malformed JSON every time.
+    from blpl.agent.tools.datasheets import has_text_layer
+
+    readable = await _to_thread(has_text_layer, pdf)
+    chain = ctx.endpoints_for("chat" if readable else "vision")
+    if not chain and readable:
+        chain = ctx.endpoints_for("default")
+    if not chain:
+        raise ToolDenied(
+            f"{pdf.name} has no text layer, so it has to be read as images, and no "
+            "vision-capable endpoint is routed to the 'vision' task. Set one in Settings."
+            if not readable
+            else "no endpoint is routed to chat or default — set one in Settings."
+        )
+
     cache = ctx.project_dir / "datasheets" / "extracted"
     ctx.sandbox.check_write(cache)
     # The whole chain, not its head. A model that cannot hold the output schema

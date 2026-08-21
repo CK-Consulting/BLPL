@@ -747,8 +747,8 @@ def get_settings(
         #
         # Returning only the effective map meant the client echoed inherited
         # values back as explicit routes on the next save. That turned a
-        # perfectly legal "datasheet_vision is unset" into an illegal
-        # "datasheet_vision routes to a blind endpoint", which validation then
+        # perfectly legal "vision is unset" into an illegal
+        # "vision routes to a blind endpoint", which validation then
         # refused — including refusing the very edit that would have fixed it.
         # A GET whose result cannot be PUT back unchanged is the bug.
         "tasks": {t: list(chain) for t, chain in cfg.tasks.items() if chain},
@@ -756,7 +756,7 @@ def get_settings(
         # What each endpoint's chosen model can actually do. Surfaced here, not
         # only in the endpoint editor, because task routing is where the
         # difference bites: review_panel wants several genuinely different
-        # models, chat is better with one that reasons, and datasheet_vision
+        # models, chat is better with one that reasons, and vision
         # simply cannot be served by a model that does not see. None of that is
         # guessable from an endpoint's name.
         "endpoint_capabilities": _endpoint_capabilities(cfg),
@@ -898,7 +898,7 @@ def probe_models(
         "models": names,
         # Which of them can actually read an image. Asked rather than assumed:
         # `vision = true` on an endpoint whose model is blind produces a
-        # datasheet_vision route that validates fine and then fails at request
+        # vision route that validates fine and then fails at request
         # time, which is the least useful place to discover it.
         "capabilities": _model_capabilities(kind, url, names, headers),
     }
