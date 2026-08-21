@@ -126,3 +126,76 @@ def test_bookkeeping_is_still_committed_even_though_it_is_not_flagged(tmp_path: 
     projects.commit_all("dev04", "both")
     tracked = _git(d, "ls-files").split()
     assert ".blpl/conversations/a.jsonl" in tracked
+
+
+# -- the baseline ignore rules -----------------------------------------------
+
+
+def test_a_new_project_ignores_its_own_output(tmp_path: Path) -> None:
+    projects = Projects(tmp_path / "root")
+    d = projects.init_local("dev04")
+    (d / ".pipeline").mkdir()
+    (d / ".pipeline" / "bom.json").write_text("{}", encoding="utf-8")
+    (d / "overview.md").write_text("# Board\n", encoding="utf-8")
+    projects.commit_all("dev04", "work")
+    tracked = _git(d, "ls-files").split()
+    assert "overview.md" in tracked
+    assert not any(t.startswith(".pipeline/") for t in tracked)
+
+
+def test_quarantined_downloads_stay_out_of_history_but_the_ledger_does_not(
+    tmp_path: Path,
+) -> None:
+    """An uncleared download is the one thing that should never reach permanent
+    history. What it was and where it came from should."""
+    projects = Projects(tmp_path / "root")
+    d = projects.init_local("dev04")
+    (d / "retrieved").mkdir()
+    (d / "retrieved" / "abc-part.pdf").write_bytes(b"%PDF-1.4")
+    (d / "retrieved" / "quarantine.json").write_text("[]", encoding="utf-8")
+    projects.commit_all("dev04", "fetch")
+    tracked = _git(d, "ls-files").split()
+    assert "retrieved/quarantine.json" in tracked
+    assert "retrieved/abc-part.pdf" not in tracked
+
+
+def test_an_existing_project_is_cleaned_up_and_says_what_it_untracked(
+    tmp_path: Path,
+) -> None:
+    """Adding the file changes nothing on its own — git keeps tracking what it
+    already tracks — so the untracking is the part that does the work."""
+    projects = Projects(tmp_path / "root")
+    d = projects.init_local("dev04")
+    (d / ".gitignore").unlink()
+    (d / ".pipeline").mkdir()
+    (d / ".pipeline" / "bom.json").write_text("{}", encoding="utf-8")
+    projects.commit_all("dev04", "before")
+    assert ".pipeline/bom.json" in _git(d, "ls-files").split()
+
+    untracked = projects.apply_baseline_gitignore("dev04")
+    assert untracked == [".pipeline/bom.json"]
+    assert ".pipeline/bom.json" not in _git(d, "ls-files").split()
+    # Untracked, never deleted: the next run expects to find its own artifacts.
+    assert (d / ".pipeline" / "bom.json").is_file()
+    # And still in the history it was already part of. This stops the repository
+    # growing; it does not rewrite what is there.
+    assert ".pipeline/bom.json" in _git(d, "show", "--name-only", "--format=", "HEAD~1")
+
+
+def test_applying_the_baseline_twice_changes_nothing_the_second_time(tmp_path: Path) -> None:
+    projects = Projects(tmp_path / "root")
+    projects.init_local("dev04")
+    d = projects.project_dir("dev04")
+    before = _git(d, "rev-parse", "HEAD")
+    assert projects.apply_baseline_gitignore("dev04") == []
+    assert _git(d, "rev-parse", "HEAD") == before
+
+
+def test_a_project_with_its_own_rules_keeps_them(tmp_path: Path) -> None:
+    projects = Projects(tmp_path / "root")
+    d = projects.init_local("dev04")
+    (d / ".gitignore").write_text("# mine\nscratch/\n", encoding="utf-8")
+    projects.commit_all("dev04", "my rules")
+    projects.apply_baseline_gitignore("dev04")
+    rules = (d / ".gitignore").read_text(encoding="utf-8")
+    assert "scratch/" in rules and ".pipeline/" in rules

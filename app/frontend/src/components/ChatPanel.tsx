@@ -4,6 +4,7 @@ import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
 import { SlashCommand, SlashPopover, useSlashCommands } from "./SlashCommands";
 import { useVerticalResizable } from "../useResizable";
+import { Menu, tail } from "./Menu";
 import {
   ACCEPTED,
   Attachment,
@@ -748,6 +749,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     return out;
   }, [messages]);
 
+  const here = conversations.find((c) => c.filename === filename);
   const turns = useMemo(() => toTurns(messages), [messages]);
 
   // Flattened back out with no wrapper element: `.chat-scroll` is the flex
@@ -833,31 +835,19 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   return (
     <div className="chat">
       <div className="chat-head">
-        {/* Every conversation in this project, not just the newest. "New" has
-            always worked; getting back to what it replaced did not — the list
-            was fetched and then never shown, so past design conversations were
-            reachable only by reading the JSONL on disk. */}
+        {/* Two controls stay in the bar, because they are the two you change
+            mid-session: who answers, and what answered. Everything else — which
+            conversation, which way it reads, archiving, starting a new one — is
+            set once and then lives in the menu at the end. */}
         <select
-          className="chat-picker"
-          value={filename ?? ""}
-          disabled={streaming || conversations.length === 0}
-          title="Switch conversation"
-          onChange={(e) => void openConversation(e.target.value)}
-        >
-          {conversations.map((c) => (
-            <option key={c.filename} value={c.filename}>
-              {c.archived ? "📦 " : ""}
-              {c.slug} · {c.message_count} msg
-            </option>
-          ))}
-        </select>
-        {/* Beside the conversation picker, because they answer the same kind
-            of question: which thread, and who is answering in it. */}
-        <select
-          className="chat-picker"
+          className="chat-picker model-picker"
           value={chosenEndpoint}
           disabled={endpoints.length === 0}
-          title="Which model answers — for this turn, not saved"
+          title={
+            chosenEndpoint
+              ? `Answering with ${chosenEndpoint}`
+              : "Which model answers — for this turn, not saved"
+          }
           onChange={(e) => setChosenEndpoint(e.target.value)}
         >
           <option value="">
@@ -873,53 +863,85 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             </option>
           ))}
         </select>
-        {model && <span className="muted small">{model}</span>}
-        <span className="spacer" />
-        {/* The order is shown as a value rather than hidden behind an icon that
-            has to be tried: which way this reads is the whole question. */}
-        <select
-          className="chat-picker"
-          value={order}
-          title="Which end new messages arrive at"
-          onChange={(e) => {
-            const next = e.target.value as Order;
-            setOrder(next);
-            localStorage.setItem(ORDER_KEY, next);
-          }}
-        >
-          <option value="oldest">Newest last ↓</option>
-          <option value="newest">Newest first ↑</option>
-        </select>
-        <label className="muted small" title="Include archived conversations in the list">
-          <input
-            type="checkbox"
-            checked={showArchived}
-            onChange={async (e) => {
-              setShowArchived(e.target.checked);
-              const list = await getJSON<ConversationMeta[]>(
-                `/api/projects/${projectId}/conversations${e.target.checked ? "?include_archived=true" : ""}`,
-              ).catch(() => []);
-              setConversations(list);
-            }}
-          />{" "}
-          archived
-        </label>
-        {filename && (
-          <button
-            className="link"
-            disabled={streaming}
-            title="Take this conversation off the list — it is kept, not deleted"
-            onClick={() => {
-              const here = conversations.find((c) => c.filename === filename);
-              void archive(filename, !(here?.archived ?? false));
-            }}
-          >
-            {conversations.find((c) => c.filename === filename)?.archived ? "Unarchive" : "Archive"}
-          </button>
+        {/* The model that actually answered, which is not always the one asked:
+            the chain falls through. Fixed width and tail-truncated — the end of
+            a model id is the part that identifies it. */}
+        {model && (
+          <span className="muted small model-now mono" title={model}>
+            {tail(model, 22)}
+          </span>
         )}
-        <button className="link" onClick={newConversation} disabled={streaming}>
-          New
-        </button>
+        <span className="spacer" />
+        <Menu
+          align="right"
+          title="Conversations, order, archiving"
+          label={
+            <>
+              <span className="menu-kicker">Session</span>
+              <span className="menu-value">{tail(here?.slug ?? "none", 16)}</span>
+            </>
+          }
+        >
+          <label className="menu-field">
+            <span>Conversation</span>
+            <select
+              value={filename ?? ""}
+              disabled={streaming || conversations.length === 0}
+              onChange={(e) => void openConversation(e.target.value)}
+            >
+              {conversations.map((c) => (
+                <option key={c.filename} value={c.filename}>
+                  {c.archived ? "📦 " : ""}
+                  {c.slug} · {c.message_count} msg
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="menu-check">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={async (e) => {
+                setShowArchived(e.target.checked);
+                const list = await getJSON<ConversationMeta[]>(
+                  `/api/projects/${projectId}/conversations${e.target.checked ? "?include_archived=true" : ""}`,
+                ).catch(() => []);
+                setConversations(list);
+              }}
+            />{" "}
+            {/* "archived" on its own read as a state this session was in,
+                rather than a filter on the list above it. */}
+            <span>Show archived sessions</span>
+          </label>
+          <label className="menu-field">
+            <span>Message order</span>
+            <select
+              value={order}
+              onChange={(e) => {
+                const next = e.target.value as Order;
+                setOrder(next);
+                localStorage.setItem(ORDER_KEY, next);
+              }}
+            >
+              <option value="oldest">Newest last ↓</option>
+              <option value="newest">Newest first ↑</option>
+            </select>
+          </label>
+          <div className="menu-sep" />
+          {filename && (
+            <button
+              className="menu-item"
+              disabled={streaming}
+              title="Take this conversation off the list — it is kept, not deleted"
+              onClick={() => void archive(filename, !(here?.archived ?? false))}
+            >
+              {here?.archived ? "Unarchive this session" : "Archive this session"}
+            </button>
+          )}
+          <button className="menu-item" onClick={newConversation} disabled={streaming}>
+            New session
+          </button>
+        </Menu>
       </div>
 
       <div

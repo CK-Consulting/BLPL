@@ -293,6 +293,34 @@ body.resizing-y * { pointer-events: none; }
    which was merely odd at three lines and absurd at twelve. */
 .chat-composer > button { align-self: flex-end; }
 
+/* The chat header keeps two controls and a menu. Both stay a fixed width so the
+   bar does not reflow when a long model id is picked — the row used to shrink
+   the conversation picker to nothing the moment an endpoint with a long name
+   was selected. */
+.chat-head .model-picker { flex: 0 0 13rem; max-width: 13rem; }
+.model-now { flex: none; max-width: 12rem; overflow: hidden; white-space: nowrap; }
+
+.menu { position: relative; flex: none; }
+.menu-trigger { display: inline-flex; align-items: baseline; gap: .4rem; max-width: 15rem; }
+.menu-kicker { color: #b9c3d0; font-size: 12px; }
+.menu-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow: hidden; white-space: nowrap; }
+.menu-caret { font-size: 10px; color: #b9c3d0; }
+.menu-trigger:focus-visible, .menu-item:focus-visible { outline: 3px solid #80a8ff; outline-offset: 1px; }
+/* Above the transcript and the composer's popovers, or the panel opens behind
+   the thing it was called from. */
+.menu-panel { position: absolute; top: calc(100% + .35rem); z-index: 20; min-width: 17rem; display: flex; flex-direction: column; gap: .55rem; padding: .7rem; background: #1c2029; border: 1px solid #6b6f75; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.55); }
+.menu-panel.right { right: 0; }
+.menu-panel.left { left: 0; }
+/* 13.06:1 and 9.15:1 on the panel. Field labels are the text that says what a
+   control does, so they are sized and contrasted as text, not as decoration. */
+.menu-field { display: flex; flex-direction: column; gap: .25rem; font-size: 13px; color: #b9c3d0; }
+.menu-field select { width: 100%; }
+.menu-check { display: flex; align-items: center; gap: .1rem; font-size: 13px; color: #e6e6e6; }
+.menu-check input { width: 16px; height: 16px; accent-color: #4f7fd0; }
+.menu-sep { height: 1px; background: #6b6f75; margin: .15rem 0; }
+.menu-item { text-align: left; width: 100%; background: transparent; border: 1px solid transparent; padding: .35rem .4rem; border-radius: 6px; font-size: 13px; color: #e6e6e6; }
+.menu-item:hover:not(:disabled) { background: #2a303c; border-color: #6b6f75; }
+
 /* Anchored over the transcript at whichever end new material arrives at, so
    the arrow on it and the direction it takes you always agree. `.chat` is the
    positioning context; the button is outside `.chat-scroll` so it does not
