@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -220,9 +221,11 @@ async def _one_task(
     adapter = build_chat_adapter(endpoint)
     instruction = (
         f"{prompt}\n\n"
-        "Return ONLY the JSON object. No prose before or after it, no markdown "
-        "fence. It must validate against the schema named above; that schema is "
-        "reproduced here so you do not need to open it:\n\n"
+        "Return ONLY the JSON value the schema below describes — an array if it "
+        "says array, an object if it says object. No prose before or after it, "
+        "no markdown fence, and nothing following it. It must validate against "
+        "that schema, which is reproduced here so you do not need to open it:"
+        "\n\n"
         f"{json.dumps(schema, indent=2)[:20000]}"
     )
     if page_text:
@@ -252,14 +255,74 @@ async def _one_task(
     raw = "\n".join(t for t in text_parts if t).strip()
     if not raw:
         return None, "model returned no text", usage_in, usage_out
-    # Models sometimes fence JSON despite instructions; take the outermost object.
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end <= start:
-        return None, f"no JSON object in output: {raw[:200]}", usage_in, usage_out
-    try:
-        return json.loads(raw[start : end + 1]), "", usage_in, usage_out
-    except json.JSONDecodeError as exc:
-        return None, f"malformed JSON: {exc}", usage_in, usage_out
+    payload, err = first_json_value(raw)
+    if err:
+        return None, err, usage_in, usage_out
+    return payload, "", usage_in, usage_out
+
+
+def first_json_value(raw: str) -> tuple[Any | None, str]:
+    """The first complete JSON value in a model's reply.
+
+    Scanned with a depth counter that understands strings and escapes, rather
+    than sliced between the first ``{`` and the last ``}``. That slice was the
+    single largest source of extraction failures, and it failed in a way that
+    looked exactly like a model problem:
+
+        100058045.pinout   malformed JSON: Extra data: line 20 column 4 (char 450)
+        MAYA-W463.pinout   malformed JSON: Extra data: line 20 column 4 (char 450)
+        MM8108.pinout      malformed JSON: Extra data: line 20 column 4 (char 450)
+        NORA-B206.pinout   malformed JSON: Extra data: line 15 column 4 (char 420)
+
+    Near-identical offsets across four unrelated documents, which reads as a
+    model that breaks down at a fixed point. It is not. **The pinout schema is a
+    top-level array.** A correct reply starts ``[`` — so ``find("{")`` landed on
+    the first pin *inside* it, ``rfind("}")`` on the last, and json.loads parsed
+    one pin object and then found the rest of the array sitting after it. The
+    offsets matched because the first pin object is about the same size in every
+    datasheet.
+
+    Every pinout task in the corpus failed this way, on every model, including
+    ones that had produced perfectly good output. The harness was breaking it.
+    """
+    text = raw.strip()
+    # Fenced blocks, with or without a language tag.
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fence:
+        text = fence.group(1).strip()
+    start = min(
+        (i for i in (text.find("{"), text.find("[")) if i >= 0),
+        default=-1,
+    )
+    if start < 0:
+        return None, f"no JSON in output: {text[:200]}"
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1]), ""
+                except json.JSONDecodeError as exc:
+                    return None, f"malformed JSON: {exc}"
+    return None, f"unterminated JSON in output (truncated at {len(text)} chars)"
 
 
 def _validate(data: dict, schema_path: Path) -> str:

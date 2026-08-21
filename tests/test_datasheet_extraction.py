@@ -274,3 +274,60 @@ def test_a_run_that_extracted_nothing_is_not_ok(tmp_path, happy, monkeypatch) ->
     assert not run.ok
     # And the scout's reason is carried out, not left in a cache file nobody opens.
     assert "target MPN not found in PDF" in run.error
+
+
+# -- reading the model's reply ------------------------------------------------
+
+
+def test_a_top_level_array_is_not_mistaken_for_its_first_element() -> None:
+    """The single largest source of extraction failures, and it looked exactly
+    like a model problem:
+
+        100058045.pinout   malformed JSON: Extra data: line 20 column 4 (char 450)
+        MAYA-W463.pinout   malformed JSON: Extra data: line 20 column 4 (char 450)
+        MM8108.pinout      malformed JSON: Extra data: line 20 column 4 (char 450)
+
+    Near-identical offsets across unrelated documents. The pinout schema is a
+    top-level array: slicing between the first '{' and the last '}' took the
+    first pin *object* and left the rest of the array after it. The offsets
+    matched because the first pin is about the same size in every datasheet.
+    """
+    reply = '[{"numbers": ["1"], "name": "GND"}, {"numbers": ["2"], "name": "P0.20"}]'
+    value, err = datasheets.first_json_value(reply)
+    assert not err
+    assert isinstance(value, list) and len(value) == 2
+
+
+def test_prose_after_the_json_is_ignored() -> None:
+    value, err = datasheets.first_json_value('{"a": 1}\n\nI hope that helps!')
+    assert not err and value == {"a": 1}
+
+
+def test_a_fenced_block_is_unwrapped() -> None:
+    value, err = datasheets.first_json_value('```json\n{"a": 1}\n```')
+    assert not err and value == {"a": 1}
+
+
+def test_a_brace_inside_a_string_does_not_close_the_value() -> None:
+    """The reason this is a scanner and not a bracket count."""
+    value, err = datasheets.first_json_value('{"note": "a } inside", "b": 2}')
+    assert not err and value == {"note": "a } inside", "b": 2}
+
+
+def test_an_escaped_quote_does_not_end_the_string() -> None:
+    value, err = datasheets.first_json_value(r'{"note": "he said \"hi\"", "b": 2}')
+    assert not err and value["b"] == 2
+
+
+def test_output_cut_off_mid_value_says_so() -> None:
+    """Distinct from malformed: the fix is a bigger max_tokens, not a different
+    model, and the message has to say which."""
+    value, err = datasheets.first_json_value('[{"numbers": ["1"], "name": "GN')
+    assert value is None and "unterminated" in err
+
+
+def test_reasoning_prose_before_the_json_is_skipped() -> None:
+    value, err = datasheets.first_json_value(
+        'Let me work through the table.\nThe first pin is GND.\n[{"name": "GND"}]'
+    )
+    assert not err and value == [{"name": "GND"}]
