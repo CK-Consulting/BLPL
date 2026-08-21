@@ -3,6 +3,7 @@ import { ApiError, ChatMessage, ConversationMeta, Proposal, getJSON, postJSON, r
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
 import { SlashCommand, SlashPopover, useSlashCommands } from "./SlashCommands";
+import { useVerticalResizable } from "../useResizable";
 import {
   ACCEPTED,
   Attachment,
@@ -584,6 +585,10 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
 
   const fileInput = useRef<HTMLInputElement | null>(null);
   const textarea = useRef<HTMLTextAreaElement | null>(null);
+  // Eight lines to start. A design message is a paragraph and a part number,
+  // not a chat line, and the height is remembered so this is a decision made
+  // once rather than a drag repeated every session.
+  const box = useVerticalResizable("blpl.composerHeight", 188, 96);
   const slash = useSlashCommands(input);
 
   /** Replace the typed `/cmd` with its text and put the caret where it belongs. */
@@ -851,6 +856,25 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           void attach(files);
         }}
       >
+        {/* A seam across the top of the composer, not the browser's corner grip.
+            The UA grip is drawn in a grey that is very nearly invisible on a
+            dark box and cannot be reached by keyboard at all, so the box read
+            as fixed at three lines. This one is a separator: drag it, or focus
+            it and use the arrows. */}
+        <div
+          className="composer-grip"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize the message box"
+          aria-valuenow={box.height}
+          aria-valuemin={box.min}
+          aria-valuemax={box.max}
+          tabIndex={0}
+          title="Drag or use ↑ ↓ to resize · double-click to reset"
+          onMouseDown={box.onMouseDown}
+          onKeyDown={box.onKeyDown}
+          onDoubleClick={box.reset}
+        />
         {(attached.length > 0 || uploading > 0) && (
           <div className="chat-attachments">
             {attached.map((a) => (
@@ -909,6 +933,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         )}
         <textarea
           ref={textarea}
+          style={{ height: box.height }}
           value={input}
           placeholder={
             streaming
