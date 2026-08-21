@@ -767,3 +767,73 @@ def test_a_datasheet_path_cannot_escape_the_project(tmp_path) -> None:
     (tmp_path / "secret.pdf").write_bytes(b"%PDF-1.4\n")
     assert not df.resolve(tmp_path, "X", file="../secret.pdf").ok
     assert not df.resolve(tmp_path, "X", file="/etc/passwd").ok
+
+
+def test_one_datasheet_serves_a_whole_family(tmp_path) -> None:
+    """The normal case, not an edge one. Manufacturers publish one document per
+    product line and the orderable MPN is a row in its ordering table, so
+    expecting `<MPN>.pdf` per part is a shape the world does not have."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    sheets.mkdir()
+    (sheets / "nRF54L15_nRF54L10_nRF54L05_Datasheet_v1.0.pdf").write_bytes(b"%PDF-1.4\n")
+
+    for part in ("NRF54L15-QFAA-R", "NRF54L10-QFAA-R", "NRF54L05-QFAA-R"):
+        got = df.resolve(tmp_path, part)
+        assert got.ok and got.how == "family", part
+
+
+def test_the_datasheet_beats_the_errata_beside_it(tmp_path) -> None:
+    """A vendor ships several documents per family — datasheet, errata, design
+    guidelines, AT-command manual — all named for the same line. Treating them
+    as equally likely made the obvious case refuse to resolve."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    sheets.mkdir()
+    for f in (
+        "nRF9151_Rev_2_Errata_v1.0.pdf",
+        "nRF9151_datasheet_rev_v1.1.pdf",
+        "nRF9151_hardware-design-guidelines.pdf",
+    ):
+        (sheets / f).write_bytes(b"%PDF-1.4\n")
+
+    got = df.resolve(tmp_path, "NRF9151-LACA-R")
+    assert got.ok
+    assert got.path.name == "nRF9151_datasheet_rev_v1.1.pdf"
+    # The others are still reported, since which documents exist is worth knowing.
+    assert len(got.candidates) == 2
+
+
+def test_two_revisions_of_the_same_document_still_refuse(tmp_path) -> None:
+    """Ranking resolves 'which kind of document'; it must not paper over 'which
+    revision', where guessing puts a stale pinout into a BOM."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    sheets.mkdir()
+    for f in ("nRF9151_datasheet_rev_v1.0.pdf", "nRF9151_datasheet_rev_v1.1.pdf"):
+        (sheets / f).write_bytes(b"%PDF-1.4\n")
+
+    got = df.resolve(tmp_path, "NRF9151-LACA-R")
+    assert not got.ok and len(got.candidates) == 2
+
+
+def test_the_searched_prefix_walks_down_to_the_family(tmp_path) -> None:
+    """The full orderable MPN is often nowhere in its own datasheet — package
+    and reel suffixes live in an ordering table text extraction does not
+    recover. Measured, not assumed: NRF9151-LACA-R appears in none of Nordic's
+    six documents, while the stem appears in all of them."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    sheets.mkdir()
+    # A PDF with uncompressed, readable text.
+    pdf = sheets / "family.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nBT (STM32U5G9NJ family reference) Tj ET\n%%EOF\n")
+
+    assert df.mentions(pdf, "STM32U5G9NJH6Q")      # matched on a shorter prefix
+    assert not df.mentions(pdf, "NRF9151-LACA-R")
+    # Too short to mean anything is not a match.
+    assert not df.mentions(pdf, "ST")
