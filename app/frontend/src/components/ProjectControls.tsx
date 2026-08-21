@@ -51,10 +51,28 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
       <span className="git-branch" title="current branch">
         ⎇ {st.branch}
       </span>
-      {st.dirty && <span className="badge warn">uncommitted</span>}
+      {/* Design files only. This counted the conversation log and the usage
+          ledger, which are appended to on every turn, so it was lit permanently
+          and said nothing — while looking exactly like a warning that unsaved
+          work was at risk. */}
+      {st.dirty && (
+        <span
+          className="badge warn"
+          title="Design files changed since the last commit. Accepted chat edits and saves from the editor commit themselves; this is everything else — a pipeline run's outputs, a datasheet you dropped in."
+        >
+          uncommitted
+        </span>
+      )}
       {st.ahead > 0 && <span className="badge">↑{st.ahead}</span>}
       {st.behind > 0 && <span className="badge">↓{st.behind}</span>}
-      {!st.has_remote && <span className="muted">local only</span>}
+      {!st.has_remote && (
+        <span
+          className="muted"
+          title="No git remote is configured, so history lives on this server only. Every version is kept and readable; nothing is pushed anywhere."
+        >
+          local only
+        </span>
+      )}
       <span className="spacer" />
       {st.has_remote && (
         <button className="link" disabled={busy} onClick={() => act(() => postJSON(`/api/projects/${projectId}/git/pull`, {}), "pull")}>

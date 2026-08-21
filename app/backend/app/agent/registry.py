@@ -29,6 +29,8 @@ called at the wrong moments, and this set has expensive members.
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 from pathlib import Path
 
 from blpl.agent.tools.bom import HOUSES as HOUSES_FOR_SCHEMA
@@ -352,6 +354,109 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
     # fails every task the same way, so the endpoints behind it are the fix.
     run = await extract_datasheet(mpn, pdf, cache, chain, on_progress=ctx.note)
     return json.dumps(run.to_dict(), indent=2)
+
+
+# ---------------------------------------------------------------------------
+# History
+#
+# The project is a git repository and every accepted proposal is a commit, so
+# the record of what a file used to say already exists. Nothing could read it.
+#
+# That gap is what turns an ordinary context limit into lost work. A pinmap
+# agreed forty turns ago falls out of the window — summarisation drops tables
+# first — and with no way to consult the history, the only remaining copy of it
+# is the one in the conversation nobody can search. The bytes were never gone;
+# the door was missing.
+# ---------------------------------------------------------------------------
+
+# Refs come from a model, so they are constrained rather than trusted. This
+# admits hashes, HEAD, HEAD~3, branch names and tags, and refuses anything
+# beginning with '-' — a ref that is really a git option is the injection to
+# care about here. Paths are always passed after '--' for the same reason.
+_REF = re.compile(r"^(?!-)[A-Za-z0-9_./~^@{}-]{1,64}$")
+
+
+def _git(project_dir: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        raise ToolDenied(f"git {args[0]}: {(proc.stderr or proc.stdout).strip()[:400]}")
+    return proc.stdout
+
+
+def _ref(value: str) -> str:
+    ref = (value or "").strip()
+    if not _REF.match(ref):
+        raise ToolDenied(f"{value!r} is not a usable commit reference")
+    return ref
+
+
+async def _file_history(ctx: ToolContext, args: dict) -> str:
+    raw = str(args.get("path", "")).strip()
+    limit = max(1, min(int(args.get("limit") or 20), 100))
+    argv = ["log", f"-{limit}", "--date=iso-strict", "--format=%h\t%ad\t%an\t%s"]
+    if raw:
+        # Resolved through the same rule as a read, so history cannot be asked
+        # for a path a read would refuse.
+        target = _readable_file(ctx, raw)
+        ctx.sandbox.check_read(target)
+        argv += ["--", str(target.relative_to(ctx.project_dir.resolve()))]
+    out = await _to_thread(_git, ctx.project_dir, *argv)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4:
+            rows.append({"commit": parts[0], "when": parts[1], "who": parts[2], "what": parts[3]})
+    if not rows:
+        return json.dumps(
+            {
+                "commits": [],
+                "note": (
+                    f"no commits touch {raw!r}"
+                    if raw
+                    else "this project has no history yet"
+                ),
+            },
+            indent=2,
+        )
+    return json.dumps({"commits": rows}, indent=2)
+
+
+async def _read_file_version(ctx: ToolContext, args: dict) -> str:
+    target = _readable_file(ctx, str(args.get("path", "")))
+    ctx.sandbox.check_read(target)
+    ref = _ref(str(args.get("commit", "")))
+    rel = str(target.relative_to(ctx.project_dir.resolve()))
+    text = await _to_thread(_git, ctx.project_dir, "show", f"{ref}:{rel}")
+    if len(text) > _READ_LIMIT:
+        raise ToolDenied(
+            f"{rel} at {ref} is {len(text) // 1024} KB, over the "
+            f"{_READ_LIMIT // 1024} KB read limit"
+        )
+    return text
+
+
+async def _diff_file(ctx: ToolContext, args: dict) -> str:
+    since = _ref(str(args.get("since", "")))
+    until = _ref(str(args.get("until") or "HEAD")) if args.get("until") else None
+    argv = ["diff", "--unified=3", since] + ([until] if until else [])
+    raw = str(args.get("path", "")).strip()
+    if raw:
+        target = _readable_file(ctx, raw)
+        ctx.sandbox.check_read(target)
+        argv += ["--", str(target.relative_to(ctx.project_dir.resolve()))]
+    out = await _to_thread(_git, ctx.project_dir, *argv)
+    if not out.strip():
+        return f"no changes to {raw or 'the project'} between {since} and {until or 'the working tree'}"
+    if len(out) > _READ_LIMIT:
+        out = out[:_READ_LIMIT] + f"\n... diff truncated at {_READ_LIMIT // 1024} KB"
+    return out
 
 
 async def _read_extraction(ctx: ToolContext, args: dict) -> str:
@@ -868,6 +973,64 @@ def project_tools() -> list[ToolSpec]:
             handler=_propose_edit,
             path_args=("path",),
             write_args=("path",),
+        ),
+        ToolSpec(
+            name="file_history",
+            description=(
+                "When a file changed and why. Every accepted edit is a commit, so this is the "
+                "record of how the design got to where it is. Reach for it when the user refers "
+                "to something from earlier — 'the pinmap that worked', 'before we changed the "
+                "rail' — instead of saying you no longer have it: the conversation may have been "
+                "summarised, the history has not. Omit path for the whole project."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional file, relative to the project root."},
+                    "limit": {"type": "integer", "description": "How many commits, newest first (default 20)."},
+                },
+            },
+            kind="file_read",
+            handler=_file_history,
+        ),
+        ToolSpec(
+            name="read_file_version",
+            description=(
+                "Read a file exactly as it stood at a past commit. Use file_history first to "
+                "find the commit. This is how a value that was agreed and later overwritten is "
+                "recovered — quote it rather than reconstructing it from memory."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File, relative to the project root."},
+                    "commit": {"type": "string", "description": "A commit hash from file_history, or HEAD~2."},
+                },
+                "required": ["path", "commit"],
+            },
+            kind="file_read",
+            handler=_read_file_version,
+        ),
+        ToolSpec(
+            name="diff_file",
+            description=(
+                "What changed in a file since a past commit, as a unified diff. Cheaper than "
+                "reading both versions when the question is what moved rather than what it says."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional file; omit for the whole project."},
+                    "since": {"type": "string", "description": "The commit to compare against."},
+                    "until": {
+                        "type": "string",
+                        "description": "Optional second commit. Omit to compare against the files as they are now.",
+                    },
+                },
+                "required": ["since"],
+            },
+            kind="file_read",
+            handler=_diff_file,
         ),
     ]
 

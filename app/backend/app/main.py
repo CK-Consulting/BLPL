@@ -2302,7 +2302,25 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     activity.record(
         session, _project_or_404(session, user, project_id), user, activity.EDITED, name
     )
-    return {"ok": True, "name": name, "bytes": target.stat().st_size}
+    # Committed, the way an accepted proposal is. This was the one edit path
+    # that wrote over the previous version and kept no record of it: an edit
+    # made in the workbench survived only until the next one, and was then only
+    # recoverable if some later chat commit happened to sweep it up — filed
+    # under someone else's rationale, which is worse than not filed at all.
+    #
+    # Failure to commit is reported, never fatal. The bytes are already on disk
+    # and refusing the save that landed would be a lie about what happened.
+    committed = False
+    try:
+        committed = projects.commit_all(project_id, f"edit: {name}") is not None
+    except ProjectError:
+        committed = False
+    return {
+        "ok": True,
+        "name": name,
+        "bytes": target.stat().st_size,
+        "committed": committed,
+    }
 
 
 @app.get("/api/projects/{project_id}/artifacts/{name}")
