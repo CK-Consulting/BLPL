@@ -2633,6 +2633,60 @@ def archive_conversation(
     return {"ok": True, "filename": filename, "archived": body.archived}
 
 
+@app.delete("/api/projects/{project_id}/conversations/{filename}/messages/{index}")
+def delete_failed_message(
+    project_id: str, filename: str, index: int,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Remove a question nothing ever answered, and the error that answered it.
+
+    The one delete there is, and narrow on purpose. A transcript records what
+    was proposed and why a part was chosen, so removing an *answered* exchange
+    would take out evidence — and would break the history structurally, since a
+    tool call and its result have to travel together.
+
+    What this removes never had either. It is a question that reached no model
+    and produced nothing, and four copies of one accumulate in the time it
+    takes to work out that retrying is not the answer.
+
+    They are already excluded from what gets sent. This is for the transcript,
+    which is otherwise left showing the same paragraph four times with an error
+    under each.
+    """
+    d = _conversations_dir(session, user, project_id)
+    if chat_sessions.active_for(filename):
+        raise HTTPException(
+            status_code=409,
+            detail="that conversation has a turn running — stop it first",
+        )
+    try:
+        conv = Conversation.open_existing(d, filename)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    events = conv.read_all()
+    if index not in chat_mod.unanswered_messages(events):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "only a message that produced no answer at all can be removed — "
+                "this one was answered, and the reply refers to it"
+            ),
+        )
+    # The errors that followed it go too: they are about this message and mean
+    # nothing without it.
+    doomed = {index}
+    for j in range(index + 1, len(events)):
+        role = events[j].get("role")
+        if role == "error":
+            doomed.add(j)
+        elif role == "user":
+            break
+    removed = conv.drop(doomed)
+    return {"ok": True, "removed": removed}
+
+
 @app.post("/api/projects/{project_id}/conversations")
 def create_conversation(
     project_id: str, payload: NewConversationInput, user: User = Depends(require_onboarded),

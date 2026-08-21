@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ApiError, ChatMessage, ConversationMeta, Proposal, getJSON, postJSON, readSSE } from "../api";
+import { ApiError, ChatMessage, ConversationMeta, Proposal, del, getJSON, postJSON, readSSE } from "../api";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
 import { SlashCommand, SlashPopover, useSlashCommands } from "./SlashCommands";
@@ -822,6 +822,40 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   }, [messages]);
 
   const here = conversations.find((c) => c.filename === filename);
+
+  // Questions that produced nothing at all. Mirrors the server's rule — the
+  // backend re-checks before removing anything, so this is only about which
+  // messages offer the control.
+  const unanswered = useMemo(() => {
+    const out = new Set<number>();
+    messages.forEach((m, i) => {
+      if (m.role !== "user") return;
+      let produced = false;
+      let failed = false;
+      for (let j = i + 1; j < messages.length; j++) {
+        const r = messages[j].role;
+        if (r === "user") break;
+        if (r === "assistant" || r === "tool_results") {
+          produced = true;
+          break;
+        }
+        if (r === "error") failed = true;
+      }
+      if (failed && !produced) out.add(i);
+    });
+    return out;
+  }, [messages]);
+
+  const removeMessage = async (index: number) => {
+    if (!filename) return;
+    try {
+      await del(`/api/projects/${projectId}/conversations/${filename}/messages/${index}`);
+      const reloaded = await loadMessages(filename);
+      setMessages(reloaded);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
   const turns = useMemo(() => toTurns(messages), [messages]);
 
   // Flattened back out with no wrapper element: `.chat-scroll` is the flex
@@ -829,7 +863,13 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   // entry its gap, and a per-turn <div> would take both away.
   const transcript = (newestFirst ? [...turns].reverse() : turns).flatMap((t) =>
     t.items.map(({ i, m }) => (
-      <Message key={i} message={m} projectId={projectId} repeatOf={repeats.get(i)} />
+      <Message
+        key={i}
+        message={m}
+        projectId={projectId}
+        repeatOf={repeats.get(i)}
+        onRemove={unanswered.has(i) ? () => void removeMessage(i) : undefined}
+      />
     )),
   );
 
@@ -1292,11 +1332,14 @@ function Message({
   message,
   projectId,
   repeatOf,
+  onRemove,
 }: {
   message: ChatMessage;
   projectId: string;
   /** Index of the earlier message this one repeats, when it does. */
   repeatOf?: number;
+  /** Set when this question produced no answer at all and can be taken out. */
+  onRemove?: () => void;
 }) {
   if (message.role === "tool_results") {
     // The call itself is already shown; the raw result body is noise in the
@@ -1316,7 +1359,28 @@ function Message({
       (b: any) => b.type === "image" || b.type === "document",
     ) as any[];
     return (
-      <div className={repeatOf === undefined ? "msg user" : "msg user repeat"}>
+      <div
+        className={[
+          "msg user",
+          repeatOf === undefined ? "" : "repeat",
+          onRemove ? "unanswered" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+      >
+        {/* A question nothing answered. It is not sent with later turns — no
+            model ever read it — but it stays on screen until someone says
+            otherwise, because deleting a person's words on their behalf is not
+            ours to do. */}
+        {onRemove && (
+          <div className="unanswered-tag">
+            <span>Never answered — not sent with later messages</span>
+            <span className="spacer" />
+            <button className="link" onClick={onRemove} title="Remove this message and its error">
+              Remove
+            </button>
+          </div>
+        )}
         {repeatOf !== undefined && (
           <div className="repeat-tag" title="Identical to an earlier message in this conversation">
             ↑ same question asked earlier — the assistant sees it more than once

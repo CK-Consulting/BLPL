@@ -324,6 +324,14 @@ body.resizing-y * { pointer-events: none; }
    control on its own never does. */
 .menu-note { margin: 0; font-size: 12.5px; line-height: 1.45; color: #b9c3d0; }
 
+/* A question nothing answered. Marked rather than hidden: it is still what the
+   person typed, and four copies of it stacking up is the symptom that explains
+   what went wrong. 9.14:1 on the message bubble, with a dashed edge so the
+   state is not carried by colour alone. */
+.msg.user.unanswered { border-style: dashed; border-color: #8a7a52; }
+.unanswered-tag { display: flex; align-items: center; gap: .5rem; margin: -.1rem 0 .4rem; padding-bottom: .35rem; border-bottom: 1px solid #3a4557; font-size: 12.5px; color: #d7c7a8; }
+.unanswered-tag button.link { color: #d7c7a8; text-decoration: underline; font-size: 12.5px; }
+
 /* Anchored over the transcript at whichever end new material arrives at, so
    the arrow on it and the direction it takes you always agree. `.chat` is the
    positioning context; the button is outside `.chat-scroll` so it does not

@@ -153,3 +153,99 @@ def test_a_file_attached_twice_is_named_once_when_it_is_dropped(convo, monkeypat
     new = _put(convo, "new.pdf", 1.4)
     events = [_msg(old, "old.pdf"), _msg(old, "old.pdf"), _msg(new, "new.pdf")]
     assert attachments_left_out(events, convo) == ["old.pdf"]
+
+
+# -- turns that produced nothing ---------------------------------------------
+
+
+def _err(text: str = "RequestTooLargeError: 413") -> dict:
+    return {"role": "error", "content": text, "metadata": {}}
+
+
+def _said(text: str) -> dict:
+    return {"role": "assistant", "content": text, "metadata": {"blocks": [{"type": "text", "text": text}]}}
+
+
+def test_a_message_nothing_ever_answered_is_not_replayed(convo) -> None:
+    """The sequence that made this unescapable, verbatim from a real log:
+    message with three datasheets → 413; same message, same datasheets → 413;
+    attachments removed and sent again → 413 anyway, because the two earlier
+    copies were still carrying six documents between them."""
+    aid = _put(convo, "spec.pdf", 1)
+    events = [
+        _msg(aid, "spec.pdf"),      # 0: failed
+        _err(),
+        _msg(aid, "spec.pdf"),      # 2: failed
+        _err(),
+        {"role": "user", "content": "same question, no attachment",
+         "metadata": {"blocks": [{"type": "text", "text": "same question, no attachment"}]}},
+    ]
+    msgs = history_to_messages(events, convo)
+    # Only the live question survives; the two dead copies and their documents
+    # do not reach the provider at all.
+    assert len(msgs) == 1
+    assert _kinds(msgs) == ["TextBlock"]
+
+
+def test_a_message_that_was_answered_is_kept_even_if_a_later_turn_failed(convo) -> None:
+    """Failing later says nothing about a turn that worked."""
+    events = [
+        {"role": "user", "content": "q1", "metadata": {"blocks": [{"type": "text", "text": "q1"}]}},
+        _said("a1"),
+        {"role": "user", "content": "q2", "metadata": {"blocks": [{"type": "text", "text": "q2"}]}},
+        _err(),
+    ]
+    msgs = history_to_messages(events, convo)
+    assert [m.content[0].text for m in msgs] == ["q1", "a1"]
+
+
+def test_a_turn_that_produced_output_then_failed_is_kept(convo) -> None:
+    """A provider that dies mid-answer still read the question, and the partial
+    answer refers to it. Dropping it would orphan what is on screen."""
+    events = [
+        {"role": "user", "content": "q", "metadata": {"blocks": [{"type": "text", "text": "q"}]}},
+        _said("partial"),
+        _err(),
+    ]
+    assert len(history_to_messages(events, convo)) == 2
+
+
+def test_attachments_on_a_dead_message_are_not_counted_against_the_budget(convo) -> None:
+    monkeypatch_budget = 2 * 1024 * 1024
+    dead = _put(convo, "dead.pdf", 1.4)
+    live = _put(convo, "live.pdf", 1.4)
+    events = [_msg(dead, "dead.pdf"), _err(), _msg(live, "live.pdf")]
+    # The dead one is not sent and is not reported as "left out" either: it was
+    # never going to be read, so calling it a casualty of the budget misleads.
+    assert attachments_left_out(events, convo) == []
+    assert _kinds(history_to_messages(events, convo)).count("DocumentBlock") == 1
+    assert monkeypatch_budget  # documents intent; the default budget suffices here
+
+
+def test_the_size_error_says_what_to_actually_do() -> None:
+    from app.chat import explain
+
+    class RequestTooLargeError(Exception):
+        pass
+
+    text = explain(RequestTooLargeError("Error code: 413 - request_too_large"))
+    assert "datasheets/" in text and "new session" in text
+    # And still carries what the provider said, so it is diagnosable.
+    assert "413" in text
+
+
+def test_only_a_message_that_produced_nothing_can_be_removed(tmp_path) -> None:
+    """The one delete there is, and narrow on purpose: removing an answered
+    exchange takes out evidence, and breaks the history structurally, since a
+    tool call and its result have to travel together."""
+    from app.chat import unanswered_messages
+
+    events = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "error", "content": "413"},
+        {"role": "user", "content": "q3"},
+        {"role": "error", "content": "413"},
+    ]
+    assert unanswered_messages(events) == {2, 4}

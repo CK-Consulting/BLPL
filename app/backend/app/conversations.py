@@ -85,6 +85,23 @@ class Conversation:
             raise ValueError(f"conversation filename {filename!r} doesn't match expected shape")
         return cls(path=path, slug=match["slug"], started_at=match["stamp"])
 
+    def drop(self, indices: set[int]) -> int:
+        """Remove events by position. Returns how many went.
+
+        Rewritten through a temporary file and renamed into place, so a crash
+        halfway leaves the original conversation rather than half of one. The
+        transcript is the record of decisions about a board; it is worth more
+        than the milliseconds a truncate-and-rewrite would save.
+        """
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        kept = [line for i, line in enumerate(lines) if i not in indices]
+        if len(kept) == len(lines):
+            return 0
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+        tmp.replace(self.path)
+        return len(lines) - len(kept)
+
     def append(self, role: str, content: str, metadata: dict | None = None) -> dict:
         event = {
             "timestamp": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),

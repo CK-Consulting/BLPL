@@ -311,11 +311,29 @@ def test_history_replays_tool_calls_not_just_prose(tmp_path) -> None:
     assert messages[2].content[0].tool_use_id == "t1"
 
 
-def test_error_records_are_kept_for_humans_but_not_replayed_as_context(tmp_path) -> None:
+def test_a_question_nothing_answered_is_kept_for_humans_and_not_replayed(tmp_path) -> None:
+    """Both halves go: the error marker, and the question it was the only reply
+    to. This used to keep the question, which is benign until the failure is
+    about request size — then every retry adds another copy of the message that
+    was already too big, and the request grows with each attempt to escape it.
+
+    On disk and on screen it stays. The transcript is the record of what
+    happened, and it is where the four identical copies explain themselves."""
     conv = Conversation.create(tmp_path, title="t")
     conv.append("user", "hi", {"blocks": [{"type": "text", "text": "hi"}]})
     conv.append("error", "RuntimeError: provider exploded", {})
-    assert [m.role for m in history_to_messages(conv.read_all())] == ["user"]
+    assert history_to_messages(conv.read_all()) == []
+    assert len(conv.read_all()) == 2
+
+
+def test_a_question_that_was_answered_before_the_failure_is_replayed(tmp_path) -> None:
+    """A provider dying mid-answer still read the question, and the partial
+    reply on screen refers to it."""
+    conv = Conversation.create(tmp_path, title="t")
+    conv.append("user", "hi", {"blocks": [{"type": "text", "text": "hi"}]})
+    conv.append("assistant", "partway through", {"blocks": [{"type": "text", "text": "partway"}]})
+    conv.append("error", "RuntimeError: provider exploded", {})
+    assert [m.role for m in history_to_messages(conv.read_all())] == ["user", "assistant"]
 
 
 # -- the API ------------------------------------------------------------------

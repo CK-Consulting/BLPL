@@ -171,6 +171,28 @@ def is_transient(exc: BaseException) -> bool:
     return "overloaded_error" in text or "rate_limit_error" in text
 
 
+def explain(exc: BaseException) -> str:
+    """The provider's failure, plus what to do about it where that is knowable.
+
+    "Request exceeds the maximum size" is true and useless: it names no file,
+    no number, and no next step, so the obvious move — take the attachments off
+    and send again — is both the right one and, on its own, ineffective, since
+    the copies already in the history are what put the request over.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    text = str(exc).lower()
+    if "request_too_large" in text or "exceeds the maximum size" in text or "413" in text:
+        detail += (
+            "\n\nThis is the size of the whole request, not of your message: every turn "
+            "resends the conversation with its attachments. Taking the files off this "
+            "message is not enough on its own, because the copies attached to earlier "
+            "messages are still being sent. Save the large PDFs into the project's "
+            "datasheets/ folder and start a new session — the assistant can read them "
+            "from there without carrying them in every request."
+        )
+    return detail
+
+
 def worth_another_endpoint(exc: BaseException) -> bool:
     """Whether a *different* endpoint could plausibly succeed where this failed.
 
@@ -517,12 +539,52 @@ def _attachment_budget(events: list[dict], attachments_dir: Path | None) -> set[
     return keep
 
 
+def unanswered_messages(events: list[dict]) -> set[int]:
+    """Indices of user messages whose turn produced nothing whatsoever.
+
+    A question that was persisted, sent, and answered only by an error. Nothing
+    in the transcript refers to it, no model ever read it, and replaying it
+    achieves nothing — but it is replayed, because the message is written to the
+    conversation *before* the turn runs, and a failed turn leaves it there.
+
+    That is benign until the failure is about size, at which point it is the
+    whole problem. Observed, four rows in a row: a message with three datasheets
+    attached fails at 413; the same message with the same three datasheets fails
+    again; the user removes the attachments and sends again — and it *still*
+    fails, because both earlier copies are in the history, carrying six
+    documents between them. Every attempt to escape made the request bigger. The
+    one correct move, taking the files out, was the one the accumulated failures
+    had already made useless.
+
+    Kept on disk and on screen either way: the transcript is a record of what
+    happened, and this is only about what gets sent.
+    """
+    out: set[int] = set()
+    for i, ev in enumerate(events):
+        if ev.get("role") != "user":
+            continue
+        produced = failed = False
+        for later in events[i + 1 :]:
+            role = later.get("role")
+            if role == "user":
+                break
+            if role in ("assistant", "tool_results"):
+                produced = True
+                break
+            if role == "error":
+                failed = True
+        if failed and not produced:
+            out.add(i)
+    return out
+
+
 def _plan_attachments(
     events: list[dict], attachments_dir: Path | None
 ) -> tuple[set[tuple[int, str]], list[str]]:
     """The pairs to send, and the names of the files left behind."""
     if attachments_dir is None:
         return set(), []
+    dead = unanswered_messages(events)
     keep: set[tuple[int, str]] = set()
     seen: set[str] = set()
     # Named once each. A file the user attached twice is one file, and listing
@@ -531,6 +593,8 @@ def _plan_attachments(
     left: list[str] = []
     spent = 0
     for i in range(len(events) - 1, -1, -1):
+        if i in dead:
+            continue  # never reached a model; its bytes buy nothing
         blocks = (events[i].get("metadata") or {}).get("blocks") or []
         refs = [b for b in blocks if b.get("type") in ("image", "document") and b.get("attachment")]
         for b in refs:
@@ -589,8 +653,13 @@ def history_to_messages(
     """
     events = list(events)
     keep = _attachment_budget(events, attachments_dir)
+    # Questions nothing ever answered. Four identical copies of the same
+    # paragraph is not context; it is the wreckage of four attempts to send it.
+    dead = unanswered_messages(events)
     messages: list[Msg] = []
     for i, ev in enumerate(events):
+        if i in dead:
+            continue
         role = ev.get("role")
         meta = ev.get("metadata") or {}
         blocks = _blocks_from_json(
@@ -894,7 +963,7 @@ class ChatSessionManager:
             # The turn is lost either way; what must not be lost is the reason.
             # It is recorded in the conversation so it survives the page, and
             # published so whoever is watching sees it now.
-            detail = f"{type(exc).__name__}: {exc}"
+            detail = explain(exc)
             retryable = is_transient(exc)
             try:
                 req.conversation.append(
