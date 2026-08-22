@@ -131,12 +131,14 @@ def test_a_task_walks_the_chain_when_the_first_model_cannot_hold_the_schema(
     assert run.results[0].model_id == "big-model"
 
 
-def test_a_chain_of_one_still_fails_exactly_as_before(tmp_path, scripted, monkeypatch) -> None:
-    """No silent second attempt at the same model: it would spend twice and
-    change nothing."""
+def test_a_chain_of_one_does_not_walk_to_another_model(tmp_path, scripted, monkeypatch) -> None:
+    """No silent attempt at a *different* model, because there is not one. The
+    same model does get one correction, which is a different thing: it is being
+    told what was wrong rather than asked the same question again."""
     run, seen = _run(tmp_path, [_endpoint("small")], {"small": {"pins": []}}, monkeypatch)
     assert [r.status for r in run.results] == ["failed"]
-    assert seen == ["small", "small"]  # scout, then the one mcu attempt
+    assert set(seen) == {"small"}
+    assert len(seen) == 3  # scout, the attempt, one correction
 
 
 def test_what_succeeded_survives_a_sibling_task_failing(
@@ -570,3 +572,64 @@ def test_subentries_sharing_a_page_do_not_end_a_section(monkeypatch) -> None:
 def test_no_contents_leaves_the_scout_alone(monkeypatch) -> None:
     monkeypatch.setattr(datasheets, "toc_entries", lambda pdf, scan_pages=12: [])
     assert datasheets.section_span(Path("x.pdf"), "pinout") == []
+
+
+def test_a_schema_slip_is_corrected_rather_than_discarded(tmp_path, scripted, monkeypatch) -> None:
+    """Nearly all of these are one wrong word in an otherwise complete answer: a
+    45-pin extraction with every pin right and `"type": "analog_in"` where the
+    enum has no analog member. Throwing away 45 correct pins over a word — and
+    then blaming the model — is what made this look like a model problem for so
+    long.
+    """
+    calls: list[str] = []
+
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text="", tables=""):
+        calls.append(prompt)
+        # The first *task* answer is complete and uses a value the enum does not
+        # list; the correction, told exactly what was wrong, uses one it does.
+        corrected = "did not validate" in prompt
+        return ({"family": "x", "type": "input" if corrected else "analog_in"}, "", 10, 5)
+
+    def validate(data, schema_path):
+        return "" if data.get("type") == "input" else "'analog_in' is not one of ['input', …]"
+
+    monkeypatch.setattr(datasheets, "_one_task", one_task)
+    monkeypatch.setattr(datasheets, "_validate", validate)
+    monkeypatch.setattr(datasheets, "has_text_layer", lambda p: True)
+    monkeypatch.setattr(datasheets, "page_text", lambda p, pages=(): "text")
+    monkeypatch.setattr(datasheets, "page_tables", lambda p, pages=(): "")
+    monkeypatch.setattr(datasheets, "section_span", lambda p, *w, **k: [1])
+
+    run = asyncio.run(
+        datasheets.extract_datasheet("PART1", _pdf(tmp_path), tmp_path / "cache", [_endpoint("m")])
+    )
+    assert [r.status for r in run.results] == ["complete"]
+    # It was told what was wrong, in the provider's own words.
+    assert len(calls) == 3  # scout, the attempt, the correction
+    assert "did not validate" in calls[2] and "analog_in" in calls[2]
+
+
+def test_a_correction_that_fails_again_is_not_retried_forever(
+    tmp_path, scripted, monkeypatch
+) -> None:
+    """One correction, not a loop. Output that is wrong in a way the model
+    cannot see is wrong however many times it is asked."""
+    calls: list[str] = []
+
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text="", tables=""):
+        calls.append(prompt)
+        return ({"family": "x"}, "", 10, 5)
+
+    monkeypatch.setattr(datasheets, "_one_task", one_task)
+    monkeypatch.setattr(datasheets, "_validate", lambda d, s: "still wrong")
+    monkeypatch.setattr(datasheets, "has_text_layer", lambda p: True)
+    monkeypatch.setattr(datasheets, "page_text", lambda p, pages=(): "text")
+    monkeypatch.setattr(datasheets, "page_tables", lambda p, pages=(): "")
+    monkeypatch.setattr(datasheets, "section_span", lambda p, *w, **k: [1])
+
+    run = asyncio.run(
+        datasheets.extract_datasheet("PART1", _pdf(tmp_path), tmp_path / "cache", [_endpoint("m")])
+    )
+    assert [r.status for r in run.results] == ["failed"]
+    # Scout, the attempt, and one correction — not a third.
+    assert len(calls) == 3

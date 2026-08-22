@@ -971,14 +971,50 @@ async def extract_datasheet(
                     page_text=task_text,
                     tables=task_tables,
                 )
-                # Schema validation counts as failure for the purpose of moving
-                # on. Output that parses but does not validate is the signature
-                # failure of a model too small for the contract, and it is
-                # exactly the case a single-endpoint dispatch could not escape.
                 if data is not None and not err:
                     err = _validate(data, schema_path)
                     if err:
-                        data = None
+                        # Show it what it got wrong and let it correct itself,
+                        # once, before writing the attempt off.
+                        #
+                        # Nearly all of these are one wrong word in an otherwise
+                        # complete answer: a 45-pin extraction with every pin
+                        # right and `"type": "analog_in"` where the enum has no
+                        # analog member, or "ceramic" where a dielectric class
+                        # was wanted, or "mA" where the unit had to be a base
+                        # one. Throwing away 45 correct pins over a word — and
+                        # then blaming the model — is what made this look like a
+                        # model problem for so long.
+                        #
+                        # This is the fallback for constrained decoding, not a
+                        # substitute for it. The schema is sent as
+                        # response_format on every call; where a server honours
+                        # it the sampler cannot produce these at all. This
+                        # deployment does not honour it — a custom reasoning
+                        # parser and structured outputs do not appear to
+                        # cooperate — so the correction has to happen after the
+                        # fact.
+                        fixed, again, ti2, to2 = await _one_task(
+                            endpoint=ep,
+                            prompt=(
+                                f"{prompt}\n\nYour previous answer was complete but did not "
+                                f"validate:\n\n    {err}\n\nReturn the whole thing again with "
+                                "only that corrected. Use a value the schema's enum actually "
+                                "lists; do not invent one, and do not drop the entry."
+                            ),
+                            pdf_bytes=pdf_b64,
+                            filename=pdf_path.name,
+                            schema=schema,
+                            page_text=task_text,
+                            tables=task_tables,
+                        )
+                        ti += ti2
+                        to += to2
+                        if fixed is not None and not again and not _validate(fixed, schema_path):
+                            note(f"{mpn}: {task_id} corrected a schema slip and validated")
+                            data, err = fixed, ""
+                        else:
+                            data = None
                 used, tin, tout = ep, ti, to
                 # Billed per attempt, so recorded per attempt: a ledger that
                 # only notes the model that finally worked understates what the
