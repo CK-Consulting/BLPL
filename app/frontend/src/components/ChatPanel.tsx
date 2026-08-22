@@ -243,7 +243,22 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     async (name: string) => {
       const convo = await fetchConversation(name);
       setMessages(convo.events);
-      return convo.active_turn ?? null;
+      const active = convo.active_turn ?? null;
+      // No turn running, and the last thing in the transcript is still the
+      // question. Nothing is going to answer it.
+      //
+      // This used to be decided only inside `watch`, which means it was only
+      // ever noticed by a panel that was *watching when the turn died*. Reload
+      // the page, or restart the server, and the same conversation came back
+      // with an unanswered question, no explanation and nothing to press —
+      // which is the exact situation where being offered the question back is
+      // most useful, since the turn is definitively gone rather than maybe
+      // still running somewhere.
+      if (!active) {
+        const orphan = unansweredTail(convo.events);
+        setLost(orphan ? { message: orphan, reason: "not_live" } : null);
+      }
+      return active;
     },
     [fetchConversation],
   );
@@ -927,7 +942,10 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
                   "question — nothing about the message needs changing. Asking again " +
                   "usually works."
                 : "The server stopped holding this turn — usually because it restarted " +
-                  "mid-answer. Your question is safe and still here; nothing replied to it."}
+                  "mid-answer. Your question is safe and still here; nothing replied to it. " +
+                  "Asking again resumes rather than starting over: anything the turn " +
+                  "finished — a datasheet scouted, an extraction task completed, a file " +
+                  "written — is on disk and gets reused."}
             </div>
           </div>
           <span className="spacer" />
