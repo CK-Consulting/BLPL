@@ -95,7 +95,7 @@ from . import (
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, Run, User
-from blpl.core import project_manifest, quarantine
+from blpl.core import limits, project_manifest, quarantine
 from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
@@ -883,19 +883,36 @@ def probe_models(
         )
 
     rows = payload.get(field) or []
-    names = sorted(
-        {
-            str(m.get("model") or m.get("name") or m.get("id") or "").strip()
-            for m in rows
-            if isinstance(m, dict)
-        }
-    )
-    names = [n for n in names if n]
+    # `id` first, and the order is the whole bug this fixes.
+    #
+    # It used to read `model` → `name` → `id`, which is right for Ollama (whose
+    # `name` *is* the wire identifier) and quietly wrong for anything that
+    # publishes both. OpenRouter's catalogue gives id `google/gemini-3.7-flash`
+    # and name `Google: Gemini 3.7 Flash`; the display string won, went into the
+    # dropdown, and got saved as the model — so an endpoint picked from a list
+    # this app generated could never resolve on the wire.
+    #
+    # Ollama is unaffected: it has no `id`, and its `model` and `name` are the
+    # same string.
+    pairs: dict[str, str] = {}
+    for m in rows:
+        if not isinstance(m, dict):
+            continue
+        wire = str(m.get("id") or m.get("model") or m.get("name") or "").strip()
+        if not wire:
+            continue
+        # A human label where the provider offers one, so a list of four hundred
+        # router models is readable — but it never becomes the stored value.
+        label = str(m.get("name") or m.get("display_name") or "").strip()
+        pairs.setdefault(wire, label if label and label != wire else "")
+    names = sorted(pairs)
     return {
         "kind": kind,
         "asked": True,
         "url": url,
         "models": names,
+        # id → human label, for a picker that shows one and stores the other.
+        "labels": {k: v for k, v in pairs.items() if v},
         # Which of them can actually read an image. Asked rather than assumed:
         # `vision = true` on an endpoint whose model is blind produces a
         # vision route that validates fine and then fails at request
@@ -2973,10 +2990,40 @@ def _cred_resolver():
     return CredResolver()
 
 
-def _context_of(session: Session, user: User, endpoint_name: str) -> int:
-    """The declared context window of one of this user's endpoints."""
+# Windows discovered from a server, by endpoint name. A window does not change
+# while a server is up, and asking again per turn would pay a round trip to
+# learn the same number.
+_DISCOVERED_CONTEXT: dict[str, int] = {}
+
+
+def _context_of(session: Session, user: User, master_key: bytes, endpoint_name: str) -> int:
+    """This endpoint's context window: declared, discovered, or inferred.
+
+    Discovery happens here rather than on the Endpoint itself, because this is a
+    request handler where a network call is expected and can be cached. It asks
+    about *one* model — the one this endpoint uses. A self-hosted server lists
+    one thing and a router lists thousands, and pulling a catalogue to find a
+    single row is not a way to learn a number that does not change.
+    """
     declared = llmconfig.load(session, user).endpoint(endpoint_name)
-    return declared.context if declared else 0
+    if declared is None:
+        return 0
+    if declared.context_tokens:
+        return int(declared.context_tokens)
+    if endpoint_name in _DISCOVERED_CONTEXT:
+        return _DISCOVERED_CONTEXT[endpoint_name]
+    if declared.kind in ("openai-compatible", "vllm") and declared.base_url:
+        found, _ = limits.describe(
+            declared.base_url,
+            keystore.get(session, master_key, user, endpoint_name)
+            if declared.needs_key
+            else None,
+            declared.resolved_model(),
+        )
+        if found:
+            _DISCOVERED_CONTEXT[endpoint_name] = int(found)
+            return int(found)
+    return declared.context
 
 
 def _task_endpoints(
@@ -3222,7 +3269,7 @@ async def start_chat_turn(
                 # the declared config rather than guessed from the wire name,
                 # so a self-hosted model started with a 1M window is treated as
                 # having one.
-                context=_context_of(session, user, endpoint.name),
+                context=_context_of(session, user, master_key, endpoint.name),
                 sandbox=_sandbox_for(session, user, project_id),
                 usage_ledger=_blpl_dir(session, user, project_id) / "llm_usage.jsonl",
                 creds=_cred_resolver(),

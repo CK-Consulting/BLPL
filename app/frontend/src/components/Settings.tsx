@@ -231,6 +231,10 @@ function EndpointRow({
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [models, setModels] = useState<string[]>([]);
+  // id → human label. Shown in the list; never what gets stored. A router
+  // publishes "Google: Gemini 3.7 Flash" beside "google/gemini-3.7-flash", and
+  // only one of those is a thing you can send.
+  const [labels, setLabels] = useState<Record<string, string>>({});
   const [caps, setCaps] = useState<Record<string, string[]> | null>(null);
   const [probing, setProbing] = useState(false);
 
@@ -242,6 +246,7 @@ function EndpointRow({
     try {
       const r = await postJSON<{
         models: string[];
+        labels?: Record<string, string>;
         capabilities: Record<string, string[]>;
         detail?: string;
       }>("/api/settings/llm/models", {
@@ -250,6 +255,7 @@ function EndpointRow({
         name: endpoint.name,
       });
       setModels(r.models);
+      setLabels(r.labels ?? {});
       setCaps(r.capabilities ?? {});
       if (!r.models.length) onError(r.detail ?? "no models listed");
     } catch (e) {
@@ -288,8 +294,11 @@ function EndpointRow({
               {endpoint.model ? `${endpoint.model} (not offered)` : "choose a model…"}
             </option>
             {models.map((m) => (
+              // The value is always the wire id. The label is decoration, and
+              // conflating the two is how an endpoint got saved with a string
+              // no provider would answer to.
               <option key={m} value={m}>
-                {m}
+                {labels[m] ? `${labels[m]}  ·  ${m}` : m}
                 {caps?.[m]?.length ? `  —  ${caps[m].join(", ")}` : ""}
               </option>
             ))}
@@ -388,6 +397,10 @@ function NewEndpoint({
   const [auth, setAuth] = useState("vault");
   const [vision, setVision] = useState(false);
   const [models, setModels] = useState<string[]>([]);
+  // id → human label. Shown in the list; never what gets stored. A router
+  // publishes "Google: Gemini 3.7 Flash" beside "google/gemini-3.7-flash", and
+  // only one of those is a thing you can send.
+  const [labels, setLabels] = useState<Record<string, string>>({});
   const [probing, setProbing] = useState(false);
   const [probeNote, setProbeNote] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState("");
@@ -407,11 +420,17 @@ function NewEndpoint({
       // POSTed, not queried: a key in a URL ends up in access logs, proxy logs
       // and browser history. It is used for this one request and not stored —
       // saving it is a separate, deliberate step below.
-      const r = await postJSON<{ models: string[]; asked: boolean; detail?: string }>(
+      const r = await postJSON<{
+        models: string[];
+        labels?: Record<string, string>;
+        asked: boolean;
+        detail?: string;
+      }>(
         "/api/settings/llm/models",
         { kind, base_url: baseUrl, name, api_key: apiKey },
       );
       setModels(r.models);
+      setLabels(r.labels ?? {});
       if (!r.models.length) {
         // "None" and "could not ask" are different answers and must not look
         // the same in a dropdown.
@@ -441,7 +460,7 @@ function NewEndpoint({
             <option value="">choose a model…</option>
             {models.map((m) => (
               <option key={m} value={m}>
-                {m}
+                {labels[m] ? `${labels[m]}  ·  ${m}` : m}
               </option>
             ))}
           </select>

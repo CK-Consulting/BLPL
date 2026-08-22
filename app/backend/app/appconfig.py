@@ -164,6 +164,11 @@ class Endpoint:
         """
         if self.context_tokens:
             return int(self.context_tokens)
+        # Deliberately no network call here. A dataclass property that reaches
+        # out to a server is a property that hangs a test suite, stalls a
+        # settings page, and pays a round trip every time anything touches it —
+        # all of which it did. Discovery belongs where I/O is expected: see
+        # `_context_of` in main.py, which caches it.
         model = (self.resolved_model() or "").lower()
         for needle, size in _CONTEXT_BY_MODEL:
             if needle in model:

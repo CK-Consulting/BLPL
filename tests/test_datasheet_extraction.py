@@ -351,3 +351,42 @@ def test_truncation_is_reported_as_truncation_not_as_a_bad_model() -> None:
     _, err = datasheets.first_json_value('[{"numbers": ["1"], "name": "GN')
     assert "cut off" in err and "ceiling" in err
     assert "not a model that cannot hold the schema" in err
+
+
+def test_the_slice_is_sized_to_the_model_that_will_read_it(tmp_path, scripted, monkeypatch) -> None:
+    """A 4B model on Ollama and a router's frontier model are three orders of
+    magnitude apart. Sending a slice and hoping produces either a provider error
+    or, worse, a silently truncated read."""
+    asked: list[list[int]] = []
+
+    def fake_page_text(pdf, pages=()):
+        asked.append(sorted(pages) if pages else [])
+        # Far more text than a small window could take.
+        return "x" * 400_000
+
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+        return ({"family": "x"}, "", 10, 5)
+
+    monkeypatch.setattr(datasheets, "_one_task", one_task)
+    monkeypatch.setattr(datasheets, "has_text_layer", lambda p: True)
+    monkeypatch.setattr(datasheets, "page_text", fake_page_text)
+    monkeypatch.setattr(datasheets, "budget_for", lambda ep: 8_000)
+    asyncio.run(
+        datasheets.extract_datasheet("PART1", _pdf(tmp_path), tmp_path / "cache", [_endpoint("m")])
+    )
+    # It asked for the task's pages, found them too big, and asked again for
+    # fewer — rather than sending 400k characters at an 8k budget.
+    assert len(asked) >= 3
+
+
+def test_a_window_is_asked_of_the_endpoint_not_assumed(monkeypatch) -> None:
+    """The same model served two ways has two different windows: this network's
+    Nemotron reports 512,000 where the model id alone would have said
+    1,000,000."""
+    from blpl.core import limits
+
+    monkeypatch.setattr(limits, "describe", lambda *a: (512_000, None))
+    ep = Endpoint(name="thor", kind="openai-compatible", model="nvidia/nemotron-3-super",
+                  base_url="http://x/v1", api_key="k")
+    room = datasheets.budget_for(ep)
+    assert 400_000 < room < 512_000  # the window, less what the answer needs

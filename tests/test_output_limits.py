@@ -86,7 +86,7 @@ def test_what_a_refusal_taught_is_used_next_time() -> None:
 def test_a_server_that_advertises_its_window_is_asked(monkeypatch) -> None:
     """A deployment choice, not a property of the weights: the same model served
     differently reports a different number, and the model id cannot tell you."""
-    monkeypatch.setattr(limits, "_discover_openai_compatible", lambda *a: 262_144)
+    monkeypatch.setattr(limits, "describe", lambda *a: (262_144, None))
     ep = Ep(name="thor", kind="openai-compatible", model="nvidia/nemotron-3-super",
             base_url="http://x/v1")
     # Two thirds: a server's window is prompt *plus* completion, so asking for
@@ -94,10 +94,52 @@ def test_a_server_that_advertises_its_window_is_asked(monkeypatch) -> None:
     assert limits.output_limit(ep) == int(262_144 * 2 / 3)
 
 
+def test_a_stated_output_cap_beats_a_window_it_was_derived_from(monkeypatch) -> None:
+    """A router that states the output cap is quoting the provider behind it,
+    which beats anything derivable from the context window."""
+    monkeypatch.setattr(limits, "describe", lambda *a: (1_000_000, 8_192))
+    ep = Ep(name="router", kind="openai-compatible", model="google/gemini-3.7-flash",
+            base_url="https://openrouter.ai/api/v1")
+    assert limits.output_limit(ep) == 8_192
+
+
 def test_an_unreachable_server_falls_back_rather_than_failing(monkeypatch) -> None:
-    monkeypatch.setattr(limits, "_discover_openai_compatible", lambda *a: None)
+    monkeypatch.setattr(limits, "describe", lambda *a: (None, None))
     ep = Ep(name="thor", kind="openai-compatible", model="nemotron-x", base_url="http://x/v1")
     assert limits.output_limit(ep) == 32_000  # the nemotron row in the table
+
+
+def test_only_the_active_model_is_asked_about(monkeypatch) -> None:
+    """A self-hosted server lists one thing and a router lists thousands.
+    Pulling a catalogue to find one row, on every cold start, per endpoint, is
+    not a way to learn a number that does not change."""
+    asked: list[str] = []
+
+    def fake_get(url, api_key, timeout=8):
+        asked.append(url)
+        if url.endswith("/models/google/gemini-3.7-flash"):
+            return {"data": {"id": "google/gemini-3.7-flash", "context_length": 1_000_000,
+                             "top_provider": {"max_completion_tokens": 65_536}}}
+        return None
+
+    monkeypatch.setattr(limits, "_get_json", fake_get)
+    ctx, out = limits.describe("https://openrouter.ai/api/v1", "k", "google/gemini-3.7-flash")
+    assert (ctx, out) == (1_000_000, 65_536)
+    # The single-model route answered, so the catalogue was never fetched.
+    assert not any(u.endswith("/models") for u in asked)
+
+
+def test_the_catalogue_is_the_last_resort(monkeypatch) -> None:
+    """Some servers only serve the list. It still works, it is just the fallback."""
+
+    def fake_get(url, api_key, timeout=8):
+        if url.endswith("/models"):
+            return {"data": [{"id": "other", "context_length": 4}, 
+                             {"id": "wanted", "max_model_len": 262_144}]}
+        return None
+
+    monkeypatch.setattr(limits, "_get_json", fake_get)
+    assert limits.describe("http://x/v1", None, "wanted") == (262_144, None)
 
 
 def test_a_real_pinout_fits_what_extraction_asks_for() -> None:
@@ -123,8 +165,13 @@ def test_running_into_the_ceiling_teaches_it_upward(tmp_path, monkeypatch) -> No
     class Adapter:
         endpoint = Ep(name="e")
 
-        async def stream_chat(self, messages, *, system="", tools=(), max_tokens=0):
+        async def stream_chat(self, messages, *, system="", tools=(), max_tokens=0,
+                              json_schema=None):
             asked.append(max_tokens)
+            # The schema is handed to the provider, not just written into the
+            # prompt: constrained decoding is the only fix for malformed JSON
+            # that addresses the cause.
+            assert json_schema is not None
             # Cut off on the first, modest ask; complete on the larger one.
             text = full if max_tokens > limits._FALLBACK else full[:12]
             yield Done(message=Msg(role="assistant", content=[TextBlock(text)]),

@@ -837,3 +837,73 @@ def test_the_searched_prefix_walks_down_to_the_family(tmp_path) -> None:
     assert not df.mentions(pdf, "NRF9151-LACA-R")
     # Too short to mean anything is not a match.
     assert not df.mentions(pdf, "ST")
+
+
+def test_a_listed_model_is_the_one_you_can_actually_send(unlocked, monkeypatch) -> None:
+    """The id, never the display name.
+
+    Precedence used to be model → name → id, which is right for Ollama (whose
+    `name` *is* the wire identifier) and quietly wrong for anything publishing
+    both. OpenRouter gives id `google/gemini-3.7-flash` and name
+    `Google: Gemini 3.7 Flash`; the label won, went into the dropdown, and was
+    saved as the model — so an endpoint chosen from a list this app generated
+    could never resolve on the wire.
+    """
+    import io
+    import json as _json
+
+    from app import main as main_mod
+
+    body = _json.dumps({
+        "data": [
+            {"id": "google/gemini-3.7-flash", "name": "Google: Gemini 3.7 Flash"},
+            {"id": "openrouter/auto", "name": "Auto Router"},
+        ]
+    }).encode()
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(main_mod.urllib.request, "urlopen", lambda *a, **k: Resp(body))
+    monkeypatch.setattr(main_mod, "_model_capabilities", lambda *a: {})
+    r = unlocked.post(
+        "/api/settings/llm/models",
+        json={"kind": "openai-compatible", "base_url": "https://openrouter.ai/api/v1"},
+    )
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["models"] == ["google/gemini-3.7-flash", "openrouter/auto"]
+    # The label is carried separately, so a picker can show one and store the
+    # other rather than conflating them.
+    assert got["labels"]["openrouter/auto"] == "Auto Router"
+
+
+def test_ollama_still_lists_its_own_names(unlocked, monkeypatch) -> None:
+    """Ollama has no `id`, and its `model` and `name` are the same string — so
+    the reordering must not disturb it."""
+    import io
+    import json as _json
+
+    from app import main as main_mod
+
+    body = _json.dumps({
+        "models": [{"name": "qwen2.5vl:7b", "model": "qwen2.5vl:7b"}]
+    }).encode()
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(main_mod.urllib.request, "urlopen", lambda *a, **k: Resp(body))
+    monkeypatch.setattr(main_mod, "_model_capabilities", lambda *a: {})
+    r = unlocked.post("/api/settings/llm/models", json={"kind": "ollama"})
+    assert r.status_code == 200, r.text
+    assert r.json()["models"] == ["qwen2.5vl:7b"]
+    assert r.json()["labels"] == {}

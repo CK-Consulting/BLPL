@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.parse
 import urllib.request
 
 # Substring → output ceiling, first match wins. Deliberately modest: this is
@@ -99,27 +100,93 @@ def learn_from_error(endpoint_name: str, exc: BaseException) -> int | None:
     return found
 
 
-def _discover_openai_compatible(base_url: str, api_key: str | None, model: str) -> int | None:
-    """Ask an OpenAI-compatible server what it was started with."""
-    if not base_url:
-        return None
-    url = base_url.rstrip("/") + "/models"
-    req = urllib.request.Request(url)
+def _get_json(url: str, api_key: str | None, timeout: int = 8) -> dict | None:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
     if api_key:
         req.add_header("Authorization", f"Bearer {api_key}")
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.load(resp)
+        return body if isinstance(body, dict) else None
     except Exception:  # noqa: BLE001 — an unreachable server is not an error here
         return None
+
+
+def _read_limits(entry: dict) -> tuple[int | None, int | None]:
+    """(context window, max completion) out of one model description.
+
+    Servers disagree about the names. vLLM says ``max_model_len``; OpenRouter
+    says ``context_length`` and puts the output cap under ``top_provider``,
+    which is the one worth reaching for — it is the only place a router states
+    what the model behind it will actually produce.
+    """
+    context = None
+    for key in ("max_model_len", "max_total_tokens", "context_length", "context_window"):
+        value = entry.get(key)
+        if isinstance(value, int) and value > 0:
+            context = value
+            break
+    output = None
+    for holder in (entry.get("top_provider") or {}, entry):
+        if not isinstance(holder, dict):
+            continue
+        for key in ("max_completion_tokens", "max_output_tokens", "max_tokens"):
+            value = holder.get(key)
+            if isinstance(value, int) and value > 0:
+                output = value
+                break
+        if output:
+            break
+    return context, output
+
+
+def describe(base_url: str, api_key: str | None, model: str) -> tuple[int | None, int | None]:
+    """Ask a server about **one** model: its window and its output cap.
+
+    The active model, never the catalogue. A self-hosted server lists one thing
+    and a router lists thousands, and pulling several megabytes of JSON to find
+    one row — on every cold start, per endpoint — is not a reasonable way to
+    learn a number that does not change.
+
+    So the single-model routes are tried first, in the order most likely to
+    exist, and the full listing is the last resort:
+
+      GET {base}/models/{id}            the OpenAI shape; vLLM serves it
+      GET {base}/models/{id}/endpoints  OpenRouter's, which also names the
+                                        output cap under top_provider
+      GET {base}/models                 everything, filtered here
+    """
+    if not base_url:
+        return None, None
+    root = base_url.rstrip("/")
+    quoted = urllib.parse.quote(model or "", safe="/")
+
+    if model:
+        for path in (f"/models/{quoted}", f"/models/{quoted}/endpoints"):
+            body = _get_json(root + path, api_key)
+            if not body:
+                continue
+            entry = body.get("data") if isinstance(body.get("data"), dict) else body
+            if isinstance(entry, dict):
+                context, output = _read_limits(entry)
+                if context or output:
+                    return context, output
+
+    body = _get_json(root + "/models", api_key, timeout=15)
+    if not body:
+        return None, None
     for entry in body.get("data") or []:
+        if not isinstance(entry, dict):
+            continue
         if model and entry.get("id") != model:
             continue
-        for key in ("max_model_len", "max_total_tokens", "context_length"):
-            value = entry.get(key)
-            if isinstance(value, int) and value > 0:
-                return value
-    return None
+        return _read_limits(entry)
+    return None, None
+
+
+def _discover_openai_compatible(base_url: str, api_key: str | None, model: str) -> int | None:
+    """The context window only, for callers that just want the one number."""
+    return describe(base_url, api_key, model)[0]
 
 
 def output_limit(endpoint, ceiling: int = 0) -> int:
@@ -140,17 +207,22 @@ def output_limit(endpoint, ceiling: int = 0) -> int:
     else:
         limit = 0
         if getattr(endpoint, "kind", "") in ("openai-compatible", "vllm"):
-            found = _discover_openai_compatible(
+            context, stated = describe(
                 getattr(endpoint, "base_url", "") or "",
                 getattr(endpoint, "api_key", None),
                 getattr(endpoint, "model", "") or "",
             )
-            if found:
+            if stated:
+                # A router that states the output cap is quoting the provider
+                # behind it, which beats anything derivable from the window.
+                limit = stated
+            elif context:
                 # A server's total window is prompt *plus* completion, so asking
                 # for all of it leaves no room for the question. Two thirds is
                 # generous for an extraction and still leaves a long document
                 # somewhere to sit.
-                limit = int(found * 2 / 3)
+                limit = int(context * 2 / 3)
+            if limit:
                 learn(name, limit)
         if not limit:
             limit = next((v for k, v in _BY_NAME if k in model), _FALLBACK)

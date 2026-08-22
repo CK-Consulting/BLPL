@@ -145,6 +145,36 @@ def page_text(pdf: Path, pages: Sequence[int] = ()) -> str:
     return text if printable > 200 * span else ""
 
 
+def budget_for(endpoint) -> int:
+    """How much of a document this endpoint can be handed at once.
+
+    The context window less what the answer needs. Asked of the endpoint rather
+    than assumed, because the same model served two ways has two different
+    windows — this network's Nemotron reports 512,000 while the model id alone
+    would have said 1,000,000 — and because a 4B model on Ollama and a router's
+    frontier model are three orders of magnitude apart.
+    """
+    window = 0
+    describe = getattr(limits, "describe", None)
+    if describe and getattr(endpoint, "kind", "") in ("openai-compatible", "vllm"):
+        found, _ = describe(
+            getattr(endpoint, "base_url", "") or "",
+            getattr(endpoint, "api_key", None),
+            getattr(endpoint, "model", "") or "",
+        )
+        window = found or 0
+    if not window:
+        window = int(getattr(endpoint, "context_tokens", 0) or 0)
+    if not window:
+        window = _CONTEXT_FALLBACK
+    return max(4_000, window - limits.output_limit(endpoint, MAX_OUTPUT_TOKENS))
+
+
+# When nothing will say. Low rather than high: a slice that turns out to fit is
+# a wasted round trip, and one that does not is a failed task.
+_CONTEXT_FALLBACK = 32_768
+
+
 def has_text_layer(pdf: Path) -> bool:
     """Whether this document can be read rather than looked at."""
     return bool(page_text(pdf, ()))
@@ -247,7 +277,12 @@ async def _one_task(
 
     async def attempt(cap: int) -> None:
         nonlocal usage_in, usage_out
-        async for event in adapter.stream_chat(messages, max_tokens=cap):
+        # The schema goes to the provider, not only into the prompt. Where the
+        # server supports constrained decoding it masks the sampler so a token
+        # that would break the schema cannot be chosen — which turns "the model
+        # forgot a comma" from a thing that happens into a thing that cannot.
+        # Servers that do not support it ignore the field.
+        async for event in adapter.stream_chat(messages, max_tokens=cap, json_schema=schema):
             if isinstance(event, llm_chat.Usage):
                 usage_in += event.input_tokens
                 usage_out += event.output_tokens
@@ -613,6 +648,21 @@ async def extract_datasheet(
         # are, and a pin table read from its own six pages costs a few thousand
         # tokens where the whole 541-page document costs hundreds of thousands.
         task_text = page_text(pdf_path, pages) if readable else ""
+        if task_text:
+            # Measured against the window of the model that will read it, rather
+            # than sent and hoped for. A slice that does not fit comes back as a
+            # provider error or, worse, as a silently truncated read — and the
+            # cost of knowing in advance is a character count.
+            room = max(4_000, int(budget_for(chain[0]) * 0.6))
+            estimate = len(task_text) // 4
+            if estimate > room:
+                keep_pages = max(1, int(len(pages or [1]) * room / estimate))
+                note(
+                    f"{mpn}: {task_id} spans ~{estimate:,} tokens, over the "
+                    f"~{room:,} that fits — reading the first {keep_pages} of "
+                    f"{len(pages)} pages"
+                )
+                task_text = page_text(pdf_path, sorted(pages)[:keep_pages])
         async with semaphore:
             for i, ep in enumerate(chain):
                 note(
