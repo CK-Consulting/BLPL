@@ -125,6 +125,7 @@ def electrical_type(word: str) -> tuple[str, bool]:
 
 def _pin(numbers: list[str], name: str, type_word: str, description: str,
          page: int | None, section: str) -> dict[str, Any]:
+    description = " ".join((description or "").split())
     kind, known = electrical_type(type_word)
     # A blank cell is not an unmapped word. Saying "unmapped type: ''" told the
     # reader nothing and buried the one row that genuinely had a type nobody
@@ -160,6 +161,42 @@ def _columns(line: str) -> list[str]:
     """Split on runs of two or more spaces — the column separator these files
     use. One space is inside a value ("Digital I/O", "Trace clock")."""
     return [c.strip() for c in re.split(r"\s{2,}", line.strip()) if c.strip()]
+
+
+# A page marker left in by the text extractor. Harmless in the middle of a
+# table and decisive after it: these files are cut from a whole-document
+# conversion, so the pin table is followed by the rest of the datasheet, and
+# without a stop the parser reads footnotes and page furniture as pins.
+_PAGE_MARK = re.compile(r"^\s*-{2,}\s*page\s+\d+\s*-{2,}\s*$", re.I)
+
+
+def _is_separator(line: str) -> bool:
+    """A rule between pins — but never a page marker.
+
+    ``--- Page 9 ---`` matched the separator pattern, so a flat table cut from a
+    whole-document conversion was read as one enormous separated block: one pin,
+    numbered 38, with the other 37 as its alternate functions.
+    """
+    return bool(_SEPARATOR.match(line)) and not _PAGE_MARK.match(line)
+
+
+def has_alternative_column(text: str) -> bool:
+    """Whether the table carries a fifth column naming an alternate function.
+
+    Morse Micro writes the MM8108's that way — one line per pin, with the
+    alternate beside the description rather than on a row of its own:
+
+        6   JTAG_TMS   Digital I/O   JTAG Mode Select   GPIO15[3]
+
+    Read from the header, because a row with a long description and one with a
+    short description plus an alternate look identical once split.
+    """
+    for line in text.splitlines()[:12]:
+        low = " ".join(line.split()).lower()
+        if "alternative" in low or "alternate function" in low:
+            if "pin" in low or "name" in low or "type" in low:
+                return True
+    return False
 
 
 def split_row(line: str) -> tuple[str | None, str, str, str]:
@@ -209,7 +246,10 @@ def split_row(line: str) -> tuple[str | None, str, str, str]:
         name = tokens[0] if tokens else ""
         return number, name, "", " ".join(tokens[1:])
     name = " ".join(tokens[:where])
-    return number, name, tokens[where], " ".join(tokens[where + 1:])
+    # The tail keeps its column separators — two spaces — so a caller that
+    # knows there is a fifth column can still find where it starts. Collapsing
+    # them here made the MM8108's Alternative column unrecoverable.
+    return number, name, tokens[where], "  ".join(tokens[where + 1:])
 
 
 def stated_convention(text: str) -> str | None:
@@ -258,7 +298,7 @@ def detect(text: str) -> str:
     stated = stated_convention(text)
     if stated:
         return stated
-    if any(_SEPARATOR.match(line) for line in text.splitlines()):
+    if any(_is_separator(line) for line in text.splitlines()):
         return "separated"
     numbers = [
         m.group("num")
@@ -289,16 +329,21 @@ def _data_lines(text: str) -> list[str]:
     """Lines that could be table rows."""
     return [
         line for line in text.splitlines()
-        if line.strip() and not _SEPARATOR.match(line) and re.search(r"\S\s{2,}\S", line)
+        if line.strip() and not _is_separator(line) and re.search(r"\S\s{2,}\S", line)
     ]
 
 
 def _rows(text: str) -> list[tuple[str | None, tuple[str, str, str]] | None]:
     """Every line as (number, (name, type, description)); None marks a block
-    boundary."""
+    boundary. Stops at the first page marker after the table has begun."""
     out: list[tuple[str | None, tuple[str, str, str]] | None] = []
+    started = False
     for line in text.splitlines():
-        if _SEPARATOR.match(line):
+        if _PAGE_MARK.match(line):
+            if started:
+                break
+            continue
+        if _is_separator(line):
             out.append(None)
             continue
         if not line.strip():
@@ -306,6 +351,8 @@ def _rows(text: str) -> list[tuple[str | None, tuple[str, str, str]] | None]:
         number, name, type_word, description = split_row(line)
         if number is None and not name and not type_word:
             continue
+        if number is not None and electrical_type(type_word)[1]:
+            started = True
         out.append((number, (name, type_word, description)))
     return out
 
@@ -317,6 +364,7 @@ def _is_header(name: str, type_word: str, description: str) -> bool:
 
 def _parse_columns(text: str, shape: str, page: int | None, section: str) -> list[dict]:
     rows = _rows(text)
+    alt_column = has_alternative_column(text)
     pins: list[dict] = []
 
     if shape == "separated":
@@ -346,9 +394,11 @@ def _parse_columns(text: str, shape: str, page: int | None, section: str) -> lis
         if _is_header(name, type_word, description):
             continue
         if num is None:
-            # A continuation belongs to the pin above. Reading it as a new pin
-            # is how a pinout gains phantom entries.
-            if pins:
+            # A continuation belongs to the pin above — but only if it looks
+            # like a table row at all. Without the type check, a running footer
+            # ("MM8108-MF15457 Data Sheet v4   morsemicro.com | 8") became an
+            # alternate function of pin 38.
+            if pins and electrical_type(type_word)[1]:
                 _add_alt(pins[-1], name or description, type_word,
                          "" if not name else description)
             continue
@@ -356,7 +406,17 @@ def _parse_columns(text: str, shape: str, page: int | None, section: str) -> lis
             _add_alt(pins[-1], name or description, type_word,
                      "" if not name else description)
             continue
-        pins.append(_pin([num], name, type_word, description, page, section))
+        alternative = ""
+        if alt_column:
+            # The last whitespace-separated chunk of the description is the
+            # alternate, when the header says there is such a column.
+            parts = re.split(r"\s{2,}", description.strip())
+            if len(parts) > 1:
+                description, alternative = "  ".join(parts[:-1]).strip(), parts[-1].strip()
+        pin = _pin([num], name, type_word, description, page, section)
+        if alternative:
+            _add_alt(pin, alternative, type_word, "")
+        pins.append(pin)
     return pins
 
 
@@ -375,6 +435,11 @@ def _emit_block(pins: list[dict], number: str | None,
         if cells is head:
             continue
         name, type_word, description = cells
+        if not electrical_type(type_word)[1]:
+            # Not a table row at all. Without this a running footer —
+            # "MM8108-MF15457 Data Sheet v4   morsemicro.com | 8" — became an
+            # alternate function of the last pin.
+            continue
         if not name:
             # No name but a description: the description *is* the function's
             # name, which is how Nordic writes an alternate —
@@ -600,10 +665,10 @@ def main(argv: list[str] | None = None) -> int:
             continue
         print(_report(f, pins))
         text = f.read_text(encoding="utf-8")
-        if detect(text) != "cubemx":
-            bad = misaligned_lines(_data_lines(text), expect=4)
-            for number, line in bad[:5]:
-                print(f"{'':48s}line {number} breaks the column alignment: {line[:60]!r}")
+        shape = detect(text)
+        stated = stated_convention(text)
+        how = f"{shape}" + ("" if stated else ", inferred — the file states no convention")
+        print(f"{'':48s}read as: {how}")
         if args.out:
             args.out.mkdir(parents=True, exist_ok=True)
             dest = args.out / f"{f.stem}.pinout.json"

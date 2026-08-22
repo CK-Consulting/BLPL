@@ -271,3 +271,56 @@ def test_a_single_letter_type_does_not_match_inside_a_name() -> None:
 def test_a_word_boundary_is_respected_in_longer_matches() -> None:
     assert pp.electrical_type("Digital I/O (SoC)") == ("bidirectional", True)
     assert pp.electrical_type("Powerhouse") == ("unspecified", False)
+
+
+# -- a fifth column, and a file that runs on past its table -------------------
+
+WITH_ALTERNATIVE = """Pin Pin Name     Type          Description                             Alternative
+1   GND          Ground        Ground
+6   JTAG_TMS     Digital I/O   JTAG Mode Select                        GPIO15[3]
+15  SDIO_D2[1]   Digital I/O   SDIO Data line
+38  GND          Ground        Ground
+
+
+
+MM8108-MF15457 Data Sheet v4    morsemicro.com | 8
+
+
+--- Page 9 ---
+[1] All SDIO bus pins except SDIO_CLK should be pulled up with a 10 kOhm resistor
+"""
+
+
+def test_an_alternative_column_becomes_an_alternate_function() -> None:
+    """Morse Micro writes the MM8108's that way: one line per pin, the
+    alternate beside the description rather than on a row of its own."""
+    assert pp.has_alternative_column(WITH_ALTERNATIVE)
+    pins = pp.parse(WITH_ALTERNATIVE)
+    by = {p["numbers"][0]: p for p in pins}
+    assert [a["name"] for a in by["6"]["alt_functions"]] == ["GPIO15[3]"]
+    assert by["6"]["description"] == "JTAG Mode Select"
+    # And a row without one does not gain a phantom.
+    assert by["15"]["alt_functions"] == []
+
+
+def test_the_table_ends_at_the_next_page_marker() -> None:
+    """These files are cut from a whole-document conversion, so the table is
+    followed by the rest of the datasheet. Without a stop, footnotes and page
+    furniture are read as pins."""
+    pins = pp.parse(WITH_ALTERNATIVE)
+    assert [p["numbers"][0] for p in pins] == ["1", "6", "15", "38"]
+
+
+def test_a_page_marker_is_not_a_block_separator() -> None:
+    """'--- Page 9 ---' matched the separator pattern, so a flat table was read
+    as one enormous separated block: a single pin numbered 38 with the other 37
+    as its alternate functions."""
+    assert pp.detect(WITH_ALTERNATIVE) != "separated"
+
+
+def test_a_running_footer_is_not_an_alternate_function() -> None:
+    """'MM8108-MF15457 Data Sheet v4   morsemicro.com | 8' became an alternate
+    of the last pin, because a continuation was accepted without checking that
+    it looked like a table row."""
+    pins = pp.parse(WITH_ALTERNATIVE)
+    assert all("Data Sheet" not in a["name"] for p in pins for a in p["alt_functions"])
