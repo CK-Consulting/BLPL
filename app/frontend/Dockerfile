@@ -10,6 +10,10 @@ COPY . .
 # readable in any built bundle. The secret key must never appear here.
 ARG VITE_CLERK_PUBLISHABLE_KEY
 ENV VITE_CLERK_PUBLISHABLE_KEY=$VITE_CLERK_PUBLISHABLE_KEY
+# Tests before the build, so a broken one stops the image the way a type error
+# does. They are fast (jsdom, no network) and the alternative is a suite nobody
+# runs.
+RUN npm run test
 RUN npm run build
 
 FROM nginx:alpine

@@ -76,7 +76,7 @@ const ORDER_KEY = "blpl.chatOrder";
 const readOrder = (): Order => (localStorage.getItem(ORDER_KEY) === "newest" ? "newest" : "oldest");
 
 /** Split a flat transcript into turns. A turn opens at each user message. */
-function toTurns(messages: ChatMessage[]): { key: number; items: { i: number; m: ChatMessage }[] }[] {
+export function toTurns(messages: ChatMessage[]): { key: number; items: { i: number; m: ChatMessage }[] }[] {
   const out: { key: number; items: { i: number; m: ChatMessage }[] }[] = [];
   messages.forEach((m, i) => {
     if (m.role === "user" || out.length === 0) out.push({ key: i, items: [] });
@@ -86,7 +86,7 @@ function toTurns(messages: ChatMessage[]): { key: number; items: { i: number; m:
 }
 
 /** The last thing said, if the transcript ends on the user — i.e. nothing answered. */
-function unansweredTail(messages: ChatMessage[]): ChatMessage | null {
+export function unansweredTail(messages: ChatMessage[]): ChatMessage | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     // tool_results are bookkeeping between an assistant turn and its

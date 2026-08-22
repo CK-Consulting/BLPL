@@ -337,6 +337,11 @@ body.resizing-y * { pointer-events: none; }
 .fileview-body { flex: 1; min-height: 0; overflow: auto; padding: 1rem 1.2rem; }
 .code-view { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; color: #cfd6de; }
 .tree-actions { display: flex; gap: .5rem; padding: 0 .1rem .35rem; }
+.tree-group-head { display: flex; align-items: center; gap: .3rem; width: 100%; text-align: left; background: none; border: 0; padding: .25rem .2rem; }
+.tree-group-head:hover { color: #e6e6e6; }
+.tree-group-head:focus-visible { outline: 3px solid #80a8ff; outline-offset: -2px; border-radius: 4px; }
+.tree-hidden-toggle { display: flex; align-items: center; gap: .35rem; margin-top: .6rem; padding-top: .5rem; border-top: 1px solid #2a3038; font-size: 12.5px; color: #b9c3d0; }
+.tree-hidden-toggle input { width: 15px; height: 15px; accent-color: #4f7fd0; }
 
 /* Syntax colours, named for the nano colour each one stands in for, so the
    mapping stays readable. Every one is ≥7:1 against #0f1115 — measured, not

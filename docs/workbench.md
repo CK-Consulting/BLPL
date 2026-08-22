@@ -181,3 +181,21 @@ server advertises does not decide what the assistant may do — and a partial to
 set disables the bridge with the missing names rather than failing three-quarters
 through a route. The working tree is committed to a ref before the first edit, so
 "undo that routing attempt" is one call.
+
+## Frontend tests
+
+```
+cd app/frontend && npm test        # once
+cd app/frontend && npm run test:watch
+```
+
+Vitest in jsdom, and they run inside the image build — a failing test stops the
+image the way a type error does, because a suite nobody runs is worse than no
+suite at all.
+
+What is worth testing here is behaviour that only exists in a DOM: whether a
+control is disabled and why, whether a folded group hides its contents, whether
+an error is rendered somewhere a person will actually see it. Several of the
+bugs these cover were shipped and then found by hand — a tree that opened fully
+expanded, an approval prompt off the bottom of the scroll, a "lost turn" card
+that only appeared if you happened to be watching when the turn died.

@@ -80,6 +80,12 @@ function toTree(files: TreeNode[]): Dir {
   return root;
 }
 
+/** Any segment beginning with a dot. A file in `.pipeline/` is as hidden as
+ *  `.gitignore` is, and hiding only the leaf would be half a rule. */
+export function isHidden(path: string): boolean {
+  return path.split("/").some((seg) => seg.startsWith("."));
+}
+
 function countIn(dir: Dir): number {
   let n = dir.files.length;
   for (const d of dir.dirs.values()) n += countIn(d);
@@ -110,6 +116,11 @@ export function FileTree({
   const [filter, setFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [bump, setBump] = useState(0);
+  // Dotfiles are machinery until someone says otherwise. The tree used to open
+  // with .pipeline's generated artifacts sitting alongside the design
+  // documents, which is a lot of noise in front of the four files anybody came
+  // to look at.
+  const [showHidden, setShowHidden] = useState(false);
 
   useEffect(() => {
     getJSON<{ nodes: TreeNode[] }>(`/api/projects/${projectId}/tree`)
@@ -150,12 +161,20 @@ export function FileTree({
     }
   };
 
+  const hiddenCount = useMemo(
+    () => nodes.filter((n) => !n.dir && isHidden(n.path)).length,
+    [nodes],
+  );
+
   const files = useMemo(() => {
     const q = filter.trim().toLowerCase();
     return nodes.filter(
-      (n) => !n.dir && (!q || n.path.toLowerCase().includes(q)),
+      (n) =>
+        !n.dir &&
+        (showHidden || !isHidden(n.path)) &&
+        (!q || n.path.toLowerCase().includes(q)),
     );
-  }, [nodes, filter]);
+  }, [nodes, filter, showHidden]);
 
   const grouped = useMemo(() => {
     const out = new Map<string, TreeNode[]>();
@@ -193,22 +212,73 @@ export function FileTree({
         const list = grouped.get(role);
         if (!list || list.length === 0) return null;
         return (
-          <div className="tree-group" key={role}>
-            <div className="rail-subtitle">
-              {label} <span className="muted">{list.length}</span>
-            </div>
+          <Group
+            key={role}
+            label={label}
+            count={list.length}
+            // Design open, everything else folded. The tree opened with every
+            // group and every folder expanded, which put a project's four
+            // design documents at the bottom of a page of generated artifacts.
+            // Design is what the workbench is for.
+            defaultOpen={role === "design"}
+            // A filter is a search, and a search that leaves its results folded
+            // away has not answered anything.
+            forceOpen={filter.trim().length > 0}
+          >
             <Branch
               dir={toTree(list)}
               depth={0}
               onOpen={onOpen}
-              // A filter is a search, and a search that leaves its results
-              // folded away has not answered anything.
               forceOpen={filter.trim().length > 0}
             />
-          </div>
+          </Group>
         );
       })}
+      {hiddenCount > 0 && (
+        <label className="tree-hidden-toggle">
+          <input
+            type="checkbox"
+            checked={showHidden}
+            onChange={(e) => setShowHidden(e.target.checked)}
+          />{" "}
+          <span>Show hidden ({hiddenCount})</span>
+        </label>
+      )}
       {files.length === 0 && <div className="muted small pad">No file matches that.</div>}
+    </div>
+  );
+}
+
+/** A collapsible category. Folded groups are the difference between a tree you
+ *  scan and a tree you scroll. */
+function Group({
+  label,
+  count,
+  defaultOpen,
+  forceOpen,
+  children,
+}: {
+  label: string;
+  count: number;
+  defaultOpen: boolean;
+  forceOpen: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const shown = forceOpen || open;
+  return (
+    <div className="tree-group">
+      <button
+        className="rail-subtitle tree-group-head"
+        aria-expanded={shown}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="tree-caret" aria-hidden="true">
+          {shown ? "▾" : "▸"}
+        </span>
+        {label} <span className="muted">{count}</span>
+      </button>
+      {shown && children}
     </div>
   );
 }
@@ -270,7 +340,9 @@ function Folder({
   onOpen: (node: TreeNode) => void;
   forceOpen: boolean;
 }) {
-  const [open, setOpen] = useState(true);
+  // Folded, like the groups above them. A per-MPN datasheet directory is a
+  // place you go when you want it, not something to wade past.
+  const [open, setOpen] = useState(false);
   const shown = forceOpen || open;
   return (
     <>
