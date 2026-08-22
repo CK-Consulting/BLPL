@@ -28,3 +28,8 @@ blpl/webapp/static/assets/
 *.env.local
 *.swp
 blpl-db
+
+# Datasheets belong to a project, not to the app source tree. One was swept
+# in by a `git add -A` from this directory and cost 7.4 MB of repository.
+app/*.pdf
+app/*.txt
