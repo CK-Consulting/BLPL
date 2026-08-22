@@ -318,6 +318,28 @@ async def _fetch_datasheet(ctx: ToolContext, args: dict) -> str:
     return json.dumps(result.to_dict(), indent=2)
 
 
+def usable_extraction(payload: object) -> bool:
+    """Whether an extraction holds findings rather than a record of failing.
+
+    A partial merge marks each task it could not complete with
+    ``{"_extraction_failed": true, "reason": ...}``. That is the right thing to
+    write into a project's cache — it says what happened, next to what worked —
+    and exactly the wrong thing to keep in a library that is consulted first and
+    across projects, because it converts one bad afternoon into a permanent
+    answer.
+
+    Checked recursively: the sentinel appears at whatever depth the failing task
+    sat, so a top-level look would miss most of them.
+    """
+    if isinstance(payload, dict):
+        if payload.get("_extraction_failed"):
+            return False
+        return all(usable_extraction(v) for v in payload.values())
+    if isinstance(payload, list):
+        return all(usable_extraction(v) for v in payload)
+    return True
+
+
 async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
     from blpl.agent.tools.datasheets import extract_datasheet
 
@@ -390,17 +412,31 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
     # The whole chain, not its head. A model that cannot hold the output schema
     # fails every task the same way, so the endpoints behind it are the fix.
     run = await extract_datasheet(mpn, pdf, cache, chain, on_progress=ctx.note)
-    # Kept for next time, and for the next project. Only when something actually
-    # landed: filing a failed run would poison every later lookup with the
-    # answer "we already tried".
+    # Kept for next time, and for the next project — but only when something
+    # actually landed.
+    #
+    # This checked that the merged file *existed*, which after the partial-merge
+    # change it does even when every task failed: the merge writes
+    # {"_extraction_failed": true, "reason": "<whatever the provider said>"} in
+    # place of each one. So a run that failed got filed, permanently, per user,
+    # across every project — and because the library is consulted before
+    # anything else, it then answered every later attempt with the fossilised
+    # error instead of trying again.
+    #
+    # The symptom was a provider that had been removed from every route still
+    # appearing in failures: "your credit balance is too low to access the
+    # Anthropic API", quoted back weeks later from a cache, on a system with no
+    # Anthropic route at all.
     merged = cache / f"{mpn}.json"
-    if ctx.library is not None and merged.is_file():
+    if ctx.library is not None and run.ok and merged.is_file():
         try:
-            ctx.library.put(mpn, json.loads(merged.read_text(encoding="utf-8")))
-            ctx.note(f"{mpn}: saved to your component library for reuse")
-        except (OSError, json.JSONDecodeError, Exception):  # noqa: B014
-            # Never fatal: the extraction succeeded and is on disk in the
-            # project. Failing to file a copy is worth less than the result.
+            payload = json.loads(merged.read_text(encoding="utf-8"))
+            if usable_extraction(payload):
+                ctx.library.put(mpn, payload)
+                ctx.note(f"{mpn}: saved to your component library for reuse")
+        except (OSError, json.JSONDecodeError):
+            # Never fatal: the extraction is on disk in the project either way.
+            # Failing to file a copy is worth less than the result.
             pass
     return json.dumps(run.to_dict(), indent=2)
 

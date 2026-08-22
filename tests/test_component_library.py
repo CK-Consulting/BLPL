@@ -248,3 +248,58 @@ def test_extraction_reuses_the_library_instead_of_paying_again(data, tmp_path) -
     assert body["pinout"][0]["name"] == "VDD"
     # No vision endpoint was configured, and it did not need one.
     assert ctx.endpoints_for("vision") == []
+
+
+# -- not filing failures ------------------------------------------------------
+
+
+def test_a_record_of_failing_is_not_served_as_an_answer(data) -> None:
+    """The library is consulted before anything else, so an entry that only says
+    "we tried and could not" stops every future attempt with a stale reason.
+
+    The symptom: a provider removed from every route still appearing in
+    failures — "your credit balance is too low to access the Anthropic API",
+    quoted back from a cache, on a system with no Anthropic route at all.
+    """
+    components.save_extraction(data, 7, "PART1", {
+        "mpn": "PART1",
+        "base": {"_extraction_failed": True, "reason": "RateLimitError: no credits"},
+    })
+    assert components.extraction(data, 7, "PART1") is None
+
+
+def test_the_sentinel_is_found_at_any_depth(data) -> None:
+    """It sits wherever the failing task sat, so a top-level look would miss
+    most of them."""
+    components.save_extraction(data, 7, "PART2", {
+        "base": {"pinout": {"_extraction_failed": True, "reason": "boom"}},
+    })
+    assert components.extraction(data, 7, "PART2") is None
+
+
+def test_a_real_extraction_is_still_served(data) -> None:
+    components.save_extraction(data, 7, "PART3", {"pinout": [{"name": "VDD"}]})
+    assert components.extraction(data, 7, "PART3") == {"pinout": [{"name": "VDD"}]}
+
+
+def test_a_partial_result_is_not_half_trusted(data) -> None:
+    """One failed task among three does not make the file usable as a library
+    answer. It is fine in the project's own cache, where it sits next to what
+    did work and says what happened."""
+    components.save_extraction(data, 7, "PART4", {
+        "mcu": {"family": "STM32U5"},
+        "pinout": {"_extraction_failed": True, "reason": "truncated"},
+    })
+    assert components.extraction(data, 7, "PART4") is None
+
+
+def test_poisoned_entries_can_be_swept_and_stay_recoverable(data) -> None:
+    components.save_extraction(data, 7, "GOOD", {"pinout": [{"name": "VDD"}]})
+    components.save_extraction(data, 7, "BAD", {"_extraction_failed": True, "reason": "x"})
+    assert components.prune_failed(data, 7) == ["BAD"]
+    assert components.extraction(data, 7, "GOOD") is not None
+    assert not (components.part_repo(data, 7, "BAD") / components.EXTRACTED).exists()
+    # Removed with a commit, so it is still readable at the commit before — the
+    # whole reason a part is a repository.
+    repo = components.part_repo(data, 7, "BAD")
+    assert "_extraction_failed" in _git(repo, "show", f"HEAD~1:{components.EXTRACTED}")

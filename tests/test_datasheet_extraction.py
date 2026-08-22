@@ -97,7 +97,7 @@ def _run(tmp_path, chain, answers, monkeypatch):
     """Drive one extraction with ``answers`` keyed by endpoint name."""
     seen: list[str] = []
 
-    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text="", tables=""):
         seen.append(endpoint.name)
         return (answers.get(endpoint.name), "" if answers.get(endpoint.name) else "boom", 10, 5)
 
@@ -170,7 +170,7 @@ def test_a_document_with_a_text_layer_is_read_not_looked_at(tmp_path, scripted, 
     the ones an OCR pass merged. Every one of the seven had a text layer."""
     seen: list[bool] = []
 
-    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text="", tables=""):
         seen.append(bool(page_text))
         return ({"family": "x"}, "", 10, 5)
 
@@ -188,7 +188,7 @@ def test_a_scan_still_goes_as_pages(tmp_path, scripted, monkeypatch) -> None:
     because a scanned datasheet is a real thing and has no text to read."""
     seen: list[bool] = []
 
-    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text="", tables=""):
         seen.append(bool(page_text))
         return ({"family": "x"}, "", 10, 5)
 
@@ -227,7 +227,7 @@ def test_only_the_pages_a_task_is_about_are_sent(tmp_path, scripted, monkeypatch
         asked.append(list(pages) if pages else [])
         return "1  VDD  Power  Supply"
 
-    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text="", tables=""):
         return ({"family": "x"}, "", 10, 5)
 
     monkeypatch.setattr(datasheets, "_one_task", one_task)
@@ -260,7 +260,7 @@ def test_a_run_that_extracted_nothing_is_not_ok(tmp_path, happy, monkeypatch) ->
             (cache / f"{mpn}.plan.json").write_text(json.dumps({"tasks": []}), encoding="utf-8")
         return _Result(True, "")
 
-    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text="", tables=""):
         return ({"quality_verdict": {"verdict": "skip", "reason": "target MPN not found in PDF"}},
                 "", 10, 5)
 
@@ -364,7 +364,7 @@ def test_the_slice_is_sized_to_the_model_that_will_read_it(tmp_path, scripted, m
         # Far more text than a small window could take.
         return "x" * 400_000
 
-    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text=""):
+    async def one_task(*, endpoint, prompt, pdf_bytes, filename, schema, page_text="", tables=""):
         return ({"family": "x"}, "", 10, 5)
 
     monkeypatch.setattr(datasheets, "_one_task", one_task)
@@ -390,3 +390,183 @@ def test_a_window_is_asked_of_the_endpoint_not_assumed(monkeypatch) -> None:
                   base_url="http://x/v1", api_key="k")
     room = datasheets.budget_for(ep)
     assert 400_000 < room < 512_000  # the window, less what the answer needs
+
+
+# -- reading the grid the PDF already has ------------------------------------
+
+
+def _grid_pdf(path: Path) -> Path:
+    """A one-page PDF with a ruled 3x3 table, drawn the way a datasheet draws
+    one: lines for the cell borders and text inside them."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    c = canvas.Canvas(str(path), pagesize=letter)
+    rows = [["Pin", "Name", "Type"], ["1", "GND", "Ground"], ["2", "ANT", "Analog"]]
+    x0, y0, w, h = 60, 700, 120, 22
+    for r, row in enumerate(rows):
+        for col, cell in enumerate(row):
+            x, y = x0 + col * w, y0 - r * h
+            c.rect(x, y, w, h)
+            c.drawString(x + 4, y + 6, cell)
+    c.showPage()
+    c.save()
+    return path
+
+
+def test_a_ruled_table_comes_back_as_cells(tmp_path) -> None:
+    """The part that laying text out flat could never do. A pin table is a grid
+    and the PDF says so — it has the ruling lines, the cell bounds and the runs
+    inside them. Flattening it and asking a model to infer the grid back throws
+    that away, and every trick after that is an attempt to recover what the file
+    had already handed us."""
+    pytest.importorskip("reportlab")
+    pytest.importorskip("pdfplumber")
+    pdf = _grid_pdf(tmp_path / "grid.pdf")
+    out = datasheets.page_tables(pdf, [1])
+    assert "Pin | Name | Type" in out
+    assert "1 | GND | Ground" in out
+    assert "2 | ANT | Analog" in out
+
+
+def test_a_document_with_no_tables_says_nothing_rather_than_guessing(tmp_path) -> None:
+    pytest.importorskip("reportlab")
+    pytest.importorskip("pdfplumber")
+    from reportlab.pdfgen import canvas
+
+    p = tmp_path / "prose.pdf"
+    c = canvas.Canvas(str(p))
+    c.drawString(70, 700, "Just a sentence, with no table anywhere near it.")
+    c.showPage()
+    c.save()
+    # No ruling lines and one line of text: nothing that is honestly a table.
+    assert "|" not in datasheets.page_tables(p, [1]).replace("[table", "")
+
+
+def test_an_unreadable_file_falls_back_instead_of_failing(tmp_path) -> None:
+    """Tables are an improvement on the text layer, never a precondition for it."""
+    broken = tmp_path / "broken.pdf"
+    broken.write_bytes(b"%PDF-1.4 this is not a pdf")
+    assert datasheets.page_tables(broken, [1]) == ""
+
+
+def test_a_cell_holding_two_lines_stays_one_row(tmp_path) -> None:
+    """A pin with two functions is one cell containing two lines, which is
+    exactly what it means. On the real nRF9151 page this is
+    `2 | P0.20 ⏎ AIN7 | …` — where -layout gave two unlinked lines and OCR gave
+    'TRACECLK P0.22' merged into one string."""
+    assert datasheets._render_table([["2", "P0.20\nAIN7", "Digital I/O"]]) == (
+        "2 | P0.20 ⏎ AIN7 | Digital I/O"
+    )
+
+
+def test_blank_rows_are_dropped(tmp_path) -> None:
+    assert datasheets._render_table([["a", "b"], [None, ""], ["c", "d"]]) == "a | b\nc | d"
+
+
+def test_a_table_is_followed_past_the_page_the_scout_named(tmp_path, monkeypatch) -> None:
+    """The scout names where a section starts. A pin table does not politely end
+    there — the nRF54L15 module's runs 12 → 16, repeating its header on each and
+    stopping at 17 where a different table begins. Reading only the named page
+    returns a third of the pinout and reports success, which is the failure that
+    is hardest to notice because everything it does return is correct.
+    """
+    headers = {
+        12: ("Pin No.", "Name", "Pin function", "Description"),
+        13: ("Pin No.", "Name", "Pin function", "Description"),
+        14: ("Pin No.", "Name", "Pin function", "Description"),
+        15: ("Pin No.", "Name", "Pin function", "Description"),
+        16: ("Pin No.", "Name", "Pin function", "Description"),
+        17: ("RF IC", "Crystal Frequency"),
+    }
+    monkeypatch.setattr(datasheets, "_table_header", lambda pdf, n: headers.get(n))
+    assert datasheets.continued_pages(Path("x.pdf"), [12]) == [12, 13, 14, 15, 16]
+
+
+def test_a_one_page_table_stays_one_page(tmp_path, monkeypatch) -> None:
+    """MM8108's pin table is 38 pins on page 8, and page 9 is footnotes."""
+    headers = {8: ("Pin", "Pin Name", "Type"), 9: ("", "Refer to the onlin", "e version f")}
+    monkeypatch.setattr(datasheets, "_table_header", lambda pdf, n: headers.get(n))
+    assert datasheets.continued_pages(Path("x.pdf"), [8]) == [8]
+
+
+def test_continuation_is_judged_on_the_table_not_on_page_furniture(monkeypatch) -> None:
+    """Judging by "the first substantial line" found the *running header* —
+    "Refer to the online version for up-to-date content", on all 36 pages — so
+    one document continued forever and another not at all."""
+    monkeypatch.setattr(datasheets, "_table_header", lambda pdf, n: None)
+    # No table to compare, so it does not invent a continuation.
+    assert datasheets.continued_pages(Path("x.pdf"), [8]) == [8]
+
+
+def test_the_walk_is_bounded(monkeypatch) -> None:
+    """A header that matches forever must not read a 940-page datasheet."""
+    monkeypatch.setattr(datasheets, "_table_header", lambda pdf, n: ("same",  "header"))
+    assert len(datasheets.continued_pages(Path("x.pdf"), [1], limit=5)) == 5
+
+
+def test_pages_are_labelled_with_their_real_numbers() -> None:
+    """pdftotext separates pages with a form feed and says nothing about which
+    page is which. The schema asks every finding for its page, so without this
+    the model is guessing at the one field that makes a claim checkable."""
+    assert datasheets._mark_pages("first\fsecond", 12) == (
+        "--- Page 12 ---\nfirst\n--- Page 13 ---\nsecond"
+    )
+    # Blank pages do not consume a number they never had.
+    assert "Page 13" not in datasheets._mark_pages("first\f   \f", 12)
+
+
+# -- letting the document say where its sections are -------------------------
+
+
+def test_a_contents_line_is_read_as_title_and_page() -> None:
+    """The document already says where each section starts and, by naming the
+    next one, where it ends. That is a statement, not an inference."""
+    line = "     2.5. Pin assignment ................................................... 12"
+    m = datasheets._TOC_LINE.match(line)
+    assert m and m.group("page") == "12"
+    assert "Pin assignment" in m.group("title")
+
+
+def test_spaced_dot_leaders_are_read_too() -> None:
+    """Nordic's contents uses '. . . . .' with spaces between."""
+    m = datasheets._TOC_LINE.match("        11.1.1 LGA pin assignments. . . . . . . . . . . . 518")
+    assert m and m.group("page") == "518"
+
+
+def test_a_bare_page_number_is_not_a_contents_line() -> None:
+    """The footer prints one on every page. Requiring a title keeps it out."""
+    assert datasheets._TOC_LINE.match("                          12") is None
+
+
+def test_the_more_specific_heading_wins(monkeypatch) -> None:
+    """'Pin configuration' occurs six times in the nRF9151 contents as GPIO and
+    peripheral *register* subsections, none of which is the pinout. Taking the
+    first match sent the extractor to page 163 for a table on page 518."""
+    entries = [
+        ("6.4.1 Pin configuration", 163),
+        ("6.5.3 Tasks and events pin configuration", 173),
+        ("11.1 Pin assignments", 518),
+        ("11.2 Mechanical specifications", 521),
+    ]
+    monkeypatch.setattr(datasheets, "toc_entries", lambda pdf, scan_pages=12: entries)
+    got = datasheets.section_span(Path("x.pdf"), "pin assignment", "pin configuration")
+    assert got == [518, 519, 520]
+
+
+def test_a_section_ends_where_the_next_one_starts(monkeypatch) -> None:
+    entries = [("2.5. Pin assignment", 12), ("3. Main chip solution", 17)]
+    monkeypatch.setattr(datasheets, "toc_entries", lambda pdf, scan_pages=12: entries)
+    assert datasheets.section_span(Path("x.pdf"), "pin assignment") == [12, 13, 14, 15, 16]
+
+
+def test_subentries_sharing_a_page_do_not_end_a_section(monkeypatch) -> None:
+    entries = [("11.1 Pin assignments", 518), ("11.1.1 LGA pin assignments", 518),
+               ("11.2 Mechanical", 521)]
+    monkeypatch.setattr(datasheets, "toc_entries", lambda pdf, scan_pages=12: entries)
+    assert datasheets.section_span(Path("x.pdf"), "pin assignment") == [518, 519, 520]
+
+
+def test_no_contents_leaves_the_scout_alone(monkeypatch) -> None:
+    monkeypatch.setattr(datasheets, "toc_entries", lambda pdf, scan_pages=12: [])
+    assert datasheets.section_span(Path("x.pdf"), "pinout") == []

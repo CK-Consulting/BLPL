@@ -127,16 +127,17 @@ def page_text(pdf: Path, pages: Sequence[int] = ()) -> str:
     """
     if not shutil.which("pdftotext"):
         return ""
+    first = min(pages) if pages else 0
     args = ["pdftotext", "-layout"]
     if pages:
-        args += ["-f", str(min(pages)), "-l", str(max(pages))]
+        args += ["-f", str(first), "-l", str(max(pages))]
     try:
         out = subprocess.run(
             args + [str(pdf), "-"], capture_output=True, text=True, timeout=180
         )
     except (OSError, subprocess.SubprocessError):
         return ""
-    text = out.stdout
+    text = _mark_pages(out.stdout, first or 1)
     # A page of a scanned PDF yields a form feed and nothing else. Judge on the
     # printable characters rather than the length, or a 900-page scan looks like
     # a document with plenty of text.
@@ -173,6 +174,266 @@ def budget_for(endpoint) -> int:
 # When nothing will say. Low rather than high: a slice that turns out to fit is
 # a wasted round trip, and one that does not is a failed task.
 _CONTEXT_FALLBACK = 32_768
+
+
+# Tried in order; the first that finds anything wins. Ruling lines are the
+# strongest signal a PDF gives — they are the table, drawn — and where a
+# document rules only its columns, or none of them, the fallbacks infer the rest
+# from text alignment.
+# Below this, what came back is a caption rather than a table, and the next
+# strategy is worth trying. Three is enough to distinguish "header only" from
+# "header and some rows" without waiting for a long table to prove itself.
+_REAL_TABLE_ROWS = 3
+
+_TABLE_STRATEGIES = (
+    {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
+    {"vertical_strategy": "lines", "horizontal_strategy": "text"},
+    {"vertical_strategy": "text", "horizontal_strategy": "text"},
+)
+
+
+def page_tables(pdf: Path, pages: Sequence[int] = (), *, limit: int = 400) -> str:
+    """The tables on these pages, as cells, read out of the PDF itself.
+
+    This is the part that laying the text out flat could never do. A pin table
+    is a grid, and a PDF says so — it has the ruling lines, the cell bounds and
+    the text runs inside them. Rendering it to fixed-width text and asking a
+    model to infer the grid back throws that away, and then every downstream
+    trick is an attempt to recover information the file had already given us.
+
+    What it recovers that `-layout` and OCR both lost:
+
+        pdfplumber   ['6', 'P0.22\nTRACEDATA[0]', 'Digital I/O (SoC)\nTrace data', …]
+        -layout       6  P0.22  Digital I/O (SoC)  General purpose I/O.
+                         TRACEDATA[0]  Trace data  …          ← two lines, no link
+        OCR (MinerU) ['TRACECLK P0.22', 'Trace clock Digital l/O (SoC)', …]
+                                                              ← merged, and 'l' for 'I'
+
+    A pin with two functions is one cell containing two lines, which is exactly
+    what it means. Emitted with a marker rather than a newline so a row stays a
+    row.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return ""
+    out: list[str] = []
+    rows_emitted = 0
+    try:
+        with pdfplumber.open(str(pdf)) as doc:
+            wanted = list(pages) if pages else range(1, len(doc.pages) + 1)
+            for number in wanted:
+                if number < 1 or number > len(doc.pages):
+                    continue
+                page = doc.pages[number - 1]
+                # Ruling lines win when a document actually draws them: they
+                # are the table, and inferring columns from text alignment is a
+                # guess that can split a description in half. But a document
+                # that rules only its *header* — the nRF54L15 module spec —
+                # yields one row containing the header and nothing else, and
+                # taking that on faith left 45 pins unread.
+                #
+                # So: the first strategy that produces a table rather than just
+                # a caption. Falling back on row count alone was worse than
+                # either — it preferred a text split with more rows and wrong
+                # columns, turning "1 | GND | Ground" into "GND | Ground".
+                tables: list[list[list[str | None]]] = []
+                best = 0
+                for strategy in _TABLE_STRATEGIES:
+                    try:
+                        found = page.extract_tables(strategy)
+                    except Exception:  # noqa: BLE001 — a strategy that throws is a strategy that failed
+                        continue
+                    rows = sum(len(t) for t in found)
+                    if rows > best:
+                        tables, best = found, rows
+                    if rows >= _REAL_TABLE_ROWS:
+                        break
+                for table in tables:
+                    rendered = _render_table(table)
+                    if not rendered:
+                        continue
+                    out.append(f"[table, page {number}]\n{rendered}")
+                    rows_emitted += len(table)
+                    if rows_emitted >= limit:
+                        out.append(f"[… further tables omitted after {limit} rows]")
+                        return "\n\n".join(out)
+    except Exception:  # noqa: BLE001 — an unreadable PDF falls back to the text layer
+        return ""
+    return "\n\n".join(out)
+
+
+def _render_table(table: list[list[str | None]]) -> str:
+    rows = []
+    for row in table:
+        cells = [(c or "").strip().replace("\n", " ⏎ ") for c in row]
+        if not any(cells):
+            continue
+        rows.append(" | ".join(cells))
+    return "\n".join(rows)
+
+
+def _mark_pages(text: str, first: int) -> str:
+    """Label each page break with its real page number.
+
+    pdftotext separates pages with a form feed and says nothing about which page
+    is which. The schema asks every finding for the page it came from, so
+    without this the model is guessing at the one field that makes a claim
+    checkable afterwards.
+    """
+    out = []
+    for i, part in enumerate(text.split("\f")):
+        if part.strip():
+            out.append(f"--- Page {first + i} ---\n{part}")
+    return "\n".join(out)
+
+
+# What a task is looking for in a table of contents, most specific first — the
+# order is the ranking, so "pin assignments" beats "pin configuration" when a
+# document has both and only one of them is the pinout.
+#
+# Only for tasks whose section a datasheet actually names. Anything absent here
+# keeps the pages the scout chose.
+_TOC_WORDS: dict[str, tuple[str, ...]] = {
+    "pinout": (
+        "pin assignment", "pin assignments", "pinout", "pin out",
+        "pin description", "pin descriptions", "pin definition",
+        "pin configuration", "pin function",
+    ),
+    "mcu": ("block diagram", "features", "product overview"),
+    "regulator": ("power supply", "power management", "regulator"),
+    "crystal": ("crystal", "clock", "oscillator"),
+}
+
+
+# A contents line: a title, then leaders (dots, spaced dots, or just a run of
+# spaces), then the page it starts on. Requiring a title is what keeps the
+# footer's bare page number out.
+_TOC_LINE = re.compile(r"^\s{0,12}(?P<title>\S.*?\S)[\s.]{4,}(?P<page>\d{1,4})\s*$")
+
+
+def toc_entries(pdf: Path, *, scan_pages: int = 12) -> list[tuple[str, int]]:
+    """(title, page) for every contents line, in the order printed.
+
+    The document already says where each section starts and, by naming the next
+    one, where it ends. That is a statement, not an inference — better than
+    matching repeated table headers, and it works for sections that are prose.
+
+    The offset between a printed page number and a PDF page index is not assumed
+    here; ``section_span`` resolves it by looking.
+    """
+    text = page_text(pdf, range(1, scan_pages + 1))
+    out: list[tuple[str, int]] = []
+    for line in text.splitlines():
+        m = _TOC_LINE.match(line)
+        if not m:
+            continue
+        title = " ".join(m.group("title").split()).rstrip(". ")
+        page = int(m.group("page"))
+        if title and 0 < page < 10_000:
+            out.append((title, page))
+    return out
+
+
+def section_span(pdf: Path, *words: str, scan_pages: int = 12) -> list[int]:
+    """The printed page range of the first contents entry matching ``words``.
+
+    Empty when the document has no contents, or none of its entries match — in
+    which case the caller keeps whatever the scout gave it.
+    """
+    entries = toc_entries(pdf, scan_pages=scan_pages)
+    if not entries:
+        return []
+    wanted = [w.lower() for w in words]
+
+    # Ranked, not first-match. "Pin configuration" occurs six times in the
+    # nRF9151 contents as GPIO and peripheral *register* subsections, none of
+    # which is the pinout; taking the first sent the extractor to page 163 for a
+    # table that is on page 518. The entry that wins is the one where the phrase
+    # is most nearly the whole heading, and where the phrase itself is the more
+    # specific one — "pin assignments" beats "pin configuration".
+    best: tuple[float, int, int] | None = None
+    for i, (title, page) in enumerate(entries):
+        # The section number is not part of the name.
+        name = re.sub(r"^[\d.]+\s*", "", title).strip().lower()
+        for rank, word in enumerate(wanted):
+            if word not in name:
+                continue
+            coverage = len(word) / max(len(name), 1)
+            score = (-rank, coverage)
+            if best is None or score > (-best[0], best[1]):
+                best = (rank, coverage, i)
+            break
+    if best is None:
+        return []
+
+    i = best[2]
+    page = entries[i][1]
+    # The next entry that starts on a *later* page ends this one. Sub-entries
+    # sharing a page do not.
+    end = next((p for _, p in entries[i + 1:] if p > page), page)
+    return list(range(page, max(page, end - 1) + 1))
+
+
+def _table_header(pdf: Path, number: int) -> tuple[str, ...] | None:
+    """The header row of the first real table on a page.
+
+    Read from the table structure rather than from the text, and that is the
+    whole of the fix. Judging continuation by "the first substantial line" found
+    the *running header* instead — "Refer to the online version for up-to-date
+    content", which is on all 36 pages — so one document continued forever and
+    another not at all.
+
+    A table's header row is a much better signal, because it is the thing a
+    document actually repeats when a table carries on.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return None
+    try:
+        with pdfplumber.open(str(pdf)) as doc:
+            if number < 1 or number > len(doc.pages):
+                return None
+            page = doc.pages[number - 1]
+            for strategy in _TABLE_STRATEGIES:
+                try:
+                    tables = page.extract_tables(strategy)
+                except Exception:  # noqa: BLE001
+                    continue
+                for table in tables:
+                    for row in table:
+                        cells = tuple((c or "").strip() for c in row)
+                        if sum(1 for c in cells if c) >= 2:
+                            return cells
+    except Exception:  # noqa: BLE001 — an unreadable page ends the walk
+        return None
+    return None
+
+
+def continued_pages(pdf: Path, pages: Sequence[int], *, limit: int = 30) -> list[int]:
+    """The task's pages, plus any that carry the same table onward.
+
+    The scout names where a section *starts*. A pin table does not politely end
+    there: the nRF54L15 module's runs from page 12 to page 16, repeating
+    ``Pin No. | Name | Pin function | Description`` at the top of each, and
+    stopping at 17 where a different table begins. Reading only the named page
+    returns a third of the pinout and reports success — the failure that is
+    hardest to notice, because everything it does return is correct.
+    """
+    wanted = sorted({int(p) for p in pages})
+    if not wanted:
+        return []
+    header = _table_header(pdf, wanted[0])
+    if not header:
+        return wanted
+    nxt = wanted[-1] + 1
+    while len(wanted) < limit:
+        if _table_header(pdf, nxt) != header:
+            break
+        wanted.append(nxt)
+        nxt += 1
+    return wanted
 
 
 def has_text_layer(pdf: Path) -> bool:
@@ -231,6 +492,7 @@ async def _one_task(
     filename: str,
     schema: dict,
     page_text: str = "",
+    tables: str = "",
 ) -> tuple[dict | None, str, int, int]:
     """Run one extractor. Returns (data, error, tokens_in, tokens_out).
 
@@ -260,14 +522,23 @@ async def _one_task(
         f"{json.dumps(schema, indent=2)[:20000]}"
     )
     if page_text:
-        content = [
-            TextBlock(
-                "The relevant pages of the datasheet, as text, with the original column "
-                "layout preserved by whitespace. Columns are separated by runs of spaces; "
-                "a row whose first column is blank continues the row above it.\n\n"
-                f"<<<{filename}>>>\n{page_text}\n<<<end>>>\n\n" + instruction
+        body = ""
+        if tables:
+            body += (
+                "The tables on these pages, read out of the PDF's own cell structure. "
+                "Each row is one row of the table and `|` separates its cells; ` ⏎ ` "
+                "inside a cell is a line break *within that cell*, which is how a pin "
+                "with two functions is written — both belong to the same row.\n\n"
+                "Use these for anything tabular. They are the document's own grid rather "
+                "than an inference about where the columns were.\n\n"
+                f"{tables}\n\n"
             )
-        ]
+        body += (
+            "The same pages as running text, with the column layout preserved by "
+            "whitespace — for prose, footnotes and anything the tables above missed.\n\n"
+            f"<<<{filename}>>>\n{page_text}\n<<<end>>>\n\n"
+        )
+        content = [TextBlock(body + instruction)]
     else:
         content = [DocumentBlock(data=pdf_bytes, filename=filename), TextBlock(instruction)]
     messages = [Msg(role="user", content=content)]
@@ -647,7 +918,28 @@ async def extract_datasheet(
         # Only the pages this task is about. The plan already says which they
         # are, and a pin table read from its own six pages costs a few thousand
         # tokens where the whole 541-page document costs hundreds of thousands.
-        task_text = page_text(pdf_path, pages) if readable else ""
+        # Where this section is, in the document's own words.
+        #
+        # A datasheet's contents page names the page each section starts on and,
+        # by naming the next one, where it ends. That is a statement rather than
+        # an inference, and it is what the scout's single page number was
+        # standing in for badly: the nRF54L15 module's pin assignment runs 12 to
+        # 16, so reading page 12 alone returned a third of the pinout and called
+        # it done — the failure that is hardest to see, because everything it
+        # does return is correct.
+        span = list(pages)
+        if readable:
+            named = section_span(pdf_path, *_TOC_WORDS.get(task_id, ()))
+            if named:
+                span = named
+                note(f"{mpn}: {task_id} is pages {named[0]}–{named[-1]} per the contents")
+            else:
+                # No contents entry: follow the repeated table header instead.
+                span = continued_pages(pdf_path, pages)
+                if len(span) > len(pages):
+                    note(f"{mpn}: {task_id} continues past page {max(pages)} — {len(span)} pages")
+        task_text = page_text(pdf_path, span) if readable else ""
+        task_tables = page_tables(pdf_path, span) if readable else ""
         if task_text:
             # Measured against the window of the model that will read it, rather
             # than sent and hoped for. A slice that does not fit comes back as a
@@ -656,13 +948,14 @@ async def extract_datasheet(
             room = max(4_000, int(budget_for(chain[0]) * 0.6))
             estimate = len(task_text) // 4
             if estimate > room:
-                keep_pages = max(1, int(len(pages or [1]) * room / estimate))
+                keep_pages = max(1, int(len(span or [1]) * room / estimate))
                 note(
                     f"{mpn}: {task_id} spans ~{estimate:,} tokens, over the "
                     f"~{room:,} that fits — reading the first {keep_pages} of "
-                    f"{len(pages)} pages"
+                    f"{len(span)} pages"
                 )
-                task_text = page_text(pdf_path, sorted(pages)[:keep_pages])
+                task_text = page_text(pdf_path, sorted(span)[:keep_pages])
+                task_tables = page_tables(pdf_path, sorted(span)[:keep_pages])
         async with semaphore:
             for i, ep in enumerate(chain):
                 note(
@@ -676,6 +969,7 @@ async def extract_datasheet(
                     filename=pdf_path.name,
                     schema=schema,
                     page_text=task_text,
+                    tables=task_tables,
                 )
                 # Schema validation counts as failure for the purpose of moving
                 # on. Output that parses but does not validate is the signature

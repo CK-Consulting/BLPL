@@ -271,9 +271,58 @@ def extraction(data_root: Path, user_id: int, mpn: str) -> dict | None:
     if not f.is_file():
         return None
     try:
-        return json.loads(f.read_text(encoding="utf-8"))
+        payload = json.loads(f.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    # A record of failing is not an answer, and this is consulted before
+    # anything else — so an entry that only says "we tried and could not" would
+    # stop every future attempt with a stale reason. Entries written before that
+    # was enforced are still on disk, hence the check here rather than only at
+    # the point of writing.
+    if not _holds_findings(payload):
+        return None
+    return payload
+
+
+def _holds_findings(payload: object) -> bool:
+    """False when every path through this ends in an ``_extraction_failed``
+    sentinel. Recursive, because the marker sits at whatever depth the failing
+    task did."""
+    if isinstance(payload, dict):
+        if payload.get("_extraction_failed"):
+            return False
+        return all(_holds_findings(v) for v in payload.values())
+    if isinstance(payload, list):
+        return all(_holds_findings(v) for v in payload)
+    return True
+
+
+def prune_failed(data_root: Path, user_id: int) -> list[str]:
+    """Drop library entries that record a failure instead of a result.
+
+    Returns the parts cleaned. The file is removed with a commit rather than
+    unlinked, so what was there is still readable at the commit before — the
+    whole reason a part is a repository.
+    """
+    cleaned: list[str] = []
+    r = root(data_root, user_id)
+    if not r.is_dir():
+        return cleaned
+    for d in sorted(r.iterdir()):
+        f = d / EXTRACTED
+        if not (d / ".git").exists() or not f.is_file():
+            continue
+        try:
+            payload = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if _holds_findings(payload):
+            continue
+        f.unlink()
+        _git(d, "rm", "--cached", "--quiet", "--", EXTRACTED)
+        _git(d, "commit", "-m", f"Drop failed extraction for {d.name}")
+        cleaned.append(d.name)
+    return cleaned
 
 
 def save_extraction(data_root: Path, user_id: int, mpn: str, payload: dict) -> None:
