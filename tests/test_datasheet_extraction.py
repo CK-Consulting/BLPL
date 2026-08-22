@@ -323,7 +323,7 @@ def test_output_cut_off_mid_value_says_so() -> None:
     """Distinct from malformed: the fix is a bigger max_tokens, not a different
     model, and the message has to say which."""
     value, err = datasheets.first_json_value('[{"numbers": ["1"], "name": "GN')
-    assert value is None and "unterminated" in err
+    assert value is None and "cut off" in err
 
 
 def test_reasoning_prose_before_the_json_is_skipped() -> None:
@@ -331,3 +331,23 @@ def test_reasoning_prose_before_the_json_is_skipped() -> None:
         'Let me work through the table.\nThe first pin is GND.\n[{"name": "GND"}]'
     )
     assert not err and value == [{"name": "GND"}]
+
+
+def test_the_output_ceiling_fits_a_real_pinout() -> None:
+    """A correct pinout for the nRF9151 — 113 pins with type, power domain,
+    alternate functions and evidence — measured 21,292 output tokens. The shared
+    default is 16,384, so every pinout for a real part was cut off at exactly
+    the ceiling and came back as broken JSON."""
+    from blpl.core.llm_chat import DEFAULT_MAX_TOKENS
+
+    assert datasheets.MAX_OUTPUT_TOKENS > 21_292
+    assert datasheets.MAX_OUTPUT_TOKENS > DEFAULT_MAX_TOKENS
+
+
+def test_truncation_is_reported_as_truncation_not_as_a_bad_model() -> None:
+    """The fix for one is a bigger ceiling and for the other a different model.
+    Confusing them sent this work through a vision model, MinerU and an OCR
+    pipeline before anybody looked at finish_reason."""
+    _, err = datasheets.first_json_value('[{"numbers": ["1"], "name": "GN')
+    assert "cut off" in err and "ceiling" in err
+    assert "not a model that cannot hold the schema" in err

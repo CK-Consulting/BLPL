@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -43,7 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ...core import llm_chat
+from ...core import limits, llm_chat
 from ...core.llm_chat import DocumentBlock, Endpoint, Msg, TextBlock, build_chat_adapter
 from ..kicad_happy import find_kicad_happy, run_script, script_path
 
@@ -242,23 +243,90 @@ async def _one_task(
     messages = [Msg(role="user", content=content)]
     usage_in = usage_out = 0
     text_parts: list[str] = []
-    try:
-        async for event in adapter.stream_chat(messages, max_tokens=llm_chat.DEFAULT_MAX_TOKENS):
+    want = limits.output_limit(endpoint, MAX_OUTPUT_TOKENS)
+
+    async def attempt(cap: int) -> None:
+        nonlocal usage_in, usage_out
+        async for event in adapter.stream_chat(messages, max_tokens=cap):
             if isinstance(event, llm_chat.Usage):
                 usage_in += event.input_tokens
                 usage_out += event.output_tokens
             elif isinstance(event, llm_chat.Done):
                 text_parts.append(event.message.text)
+
+    try:
+        await attempt(want)
     except Exception as exc:  # noqa: BLE001 — provider/transport failure is a task failure
-        return None, f"{type(exc).__name__}: {exc}", usage_in, usage_out
+        # A provider refusing the ceiling names the real one. That is the
+        # authoritative figure from the only party that knows it, so it is
+        # remembered and the call retried rather than reported as a failure —
+        # the first call to an unfamiliar model should not have to be a
+        # sacrifice.
+        learned = limits.learn_from_error(endpoint.name, exc)
+        if learned is None or learned >= want:
+            return None, f"{type(exc).__name__}: {exc}", usage_in, usage_out
+        text_parts.clear()
+        try:
+            await attempt(learned)
+        except Exception as retry_exc:  # noqa: BLE001
+            return None, f"{type(retry_exc).__name__}: {retry_exc}", usage_in, usage_out
 
     raw = "\n".join(t for t in text_parts if t).strip()
     if not raw:
         return None, "model returned no text", usage_in, usage_out
     payload, err = first_json_value(raw)
+
+    # A refusal teaches the ceiling downward; running into it teaches upward.
+    # Without this second half, a model whose real limit is higher than the
+    # table's opening bid would be truncated forever and never say why —
+    # nothing refuses, so nothing is learned, and a half-written pinout comes
+    # back looking like a model that cannot finish a thought.
+    if err and "cut off" in err and want < MAX_OUTPUT_TOKENS:
+        bigger = min(want * 2, MAX_OUTPUT_TOKENS)
+        text_parts.clear()
+        try:
+            await attempt(bigger)
+        except Exception as exc:  # noqa: BLE001
+            learned = limits.learn_from_error(endpoint.name, exc)
+            if learned is not None:
+                # It said no and named the real number, which is worth having
+                # even though this attempt is lost.
+                return None, f"{err} (retried at {bigger}, provider caps at {learned})", \
+                    usage_in, usage_out
+            return None, err, usage_in, usage_out
+        raw = "\n".join(t for t in text_parts if t).strip()
+        payload, err = first_json_value(raw)
+        if not err:
+            limits.learn(endpoint.name, bigger)
+
     if err:
         return None, err, usage_in, usage_out
     return payload, "", usage_in, usage_out
+
+
+# How long an extraction answer may be.
+#
+# The shared default is 16,384, which is fine for prose and much too small
+# here. A correct pinout for the nRF9151 — 113 pins, each with type, power
+# domain, alternate functions and evidence — measured **21,292 output tokens**.
+# It could not have fitted, so every pinout for a real part was cut off at
+# exactly the ceiling and came back as broken JSON.
+#
+# That failure is indistinguishable from a model that cannot hold the schema
+# unless something checks, which is why `first_json_value` reports
+# "unterminated" separately: the fix for one is a bigger ceiling and for the
+# other a different model, and confusing the two sent this work through a
+# vision model, MinerU and an OCR pipeline before anybody looked at
+# finish_reason.
+#
+# What extraction would *like*. What it actually asks any given endpoint for is
+# this capped by that endpoint's real limit — declared, discovered from the
+# server, or learned from the provider's own refusal. See blpl/core/limits.py.
+#
+# 64k rather than a snug fit. A 300-ball BGA has three times the pins of the
+# part that set this number, and the cost of asking for headroom nobody uses is
+# nothing — providers bill generated tokens, not the ceiling.
+MAX_OUTPUT_TOKENS = int(os.environ.get("BLPL_EXTRACT_MAX_TOKENS") or 65536)
 
 
 def first_json_value(raw: str) -> tuple[Any | None, str]:
@@ -322,7 +390,12 @@ def first_json_value(raw: str) -> tuple[Any | None, str]:
                     return json.loads(text[start : i + 1]), ""
                 except json.JSONDecodeError as exc:
                     return None, f"malformed JSON: {exc}"
-    return None, f"unterminated JSON in output (truncated at {len(text)} chars)"
+    return None, (
+        f"output was cut off mid-value after {len(text)} characters — the answer "
+        f"is longer than the {MAX_OUTPUT_TOKENS}-token ceiling. Raise "
+        "BLPL_EXTRACT_MAX_TOKENS, or split the task across fewer pages. This is "
+        "not a model that cannot hold the schema; it is one that was interrupted."
+    )
 
 
 def _validate(data: dict, schema_path: Path) -> str:

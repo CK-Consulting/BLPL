@@ -96,7 +96,12 @@ class ProjectEntry:
 # variant is the same model id with a suffix.
 _CONTEXT_BY_MODEL: tuple[tuple[str, int], ...] = (
     ("[1m]", 1_000_000),
-    ("nemotron-3", 1_000_000),
+    # Not 1,000,000. The weights support it; what a window actually is depends
+    # on how the server was started, and the Nemotron on this network reports
+    # max_model_len=262144. Inferring the model's *capability* rather than the
+    # deployment's *configuration* is how a request gets built four times too
+    # large — so this is the conservative figure and a declared value wins.
+    ("nemotron-3", 262_144),
     ("gpt-5", 400_000),
     ("gpt-4.1", 1_000_000),
     ("claude", 200_000),
@@ -127,6 +132,14 @@ class Endpoint:
     # a deployment choice the model's name cannot express: the same Nemotron
     # weights serve 128k or 1M depending on how vLLM was started.
     context_tokens: int | None = None
+    # The most tokens this model will produce in one answer. None → discovered
+    # from the server, learned from its own refusal, or inferred. See
+    # blpl/core/limits.py; declared always wins.
+    #
+    # Worth being able to state, because it is the difference between a pinout
+    # and half a pinout, and because it is a deployment choice as often as a
+    # model property.
+    max_output_tokens: int | None = None
 
     @property
     def needs_key(self) -> bool:
