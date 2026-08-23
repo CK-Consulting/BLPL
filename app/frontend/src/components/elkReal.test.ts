@@ -81,3 +81,4 @@ describe("elk renders the project's real diagram", () => {
     await expect(mermaid.parse(src)).resolves.toBeTruthy();
   });
 });
+

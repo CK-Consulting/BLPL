@@ -2159,6 +2159,12 @@ def _tree_role(rel: Path) -> str:
         return "artifact"
     if parts and parts[0] == "datasheets":
         return "datasheet"
+    # vis/ is where a project's diagrams and renders live. It is design work —
+    # the architecture drawing is usually the first thing anybody makes and the
+    # thing they come back to — so it belongs in the group that opens by
+    # default, not filed under "other" with the scratch files.
+    if parts and parts[0] in {"vis", "diagrams"}:
+        return "design"
     if parts and parts[0] == quarantine.QUARANTINE_DIRNAME:
         # Shown, not hidden. Hiding retrieved files would mean the only place
         # anything untrusted lives is also the only place nobody looks.

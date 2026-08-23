@@ -174,6 +174,139 @@ export function Diagram({ source }: { source: string }) {
     );
   }
   if (svg === null) return <div className="muted small pad">Rendering diagram…</div>;
-  // Mermaid's own output, produced under securityLevel: "strict".
-  return <div className="diagram" ref={host} dangerouslySetInnerHTML={{ __html: svg }} />;
+  return <Zoomable svg={svg} hostRef={host} />;
+}
+
+// How far a click of the zoom control moves, and where it stops. The floor is
+// below 1 because "fit" already shrinks a wide diagram — being able to go
+// further out is what lets you find the corner you want before going in.
+const STEP = 1.25;
+const MIN = 0.3;
+const MAX = 6;
+
+/**
+ * Pan and zoom over a rendered diagram.
+ *
+ * Fitting to the pane is the right default and is not sufficient: a board
+ * diagram that fits is a board diagram whose port labels and switch states are
+ * too small to read, and those are the parts worth checking.
+ *
+ * The wheel is left alone unless Ctrl or Cmd is held. Hijacking plain scroll
+ * inside a long document means the page stops responding to the gesture
+ * everybody uses to move down it — and the diagram is *in* a document.
+ *
+ * Everything reachable by mouse is reachable by keyboard: the buttons do the
+ * same job as the drag and the wheel, which is the whole reason they are
+ * buttons rather than a gesture nobody can discover.
+ */
+function Zoomable({
+  svg,
+  hostRef,
+}: {
+  svg: string;
+  hostRef: React.MutableRefObject<HTMLDivElement | null>;
+}) {
+  const [scale, setScale] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const frame = useRef<HTMLDivElement | null>(null);
+  const drag = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
+
+  const zoomTo = (next: number) => setScale(Math.min(MAX, Math.max(MIN, next)));
+  const fit = () => {
+    setScale(1);
+    setPan({ x: 0, y: 0 });
+  };
+
+  useEffect(() => {
+    // A new diagram starts fitted rather than wherever the last one was left.
+    fit();
+  }, [svg]);
+
+  useEffect(() => {
+    const el = frame.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      setScale((s) => Math.min(MAX, Math.max(MIN, s * (e.deltaY < 0 ? 1.1 : 1 / 1.1))));
+    };
+    // Not passive: the whole point is to prevent the browser's own page zoom.
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  const onMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    drag.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y };
+  };
+
+  useEffect(() => {
+    const move = (e: MouseEvent) => {
+      const from = drag.current;
+      if (!from) return;
+      setPan({ x: from.px + (e.clientX - from.x), y: from.py + (e.clientY - from.y) });
+    };
+    const up = () => {
+      drag.current = null;
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+  }, []);
+
+  const zoomed = scale !== 1 || pan.x !== 0 || pan.y !== 0;
+
+  return (
+    <div className="diagram">
+      <div className="diagram-controls">
+        <button
+          className="link"
+          title="Zoom out"
+          aria-label="Zoom out"
+          onClick={() => zoomTo(scale / STEP)}
+          disabled={scale <= MIN}
+        >
+          −
+        </button>
+        {/* The current zoom as a number, not just a slider position: it is the
+            thing you want to know when a diagram looks wrong. */}
+        <span className="diagram-zoom" aria-live="polite">
+          {Math.round(scale * 100)}%
+        </span>
+        <button
+          className="link"
+          title="Zoom in"
+          aria-label="Zoom in"
+          onClick={() => zoomTo(scale * STEP)}
+          disabled={scale >= MAX}
+        >
+          +
+        </button>
+        <button className="link" onClick={fit} disabled={!zoomed} title="Back to fitting the pane">
+          Fit
+        </button>
+        <span className="spacer" />
+        <span className="muted small diagram-hint">drag to pan · ⌘/ctrl + scroll to zoom</span>
+      </div>
+      <div
+        className={drag.current ? "diagram-frame dragging" : "diagram-frame"}
+        ref={frame}
+        onMouseDown={onMouseDown}
+      >
+        <div
+          className="diagram-canvas"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`,
+            transformOrigin: "top center",
+          }}
+          ref={hostRef}
+          // Mermaid's own output, produced under securityLevel: "strict".
+          dangerouslySetInnerHTML={{ __html: svg }}
+        />
+      </div>
+    </div>
+  );
 }

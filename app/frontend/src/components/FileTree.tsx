@@ -221,7 +221,10 @@ export function FileTree({
             // group and every folder expanded, which put a project's four
             // design documents at the bottom of a page of generated artifacts.
             // Design is what the workbench is for.
-            defaultOpen={role === "design"}
+            // Design and Diagrams open; the rest stay folded. A project's
+            // architecture drawing is usually the first thing made and the
+            // thing most returned to.
+            defaultOpen={role === "design" || role === "diagram"}
             // A filter is a search, and a search that leaves its results folded
             // away has not answered anything.
             forceOpen={filter.trim().length > 0}

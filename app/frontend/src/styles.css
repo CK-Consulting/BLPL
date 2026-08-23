@@ -347,8 +347,22 @@ body.resizing-y * { pointer-events: none; }
    page sideways — a wide flowchart is the one thing that reliably breaks a
    column layout. Node text is 12.44:1 and the edges 6.29:1 against the panel;
    1.4.11 asks 3:1 of a line that carries meaning, and these carry all of it. */
-.diagram { overflow-x: auto; margin: .8rem 0; padding: .6rem; background: #15181d; border: 1px solid #2a3038; border-radius: 8px; }
-.diagram svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+.diagram { margin: .8rem 0; background: #15181d; border: 1px solid #2a3038; border-radius: 8px; overflow: hidden; }
+/* The frame clips; the canvas inside it moves. Panning by transform rather than
+   by scrollbars keeps the diagram's own coordinate space intact, which matters
+   because the SVG is what gets exported. */
+.diagram-frame { overflow: hidden; padding: .6rem; cursor: grab; max-height: 78vh; }
+.diagram-frame.dragging { cursor: grabbing; user-select: none; }
+.diagram-canvas { transition: transform .08s linear; }
+.diagram-canvas svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+.diagram-controls { display: flex; align-items: center; gap: .45rem; padding: .35rem .5rem; border-bottom: 1px solid #2a3038; background: #20242c; }
+/* 11.55:1. The zoom figure is the thing you want when a diagram looks wrong,
+   so it is text rather than a slider position. */
+.diagram-zoom { font-size: 12.5px; color: #cfd8e3; min-width: 3.2rem; text-align: center; font-variant-numeric: tabular-nums; }
+.diagram-controls button.link { font-size: 15px; line-height: 1; padding: .15rem .45rem; color: #cfd8e3; }
+.diagram-controls button.link:disabled { opacity: .45; }
+.diagram-controls button.link:focus-visible { outline: 3px solid #80a8ff; outline-offset: 1px; border-radius: 4px; }
+.diagram-hint { font-size: 11.5px; }
 .diagram-error { margin: .8rem 0; padding: .6rem; border: 1px dashed #a2444f; border-radius: 8px; background: #1c1418; }
 .diagram-error .code-view { margin-top: .5rem; font-size: 12.5px; }
 

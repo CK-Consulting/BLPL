@@ -907,3 +907,20 @@ def test_ollama_still_lists_its_own_names(unlocked, monkeypatch) -> None:
     assert r.status_code == 200, r.text
     assert r.json()["models"] == ["qwen2.5vl:7b"]
     assert r.json()["labels"] == {}
+
+
+def test_vis_is_design_work_not_other() -> None:
+    """A project's architecture drawing is usually the first thing made and the
+    thing most returned to. Filed under "other" it sits behind a fold with the
+    scratch files."""
+    pytest.importorskip("fastapi")
+    from app.main import _tree_role
+
+    assert _tree_role(Path("vis/rf-block-diagram.mmd")) == "design"
+    assert _tree_role(Path("vis/rf-block-diagram.png")) == "design"
+    assert _tree_role(Path("diagrams/overview.mmd")) == "design"
+    # And the rules it must not disturb.
+    assert _tree_role(Path("datasheets/x.pdf")) == "datasheet"
+    assert _tree_role(Path("overview.md")) == "design"
+    assert _tree_role(Path("arch.mmd")) == "diagram"
+    assert _tree_role(Path("scratch.bin")) == "other"
