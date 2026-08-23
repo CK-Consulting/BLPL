@@ -22,9 +22,8 @@ on:
       - .github/workflows/kcaa-upstream-check.yml
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: write   # push the bump branch
+  issues: write     # say the bump is ready, or that a check broke
 
 env:
   SUBMODULE_PATH: kicad-ai-assistant
@@ -83,6 +82,7 @@ jobs:
           npm install jsdom
 
       - name: Run kcaa test suite
+        id: kcaa_tests
         if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
         working-directory: kicad-ai-assistant
         env:
@@ -90,35 +90,69 @@ jobs:
         run: uv run python -m pytest tests/ --tb=short -o "addopts="
 
       - name: Run BLPL contract check
+        id: contract
         if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
         working-directory: kicad-ai-assistant
         env:
           KICAD_VERSION: "10"
         run: uv run python ../tests/kcaa_contract_check.py
 
-      - name: Open bump PR
+      # No pull request is opened from here, deliberately. Creating one needs
+      # "Allow GitHub Actions to create and approve pull requests", and that same
+      # switch also lets Actions *approve* pull requests — which is a review
+      # bypass waiting for the day this repository gets branch protection. The
+      # bump is one click either way, and it is only ever needed on the weeks
+      # upstream has actually moved. So: push the branch, say so, stay green.
+      - name: Push the bump branch
+        id: bump_branch
         if: github.event_name != 'pull_request' && steps.advance.outputs.changed == 'true' && success()
-        uses: peter-evans/create-pull-request@v7
-        with:
-          branch: bots/kcaa-upstream-bump
-          add-paths: kicad-ai-assistant
-          commit-message: |
-            Bump kicad-ai-assistant to latest fork main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B bots/kcaa-upstream-bump
+          git add -- "$SUBMODULE_PATH"
+          git commit -m "Bump kicad-ai-assistant to latest fork main
 
-            ${{ steps.advance.outputs.old }} -> ${{ steps.advance.outputs.new }}
-            kcaa test suite and BLPL contract check passed in the triggering run.
-          title: "Bump kicad-ai-assistant submodule (upstream sync)"
-          body: |
-            Automated bump of `kicad-ai-assistant`:
-            `${{ steps.advance.outputs.old }}` → `${{ steps.advance.outputs.new }}`
+          ${{ steps.advance.outputs.old }} -> ${{ steps.advance.outputs.new }}
+          kcaa test suite and BLPL contract check passed in the triggering run."
+          git push --force-with-lease origin bots/kcaa-upstream-bump
 
-            kcaa's own test suite and the BLPL contract check
-            (`tests/kcaa_contract_check.py`) both passed —
-            see the [triggering run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
-          labels: kcaa-upstream
+      - name: Say the bump is ready
+        if: github.event_name != 'pull_request' && steps.advance.outputs.changed == 'true' && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create kcaa-upstream --force --description "kicad-ai-assistant upstream tracking" --color FBCA04 || true
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          compare="${{ github.server_url }}/${{ github.repository }}/compare/main...bots/kcaa-upstream-bump?expand=1"
+          body=$(cat <<EOF
+          kcaa's test suite and the BLPL contract check both passed against the fork's
+          latest main, and \`bots/kcaa-upstream-bump\` is pushed and ready:
 
+          \`${{ steps.advance.outputs.old }}\` → \`${{ steps.advance.outputs.new }}\`
+
+          Open it here: $compare
+
+          Run: $run_url
+          EOF
+          )
+          existing=$(gh issue list --label kcaa-upstream --state open --search "in:title ready to open" --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "kcaa bump ready to open" --label kcaa-upstream --body "$body"
+          fi
+
+      # Only the two checks above say anything about compatibility. `failure()`
+      # alone covered every step, so when the bump PR could not be opened — a
+      # repository permission, nothing to do with kcaa — this filed an issue
+      # announcing that upstream had broken the contract. It had not. An alarm
+      # that names the wrong cause is worse than none: it sends whoever reads it
+      # looking for a fault that was never there.
       - name: File breakage issue
-        if: github.event_name != 'pull_request' && failure()
+        if: >-
+          github.event_name != 'pull_request' && failure() &&
+          (steps.kcaa_tests.outcome == 'failure' || steps.contract.outcome == 'failure')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
