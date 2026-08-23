@@ -58,3 +58,25 @@ __MACOSX/
 .fseventsd
 .apdisk
 .com.apple.timemachine.donotpresent
+
+# Diagram reference material, for people rather than for builds. The standards
+# the block-diagram shape rules were read against — IEC 60617, IEEE 315-1975,
+# ANSI/IEEE 91-1991 — are 96 MB on disk and 78 MB in the pack. They are opened
+# when those rules are revisited and read by nothing that builds, so they stay
+# on the machine of whoever is doing that work.
+#
+# Named one by one, rather than ignoring the folder and re-admitting the
+# exceptions. That shape is a trap here: `customization-inspirations/*` excludes
+# the *directories* too, and git will not re-include a file inside an excluded
+# directory, so a later `!.../still-needed.css` would silently do nothing and
+# the file would go missing with no rule appearing to be at fault.
+#
+# Listing what leaves also means anything added here is kept by default, which
+# is the safer way round. A file that should have been ignored costs one line;
+# a file that was silently ignored costs the work that produced it.
+#
+# Everything not named below stays tracked — including tailwind-colors.css,
+# which palette.py reads to generate the theme, and the two symbol-library
+# submodules, which cost a pointer each.
+mermaid/customization-inspirations/electronics-symbols/
+mermaid/customization-inspirations/Electrical_symbols_library.svg
