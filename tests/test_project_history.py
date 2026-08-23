@@ -199,3 +199,31 @@ def test_a_project_with_its_own_rules_keeps_them(tmp_path: Path) -> None:
     projects.apply_baseline_gitignore("dev04")
     rules = (d / ".gitignore").read_text(encoding="utf-8")
     assert "scratch/" in rules and ".pipeline/" in rules
+
+
+def test_a_new_project_ignores_macos_artifacts(tmp_path: Path) -> None:
+    """These arrive the way they arrive everywhere: inside a vendor's zip. One
+    such archive put 78 of them into this repository. Nothing reads them on any
+    operating system, macOS included — __MACOSX is a resource fork for a
+    filesystem that stopped needing one in Mac OS 9."""
+    projects = Projects(tmp_path / "root")
+    d = projects.init_local("dev04")
+    (d / "datasheets").mkdir()
+    (d / "datasheets" / ".DS_Store").write_bytes(b"\x00")
+    (d / "datasheets" / "._nRF9151_spec.pdf").write_bytes(b"\x00")
+    (d / "__MACOSX").mkdir()
+    (d / "__MACOSX" / "._thing").write_bytes(b"\x00")
+    (d / "overview.md").write_text("# Board\n", encoding="utf-8")
+    projects.commit_all("dev04", "work")
+
+    tracked = _git(d, "ls-files").split()
+    assert "overview.md" in tracked
+    assert not any(".DS_Store" in t or "__MACOSX" in t or "/._" in t for t in tracked)
+
+
+def test_they_do_not_light_the_uncommitted_badge_either(tmp_path: Path) -> None:
+    """Ignored, so they are not design work waiting to be saved."""
+    projects = Projects(tmp_path / "root")
+    d = projects.init_local("dev04")
+    (d / ".DS_Store").write_bytes(b"\x00")
+    assert projects.status("dev04").dirty is False

@@ -78,6 +78,18 @@ retrieved/*
 fp-info-cache
 *.kicad_sch-bak
 *.kicad_pcb-bak
+
+# macOS artifacts. These arrive here the way they arrive everywhere: inside a
+# vendor's zip. Nothing reads them on any operating system, macOS included —
+# __MACOSX is a resource fork for a filesystem that stopped needing one in
+# Mac OS 9, and .DS_Store is a folder's window position.
+.DS_Store
+._*
+__MACOSX/
+.AppleDouble
+.Spotlight-V100
+.Trashes
+.fseventsd
 """
 
 

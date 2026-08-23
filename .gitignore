@@ -37,6 +37,24 @@ blpl-db
 app/*.pdf
 app/*.txt
 app/*.zip
-__MACOSX/
+
+# macOS writes these into any directory it touches — and into any archive it
+# creates. Nothing reads them, on any operating system, including macOS: the
+# __MACOSX tree is a resource fork for a filesystem that has not needed one
+# since Mac OS 9, and .DS_Store is a folder's window position. 78 of them came
+# out of one vendor zip and into this repository.
 .DS_Store
+.DS_Store?
 ._*
+__MACOSX/
+.AppleDouble
+.AppleDB
+.AppleDesktop
+.LSOverride
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.fseventsd
+.apdisk
+.com.apple.timemachine.donotpresent
