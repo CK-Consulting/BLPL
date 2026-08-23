@@ -83,6 +83,7 @@ jobs:
           npm install jsdom
 
       - name: Run kcaa test suite
+        id: kcaa_tests
         if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
         working-directory: kicad-ai-assistant
         env:
@@ -90,6 +91,7 @@ jobs:
         run: uv run python -m pytest tests/ --tb=short -o "addopts="
 
       - name: Run BLPL contract check
+        id: contract
         if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
         working-directory: kicad-ai-assistant
         env:
@@ -97,6 +99,7 @@ jobs:
         run: uv run python ../tests/kcaa_contract_check.py
 
       - name: Open bump PR
+        id: bump_pr
         if: github.event_name != 'pull_request' && steps.advance.outputs.changed == 'true' && success()
         uses: peter-evans/create-pull-request@v7
         with:
@@ -117,8 +120,16 @@ jobs:
             see the [triggering run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
           labels: kcaa-upstream
 
+      # Only the two checks above say anything about compatibility. `failure()`
+      # alone covered every step, so when the bump PR could not be opened — a
+      # repository permission, nothing to do with kcaa — this filed an issue
+      # announcing that upstream had broken the contract. It had not. An alarm
+      # that names the wrong cause is worse than none: it sends whoever reads it
+      # looking for a fault that was never there.
       - name: File breakage issue
-        if: github.event_name != 'pull_request' && failure()
+        if: >-
+          github.event_name != 'pull_request' && failure() &&
+          (steps.kcaa_tests.outcome == 'failure' || steps.contract.outcome == 'failure')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -132,4 +143,40 @@ jobs:
               --title "kicad-ai-assistant upstream update breaks checks" \
               --label kcaa-upstream \
               --body "The weekly upstream check failed — either kcaa's test suite or BLPL's contract check (\`tests/kcaa_contract_check.py\`) broke against the fork's latest main. See $run_url. The submodule pointer was NOT bumped."
+          fi
+
+      # The checks passed and the branch is pushed; only the PR could not be
+      # opened. Reported separately, and as itself — the bump is ready and one
+      # click away, which is a different thing to ask of a person than "upstream
+      # broke us".
+      - name: Report that the bump PR could not be opened
+        if: >-
+          github.event_name != 'pull_request' && failure() &&
+          steps.bump_pr.outcome == 'failure' &&
+          steps.kcaa_tests.outcome == 'success' && steps.contract.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create kcaa-upstream --force --description "kicad-ai-assistant upstream tracking" --color FBCA04 || true
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          compare="${{ github.server_url }}/${{ github.repository }}/compare/main...bots/kcaa-upstream-bump"
+          body=$(cat <<EOF
+          Both checks passed against the fork's latest main
+          (\`${{ steps.advance.outputs.old }}\` → \`${{ steps.advance.outputs.new }}\`),
+          so the bump is good — but the workflow could not open the pull request.
+
+          The usual cause is **Settings → Actions → General → Workflow permissions
+          → "Allow GitHub Actions to create and approve pull requests"** being off.
+
+          The branch \`bots/kcaa-upstream-bump\` is pushed either way, so the bump
+          can be opened by hand: $compare
+
+          Run: $run_url
+          EOF
+          )
+          existing=$(gh issue list --label kcaa-upstream --state open --search "in:title bump PR" --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "kcaa bump PR could not be opened" --label kcaa-upstream --body "$body"
           fi
