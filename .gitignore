@@ -29,7 +29,14 @@ blpl/webapp/static/assets/
 *.swp
 blpl-db
 
-# Datasheets belong to a project, not to the app source tree. One was swept
-# in by a `git add -A` from this directory and cost 7.4 MB of repository.
+# Vendor documents belong to a project, not to the app source tree. Two
+# `git add -A` runs from this directory swept in 61 MB of them — five
+# datasheets, a 34 MB footprint archive, and the __MACOSX resource forks that
+# came out of it — none of it referenced by anything, all of it permanent in
+# every clone and checkout. The tests build their own PDFs.
 app/*.pdf
 app/*.txt
+app/*.zip
+__MACOSX/
+.DS_Store
+._*

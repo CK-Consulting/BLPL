@@ -72,7 +72,9 @@ def test_when_the_recent_turns_alone_are_too_big_it_says_so(tmp_path) -> None:
     """It does not always work, and pretending otherwise leaves the provider to
     deliver the bad news without explaining it. Six long exchanges can exceed
     the budget between them, and those are never summarised."""
-    events = _convo(40, size=4000)
+    # Six exchanges of ~4k tokens each is more than a 32k window leaves for
+    # text, and those six are never summarised.
+    events = _convo(40, size=9000)
     p = compaction.plan(events, window=32_000)
     assert p.worth_it and not p.sufficient
     assert p.tokens_after > p.tokens_target
@@ -189,3 +191,43 @@ def test_a_summariser_that_returns_nothing_is_an_error_not_an_empty_summary() ->
             asyncio.run(mod.summarise(_convo(2), 2, endpoint=None))  # type: ignore[arg-type]
     finally:
         mod.build_chat_adapter = original
+
+
+def test_prose_kept_in_two_places_is_counted_once() -> None:
+    """Every ordinary event stores the same text in `content` and in a metadata
+    text block — start_chat_turn and persist_messages both write it twice — so
+    adding them together made a conversation look about twice its real size.
+
+    On the live transcript that was 61 of 111 events counted double, which would
+    start lossy, billable summarisation at roughly half the intended threshold:
+    paraphrasing a conversation that fits comfortably.
+    """
+    both = [{"role": "user", "content": "x" * 400,
+             "metadata": {"blocks": [{"type": "text", "text": "x" * 400}]}}]
+    assert compaction.estimate(both) == 100
+
+
+def test_an_event_with_no_blocks_still_counts() -> None:
+    """Older transcripts, and the error markers, carry only `content`."""
+    assert compaction.estimate([{"role": "error", "content": "y" * 400}]) == 100
+
+
+def test_tool_calls_and_results_are_counted() -> None:
+    events = [{"role": "assistant", "content": "", "metadata": {"blocks": [
+        {"type": "tool_use", "input": "z" * 200},
+        {"type": "tool_result", "content": "w" * 200},
+    ]}}]
+    assert compaction.estimate(events) > 90
+
+
+def test_the_oldest_turn_can_be_summarised_on_its_own() -> None:
+    """`upto` is exclusive, so a cut at the *start* of the oldest turn
+    summarises nothing. With exactly KEEP_RECENT_TURNS + 1 turns that was the
+    only candidate, so a seven-turn conversation that would have fitted after
+    summarising its first turn was sent oversized and refused instead."""
+    events = _convo(compaction.KEEP_RECENT_TURNS + 1, size=8000)
+    p = compaction.plan(events, window=32_000)
+    assert p.worth_it
+    # The cut lands on the second turn's start, so the first turn is what gets
+    # replaced — and the six recent exchanges are untouched.
+    assert p.upto == compaction.turn_starts(events)[1]

@@ -274,6 +274,10 @@ class Endpoint:
     model: str
     api_key: str | None = None
     base_url: str | None = None
+    # The most tokens this endpoint will produce, when somebody has stated it.
+    # None means "work it out" — see blpl/core/limits.py, which discovers it
+    # from the server or learns it from the provider's own refusal.
+    max_output_tokens: int | None = None
 
     @staticmethod
     def of(kind: str, model: str | None = None, **kw: Any) -> Endpoint:

@@ -77,7 +77,19 @@ class Conversation:
 
     @classmethod
     def open_existing(cls, dir_: Path, filename: str) -> "Conversation":
+        """Open a conversation, live or archived.
+
+        Archiving moves the file into ``archived/`` and the picker lists those
+        entries when asked to — so looking only in the live directory meant
+        every archived selection came back 404 and its transcript could not be
+        read without unarchiving first. Archiving takes a conversation off the
+        list; it was never meant to make it unreadable.
+        """
         path = dir_ / filename
+        if not path.exists():
+            stored = archive_dir(dir_) / filename
+            if stored.is_file():
+                path = stored
         if not path.exists():
             raise FileNotFoundError(f"conversation {filename!r} not found in {dir_}")
         match = _FILE_RE.match(filename)

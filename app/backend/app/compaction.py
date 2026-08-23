@@ -124,14 +124,27 @@ def estimate(events: list[dict]) -> int:
     """
     total = 0
     for ev in events:
-        total += len(ev.get("content") or "")
-        for b in (ev.get("metadata") or {}).get("blocks") or []:
-            if b.get("type") == "text":
-                total += len(b.get("text") or "")
-            elif b.get("type") == "tool_use":
-                total += len(str(b.get("input") or ""))
-            elif b.get("type") == "tool_result":
-                total += len(str(b.get("content") or ""))
+        blocks = (ev.get("metadata") or {}).get("blocks") or []
+        # The blocks are what actually travels, so when there are any, they are
+        # the whole measurement. `content` is the same prose kept alongside for
+        # anything that wants a plain string — both `start_chat_turn` and
+        # `persist_messages` write it twice — so adding them together made a
+        # conversation look about twice its real size.
+        #
+        # On the live transcript that was 61 of 111 events counted double, which
+        # would start lossy, billable summarisation at roughly half the intended
+        # threshold: paraphrasing a conversation that fits comfortably.
+        if blocks:
+            for b in blocks:
+                kind = b.get("type")
+                if kind == "text":
+                    total += len(b.get("text") or "")
+                elif kind == "tool_use":
+                    total += len(str(b.get("input") or ""))
+                elif kind == "tool_result":
+                    total += len(str(b.get("content") or ""))
+        else:
+            total += len(ev.get("content") or "")
     return total // 4
 
 
@@ -168,9 +181,23 @@ def plan(events: list[dict], window: int, reserved: int = 0) -> Plan:
 
     starts = turn_starts(events)
     _, already = existing_summary(events)
-    # Never touch the recent exchanges, and never touch anything a stored
-    # summary already covers.
-    candidates = [i for i in starts if i > already][:-KEEP_RECENT_TURNS] or []
+    # The boundary *after* each compactable turn, not the boundary before it.
+    #
+    # `upto` is exclusive — events[:upto] get summarised — so a cut at the start
+    # of the oldest turn summarises nothing. With exactly KEEP_RECENT_TURNS + 1
+    # turns that was the only candidate, so a seven-turn conversation that would
+    # have fitted after summarising its first turn was sent oversized instead,
+    # and refused.
+    # `already` is an exclusive end — a stored summary covers events[:already] —
+    # so a turn starting *at* it is the first one not yet covered. Using `>`
+    # excluded index 0 whenever nothing had been summarised, which quietly made
+    # the first turn of every conversation uncompactable.
+    eligible = [i for i in starts if i >= already]
+    boundaries = eligible[1:]                       # each turn's end
+    if len(eligible) > KEEP_RECENT_TURNS:
+        candidates = boundaries[: len(eligible) - KEEP_RECENT_TURNS]
+    else:
+        candidates = []
     if not candidates:
         # Everything left is recent. Compacting further would paraphrase the
         # question being asked, which is worse than a request that is too long

@@ -223,3 +223,59 @@ def test_an_explicit_blind_vision_route_warns_like_an_inherited_one():
     )
     cfg.validate()  # must not raise
     assert any("none of ollama" in w for w in cfg.warnings())
+
+
+
+
+def test_declared_limits_are_read_from_the_file(tmp_path) -> None:
+    """Both fields were added with a "declared always wins" rule and nowhere to
+    declare them — not on the request body, not in the database, not in the file
+    config — so the sizing logic always fell back to inference. That is exactly
+    wrong for the deployments needing the override most: a self-hosted model's
+    window is a property of how the server was started, and Ollama publishes
+    neither number."""
+    from app.appconfig import load
+
+    (tmp_path / "blpl.toml").write_text(
+        '[llm.endpoints.thor]\n'
+        'kind = "openai-compatible"\n'
+        'model = "nvidia/nemotron-3-super"\n'
+        'base_url = "http://x/v1"\n'
+        'context_tokens = 512000\n'
+        'max_output_tokens = 65536\n'
+        '\n[llm.tasks]\ndefault = ["thor"]\n',
+        encoding="utf-8",
+    )
+    cfg = load(tmp_path / "blpl.toml")
+    ep = cfg.endpoints["thor"]
+    assert ep.context_tokens == 512_000
+    assert ep.max_output_tokens == 65_536
+    # And declared beats the table, which would have said 262,144 for this id.
+    assert ep.context == 512_000
+
+
+def test_an_undeclared_limit_stays_none_so_it_can_be_worked_out(tmp_path) -> None:
+    """Null is a real state and means "work it out" — discovered from the server
+    where one will say, inferred otherwise."""
+    from app.appconfig import load
+
+    (tmp_path / "blpl.toml").write_text(
+        '[llm.endpoints.a]\nkind = "anthropic"\nmodel = "claude-opus-5"\n'
+        '\n[llm.tasks]\ndefault = ["a"]\n',
+        encoding="utf-8",
+    )
+    ep = load(tmp_path / "blpl.toml").endpoints["a"]
+    assert ep.context_tokens is None and ep.max_output_tokens is None
+    assert ep.context == 200_000       # inferred
+
+
+def test_a_declared_output_cap_reaches_the_limits_module() -> None:
+    """The cap has to travel on the Endpoint the tools actually call, or an
+    override nobody could set is also one nobody would have felt."""
+    from blpl.core import limits
+    from blpl.core.llm_chat import Endpoint
+
+    limits._LEARNED.clear()
+    ep = Endpoint(name="thor", kind="openai-compatible", model="nvidia/nemotron-3-super",
+                  base_url="http://x/v1", max_output_tokens=8_192)
+    assert limits.output_limit(ep) == 8_192

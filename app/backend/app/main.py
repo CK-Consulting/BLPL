@@ -732,6 +732,11 @@ def get_settings(
                 "base_url": ep.base_url,
                 "auth": ep.auth,
                 "vision": ep.can_see,
+                # What was *declared*, not what was worked out — the settings
+                # screen edits the override, and echoing an inferred figure back
+                # into it would turn a guess into a stated fact on the next save.
+                "context_tokens": ep.context_tokens,
+                "max_output_tokens": ep.max_output_tokens,
                 "needs_key": ep.needs_key,
                 "has_key": not ep.needs_key or ep.name in with_keys,
             }
@@ -1053,6 +1058,10 @@ class EndpointBody(BaseModel):
     base_url: str = ""
     auth: str = "vault"
     vision: bool | None = None
+    # Null means "work it out". Stated when neither discovery nor the model
+    # name gets it right — which is the ordinary case for a self-hosted model.
+    context_tokens: int | None = None
+    max_output_tokens: int | None = None
 
 
 class LlmSettingsBody(BaseModel):
@@ -1085,6 +1094,8 @@ def put_llm_settings(
                 base_url=e.base_url,
                 auth=e.auth,
                 vision=e.vision,
+                context_tokens=e.context_tokens,
+                max_output_tokens=e.max_output_tokens,
             )
             for e in body.endpoints
         }
@@ -3044,16 +3055,20 @@ def _task_endpoints(
     cfg = llmconfig.load(session, user)
 
     def build(rp) -> chat_mod.Endpoint:
+        name = rp.name or rp.provider
+        # Carry the declared cap across. Without it the limits module fell
+        # straight back to inference for every endpoint, so an override nobody
+        # could set was also an override nobody would have felt.
+        declared = cfg.endpoint(name)
         return chat_mod.Endpoint(
-            name=rp.name or rp.provider,
+            name=name,
             kind=rp.provider,  # type: ignore[arg-type]
             model=rp.model,
             api_key=(
-                keystore.get(session, master_key, user, rp.name or rp.provider)
-                if rp.needs_key
-                else None
+                keystore.get(session, master_key, user, name) if rp.needs_key else None
             ),
             base_url=rp.base_url or None,
+            max_output_tokens=declared.max_output_tokens if declared else None,
         )
 
     chain = [

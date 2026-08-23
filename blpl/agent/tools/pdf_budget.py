@@ -76,7 +76,15 @@ def measure(pdf: Path, first: int = 0, last: int = 0) -> Measured:
         text = out.stdout
     except (OSError, subprocess.SubprocessError):
         text = ""
-    pages = pages_of(pdf)
+    # The pages that were actually read, not the document's length. With
+    # --first/--last, dividing a slice's tokens by a 940-page total made a real
+    # slice look like it had no text layer, and reported tokens-per-page
+    # hundreds of times too low.
+    total = pages_of(pdf)
+    if first or last:
+        pages = max(1, min(last or total, total) - (first or 1) + 1)
+    else:
+        pages = total
     printable = sum(1 for ch in text if ch.strip())
     # Same rule the extractor uses: a scanned page yields a form feed and little
     # else, so judge on printable characters per page rather than on length.

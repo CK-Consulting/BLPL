@@ -324,6 +324,8 @@ def load(path: Path) -> AppConfig:
             base_url=str(raw.get("base_url", "")),
             auth=str(raw.get("auth", "vault")).lower(),
             vision=raw.get("vision"),
+            context_tokens=raw.get("context_tokens"),
+            max_output_tokens=raw.get("max_output_tokens"),
         )
 
     tasks: dict[str, list[str]] = {
