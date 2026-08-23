@@ -699,3 +699,59 @@ def test_a_family_datasheet_still_resolves_from_the_top_level(tmp_path) -> None:
     (sheets / "nRF54L15_nRF54L10_nRF54L05_Datasheet_v1.0.pdf").write_bytes(b"%PDF")
     for part in ("NRF54L15-QFAA-R", "NRF54L10-QFAA-R", "NRF54L05-QFAA-R"):
         assert datasheet_files.resolve(proj, part).how == "family", part
+
+
+# ---------------------------------------------------------------------------
+# Listing and reading directories
+#
+# Regression trio from a live turn that burned its whole context window: the
+# user dropped eight datasheets into datasheets/rf-dividers-switches/, the
+# listing showed none of them, read_project_file insisted the directory was
+# "not in this project", and nothing stopped the agent retrying the same call.
+# ---------------------------------------------------------------------------
+
+
+def test_datasheets_in_subdirectories_are_listed(project) -> None:
+    """A per-MPN subdirectory is the convention, so its files must be visible."""
+    (project / "datasheets" / "rf-dividers").mkdir(parents=True)
+    (project / "datasheets" / "rf-dividers" / "BD0926.pdf").write_bytes(b"%PDF")
+    (project / "datasheets" / "top.pdf").write_bytes(b"%PDF")
+    # Sidecars beside the PDF are what the extraction stages actually consume.
+    (project / "datasheets" / "top.txt").write_text("pin 1 VDD", encoding="utf-8")
+
+    out = json.loads(_call(_ctx(project), "list_project_files").content)
+    assert "rf-dividers/BD0926.pdf" in out["datasheets"]
+    assert "top.pdf" in out["datasheets"]
+    assert "top.txt" in out["datasheets"]
+
+
+def test_reading_a_directory_names_what_is_inside(project) -> None:
+    (project / "datasheets" / "rf-dividers").mkdir(parents=True)
+    (project / "datasheets" / "rf-dividers" / "BD0926.pdf").write_bytes(b"%PDF")
+
+    r = _call(_ctx(project), "read_project_file", path="datasheets/rf-dividers")
+    assert r.is_error
+    assert "is a directory" in r.content
+    assert "BD0926.pdf" in r.content  # the error carries the answer
+    assert "in this project" not in r.content  # never claim it is absent
+
+
+def test_the_same_failing_call_is_stopped(project) -> None:
+    """Identical arguments failing identically must not loop forever."""
+
+    async def approve(_request):
+        return True
+
+    ex = ToolExecutor(default_tools(), _ctx(project), approve=approve)
+
+    def read(path: str):
+        return asyncio.run(
+            ex(ToolUseBlock(id="t1", name="read_project_file", input={"path": path}))
+        )
+
+    seen = [read("datasheets/nope.pdf") for _ in range(5)]
+    assert all(r.is_error for r in seen)
+    assert "already failed" not in seen[0].content
+    assert "already failed" in seen[-1].content
+    # One path's failures must not gag a different one.
+    assert "already failed" not in read("datasheets/else.pdf").content

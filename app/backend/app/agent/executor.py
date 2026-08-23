@@ -35,6 +35,14 @@ from .toolspec import ApprovalRequest, ToolContext, ToolDenied, ToolSpec
 # be legitimate; a megabyte of it is never what the caller meant.
 _MAX_RESULT_CHARS = 60_000
 
+# How many times the same call, with byte-identical arguments, may fail before
+# the executor stops running it. A tool that failed on the same input twice will
+# fail the same way a third time; what changes is only how much of the context
+# window is left. Observed in the wild: twelve consecutive reads of a directory
+# path, alternating a trailing slash, until the turn ran out of room. Three
+# leaves space for a genuinely transient failure to clear on retry.
+_REPEAT_LIMIT = 3
+
 ApprovalFn = Callable[[ApprovalRequest], Awaitable[bool]]
 RecordFn = Callable[[dict], None]
 
@@ -77,6 +85,8 @@ class ToolExecutor:
             session_approved if session_approved is not None else set()
         )
         self._seq = 0
+        # Keyed by call signature: how many times this exact call has failed.
+        self._failures: dict[str, int] = {}
 
     def declarations(self):
         return [s.to_decl() for s in self.specs.values()]
@@ -84,8 +94,14 @@ class ToolExecutor:
     async def __call__(self, call: ToolUseBlock) -> ToolResultBlock:
         self._seq += 1
         args = dict(call.input or {})
+        try:
+            sig = f"{call.name}:{json.dumps(args, sort_keys=True, default=str)}"
+        except (TypeError, ValueError):  # unhashable/odd args: no loop tracking
+            sig = ""
 
         def done(content: str, *, is_error: bool = False, status: str = "ok") -> ToolResultBlock:
+            if is_error and sig and status != "repeat_loop":
+                self._failures[sig] = self._failures.get(sig, 0) + 1
             if self._record:
                 self._record(
                     {
@@ -109,6 +125,18 @@ class ToolExecutor:
                 "tool arguments were not valid JSON; call the tool again with complete arguments",
                 is_error=True,
                 status="malformed_args",
+            )
+
+        # -- 1b. the same call, failing the same way --------------------------
+        seen = self._failures.get(sig, 0) if sig else 0
+        if seen >= _REPEAT_LIMIT:
+            return done(
+                f"{call.name} has already failed {seen} times with exactly these arguments. "
+                "Calling it again will fail again. Change the arguments, use a different tool "
+                "(list_project_files shows what actually exists in this project), or tell the "
+                "user what you are stuck on.",
+                is_error=True,
+                status="repeat_loop",
             )
 
         # -- 2. sandbox, before any question is asked -------------------------
@@ -159,6 +187,8 @@ class ToolExecutor:
             return done(f"refused: {exc}", is_error=True, status="denied")
         except ReferencePolicyError as exc:
             return done(f"refused by the project sandbox: {exc}", is_error=True, status="denied_sandbox")
+        except IsADirectoryError as exc:
+            return done(str(exc), is_error=True, status="is_a_directory")
         except FileNotFoundError as exc:
             return done(f"not found: {exc}", is_error=True, status="not_found")
         except Exception as exc:  # noqa: BLE001 — a tool failure is a result, not a crash
