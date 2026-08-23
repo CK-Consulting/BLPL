@@ -81,10 +81,70 @@ changes, edit the diagram in the same proposal as the tables.
   are editable design documents like any other: proposed as a diff, reviewed,
   committed.
 
+### The design language
+
+Do **not** write `classDef` lines or a theme block. The workbench appends both,
+so a diagram spends its tokens on structure — which is the reason to draw one.
+Classify a node and it inherits everything:
+
+```mermaid
+flowchart TB
+    U1["U1<br/>STM32U5G9NJ"]:::mcu
+    ANT1(["ANT1<br/>2.4 GHz"]):::antenna
+```
+
+| class | shape | colour | what it means |
+| --- | --- | --- | --- |
+| `board` | rounded | green | A PCB. Everything sits inside one. |
+| `subboard` | subroutine | emerald | A replaceable sub-board or module. |
+| `mcu` | rect | violet | MCU or application processor. |
+| `logic` | rect | purple | MPU, CPLD, FPGA. |
+| `rf` | rect | amber | RF transceiver or radio IC. |
+| `power` | trapezoid | red | PMIC, regulator, charger — anything converting power. |
+| `battery` | trapezoid | lime | Cell or pack. |
+| `memory` | cylinder | blue | RAM. Volatile. |
+| `storage` | cylinder | sky | Flash, eMMC, SD. Non-volatile. |
+| `connector` | hexagon | slate | Board-to-board, USB, headers. |
+| `antenna` | stadium | orange | Antenna or RF port. |
+| `rfpassive` | rhombus | yellow | Switch, combiner, filter, matching. |
+| `sensor` | rect | teal | Sensors and IMUs. |
+| `display` | rect | indigo | LCD, OLED, touch. |
+| `audio` | rect | pink | Codec, amplifier, speaker, mic. |
+| `haptic` | rect | rose | Motor, driver. |
+| `passive` | rect | stone | Discretes worth naming. |
+| `note` | rect | cyan | A comment, a caveat, a TBD. |
+
+Link kinds, applied with `linkStyle` only when a diagram mixes several:
+
+| class | colour |
+| --- | --- |
+| `rfPath` | amber |
+| `power` | red |
+| `data` | sky |
+| `control` | cyan |
+| `mechanical` | stone |
+
+Two rules behind the shapes, both worth keeping:
+
+- **No triangles and no circles.** Checked against the 109 distinct symbol
+  kinds in the schematic references: a triangle is an amplifier, buffer,
+  inverter, comparator or opamp, and a circle is a source, meter, lamp, motor
+  or junction dot. Somebody who reads schematics all day will read them that
+  way here too.
+- **A plain rectangle stays a rectangle.** `ic_block`, `component_block` and
+  `ic_package` are rectangles in the standards, so a rectangle meaning "an
+  integrated circuit" agrees with them instead of competing.
+
+Colours are generated from Tailwind's ramps by `mermaid/tools/palette.py`,
+which refuses to emit a pair below AAA — every label is ≥7:1 on its own fill
+and every border ≥3:1 on the canvas. Regenerate it; do not hand-edit the theme.
+
 ### What to write
 
-`flowchart TB` (or `LR`) covers essentially every board-level block diagram.
-The vocabulary worth knowing:
+`flowchart TB` (or `LR`) covers essentially every board-level block diagram, and
+it is laid out with **ELK**, which routes orthogonally — right angles and clean
+ranks rather than curves wandering across the page. The vocabulary worth
+knowing:
 
 ```mermaid
 flowchart TB
@@ -98,6 +158,7 @@ flowchart TB
 ```
 
 - `A --> B` a signal or power path; `-->|label|` when the condition matters.
+- `:::class` on a node to give it its meaning — `U1["U1<br/>STM32U5G9NJ"]:::mcu`.
 - `-. label .->` a control or sideband line, so it reads differently from the
   path it controls.
 - `{"..."}` for a switch or mux, `["..."]` for a block.
@@ -109,6 +170,41 @@ flowchart TB
 Name nodes with the refdes or subsystem id the BOM uses. A diagram whose blocks
 are called `U_BLE` and `SB-ANT` can be checked against the tables; one whose
 blocks are called "the radio" cannot.
+
+### The first diagram of a project
+
+When somebody describes a device — "a handheld with an STM32U5G9NJ, five radio
+sub-boards, a 5-inch LCD, a 5000 mAh cell, and one RF management board" — the
+answer is a diagram, drawn before any table exists. It is how you show what you
+understood, and it is faster to correct than a BOM is.
+
+At that stage it is **boards and the parts worth naming**, nothing finer. No
+pin-level detail, no passives, no schematic. One `subgraph` per PCB, the ICs the
+user actually mentioned nested inside, connectors where boards meet, and text
+designators of the kind that would be screen-printed — `SB-RF`, `U1`, `J_CORE`.
+Nothing is to scale and nothing pretends to be.
+
+```mermaid
+flowchart TB
+    subgraph CORE["core-board — CB-01"]
+        U1["U1<br/>STM32U5G9NJ"]:::mcu
+        U2["U2<br/>PMIC"]:::power
+        RAM["U3<br/>PSRAM"]:::memory
+        J1{{"J1<br/>module bus ×5"}}:::connector
+    end
+    subgraph SBRF["sb-rf — RF management"]
+        SW1{"SW1<br/>SP3T"}:::rfpassive
+        A1(["ANT1<br/>2.4 / 5 GHz"]):::antenna
+    end
+    U1 --- J1
+    J1 --- SW1
+    SW1 --- A1
+```
+
+Then ask what is wrong with it. That conversation is worth more than the
+questions in the input contract above, because the user is correcting something
+concrete rather than answering in the abstract — and what they correct tells you
+which of the remaining questions still need asking.
 
 **Do not draw what you have not established.** A diagram states connections as
 facts and is far more convincing than the same guess in prose — which makes an

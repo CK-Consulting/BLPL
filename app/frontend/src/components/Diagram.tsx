@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
+import theme from "../generated/diagramTheme.json";
+
 /**
  * A Mermaid diagram, rendered.
  *
@@ -22,29 +24,91 @@ let loading: Promise<typeof import("mermaid").default> | null = null;
 
 function mermaidOnce() {
   if (!loading) {
-    loading = import("mermaid").then((m) => {
-      m.default.initialize({
+    loading = (async () => {
+      const [{ default: mermaid }, elk] = await Promise.all([
+        import("mermaid"),
+        import("@mermaid-js/layout-elk"),
+      ]);
+      // ELK instead of dagre, and this is the fix for "a jumble of lines all
+      // over the place". Dagre routes edges as splines through whatever space
+      // it finds; ELK's layered algorithm assigns ranks first and then routes
+      // orthogonally, which is what a block diagram has always looked like when
+      // a person draws one.
+      //
+      // Worth saying why not `architecture-beta`, which looks like the obvious
+      // fit: it lays out with cytoscape's **fcose**, a force-directed engine.
+      // Force-directed placement is organic by design — it is the thing that
+      // produces the jumble, not the cure for it — and architecture diagrams
+      // take no classDef, so the colour language below could not be applied to
+      // them at all.
+      mermaid.registerLayoutLoaders(elk.default ?? elk);
+      mermaid.initialize({
         startOnLoad: false,
         securityLevel: "strict",
-        theme: "dark",
+        theme: "base",
+        layout: "elk",
+        elk: {
+          // Orthogonal edges, and enough room between ranks that a label has
+          // somewhere to sit.
+          mergeEdges: false,
+          nodePlacementStrategy: "BRANDES_KOEPF",
+        },
         themeVariables: {
-          // The app's own ground, so a diagram does not glare out of a dark
-          // page — the reason this app is dark in the first place.
-          background: "#15181d",
-          primaryColor: "#1d2635",
-          primaryTextColor: "#e6e6e6",
-          primaryBorderColor: "#7f9bc4",
-          lineColor: "#9aa2ac",
-          secondaryColor: "#22303f",
-          tertiaryColor: "#1b2233",
+          background: theme.canvas,
+          primaryColor: theme.classes.board.fill,
+          primaryTextColor: theme.ink.light,
+          primaryBorderColor: theme.classes.board.stroke,
+          lineColor: theme.links.data.stroke,
+          secondaryColor: theme.classes.subboard.fill,
+          tertiaryColor: theme.classes.note.fill,
+          mainBkg: theme.classes.board.fill,
+          nodeBorder: theme.classes.board.stroke,
+          clusterBkg: theme.canvas,
+          clusterBorder: theme.classes.board.stroke,
+          titleColor: theme.ink.light,
+          edgeLabelBackground: theme.canvas,
+          textColor: theme.ink.light,
           fontSize: "14px",
         },
-        flowchart: { useMaxWidth: true, htmlLabels: true, curve: "basis" },
+        flowchart: { useMaxWidth: true, htmlLabels: true, defaultRenderer: "elk" },
       });
-      return m.default;
-    });
+      return mermaid;
+    })();
   }
   return loading;
+}
+
+/**
+ * The house style, prepended to every diagram.
+ *
+ * Written here rather than in each diagram, and that is the whole point. A
+ * model that has to emit twenty classDef lines before it can draw anything
+ * spends its tokens on styling instead of on structure — which is the opposite
+ * of why diagrams are worth having. A diagram says `class U1 mcu` and inherits
+ * the rest.
+ *
+ * Generated from Tailwind's oklch ramps by mermaid/tools/palette.py, which
+ * refuses to emit a pair that misses AAA. Regenerate rather than edit.
+ */
+export function houseStyle(): string {
+  const lines: string[] = [];
+  for (const [name, c] of Object.entries(theme.classes)) {
+    lines.push(
+      `classDef ${name} fill:${c.fill},stroke:${c.stroke},color:${c.color},stroke-width:2px`,
+    );
+  }
+  // Anything the author did not classify still has to be readable.
+  lines.push(
+    `classDef default fill:${theme.classes.passive.fill},` +
+      `stroke:${theme.classes.passive.stroke},color:${theme.classes.passive.color}`,
+  );
+  return lines.join("\n");
+}
+
+/** Put the house style after the author's own text, so an explicit classDef in
+ *  the diagram still wins — the style is a default, not a straitjacket. */
+function withHouseStyle(source: string): string {
+  return `${source.trimEnd()}\n\n${houseStyle()}\n`;
 }
 
 /** Diagram kinds Mermaid understands, used to spot one by its content. */
@@ -88,7 +152,7 @@ export function Diagram({ source }: { source: string }) {
         const mermaid = await mermaidOnce();
         // A unique id per render: mermaid keys internal state on it and reuses
         // a stale definition when two diagrams share one.
-        const { svg: out } = await mermaid.render(`d${seq++}`, source);
+        const { svg: out } = await mermaid.render(`d${seq++}`, withHouseStyle(source));
         if (!cancelled) setSvg(out);
       } catch (e) {
         // A diagram that will not parse is shown as its source rather than as
