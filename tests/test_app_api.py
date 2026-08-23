@@ -907,3 +907,65 @@ def test_ollama_still_lists_its_own_names(unlocked, monkeypatch) -> None:
     assert r.status_code == 200, r.text
     assert r.json()["models"] == ["qwen2.5vl:7b"]
     assert r.json()["labels"] == {}
+
+
+def test_a_datasheet_in_a_category_folder_resolves(tmp_path) -> None:
+    """People group uploads by function, not only by part number.
+
+    Subdirectory PDFs were excluded outright, so ten datasheets dropped into
+    ``datasheets/rf-dividers-switches/`` could not be resolved at all. Placement
+    is no longer a hard exclusion; the filename is what decides the match.
+    """
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    (sheets / "rf-dividers-switches").mkdir(parents=True)
+    (sheets / "rf-dividers-switches" / "Infineon_BGS12P2L6_DataSheet_v02_00_EN.pdf").write_bytes(b"%PDF")
+    (sheets / "stm32u5g9nj.pdf").write_bytes(b"%PDF")
+
+    got = df.resolve(tmp_path, "BGS12P2L6")
+    assert got.ok
+    assert got.path.parent.name == "rf-dividers-switches"
+    # A top-level part is unaffected by the widened search.
+    assert df.resolve(tmp_path, "STM32U5G9NJH6Q").path.name == "stm32u5g9nj.pdf"
+
+
+def test_a_part_folder_still_wins_over_a_filename_match(tmp_path) -> None:
+    """Filing a document under a part number is a statement, and outranks any
+    inference drawn from a filename somewhere else in the tree."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    (sheets / "NRF9151-LACA-R").mkdir(parents=True)
+    (sheets / "NRF9151-LACA-R" / "the-real-one.pdf").write_bytes(b"%PDF")
+    (sheets / "misc").mkdir()
+    (sheets / "misc" / "nRF9151_datasheet_rev_v1.1.pdf").write_bytes(b"%PDF")
+
+    got = df.resolve(tmp_path, "NRF9151-LACA-R")
+    assert got.how == "folder"
+    assert got.path.name == "the-real-one.pdf"
+
+
+def test_archived_datasheets_stay_out_of_the_running(tmp_path) -> None:
+    """.archive/ is where the user puts what they took out of play."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    (sheets / ".archive").mkdir(parents=True)
+    (sheets / ".archive" / "stm32u5g9nj.pdf").write_bytes(b"%PDF")
+
+    assert not df.resolve(tmp_path, "STM32U5G9NJH6Q").ok
+
+
+def test_naming_a_file_reaches_into_a_subdirectory(tmp_path) -> None:
+    """`file` is the documented escape hatch; advice that does not work is worse
+    than no advice."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    (sheets / "rf-dividers-switches").mkdir(parents=True)
+    (sheets / "rf-dividers-switches" / "BD0926-V9.3.pdf").write_bytes(b"%PDF")
+
+    for name in ("BD0926-V9.3.pdf", "rf-dividers-switches/BD0926-V9.3.pdf"):
+        got = df.resolve(tmp_path, "BD0926", file=name)
+        assert got.how == "explicit", name

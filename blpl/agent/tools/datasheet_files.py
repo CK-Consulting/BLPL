@@ -268,17 +268,35 @@ def _text_of(path: Path, pages: int) -> bytes | None:
 
 
 def _pdfs(project_dir: Path) -> list[Path]:
-    """Loose PDFs at the top of ``datasheets/`` — the family documents.
+    """Every PDF under ``datasheets/``, at any depth.
 
-    Files inside a per-MPN folder are excluded on purpose: they have already
-    said which part they are for, and letting them into the prefix and content
-    passes would put a document filed under one part in the running for
-    another.
+    Subdirectory files used to be excluded, on the reasoning that filing a
+    document under a part number already says which part it is for, so letting
+    it into the prefix pass would put one part's document in the running for
+    another. That holds for a per-MPN folder. It does not hold for a folder
+    named after a *function* — ``rf-dividers-switches/`` and the like — where
+    the files have declared nothing, and the blanket exclusion meant a whole
+    category of uploaded datasheets could not be resolved at all.
+
+    So placement is no longer a hard exclusion, and the evidence that decides a
+    match is the filename: the prefix pass below needs a real shared prefix, and
+    a part that has its own folder is settled earlier than this anyway. A file
+    only wins for a part whose number its own name carries.
+
+    Dot-directories stay out — ``.archive/`` is where the user puts what they
+    have deliberately taken out of play.
     """
     d = Path(project_dir) / "datasheets"
     if not d.is_dir():
         return []
-    return sorted(f for f in d.iterdir() if f.is_file() and f.suffix.lower() == ".pdf")
+    out = [
+        f
+        for f in d.rglob("*")
+        if f.is_file()
+        and f.suffix.lower() == ".pdf"
+        and not any(part.startswith(".") for part in f.relative_to(d).parts)
+    ]
+    return sorted(out)
 
 
 def folder_name(mpn: str) -> str:
@@ -323,7 +341,7 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
     project_dir = Path(project_dir)
     sheets = project_dir / "datasheets"
     available = _pdfs(project_dir)
-    names = tuple(f.name for f in available)
+    names = tuple(str(f.relative_to(sheets)) for f in available)
 
     # 1. What the caller said. Looked for in the part's own folder as well as
     #    at the top level, because "use the errata" should work when the errata
@@ -335,6 +353,17 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
             candidate = (parent / wanted).resolve()
             if candidate.is_file() and candidate.parent == parent.resolve():
                 return Resolution(path=candidate, how="explicit")
+        # Named but filed deeper: accept a full relative path, or a bare name
+        # when only one file in the tree carries it.
+        deep = [f for f in available if str(f.relative_to(sheets)) == file or f.name == wanted]
+        if len(deep) == 1:
+            return Resolution(path=deep[0], how="explicit")
+        if deep:
+            return Resolution(
+                path=None,
+                candidates=tuple(str(f.relative_to(sheets)) for f in deep),
+                detail=f"{wanted!r} names {len(deep)} files in datasheets/ — give the full path",
+            )
         return Resolution(
             path=None,
             candidates=names,
@@ -393,6 +422,16 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
     hits = []
     for f in available:
         stem = _norm(f.stem)
+        # The whole part number, somewhere inside the name. Vendors prepend
+        # their own name and append a revision — ``Infineon_BGS12P2L6_
+        # DataSheet_v02_00_EN.pdf`` — which leaves the MPN matching at neither
+        # end, so a prefix comparison scores it zero and the file is invisible
+        # to a search for the very part it is named after. Scored as the full
+        # length of the MPN, which is the strongest evidence a filename can
+        # carry and so outranks any partial prefix below.
+        if len(target) >= _MIN_PREFIX and target in stem:
+            hits.append((len(target), f))
+            continue
         shared = 0
         for a, b in zip(target, stem):
             if a != b:

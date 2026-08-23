@@ -188,8 +188,18 @@ async def _list_files(ctx: ToolContext, args: dict) -> str:
     )
     pipeline = root / ".pipeline"
     arts = sorted(f.name for f in pipeline.iterdir() if f.is_file()) if pipeline.is_dir() else []
+    # Recursive, and not only PDFs. Per-MPN subdirectories are the established
+    # convention — the datasheet resolver already looks for them — and the text
+    # extractions and pinmaps that sit beside a PDF are what the extraction
+    # stages actually consume. A non-recursive ``*.pdf`` glob showed neither,
+    # and because everything under ``datasheets/`` is excluded from `others`
+    # below, a file in a subdirectory appeared in *no* listing at all. The agent
+    # was then reduced to guessing paths, and retried the same wrong guess until
+    # the turn burned out.
     sheets = root / "datasheets"
-    pdfs = sorted(f.name for f in sheets.glob("*.pdf")) if sheets.is_dir() else []
+    found = _walk(sheets, skip=_SKIP_DIRS) if sheets.is_dir() else []
+    pdfs = found[:200]
+    sheets_dropped = max(0, len(found) - 200)
 
     # Everything else in the project, sub-board directories included. Previously
     # absent, which made a multi-board project look empty below its root.
@@ -208,6 +218,8 @@ async def _list_files(ctx: ToolContext, args: dict) -> str:
     }
     if dropped:
         payload["other_project_files_omitted"] = dropped
+    if sheets_dropped:
+        payload["datasheets_omitted"] = sheets_dropped
 
     ignored = root / CONTEXT_IGNORE
     if ignored.is_dir():
@@ -233,6 +245,23 @@ async def _read_file(ctx: ToolContext, args: dict) -> str:
 
     target = _readable_file(ctx, str(args.get("path", "")))
     ctx.sandbox.check_read(target)
+    if target.is_dir():
+        # "no file X in this project" is false when X is a directory that plainly
+        # exists, and a false error is one the model argues with: it retried the
+        # same path with and without a trailing slash a dozen times rather than
+        # believe it. So say what the path really is and name what is inside —
+        # an error that carries the answer ends the guessing in one turn.
+        inside = sorted(
+            f"{f.name}/" if f.is_dir() else f.name
+            for f in target.iterdir()
+            if not f.name.startswith(".")
+        )
+        shown = ", ".join(inside[:40]) or "(empty)"
+        more = f" … and {len(inside) - 40} more" if len(inside) > 40 else ""
+        raise IsADirectoryError(
+            f"{args.get('path')!r} is a directory, not a file. It contains: {shown}{more}. "
+            "Read one of those by its full path."
+        )
     if not target.is_file():
         raise FileNotFoundError(f"no file {args.get('path')!r} in this project")
     text = _read_text(target)
