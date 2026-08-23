@@ -108,12 +108,87 @@ def test_a_huge_artifact_keeps_both_ends_and_says_what_it_dropped(project) -> No
     assert "elided from the middle" in res.content
 
 
-@pytest.mark.parametrize(
-    "path", ["../secret.md", "sub/dir.md", ".hidden.md", "script.py", "/etc/passwd"]
-)
+@pytest.mark.parametrize("path", ["../secret.md", "../../etc/passwd", "/etc/passwd"])
 def test_tools_refuse_paths_that_leave_the_project(project, path) -> None:
+    """The project directory is the boundary, and it is the only one.
+
+    These must fail because they leave it — not because the file is missing.
+    Asserting the reason is the point: a check that only ever fires on
+    non-existent paths would pass just as happily with no check at all.
+    """
     res = _call(_ctx(project), "read_project_file", path=path)
     assert res.is_error
+    # Refused for leaving the boundary — the sandbox gets there first, before
+    # the handler is ever entered — and specifically not "no such file", which
+    # is what a check that had quietly stopped working would say.
+    assert "refused" in res.content and "no file" not in res.content
+
+
+def test_a_symlink_out_of_the_project_is_refused(project, tmp_path) -> None:
+    """The string check cannot see this one; the resolved path can."""
+    (tmp_path / "secret.md").write_text("elsewhere", encoding="utf-8")
+    (project / "escape.md").symlink_to(tmp_path / "secret.md")
+    res = _call(_ctx(project), "read_project_file", path="escape.md")
+    assert res.is_error and "elsewhere" not in res.content
+
+
+def test_files_in_subdirectories_are_readable(project) -> None:
+    """A multi-board project keeps each board in its own directory, so a rule of
+    'bare filenames in the project root' made the boards unreadable to the
+    assistant working on them."""
+    (project / "sensor").mkdir()
+    (project / "sensor" / "board.md").write_text("# Sensor\n", encoding="utf-8")
+    res = _call(_ctx(project), "read_project_file", path="sensor/board.md")
+    assert not res.is_error and "# Sensor" in res.content
+
+
+def test_non_markdown_text_in_the_project_is_readable(project) -> None:
+    (project / "power-budget.csv").write_text("rail,mA\n3V3,420\n", encoding="utf-8")
+    res = _call(_ctx(project), "read_project_file", path="power-budget.csv")
+    assert not res.is_error and "3V3,420" in res.content
+
+
+def test_binary_files_say_what_to_do_instead_of_returning_mojibake(project) -> None:
+    (project / "datasheets").mkdir()
+    (project / "datasheets" / "LM317.pdf").write_bytes(b"%PDF-1.4 \x00\x01binary")
+    res = _call(_ctx(project), "read_project_file", path="datasheets/LM317.pdf")
+    assert res.is_error and "extract_datasheet_specs" in res.content
+
+
+def test_an_oversized_file_is_refused_with_its_size(project) -> None:
+    (project / "huge.md").write_text("x" * (300 * 1024), encoding="utf-8")
+    res = _call(_ctx(project), "read_project_file", path="huge.md")
+    assert res.is_error and "300 KB" in res.content
+
+
+def test_context_ignore_is_listed_by_name_but_kept_out_of_the_project_files(project) -> None:
+    """The folder exists so files can stay in the project without joining the
+    design conversation. Names are listed — without them 'look at the enclosure
+    drawing' has nothing to resolve against — but they are separated, and the
+    note carries the instruction."""
+    (project / "context-ignore").mkdir()
+    (project / "context-ignore" / "enclosure.md").write_text("# Case\n", encoding="utf-8")
+    out = json.loads(_call(_ctx(project), "list_project_files").content)
+    assert out["context_ignore"]["files"] == ["context-ignore/enclosure.md"]
+    assert "unless the user asks" in out["context_ignore"]["note"]
+    assert not any("context-ignore" in p for p in out["other_project_files"])
+    assert out["design_documents"] == ["overview.md"]
+
+
+def test_context_ignore_files_are_still_readable_when_asked_for(project) -> None:
+    """Not a permission boundary — an attention boundary. Making it unreadable
+    would mean the one time the user does want it looked at, they cannot ask."""
+    (project / "context-ignore").mkdir()
+    (project / "context-ignore" / "enclosure.md").write_text("# Case\n", encoding="utf-8")
+    res = _call(_ctx(project), "read_project_file", path="context-ignore/enclosure.md")
+    assert not res.is_error and "# Case" in res.content
+
+
+def test_listing_reaches_into_sub_board_directories(project) -> None:
+    (project / "sensor").mkdir()
+    (project / "sensor" / "board.md").write_text("# Sensor\n", encoding="utf-8")
+    out = json.loads(_call(_ctx(project), "list_project_files").content)
+    assert "sensor/board.md" in out["other_project_files"]
 
 
 def test_tool_errors_come_back_as_results_so_the_model_can_recover(project) -> None:
@@ -236,11 +311,29 @@ def test_history_replays_tool_calls_not_just_prose(tmp_path) -> None:
     assert messages[2].content[0].tool_use_id == "t1"
 
 
-def test_error_records_are_kept_for_humans_but_not_replayed_as_context(tmp_path) -> None:
+def test_a_question_nothing_answered_is_kept_for_humans_and_not_replayed(tmp_path) -> None:
+    """Both halves go: the error marker, and the question it was the only reply
+    to. This used to keep the question, which is benign until the failure is
+    about request size — then every retry adds another copy of the message that
+    was already too big, and the request grows with each attempt to escape it.
+
+    On disk and on screen it stays. The transcript is the record of what
+    happened, and it is where the four identical copies explain themselves."""
     conv = Conversation.create(tmp_path, title="t")
     conv.append("user", "hi", {"blocks": [{"type": "text", "text": "hi"}]})
     conv.append("error", "RuntimeError: provider exploded", {})
-    assert [m.role for m in history_to_messages(conv.read_all())] == ["user"]
+    assert history_to_messages(conv.read_all()) == []
+    assert len(conv.read_all()) == 2
+
+
+def test_a_question_that_was_answered_before_the_failure_is_replayed(tmp_path) -> None:
+    """A provider dying mid-answer still read the question, and the partial
+    reply on screen refers to it."""
+    conv = Conversation.create(tmp_path, title="t")
+    conv.append("user", "hi", {"blocks": [{"type": "text", "text": "hi"}]})
+    conv.append("assistant", "partway through", {"blocks": [{"type": "text", "text": "partway"}]})
+    conv.append("error", "RuntimeError: provider exploded", {})
+    assert [m.role for m in history_to_messages(conv.read_all())] == ["user", "assistant"]
 
 
 # -- the API ------------------------------------------------------------------
@@ -467,3 +560,142 @@ def test_chat_needs_a_provider_key_and_a_real_conversation(chat_client, monkeypa
 def test_chat_endpoints_respect_the_session_gate(client) -> None:
     assert client.get("/api/projects/scratch/proposals").status_code == 401
     assert client.post("/api/projects/scratch/proposals/prop_x", json={"action": "accept"}).status_code == 401
+
+
+def test_the_most_recently_active_conversation_comes_first(tmp_path) -> None:
+    """Reopening the workbench should land in the thread you were last working
+    in. The list was ordered newest-first by filename while the client took the
+    *tail*, so every reload dropped you into the first conversation the project
+    ever had."""
+    from app.conversations import Conversation, list_conversations
+
+    old = Conversation.create(tmp_path, title="old")
+    new = Conversation.create(tmp_path, title="new")
+    old.append("user", "still working here")   # older file, newer activity
+
+    order = [m.filename for m in list_conversations(tmp_path)]
+    assert order[0] == old.path.name, order
+    assert new.path.name in order
+
+
+def test_archiving_takes_a_conversation_off_the_list_without_destroying_it(tmp_path) -> None:
+    """A transcript records what was proposed and why a part was chosen, which
+    outlives its usefulness in a dropdown. Archiving hides it; nothing deletes
+    it, and the file stays readable straight off disk."""
+    from app.conversations import Conversation, list_conversations, set_archived
+
+    keep = Conversation.create(tmp_path, title="keep")
+    done = Conversation.create(tmp_path, title="done")
+    done.append("user", "settled")
+
+    moved = set_archived(tmp_path, done.path.name, True)
+    assert moved.is_file() and moved.parent.name == "archived"
+    assert not (tmp_path / done.path.name).exists()
+
+    visible = [m.filename for m in list_conversations(tmp_path)]
+    assert visible == [keep.path.name]
+
+    everything = {m.filename: m.archived for m in list_conversations(tmp_path, include_archived=True)}
+    assert everything[done.path.name] is True
+    assert everything[keep.path.name] is False
+
+    # …and it comes back intact, messages included.
+    set_archived(tmp_path, done.path.name, False)
+    back = Conversation.open_existing(tmp_path, done.path.name)
+    assert [e["content"] for e in back.read_all()] == ["settled"]
+
+
+def test_archiving_something_twice_is_not_an_error(tmp_path) -> None:
+    """Two tabs, two clicks. The second should agree rather than 404."""
+    from app.conversations import Conversation, set_archived
+
+    conv = Conversation.create(tmp_path, title="x")
+    set_archived(tmp_path, conv.path.name, True)
+    assert set_archived(tmp_path, conv.path.name, True).parent.name == "archived"
+
+
+def test_a_crafted_filename_cannot_move_files_around(tmp_path) -> None:
+    import pytest
+
+    from app.conversations import set_archived
+
+    for bad in ("../secret.jsonl", "nope.txt", "/etc/passwd"):
+        with pytest.raises((ValueError, FileNotFoundError)):
+            set_archived(tmp_path, bad, True)
+
+
+# -- per-part datasheet folders -----------------------------------------------
+
+
+def test_a_document_filed_under_a_part_number_needs_no_guessing(tmp_path) -> None:
+    """Filing a document under an MPN *is* the statement that it belongs to
+    that part. Everything else in the resolver is inference about a filename
+    somebody else chose."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    (proj / "datasheets" / "NRF9151-LACA-R").mkdir(parents=True)
+    (proj / "datasheets" / "NRF9151-LACA-R" / "whatever-they-called-it.pdf").write_bytes(b"%PDF")
+    found = datasheet_files.resolve(proj, "NRF9151-LACA-R")
+    assert found.ok and found.how == "folder"
+
+
+def test_the_folder_matches_the_way_part_numbers_compare(tmp_path) -> None:
+    """Case and punctuation are not load-bearing in a part number, so a folder
+    someone typed by hand still resolves."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    (proj / "datasheets" / "nrf9151_laca_r").mkdir(parents=True)
+    (proj / "datasheets" / "nrf9151_laca_r" / "ds.pdf").write_bytes(b"%PDF")
+    assert datasheet_files.resolve(proj, "NRF9151-LACA-R").how == "folder"
+
+
+def test_two_documents_of_different_kinds_rank_rather_than_refuse(tmp_path) -> None:
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    d = proj / "datasheets" / "PART1"
+    d.mkdir(parents=True)
+    (d / "PART1_Errata_v1.pdf").write_bytes(b"%PDF")
+    (d / "PART1_Datasheet_v2.pdf").write_bytes(b"%PDF")
+    found = datasheet_files.resolve(proj, "PART1")
+    assert found.ok and found.path.name == "PART1_Datasheet_v2.pdf"
+
+
+def test_two_revisions_of_one_document_refuse_and_name_both(tmp_path) -> None:
+    """Picking between revisions is picking a pinout."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    d = proj / "datasheets" / "PART1"
+    d.mkdir(parents=True)
+    (d / "PART1_Datasheet_v1.pdf").write_bytes(b"%PDF")
+    (d / "PART1_Datasheet_v2.pdf").write_bytes(b"%PDF")
+    found = datasheet_files.resolve(proj, "PART1")
+    assert not found.ok and len(found.candidates) == 2
+
+
+def test_a_folder_document_is_not_offered_to_a_different_part(tmp_path) -> None:
+    """The prefix pass is why this matters: PART1 and PART2 share a stem, and a
+    document filed under one must not become a candidate for the other."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    (proj / "datasheets" / "PART100").mkdir(parents=True)
+    (proj / "datasheets" / "PART100" / "PART1_family.pdf").write_bytes(b"%PDF")
+    assert not datasheet_files.resolve(proj, "PART200-XYZ").ok
+
+
+def test_a_family_datasheet_still_resolves_from_the_top_level(tmp_path) -> None:
+    """Folders do not take over storage. A datasheet covering three parts filed
+    under one of them would be a lie; a copy in each would be the same 13 MB
+    three times."""
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "p"
+    sheets = proj / "datasheets"
+    sheets.mkdir(parents=True)
+    (sheets / "nRF54L15_nRF54L10_nRF54L05_Datasheet_v1.0.pdf").write_bytes(b"%PDF")
+    for part in ("NRF54L15-QFAA-R", "NRF54L10-QFAA-R", "NRF54L05-QFAA-R"):
+        assert datasheet_files.resolve(proj, part).how == "family", part

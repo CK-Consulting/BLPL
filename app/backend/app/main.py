@@ -71,6 +71,7 @@ from . import (
     attachments,
     chat as chat_mod,
     clerk_auth,
+    components,
     grants,
     importer,
     keystore,
@@ -94,7 +95,8 @@ from . import (
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, Run, User
-from blpl.core import project_manifest, quarantine
+from blpl.core import limits, project_manifest, quarantine
+from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects
 from .vault import VaultError
@@ -730,6 +732,11 @@ def get_settings(
                 "base_url": ep.base_url,
                 "auth": ep.auth,
                 "vision": ep.can_see,
+                # What was *declared*, not what was worked out — the settings
+                # screen edits the override, and echoing an inferred figure back
+                # into it would turn a guess into a stated fact on the next save.
+                "context_tokens": ep.context_tokens,
+                "max_output_tokens": ep.max_output_tokens,
                 "needs_key": ep.needs_key,
                 "has_key": not ep.needs_key or ep.name in with_keys,
             }
@@ -745,28 +752,24 @@ def get_settings(
         #
         # Returning only the effective map meant the client echoed inherited
         # values back as explicit routes on the next save. That turned a
-        # perfectly legal "datasheet_vision is unset" into an illegal
-        # "datasheet_vision routes to a blind endpoint", which validation then
+        # perfectly legal "vision is unset" into an illegal
+        # "vision routes to a blind endpoint", which validation then
         # refused — including refusing the very edit that would have fixed it.
         # A GET whose result cannot be PUT back unchanged is the bug.
         "tasks": {t: list(chain) for t, chain in cfg.tasks.items() if chain},
         "effective": {t: cfg.chain_for(t) for t in appconfig.KNOWN_TASKS},
-        # An inherited chain can be invalid in a way validation cannot refuse:
-        # `datasheet_vision` unset falls back to `default`, and if that is a
-        # blind endpoint the task breaks at request time rather than at save
-        # time. Refusing the config outright would be wrong — the default chain
-        # is legitimate for every other task — so it is reported instead.
-        "warnings": [
-            f"{t} reads images, but with no route of its own it falls back to "
-            f"{cfg.chain_for(t)}, which cannot see. Give it its own route."
-            for t in appconfig.VISION_TASKS
-            if t not in cfg.tasks
-            and any(
-                not cfg.endpoints[n].can_see
-                for n in cfg.chain_for(t)
-                if n in cfg.endpoints
-            )
-        ],
+        # What each endpoint's chosen model can actually do. Surfaced here, not
+        # only in the endpoint editor, because task routing is where the
+        # difference bites: review_panel wants several genuinely different
+        # models, chat is better with one that reasons, and vision
+        # simply cannot be served by a model that does not see. None of that is
+        # guessable from an endpoint's name.
+        "endpoint_capabilities": _endpoint_capabilities(cfg),
+        # One source for these. A vision task routed at a blind endpoint and one
+        # that merely inherits a blind default are the same problem, and were
+        # reported by two separate pieces of code that disagreed about whether
+        # it was fatal — which is what made the routing screen unsaveable.
+        "warnings": cfg.warnings(),
         "known_kinds": list(appconfig.KNOWN_KINDS),
         "known_tasks": list(appconfig.KNOWN_TASKS),
         "vision_tasks": sorted(appconfig.VISION_TASKS),
@@ -885,14 +888,151 @@ def probe_models(
         )
 
     rows = payload.get(field) or []
-    names = sorted(
-        {
-            str(m.get("model") or m.get("name") or m.get("id") or "").strip()
-            for m in rows
-            if isinstance(m, dict)
-        }
-    )
-    return {"kind": kind, "asked": True, "url": url, "models": [n for n in names if n]}
+    # `id` first, and the order is the whole bug this fixes.
+    #
+    # It used to read `model` → `name` → `id`, which is right for Ollama (whose
+    # `name` *is* the wire identifier) and quietly wrong for anything that
+    # publishes both. OpenRouter's catalogue gives id `google/gemini-3.7-flash`
+    # and name `Google: Gemini 3.7 Flash`; the display string won, went into the
+    # dropdown, and got saved as the model — so an endpoint picked from a list
+    # this app generated could never resolve on the wire.
+    #
+    # Ollama is unaffected: it has no `id`, and its `model` and `name` are the
+    # same string.
+    pairs: dict[str, str] = {}
+    for m in rows:
+        if not isinstance(m, dict):
+            continue
+        wire = str(m.get("id") or m.get("model") or m.get("name") or "").strip()
+        if not wire:
+            continue
+        # A human label where the provider offers one, so a list of four hundred
+        # router models is readable — but it never becomes the stored value.
+        label = str(m.get("name") or m.get("display_name") or "").strip()
+        pairs.setdefault(wire, label if label and label != wire else "")
+    names = sorted(pairs)
+    return {
+        "kind": kind,
+        "asked": True,
+        "url": url,
+        "models": names,
+        # id → human label, for a picker that shows one and stores the other.
+        "labels": {k: v for k, v in pairs.items() if v},
+        # Which of them can actually read an image. Asked rather than assumed:
+        # `vision = true` on an endpoint whose model is blind produces a
+        # vision route that validates fine and then fails at request
+        # time, which is the least useful place to discover it.
+        "capabilities": _model_capabilities(kind, url, names, headers),
+    }
+
+
+def _endpoint_capabilities(cfg) -> dict[str, list[str]]:
+    """Capabilities per configured endpoint, for the kinds that will say.
+
+    Cheap enough to do on a settings load: one local HTTP call per endpoint,
+    against a server on the same host or LAN. Hosted providers are skipped —
+    probing them is a billable call and their catalogues are documented.
+
+    An endpoint missing from the result is *unknown*, not incapable.
+    """
+    out: dict[str, list[str]] = {}
+    for name, ep in cfg.endpoints.items():
+        if ep.kind not in ("ollama", "openai-compatible"):
+            continue
+        model = ep.resolved_model()
+        if not model:
+            continue
+        try:
+            if ep.kind == "ollama":
+                base = ep.base_url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+                url = _normalise_base(base).rstrip("/") + "/api/tags"
+            else:
+                if not ep.base_url:
+                    continue
+                url = _normalise_base(ep.base_url).rstrip("/") + "/models"
+            caps = _model_capabilities(ep.kind, url, [model], {})
+            if caps.get(model):
+                out[name] = caps[model]
+        except Exception:
+            continue
+    return out
+
+
+def _model_capabilities(
+    kind: str, url: str, names: list[str], headers: dict
+) -> dict[str, list[str]]:
+    """What each model can do, asked of the server rather than inferred.
+
+    Ollama publishes this directly: ``/api/show`` returns a capability list —
+    ``vision``, ``tools``, ``thinking``, ``completion``, ``embedding`` — which
+    is free, authoritative, and explains behaviour that is otherwise puzzling.
+    A model tagged ``thinking`` emits chain-of-thought that a caller has to
+    parse out; one without ``tools`` will not call a tool no matter how the
+    prompt is written.
+
+    An OpenAI-compatible server does not publish capabilities, so vision is
+    established the only definitive way: send a one-pixel image and see whether
+    it refuses. vLLM answers "is not a multimodal model" with a 400, which
+    beats guessing from the model's name.
+
+    A model absent from the result is *unknown*, not incapable — the same
+    distinction the rest of this codebase keeps. Hosted providers are left
+    unknown deliberately: their catalogues are large, probing is a billable
+    call per model, and their capabilities are documented.
+    """
+    caps: dict[str, list[str]] = {}
+
+    if kind == "ollama":
+        base = url[: -len("/api/tags")]
+        for n in names:
+            try:
+                req = urllib.request.Request(
+                    base + "/api/show",
+                    data=json.dumps({"model": n}).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    got = json.loads(r.read()).get("capabilities") or []
+                if got:
+                    caps[n] = sorted(str(c) for c in got)
+            except Exception:
+                continue
+        return caps
+
+    if kind == "openai-compatible" and len(names) <= 4:
+        # Bounded: a server hosting one or two models is worth probing; a
+        # gateway fronting two hundred is not.
+        base = url[: -len("/models")]
+        for n in names:
+            body = {
+                "model": n, "max_tokens": 1,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "."},
+                    {"type": "image_url", "image_url": {"url": _ONE_PIXEL_PNG}},
+                ]}],
+            }
+            try:
+                req = urllib.request.Request(
+                    base + "/chat/completions", data=json.dumps(body).encode(),
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=20):
+                    caps[n] = ["completion", "vision"]
+            except urllib.error.HTTPError:
+                caps[n] = ["completion"]     # answered, and refused the image
+            except Exception:
+                continue                      # no answer — unknown, not blind
+        return caps
+
+    return caps
+
+
+# A 1x1 red PNG. Small enough that probing costs nothing and any server that
+# can decode an image at all will accept it.
+_ONE_PIXEL_PNG = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAA"
+    "DUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 
 def _normalise_base(base: str) -> str:
@@ -918,6 +1058,10 @@ class EndpointBody(BaseModel):
     base_url: str = ""
     auth: str = "vault"
     vision: bool | None = None
+    # Null means "work it out". Stated when neither discovery nor the model
+    # name gets it right — which is the ordinary case for a self-hosted model.
+    context_tokens: int | None = None
+    max_output_tokens: int | None = None
 
 
 class LlmSettingsBody(BaseModel):
@@ -950,6 +1094,8 @@ def put_llm_settings(
                 base_url=e.base_url,
                 auth=e.auth,
                 vision=e.vision,
+                context_tokens=e.context_tokens,
+                max_output_tokens=e.max_output_tokens,
             )
             for e in body.endpoints
         }
@@ -967,9 +1113,13 @@ def put_llm_settings(
 
     try:
         llmconfig.save(session, user, cfg)
-    except ValueError as exc:  # unknown kind/endpoint, empty chain, blind vision task
+    except ValueError as exc:  # unknown kind or endpoint, empty default chain
         raise HTTPException(status_code=400, detail=str(exc))
-    return {"ok": True}
+    # Saved, and here is what is odd about it. Warnings ride back on the success
+    # response rather than becoming a refusal: a configuration that will run in
+    # a way you may not have meant is worth saying, and is not worth making the
+    # screen unable to save.
+    return {"ok": True, "warnings": cfg.warnings()}
 
 
 class SecretBody(BaseModel):
@@ -2181,7 +2331,64 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     activity.record(
         session, _project_or_404(session, user, project_id), user, activity.EDITED, name
     )
-    return {"ok": True, "name": name, "bytes": target.stat().st_size}
+    # Committed, the way an accepted proposal is. This was the one edit path
+    # that wrote over the previous version and kept no record of it: an edit
+    # made in the workbench survived only until the next one, and was then only
+    # recoverable if some later chat commit happened to sweep it up — filed
+    # under someone else's rationale, which is worse than not filed at all.
+    #
+    # Failure to commit is reported, never fatal. The bytes are already on disk
+    # and refusing the save that landed would be a lie about what happened.
+    committed = False
+    try:
+        committed = projects.commit_all(project_id, f"edit: {name}") is not None
+    except ProjectError:
+        committed = False
+    return {
+        "ok": True,
+        "name": name,
+        "bytes": target.stat().st_size,
+        "committed": committed,
+    }
+
+
+class FolderBody(BaseModel):
+    path: str
+
+
+@app.post("/api/projects/{project_id}/folders")
+def make_folder(
+    project_id: str, body: FolderBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Create a directory in the project.
+
+    Git does not track directories, so this leaves nothing in the history until
+    something is put inside — which is fine, and is why it is worth having as
+    an action rather than a side effect of naming a file with slashes in it. A
+    per-MPN datasheet folder is a place you make *before* you have the file to
+    put in it.
+    """
+    proj = _project_dir(session, user, project_id)
+    parts = [seg for seg in body.path.replace("\\", "/").split("/") if seg]
+    if (
+        not parts
+        or body.path.startswith("/")
+        or any(seg == ".." or seg.startswith(".") for seg in parts)
+    ):
+        raise HTTPException(status_code=400, detail="invalid folder name")
+    target = proj.joinpath(*parts)
+    root = proj.resolve()
+    # Resolve the parent rather than the target: the target does not exist yet,
+    # and a symlinked parent is the way out of the project that a string check
+    # would not see.
+    if not target.parent.resolve().is_relative_to(root):
+        raise HTTPException(status_code=400, detail="invalid folder name")
+    if target.exists():
+        raise HTTPException(status_code=409, detail=f"{body.path} already exists")
+    target.mkdir(parents=True)
+    return {"ok": True, "path": "/".join(parts)}
 
 
 @app.get("/api/projects/{project_id}/artifacts/{name}")
@@ -2425,10 +2632,246 @@ class MessageInput(BaseModel):
     metadata: dict | None = None
 
 
+@app.get("/api/projects/{project_id}/chat/endpoints")
+def chat_endpoints(project_id: str, user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> dict:
+    """Which endpoints can answer a chat turn here, in routed order.
+
+    Named separately from /api/settings because the picker beside the
+    conversation list is asking a narrower question — not "what exists" but
+    "what could answer this" — and an endpoint with no key cannot.
+    """
+    cfg = llmconfig.load(session, user)
+    with_keys = keystore.endpoints_with_keys(session, user)
+    chain = llm_resolver.resolve_chain(cfg, with_keys, "chat")
+    caps = _endpoint_capabilities(cfg)
+    return {
+        "endpoints": [
+            {
+                "name": rp.name,
+                "model": rp.model,
+                "kind": rp.provider,
+                "capabilities": caps.get(rp.name, []),
+                "default": i == 0,
+            }
+            for i, rp in enumerate(chain)
+        ]
+    }
+
+
 @app.get("/api/projects/{project_id}/conversations")
-def get_conversations(project_id: str, user: User = Depends(require_onboarded),
+def get_conversations(project_id: str, include_archived: bool = False,
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> list[dict]:
-    return [m.to_dict() for m in list_conversations(_conversations_dir(session, user, project_id))]
+    return [
+        m.to_dict()
+        for m in list_conversations(
+            _conversations_dir(session, user, project_id),
+            include_archived=include_archived,
+        )
+    ]
+
+
+class ArchiveBody(BaseModel):
+    archived: bool = True
+
+
+@app.post("/api/projects/{project_id}/conversations/{filename}/archive")
+def archive_conversation(
+    project_id: str, filename: str, body: ArchiveBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Take a conversation off the picker, or put it back.
+
+    Not a delete, and there is deliberately no delete: a transcript records
+    what was proposed and why a part was chosen, which outlives its usefulness
+    in a dropdown.
+    """
+    d = _conversations_dir(session, user, project_id)
+    if chat_sessions.active_for(filename):
+        raise HTTPException(
+            status_code=409,
+            detail="that conversation has a turn running — stop it first",
+        )
+    try:
+        conversations_mod.set_archived(d, filename, body.archived)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"ok": True, "filename": filename, "archived": body.archived}
+
+
+@app.delete("/api/projects/{project_id}/conversations/{filename}/messages/{index}")
+def delete_failed_message(
+    project_id: str, filename: str, index: int,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Remove a question nothing ever answered, and the error that answered it.
+
+    The one delete there is, and narrow on purpose. A transcript records what
+    was proposed and why a part was chosen, so removing an *answered* exchange
+    would take out evidence — and would break the history structurally, since a
+    tool call and its result have to travel together.
+
+    What this removes never had either. It is a question that reached no model
+    and produced nothing, and four copies of one accumulate in the time it
+    takes to work out that retrying is not the answer.
+
+    They are already excluded from what gets sent. This is for the transcript,
+    which is otherwise left showing the same paragraph four times with an error
+    under each.
+    """
+    d = _conversations_dir(session, user, project_id)
+    if chat_sessions.active_for(filename):
+        raise HTTPException(
+            status_code=409,
+            detail="that conversation has a turn running — stop it first",
+        )
+    try:
+        conv = Conversation.open_existing(d, filename)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    events = conv.read_all()
+    if index not in chat_mod.unanswered_messages(events):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "only a message that produced no answer at all can be removed — "
+                "this one was answered, and the reply refers to it"
+            ),
+        )
+    # The errors that followed it go too: they are about this message and mean
+    # nothing without it.
+    doomed = {index}
+    for j in range(index + 1, len(events)):
+        role = events[j].get("role")
+        if role == "error":
+            doomed.add(j)
+        elif role == "user":
+            break
+    removed = conv.drop(doomed)
+    return {"ok": True, "removed": removed}
+
+
+# --------------------------------------------------------------------------
+# Component library
+# --------------------------------------------------------------------------
+
+
+class _Library:
+    """One user's component library, as the two operations a tool needs.
+
+    Closed over the user id rather than handed to tools as a path: a tool that
+    only has ``get`` and ``put`` cannot construct another user's library
+    location, even by accident, and the per-user boundary is the entirety of
+    the answer to "what about an NDA datasheet".
+    """
+
+    def __init__(self, user_id: int) -> None:
+        self._user_id = user_id
+
+    def get(self, mpn: str) -> dict | None:
+        return components.extraction(_DATA, self._user_id, mpn)
+
+    def put(self, mpn: str, payload: dict) -> None:
+        components.save_extraction(_DATA, self._user_id, mpn, payload)
+
+
+class ComponentDocBody(BaseModel):
+    mpn: str
+
+
+@app.get("/api/components")
+def list_components(
+    user: User = Depends(require_onboarded),
+) -> dict:
+    """This user's parts. Never anyone else's — the library is per-user, and
+    that scoping is the whole of the answer to "what about NDA documents"."""
+    return {"parts": components.parts(_DATA, user.id)}
+
+
+@app.get("/api/components/{mpn}")
+def read_component(mpn: str, user: User = Depends(require_onboarded)) -> dict:
+    return {
+        "mpn": mpn,
+        "documents": components.documents(_DATA, user.id, mpn),
+        "has_extraction": components.extraction(_DATA, user.id, mpn) is not None,
+    }
+
+
+@app.post("/api/components/{mpn}/documents")
+async def add_component_document(
+    mpn: str,
+    file: UploadFile = File(...),
+    user: User = Depends(require_onboarded),
+) -> dict:
+    data = await file.read()
+    if len(data) > attachments.MAX_DOCUMENT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{file.filename} is larger than {attachments.MAX_DOCUMENT_BYTES // (1024*1024)} MB",
+        )
+    try:
+        return components.add_document(_DATA, user.id, mpn, file.filename or "document.pdf", data)
+    except components.ComponentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/projects/{project_id}/components")
+def project_components(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Which parts this project references, and at which revision.
+
+    A bill of documents beside the bill of materials: the exact datasheet
+    revision the board was designed against, per part.
+    """
+    proj = _project_dir(session, user, project_id)
+    return {"attached": sorted(components.attached(proj))}
+
+
+@app.post("/api/projects/{project_id}/components")
+def attach_component(
+    project_id: str, body: ComponentDocBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    proj = _project_dir(session, user, project_id)
+    try:
+        return components.attach(proj, _DATA, user.id, body.mpn)
+    except components.ComponentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/projects/{project_id}/components/{mpn}/update")
+def update_component(
+    project_id: str, mpn: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    proj = _project_dir(session, user, project_id)
+    try:
+        return components.update(proj, mpn)
+    except components.ComponentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/projects/{project_id}/components/{mpn}")
+def detach_component(
+    project_id: str, mpn: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    proj = _project_dir(session, user, project_id)
+    try:
+        components.detach(proj, mpn)
+    except components.ComponentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True}
 
 
 @app.post("/api/projects/{project_id}/conversations")
@@ -2484,6 +2927,33 @@ def append_message(
 # --------------------------------------------------------------------------
 
 
+def _chat_chain(
+    session: Session, user: User, master_key: bytes, task: str = "chat"
+) -> list[chat_mod.Endpoint]:
+    """Every endpoint routed to a task, in order, keys decrypted for this request.
+
+    The whole chain rather than its head, because a chain used only for its
+    first entry is not a fallback chain. When the head cannot serve a turn — no
+    tool support, overloaded, model gone — the rest are what make the route
+    worth declaring.
+    """
+    cfg = llmconfig.load(session, user)
+    with_keys = keystore.endpoints_with_keys(session, user)
+    out: list[chat_mod.Endpoint] = []
+    for rp in llm_resolver.resolve_chain(cfg, with_keys, task):
+        name = rp.name or rp.provider
+        out.append(
+            chat_mod.Endpoint(
+                name=name,
+                kind=rp.provider,  # type: ignore[arg-type]
+                model=rp.model,
+                api_key=keystore.get(session, master_key, user, name) if rp.needs_key else None,
+                base_url=rp.base_url or None,
+            )
+        )
+    return out
+
+
 def _chat_endpoint(session: Session, user: User, master_key: bytes) -> chat_mod.Endpoint:
     """The endpoint *this user's* chat turn should use, key decrypted for this
     request only.
@@ -2531,31 +3001,102 @@ def _cred_resolver():
     return CredResolver()
 
 
-def _task_endpoint(session: Session, user: User, master_key: bytes, task: str):
-    """The endpoint routed to a task for this user, or None if nothing usable is.
+# Windows discovered from a server, by endpoint name. A window does not change
+# while a server is up, and asking again per turn would pay a round trip to
+# learn the same number.
+_DISCOVERED_CONTEXT: dict[str, int] = {}
 
-    None rather than a fallback: a tool that needs vision must not quietly run
-    on a model that cannot see.
+
+def _context_of(session: Session, user: User, master_key: bytes, endpoint_name: str) -> int:
+    """This endpoint's context window: declared, discovered, or inferred.
+
+    Discovery happens here rather than on the Endpoint itself, because this is a
+    request handler where a network call is expected and can be cached. It asks
+    about *one* model — the one this endpoint uses. A self-hosted server lists
+    one thing and a router lists thousands, and pulling a catalogue to find a
+    single row is not a way to learn a number that does not change.
+    """
+    declared = llmconfig.load(session, user).endpoint(endpoint_name)
+    if declared is None:
+        return 0
+    if declared.context_tokens:
+        return int(declared.context_tokens)
+    if endpoint_name in _DISCOVERED_CONTEXT:
+        return _DISCOVERED_CONTEXT[endpoint_name]
+    if declared.kind in ("openai-compatible", "vllm") and declared.base_url:
+        found, _ = limits.describe(
+            declared.base_url,
+            keystore.get(session, master_key, user, endpoint_name)
+            if declared.needs_key
+            else None,
+            declared.resolved_model(),
+        )
+        if found:
+            _DISCOVERED_CONTEXT[endpoint_name] = int(found)
+            return int(found)
+    return declared.context
+
+
+def _task_endpoints(
+    session: Session, user: User, master_key: bytes, task: str
+) -> list[chat_mod.Endpoint]:
+    """Every endpoint routed to a task for this user, best first.
+
+    A list rather than one. ``resolve_chain`` has always known the fallbacks —
+    it drops endpoints that cannot serve the task, so what comes back is usable
+    rather than merely first — but this returned only its head, and the tool
+    behind it got one attempt at one model. When that model could not hold the
+    extraction schema, the endpoints sitting behind it in the very same chain
+    were never asked.
+
+    Empty rather than a loose fallback: a tool that needs vision must not
+    quietly run on a model that cannot see.
     """
     cfg = llmconfig.load(session, user)
-    try:
-        rp = llm_resolver.resolve_primary(cfg, keystore.endpoints_with_keys(session, user), task)
-    except llm_resolver.NoUsableProvider:
-        return None
-    ep = cfg.endpoint(rp.name)
-    if task in appconfig.VISION_TASKS and ep is not None and not ep.can_see:
-        return None
-    return chat_mod.Endpoint(
-        name=rp.name or rp.provider,
-        kind=rp.provider,  # type: ignore[arg-type]
-        model=rp.model,
-        api_key=(
-            keystore.get(session, master_key, user, rp.name or rp.provider)
-            if rp.needs_key
-            else None
-        ),
-        base_url=rp.base_url or None,
-    )
+
+    def build(rp) -> chat_mod.Endpoint:
+        name = rp.name or rp.provider
+        # Carry the declared cap across. Without it the limits module fell
+        # straight back to inference for every endpoint, so an override nobody
+        # could set was also an override nobody would have felt.
+        declared = cfg.endpoint(name)
+        return chat_mod.Endpoint(
+            name=name,
+            kind=rp.provider,  # type: ignore[arg-type]
+            model=rp.model,
+            api_key=(
+                keystore.get(session, master_key, user, name) if rp.needs_key else None
+            ),
+            base_url=rp.base_url or None,
+            max_output_tokens=declared.max_output_tokens if declared else None,
+        )
+
+    chain = [
+        build(rp)
+        for rp in llm_resolver.resolve_chain(
+            cfg, keystore.endpoints_with_keys(session, user), task
+        )
+    ]
+    if chain:
+        return chain
+    # Nothing is routed to the task. Before giving up, consider the model
+    # already driving this conversation: if the user has put a vision-capable
+    # model in the chair, refusing to read a PDF with it because a *different*
+    # route is unset is pedantry, not safety.
+    if task in appconfig.VISION_TASKS:
+        seeing = []
+        for ep in _chat_chain(session, user, master_key):
+            declared = cfg.endpoint(ep.name)
+            if declared is not None and declared.can_see:
+                seeing.append(ep)
+        return seeing
+    return []
+
+
+def _task_endpoint(session: Session, user: User, master_key: bytes, task: str):
+    """The best endpoint routed to a task, or None. See ``_task_endpoints``."""
+    chain = _task_endpoints(session, user, master_key, task)
+    return chain[0] if chain else None
 
 
 def _kicad_bridge_url() -> str | None:
@@ -2643,6 +3184,12 @@ class ChatInput(BaseModel):
     # than trusted from the client, so the transcript cannot be made to claim a
     # file is something it is not.
     attachments: list[str] = []
+    # Which endpoint should answer, overriding the routed order for this turn.
+    # A per-turn choice rather than a stored setting: "ask the big model about
+    # this one" is a decision about a question, not a change of configuration,
+    # and having it silently persist is how people end up billing a frontier
+    # model for a week of small talk.
+    endpoint: str = ""
 
 
 @app.post("/api/projects/{project_id}/conversations/{filename}/chat")
@@ -2709,7 +3256,21 @@ async def start_chat_turn(
             },
         )
 
+    chain = _chat_chain(session, user, master_key)
     endpoint = _chat_endpoint(session, user, master_key)
+    if payload.endpoint:
+        chosen = next((e for e in chain if e.name == payload.endpoint), None)
+        if chosen is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{payload.endpoint!r} is not routed to chat, or has no key. "
+                    f"Available: {[e.name for e in chain]}"
+                ),
+            )
+        endpoint = chosen
+    # The rest of the chain still backs it up, in its configured order.
+    fallbacks = tuple(e for e in chain if e.name != endpoint.name)
     conv.append("user", payload.content, {"blocks": blocks})
     try:
         turn_id = chat_sessions.start(
@@ -2718,10 +3279,17 @@ async def start_chat_turn(
                 project_dir=proj,
                 conversation=conv,
                 endpoint=endpoint,
+                fallbacks=fallbacks,
+                # What the chosen model can actually be told at once. Read from
+                # the declared config rather than guessed from the wire name,
+                # so a self-hosted model started with a 1M window is treated as
+                # having one.
+                context=_context_of(session, user, master_key, endpoint.name),
                 sandbox=_sandbox_for(session, user, project_id),
                 usage_ledger=_blpl_dir(session, user, project_id) / "llm_usage.jsonl",
                 creds=_cred_resolver(),
-                endpoint_for=lambda task: _task_endpoint(session, user, master_key, task),
+                endpoints_for=lambda task: _task_endpoints(session, user, master_key, task),
+                library=_Library(user.id),
                 record_tool_call=lambda rec: run_manager.record_tool_call(
                     project_id, rec, conversation=conv.path.name
                 ),

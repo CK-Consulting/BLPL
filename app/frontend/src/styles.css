@@ -50,7 +50,10 @@ header .kicad { margin-left: 0; }
 .gate-card button { padding: .65rem; font-size: 15px; background: #2f5db0; border: 1px solid #3d6cc4; border-radius: 8px; }
 .gate-card button:hover:not(:disabled) { background: #3768c4; }
 .gate-error { color: #ff9b9b; font-size: 14px; }
-.gate-hint { color: #97a1ad; font-size: 13px; }
+/* 6.52:1 before, which is AA and not AAA. This is help text — the text that
+   explains how to use the thing — so it is the worst candidate for being the
+   hardest thing on screen to read. 9.57:1. */
+.gate-hint { color: #b9c3d0; font-size: 13px; }
 /* An anchor, not a button — it must be a real top-level navigation so the
    provider can take the tab. Styled to sit alongside the unlock button without
    competing with it: the passphrase remains the primary path. */
@@ -64,11 +67,21 @@ header .kicad { margin-left: 0; }
 
 /* --- modal (settings, new project) --- */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: flex-start; justify-content: center; padding-top: 6vh; z-index: 10; }
-.modal { width: 640px; max-width: 92vw; max-height: 84vh; overflow: auto; background: #191c22; border: 1px solid #6b6f75; border-radius: 12px; }
+/* A column with one scrolling region, rather than one scrolling box. What
+   sits outside .modal-body — the header, and anything telling you a save was
+   refused — then stays put instead of scrolling away from the thing it is
+   about. */
+.modal { width: 640px; max-width: 92vw; max-height: 84vh; display: flex; flex-direction: column; overflow: hidden; background: #191c22; border: 1px solid #6b6f75; border-radius: 12px; }
 .modal.small { width: 440px; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.2rem; border-bottom: 1px solid #6b6f75; position: sticky; top: 0; background: #191c22; }
 .modal-head h2 { margin: 0; font-size: 16px; }
-.modal-body { padding: 1.2rem; display: flex; flex-direction: column; gap: 1.4rem; }
+/* Pinned under the header, never in the scroll. 11.19:1, and it carries a word
+   as well as a colour — "could not save" has to survive being looked at by
+   someone who cannot tell this red from the panel behind it. */
+.modal-notice { display: flex; align-items: flex-start; gap: .6rem; flex: none; padding: .7rem 1.2rem; font-size: 14px; line-height: 1.45; border-bottom: 1px solid #6b6f75; }
+.modal-notice.error { background: #2a1418; color: #ffc0c0; border-bottom-color: #a2444f; }
+.modal-notice button.link { color: inherit; font-size: 16px; line-height: 1; }
+.modal-body { padding: 1.2rem; display: flex; flex-direction: column; gap: 1.4rem; overflow: auto; flex: 1; min-height: 0; }
 .modal-body section { display: flex; flex-direction: column; gap: .5rem; }
 .modal-body h3 { margin: 0; font-size: 14px; }
 .muted { color: #adb1b6; font-size: 13px; margin: 0; }
@@ -254,9 +267,124 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8e8e; }
    overflow:auto box (the proposal's diff) can shrink all the way to nothing —
    which collapsed the accept/reject card to 2px at the end of a long chat. */
 .chat-scroll > * { flex: none; }
-.chat-composer { display: flex; gap: .4rem; padding: .6rem; border-top: 1px solid #24262c; flex: none; }
-.chat-composer textarea { flex: 1; resize: none; min-height: 3.6rem; max-height: 12rem; background: #0f1115; color: #e6e6e6; border: 1px solid #6b6f75; border-radius: 6px; padding: .45rem .6rem; font: inherit; font-size: 13px; }
-.chat-composer textarea:focus { outline: 2px solid #34507f; outline-offset: -1px; }
+.chat-composer { display: flex; gap: .4rem; padding: .6rem; border-top: 1px solid #6b6f75; flex: none; align-items: stretch; }
+/* Vertically resizable, and taller by default. The dock resizes horizontally,
+   which widens the box but does not help when you are composing something long
+   — three lines of a twenty-line paste is a keyhole.
+   The height is set from .composer-grip and remembered, so `resize` is off: two
+   mechanisms writing the same property fight, and the one that is visible and
+   keyboard-operable should win. line-height is explicit because `font: inherit`
+   carried the body's 1.5 computed against 14px, which quietly made this box
+   three lines tall whatever min-height said. */
+.chat-composer textarea { flex: 1; resize: none; min-height: 6rem; max-height: 60vh; background: #0f1115; color: #e6e6e6; border: 1px solid #6b6f75; border-radius: 6px; padding: .45rem .6rem; font: inherit; font-size: 13px; line-height: 1.5; }
+/* The seam itself: full width across the top of the composer, pulled out to the
+   panel edges through the composer's padding. 10px tall rather than the 5px of
+   the sidebar seams — this one is grabbed far more often, and a taller target
+   is easier to hit. The bar inside it is 7.09:1 against the composer, well past
+   the 3:1 that 1.4.11 asks of a control. */
+.composer-grip { flex: 0 0 100%; height: 10px; margin: -.6rem -.6rem .1rem; cursor: ns-resize; display: flex; align-items: center; justify-content: center; }
+.composer-grip::after { content: ""; width: 46px; height: 3px; border-radius: 2px; background: #9aa2ac; }
+.composer-grip:hover::after, body.resizing-y .composer-grip::after { background: #80a8ff; }
+.composer-grip:focus-visible { outline: 3px solid #80a8ff; outline-offset: -2px; border-radius: 3px; }
+body.resizing-y { cursor: ns-resize; user-select: none; }
+body.resizing-y * { pointer-events: none; }
+/* The composer's buttons sit at the foot of the box rather than stretching to
+   its full height: `align-items: stretch` made Send as tall as the textarea,
+   which was merely odd at three lines and absurd at twelve. */
+.chat-composer > button { align-self: flex-end; }
+
+/* The chat header keeps two controls and a menu. Both stay a fixed width so the
+   bar does not reflow when a long model id is picked — the row used to shrink
+   the conversation picker to nothing the moment an endpoint with a long name
+   was selected. */
+.chat-head .model-picker { flex: 0 0 13rem; max-width: 13rem; }
+.model-now { flex: none; max-width: 12rem; overflow: hidden; white-space: nowrap; }
+
+.menu { position: relative; flex: none; }
+.menu-trigger { display: inline-flex; align-items: baseline; gap: .4rem; max-width: 15rem; }
+.menu-kicker { color: #b9c3d0; font-size: 12px; }
+.menu-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow: hidden; white-space: nowrap; }
+.menu-caret { font-size: 10px; color: #b9c3d0; }
+.menu-trigger:focus-visible, .menu-item:focus-visible { outline: 3px solid #80a8ff; outline-offset: 1px; }
+/* Above the transcript and the composer's popovers, or the panel opens behind
+   the thing it was called from. */
+.menu-panel { position: absolute; top: calc(100% + .35rem); z-index: 20; min-width: 17rem; display: flex; flex-direction: column; gap: .55rem; padding: .7rem; background: #1c2029; border: 1px solid #6b6f75; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.55); }
+.menu-panel.right { right: 0; }
+.menu-panel.left { left: 0; }
+/* 13.06:1 and 9.15:1 on the panel. Field labels are the text that says what a
+   control does, so they are sized and contrasted as text, not as decoration. */
+.menu-field { display: flex; flex-direction: column; gap: .25rem; font-size: 13px; color: #b9c3d0; }
+.menu-field select { width: 100%; }
+.menu-check { display: flex; align-items: center; gap: .1rem; font-size: 13px; color: #e6e6e6; }
+.menu-check input { width: 16px; height: 16px; accent-color: #4f7fd0; }
+.menu-sep { height: 1px; background: #6b6f75; margin: .15rem 0; }
+.menu-item { text-align: left; width: 100%; background: transparent; border: 1px solid transparent; padding: .35rem .4rem; border-radius: 6px; font-size: 13px; color: #e6e6e6; }
+.menu-item:hover:not(:disabled) { background: #2a303c; border-color: #6b6f75; }
+/* 9.15:1. Says why the control above it is unavailable, which a disabled
+   control on its own never does. */
+.menu-note { margin: 0; font-size: 12.5px; line-height: 1.45; color: #b9c3d0; }
+
+/* A compaction marker. Folded, because it is long and is rarely what you came
+   back for — and present, because the alternative is a conversation that
+   rewrote itself without saying so. 10.7:1. */
+.msg.summary { background: #1b2233; border: 1px dashed #6f7fa5; color: #cbd6e6; font-size: 13px; }
+.msg.summary > summary { cursor: pointer; padding: .15rem 0; font-size: 12.5px; }
+.msg.summary > summary:focus-visible { outline: 3px solid #80a8ff; outline-offset: 2px; }
+
+/* View/Edit. One file, two modes, and the rendered one first — a pipe table is
+   a table when it is rendered and a wall of pipes when it is not. */
+.fileview, .kicad-file { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.fileview-body { flex: 1; min-height: 0; overflow: auto; padding: 1rem 1.2rem; }
+.code-view { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; color: #cfd6de; }
+.tree-actions { display: flex; gap: .5rem; padding: 0 .1rem .35rem; }
+.tree-group-head { display: flex; align-items: center; gap: .3rem; width: 100%; text-align: left; background: none; border: 0; padding: .25rem .2rem; }
+.tree-group-head:hover { color: #e6e6e6; }
+.tree-group-head:focus-visible { outline: 3px solid #80a8ff; outline-offset: -2px; border-radius: 4px; }
+.tree-hidden-toggle { display: flex; align-items: center; gap: .35rem; margin-top: .6rem; padding-top: .5rem; border-top: 1px solid #2a3038; font-size: 12.5px; color: #b9c3d0; }
+.tree-hidden-toggle input { width: 15px; height: 15px; accent-color: #4f7fd0; }
+
+/* Syntax colours, named for the nano colour each one stands in for, so the
+   mapping stays readable. Every one is ≥7:1 against #0f1115 — measured, not
+   eyeballed, because a token colour is small text on a dark ground and that is
+   where contrast quietly fails. */
+.tok-brightwhite { color: #f2f4f7; font-weight: 600; }
+.tok-cyan { color: #7fd4e8; }
+.tok-brightcyan { color: #a8e6f5; }
+.tok-green { color: #8fd694; font-style: italic; }
+.tok-brightgreen { color: #b6e8b6; font-weight: 600; }
+.tok-yellow { color: #e8d38a; }
+.tok-brightyellow { color: #f2e3a8; }
+.tok-red { color: #ff9b9b; }
+.tok-magenta { color: #e5a8e0; }
+.tok-brightmagenta { color: #f0c2ec; }
+.tok-blue { color: #9ab8ff; }
+.tok-brightblue { color: #b7cbff; }
+.tok-brightblack { color: #9aa2ac; }
+
+/* A question nothing answered. Marked rather than hidden: it is still what the
+   person typed, and four copies of it stacking up is the symptom that explains
+   what went wrong. 9.14:1 on the message bubble, with a dashed edge so the
+   state is not carried by colour alone. */
+.msg.user.unanswered { border-style: dashed; border-color: #8a7a52; }
+.unanswered-tag { display: flex; align-items: center; gap: .5rem; margin: -.1rem 0 .4rem; padding-bottom: .35rem; border-bottom: 1px solid #3a4557; font-size: 12.5px; color: #d7c7a8; }
+.unanswered-tag button.link { color: #d7c7a8; text-decoration: underline; font-size: 12.5px; }
+
+/* Anchored over the transcript at whichever end new material arrives at, so
+   the arrow on it and the direction it takes you always agree. `.chat` is the
+   positioning context; the button is outside `.chat-scroll` so it does not
+   scroll away with the content it is announcing.
+   11.59:1 for the ordinary state and 12.24:1 for the approval one — both past
+   AAA's 7:1, because this is the text that says something is waiting. */
+.chat { position: relative; }
+.chat-jump { position: absolute; left: 50%; transform: translateX(-50%); z-index: 3; bottom: 5.2rem; padding: .4rem .8rem; font-size: 13px; background: #1d2a3d; color: #dce7f7; border: 1px solid #6f8bb5; border-radius: 999px; box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+.chat-jump.top { bottom: auto; top: 3rem; }
+/* Not colour alone: the wording changes to name the approval, and the shape
+   does not move. The warmer palette is the redundant signal, not the message. */
+.chat-jump.waiting { background: #2b1d10; color: #ffd9a8; border-color: #d4881f; }
+.chat-jump:focus-visible { outline: 3px solid #80a8ff; outline-offset: 2px; }
+/* 2.34:1 before — a focus ring that fails 1.4.11 is not a focus ring. Matches
+   the app-wide indicator so focus looks the same wherever it lands. */
+.chat-composer textarea:focus { outline: 3px solid #80a8ff; outline-offset: -1px; }
 
 .msg { border-radius: 8px; padding: .5rem .7rem; font-size: 13.5px; line-height: 1.5; }
 .msg.user { background: #1d2635; border: 1px solid #26344a; align-self: flex-end; max-width: 92%; white-space: pre-wrap; }
@@ -481,7 +609,10 @@ header .logo-lockup { font-size: 13px; }
 .rail-head:hover { background: #1c2027; }
 .rail-caret { color: #6b7684; font-size: 10px; width: .7rem; }
 .rail-title { font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: #9aa4b0; }
-.rail-subtitle { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: #6b7684; margin: .5rem 0 .25rem; }
+/* 3.85:1 at 10px uppercase before — small, spaced-out, and the least legible
+   text on the screen, which for a group heading is precisely backwards. 9.98:1
+   at 11.5px. */
+.rail-subtitle { font-size: 11.5px; text-transform: uppercase; letter-spacing: .08em; color: #b9c3d0; margin: .5rem 0 .25rem; }
 .rail-body { padding: 0 .2rem .5rem; }
 
 /* --- board panel --- */
@@ -498,10 +629,15 @@ header .logo-lockup { font-size: 13px; }
 .file-tree { padding: 0 .4rem; }
 .tree-filter { width: 100%; font-size: 12px; padding: .25rem .4rem; margin-bottom: .4rem; }
 .tree-group { margin-bottom: .5rem; }
-.tree-item { display: flex; align-items: center; gap: .4rem; width: 100%; text-align: left; padding: .22rem .4rem; background: none; border: 0; border-radius: 5px; font-size: 12px; }
-.tree-item:hover { background: #1c2027; }
+.tree-item, .tree-folder { display: flex; align-items: center; gap: .4rem; width: 100%; text-align: left; padding: .24rem .4rem; background: none; border: 0; border-radius: 5px; font-size: 12.5px; }
+.tree-item:hover, .tree-folder:hover { background: #1c2027; }
+.tree-item:focus-visible, .tree-folder:focus-visible { outline: 3px solid #80a8ff; outline-offset: -2px; }
+/* A folder differs from a file by a caret four pixels wide, so it says so in
+   weight and colour too, and carries a count rather than a size. 10.7:1. */
+.tree-folder .tree-name { color: #d7c7a8; font-weight: 600; }
+.tree-caret { flex: none; width: .7rem; color: #b9c3d0; font-size: 10px; }
 .tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cfd6de; }
-.tree-size { font-size: 11px; flex: none; }
+.tree-size { font-size: 11.5px; flex: none; }
 
 /* A lost answer is not an error the user caused, and not a warning about the
    design — it is a status with one obvious action. Amber, and it carries that
@@ -589,3 +725,19 @@ header .logo-lockup { font-size: 13px; }
 /* Never remove it. A control that cannot be seen while focused cannot be used
    from a keyboard, which is the whole point of the criterion. */
 *:focus:not(:focus-visible) { outline: none; }
+
+/* Model capabilities. Colour is a second signal, never the only one — each
+   chip is also labelled, so the distinction survives any colour deficiency. */
+.cap-row { display: flex; flex-wrap: wrap; gap: .35rem; }
+.cap { font-size: 12px; padding: .1rem .4rem; border-radius: 4px;
+  background: #22262e; color: #e6e6e6; border: 1px solid #6b6f75; }
+.cap.cap-vision { background: #16351f; color: #9ff0c0; border-color: #3f7d58; }
+.cap.cap-thinking { background: #2f2740; color: #caa7ff; border-color: #7d6aa8; }
+
+/* A message composed during a turn, waiting for it to end. Stated plainly
+   because the alternative — an input that silently refuses clicks — made the
+   app look broken at exactly the moment it was working hardest. */
+.queued-note { display: flex; align-items: center; gap: .5rem; padding: .35rem .5rem;
+  margin-bottom: .4rem; border: 1px dashed #6b6f75; border-radius: 6px;
+  background: #171d27; color: #e6e6e6; font-size: 13px; }
+.queued-note .queued-text { color: #adb1b6; font-style: italic; }

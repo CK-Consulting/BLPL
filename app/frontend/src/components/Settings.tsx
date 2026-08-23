@@ -67,8 +67,22 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
             Close
           </button>
         </header>
+        {/* Outside the scrolling body on purpose. This sat at the top of the
+            body, which scrolls: a save rejected while you were looking at the
+            third task put its explanation somewhere you had no reason to look
+            and no indication existed. You could then press Close believing the
+            change had been saved. It is now pinned under the header, announced,
+            and dismissible only by fixing or acknowledging it. */}
+        {error && (
+          <div className="modal-notice error" role="alert">
+            <span>{error}</span>
+            <span className="spacer" />
+            <button className="link" onClick={() => setError(null)} title="Dismiss">
+              ×
+            </button>
+          </div>
+        )}
         <div className="modal-body">
-          {error && <div className="gate-error">{error}</div>}
           {tab === "endpoints" && (
             <Endpoints data={data} onChanged={refresh} onError={setError} />
           )}
@@ -109,6 +123,28 @@ function Endpoints({
     await save(data.endpoints.map((e) => (e.name === name ? { ...e, model } : e)));
   };
 
+  const setVision = async (name: string, vision: boolean) => {
+    // Clearing the flag on an endpoint a vision task still routes to would be
+    // refused server-side; drop it from those routes here so the message is
+    // about what you did rather than a reference you cannot see.
+    const endpoints = data.endpoints.map((e) => (e.name === name ? { ...e, vision } : e));
+    if (!vision) {
+      const tasks = Object.fromEntries(
+        Object.entries(data.tasks)
+          .filter(([t]) => data.vision_tasks.includes(t))
+          .map(([t, chain]) => [t, chain.filter((n) => n !== name)]),
+      );
+      try {
+        await putJSON("/api/settings/llm", { endpoints, tasks });
+        onChanged();
+      } catch (e) {
+        onError((e as Error).message);
+      }
+      return;
+    }
+    await save(endpoints);
+  };
+
   const remove = async (name: string) => {
     // Dropping an endpoint that a task still routes to would fail validation
     // server-side; clear it from the routes here so the message is about what
@@ -141,6 +177,7 @@ function Endpoints({
           onChanged={onChanged}
           onError={onError}
           onModel={setModel}
+          onVision={setVision}
         />
       ))}
       {adding ? (
@@ -181,6 +218,7 @@ function EndpointRow({
   onChanged,
   onError,
   onModel,
+  onVision,
 }: {
   endpoint: EndpointConfig;
   keyedAt?: string;
@@ -188,10 +226,16 @@ function EndpointRow({
   onChanged: () => void;
   onError: (m: string) => void;
   onModel: (name: string, model: string) => Promise<void>;
+  onVision: (name: string, vision: boolean) => Promise<void>;
 }) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [models, setModels] = useState<string[]>([]);
+  // id → human label. Shown in the list; never what gets stored. A router
+  // publishes "Google: Gemini 3.7 Flash" beside "google/gemini-3.7-flash", and
+  // only one of those is a thing you can send.
+  const [labels, setLabels] = useState<Record<string, string>>({});
+  const [caps, setCaps] = useState<Record<string, string[]> | null>(null);
   const [probing, setProbing] = useState(false);
 
   // A saved endpoint could not have its model corrected at all: the row showed
@@ -200,11 +244,19 @@ function EndpointRow({
   const listModels = async () => {
     setProbing(true);
     try {
-      const r = await postJSON<{ models: string[]; detail?: string }>(
-        "/api/settings/llm/models",
-        { kind: endpoint.kind, base_url: endpoint.base_url, name: endpoint.name },
-      );
+      const r = await postJSON<{
+        models: string[];
+        labels?: Record<string, string>;
+        capabilities: Record<string, string[]>;
+        detail?: string;
+      }>("/api/settings/llm/models", {
+        kind: endpoint.kind,
+        base_url: endpoint.base_url,
+        name: endpoint.name,
+      });
       setModels(r.models);
+      setLabels(r.labels ?? {});
+      setCaps(r.capabilities ?? {});
       if (!r.models.length) onError(r.detail ?? "no models listed");
     } catch (e) {
       onError((e as Error).message);
@@ -242,8 +294,12 @@ function EndpointRow({
               {endpoint.model ? `${endpoint.model} (not offered)` : "choose a model…"}
             </option>
             {models.map((m) => (
+              // The value is always the wire id. The label is decoration, and
+              // conflating the two is how an endpoint got saved with a string
+              // no provider would answer to.
               <option key={m} value={m}>
-                {m}
+                {labels[m] ? `${labels[m]}  ·  ${m}` : m}
+                {caps?.[m]?.length ? `  —  ${caps[m].join(", ")}` : ""}
               </option>
             ))}
           </select>
@@ -253,7 +309,14 @@ function EndpointRow({
         <button className="link" onClick={listModels} disabled={probing}>
           {probing ? "asking…" : models.length ? "refresh" : "list models"}
         </button>
-        {endpoint.vision && <span className="status-tag modified">vision</span>}
+        <label className="muted small" title="whether this endpoint's model can read images and PDF pages">
+          <input
+            type="checkbox"
+            checked={endpoint.vision}
+            onChange={(e) => onVision(endpoint.name, e.target.checked)}
+          />{" "}
+          reads images
+        </label>
         <span className="spacer" />
         <button className="link" onClick={onRemove}>
           Remove
@@ -264,6 +327,38 @@ function EndpointRow({
         // documents actually go, and that is worth seeing at a glance.
         <div className="muted small mono">→ {endpoint.base_url}</div>
       )}
+      {caps?.[endpoint.model]?.length ? (
+        // Visible because the differences matter and are otherwise invisible:
+        // a `thinking` model emits chain-of-thought a caller has to strip, and
+        // one without `tools` will not call a tool however the prompt is
+        // written. Both look like the model misbehaving.
+        <div className="cap-row">
+          {caps[endpoint.model].map((c) => (
+            <span className={`cap ${CAP_CLASS[c] ?? ""}`} key={c} title={CAP_HELP[c] ?? c}>
+              {c}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {caps !== null && (() => {
+        const known = models.includes(endpoint.model);
+        const seen = caps[endpoint.model];
+        if (!known || !seen) return null;      // unknown is not incapable
+        const canSee = seen.includes("vision");
+        if (canSee === endpoint.vision) return null;
+        // The flag is a claim about the model; the server just answered the
+        // same question directly. Where they disagree, say so and offer the
+        // correction rather than leaving a route that fails at request time.
+        return (
+          <div className="muted small">
+            {endpoint.model} {canSee ? "can" : "cannot"} read images, but this
+            endpoint is marked {endpoint.vision ? "vision-capable" : "text-only"}.{" "}
+            <button className="link" onClick={() => onVision(endpoint.name, canSee)}>
+              mark it {canSee ? "vision-capable" : "text-only"}
+            </button>
+          </div>
+        );
+      })()}
       {endpoint.needs_key ? (
         <div className="row">
           <input
@@ -302,6 +397,10 @@ function NewEndpoint({
   const [auth, setAuth] = useState("vault");
   const [vision, setVision] = useState(false);
   const [models, setModels] = useState<string[]>([]);
+  // id → human label. Shown in the list; never what gets stored. A router
+  // publishes "Google: Gemini 3.7 Flash" beside "google/gemini-3.7-flash", and
+  // only one of those is a thing you can send.
+  const [labels, setLabels] = useState<Record<string, string>>({});
   const [probing, setProbing] = useState(false);
   const [probeNote, setProbeNote] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState("");
@@ -321,11 +420,17 @@ function NewEndpoint({
       // POSTed, not queried: a key in a URL ends up in access logs, proxy logs
       // and browser history. It is used for this one request and not stored —
       // saving it is a separate, deliberate step below.
-      const r = await postJSON<{ models: string[]; asked: boolean; detail?: string }>(
+      const r = await postJSON<{
+        models: string[];
+        labels?: Record<string, string>;
+        asked: boolean;
+        detail?: string;
+      }>(
         "/api/settings/llm/models",
         { kind, base_url: baseUrl, name, api_key: apiKey },
       );
       setModels(r.models);
+      setLabels(r.labels ?? {});
       if (!r.models.length) {
         // "None" and "could not ask" are different answers and must not look
         // the same in a dropdown.
@@ -355,7 +460,7 @@ function NewEndpoint({
             <option value="">choose a model…</option>
             {models.map((m) => (
               <option key={m} value={m}>
-                {m}
+                {labels[m] ? `${labels[m]}  ·  ${m}` : m}
               </option>
             ))}
           </select>
@@ -433,15 +538,27 @@ function NewEndpoint({
   );
 }
 
+// What each capability means for how a model behaves here. Written out because
+// the consequences are concrete and none of them are guessable from the name.
+const CAP_HELP: Record<string, string> = {
+  vision: "can read images and PDF pages — needed only for scanned documents, since one with a text layer is read as text",
+  tools: "can call tools; without this it will not, however the prompt is written",
+  thinking: "emits chain-of-thought that has to be parsed out of the reply",
+  completion: "ordinary text generation",
+  embedding: "produces embeddings rather than replies",
+  insert: "supports fill-in-the-middle",
+};
+const CAP_CLASS: Record<string, string> = { vision: "cap-vision", thinking: "cap-thinking" };
+
 // -- task routing ------------------------------------------------------------
 
 const TASK_HELP: Record<string, string> = {
   default: "Anything without its own route.",
-  chat: "The design chat in the workbench.",
+  chat: "The design chat in the workbench. A model with the thinking capability reasons before answering, which suits open-ended design questions.",
   stage0: "Markdown re-read — mechanical, a cheap model is fine.",
   stage1: "MPN → package → library hints. Hallucinated footprints are expensive here.",
-  datasheet_vision: "Reads PDF pages. Must be vision-capable.",
-  review_panel: "Every endpoint listed runs, and their findings are merged with attribution.",
+  vision: "Anything that has to be looked at rather than read: a scanned datasheet, an image. A datasheet with a text layer never comes here — it is read as text by whatever serves chat.",
+  review_panel: "Every endpoint listed runs, and their findings are merged with attribution — so its value comes from listing models that differ, not several of the same one.",
 };
 
 function Routing({
@@ -510,10 +627,19 @@ function Routing({
         const chain = chainOf(task);
         const inherited = stored === undefined;
         const visionTask = data.vision_tasks.includes(task);
-        // A task that reads images can only be served by an endpoint that can
-        // see, so the others are not offered. Showing a control that is
-        // guaranteed to be refused is just a slower way to deliver an error.
-        const offered = visionTask ? data.endpoints.filter((e) => e.vision) : data.endpoints;
+        // A task that reads images is best served by an endpoint that can see,
+        // so the others are not offered — but anything already *in* the chain
+        // is always shown, whether or not it would be offered today.
+        //
+        // That second half was missing, and it closed the only exit. Three
+        // text-only endpoints were routed to vision; the filter hid
+        // them, so they had no row and no way to be taken out, while the same
+        // condition made every save fail validation. The screen was reporting
+        // an error whose only fix was an edit the screen had removed.
+        const inChain = new Set(chain);
+        const offered = data.endpoints.filter(
+          (e) => !visionTask || e.vision || inChain.has(e.name),
+        );
         const hidden = data.endpoints.length - offered.length;
         return (
           <div className="task-row" key={task}>
@@ -545,6 +671,23 @@ function Routing({
                       ))}
                     </select>
                     <span className="mono">{ep.name}</span>
+                    {/* Named, not just implied by being unusable: this is the
+                        row you are looking for when the task will not run. */}
+                    {visionTask && !ep.vision && (
+                      <span className="status-tag deleted" title="This task will skip past it">
+                        cannot see
+                      </span>
+                    )}
+                    {(data.endpoint_capabilities?.[ep.name] ?? []).map((c) => (
+                      <span
+                        className={`cap ${CAP_CLASS[c] ?? ""}`}
+                        key={c}
+                        title={CAP_HELP[c] ?? c}
+                      >
+                        {c}
+                      </span>
+                    ))}
+                    <span className="spacer" />
                     {used && at === 0 && <span className="muted small">tried first</span>}
                     {used && at > 0 && (
                       <span className="muted small">fallback {at}</span>
@@ -566,8 +709,9 @@ function Routing({
             )}
             {hidden > 0 && (
               <div className="muted small">
-                {hidden} endpoint{hidden > 1 ? "s" : ""} not shown here: this task reads
-                images and they cannot.
+                {hidden} endpoint{hidden > 1 ? "s" : ""} not offered here: this task reads
+                images and they cannot. One already routed to this task is still shown, so
+                it can be taken out.
               </div>
             )}
           </div>

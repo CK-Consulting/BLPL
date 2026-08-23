@@ -28,3 +28,33 @@ blpl/webapp/static/assets/
 *.env.local
 *.swp
 blpl-db
+
+# Vendor documents belong to a project, not to the app source tree. Two
+# `git add -A` runs from this directory swept in 61 MB of them — five
+# datasheets, a 34 MB footprint archive, and the __MACOSX resource forks that
+# came out of it — none of it referenced by anything, all of it permanent in
+# every clone and checkout. The tests build their own PDFs.
+app/*.pdf
+app/*.txt
+app/*.zip
+
+# macOS writes these into any directory it touches — and into any archive it
+# creates. Nothing reads them, on any operating system, including macOS: the
+# __MACOSX tree is a resource fork for a filesystem that has not needed one
+# since Mac OS 9, and .DS_Store is a folder's window position. 78 of them came
+# out of one vendor zip and into this repository.
+.DS_Store
+.DS_Store?
+._*
+__MACOSX/
+.AppleDouble
+.AppleDB
+.AppleDesktop
+.LSOverride
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.fseventsd
+.apdisk
+.com.apple.timemachine.donotpresent

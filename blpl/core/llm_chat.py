@@ -274,6 +274,10 @@ class Endpoint:
     model: str
     api_key: str | None = None
     base_url: str | None = None
+    # The most tokens this endpoint will produce, when somebody has stated it.
+    # None means "work it out" — see blpl/core/limits.py, which discovers it
+    # from the server or learns it from the provider's own refusal.
+    max_output_tokens: int | None = None
 
     @staticmethod
     def of(kind: str, model: str | None = None, **kw: Any) -> Endpoint:
@@ -302,6 +306,7 @@ class ChatAdapter(Protocol):
         system: str = "",
         tools: Sequence[ToolDecl] = (),
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        json_schema: dict | None = None,
     ) -> AsyncIterator[ChatEvent]: ...
 
 
@@ -492,6 +497,7 @@ class _AnthropicChat:
         system: str = "",
         tools: Sequence[ToolDecl] = (),
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        json_schema: dict | None = None,
     ) -> AsyncIterator[ChatEvent]:
         client = self._client()
         payload: dict[str, Any] = {
@@ -631,6 +637,7 @@ class _OpenAIChat:
         system: str = "",
         tools: Sequence[ToolDecl] = (),
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        json_schema: dict | None = None,
     ) -> AsyncIterator[ChatEvent]:
         client = self._client()
         wire: list[dict] = []
@@ -646,6 +653,23 @@ class _OpenAIChat:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if json_schema is not None:
+            # Constrained decoding, where the server offers it. This is the only
+            # fix for malformed JSON that addresses the cause rather than the
+            # symptom: vLLM and OpenAI both mask the sampler so a token that
+            # would break the schema cannot be chosen, which makes "the model
+            # forgot a comma" impossible rather than unlikely. A router that
+            # does not support it ignores the field, which is why it is sent
+            # unconditionally rather than gated on a capability nobody reports
+            # reliably.
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "extraction",
+                    "schema": json_schema,
+                    "strict": True,
+                },
+            }
         if tools:
             payload["tools"] = [
                 {
@@ -808,6 +832,7 @@ class _OllamaChat:
         system: str = "",
         tools: Sequence[ToolDecl] = (),
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        json_schema: dict | None = None,
     ) -> AsyncIterator[ChatEvent]:
         client = self._client()
         wire: list[dict] = []
@@ -821,6 +846,10 @@ class _OllamaChat:
             "messages": wire,
             "stream": True,
             "options": {"num_predict": max_tokens},
+            # Ollama takes the schema directly rather than wrapped in a
+            # response_format envelope, and honours it by constraining the
+            # sampler the same way.
+            **({"format": json_schema} if json_schema is not None else {}),
         }
         if tools:
             payload["tools"] = [

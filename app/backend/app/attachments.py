@@ -45,12 +45,20 @@ _IMAGE_TYPES = {
 _DOC_TYPES = {"application/pdf": ".pdf"}
 SUPPORTED_TYPES = {**_IMAGE_TYPES, **_DOC_TYPES}
 
-# Anthropic caps a vision image around 25 MB and a PDF around 32 MB; other
-# providers are stricter, not looser. Rejecting here costs a message, whereas
-# letting it through costs a whole turn that fails at the provider after the
-# upload has already been paid for.
-MAX_IMAGE_BYTES = 25 * 1024 * 1024
-MAX_DOCUMENT_BYTES = 32 * 1024 * 1024
+# What can actually be *sent*, not what the provider will accept in isolation.
+#
+# The old numbers came from the provider's per-item limits — 25 MB for an image,
+# 32 MB for a PDF. Both were unreachable in practice, for two compounding
+# reasons: base64 adds a third on the wire, so a 32 MB PDF is a 42 MB request
+# body against a 32 MB cap; and an attachment is not sent alone, but with the
+# whole conversation and every other attachment, on every turn thereafter.
+#
+# So the cap is the share of one request an attachment may occupy after
+# encoding. Accepting a file that could never be sent is not permissiveness, it
+# is a rejection deferred until after the upload and moved somewhere less
+# obvious.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 
 # How many files may ride along on a single message. Not a resource limit — it
 # is a "you meant to attach a folder" limit.

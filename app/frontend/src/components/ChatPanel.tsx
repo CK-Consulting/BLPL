@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, ChatMessage, ConversationMeta, Proposal, getJSON, postJSON, readSSE } from "../api";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ApiError, ChatMessage, ConversationMeta, Proposal, del, getJSON, postJSON, readSSE } from "../api";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
 import { SlashCommand, SlashPopover, useSlashCommands } from "./SlashCommands";
+import { useVerticalResizable } from "../useResizable";
+import { Menu, tail } from "./Menu";
 import {
   ACCEPTED,
   Attachment,
@@ -53,8 +55,38 @@ type TurnOutcome = "ended" | "not_live";
 /** Why a question ended up with no answer — the two cases read differently. */
 type LostReason = "not_live" | "transient";
 
+/**
+ * Which end of the transcript is the newest.
+ *
+ * Every messaging app puts the new message at the bottom; every inbox puts it
+ * at the top. Both conventions are entrenched and neither is wrong, so this is
+ * a setting rather than an argument — and it is remembered, because it is a
+ * habit rather than a per-conversation decision.
+ *
+ * What reverses is the *turn*, not the line. A turn — a question and everything
+ * that answered it — still reads top to bottom, the way a mail thread does
+ * inside an inbox that lists threads newest-first. Reversing the flat list
+ * instead would put each answer above its own question and run the tool calls
+ * backwards, which is not what "newest on top" means anywhere.
+ */
+type Order = "oldest" | "newest";
+
+const ORDER_KEY = "blpl.chatOrder";
+
+const readOrder = (): Order => (localStorage.getItem(ORDER_KEY) === "newest" ? "newest" : "oldest");
+
+/** Split a flat transcript into turns. A turn opens at each user message. */
+export function toTurns(messages: ChatMessage[]): { key: number; items: { i: number; m: ChatMessage }[] }[] {
+  const out: { key: number; items: { i: number; m: ChatMessage }[] }[] = [];
+  messages.forEach((m, i) => {
+    if (m.role === "user" || out.length === 0) out.push({ key: i, items: [] });
+    out[out.length - 1].items.push({ i, m });
+  });
+  return out;
+}
+
 /** The last thing said, if the transcript ends on the user — i.e. nothing answered. */
-function unansweredTail(messages: ChatMessage[]): ChatMessage | null {
+export function unansweredTail(messages: ChatMessage[]): ChatMessage | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     // tool_results are bookkeeping between an assistant turn and its
@@ -82,6 +114,15 @@ function turnInFlightId(e: unknown): string | null {
 export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [filename, setFilename] = useState<string | null>(null);
+  // Which conversation is on screen, readable from inside a running async loop.
+  //
+  // A turn belongs to a conversation and outlives being looked at: it runs on
+  // the server, and the user is free to go and read something else while it
+  // works. What must not happen is a turn writing into a conversation that is
+  // no longer open — its `finally` reloads the transcript, and with a stale
+  // closure that reload replaces whatever you switched to with what you left.
+  // Every state write from a turn is gated on this still naming its owner.
+  const openRef = useRef<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [decided, setDecided] = useState<Record<string, string>>({});
@@ -104,6 +145,15 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [turnId, setTurnId] = useState<string | null>(null);
   const [progress, setProgress] = useState<string | null>(null);
   const [model, setModel] = useState<string | null>(null);
+  // Which endpoint answers, chosen per turn rather than stored. "Ask the big
+  // model about this one" is a decision about a question, not a change of
+  // configuration — persisting it is how a frontier model ends up billed for a
+  // week of small talk.
+  const [endpoints, setEndpoints] = useState<
+    { name: string; model: string; capabilities: string[]; default: boolean }[]
+  >([]);
+  const [chosenEndpoint, setChosenEndpoint] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // A question the server was answering when it stopped existing. Held so the
   // panel can say so and offer to ask it again, rather than leaving it looking
@@ -125,14 +175,61 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const persistedErrorRef = useRef(false);
   const retryableRef = useRef(false);
 
-  // Follow the tail while an answer streams, but never yank the view back down
-  // if the user has scrolled up to read something earlier.
-  useEffect(() => {
+  // Which end new material arrives at. Chat apps put it at the bottom; an inbox
+  // puts it at the top, and there is no reason the reader should not choose.
+  const [order, setOrder] = useState<Order>(readOrder);
+  const newestFirst = order === "newest";
+
+  // Whether the reader is parked at the end new material arrives at.
+  //
+  // Load-bearing that this is tracked from the scroll event rather than
+  // measured inside the effect. The old code measured *after* React had
+  // committed, so the new content was already in the box: anything taller than
+  // the 120px slack — an approval card, a tool block, a long answer — made the
+  // box look scrolled-away at the exact moment it had not been, and the view
+  // stayed put. Small streaming deltas stayed under the threshold, which is why
+  // following a plain answer worked and being asked a question did not.
+  const stick = useRef(true);
+  // Something arrived while they were reading elsewhere. Worth saying out loud
+  // rather than silently leaving it off-screen — a turn parked on an approval
+  // is stopped until it is answered, and nothing about the panel showed that.
+  const [missed, setMissed] = useState(false);
+
+  const anchored = useCallback(
+    (el: HTMLElement) =>
+      newestFirst ? el.scrollTop < 120 : el.scrollHeight - el.scrollTop - el.clientHeight < 120,
+    [newestFirst],
+  );
+
+  const toAnchor = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-    if (nearBottom) el.scrollTop = el.scrollHeight;
+    el.scrollTop = newestFirst ? 0 : el.scrollHeight;
+    stick.current = true;
+    setMissed(false);
+  }, [newestFirst]);
+
+  // Layout, not passive: scrolling in a plain effect lets the browser paint the
+  // pre-scroll frame first, which shows as a jump on every arrival.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (stick.current) {
+      el.scrollTop = newestFirst ? 0 : el.scrollHeight;
+      setMissed(false);
+    } else {
+      setMissed(true);
+    }
+    // `newestFirst` is deliberately absent: flipping the order is handled below,
+    // where it always re-anchors. Reacting to it here as well would fight that.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages, liveText, liveSegments, liveTools, proposals, approvals]);
+
+  // Reversing the transcript, or opening a different one, invalidates where the
+  // view was pointing. Both go back to the end things arrive at.
+  useLayoutEffect(() => {
+    toAnchor();
+  }, [order, filename, toAnchor]);
 
   const fetchConversation = useCallback(
     (name: string) =>
@@ -146,7 +243,22 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     async (name: string) => {
       const convo = await fetchConversation(name);
       setMessages(convo.events);
-      return convo.active_turn ?? null;
+      const active = convo.active_turn ?? null;
+      // No turn running, and the last thing in the transcript is still the
+      // question. Nothing is going to answer it.
+      //
+      // This used to be decided only inside `watch`, which means it was only
+      // ever noticed by a panel that was *watching when the turn died*. Reload
+      // the page, or restart the server, and the same conversation came back
+      // with an unanswered question, no explanation and nothing to press —
+      // which is the exact situation where being offered the question back is
+      // most useful, since the turn is definitively gone rather than maybe
+      // still running somewhere.
+      if (!active) {
+        const orphan = unansweredTail(convo.events);
+        setLost(orphan ? { message: orphan, reason: "not_live" } : null);
+      }
+      return active;
     },
     [fetchConversation],
   );
@@ -176,13 +288,17 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     (async () => {
       const list = await getJSON<ConversationMeta[]>(`/api/projects/${projectId}/conversations`);
       if (cancelled) return;
-      let chosen = list[list.length - 1];
+      // The server returns most-recently-active first, so the newest thread is
+      // at the head. This took the tail, which is the *oldest* — so every
+      // reload dropped you into the first conversation the project ever had.
+      let chosen = list[0];
       if (!chosen) {
         chosen = await postJSON<ConversationMeta>(`/api/projects/${projectId}/conversations`, {
           title: "design",
         });
       }
       setConversations(list.length ? list : [chosen]);
+      openRef.current = chosen.filename;
       setFilename(chosen.filename);
       const live = await loadConversation(chosen.filename);
       await refreshProposals();
@@ -199,23 +315,36 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   /** Open a different conversation in this project. */
   const openConversation = useCallback(
     async (name: string) => {
-      if (name === filename || streaming) return;
+      if (name === filename) return;
+      // No longer refused while a turn is running. The turn is on the server
+      // and keeps going; refusing only stopped you *looking* at anything else
+      // for as long as it took, which on a long extraction is minutes. What
+      // made it unsafe was the reload in `watch`'s finally reaching for a
+      // stale `filename` — that is now gated on ownership instead.
+      openRef.current = name;
       setFilename(name);
       setMessages([]);
       setLiveText("");
       setLiveSegments([]);
       setLiveTools([]);
+      setApprovals([]);
+      setProgress(null);
+      setTurnId(null);
+      setStreaming(false);
+      setLost(null);
       setAttached([]);
       setError(null);
       const live = await loadConversation(name).catch((e) => {
         setError((e as Error).message);
         return null;
       });
+      // They may have moved on again while that was in flight.
+      if (openRef.current !== name) return;
       // Each conversation has its own turn. Switching into one with an answer
       // in progress should show that answer, not a frozen transcript.
       if (live) void watchRef.current?.(live);
     },
-    [filename, streaming, loadConversation],
+    [filename, loadConversation],
   );
 
   const newConversation = async () => {
@@ -223,10 +352,17 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       title: "design",
     });
     setConversations((c) => [...c, created]);
+    openRef.current = created.filename;
     setFilename(created.filename);
     setMessages([]);
     setLiveText("");
+    setLiveSegments([]);
     setLiveTools([]);
+    setApprovals([]);
+    setProgress(null);
+    setTurnId(null);
+    setStreaming(false);
+    setLost(null);
     setAttached([]);
   };
 
@@ -247,8 +383,13 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
    * caller.
    */
   const follow = useCallback(
-    async (id: string): Promise<TurnOutcome> => {
-      setTurnId(id);
+    async (id: string, owner: string | null): Promise<TurnOutcome> => {
+      // The turn belongs to `owner`. If the reader has gone elsewhere, keep
+      // reading the stream — the terminal event still has to be seen so the
+      // loop ends and the transcript reconciles — but write nothing to a screen
+      // that is now showing a different conversation.
+      const mine = () => openRef.current === owner;
+      if (mine()) setTurnId(id);
       cancelledRef.current = false;
       persistedErrorRef.current = false;
       retryableRef.current = false;
@@ -256,11 +397,15 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       let attempt = 0;
       for (;;) {
         // Replay is from the top every time; start from an empty slate so a
-        // reconnect cannot double the text it already showed.
-        setLiveText("");
-        setLiveSegments([]);
-        setLiveTools([]);
-        setApprovals([]);
+        // reconnect cannot double the text it already showed. Only when this
+        // turn owns the screen — a background reconnect clearing these would
+        // wipe the conversation the reader moved to.
+        if (mine()) {
+          setLiveText("");
+          setLiveSegments([]);
+          setLiveTools([]);
+          setApprovals([]);
+        }
         let sawEnd = false;
         outcome = "ended";
         try {
@@ -268,6 +413,38 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             `/api/projects/${projectId}/chat/${id}/events`,
             { method: "GET" },
             (event, payload) => {
+              if (event === "done") {
+                sawEnd = true;
+                // "not_live" means the server has no such turn: it was lost in
+                // a restart, or it finished long enough ago to have aged out of
+                // the retained buffer. Those need opposite things said about
+                // them, and only the transcript can tell them apart — so the
+                // reason is carried out to the caller, which reloads it.
+                if (payload.stop_reason === "not_live") outcome = "not_live";
+                return;
+              }
+              if (event === "cancelled") {
+                sawEnd = true;
+                cancelledRef.current = true;
+                return;
+              }
+              if (event === "error") {
+                // Terminal, so the loop has to see it whether or not this turn
+                // is on screen — otherwise a turn the reader walked away from
+                // reconnects four times against a stream that is already over.
+                sawEnd = true;
+                if (mine()) {
+                  setError(payload.detail);
+                  // The server persists this same text into the conversation,
+                  // so once the transcript reloads it is on screen from there
+                  // too. Without this the user reads the identical provider
+                  // error twice, which looks like it happened twice.
+                  persistedErrorRef.current = true;
+                  retryableRef.current = Boolean(payload.retryable);
+                }
+                return;
+              }
+              if (!mine()) return;
               if (event === "text_delta") setLiveText((t) => t + payload.text);
               else if (event === "segment")
                 setLiveText((t) => {
@@ -300,28 +477,6 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
                 );
               else if (event === "approval_resolved")
                 setApprovals((a) => a.filter((x) => x.call_id !== payload.call_id));
-              else if (event === "error") {
-                setError(payload.detail);
-                // The server persists this same text into the conversation, so
-                // once the transcript reloads it is on screen from there too.
-                // Without this the user reads the identical provider error
-                // twice, which looks like it happened twice.
-                persistedErrorRef.current = true;
-                retryableRef.current = Boolean(payload.retryable);
-                sawEnd = true;
-              } else if (event === "done") {
-                sawEnd = true;
-                // "not_live" means the server has no such turn: it was lost in
-                // a restart, or it finished long enough ago to have aged out of
-                // the retained buffer. Those need opposite things said about
-                // them, and only the transcript can tell them apart — so the
-                // reason is carried out to the caller, which reloads it.
-                if (payload.stop_reason === "not_live") outcome = "not_live";
-              }
-              else if (event === "cancelled") {
-                sawEnd = true;
-                cancelledRef.current = true;
-              }
               if (event === "start" && payload.model) setModel(payload.model);
             },
           );
@@ -332,7 +487,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           // A 4xx is an answer, not a broken pipe: the turn is gone, or this
           // client may not watch it. Retrying cannot change either.
           if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
-            setError(e.message);
+            if (mine()) setError(e.message);
             return "ended";
           }
         }
@@ -342,13 +497,15 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         if (cancelledRef.current) return "ended";
         attempt += 1;
         if (attempt > RECONNECT_ATTEMPTS) {
-          setError(
-            "Lost the connection to this answer. It is still running on the server — " +
-              "reopen the project or reload to pick it back up.",
-          );
+          if (mine())
+            setError(
+              "Lost the connection to this answer. It is still running on the server — " +
+                "reopen the project or reload to pick it back up.",
+            );
           return "ended";
         }
-        setProgress(`Connection dropped — reattaching (${attempt}/${RECONNECT_ATTEMPTS})…`);
+        if (mine())
+          setProgress(`Connection dropped — reattaching (${attempt}/${RECONNECT_ATTEMPTS})…`);
         await sleep(RECONNECT_BACKOFF_MS[attempt - 1] ?? 4000);
       }
     },
@@ -358,22 +515,38 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   /** Run a turn to completion, then reconcile against what was persisted. */
   const watch = useCallback(
     async (id: string) => {
+      // Whose turn this is. Every caller points openRef at the conversation
+      // first, so reading it here needs no extra argument threaded through.
+      const owner = openRef.current;
+      const mine = () => openRef.current === owner;
       setStreaming(true);
       let outcome: TurnOutcome = "ended";
       try {
-        outcome = await follow(id);
+        outcome = await follow(id, owner);
       } finally {
-        setStreaming(false);
-        setLiveText("");
-        setLiveSegments([]);
-        setLiveTools([]);
-        setApprovals([]);
-        setProgress(null);
-        setTurnId(null);
+        // The reader may have moved to another conversation while this ran. The
+        // turn still finished, and its result is on disk — but none of the
+        // reconciliation below belongs on a screen showing something else. The
+        // reload in particular: it used to fetch whatever `filename` was closed
+        // over, which is the conversation you *left*, and paste it over the one
+        // you had opened.
+        if (mine()) {
+          setStreaming(false);
+          setLiveText("");
+          setLiveSegments([]);
+          setLiveTools([]);
+          setApprovals([]);
+          setProgress(null);
+          setTurnId(null);
+        }
         // The persisted turn is authoritative — reload rather than trusting the
         // deltas we happened to see.
-        const reloaded = filename ? await loadMessages(filename).catch(() => null) : null;
-        if (reloaded) setMessages(reloaded);
+        const reloaded = mine() && owner ? await loadMessages(owner).catch(() => null) : null;
+        if (reloaded && mine()) setMessages(reloaded);
+        // Not gated: proposals are the project's, not this conversation's, and
+        // one produced by a turn you walked away from is still an edit waiting
+        // on you. Hiding it until you happened to reload would be the same
+        // silent wait the approval card had.
         await refreshProposals();
 
         // A turn the server no longer has is either an answer that was lost —
@@ -403,9 +576,32 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             if (orphan) setLost({ message: orphan, reason: "transient" });
           }
         }
+
+        // Whatever was typed while this turn ran goes now. Deliberately not
+        // after a turn that failed or was lost: the queued message was written
+        // in the belief that an answer was coming, and sending it on top of a
+        // failure buries the failure under a new question.
+        // Also only when this is still the open conversation: a message queued
+        // here was typed into *this* thread, and firing it after the reader has
+        // moved elsewhere would send it from a screen they are not looking at.
+        const next = mine() ? queued.current : null;
+        if (mine()) {
+          queued.current = null;
+          setQueuedNote(null);
+        }
+        if (next && outcome === "ended" && !persistedErrorRef.current) {
+          setInput(next.text);
+          setAttached(next.attached);
+          queueMicrotask(() => void sendRef.current?.());
+        } else if (next) {
+          // Put it back in the box rather than sending it into a broken state
+          // or dropping it. What they typed is theirs.
+          setInput(next.text);
+          setAttached(next.attached);
+        }
       }
     },
-    [follow, filename, loadMessages, refreshProposals],
+    [follow, loadMessages, refreshProposals],
   );
   watchRef.current = watch;
 
@@ -443,11 +639,33 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     }
   };
 
+  // Composed while a turn was running, waiting for it to end. Typing during a
+  // turn is the normal way a conversation goes — a correction, an extra
+  // constraint, the thing you forgot — and the input simply refused clicks,
+  // silently, with no explanation. Blocking it is defensible only because the
+  // server allows one turn per conversation; making the person hold the thought
+  // is not.
+  const queued = useRef<{ text: string; attached: Attachment[] } | null>(null);
+  const [queuedNote, setQueuedNote] = useState<{ text: string; count: number } | null>(null);
+
+  const sendRef = useRef<(() => Promise<void>) | null>(null);
+
   const send = async () => {
     const text = input.trim();
     // An attachment alone is a message: dropping in a datasheet and asking
     // nothing is a normal opening move, and the server agrees.
-    if ((!text && attached.length === 0) || !filename || streaming) return;
+    if ((!text && attached.length === 0) || !filename) return;
+    if (streaming) {
+      // Hold it and clear the box, so it reads as sent rather than ignored.
+      // One queued message, not a backlog: a queue you cannot see the end of
+      // turns a conversation into a batch job, and the answer to the second
+      // message usually depends on the answer to the first.
+      queued.current = { text, attached };
+      setQueuedNote({ text, count: attached.length });
+      setInput("");
+      setAttached([]);
+      return;
+    }
     const sent = attached;
     setInput("");
     setAttached([]);
@@ -475,7 +693,11 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     try {
       const started = await postJSON<{ turn_id: string; model: string }>(
         `/api/projects/${projectId}/conversations/${filename}/chat`,
-        { content: text, attachments: sent.map((a) => a.id) },
+        {
+          content: text,
+          attachments: sent.map((a) => a.id),
+          endpoint: chosenEndpoint,
+        },
       );
       setModel(started.model);
       id = started.turn_id;
@@ -528,6 +750,10 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
 
   const fileInput = useRef<HTMLInputElement | null>(null);
   const textarea = useRef<HTMLTextAreaElement | null>(null);
+  // Eight lines to start. A design message is a paragraph and a part number,
+  // not a chat line, and the height is remembered so this is a decision made
+  // once rather than a drag repeated every session.
+  const box = useVerticalResizable("blpl.composerHeight", 188, 96);
   const slash = useSlashCommands(input);
 
   /** Replace the typed `/cmd` with its text and put the caret where it belongs. */
@@ -542,6 +768,34 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       el.focus();
       el.setSelectionRange(caret, caret);
     });
+  };
+
+  sendRef.current = send;
+
+  useEffect(() => {
+    getJSON<{ endpoints: typeof endpoints }>(`/api/projects/${projectId}/chat/endpoints`)
+      .then((r) => setEndpoints(r.endpoints))
+      .catch(() => setEndpoints([]));
+  }, [projectId]);
+
+  const archive = async (target: string, archived: boolean) => {
+    const filename2 = filename;
+    try {
+      await postJSON(`/api/projects/${projectId}/conversations/${target}/archive`, { archived });
+      const list = await getJSON<ConversationMeta[]>(
+        `/api/projects/${projectId}/conversations${showArchived ? "?include_archived=true" : ""}`,
+      );
+      setConversations(list);
+      // Archiving the open one moves you to whatever is now most recent, since
+      // staying in a conversation you just took off the list is a dead end.
+      if (archived && target === filename2) {
+        const next = list.find((c) => !c.archived);
+        if (next) await openConversation(next.filename);
+        else await newConversation();
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    }
   };
 
   const stop = async () => {
@@ -582,34 +836,267 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     return out;
   }, [messages]);
 
+  const here = conversations.find((c) => c.filename === filename);
+
+  // Questions that produced nothing at all. Mirrors the server's rule — the
+  // backend re-checks before removing anything, so this is only about which
+  // messages offer the control.
+  const unanswered = useMemo(() => {
+    const out = new Set<number>();
+    messages.forEach((m, i) => {
+      if (m.role !== "user") return;
+      let produced = false;
+      let failed = false;
+      for (let j = i + 1; j < messages.length; j++) {
+        const r = messages[j].role;
+        if (r === "user") break;
+        if (r === "assistant" || r === "tool_results") {
+          produced = true;
+          break;
+        }
+        if (r === "error") failed = true;
+      }
+      if (failed && !produced) out.add(i);
+    });
+    return out;
+  }, [messages]);
+
+  const removeMessage = async (index: number) => {
+    if (!filename) return;
+    try {
+      await del(`/api/projects/${projectId}/conversations/${filename}/messages/${index}`);
+      const reloaded = await loadMessages(filename);
+      setMessages(reloaded);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+  const turns = useMemo(() => toTurns(messages), [messages]);
+
+  // Flattened back out with no wrapper element: `.chat-scroll` is the flex
+  // container that gives user messages their right-hand alignment and every
+  // entry its gap, and a per-turn <div> would take both away.
+  const transcript = (newestFirst ? [...turns].reverse() : turns).flatMap((t) =>
+    t.items.map(({ i, m }) => (
+      <Message
+        key={i}
+        message={m}
+        projectId={projectId}
+        repeatOf={repeats.get(i)}
+        onRemove={unanswered.has(i) ? () => void removeMessage(i) : undefined}
+      />
+    )),
+  );
+
+  // The turn in progress, and everything still awaiting an answer. Newest by
+  // definition, so it sits at whichever end that is.
+  const liveTail = (
+    <>
+      {liveSegments.map((seg, i) => (
+        <div className="msg assistant" key={`seg${i}`}>
+          <Markdown text={seg} />
+        </div>
+      ))}
+      {liveTools.map((t) => (
+        <ToolLine key={t.id} tool={t} />
+      ))}
+      {approvals.map((a) => (
+        <ApprovalCard
+          key={a.call_id}
+          approval={a}
+          onDecide={async (approved) => {
+            if (!turnId) return;
+            await postJSON(
+              `/api/projects/${projectId}/chat/${turnId}/approvals/${a.call_id}`,
+              { approved },
+            ).catch((e) => setError((e as Error).message));
+            setApprovals((list) => list.filter((x) => x.call_id !== a.call_id));
+          }}
+        />
+      ))}
+      {progress && streaming && <div className="muted small pad">{progress}</div>}
+      {liveText && (
+        <div className="msg assistant">
+          <Markdown text={liveText} />
+        </div>
+      )}
+      {streaming && !liveText && liveTools.length === 0 && (
+        <div className="muted pad">Thinking…</div>
+      )}
+
+      {pending.map((p) => (
+        <ProposalCard key={p.id} projectId={projectId} proposal={p} onDecided={onDecided} />
+      ))}
+
+      {lost && (
+        <div className="turn-lost">
+          <div>
+            <strong>
+              {lost.reason === "transient"
+                ? "The model provider was busy."
+                : "That answer was lost."}
+            </strong>
+            <div className="muted small">
+              {lost.reason === "transient"
+                ? "This is a capacity problem at the provider, not a problem with your " +
+                  "question — nothing about the message needs changing. Asking again " +
+                  "usually works."
+                : "The server stopped holding this turn — usually because it restarted " +
+                  "mid-answer. Your question is safe and still here; nothing replied to it. " +
+                  "Asking again resumes rather than starting over: anything the turn " +
+                  "finished — a datasheet scouted, an extraction task completed, a file " +
+                  "written — is on disk and gets reused."}
+            </div>
+          </div>
+          <span className="spacer" />
+          <button onClick={() => void retryLost()} disabled={streaming}>
+            Ask again
+          </button>
+          <button className="link" onClick={() => setLost(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {error && <div className="gate-error">{error}</div>}
+    </>
+  );
+
   return (
     <div className="chat">
       <div className="chat-head">
-        {/* Every conversation in this project, not just the newest. "New" has
-            always worked; getting back to what it replaced did not — the list
-            was fetched and then never shown, so past design conversations were
-            reachable only by reading the JSONL on disk. */}
+        {/* Two controls stay in the bar, because they are the two you change
+            mid-session: who answers, and what answered. Everything else — which
+            conversation, which way it reads, archiving, starting a new one — is
+            set once and then lives in the menu at the end. */}
         <select
-          className="chat-picker"
-          value={filename ?? ""}
-          disabled={streaming || conversations.length === 0}
-          title="Switch conversation"
-          onChange={(e) => void openConversation(e.target.value)}
+          className="chat-picker model-picker"
+          value={chosenEndpoint}
+          disabled={endpoints.length === 0}
+          title={
+            chosenEndpoint
+              ? `Answering with ${chosenEndpoint}`
+              : "Which model answers — for this turn, not saved"
+          }
+          onChange={(e) => setChosenEndpoint(e.target.value)}
         >
-          {conversations.map((c) => (
-            <option key={c.filename} value={c.filename}>
-              {c.slug} · {c.message_count} msg
+          <option value="">
+            {endpoints.find((e) => e.default)
+              ? `routed (${endpoints.find((e) => e.default)!.name})`
+              : "routed"}
+          </option>
+          {endpoints.map((e) => (
+            <option key={e.name} value={e.name}>
+              {e.name}
+              {e.capabilities.includes("vision") ? " · sees" : ""}
+              {e.capabilities.includes("thinking") ? " · reasons" : ""}
             </option>
           ))}
         </select>
-        {model && <span className="muted small">{model}</span>}
+        {/* The model that actually answered, which is not always the one asked:
+            the chain falls through. Fixed width and tail-truncated — the end of
+            a model id is the part that identifies it. */}
+        {model && (
+          <span className="muted small model-now mono" title={model}>
+            {tail(model, 22)}
+          </span>
+        )}
         <span className="spacer" />
-        <button className="link" onClick={newConversation} disabled={streaming}>
-          New
-        </button>
+        <Menu
+          align="right"
+          title="Conversations, order, archiving"
+          label={
+            <>
+              <span className="menu-kicker">Session</span>
+              <span className="menu-value">{tail(here?.slug ?? "none", 16)}</span>
+            </>
+          }
+        >
+          <label className="menu-field">
+            <span>Conversation</span>
+            <select
+              value={filename ?? ""}
+              disabled={conversations.length === 0}
+              onChange={(e) => void openConversation(e.target.value)}
+            >
+              {conversations.map((c) => (
+                <option key={c.filename} value={c.filename}>
+                  {c.archived ? "📦 " : ""}
+                  {c.slug} · {c.message_count} msg
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="menu-check">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={async (e) => {
+                setShowArchived(e.target.checked);
+                const list = await getJSON<ConversationMeta[]>(
+                  `/api/projects/${projectId}/conversations${e.target.checked ? "?include_archived=true" : ""}`,
+                ).catch(() => []);
+                setConversations(list);
+              }}
+            />{" "}
+            {/* "archived" on its own read as a state this session was in,
+                rather than a filter on the list above it. */}
+            <span>Show archived sessions</span>
+          </label>
+          <label className="menu-field">
+            <span>Message order</span>
+            <select
+              value={order}
+              onChange={(e) => {
+                const next = e.target.value as Order;
+                setOrder(next);
+                localStorage.setItem(ORDER_KEY, next);
+              }}
+            >
+              <option value="oldest">Newest last ↓</option>
+              <option value="newest">Newest first ↑</option>
+            </select>
+          </label>
+          <div className="menu-sep" />
+          {filename && (
+            <button
+              className="menu-item"
+              disabled={streaming}
+              title={
+                streaming
+                  ? "Not while this session is being answered — archiving moves the file the answer is being written into"
+                  : "Take this conversation off the list — it is kept, not deleted"
+              }
+              onClick={() => void archive(filename, !(here?.archived ?? false))}
+            >
+              {here?.archived ? "Unarchive this session" : "Archive this session"}
+            </button>
+          )}
+          <button className="menu-item" onClick={newConversation}>
+            New session
+          </button>
+          {/* The one thing still held back, and why. A disabled control with no
+              stated reason is the same silent failure as an error nobody can
+              see — you are left guessing whether it is broken or forbidden. */}
+          {streaming && (
+            <p className="menu-note">
+              This session is being answered. You can switch away and come back —
+              the answer keeps running and picks up where it left off. Archiving
+              waits until it finishes.
+            </p>
+          )}
+        </Menu>
       </div>
 
-      <div className="chat-scroll" ref={scrollRef}>
+      <div
+        className="chat-scroll"
+        ref={scrollRef}
+        onScroll={(e) => {
+          const at = anchored(e.currentTarget);
+          stick.current = at;
+          if (at) setMissed(false);
+        }}
+      >
         {messages.length === 0 && !streaming && (
           <div className="muted pad">
             Describe the board you want, or ask about this project. The assistant can read your
@@ -618,80 +1105,38 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           </div>
         )}
 
-        {messages.map((m, i) => (
-          <Message
-            key={i}
-            message={m}
-            projectId={projectId}
-            repeatOf={repeats.get(i)}
-          />
-        ))}
-
-        {liveSegments.map((seg, i) => (
-          <div className="msg assistant" key={`seg${i}`}>
-            <Markdown text={seg} />
-          </div>
-        ))}
-        {liveTools.map((t) => (
-          <ToolLine key={t.id} tool={t} />
-        ))}
-        {approvals.map((a) => (
-          <ApprovalCard
-            key={a.call_id}
-            approval={a}
-            onDecide={async (approved) => {
-              if (!turnId) return;
-              await postJSON(
-                `/api/projects/${projectId}/chat/${turnId}/approvals/${a.call_id}`,
-                { approved },
-              ).catch((e) => setError((e as Error).message));
-              setApprovals((list) => list.filter((x) => x.call_id !== a.call_id));
-            }}
-          />
-        ))}
-        {progress && streaming && <div className="muted small pad">{progress}</div>}
-        {liveText && (
-          <div className="msg assistant">
-            <Markdown text={liveText} />
-          </div>
+        {newestFirst ? (
+          <>
+            {liveTail}
+            {transcript}
+          </>
+        ) : (
+          <>
+            {transcript}
+            {liveTail}
+          </>
         )}
-        {streaming && !liveText && liveTools.length === 0 && (
-          <div className="muted pad">Thinking…</div>
-        )}
-
-        {pending.map((p) => (
-          <ProposalCard key={p.id} projectId={projectId} proposal={p} onDecided={onDecided} />
-        ))}
-
-        {lost && (
-          <div className="turn-lost">
-            <div>
-              <strong>
-                {lost.reason === "transient"
-                  ? "The model provider was busy."
-                  : "That answer was lost."}
-              </strong>
-              <div className="muted small">
-                {lost.reason === "transient"
-                  ? "This is a capacity problem at the provider, not a problem with your " +
-                    "question — nothing about the message needs changing. Asking again " +
-                    "usually works."
-                  : "The server stopped holding this turn — usually because it restarted " +
-                    "mid-answer. Your question is safe and still here; nothing replied to it."}
-              </div>
-            </div>
-            <span className="spacer" />
-            <button onClick={() => void retryLost()} disabled={streaming}>
-              Ask again
-            </button>
-            <button className="link" onClick={() => setLost(null)}>
-              Dismiss
-            </button>
-          </div>
-        )}
-
-        {error && <div className="gate-error">{error}</div>}
       </div>
+
+      {/* Only while they are reading elsewhere. An approval is named, because a
+          turn parked on one is stopped until it is answered — leaving that
+          off-screen and unannounced is how a session ends up looking hung. */}
+      {missed && (
+        <button
+          className={[
+            "chat-jump",
+            newestFirst ? "top" : "",
+            approvals.length ? "waiting" : "",
+          ]
+            .filter(Boolean)
+            .join(" ")}
+          onClick={toAnchor}
+        >
+          {approvals.length
+            ? `Waiting for your approval ${newestFirst ? "↑" : "↓"}`
+            : `New ${newestFirst ? "above ↑" : "below ↓"}`}
+        </button>
+      )}
 
       <div
         className={dragging ? "chat-composer dropping" : "chat-composer"}
@@ -717,6 +1162,25 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           void attach(files);
         }}
       >
+        {/* A seam across the top of the composer, not the browser's corner grip.
+            The UA grip is drawn in a grey that is very nearly invisible on a
+            dark box and cannot be reached by keyboard at all, so the box read
+            as fixed at three lines. This one is a separator: drag it, or focus
+            it and use the arrows. */}
+        <div
+          className="composer-grip"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize the message box"
+          aria-valuenow={box.height}
+          aria-valuemin={box.min}
+          aria-valuemax={box.max}
+          tabIndex={0}
+          title="Drag or use ↑ ↓ to resize · double-click to reset"
+          onMouseDown={box.onMouseDown}
+          onKeyDown={box.onKeyDown}
+          onDoubleClick={box.reset}
+        />
         {(attached.length > 0 || uploading > 0) && (
           <div className="chat-attachments">
             {attached.map((a) => (
@@ -748,15 +1212,43 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         {slash.open && (
           <SlashPopover query={slash.query ?? ""} active={slash.active} onPick={applyCommand} />
         )}
+        {queuedNote && (
+          <div className="queued-note">
+            <span>
+              Queued — sends when this answer finishes
+              {queuedNote.count ? ` (with ${queuedNote.count} attachment${queuedNote.count > 1 ? "s" : ""})` : ""}:{" "}
+              <span className="queued-text">{queuedNote.text.slice(0, 90)}
+                {queuedNote.text.length > 90 ? "…" : ""}</span>
+            </span>
+            <button
+              className="link"
+              onClick={() => {
+                // Back into the box, not deleted. It is still what they wrote.
+                const held = queued.current;
+                queued.current = null;
+                setQueuedNote(null);
+                if (held) {
+                  setInput(held.text);
+                  setAttached(held.attached);
+                }
+              }}
+            >
+              edit
+            </button>
+          </div>
+        )}
         <textarea
           ref={textarea}
+          style={{ height: box.height }}
           value={input}
           placeholder={
-            attached.length
-              ? "Ask about what you attached…"
-              : "Describe the board, or ask about this design…"
+            streaming
+              ? "Type now — this will send when the current answer finishes…"
+              : attached.length
+                ? "Ask about what you attached…"
+                : "Describe the board, or ask about this design…"
           }
-          disabled={streaming || !filename}
+          disabled={!filename}
           onChange={(e) => setInput(e.target.value)}
           // Screenshot straight into the conversation. This is the common case
           // for a board — a scope trace, a datasheet page, a photo of the
@@ -819,18 +1311,25 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         <button
           className="link attach-btn"
           title="Attach an image or PDF — you can also paste or drop one"
-          disabled={streaming || !filename}
+          disabled={!filename}
           onClick={() => fileInput.current?.click()}
         >
           +
         </button>
         {streaming ? (
-          // Occupies the same spot as Send rather than sitting beside it: while
-          // a turn runs, stopping it is the only thing this button can do, and
-          // a disabled "…" was a status readout offered where an action belongs.
-          <button className="stop" onClick={() => void stop()} disabled={!turnId}>
-            Stop
-          </button>
+          // Two things are worth doing mid-turn, so both are offered. Queue is
+          // the ordinary one — you thought of something while it was working —
+          // and only appears when there is something to queue.
+          <>
+            {(input.trim() || attached.length > 0) && (
+              <button onClick={() => void send()} title="Send when this answer finishes">
+                Queue
+              </button>
+            )}
+            <button className="stop" onClick={() => void stop()} disabled={!turnId}>
+              Stop
+            </button>
+          </>
         ) : (
           <button
             onClick={() => void send()}
@@ -851,16 +1350,36 @@ function Message({
   message,
   projectId,
   repeatOf,
+  onRemove,
 }: {
   message: ChatMessage;
   projectId: string;
   /** Index of the earlier message this one repeats, when it does. */
   repeatOf?: number;
+  /** Set when this question produced no answer at all and can be taken out. */
+  onRemove?: () => void;
 }) {
   if (message.role === "tool_results") {
     // The call itself is already shown; the raw result body is noise in the
     // transcript, and the assistant's next message says what it found.
     return null;
+  }
+  if (message.role === "summary") {
+    // Shown, not hidden. Compaction changes what the assistant is working from,
+    // and a conversation that quietly rewrote itself under someone is worse
+    // than one that admits it. Collapsed by default because it is long and is
+    // usually not what you came back to read.
+    const covers = (message.metadata as any)?.covers ?? 0;
+    return (
+      <details className="msg summary">
+        <summary>
+          Earlier messages summarised to fit the model's context
+          {covers ? ` — ${covers} entries replaced` : ""}. The files and git history are
+          untouched.
+        </summary>
+        <Markdown text={message.content} />
+      </details>
+    );
   }
   if (message.role === "error") {
     // A stop is recorded on the same line as a failure — both are "this turn
@@ -875,7 +1394,28 @@ function Message({
       (b: any) => b.type === "image" || b.type === "document",
     ) as any[];
     return (
-      <div className={repeatOf === undefined ? "msg user" : "msg user repeat"}>
+      <div
+        className={[
+          "msg user",
+          repeatOf === undefined ? "" : "repeat",
+          onRemove ? "unanswered" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+      >
+        {/* A question nothing answered. It is not sent with later turns — no
+            model ever read it — but it stays on screen until someone says
+            otherwise, because deleting a person's words on their behalf is not
+            ours to do. */}
+        {onRemove && (
+          <div className="unanswered-tag">
+            <span>Never answered — not sent with later messages</span>
+            <span className="spacer" />
+            <button className="link" onClick={onRemove} title="Remove this message and its error">
+              Remove
+            </button>
+          </div>
+        )}
         {repeatOf !== undefined && (
           <div className="repeat-tag" title="Identical to an earlier message in this conversation">
             ↑ same question asked earlier — the assistant sees it more than once

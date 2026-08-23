@@ -40,10 +40,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import subprocess
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from blpl.core import llm_chat
@@ -66,6 +68,7 @@ from blpl.core.llm_chat import (
 from . import attachments as attachments_store
 from .agent import ToolContext, ToolExecutor, default_tools
 from .agent.toolspec import ApprovalRequest
+from . import compaction
 from .conversations import Conversation
 from .references import FilesystemSandbox
 
@@ -83,9 +86,21 @@ project through a deterministic 9-stage pipeline.
 
 How you work here:
 
-- You can read the project's design markdown and its generated pipeline \
-artifacts with your tools. Read before you assert — the artifacts say what the \
-pipeline actually produced, and that is the ground truth about this board.
+- You can read anything in the project directory with your tools — design \
+markdown, sub-board directories, notes, generated pipeline artifacts. Reading \
+is free and needs nobody's permission, so read before you assert: the artifacts \
+say what the pipeline actually produced, and that is the ground truth about \
+this board. Call list_project_files when you do not know what is there.
+- One exception, and it is the user's instruction rather than a permission: \
+files under `context-ignore/` are things they keep in the project but have \
+declared irrelevant to the board. Do not read them, and do not reason from \
+them, unless the user asks about one by name. Then read it like any other file.
+- The project is a git repository and every accepted edit is a commit, so the \
+history is the record of how the design got here. When the user refers to \
+something from earlier — "the pinmap that worked", "before we changed the rail" \
+— look it up with file_history and read_file_version instead of saying it is no \
+longer in front of you. This conversation may have been summarised; the history \
+has not, and quoting the committed value beats reconstructing it.
 - You cannot write files. To change one, call propose_file_edit; the user sees \
 your change as a diff and accepts or rejects it. Propose the complete new file \
 content, not a fragment. Say in the rationale what you changed and why.
@@ -156,6 +171,58 @@ def is_transient(exc: BaseException) -> bool:
     # raising a typed error, so the wire vocabulary is the last resort.
     text = str(exc)
     return "overloaded_error" in text or "rate_limit_error" in text
+
+
+def explain(exc: BaseException) -> str:
+    """The provider's failure, plus what to do about it where that is knowable.
+
+    "Request exceeds the maximum size" is true and useless: it names no file,
+    no number, and no next step, so the obvious move — take the attachments off
+    and send again — is both the right one and, on its own, ineffective, since
+    the copies already in the history are what put the request over.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    text = str(exc).lower()
+    if "request_too_large" in text or "exceeds the maximum size" in text or "413" in text:
+        detail += (
+            "\n\nThis is the size of the whole request, not of your message: every turn "
+            "resends the conversation with its attachments. Taking the files off this "
+            "message is not enough on its own, because the copies attached to earlier "
+            "messages are still being sent. Save the large PDFs into the project's "
+            "datasheets/ folder and start a new session — the assistant can read them "
+            "from there without carrying them in every request."
+        )
+    return detail
+
+
+def worth_another_endpoint(exc: BaseException) -> bool:
+    """Whether a *different* endpoint could plausibly succeed where this failed.
+
+    Broader than ``is_transient``, and for a different reason. Transient means
+    "ask again"; this means "ask someone else". The case that prompted it: a
+    model with no tool support answers 400 ``does not support tools`` — asking
+    it again is pointless, and asking the next endpoint in the chain works
+    immediately.
+
+    Deliberately not a catch-all. A tool that raised, a refusal, or a bad
+    request we constructed will fail identically everywhere, and retrying those
+    across four providers would turn one clear error into four slow ones.
+    """
+    if is_transient(exc):
+        return True
+    text = str(exc).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "does not support tools",
+            "does not support",
+            "not supported",
+            "unsupported",
+            "no endpoints available",
+            "model not found",
+            "is not a multimodal model",
+        )
+    )
 
 
 class TurnInFlight(RuntimeError):
@@ -371,7 +438,13 @@ def _blocks_to_json(msg: Msg) -> list[dict]:
     return out
 
 
-def _blocks_from_json(raw: Iterable[dict], attachments_dir: Path | None = None) -> list:
+def _blocks_from_json(
+    raw: Iterable[dict],
+    attachments_dir: Path | None = None,
+    *,
+    keep: set[tuple[int, str]] | None = None,
+    index: int = 0,
+) -> list:
     blocks: list = []
     for b in raw or []:
         kind = b.get("type")
@@ -382,6 +455,21 @@ def _blocks_from_json(raw: Iterable[dict], attachments_dir: Path | None = None) 
             # shape of the history (the UI). Skip rather than fabricate: an
             # empty ImageBlock would be sent to the provider as a broken image.
             if attachments_dir is None:
+                continue
+            if keep is not None and (index, str(b.get("attachment", ""))) not in keep:
+                # Left out of this request by the budget, or already carried by
+                # a later message. Named, not dropped: the assistant has to know
+                # it is reasoning without the file rather than assume it has it.
+                name = b.get("name") or "file"
+                blocks.append(
+                    TextBlock(
+                        f"[{name} was attached earlier in this conversation and is not "
+                        "included again here, to keep the request within the provider's "
+                        "size limit. What was read from it is in the transcript above. "
+                        "If you need the file itself again, say so and ask for it to be "
+                        "re-attached, or read it from the project if it was saved there.]"
+                    )
+                )
                 continue
             data = attachments_store.read_b64(attachments_dir, b.get("attachment", ""))
             if data is None:
@@ -419,8 +507,223 @@ def _blocks_from_json(raw: Iterable[dict], attachments_dir: Path | None = None) 
     return blocks
 
 
+# What one request may carry, measured two ways, because two different limits
+# bite and neither predicts the other.
+#
+# **Bytes** is the transport limit: Anthropic rejects a request body over 32 MB.
+# **Tokens** is the model limit, and it is the one that surprises people. A
+# 6 MB PDF passed a 16 MB byte budget comfortably and was 250 pages — around
+# 400,000 tokens on its own. Four such attachments and 54k tokens of actual
+# conversation came to 1,007,587 tokens against a 1,000,000 limit, and the
+# provider's answer named neither the file nor the number.
+#
+# Bytes are a terrible proxy for tokens: a scanned 6 MB PDF and a text-layer
+# 6 MB PDF differ by an order of magnitude in what they cost to read. So page
+# count is used for PDFs and character count for text, and both budgets are
+# enforced — a request has to clear the transport limit *and* fit the window of
+# whichever model is about to be asked.
+_ATTACHMENT_BUDGET = int(os.environ.get("BLPL_ATTACHMENT_BUDGET_BYTES") or 16 * 1024 * 1024)
+
+# Anthropic documents a PDF page as roughly 1,500–3,000 tokens once its image
+# and text are both counted. The high end, deliberately: an estimate that runs
+# under the truth turns a refusal we could explain into one the provider makes
+# for us.
+_TOKENS_PER_PDF_PAGE = 2_600
+_TOKENS_PER_IMAGE = 1_600
+
+# The share of a model's context an attachment may occupy. The rest is for the
+# conversation, the tools, and the answer — all of which have to fit too, and
+# none of which anybody would thank us for evicting to make room for a datasheet
+# that was read forty turns ago.
+_ATTACHMENT_SHARE = 0.35
+
+# Fallback when nothing says otherwise. Low rather than high: overestimating a
+# window produces a failed turn, underestimating it produces a note saying a
+# file was left out.
+_DEFAULT_CONTEXT = 128_000
+
+_PAGE_CACHE: dict[tuple[str, int], int] = {}
+
+
+def _pdf_pages(path: Path) -> int:
+    """Page count, cached on (path, mtime). Attachments are immutable — they are
+    content-addressed — so this only ever runs once per file per process."""
+    try:
+        key = (str(path), int(path.stat().st_mtime))
+    except OSError:
+        return 0
+    if key not in _PAGE_CACHE:
+        try:
+            out = subprocess.run(
+                ["pdfinfo", str(path)], capture_output=True, text=True, timeout=20
+            ).stdout
+            pages = next(
+                (int(line.split()[1]) for line in out.splitlines() if line.startswith("Pages")),
+                0,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # No poppler, or a PDF it will not open. Fall back to size, which is
+            # wrong but not zero — and zero would wave the file straight through.
+            pages = max(1, path.stat().st_size // 60_000)
+        _PAGE_CACHE[key] = pages
+    return _PAGE_CACHE[key]
+
+
+def _token_cost(path: Path, kind: str) -> int:
+    if kind == "image":
+        return _TOKENS_PER_IMAGE
+    return max(1, _pdf_pages(path)) * _TOKENS_PER_PDF_PAGE
+
+
+def _attachment_budget(
+    events: list[dict], attachments_dir: Path | None, context: int = _DEFAULT_CONTEXT
+) -> set[tuple[int, str]]:
+    """Which (message index, attachment id) pairs are sent as bytes this turn.
+
+    Walked newest-first, because recency is the best available proxy for
+    relevance: the datasheet under discussion is the one just attached, and the
+    one from twenty turns ago has usually been read and its findings written
+    into the transcript — which is still there, and is a hundredth of the size.
+
+    Duplicates lose regardless of budget. The same file in two messages is the
+    same bytes twice in one request, and the provider gains nothing from the
+    second copy.
+    """
+    keep, _ = _plan_attachments(events, attachments_dir, context)
+    return keep
+
+
+def _reserved_tokens(events: list[dict], attachments_dir: Path | None, window: int) -> int:
+    """What the request is already committed to, apart from conversation text.
+
+    The attachments that survived stage one, plus a flat allowance for the
+    system prompt and the tool declarations — both of which are sizeable here
+    and neither of which shrinks when the conversation does.
+    """
+    keep, _ = _plan_attachments(events, attachments_dir, window)
+    spent = 0
+    if attachments_dir is not None:
+        seen: set[str] = set()
+        for i, aid in keep:
+            if aid in seen:
+                continue
+            seen.add(aid)
+            path = attachments_store.path_of(attachments_dir, aid)
+            if path is not None:
+                spent += _token_cost(path, "document" if path.suffix == ".pdf" else "image")
+    return spent + 12_000
+
+
+def unanswered_messages(events: list[dict]) -> set[int]:
+    """Indices of user messages whose turn produced nothing whatsoever.
+
+    A question that was persisted, sent, and answered only by an error. Nothing
+    in the transcript refers to it, no model ever read it, and replaying it
+    achieves nothing — but it is replayed, because the message is written to the
+    conversation *before* the turn runs, and a failed turn leaves it there.
+
+    That is benign until the failure is about size, at which point it is the
+    whole problem. Observed, four rows in a row: a message with three datasheets
+    attached fails at 413; the same message with the same three datasheets fails
+    again; the user removes the attachments and sends again — and it *still*
+    fails, because both earlier copies are in the history, carrying six
+    documents between them. Every attempt to escape made the request bigger. The
+    one correct move, taking the files out, was the one the accumulated failures
+    had already made useless.
+
+    Kept on disk and on screen either way: the transcript is a record of what
+    happened, and this is only about what gets sent.
+    """
+    out: set[int] = set()
+    for i, ev in enumerate(events):
+        if ev.get("role") != "user":
+            continue
+        produced = failed = False
+        for later in events[i + 1 :]:
+            role = later.get("role")
+            if role == "user":
+                break
+            if role in ("assistant", "tool_results"):
+                produced = True
+                break
+            if role == "error":
+                failed = True
+        if failed and not produced:
+            out.add(i)
+    return out
+
+
+def _plan_attachments(
+    events: list[dict], attachments_dir: Path | None, context: int = _DEFAULT_CONTEXT
+) -> tuple[set[tuple[int, str]], list[str]]:
+    """The pairs to send, and the names of the files left behind.
+
+    ``context`` is the window of the model about to be asked. Both budgets are
+    enforced: a request has to clear the provider's transport limit and fit the
+    model's window, and which one binds depends entirely on the documents. A
+    scanned PDF hits the byte limit first; a 250-page text one sails past it and
+    costs 400,000 tokens.
+    """
+    if attachments_dir is None:
+        return set(), []
+    token_budget = max(20_000, int(context * _ATTACHMENT_SHARE))
+    dead = unanswered_messages(events)
+    keep: set[tuple[int, str]] = set()
+    seen: set[str] = set()
+    # Named once each. A file the user attached twice is one file, and listing
+    # it twice in "not sending X, X" reads like two separate problems.
+    dropped: set[str] = set()
+    left: list[str] = []
+    spent = 0
+    spent_tokens = 0
+    for i in range(len(events) - 1, -1, -1):
+        if i in dead:
+            continue  # never reached a model; its bytes buy nothing
+        blocks = (events[i].get("metadata") or {}).get("blocks") or []
+        refs = [b for b in blocks if b.get("type") in ("image", "document") and b.get("attachment")]
+        for b in refs:
+            aid = str(b["attachment"])
+            name = str(b.get("name") or "file")
+            if aid in seen or aid in dropped:
+                continue  # already decided; a later message spoke for this file
+            path = attachments_store.path_of(attachments_dir, aid)
+            if path is None:
+                continue
+            # base64 is 4 bytes out for every 3 in, which is what actually
+            # travels; the size on disk understates the request by a third.
+            cost = (path.stat().st_size + 2) // 3 * 4
+            tokens = _token_cost(path, str(b.get("type")))
+            # Both budgets bind, and they bind even on the message just sent.
+            # Keeping one file regardless means attaching something is never a
+            # no-op; keeping all of them regardless was how three 8 MB
+            # datasheets on one message produced a 34 MB request against a
+            # 32 MB limit on every turn thereafter.
+            over = spent + cost > _ATTACHMENT_BUDGET or spent_tokens + tokens > token_budget
+            if over and keep:
+                dropped.add(aid)
+                left.append(f"{name} (~{tokens // 1000}k tokens)")
+                continue
+            seen.add(aid)
+            spent += cost
+            spent_tokens += tokens
+            keep.add((i, aid))
+    return keep, left
+
+
+def attachments_left_out(
+    events: Iterable[dict], attachments_dir: Path | None, context: int = _DEFAULT_CONTEXT
+) -> list[str]:
+    """Names of attachments this turn will not carry, newest-relevant first.
+
+    Separate from building the messages so the turn can *say* so. A request
+    silently missing the datasheet it is being asked about is the failure mode
+    to avoid — worse than the size error, because it looks like it worked.
+    """
+    return _plan_attachments(list(events), attachments_dir, context)[1]
+
+
 def history_to_messages(
-    events: Iterable[dict], attachments_dir: Path | None = None
+    events: Iterable[dict], attachments_dir: Path | None = None, context: int = _DEFAULT_CONTEXT
 ) -> list[Msg]:
     """Rebuild the chat history from the conversation's JSONL.
 
@@ -428,12 +731,53 @@ def history_to_messages(
     would leave assistant turns referring to tool calls the provider can no
     longer see — which providers reject outright, and which would in any case
     strip the evidence the conversation was reasoning from.
+
+    Attachments are the exception, and have to be: they are bytes rather than
+    words, they are resent in full on every turn, and a handful of datasheets
+    outweighs the entire conversation by three orders of magnitude. What is left
+    behind is named rather than dropped silently — the assistant is told the
+    file was provided earlier and how to get it back, because an assistant
+    answering "as the datasheet shows" about a datasheet it did not receive is
+    the failure this is avoiding.
     """
+    events = list(events)
+    keep = _attachment_budget(events, attachments_dir, context)
+    # Questions nothing ever answered. Four identical copies of the same
+    # paragraph is not context; it is the wreckage of four attempts to send it.
+    dead = unanswered_messages(events)
+
+    # A stored summary stands in for everything it covers. Computed once by
+    # app/compaction.py and written into the conversation, so a later turn
+    # reuses it rather than re-summarising — a conversation that quietly
+    # rewords itself on every question is worse than one that is too long.
+    summary, covers = compaction.existing_summary(events)
     messages: list[Msg] = []
-    for ev in events:
+    if summary:
+        messages.append(
+            Msg(
+                role="user",
+                content=[
+                    TextBlock(
+                        "[Summary of the earlier part of this conversation, which has been "
+                        "compacted to fit. Exact values below are quoted; anything not here "
+                        "may still be in the project's files and git history, which you can "
+                        "read.]\n\n" + summary
+                    )
+                ],
+            )
+        )
+        messages.append(
+            Msg(role="assistant", content=[TextBlock("Understood — carrying on from there.")])
+        )
+
+    for i, ev in enumerate(events):
+        if i in dead or (summary and i < covers):
+            continue
         role = ev.get("role")
         meta = ev.get("metadata") or {}
-        blocks = _blocks_from_json(meta.get("blocks") or [], attachments_dir)
+        blocks = _blocks_from_json(
+            meta.get("blocks") or [], attachments_dir, keep=keep, index=i
+        )
         if role == "user":
             messages.append(Msg(role="user", content=blocks or [TextBlock(ev.get("content", ""))]))
         elif role == "assistant":
@@ -448,8 +792,10 @@ def history_to_messages(
         elif role == "tool_results":
             if blocks:
                 messages.append(Msg(role="user", content=blocks))
-        # Any other role (e.g. the "error" marker conversations.py emits for a
-        # corrupt line) is skipped: it is a record for humans, not context.
+        # Any other role — the "error" marker conversations.py emits for a
+        # corrupt line, and the "summary" event, which was already placed above
+        # rather than replayed in sequence — is skipped: a record for humans,
+        # not context.
     return messages
 
 
@@ -517,13 +863,21 @@ class TurnRequest:
     project_dir: Path
     conversation: Conversation
     endpoint: Endpoint
-    sandbox: FilesystemSandbox
+    # The rest of the routed chain, in order. A chain that is only ever used
+    # for its head is not a fallback chain — it is a list with decoration, and
+    # that is what this was: an endpoint that could not serve the turn ended it
+    # rather than passing it on to the next one that could.
+    fallbacks: tuple[Endpoint, ...] = ()
+    sandbox: FilesystemSandbox = None  # type: ignore[assignment]
     usage_ledger: Path | None = None
     creds: object | None = None
     # task name → endpoint, so a tool that needs a different model (datasheet
     # extraction needs one that can see) gets the routed one rather than this
     # conversation's.
-    endpoint_for: Callable[[str], Endpoint | None] | None = None
+    endpoints_for: Callable[[str], list[Endpoint]] | None = None
+    library: object | None = None
+    # The chosen endpoint's context window, so the request can be sized to it.
+    context: int = 0
     record_tool_call: Callable[[dict], None] | None = None
     # Where the KiCad MCP server is, if the deploy has one.
     kicad_url: str | None = None
@@ -595,7 +949,8 @@ class ChatSessionManager:
             sandbox=req.sandbox,
             conversation=req.conversation.path.name,
             creds=req.creds or CredResolver(),
-            endpoint_for=req.endpoint_for or (lambda _t: None),
+            endpoints_for=req.endpoints_for or (lambda _t: []),
+            library=req.library,
             on_progress=lambda m: live.publish({"type": "progress", "message": m}),
             # A tool whose whole effect is visual publishes straight to the
             # browser; highlighting the part under discussion beats describing
@@ -605,11 +960,74 @@ class ChatSessionManager:
         live.publish({"type": "start", "turn_id": live.turn_id, "model": req.endpoint.model,
                       "endpoint": req.endpoint.name})
         try:
-            messages = history_to_messages(
-                req.conversation.read_all(),
-                req.conversations_dir or req.conversation.path.parent,
-            )
-            adapter = build_chat_adapter(req.endpoint)
+            events = list(req.conversation.read_all())
+            attachments_dir = req.conversations_dir or req.conversation.path.parent
+            # Sized to the model that is about to be asked, not to a fixed
+            # number. Switching endpoints mid-conversation changes what fits —
+            # a history that a 1M-token model carries comfortably is three
+            # times over the head of a 200k one — and the request is rebuilt
+            # per turn anyway, so this costs nothing to get right.
+            window = req.context or _DEFAULT_CONTEXT
+
+            # Stage two, and only when stage one was not enough. Dropping
+            # attachments is free and loses nothing anybody wrote; summarising
+            # costs a call and loses detail unpredictably, so it runs last and
+            # only when the text alone will not fit.
+            reserved = _reserved_tokens(events, attachments_dir, window)
+            todo = compaction.plan(events, window, reserved)
+            if todo.worth_it:
+                live.publish({
+                    "type": "note",
+                    "text": (
+                        f"This conversation is about {todo.tokens_now // 1000}k tokens of text, "
+                        f"over the {todo.tokens_target // 1000}k that fits alongside everything "
+                        f"else in {req.endpoint.name}'s window. Summarising the earlier part "
+                        "now — it is written into the transcript, so you can read exactly what "
+                        "it says, and the project's files and history are untouched."
+                    ),
+                })
+                try:
+                    text = await compaction.summarise(events, todo.upto, req.endpoint)
+                    compaction.record(req.conversation, todo.upto, text, req.endpoint.model)
+                    events = list(req.conversation.read_all())
+                    if not todo.sufficient:
+                        # Compacting as far as it is allowed to did not get
+                        # under budget. Said plainly rather than left to the
+                        # provider, which will refuse without explaining that
+                        # the recent turns alone are the problem.
+                        live.publish({
+                            "type": "note",
+                            "text": (
+                                f"Even after summarising, the recent exchanges come to about "
+                                f"{todo.tokens_after // 1000}k tokens on their own — over what "
+                                "fits. This turn may be refused. Starting a new session keeps "
+                                "the project and its history; only the chat resets."
+                            ),
+                        })
+                except Exception as exc:  # noqa: BLE001 — never fatal
+                    # A failed compaction must not take the turn with it. The
+                    # request may still be too long, and the provider's refusal
+                    # is a better outcome than an answer nobody asked for.
+                    live.publish({
+                        "type": "note",
+                        "text": f"Could not summarise the earlier conversation ({exc}).",
+                    })
+
+            messages = history_to_messages(events, attachments_dir, window)
+            # Said out loud, because the alternative is an answer written
+            # without a file the user believes was in front of it.
+            left = attachments_left_out(events, attachments_dir, window)
+            if left:
+                live.publish({
+                    "type": "note",
+                    "text": (
+                        f"Not sending {', '.join(left)} with this message — the request "
+                        f"would not fit {req.endpoint.name}'s {window // 1000}k-token window. "
+                        "What was already read from them is still in the transcript. Ask "
+                        "about one at a time, or save them into the project so they can be "
+                        "read from there instead of riding along in every request."
+                    ),
+                })
             executor = ToolExecutor(
                 default_tools(req.kicad_url),
                 ctx,
@@ -636,14 +1054,46 @@ class ChatSessionManager:
                 else:
                     live.publish(payload)
 
-            result = await run_tool_loop(
-                adapter,
-                messages,
-                system=build_system_prompt(),
-                tools=executor.declarations(),
-                execute=executor,
-                on_event=on_event,
-            )
+            # Walk the routed chain. Only the head was ever tried before, so a
+            # model that could not serve the turn ended it — the four endpoints
+            # behind it in the chain were never asked.
+            attempts = [req.endpoint, *req.fallbacks]
+            last: BaseException | None = None
+            result = None
+            for i, endpoint in enumerate(attempts):
+                try:
+                    result = await run_tool_loop(
+                        build_chat_adapter(endpoint),
+                        messages,
+                        system=build_system_prompt(),
+                        tools=executor.declarations(),
+                        execute=executor,
+                        on_event=on_event,
+                    )
+                    if i:
+                        # Say which model actually answered. A silent switch
+                        # would leave the transcript attributing an answer to a
+                        # model that never produced it.
+                        live.publish({
+                            "type": "note",
+                            "text": (
+                                f"{attempts[i - 1].name} could not serve this turn "
+                                f"({last}); answered by {endpoint.name} instead."
+                            ),
+                        })
+                    used = endpoint
+                    break
+                except Exception as exc:
+                    last = exc
+                    if i + 1 < len(attempts) and worth_another_endpoint(exc):
+                        live.publish({
+                            "type": "note",
+                            "text": f"{endpoint.name} failed ({exc}); trying {attempts[i + 1].name}.",
+                        })
+                        continue
+                    raise
+            assert result is not None
+            req = replace(req, endpoint=used)
 
             usage = _sum_usage(result.usage)
             persist_messages(req.conversation, result.new_messages, model=req.endpoint.model, usage=usage)
@@ -684,7 +1134,7 @@ class ChatSessionManager:
             # The turn is lost either way; what must not be lost is the reason.
             # It is recorded in the conversation so it survives the page, and
             # published so whoever is watching sees it now.
-            detail = f"{type(exc).__name__}: {exc}"
+            detail = explain(exc)
             retryable = is_transient(exc)
             try:
                 req.conversation.append(

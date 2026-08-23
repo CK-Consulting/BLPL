@@ -11,6 +11,12 @@ dependencies = [
     "pyyaml>=6.0",
     "jsonschema>=4.21",
     "markdown-it-py>=3.0",
+    # Reads a PDF's own table structure — ruling lines, cell bounds, the text
+    # inside each cell. Pure Python on pdfminer.six: no models, no GPU, no OCR.
+    # A datasheet's pin table is a grid and the file says so; flattening it to
+    # text and asking something to infer the grid back is what every failed
+    # approach here had in common.
+    "pdfplumber>=0.11",
 ]
 
 [project.optional-dependencies]

@@ -227,6 +227,13 @@ class LlmEndpoint(Base):
     # because a local server's vision support genuinely cannot be guessed and a
     # wrong guess makes the datasheet extractor read nothing at all.
     vision: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
+    # Null means "work it out" — discovered from the server where one will say,
+    # inferred from the model id otherwise. Stated here when neither is right,
+    # which is the ordinary case for a self-hosted model: the same weights serve
+    # 128k or 1M depending on how the server was started, and Ollama publishes
+    # neither number.
+    context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now

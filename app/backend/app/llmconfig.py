@@ -35,6 +35,8 @@ def load(session: Session, user: User) -> AppConfig:
             base_url=row.base_url,
             auth=row.auth,
             vision=row.vision,
+            context_tokens=row.context_tokens,
+            max_output_tokens=row.max_output_tokens,
         )
         for row in session.scalars(
             select(LlmEndpoint).where(LlmEndpoint.user_id == user.id).order_by(LlmEndpoint.id)
@@ -79,6 +81,8 @@ def save(session: Session, user: User, cfg: AppConfig) -> None:
                     base_url=ep.base_url,
                     auth=ep.auth,
                     vision=ep.vision,
+                    context_tokens=ep.context_tokens,
+                    max_output_tokens=ep.max_output_tokens,
                 )
             )
         else:
@@ -87,6 +91,8 @@ def save(session: Session, user: User, cfg: AppConfig) -> None:
             # a per-endpoint usage record, say — for a rename that isn't one.
             row.kind, row.model, row.base_url = ep.kind, ep.model, ep.base_url
             row.auth, row.vision = ep.auth, ep.vision
+            row.context_tokens = ep.context_tokens
+            row.max_output_tokens = ep.max_output_tokens
     for row in existing.values():
         session.delete(row)
 

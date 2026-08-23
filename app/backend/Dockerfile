@@ -12,8 +12,13 @@ FROM kicad/kicad:10.0.0
 
 USER root
 
+# poppler-utils supplies pdftotext, which is how a datasheet is searched for
+# the part it covers. Not optional in practice: PDFs subset their fonts, so a
+# raw byte scan reads "ORDERING" out of an ordering table and misses the part
+# being ordered. kicad-happy's datasheet verification already reaches for the
+# same binary and silently degrades without it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3-pip python3-venv git \
+        python3-pip python3-venv git poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

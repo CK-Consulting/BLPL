@@ -255,6 +255,8 @@ export type Settings = {
   effective: Record<string, string[]>;
   /** Configurations that are legal but will fail at request time. */
   warnings: string[];
+  /** endpoint name → what its chosen model can do, where the server will say. */
+  endpoint_capabilities: Record<string, string[]>;
   known_kinds: string[];
   known_tasks: string[];
   vision_tasks: string[];
@@ -373,6 +375,8 @@ export type ConversationMeta = {
   started_at: string;
   message_count: number;
   last_message_at: string | null;
+  /** Off the picker, but kept — a transcript is a record, so nothing deletes it. */
+  archived: boolean;
 };
 
 /** One persisted line of a conversation. `role` is free-form by design: user,

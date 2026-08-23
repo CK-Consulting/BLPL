@@ -47,9 +47,20 @@ class ToolContext:
     sandbox: FilesystemSandbox
     conversation: str = ""
     creds: CredResolver = field(default_factory=CredResolver)
-    # task name → endpoint, for tools that themselves call a model (datasheet
-    # extraction needs a vision-capable one, which is Phase 2's routing).
-    endpoint_for: Callable[[str], Endpoint | None] = lambda _task: None
+    # task name → the endpoints routed to it, best first, for tools that
+    # themselves call a model (datasheet extraction needs a vision-capable one).
+    #
+    # A list rather than one endpoint. The chat turn has walked its fallbacks
+    # since the routing work; a tool that dispatches to a model got the head of
+    # the chain and nothing else, so a model that could not hold the output
+    # contract failed the task outright while the endpoints behind it in the
+    # same chain were never asked.
+    endpoints_for: Callable[[str], list[Endpoint]] = lambda _task: []
+
+    def endpoint_for(self, task: str) -> Endpoint | None:
+        """The best endpoint for a task, for callers that only want one."""
+        chain = self.endpoints_for(task)
+        return chain[0] if chain else None
     # Hashes of files read this turn, so a later proposal is anchored to the
     # bytes the model actually reasoned about.
     read_shas: dict[str, str] = field(default_factory=dict)
@@ -67,6 +78,14 @@ class ToolContext:
     # None means single-agent, which is every session today: one agent owning
     # the whole project needs no boundary drawn inside it.
     write_scope: Any | None = None
+    # The user's component library, when one is reachable. A part's pinout is a
+    # property of the part, so an extraction already paid for on another of this
+    # user's projects is the same answer — looked up before spending again.
+    #
+    # A pair rather than a path so the callable can stay a closure over the
+    # request's user; tools never see a user id and cannot construct another
+    # user's library path even by accident.
+    library: Any | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def note(self, message: str) -> None:

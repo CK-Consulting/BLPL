@@ -69,13 +69,19 @@ KNOWN_TASKS = (
     "chat",
     "stage0",
     "stage1",
-    "datasheet_vision",
+    "vision",
     "review_panel",
 )
 
-# Tasks that hand the model an image or a PDF page. Routing one of these to an
-# endpoint that cannot see is a configuration error worth refusing up front.
-VISION_TASKS = frozenset({"datasheet_vision"})
+# Tasks that hand the model an image or a PDF page.
+#
+# One route, named for what it asks for. It used to be "datasheet_vision",
+# named for its only caller — but needing a model that can see is a property of
+# the request, not of datasheets, and the next thing needing one would have had
+# to either borrow a route named for something else or add a near-duplicate
+# beside it, with the settings screen listing both and nothing to say which
+# mattered.
+VISION_TASKS = frozenset({"vision"})
 
 
 @dataclass
@@ -83,6 +89,32 @@ class ProjectEntry:
     name: str
     remote: str = ""  # git remote URL; empty for a local-only project
     branch: str = "main"
+
+
+# Substring → window, first match wins, so the more specific patterns come
+# first. "[1m]" ahead of "opus" is the whole reason this is ordered: the 1M
+# variant is the same model id with a suffix.
+_CONTEXT_BY_MODEL: tuple[tuple[str, int], ...] = (
+    ("[1m]", 1_000_000),
+    # Not 1,000,000. The weights support it; what a window actually is depends
+    # on how the server was started, and the Nemotron on this network reports
+    # max_model_len=262144. Inferring the model's *capability* rather than the
+    # deployment's *configuration* is how a request gets built four times too
+    # large — so this is the conservative figure and a declared value wins.
+    ("nemotron-3", 262_144),
+    ("gpt-5", 400_000),
+    ("gpt-4.1", 1_000_000),
+    ("claude", 200_000),
+    ("gemini", 1_000_000),
+    ("llama-4", 1_000_000),
+    ("qwen3", 128_000),
+    ("qwen2.5", 32_000),
+    ("gpt-4o", 128_000),
+    ("mistral", 128_000),
+    ("gemma", 128_000),
+)
+
+_CONTEXT_DEFAULT = 128_000
 
 
 @dataclass
@@ -93,6 +125,21 @@ class Endpoint:
     base_url: str = ""
     auth: str = "vault"          # vault | none
     vision: bool | None = None   # None → infer from kind
+    # How much this model can be told at once. None → infer from its name.
+    #
+    # Worth stating rather than assuming, because the app decides what to leave
+    # out of a request based on it, and because a self-hosted model's window is
+    # a deployment choice the model's name cannot express: the same Nemotron
+    # weights serve 128k or 1M depending on how vLLM was started.
+    context_tokens: int | None = None
+    # The most tokens this model will produce in one answer. None → discovered
+    # from the server, learned from its own refusal, or inferred. See
+    # blpl/core/limits.py; declared always wins.
+    #
+    # Worth being able to state, because it is the difference between a pinout
+    # and half a pinout, and because it is a deployment choice as often as a
+    # model property.
+    max_output_tokens: int | None = None
 
     @property
     def needs_key(self) -> bool:
@@ -104,6 +151,29 @@ class Endpoint:
 
     def resolved_model(self) -> str:
         return self.model or _DEFAULT_MODELS.get(self.kind, "")
+
+    @property
+    def context(self) -> int:
+        """Best available figure for this endpoint's window.
+
+        Declared beats inferred, and inference is by substring on the model id
+        because that is the only signal there is. Every unknown falls to a
+        conservative default: overestimating a window produces a turn that
+        fails at the provider, underestimating it produces a note saying a file
+        was left out. Those are not equally bad.
+        """
+        if self.context_tokens:
+            return int(self.context_tokens)
+        # Deliberately no network call here. A dataclass property that reaches
+        # out to a server is a property that hangs a test suite, stalls a
+        # settings page, and pays a round trip every time anything touches it —
+        # all of which it did. Discovery belongs where I/O is expected: see
+        # `_context_of` in main.py, which caches it.
+        model = (self.resolved_model() or "").lower()
+        for needle, size in _CONTEXT_BY_MODEL:
+            if needle in model:
+                return size
+        return _CONTEXT_DEFAULT
 
 
 @dataclass
@@ -179,16 +249,52 @@ class AppConfig:
                     f"task {task!r} routes to undeclared endpoint(s) {unknown}. "
                     f"Declared endpoints: {sorted(self.endpoints)}"
                 )
-            if task in VISION_TASKS:
-                blind = [n for n in chain if not self.endpoints[n].can_see]
-                if blind:
-                    raise ValueError(
-                        f"task {task!r} reads images or PDF pages, but endpoint(s) {blind} "
-                        "are not vision-capable. Route it elsewhere, or set vision = true "
-                        "on those endpoints if their model really can see."
-                    )
         if "default" in self.tasks and not self.tasks["default"]:
             raise ValueError("the default task chain must name at least one endpoint")
+
+    def warnings(self) -> list[str]:
+        """Things worth saying that are not reasons to refuse the config.
+
+        The distinction is the point. ``validate`` refuses configurations that
+        cannot run; this reports ones that will run in a way the user may not
+        have intended. Conflating the two is how the settings screen became
+        impossible to edit: a text-only endpoint sitting in a vision task's
+        chain was a hard error, so *every* save was rejected while it was there
+        — including the save that was reordering the chain to fix it. The only
+        escape was the exact edit the error made hardest to reach.
+
+        And it was refusing something the resolver already handles. It drops
+        endpoints that cannot serve a task, with a comment saying in as many
+        words that a text-only model in a chain is "not an error and not a
+        warning" — so the config layer was rejecting a state the runtime layer
+        considers ordinary. A chain with nothing left after that filter is the
+        case actually worth flagging, and it is flagged here.
+        """
+        out: list[str] = []
+        for task in sorted(VISION_TASKS):
+            # chain_for, not self.tasks: an unset vision task inherits the
+            # default chain, and inheriting a blind one breaks it just as
+            # thoroughly as routing it there on purpose. That case used to be
+            # reported from the settings endpoint and this one from validate,
+            # which is how they ended up disagreeing about whether it was fatal.
+            chain = self.chain_for(task)
+            inherited = "" if self.tasks.get(task) else " (inherited from default)"
+            blind = [n for n in chain if n in self.endpoints and not self.endpoints[n].can_see]
+            seeing = [n for n in chain if n in self.endpoints and self.endpoints[n].can_see]
+            if blind and seeing:
+                out.append(
+                    f"{task}{inherited}: {', '.join(blind)} cannot read images, so this task "
+                    f"skips past them to {seeing[0]}. Harmless, but the priority order shown "
+                    "is not the order this task will use."
+                )
+            elif blind and not seeing:
+                out.append(
+                    f"{task} reads images and PDF pages, and none of {', '.join(blind)}"
+                    f"{inherited} can see. This task will fail until a vision-capable "
+                    "endpoint is routed to it — or until 'sees images' is set on one of "
+                    "these, if its model really can."
+                )
+        return out
 
 
 def default_config() -> AppConfig:
@@ -218,6 +324,8 @@ def load(path: Path) -> AppConfig:
             base_url=str(raw.get("base_url", "")),
             auth=str(raw.get("auth", "vault")).lower(),
             vision=raw.get("vision"),
+            context_tokens=raw.get("context_tokens"),
+            max_output_tokens=raw.get("max_output_tokens"),
         )
 
     tasks: dict[str, list[str]] = {

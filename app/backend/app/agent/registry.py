@@ -2,13 +2,24 @@
 
 Grouped by what they touch, because that is what decides their policy:
 
-  *project* — read design documents and pipeline artifacts, propose an edit.
-              Reads are automatic; the "write" is a proposal a human accepts,
-              so it needs no approval of its own.
+  *project* — read anything in the project, propose an edit. Reads are
+              automatic; the "write" is a proposal a human accepts, so it needs
+              no approval of its own.
   *parts*   — reach distributor APIs. Network egress with your API keys on it,
               so it asks once per session.
-  *depth*   — datasheet download and extraction. These spend real money per
-              call and write into the project, so they ask every time.
+  *depth*   — datasheet download and extraction. Spends real money per call and
+              writes into the project's cache, but reads nothing the project
+              does not already contain, so it runs without asking.
+
+Reading is free inside the project directory, and that is the whole rule. The
+boundary this enforces is the project, the same shape as a web server rooted at
+a document directory: everything under it is reachable, nothing above it is.
+Confirming individual reads inside that boundary bought no safety — the files
+are the user's own, put there for this — and cost the thing approvals actually
+run on, which is someone still reading them.
+
+Writing is a separate question with a separate answer. It stays gated, and on a
+multi-board project the write scope narrows further to the board an agent owns.
 
 The descriptions are written for the model and say *when* to reach for a tool,
 not just what it does — a tool description that only states its function gets
@@ -18,6 +29,8 @@ called at the wrong moments, and this set has expensive members.
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 from pathlib import Path
 
 from blpl.agent.tools.bom import HOUSES as HOUSES_FOR_SCHEMA
@@ -28,6 +41,96 @@ from .toolspec import ToolContext, ToolDenied, ToolSpec
 # Design documents, matching the editor's rule so the assistant can never
 # propose a file the user has no way to open.
 EDITABLE_SUFFIXES = {".md", ".markdown", ".yaml", ".yml"}
+
+# Files the user keeps in the project but does not want in the design
+# conversation. Not hidden, not git-ignored, not off-limits — the boundary the
+# app enforces is the project directory, and this folder is inside it. What it
+# changes is *default attention*: its contents are named in a listing but never
+# swept up as project context, and are read only when someone points at one.
+#
+# The distinction matters because the alternatives are all worse. Deleting the
+# files loses them; git-ignoring them takes them out of the history the project
+# depends on; making them unreadable means the one time you do want the
+# assistant to look at the mechanical drawing, you cannot ask.
+CONTEXT_IGNORE = "context-ignore"
+
+# Directories that are never part of a file listing: machinery, not content.
+_SKIP_DIRS = {".git", ".pipeline", ".worktrees", "__pycache__", "node_modules"}
+
+# Reading one of these as text produces mojibake, not information. Named
+# explicitly so the refusal can say what to do instead, rather than returning a
+# screenful of replacement characters and letting the model reason about it.
+_OPAQUE_SUFFIXES = {
+    ".pdf": "use fetch_datasheet / extract_datasheet_specs for datasheets",
+    ".zip": "an archive — ask the user to extract what you need",
+    ".png": "an image — attach it to the conversation to have it looked at",
+    ".jpg": "an image — attach it to the conversation to have it looked at",
+    ".jpeg": "an image — attach it to the conversation to have it looked at",
+    ".step": "a 3D model — not readable as text",
+    ".stp": "a 3D model — not readable as text",
+    ".xlsx": "a spreadsheet — export it to CSV first",
+    ".docx": "a Word document — export it to text or markdown first",
+}
+
+# Enough for any design document or netlist; short of pulling a generated
+# multi-megabyte artifact into the conversation whole.
+_READ_LIMIT = 256 * 1024
+
+
+def _readable_file(ctx: ToolContext, name: str) -> Path:
+    """Resolve a path for *reading*, anywhere inside the project.
+
+    The sandbox already treats the project directory as readable in full, and
+    that is the boundary the app actually maintains — the same shape as a web
+    server rooted at a document directory. What used to sit on top of it was a
+    second, much tighter rule in this module: bare filenames, project root,
+    markdown only. So a datasheet the user had put in the project, or any file
+    in a sub-board's directory, was unreachable by the assistant working on it.
+
+    Writing is unchanged and still goes through ``_project_file``: reading a
+    file and editing it are not the same permission, and only one of them is
+    recoverable by pressing undo.
+    """
+    raw = (name or "").strip().replace("\\", "/")
+    if not raw:
+        raise ToolDenied("path must name a file inside the project")
+    if ".." in Path(raw).parts:
+        raise ToolDenied(f"{name!r} must stay inside the project directory")
+    root = ctx.project_dir.resolve()
+    if raw.startswith("/"):
+        # An absolute path is accepted only when it is this project's own — a
+        # model that has seen the project root in an earlier tool result will
+        # sometimes echo it back. Anything else is refused outright rather than
+        # quietly reinterpreted as relative, which would turn '/etc/passwd' into
+        # a confusing "no such file in this project" instead of a straight no.
+        absolute = Path(raw)
+        if not absolute.is_relative_to(root):
+            raise ToolDenied(f"{name!r} is outside the project directory")
+        raw = str(absolute.relative_to(root))
+    target = (root / raw).resolve()
+    # Belt and braces with the sandbox: this catches a symlink pointing out of
+    # the project, which a string check on the input never would.
+    if not target.is_relative_to(root):
+        raise ToolDenied(f"{name!r} resolves outside the project directory")
+    return target
+
+
+def _read_text(target: Path) -> str:
+    """Read a project file as text, or say precisely why it cannot be."""
+    hint = _OPAQUE_SUFFIXES.get(target.suffix.lower())
+    if hint:
+        raise ToolDenied(f"{target.name} is not readable as text — {hint}")
+    size = target.stat().st_size
+    if size > _READ_LIMIT:
+        raise ToolDenied(
+            f"{target.name} is {size // 1024} KB, over the {_READ_LIMIT // 1024} KB read limit. "
+            "Read a generated artifact through read_pipeline_artifact, or ask the user which "
+            "part of it matters."
+        )
+    head = target.read_bytes()[:8192]
+    if b"\x00" in head:
+        raise ToolDenied(f"{target.name} looks binary — it has no text to read")
+    return target.read_text(encoding="utf-8", errors="replace")
 
 
 def _project_file(ctx: ToolContext, name: str) -> Path:
@@ -48,29 +151,94 @@ def _project_file(ctx: ToolContext, name: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _walk(root: Path, *, skip: set[str], limit: int = 400) -> list[str]:
+    """Every file under ``root`` as a project-relative path, machinery omitted.
+
+    Bounded rather than complete. A listing that grows without limit is a
+    listing that one day arrives as fifty thousand paths and displaces the
+    conversation it was meant to inform, and truncating silently would read as
+    "that is everything" — so the caller reports the count it dropped.
+    """
+    out: list[str] = []
+    stack = [root]
+    while stack:
+        here = stack.pop()
+        try:
+            entries = sorted(here.iterdir())
+        except OSError:
+            continue
+        for f in entries:
+            if f.is_dir():
+                if f.name in skip or f.name.startswith("."):
+                    continue
+                stack.append(f)
+            elif f.is_file() and not f.name.startswith("."):
+                out.append(str(f.relative_to(root)))
+                if len(out) >= limit * 4:  # hard stop; the caller trims to limit
+                    return sorted(out)
+    return sorted(out)
+
+
 async def _list_files(ctx: ToolContext, args: dict) -> str:
+    root = ctx.project_dir.resolve()
     docs = sorted(
         f.name
-        for f in ctx.project_dir.iterdir()
+        for f in root.iterdir()
         if f.is_file() and not f.name.startswith(".") and f.suffix.lower() in EDITABLE_SUFFIXES
     )
-    pipeline = ctx.project_dir / ".pipeline"
+    pipeline = root / ".pipeline"
     arts = sorted(f.name for f in pipeline.iterdir() if f.is_file()) if pipeline.is_dir() else []
-    sheets = ctx.project_dir / "datasheets"
+    sheets = root / "datasheets"
     pdfs = sorted(f.name for f in sheets.glob("*.pdf")) if sheets.is_dir() else []
-    return json.dumps(
-        {"design_documents": docs, "pipeline_artifacts": arts, "datasheets": pdfs}, indent=2
-    )
+
+    # Everything else in the project, sub-board directories included. Previously
+    # absent, which made a multi-board project look empty below its root.
+    known = set(docs) | {f"datasheets/{p}" for p in pdfs}
+    others = [
+        p
+        for p in _walk(root, skip=_SKIP_DIRS | {CONTEXT_IGNORE})
+        if p not in known and not p.startswith("datasheets/")
+    ]
+    dropped = max(0, len(others) - 400)
+    payload: dict = {
+        "design_documents": docs,
+        "other_project_files": others[:400],
+        "pipeline_artifacts": arts,
+        "datasheets": pdfs,
+    }
+    if dropped:
+        payload["other_project_files_omitted"] = dropped
+
+    ignored = root / CONTEXT_IGNORE
+    if ignored.is_dir():
+        names = _walk(ignored, skip=_SKIP_DIRS)
+        # Names, not contents, and never swept up as context. Without the names
+        # the folder could not be used at all — "look at the enclosure drawing"
+        # needs something to resolve against — and a filename is cheap where the
+        # file behind it is the thing that would fill the conversation.
+        payload["context_ignore"] = {
+            "note": (
+                f"The user keeps these in {CONTEXT_IGNORE}/ because they are not part of the "
+                "board design work. Do not read them or reason from them unless the user asks "
+                "about one by name. They are readable when they do."
+            ),
+            "files": [f"{CONTEXT_IGNORE}/{n}" for n in names[:100]],
+            "omitted": max(0, len(names) - 100),
+        }
+    return json.dumps(payload, indent=2)
 
 
 async def _read_file(ctx: ToolContext, args: dict) -> str:
     from ..chat import sha_of  # local import: chat owns the proposal hashing
 
-    target = _project_file(ctx, str(args.get("path", "")))
+    target = _readable_file(ctx, str(args.get("path", "")))
     ctx.sandbox.check_read(target)
     if not target.is_file():
-        raise FileNotFoundError(f"no file {target.name!r} in this project")
-    text = target.read_text(encoding="utf-8", errors="replace")
+        raise FileNotFoundError(f"no file {args.get('path')!r} in this project")
+    text = _read_text(target)
+    # Keyed by the path as given, so a later proposal for the same file finds
+    # the hash of the bytes that were actually read. Root-level documents — the
+    # only ones a proposal can target — key the same way they always did.
     ctx.read_shas[target.name] = sha_of(text)
     return text
 
@@ -135,11 +303,41 @@ async def _fetch_datasheet(ctx: ToolContext, args: dict) -> str:
     mpn = str(args.get("mpn", "")).strip()
     if not mpn:
         raise ToolDenied("mpn is required")
-    dest = ctx.project_dir / "datasheets"
+    from blpl.agent.tools import datasheet_files
+
+    # Into the part's own folder. A file this tool fetched for a specific MPN is
+    # the least ambiguous case there is, and filing it under the part number
+    # records that at the moment it is known — rather than writing
+    # "<MPN>.pdf" at the top level and having every later lookup re-derive it
+    # from the filename.
+    dest = datasheet_files.part_dir(ctx.project_dir, mpn)
     ctx.sandbox.check_write(dest)
+    dest.mkdir(parents=True, exist_ok=True)
     ctx.note(f"downloading datasheet for {mpn}")
     result = await _to_thread(fetch_datasheet, mpn, dest, creds=ctx.creds)
     return json.dumps(result.to_dict(), indent=2)
+
+
+def usable_extraction(payload: object) -> bool:
+    """Whether an extraction holds findings rather than a record of failing.
+
+    A partial merge marks each task it could not complete with
+    ``{"_extraction_failed": true, "reason": ...}``. That is the right thing to
+    write into a project's cache — it says what happened, next to what worked —
+    and exactly the wrong thing to keep in a library that is consulted first and
+    across projects, because it converts one bad afternoon into a permanent
+    answer.
+
+    Checked recursively: the sentinel appears at whatever depth the failing task
+    sat, so a top-level look would miss most of them.
+    """
+    if isinstance(payload, dict):
+        if payload.get("_extraction_failed"):
+            return False
+        return all(usable_extraction(v) for v in payload.values())
+    if isinstance(payload, list):
+        return all(usable_extraction(v) for v in payload)
+    return True
 
 
 async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
@@ -148,19 +346,202 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
     mpn = str(args.get("mpn", "")).strip()
     if not mpn:
         raise ToolDenied("mpn is required")
-    endpoint = ctx.endpoint_for("datasheet_vision")
-    if endpoint is None:
-        raise ToolDenied(
-            "no vision-capable endpoint is routed to datasheet_vision — set one in Settings. "
-            "Extraction reads PDF pages as images; a text-only model would read nothing."
+    # Before anything else, including the vision-endpoint requirement. An
+    # extraction already paid for on another of this user's projects is the same
+    # answer — a pinout is a property of the part, not of the board — and
+    # demanding a model that can see, in order to hand back a result that was
+    # read months ago, is a check standing in front of nothing.
+    if ctx.library is not None:
+        prior = ctx.library.get(mpn)
+        if prior is not None:
+            ctx.note(f"{mpn}: reusing the extraction already in your component library")
+            return json.dumps({"source": "component-library", "mpn": mpn, **prior}, indent=2)
+
+    from blpl.agent.tools import datasheet_files
+
+    # A vendor almost never names a PDF after the orderable part number, so
+    # `<MPN>.pdf` only ever worked for files this tool downloaded itself.
+    found = datasheet_files.resolve(ctx.project_dir, mpn, file=str(args.get("file") or ""))
+    if not found.ok:
+        raise FileNotFoundError(
+            f"no datasheet resolved for {mpn}: {found.detail}. "
+            + (
+                f"Files present: {', '.join(found.candidates)}. "
+                if found.candidates
+                else ""
+            )
+            + "Pass `file` to name one directly, add a row to "
+            f"datasheets/{datasheet_files.MAP_NAME}, or call fetch_datasheet first."
         )
-    pdf = ctx.project_dir / "datasheets" / f"{mpn}.pdf"
-    if not pdf.is_file():
-        raise FileNotFoundError(f"no datasheet at {pdf.name} — call fetch_datasheet first")
+    pdf = found.path
+    if found.how in ("explicit", "prefix"):
+        # Remember what was worked out, so the next run is a lookup rather than
+        # another guess — and so a person can see and correct the binding.
+        try:
+            datasheet_files.record(ctx.project_dir, mpn, pdf.name)
+        except OSError:
+            pass
+    if found.how != "exact":
+        ctx.note(f"{mpn}: reading {pdf.name} (matched by {found.how})")
+
+    # Which kind of model this needs is a property of the document, not of the
+    # task. A datasheet with a text layer — which is nearly all of them — is
+    # read by any competent text model; only a scan needs one that can see.
+    #
+    # Deciding it here rather than demanding vision up front is what makes the
+    # ordinary case work at all. Requiring a vision endpoint for every
+    # extraction meant a perfectly readable PDF failed because no vision route
+    # was configured, and when one was, it was a small VL model that could not
+    # hold the output schema: 0 of 7 pinouts, malformed JSON every time.
+    from blpl.agent.tools.datasheets import has_text_layer
+
+    readable = await _to_thread(has_text_layer, pdf)
+    chain = ctx.endpoints_for("chat" if readable else "vision")
+    if not chain and readable:
+        chain = ctx.endpoints_for("default")
+    if not chain:
+        raise ToolDenied(
+            f"{pdf.name} has no text layer, so it has to be read as images, and no "
+            "vision-capable endpoint is routed to the 'vision' task. Set one in Settings."
+            if not readable
+            else "no endpoint is routed to chat or default — set one in Settings."
+        )
+
     cache = ctx.project_dir / "datasheets" / "extracted"
     ctx.sandbox.check_write(cache)
-    run = await extract_datasheet(mpn, pdf, cache, endpoint, on_progress=ctx.note)
+    # The whole chain, not its head. A model that cannot hold the output schema
+    # fails every task the same way, so the endpoints behind it are the fix.
+    run = await extract_datasheet(mpn, pdf, cache, chain, on_progress=ctx.note)
+    # Kept for next time, and for the next project — but only when something
+    # actually landed.
+    #
+    # This checked that the merged file *existed*, which after the partial-merge
+    # change it does even when every task failed: the merge writes
+    # {"_extraction_failed": true, "reason": "<whatever the provider said>"} in
+    # place of each one. So a run that failed got filed, permanently, per user,
+    # across every project — and because the library is consulted before
+    # anything else, it then answered every later attempt with the fossilised
+    # error instead of trying again.
+    #
+    # The symptom was a provider that had been removed from every route still
+    # appearing in failures: "your credit balance is too low to access the
+    # Anthropic API", quoted back weeks later from a cache, on a system with no
+    # Anthropic route at all.
+    merged = cache / f"{mpn}.json"
+    if ctx.library is not None and run.ok and merged.is_file():
+        try:
+            payload = json.loads(merged.read_text(encoding="utf-8"))
+            if usable_extraction(payload):
+                ctx.library.put(mpn, payload)
+                ctx.note(f"{mpn}: saved to your component library for reuse")
+        except (OSError, json.JSONDecodeError):
+            # Never fatal: the extraction is on disk in the project either way.
+            # Failing to file a copy is worth less than the result.
+            pass
     return json.dumps(run.to_dict(), indent=2)
+
+
+# ---------------------------------------------------------------------------
+# History
+#
+# The project is a git repository and every accepted proposal is a commit, so
+# the record of what a file used to say already exists. Nothing could read it.
+#
+# That gap is what turns an ordinary context limit into lost work. A pinmap
+# agreed forty turns ago falls out of the window — summarisation drops tables
+# first — and with no way to consult the history, the only remaining copy of it
+# is the one in the conversation nobody can search. The bytes were never gone;
+# the door was missing.
+# ---------------------------------------------------------------------------
+
+# Refs come from a model, so they are constrained rather than trusted. This
+# admits hashes, HEAD, HEAD~3, branch names and tags, and refuses anything
+# beginning with '-' — a ref that is really a git option is the injection to
+# care about here. Paths are always passed after '--' for the same reason.
+_REF = re.compile(r"^(?!-)[A-Za-z0-9_./~^@{}-]{1,64}$")
+
+
+def _git(project_dir: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        raise ToolDenied(f"git {args[0]}: {(proc.stderr or proc.stdout).strip()[:400]}")
+    return proc.stdout
+
+
+def _ref(value: str) -> str:
+    ref = (value or "").strip()
+    if not _REF.match(ref):
+        raise ToolDenied(f"{value!r} is not a usable commit reference")
+    return ref
+
+
+async def _file_history(ctx: ToolContext, args: dict) -> str:
+    raw = str(args.get("path", "")).strip()
+    limit = max(1, min(int(args.get("limit") or 20), 100))
+    argv = ["log", f"-{limit}", "--date=iso-strict", "--format=%h\t%ad\t%an\t%s"]
+    if raw:
+        # Resolved through the same rule as a read, so history cannot be asked
+        # for a path a read would refuse.
+        target = _readable_file(ctx, raw)
+        ctx.sandbox.check_read(target)
+        argv += ["--", str(target.relative_to(ctx.project_dir.resolve()))]
+    out = await _to_thread(_git, ctx.project_dir, *argv)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4:
+            rows.append({"commit": parts[0], "when": parts[1], "who": parts[2], "what": parts[3]})
+    if not rows:
+        return json.dumps(
+            {
+                "commits": [],
+                "note": (
+                    f"no commits touch {raw!r}"
+                    if raw
+                    else "this project has no history yet"
+                ),
+            },
+            indent=2,
+        )
+    return json.dumps({"commits": rows}, indent=2)
+
+
+async def _read_file_version(ctx: ToolContext, args: dict) -> str:
+    target = _readable_file(ctx, str(args.get("path", "")))
+    ctx.sandbox.check_read(target)
+    ref = _ref(str(args.get("commit", "")))
+    rel = str(target.relative_to(ctx.project_dir.resolve()))
+    text = await _to_thread(_git, ctx.project_dir, "show", f"{ref}:{rel}")
+    if len(text) > _READ_LIMIT:
+        raise ToolDenied(
+            f"{rel} at {ref} is {len(text) // 1024} KB, over the "
+            f"{_READ_LIMIT // 1024} KB read limit"
+        )
+    return text
+
+
+async def _diff_file(ctx: ToolContext, args: dict) -> str:
+    since = _ref(str(args.get("since", "")))
+    until = _ref(str(args.get("until") or "HEAD")) if args.get("until") else None
+    argv = ["diff", "--unified=3", since] + ([until] if until else [])
+    raw = str(args.get("path", "")).strip()
+    if raw:
+        target = _readable_file(ctx, raw)
+        ctx.sandbox.check_read(target)
+        argv += ["--", str(target.relative_to(ctx.project_dir.resolve()))]
+    out = await _to_thread(_git, ctx.project_dir, *argv)
+    if not out.strip():
+        return f"no changes to {raw or 'the project'} between {since} and {until or 'the working tree'}"
+    if len(out) > _READ_LIMIT:
+        out = out[:_READ_LIMIT] + f"\n... diff truncated at {_READ_LIMIT // 1024} KB"
+    return out
 
 
 async def _read_extraction(ctx: ToolContext, args: dict) -> str:
@@ -605,8 +986,11 @@ def project_tools() -> list[ToolSpec]:
         ToolSpec(
             name="list_project_files",
             description=(
-                "List the project's design documents, its generated pipeline artifacts, and any "
-                "cached datasheet PDFs. Start here when you do not know what the project contains."
+                "List everything in the project: design documents, files in sub-board and other "
+                "directories, generated pipeline artifacts, and cached datasheet PDFs. Start here "
+                "when you do not know what the project contains. Anything listed under "
+                f"'context_ignore' is deliberately outside the design work — do not read those "
+                "unless the user asks about one."
             ),
             input_schema={"type": "object", "properties": {}},
             kind="query",
@@ -614,10 +998,23 @@ def project_tools() -> list[ToolSpec]:
         ),
         ToolSpec(
             name="read_project_file",
-            description="Read one design document from the project root, e.g. 'overview.md'.",
+            description=(
+                "Read any text file in the project by its path — 'overview.md', "
+                "'sensor/board.md', 'notes/power-budget.csv'. Use list_project_files if you do "
+                "not know what is there. Reads are free and need no permission; the project "
+                "directory is the boundary."
+            ),
             input_schema={
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "Filename in the project root."}},
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Path relative to the project root. May name a subdirectory, "
+                            "e.g. 'sensor/board.md'."
+                        ),
+                    }
+                },
                 "required": ["path"],
             },
             kind="file_read",
@@ -661,6 +1058,64 @@ def project_tools() -> list[ToolSpec]:
             handler=_propose_edit,
             path_args=("path",),
             write_args=("path",),
+        ),
+        ToolSpec(
+            name="file_history",
+            description=(
+                "When a file changed and why. Every accepted edit is a commit, so this is the "
+                "record of how the design got to where it is. Reach for it when the user refers "
+                "to something from earlier — 'the pinmap that worked', 'before we changed the "
+                "rail' — instead of saying you no longer have it: the conversation may have been "
+                "summarised, the history has not. Omit path for the whole project."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional file, relative to the project root."},
+                    "limit": {"type": "integer", "description": "How many commits, newest first (default 20)."},
+                },
+            },
+            kind="file_read",
+            handler=_file_history,
+        ),
+        ToolSpec(
+            name="read_file_version",
+            description=(
+                "Read a file exactly as it stood at a past commit. Use file_history first to "
+                "find the commit. This is how a value that was agreed and later overwritten is "
+                "recovered — quote it rather than reconstructing it from memory."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File, relative to the project root."},
+                    "commit": {"type": "string", "description": "A commit hash from file_history, or HEAD~2."},
+                },
+                "required": ["path", "commit"],
+            },
+            kind="file_read",
+            handler=_read_file_version,
+        ),
+        ToolSpec(
+            name="diff_file",
+            description=(
+                "What changed in a file since a past commit, as a unified diff. Cheaper than "
+                "reading both versions when the question is what moved rather than what it says."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional file; omit for the whole project."},
+                    "since": {"type": "string", "description": "The commit to compare against."},
+                    "until": {
+                        "type": "string",
+                        "description": "Optional second commit. Omit to compare against the files as they are now.",
+                    },
+                },
+                "required": ["since"],
+            },
+            kind="file_read",
+            handler=_diff_file,
         ),
     ]
 
@@ -729,12 +1184,37 @@ def parts_tools() -> list[ToolSpec]:
             ),
             input_schema={
                 "type": "object",
-                "properties": {"mpn": {"type": "string"}},
+                "properties": {
+                    "mpn": {"type": "string"},
+                    "file": {
+                        "type": "string",
+                        "description": (
+                            "Optional filename in datasheets/ to read, when it is not "
+                            "named after the MPN. Vendors rarely name a PDF after the "
+                            "orderable part number, and the user naming a file is a "
+                            "statement rather than a guess — prefer it when they do."
+                        ),
+                    },
+                },
                 "required": ["mpn"],
             },
             kind="dispatch",
             handler=_extract_datasheet,
-            approval="ask_always",
+            # Reading a file the project already contains is not a decision worth
+            # interrupting anyone for. This asked every single time, and the cost
+            # was not the seconds: the question arrives mid-answer, in a panel
+            # you may have scrolled away from, about a datasheet you put in the
+            # project yourself for exactly this purpose. A prompt like that is
+            # not a safety control, it is a control people learn to click
+            # through — which then spends the attention the prompts that
+            # matter were relying on.
+            #
+            # What it was really guarding was *spend*, not safety, and spend is
+            # answerable after the fact: the extraction is written to the
+            # project's cache with the model and page range that produced it,
+            # and the usage ledger records the call. read_datasheet_specs is
+            # cheap and is described as the thing to try first.
+            approval="auto",
         ),
         ToolSpec(
             name="read_datasheet_specs",
