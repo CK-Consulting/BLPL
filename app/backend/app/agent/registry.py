@@ -403,12 +403,23 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
             f"datasheets/{datasheet_files.MAP_NAME}, or call fetch_datasheet first."
         )
     pdf = found.path
-    if found.how in ("explicit", "prefix"):
+    if found.how in ("explicit", "family"):
         # Remember what was worked out, so the next run is a lookup rather than
         # another guess — and so a person can see and correct the binding.
+        #
+        # "family" is the guess worth remembering, and it was spelled "prefix"
+        # here — a value `resolve` has never returned, so the working-out was
+        # thrown away every time and only an explicitly named file was ever
+        # written down.
+        #
+        # Recorded relative to datasheets/, because the name alone cannot find a
+        # file in a subdirectory again: the map is consulted before any matching
+        # runs, so a row that resolves to nothing does not fall through to the
+        # search that would have succeeded — it answers for it.
         try:
-            datasheet_files.record(ctx.project_dir, mpn, pdf.name)
-        except OSError:
+            rel = pdf.resolve().relative_to((ctx.project_dir / "datasheets").resolve())
+            datasheet_files.record(ctx.project_dir, mpn, rel.as_posix())
+        except (OSError, ValueError):
             pass
     if found.how != "exact":
         ctx.note(f"{mpn}: reading {pdf.name} (matched by {found.how})")

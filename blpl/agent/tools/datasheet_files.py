@@ -299,6 +299,38 @@ def _pdfs(project_dir: Path) -> list[Path]:
     return sorted(out)
 
 
+def _binds_to_a_part(dirname: str) -> bool:
+    """Whether a directory under ``datasheets/`` names a part or a subject.
+
+    A part number carries digits and letters together — NRF9151AAA, BGS12P2L6,
+    STM32U5G9NJH6Q — and a folder named for one is a statement that everything
+    inside belongs to that part. A folder named for what the parts *do* —
+    ``rf-dividers-switches``, ``power``, ``connectors`` — states nothing about
+    any particular MPN, and the files inside it have to be matched on their own
+    names or they cannot be found at all.
+
+    A heuristic, and deliberately the cautious one: a directory that looks like
+    a part number is treated as binding, so the failure mode is a file not
+    offered for some *other* part rather than the wrong revision handed to the
+    extractor. `file`, the map, and the part's own folder all still reach
+    anything this holds back.
+    """
+    flat = _norm(dirname)
+    return any(c.isdigit() for c in flat) and any(c.isalpha() for c in flat)
+
+
+def _bound_elsewhere(f: Path, sheets: Path, target: str) -> bool:
+    """Is this file filed under a *different* part's folder?"""
+    try:
+        rel = f.relative_to(sheets)
+    except ValueError:
+        return False
+    if len(rel.parts) < 2:
+        return False        # loose at the top: a family document, in the running
+    top = rel.parts[0]
+    return _binds_to_a_part(top) and _norm(top) != target
+
+
 def folder_name(mpn: str) -> str:
     """The directory a part's own documents live in.
 
@@ -355,7 +387,14 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
                 return Resolution(path=candidate, how="explicit")
         # Named but filed deeper: accept a full relative path, or a bare name
         # when only one file in the tree carries it.
-        deep = [f for f in available if str(f.relative_to(sheets)) == file or f.name == wanted]
+        # The exact path first, and only then the bare name. Matching both at
+        # once meant that naming `cat-a/foo.pdf` while `cat-b/foo.pdf` existed
+        # collected them both and answered "give the full path" to someone who
+        # just had.
+        want_rel = Path(file).as_posix()
+        deep = [f for f in available if f.relative_to(sheets).as_posix() == want_rel]
+        if not deep:
+            deep = [f for f in available if f.name == wanted]
         if len(deep) == 1:
             return Resolution(path=deep[0], how="explicit")
         if deep:
@@ -399,9 +438,17 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
     # 3. The project's map.
     mapped = read_map(project_dir).get(_norm(mpn))
     if mapped:
-        candidate = (sheets / Path(mapped).name).resolve()
-        if candidate.is_file():
+        # A row may name a nested file. Resolved under datasheets/ and then
+        # checked to be inside it, because this table is hand-editable markdown
+        # and `../` in a cell must not become a read outside the project.
+        candidate = (sheets / mapped).resolve()
+        inside = candidate.is_file() and candidate.is_relative_to(sheets.resolve())
+        if inside:
             return Resolution(path=candidate, how="map")
+        # Rows written before bindings carried their directory hold a bare name.
+        same = [f for f in available if f.name == Path(mapped).name]
+        if len(same) == 1:
+            return Resolution(path=same[0], how="map")
         return Resolution(
             path=None,
             candidates=names,
@@ -421,6 +468,8 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
     target = _norm(mpn)
     hits = []
     for f in available:
+        if _bound_elsewhere(f, sheets, target):
+            continue
         stem = _norm(f.stem)
         # The whole part number, somewhere inside the name. Vendors prepend
         # their own name and append a revision — ``Infineon_BGS12P2L6_

@@ -969,3 +969,63 @@ def test_naming_a_file_reaches_into_a_subdirectory(tmp_path) -> None:
     for name in ("BD0926-V9.3.pdf", "rf-dividers-switches/BD0926-V9.3.pdf"):
         got = df.resolve(tmp_path, "BD0926", file=name)
         assert got.how == "explicit", name
+
+
+def test_a_document_filed_under_one_part_is_not_offered_for_another(tmp_path) -> None:
+    """Codex, PR #8. Widening the search must not undo what a folder states.
+
+    A per-MPN folder binds its contents to that part. Once every PDF joined the
+    family-prefix pass, a document filed under NRF9151AAA could be returned for
+    NRF9151BBB — a different package or revision, fed to the extractor with
+    nothing downstream to question it. A folder named for a function still has
+    to work, so the two are told apart rather than the exclusion coming back."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    (sheets / "NRF9151AAA").mkdir(parents=True)
+    (sheets / "NRF9151AAA" / "nRF9151_datasheet.pdf").write_bytes(b"%PDF")
+
+    assert not df.resolve(tmp_path, "NRF9151BBB").ok
+    # Its own part still finds it, and a category folder is unaffected.
+    assert df.resolve(tmp_path, "NRF9151AAA").how == "folder"
+    (sheets / "rf-switches").mkdir()
+    (sheets / "rf-switches" / "Infineon_BGS12P2L6_DataSheet.pdf").write_bytes(b"%PDF")
+    assert df.resolve(tmp_path, "BGS12P2L6").ok
+
+
+def test_an_exact_path_settles_a_duplicate_basename(tmp_path) -> None:
+    """Codex, PR #8. Answering "give the full path" to someone who just did."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    for d in ("cat-a", "cat-b"):
+        (sheets / d).mkdir(parents=True)
+        (sheets / d / "foo.pdf").write_bytes(b"%PDF")
+
+    got = df.resolve(tmp_path, "PART1", file="cat-a/foo.pdf")
+    assert got.how == "explicit"
+    assert got.path.parent.name == "cat-a"
+    # An ambiguous bare name still refuses, and says both.
+    bare = df.resolve(tmp_path, "PART1", file="foo.pdf")
+    assert not bare.ok
+    assert len(bare.candidates) == 2
+
+
+def test_a_recorded_binding_survives_a_nested_file(tmp_path) -> None:
+    """Codex, PR #8. A binding written after one success must not break the next.
+
+    `record` stored a basename, and the map branch looked only in the root, so
+    extracting a datasheet from a subdirectory wrote a row that could never
+    resolve again — and the map branch answers before any matching, so it
+    poisoned the automatic path it was meant to shortcut."""
+    from blpl.agent.tools import datasheet_files as df
+
+    sheets = tmp_path / "datasheets"
+    (sheets / "rf-switches").mkdir(parents=True)
+    (sheets / "rf-switches" / "nested.pdf").write_bytes(b"%PDF")
+
+    df.record(tmp_path, "PART1", "rf-switches/nested.pdf")
+    got = df.resolve(tmp_path, "PART1")
+    assert got.ok, got.detail
+    assert got.how == "map"
+    assert got.path.parent.name == "rf-switches"
