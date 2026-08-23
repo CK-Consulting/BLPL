@@ -199,17 +199,29 @@ export function Diagram({ source }: { source: string }) {
   useEffect(() => {
     let cancelled = false;
     setError(null);
+    // A unique id per render: mermaid keys internal state on it and reuses a
+    // stale definition when two diagrams share one.
+    const id = `d${seq++}`;
     (async () => {
       try {
         const mermaid = await mermaidOnce();
-        // A unique id per render: mermaid keys internal state on it and reuses
-        // a stale definition when two diagrams share one.
-        const { svg: out } = await mermaid.render(`d${seq++}`, withHouseStyle(source));
+        const { svg: out } = await mermaid.render(id, withHouseStyle(source));
         if (!cancelled) setSvg(out);
       } catch (e) {
         // A diagram that will not parse is shown as its source rather than as
         // nothing. The text is what somebody wrote and what they need to fix.
         if (!cancelled) setError((e as Error).message);
+      } finally {
+        // Mermaid measures in a div it appends to <body> — `d` + the id it was
+        // given — and removes it when the render succeeds. When the render
+        // throws, it does not: the div stays, holding mermaid's own error
+        // graphic, whose "Syntax error in text" is drawn at font-size 150px.
+        // One per failure, appended to the end of the page, so a conversation
+        // that produced three bad diagrams grew three giant error banners below
+        // everything else, belonging to no diagram in particular and impossible
+        // to dismiss. This component reports its own failures inline; mermaid's
+        // stray copy is not wanted at any size.
+        document.getElementById(`d${id}`)?.remove();
       }
     })();
     return () => {

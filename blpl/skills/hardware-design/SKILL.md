@@ -171,6 +171,41 @@ Name nodes with the refdes or subsystem id the BOM uses. A diagram whose blocks
 are called `U_BLE` and `SB-ANT` can be checked against the tables; one whose
 blocks are called "the radio" cannot.
 
+### Two things that do not parse
+
+Both have already cost a diagram in this app, and neither reads like a syntax
+question while you are writing it. A diagram that does not parse is not drawn at
+all, so each one costs the whole picture rather than a detail of it.
+
+**Quote any label with brackets or punctuation in it.** To mermaid `(` and `)`
+are grammar, not text, everywhere a label can appear:
+
+```
+DSI -->|Diff Pairs (6 pins)| PANEL       parse error
+DSI -->|"Diff Pairs (6 pins)"| PANEL     works
+A[Foo (bar)]                             parse error
+A["Foo (bar)"]                           works
+subgraph X[Foo (bar)]                    parse error
+subgraph X["Foo (bar)"]                  works
+```
+
+Pin counts, impedances, package names — the details that make a diagram
+checkable are the ones that carry brackets. Quote every label as a habit and the
+question stops arising.
+
+**There is no left-pointing arrow.** `-->` and `<-->` exist. `<--` does not.
+
+```
+TE <-- PANEL      parse error
+PANEL --> TE      works — write the edge in the direction it flows
+A <--> B          works — when it genuinely goes both ways
+```
+
+One more thing worth knowing rather than discovering: the house classes are
+added to `flowchart` and `graph` only. `classDef` belongs to that grammar, and a
+`sequenceDiagram` or `gantt` refuses to parse with one attached — so those kinds
+render, but plainly, and `:::class` in them does nothing.
+
 ### The first diagram of a project
 
 When somebody describes a device — "a handheld with an STM32U5G9NJ, five radio

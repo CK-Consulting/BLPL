@@ -95,3 +95,26 @@ describe("applying the house style", () => {
     ).rejects.toThrow();
   });
 });
+
+describe("a diagram that will not parse", () => {
+  it("leaves nothing of mermaid's own error graphic on the page", async () => {
+    // Mermaid measures in a div appended to <body> and removes it only when the
+    // render succeeds. On a throw it stays, holding the "Syntax error in text"
+    // graphic mermaid draws at font-size 150px — one per failure, stacked at the
+    // end of the page, attached to no diagram and impossible to dismiss.
+    const { render: renderComponent } = await import("@testing-library/react");
+    const React = await import("react");
+    const { Diagram } = await import("./Diagram");
+
+    const before = document.body.querySelectorAll("body > div[id^='d']").length;
+    for (const bad of ["flowchart LR\n A[Foo (bar)] --> B", "flowchart LR\n TE <-- PANEL"]) {
+      renderComponent(React.createElement(Diagram, { source: bad }));
+    }
+    await new Promise((r) => setTimeout(r, 400));
+    const stray = [...document.body.querySelectorAll("div[id^='d']")].filter((el) =>
+      (el.textContent || "").includes("Syntax error in text"),
+    );
+    expect(stray).toHaveLength(0);
+    expect(document.body.querySelectorAll("body > div[id^='dd']").length).toBe(before);
+  });
+});
