@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getJSON, putJSON } from "../api";
 import { Code, langOf } from "./Code";
+import { Diagram, isDiagramFile } from "./Diagram";
 import { Markdown } from "./Markdown";
 
 /**
@@ -17,7 +18,8 @@ import { Markdown } from "./Markdown";
  * having to press Edit to read something is backwards.
  */
 
-const SAVABLE = /\.(md|markdown|ya?ml)$/i;
+// Diagrams are design documents too: text, versioned, edited here.
+const SAVABLE = /\.(md|markdown|ya?ml|mmd|mermaid)$/i;
 
 export function FileView({
   projectId,
@@ -90,6 +92,7 @@ export function FileView({
   }
 
   const lang = langOf(path);
+  const diagram = isDiagramFile(path, content);
   const pretty = lang === "json" ? tryPretty(content) : content;
 
   return (
@@ -150,7 +153,16 @@ export function FileView({
         />
       ) : (
         <div className="fileview-body">
-          {lang === "markdown" ? <Markdown text={content} /> : <Code text={pretty} lang={lang} />}
+          {lang === "markdown" ? (
+            <Markdown text={content} />
+          ) : diagram ? (
+            // A diagram file renders as the diagram. Its source is one Edit
+            // click away, which is the same bargain markdown gets — and the
+            // reason to write one as text in the first place.
+            <Diagram source={content} />
+          ) : (
+            <Code text={pretty} lang={lang} />
+          )}
         </div>
       )}
     </div>

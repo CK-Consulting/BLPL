@@ -907,3 +907,50 @@ def test_ollama_still_lists_its_own_names(unlocked, monkeypatch) -> None:
     assert r.status_code == 200, r.text
     assert r.json()["models"] == ["qwen2.5vl:7b"]
     assert r.json()["labels"] == {}
+
+
+def test_vis_is_design_work_not_other() -> None:
+    """A project's architecture drawing is usually the first thing made and the
+    thing most returned to. Filed under "other" it sits behind a fold with the
+    scratch files."""
+    pytest.importorskip("fastapi")
+    from app.main import _tree_role
+
+    assert _tree_role(Path("vis/rf-block-diagram.mmd")) == "design"
+    assert _tree_role(Path("vis/rf-block-diagram.png")) == "design"
+    assert _tree_role(Path("diagrams/overview.mmd")) == "design"
+    # And the rules it must not disturb.
+    assert _tree_role(Path("datasheets/x.pdf")) == "datasheet"
+    assert _tree_role(Path("overview.md")) == "design"
+    assert _tree_role(Path("arch.mmd")) == "diagram"
+    assert _tree_role(Path("scratch.bin")) == "other"
+
+
+def test_the_skill_table_matches_the_palette(tmp_path) -> None:
+    """Codex, PR #9. The shapes are only real if the writer is told the truth.
+
+    A `classDef` cannot set a node's shape, so the renderer cannot enforce the
+    shape half of the design language — the class table in the skill is what
+    does, by telling whoever writes the diagram which shape a class takes. That
+    makes the table load-bearing, and a table that drifts from the palette is
+    worse than no table: it is confidently wrong."""
+    import json
+    import re
+    from pathlib import Path as P
+
+    root = P(__file__).resolve().parent.parent
+    theme = json.loads((root / "mermaid" / "themes" / "blpl-dark.json").read_text())
+    skill = (root / "blpl" / "skills" / "hardware-design" / "SKILL.md").read_text()
+
+    rows = dict(
+        (m.group(1), (m.group(2).strip(), m.group(3).strip()))
+        for m in re.finditer(r"^\| `([a-z]+)` \| ([^|]+) \| ([^|]+) \|", skill, re.M)
+    )
+    assert rows, "the class table is gone from the skill"
+    for name, spec in theme["classes"].items():
+        assert name in rows, f"{name} is in the palette but not in the skill's table"
+        shape, hue = rows[name]
+        assert shape == spec["shape"], f"{name}: skill says {shape!r}, palette says {spec['shape']!r}"
+        assert hue == spec["hue"], f"{name}: skill says {hue!r}, palette says {spec['hue']!r}"
+    for name in rows:
+        assert name in theme["classes"], f"{name} is in the skill's table but not the palette"

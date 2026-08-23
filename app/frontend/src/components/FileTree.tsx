@@ -27,7 +27,7 @@ export type TreeNode = {
   path: string;
   name: string;
   dir: boolean;
-  role: "design" | "artifact" | "datasheet" | "note" | "kicad" | "other";
+  role: "design" | "diagram" | "artifact" | "datasheet" | "note" | "kicad" | "other";
   bytes?: number;
   modified?: string;
 };
@@ -36,6 +36,7 @@ export type TreeNode = {
 // order they matter when you are looking for something.
 const GROUPS: { role: TreeNode["role"]; label: string }[] = [
   { role: "design", label: "Design" },
+  { role: "diagram", label: "Diagrams" },
   { role: "kicad", label: "KiCad" },
   { role: "datasheet", label: "Datasheets" },
   { role: "artifact", label: "Pipeline" },
@@ -220,7 +221,10 @@ export function FileTree({
             // group and every folder expanded, which put a project's four
             // design documents at the bottom of a page of generated artifacts.
             // Design is what the workbench is for.
-            defaultOpen={role === "design"}
+            // Design and Diagrams open; the rest stay folded. A project's
+            // architecture drawing is usually the first thing made and the
+            // thing most returned to.
+            defaultOpen={role === "design" || role === "diagram"}
             // A filter is a search, and a search that leaves its results folded
             // away has not answered anything.
             forceOpen={filter.trim().length > 0}
@@ -380,7 +384,8 @@ function Folder({
 export function destinationFor(node: TreeNode): "text" | "kicad" | "browser" {
   const name = node.name.toLowerCase();
   if (/\.(kicad_pcb|kicad_sch)$/.test(name)) return "kicad";
-  if (/\.(md|markdown|ya?ml|toml|json|txt|csv|log|ini|cfg|net|nanorc)$/.test(name)) return "text";
+  if (/\.(mmd|mermaid)$/.test(name)) return "text";
+  if (/\.(md|markdown|ya?ml|toml|json|txt|csv|log|ini|cfg|net|nanorc|tb)$/.test(name)) return "text";
   // No extension and small enough to be a note rather than a blob: README,
   // LICENSE, Makefile. Guessing wrong here costs a wasted tab, not data.
   if (!name.includes(".") && (node.bytes ?? 0) < 512 * 1024) return "text";

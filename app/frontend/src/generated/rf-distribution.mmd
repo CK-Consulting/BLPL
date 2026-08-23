@@ -1,0 +1,68 @@
+%% The RF distribution architecture — a worked example of the house style.
+%% .
+%% Written by hand in minutes; the SVG it replaced took about an hour and is
+%% 35 kB of geometry nobody can review. This is 2.1 kB anybody can correct in a
+%% sentence, and roughly 520 tokens — which is why the assistant is told to
+%% answer with a diagram rather than a paragraph.
+%% .
+%% Note what is *not* here: no classDef block and no theme. The workbench
+%% appends both, so a node says `:::mcu` and inherits the rest.
+flowchart TB
+    SGA(["Sub-GHz antenna"]):::antenna --> SGF{"Sub-GHz ESD protection<br/>band filter and matching"}:::rfpassive
+    A24(["2.4 GHz antenna"]):::antenna --> F24{"2.4 GHz ESD protection<br/>band filter and matching"}:::rfpassive
+    WA(["Wi-Fi dual-band antenna<br/>2.4 + 5 GHz"]):::antenna --> WIFI
+    CA(["Cellular/GNSS antenna arrangement"]):::antenna --> CELL
+
+    subgraph ANT["sb-ant — fixed RF distribution board"]
+        SGF --> SGW{"2-way Wilkinson<br/>sub-GHz"}:::rfpassive
+        SGW --> SGS1{"RF SPDT"}:::rfpassive
+        SGW --> SGS2{"RF SPDT"}:::rfpassive
+        SGS1 --> SGT1["50 Ω RF load"]:::passive
+        SGS2 --> SGT2["50 Ω RF load"]:::passive
+
+        F24 --> W24{"2-way Wilkinson<br/>2.4 GHz"}:::rfpassive
+        W24 --> S241{"RF SPDT"}:::rfpassive
+        W24 --> S242{"RF SPDT"}:::rfpassive
+        S241 --> T241["50 Ω RF load"]:::passive
+        S242 --> T242["50 Ω RF load"]:::passive
+
+        SWC["RF switch control<br/>hardware default: all loads"]:::note
+        SWC -. control .-> SGS1
+        SWC -. control .-> SGS2
+        SWC -. control .-> S241
+        SWC -. control .-> S242
+    end
+
+    subgraph MOD["Replaceable sb-* radio modules"]
+        LORA["sb-lora<br/>50 Ω sub-GHz port<br/>50 Ω 2.4 GHz port"]:::rf
+        HALOW["sb-halow<br/>50 Ω sub-GHz port"]:::rf
+        BLE["sb-ble<br/>50 Ω 2.4 GHz port"]:::rf
+        WIFI["sb-wifi<br/>dedicated dual-band RF port"]:::rf
+        CELL["sb-cell<br/>module-specific LTE/GNSS ports"]:::rf
+    end
+
+    SGS1 -->|connected state| LORA
+    SGS2 -->|connected state| HALOW
+    S241 -->|connected state| LORA
+    S242 -->|connected state| BLE
+
+    subgraph CORE["coreMCU-board"]
+        MCU["U1<br/>MCU / application processor"]:::mcu
+        MGMT["Module-management sideband<br/>PRESENT • ID • RESET • RF_ENABLE<br/>TX_REQUEST • TX_GRANT • TX_ACTIVE"]:::connector
+        DATA{{"SPI • USB • UART • SDIO"}}:::connector
+        MCU --- MGMT
+        MCU --- DATA
+    end
+
+    MGMT -. switch commands .-> SWC
+    MGMT -. module control .-> LORA
+    MGMT -. module control .-> HALOW
+    MGMT -. module control .-> BLE
+    MGMT -. coexistence control .-> WIFI
+    MGMT -. module control .-> CELL
+
+    DATA -. B2B data .-> LORA
+    DATA -. B2B data .-> HALOW
+    DATA -. B2B data .-> BLE
+    DATA -. B2B data .-> WIFI
+    DATA -. B2B data .-> CELL

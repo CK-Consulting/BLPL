@@ -1,0 +1,287 @@
+{
+  "canvas": "#2b2b2b",
+  "ink": {
+    "light": "#f4f4f5",
+    "dark": "#18181b"
+  },
+  "classes": {
+    "board": {
+      "fill": "#032e15",
+      "stroke": "#00c950",
+      "color": "#f4f4f5",
+      "shape": "rounded",
+      "hue": "green",
+      "of": "A PCB. Everything sits inside one."
+    },
+    "subboard": {
+      "fill": "#002c22",
+      "stroke": "#00d492",
+      "color": "#f4f4f5",
+      "shape": "subroutine",
+      "hue": "emerald",
+      "of": "A replaceable sub-board or module."
+    },
+    "mcu": {
+      "fill": "#2f0d68",
+      "stroke": "#a684ff",
+      "color": "#f4f4f5",
+      "shape": "rect",
+      "hue": "violet",
+      "of": "MCU or application processor."
+    },
+    "logic": {
+      "fill": "#59168b",
+      "stroke": "#c27aff",
+      "color": "#f4f4f5",
+      "shape": "rect",
+      "hue": "purple",
+      "of": "MPU, CPLD, FPGA."
+    },
+    "rf": {
+      "fill": "#7b3306",
+      "stroke": "#ffb900",
+      "color": "#f4f4f5",
+      "shape": "rect",
+      "hue": "amber",
+      "of": "RF transceiver or radio IC."
+    },
+    "power": {
+      "fill": "#460809",
+      "stroke": "#ff6467",
+      "color": "#f4f4f5",
+      "shape": "trapezoid",
+      "hue": "red",
+      "of": "PMIC, regulator, charger \u2014 anything converting power."
+    },
+    "battery": {
+      "fill": "#192e03",
+      "stroke": "#9ae600",
+      "color": "#f4f4f5",
+      "shape": "trapezoid",
+      "hue": "lime",
+      "of": "Cell or pack."
+    },
+    "memory": {
+      "fill": "#162456",
+      "stroke": "#51a2ff",
+      "color": "#f4f4f5",
+      "shape": "cylinder",
+      "hue": "blue",
+      "of": "RAM. Volatile."
+    },
+    "storage": {
+      "fill": "#052f4a",
+      "stroke": "#00bcff",
+      "color": "#f4f4f5",
+      "shape": "cylinder",
+      "hue": "sky",
+      "of": "Flash, eMMC, SD. Non-volatile."
+    },
+    "connector": {
+      "fill": "#1d293d",
+      "stroke": "#90a1b9",
+      "color": "#f4f4f5",
+      "shape": "hexagon",
+      "hue": "slate",
+      "of": "Board-to-board, USB, headers."
+    },
+    "antenna": {
+      "fill": "#441306",
+      "stroke": "#ff8904",
+      "color": "#f4f4f5",
+      "shape": "stadium",
+      "hue": "orange",
+      "of": "Antenna or RF port."
+    },
+    "rfpassive": {
+      "fill": "#432004",
+      "stroke": "#fdc700",
+      "color": "#f4f4f5",
+      "shape": "rhombus",
+      "hue": "yellow",
+      "of": "Switch, combiner, filter, matching."
+    },
+    "sensor": {
+      "fill": "#022f2e",
+      "stroke": "#00d5be",
+      "color": "#f4f4f5",
+      "shape": "rect",
+      "hue": "teal",
+      "of": "Sensors and IMUs."
+    },
+    "display": {
+      "fill": "#1e1a4d",
+      "stroke": "#7c86ff",
+      "color": "#f4f4f5",
+      "shape": "rect",
+      "hue": "indigo",
+      "of": "LCD, OLED, touch."
+    },
+    "audio": {
+      "fill": "#510424",
+      "stroke": "#fb64b6",
+      "color": "#f4f4f5",
+      "shape": "rect",
+      "hue": "pink",
+      "of": "Codec, amplifier, speaker, mic."
+    },
+    "haptic": {
+      "fill": "#4d0218",
+      "stroke": "#ff637e",
+      "color": "#f4f4f5",
+      "shape": "rect",
+      "hue": "rose",
+      "of": "Motor, driver."
+    },
+    "passive": {
+      "fill": "#292524",
+      "stroke": "#a6a09b",
+      "color": "#f4f4f5",
+      "shape": "rect",
+      "hue": "stone",
+      "of": "Discretes worth naming."
+    },
+    "note": {
+      "fill": "#053345",
+      "stroke": "#00d3f2",
+      "color": "#f4f4f5",
+      "shape": "rect",
+      "hue": "cyan",
+      "of": "A comment, a caveat, a TBD."
+    }
+  },
+  "links": {
+    "rfPath": {
+      "stroke": "#ffb900",
+      "hue": "amber"
+    },
+    "power": {
+      "stroke": "#ff6467",
+      "hue": "red"
+    },
+    "data": {
+      "stroke": "#00bcff",
+      "hue": "sky"
+    },
+    "control": {
+      "stroke": "#00d3f2",
+      "hue": "cyan"
+    },
+    "mechanical": {
+      "stroke": "#a6a09b",
+      "hue": "stone"
+    }
+  },
+  "checks": [
+    {
+      "class": "board",
+      "label": 13.59,
+      "border": 6.39
+    },
+    {
+      "class": "subboard",
+      "label": 13.81,
+      "border": 7.3
+    },
+    {
+      "class": "mcu",
+      "label": 13.86,
+      "border": 4.97
+    },
+    {
+      "class": "logic",
+      "label": 9.99,
+      "border": 5.07
+    },
+    {
+      "class": "rf",
+      "label": 8.24,
+      "border": 8.22
+    },
+    {
+      "class": "power",
+      "label": 14.71,
+      "border": 4.9
+    },
+    {
+      "class": "battery",
+      "label": 13.33,
+      "border": 9.23
+    },
+    {
+      "class": "memory",
+      "label": 13.45,
+      "border": 5.37
+    },
+    {
+      "class": "storage",
+      "label": 12.64,
+      "border": 6.5
+    },
+    {
+      "class": "connector",
+      "label": 13.3,
+      "border": 5.38
+    },
+    {
+      "class": "antenna",
+      "label": 14.24,
+      "border": 5.95
+    },
+    {
+      "class": "rfpassive",
+      "label": 13.2,
+      "border": 9.0
+    },
+    {
+      "class": "sensor",
+      "label": 13.19,
+      "border": 7.59
+    },
+    {
+      "class": "display",
+      "label": 14.58,
+      "border": 4.52
+    },
+    {
+      "class": "audio",
+      "label": 13.72,
+      "border": 5.12
+    },
+    {
+      "class": "haptic",
+      "label": 14.29,
+      "border": 4.95
+    },
+    {
+      "class": "passive",
+      "label": 13.8,
+      "border": 5.48
+    },
+    {
+      "class": "note",
+      "label": 12.2,
+      "border": 7.82
+    },
+    {
+      "link": "rfPath",
+      "contrast": 8.22
+    },
+    {
+      "link": "power",
+      "contrast": 4.9
+    },
+    {
+      "link": "data",
+      "contrast": 6.5
+    },
+    {
+      "link": "control",
+      "contrast": 7.82
+    },
+    {
+      "link": "mechanical",
+      "contrast": 5.48
+    }
+  ]
+}
