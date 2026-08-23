@@ -32,3 +32,5 @@
 [submodule "ecad-viewer"]
 	path = ecad-viewer
 	url = https://github.com/Huaqiu-Electronics/ecad-viewer
+[submodule "mermaid"]
+	shallow = true
