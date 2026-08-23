@@ -89,6 +89,14 @@ function mermaidOnce() {
  *
  * Generated from Tailwind's oklch ramps by mermaid/tools/palette.py, which
  * refuses to emit a pair that misses AAA. Regenerate rather than edit.
+ *
+ * Colour only, and `shape` in the palette is deliberately not read here: a
+ * mermaid `classDef` sets style properties and cannot set a node's shape, which
+ * comes from the syntax the author writes around the node — `A[…]`, `A{{…}}`,
+ * `A([…])`. So the shape half of the design language is carried by the class
+ * table in the hardware-design skill, where whoever writes the diagram reads it,
+ * and a test holds that table to the palette so the two cannot drift. Applying
+ * shapes here would mean rewriting somebody's node syntax underneath them.
  */
 export function houseStyle(): string {
   const lines: string[] = [];
@@ -105,10 +113,54 @@ export function houseStyle(): string {
   return lines.join("\n");
 }
 
-/** Put the house style after the author's own text, so an explicit classDef in
- *  the diagram still wins — the style is a default, not a straitjacket. */
-function withHouseStyle(source: string): string {
-  return `${source.trimEnd()}\n\n${houseStyle()}\n`;
+/** Diagram kinds whose grammar has `classDef` at all. */
+const STYLEABLE = /^\s*(flowchart|graph)\b/;
+
+/** Where the diagram's own header line is, past front matter and comments. */
+export function headerIndex(lines: string[]): number {
+  let inFrontMatter = false;
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (i === 0 && t === "---") {
+      inFrontMatter = true;
+      continue;
+    }
+    if (inFrontMatter) {
+      if (t === "---") inFrontMatter = false;
+      continue;
+    }
+    if (!t || t.startsWith("%%")) continue;
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * Put the house style directly beneath the diagram's header.
+ *
+ * Two things had to be right here, and neither was.
+ *
+ * It went *after* the author's text, with a comment claiming that let an
+ * explicit `classDef` in the diagram win. It does the opposite: mermaid pushes
+ * every `classDef` for a name onto one list of styles and emits them in order,
+ * so the last declaration of a property is the one that takes effect. Appending
+ * the house style made it unoverridable — the straitjacket the comment said it
+ * was not. Injected under the header instead, the author's own line comes after
+ * and wins, which is what was wanted all along.
+ *
+ * And it went onto *every* diagram. `classDef` belongs to the flowchart
+ * grammar; a `sequenceDiagram` or a `gantt` — both kinds `looksLikeDiagram`
+ * accepts — fails to parse outright with one appended, so styling a diagram
+ * this app never styles anyway was enough to stop it rendering at all.
+ */
+export function withHouseStyle(source: string): string {
+  const lines = source.replace(/\s+$/, "").split("\n");
+  const at = headerIndex(lines);
+  if (at < 0 || !STYLEABLE.test(lines[at])) return source;
+  const style = houseStyle()
+    .split("\n")
+    .map((l) => `  ${l}`);
+  return [...lines.slice(0, at + 1), ...style, ...lines.slice(at + 1)].join("\n") + "\n";
 }
 
 /** Diagram kinds Mermaid understands, used to spot one by its content. */

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { isDiagramFile, looksLikeDiagram } from "./Diagram";
+import mermaid from "mermaid";
+
+import { houseStyle, isDiagramFile, looksLikeDiagram, withHouseStyle } from "./Diagram";
 import { splitDiagrams } from "./Markdown";
 
 describe("spotting a diagram", () => {
@@ -55,5 +57,41 @@ describe("diagrams inside a document", () => {
 
   it("returns plain prose unchanged", () => {
     expect(splitDiagrams("just words").map((p) => p.kind)).toEqual(["prose"]);
+  });
+});
+
+describe("applying the house style", () => {
+  it("leaves alone a diagram whose grammar has no classDef", () => {
+    // `looksLikeDiagram` accepts these, so they reach the renderer.
+    for (const src of ["sequenceDiagram\n  A->>B: hi", "gantt\n  title X", "pie\n  \"a\": 1"]) {
+      expect(withHouseStyle(src)).toBe(src);
+    }
+  });
+
+  it("sits under the header, so the author's own classDef still wins", () => {
+    // Mermaid pushes every classDef for a name onto one ordered list of styles,
+    // so the last declaration of a property is the one that takes effect.
+    const out = withHouseStyle("flowchart TB\n  A[x]:::mcu\n  classDef mcu fill:#ff0000");
+    expect(out.split("\n")[0]).toBe("flowchart TB");
+    expect(out.indexOf("classDef mcu fill:")).toBeLessThan(out.indexOf("fill:#ff0000"));
+  });
+
+  it("finds the header past front matter and comments", () => {
+    const out = withHouseStyle("---\ntitle: X\n---\n%% the RF chain\nflowchart LR\n  A-->B");
+    const lines = out.split("\n");
+    expect(lines[4].trim()).toBe("flowchart LR");
+    expect(lines[5].trim().startsWith("classDef")).toBe(true);
+  });
+
+  it("produces something mermaid actually parses", async () => {
+    await expect(
+      mermaid.parse(withHouseStyle("flowchart TB\n  A[x]:::mcu --> B[y]:::rf")),
+    ).resolves.toBeTruthy();
+  });
+
+  it("guards the case that used to break: classDef in a sequence diagram", async () => {
+    await expect(
+      mermaid.parse(`sequenceDiagram\n  A->>B: hi\n\n${houseStyle()}`),
+    ).rejects.toThrow();
   });
 });

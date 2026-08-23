@@ -12,9 +12,15 @@ describe("the house style", () => {
     }
   });
 
-  it("is appended, so an explicit classDef in the diagram still wins", () => {
-    // The style is a default, not a straitjacket.
-    expect(houseStyle().startsWith("classDef")).toBe(true);
+  it("is nothing but classDef lines", () => {
+    // What it *does* with them is withHouseStyle's business, and tested there.
+    // This said "is appended, so an explicit classDef still wins" and checked
+    // that the string starts with "classDef" — which would have been true
+    // however the style was applied, including the way that made the opposite
+    // true.
+    for (const line of houseStyle().split("\n")) {
+      expect(line.startsWith("classDef ")).toBe(true);
+    }
   });
 
   it("still styles a node nobody classified", () => {
