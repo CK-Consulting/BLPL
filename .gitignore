@@ -59,6 +59,16 @@ __MACOSX/
 .apdisk
 .com.apple.timemachine.donotpresent
 
+# The same from the other operating systems, and from editors. None of it is
+# authored, all of it travels in on a shared drive or a zip, and each one is a
+# file somebody has to decide about in a review.
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*~
+*.swo
+*.bak
+
 # Diagram reference material, for people rather than for builds. The standards
 # the block-diagram shape rules were read against — IEC 60617, IEEE 315-1975,
 # ANSI/IEEE 91-1991 — are 96 MB on disk and 78 MB in the pack. They are opened
