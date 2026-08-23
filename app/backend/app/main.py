@@ -2034,7 +2034,10 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
 # Deliberately NOT everything — generated artifacts live in .pipeline/ and are
 # read through the artifacts endpoint, and .git is off-limits. Editing is scoped
 # to the design inputs.
-_EDITABLE_SUFFIXES = {".md", ".yaml", ".yml"}
+# Diagrams are design documents: text, versioned, reviewed as a diff. A block
+# diagram written as mermaid is worth more than an SVG somebody drew, because
+# it can be read in a pull request and corrected in a sentence.
+_EDITABLE_SUFFIXES = {".md", ".yaml", ".yml", ".mmd", ".mermaid"}
 
 
 def _editable_file(session: Session, user: User, project_id: str, name: str) -> Path:
@@ -2156,10 +2159,18 @@ def _tree_role(rel: Path) -> str:
         return "artifact"
     if parts and parts[0] == "datasheets":
         return "datasheet"
+    # vis/ is where a project's diagrams and renders live. It is design work —
+    # the architecture drawing is usually the first thing anybody makes and the
+    # thing they come back to — so it belongs in the group that opens by
+    # default, not filed under "other" with the scratch files.
+    if parts and parts[0] in {"vis", "diagrams"}:
+        return "design"
     if parts and parts[0] == quarantine.QUARANTINE_DIRNAME:
         # Shown, not hidden. Hiding retrieved files would mean the only place
         # anything untrusted lives is also the only place nobody looks.
         return "quarantined"
+    if rel.suffix.lower() in {".mmd", ".mermaid"}:
+        return "diagram"
     if rel.suffix.lower() in {".md", ".markdown"}:
         return "design"
     if rel.suffix.lower() in {".kicad_pcb", ".kicad_sch", ".kicad_pro"}:
