@@ -26,6 +26,10 @@ The pipeline runs in stages; each writes a JSON/YAML artifact into the project's
 
 Before writing any design markdown the pipeline will consume, elicit these from the user. Don't make up defaults for things the user hasn't specified; ask once and remember.
 
+0. **The architecture**, as a block diagram. Draw what you have understood and
+   show it back before asking about details — it is faster to correct a diagram
+   than to discover halfway through a BOM that two subsystems were meant to
+   share an antenna. See "Block diagrams" below.
 1. **Project identity**: name, board ID, dimensions in mm (width × height).
 2. **Stackup**: layer count (2/4/6/8), total thickness, surface finish (HASL/ENIG/etc.).
 3. **Net classes**: at minimum `Default`; typically also `Power_Bulk`, `USB3_Diff_90Ohm`, `PCIe_Diff_85Ohm`, `DDR4_Diff_90Ohm`. Each needs `trace_width`, `clearance`, `via_dia`, `via_drill` in mm. A net gets assigned to a class by regex match on its name (see `blpl/core/stage4_synthesize_nets.py`), so name nets consistently with the class you want them in.
@@ -33,6 +37,83 @@ Before writing any design markdown the pipeline will consume, elicit these from 
 5. **Component list**: for each component, ask for MPN, subsystem role, and whether it's "generic" (passives, headers, USB/barrel/M.2/mini-PCIe connectors — pipeline can auto-resolve) or "specific" (FPGA, MCU, PMIC, custom IC — user must supply pinout).
 6. **Refdes policy**: standard prefixes `U` (ICs), `J` (connectors), `R/C/L` (passives), `Q` (transistors), `Y` (crystals), `ANT` (antennas), `ENC` (enclosure-mechanical). Use explicit refdes like `J_USB_C`, `J_HALOW`, `J_CELL` for named connectors rather than numeric `J4`, `J7`.
 7. **Pinouts for specific parts**: if the component is "specific" (FPGA/MCU/etc.), ask for a pinout table — either paste it inline or point at a datasheet page. Do not skip this step; the pipeline will halt until every specific part has a `pin_map`.
+
+## Block diagrams — write the structure, do not describe it
+
+**Draw the architecture as a Mermaid diagram before writing the tables.** Not as
+decoration afterwards, and not instead of the tables — as the thing you and the
+user agree on first, because it is the cheapest and clearest way to say what
+connects to what.
+
+Two reasons, and the second is the one people miss.
+
+**It is a better description.** Topology is a graph. Prose about a graph is a
+serialisation of it that the reader has to rebuild in their head, and every
+reader rebuilds it slightly differently. "SW2 selects between the LoRa and BLE
+paths on the shared 2.4 GHz antenna" is four claims wearing one sentence; drawn,
+it is four edges nobody can misread.
+
+**It costs a fraction of the context.** A real example from this project — the
+RF distribution architecture, 26 blocks and 35 connections including switch
+control lines, subsystem grouping and the antenna arrangement:
+
+| form | size |
+| --- | --- |
+| Mermaid source | 2.1 kB (~520 tokens) |
+| the SVG it renders to | 35 kB |
+| an equivalent prose description | more, and less precise |
+
+Describing that arrangement in text accurate enough to build from takes more
+tokens than the diagram and still leaves the topology implicit. On a long
+conversation this is the difference between the architecture staying in context
+and being summarised away — and a diagram survives summarisation better than
+prose, because it is already compressed.
+
+So: when the user describes a structure, answer with a diagram. When you need to
+confirm you have understood a subsystem, draw it and ask. When the architecture
+changes, edit the diagram in the same proposal as the tables.
+
+### Where they go
+
+- **Inline in a design document**, in a ```mermaid fence, next to the prose that
+  explains it. The workbench renders it in place.
+- **As its own file**, `*.mmd`, for a diagram several documents refer to. These
+  are editable design documents like any other: proposed as a diff, reviewed,
+  committed.
+
+### What to write
+
+`flowchart TB` (or `LR`) covers essentially every board-level block diagram.
+The vocabulary worth knowing:
+
+```mermaid
+flowchart TB
+    ANT["Sub-GHz antenna"] --> FIL["ESD + band filter"]
+    subgraph SB["sb-ant — RF distribution board"]
+        FIL --> SW{"RF SPDT"}
+        SW --> LOAD["50 Ω load"]
+    end
+    SW -->|connected state| LORA["sb-lora"]
+    MGMT["Module management"] -. control .-> SW
+```
+
+- `A --> B` a signal or power path; `-->|label|` when the condition matters.
+- `-. label .->` a control or sideband line, so it reads differently from the
+  path it controls.
+- `{"..."}` for a switch or mux, `["..."]` for a block.
+- `subgraph` for a board, a subsystem, or an enclosure boundary — the thing that
+  makes a block diagram tell you where the connectors are.
+- `<br/>` inside a label for a second line. Use it for port counts and
+  impedances; they are what make a diagram checkable.
+
+Name nodes with the refdes or subsystem id the BOM uses. A diagram whose blocks
+are called `U_BLE` and `SB-ANT` can be checked against the tables; one whose
+blocks are called "the radio" cannot.
+
+**Do not draw what you have not established.** A diagram states connections as
+facts and is far more convincing than the same guess in prose — which makes an
+invented edge worse than an invented sentence. Mark what is undecided:
+`SW2{"RF SPDT or SP3T<br/>TBD — depends on LR2021 pad count"}`.
 
 ## Output contract — the Markdown format Stage 0 parses
 

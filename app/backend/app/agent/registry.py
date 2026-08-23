@@ -40,7 +40,7 @@ from .toolspec import ToolContext, ToolDenied, ToolSpec
 
 # Design documents, matching the editor's rule so the assistant can never
 # propose a file the user has no way to open.
-EDITABLE_SUFFIXES = {".md", ".markdown", ".yaml", ".yml"}
+EDITABLE_SUFFIXES = {".md", ".markdown", ".yaml", ".yml", ".mmd", ".mermaid"}
 
 # Files the user keeps in the project but does not want in the design
 # conversation. Not hidden, not git-ignored, not off-limits — the boundary the

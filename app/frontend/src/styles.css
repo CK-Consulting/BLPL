@@ -343,6 +343,15 @@ body.resizing-y * { pointer-events: none; }
 .tree-hidden-toggle { display: flex; align-items: center; gap: .35rem; margin-top: .6rem; padding-top: .5rem; border-top: 1px solid #2a3038; font-size: 12.5px; color: #b9c3d0; }
 .tree-hidden-toggle input { width: 15px; height: 15px; accent-color: #4f7fd0; }
 
+/* A rendered block diagram. Scrolls inside its own box rather than pushing the
+   page sideways — a wide flowchart is the one thing that reliably breaks a
+   column layout. Node text is 12.44:1 and the edges 6.29:1 against the panel;
+   1.4.11 asks 3:1 of a line that carries meaning, and these carry all of it. */
+.diagram { overflow-x: auto; margin: .8rem 0; padding: .6rem; background: #15181d; border: 1px solid #2a3038; border-radius: 8px; }
+.diagram svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+.diagram-error { margin: .8rem 0; padding: .6rem; border: 1px dashed #a2444f; border-radius: 8px; background: #1c1418; }
+.diagram-error .code-view { margin-top: .5rem; font-size: 12.5px; }
+
 /* Syntax colours, named for the nano colour each one stands in for, so the
    mapping stays readable. Every one is ≥7:1 against #0f1115 — measured, not
    eyeballed, because a token colour is small text on a dark ground and that is
