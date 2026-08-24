@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Invitation, getJSON, postJSON } from "../api";
+import { stamp } from "../time";
 
 /**
  * Projects someone has offered you.
@@ -42,7 +43,7 @@ export function Invitations({ onChanged }: { onChanged: () => void }) {
           <strong className="mono">{inv.project}</strong>
           <span className="muted small">
             shared by {inv.invited_by || "another user"} · expires{" "}
-            {new Date(inv.expires_at).toLocaleDateString()}
+            {stamp(inv.expires_at)}
           </span>
           <span className="spacer" />
           <button disabled={busy === inv.id} onClick={() => respond(inv.id, "accept")}>

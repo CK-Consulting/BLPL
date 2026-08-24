@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Dashboard as DashboardData, getJSON, postJSON } from "../api";
 import { Logo } from "./Logo";
 import { NewProject } from "./ProjectControls";
+import { stamp } from "../time";
 
 /**
  * Where you land after unlocking.
@@ -102,7 +103,7 @@ export function Dashboard({ onOpen }: { onOpen: (projectId: string) => void }) {
                 <strong className="mono">{inv.project}</strong>
                 <div className="notice-sub">
                   shared by {inv.invited_by || "another user"} · expires{" "}
-                  {new Date(inv.expires_at).toLocaleDateString()}
+                  {stamp(inv.expires_at)}
                 </div>
               </div>
               <span className="spacer" />
@@ -164,7 +165,7 @@ export function Dashboard({ onOpen }: { onOpen: (projectId: string) => void }) {
                     </div>
                     <div className="project-card-when muted small">
                       {p.last_touched_by_me
-                        ? `you: ${new Date(p.last_touched_by_me).toLocaleString()}`
+                        ? `you: ${stamp(p.last_touched_by_me)}`
                         : "you have not opened this yet"}
                     </div>
                   </button>
@@ -190,7 +191,7 @@ export function Dashboard({ onOpen }: { onOpen: (projectId: string) => void }) {
                     {a.verb}
                     {a.detail ? ` ${a.detail}` : ""}
                   </span>
-                  <div className="activity-when">{new Date(a.at).toLocaleString()}</div>
+                  <div className="activity-when">{stamp(a.at)}</div>
                 </li>
               ))}
             </ul>

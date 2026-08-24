@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Run, del, getJSON, readSSE } from "../api";
+import { parseTimestamp, stamp } from "../time";
 import { Verbosity, classifyAll } from "../runlog";
 import { RunLog } from "./RunLog";
 
@@ -9,44 +10,6 @@ import { RunLog } from "./RunLog";
  * from here — full replay, then the live tail — which is what makes a browser
  * refresh (or a second workstation) a non-event mid-run.
  */
-
-/**
- * A timestamp from the API, whatever shape it arrives in.
- *
- * This appended a "Z" unconditionally, because SQLite handed back a naive
- * "YYYY-MM-DD HH:MM:SS". Postgres does not: the column is `timestamp with time
- * zone` and the API sends `.isoformat()`, so the string already ends in
- * "+00:00" — and "…+00:00Z" is not a date. Every run in the history read
- * "Invalid Date", and the duration built from two of them read "NaNmNaNs".
- *
- * So the marker is added only when there is none, and an unparseable value
- * returns null rather than NaN — a gap says "not known", where NaN says
- * nothing at all and says it loudly.
- */
-export function parseTimestamp(value: string | null | undefined): Date | null {
-  if (!value) return null;
-  const text = value.trim().replace(" ", "T");
-  const zoned = /(Z|[+-]\d{2}:?\d{2})$/i.test(text);
-  const d = new Date(zoned ? text : `${text}Z`);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-/**
- * `2026-08-23_201433Z` — UTC, sortable, and the same stamp the rest of the
- * project uses for conversation files and artifact names.
- *
- * It was a localised "Aug 23, 08:14 PM", which is friendlier to read and worse
- * at the job: run history exists to be lined up against a log line, a commit,
- * or a file on disk, and none of those are in the reader's timezone or use a
- * twelve-hour clock. A stamp you can paste into a filename and grep for beats
- * one that reads nicely.
- */
-export function when(utc: string | null | undefined): string {
-  const d = parseTimestamp(utc);
-  if (!d) return "—";
-  const [day, rest] = d.toISOString().split("T");
-  return `${day}_${rest.slice(0, 8).replace(/:/g, "")}Z`;
-}
 
 export function duration(run: Pick<Run, "started_at" | "ended_at">): string {
   const started = parseTimestamp(run.started_at);
@@ -137,7 +100,7 @@ export function RunHistory({ projectId, reloadToken }: Props) {
           <li key={r.id}>
             <button className={`runrow ${open === r.id ? "on" : ""}`} onClick={() => view(r)}>
               <span className="run-kind">{r.kind}</span>
-              <span className="muted">{when(r.started_at)}</span>
+              <span className="muted">{stamp(r.started_at)}</span>
               <span className="muted">{duration(r)}</span>
               {statusBadge(r)}
             </button>
