@@ -764,3 +764,25 @@ header .logo-lockup { font-size: 13px; }
   margin-bottom: .4rem; border: 1px dashed #6b6f75; border-radius: 6px;
   background: #171d27; color: #e6e6e6; font-size: 13px; }
 .queued-note .queued-text { color: #adb1b6; font-style: italic; }
+
+/* Line numbers — for finding the line a stage named ("…md:307").
+   #90a1b9 is 7.18:1 on #0f1115: a gutter is quiet, not exempt from AAA. The
+   line-height and font must match the text beside them exactly, or the numbers
+   drift a fraction of a row per line and are wrong by the time they matter. */
+.editor-wrap { flex: 1; display: flex; min-height: 0; background: #0f1115; }
+.line-gutter {
+  flex: 0 0 auto; overflow: hidden; padding: 1rem .55rem 1rem .8rem;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, monospace;
+  color: #90a1b9; text-align: right; user-select: none;
+  border-right: 1px solid #2a2f38; background: #0f1115;
+}
+.editor-wrap .editor-text { flex: 1; padding-left: .8rem; white-space: pre; overflow: auto; }
+
+.numbered-source { font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; color: #cfd6de; }
+.numbered-row { display: flex; gap: .8rem; }
+.numbered-n {
+  flex: 0 0 3.2em; text-align: right; color: #90a1b9; user-select: none;
+  border-right: 1px solid #2a2f38; padding-right: .5rem;
+}
+.numbered-line { flex: 1; white-space: pre-wrap; word-break: break-word; }
+.numbered-row:hover { background: #171a21; }

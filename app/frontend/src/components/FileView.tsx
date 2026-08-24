@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { getJSON, putJSON } from "../api";
 import { Code, langOf } from "./Code";
 import { Diagram, isDiagramFile } from "./Diagram";
+import { LineGutter, NumberedSource } from "./LineGutter";
 import { Markdown } from "./Markdown";
 
 /**
@@ -34,6 +35,9 @@ export function FileView({
   const [content, setContent] = useState("");
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState(false);
+  // Rendered markdown has no line 307 to point at — the headings and tables
+  // it came from do, and doctor cites those. Source is that view.
+  const [source, setSource] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const area = useRef<HTMLTextAreaElement | null>(null);
@@ -111,8 +115,24 @@ export function FileView({
             button labelled with the current mode reads as a status line and
             gets clicked by accident. */}
         <div className="seg small">
-          <button className={editing ? "" : "on"} onClick={() => setEditing(false)}>
+          <button
+            className={!editing && !source ? "on" : ""}
+            onClick={() => {
+              setEditing(false);
+              setSource(false);
+            }}
+          >
             View
+          </button>
+          <button
+            className={!editing && source ? "on" : ""}
+            title="The file as written, with line numbers — what doctor and the stages cite"
+            onClick={() => {
+              setEditing(false);
+              setSource(true);
+            }}
+          >
+            Source
           </button>
           <button
             className={editing ? "on" : ""}
@@ -120,6 +140,7 @@ export function FileView({
             title={savable ? undefined : "This file is not one the workbench edits"}
             onClick={() => {
               setDraft(content);
+              setSource(false);
               setEditing(true);
               requestAnimationFrame(() => area.current?.focus());
             }}
@@ -135,11 +156,14 @@ export function FileView({
       </div>
       {error && <div className="gate-error pad">{error}</div>}
       {editing ? (
+        <div className="editor-wrap">
+        <LineGutter text={draft} scrollRef={area} />
         <textarea
           ref={area}
           className="editor-text"
           value={draft}
           spellCheck={false}
+          wrap="off"
           onChange={(e) => {
             setDraft(e.target.value);
             setStatus(null);
@@ -151,9 +175,12 @@ export function FileView({
             }
           }}
         />
+        </div>
       ) : (
         <div className="fileview-body">
-          {lang === "markdown" ? (
+          {source ? (
+            <NumberedSource text={content} />
+          ) : lang === "markdown" ? (
             <Markdown text={content} />
           ) : diagram ? (
             // A diagram file renders as the diagram. Its source is one Edit

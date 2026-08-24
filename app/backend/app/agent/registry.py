@@ -584,6 +584,41 @@ async def _diff_file(ctx: ToolContext, args: dict) -> str:
     return out
 
 
+async def _pinout_section(ctx: ToolContext, args: dict) -> str:
+    """The markdown pinout section for a part, built from its extracted pin map.
+
+    Stage 0 is a deterministic parser: it maps pins one-to-one and drops a range,
+    and it anchors a table to the nearest heading carrying a refdes. Asking a
+    model to hand-write 216 rows of BGA pinout in that format is asking for an
+    expensive approximation of a file that already exists and was checked against
+    the datasheet. This renders that file instead.
+    """
+    from blpl.core import pinout_table
+
+    mpn = str(args.get("mpn") or "").strip()
+    refdes = str(args.get("refdes") or "").strip()
+    if not mpn or not refdes:
+        raise ToolDenied("both 'mpn' and 'refdes' are needed")
+    if not re.match(r"^(?:J|U)(?:_[A-Za-z0-9]\w*|\d+\w*)$", refdes):
+        # Said plainly, because the table would otherwise parse and bind to
+        # nothing, which looks like success right up until the netlist is short.
+        raise ToolDenied(
+            f"{refdes!r} cannot anchor a pinout table: Stage 0 only recognises a "
+            "refdes beginning 'U' or 'J' in a heading. Components like SPKR1 or "
+            "CMB1 carry their connections in the BOM and net tables instead."
+        )
+    path = pinout_table.extracted_path(ctx.project_dir, mpn)
+    if path is None:
+        raise FileNotFoundError(
+            f"no extracted pin map for {mpn} — run extract_datasheet_specs first, "
+            "and check a datasheet for it is in datasheets/"
+        )
+    data = pinout_table.load(path)
+    if not data:
+        raise FileNotFoundError(f"the extracted pin map for {mpn} has no pins in it")
+    return pinout_table.render(refdes, mpn, data, source=path.name)
+
+
 async def _read_extraction(ctx: ToolContext, args: dict) -> str:
     mpn = str(args.get("mpn", "")).strip()
     path = (ctx.project_dir / "datasheets" / "extracted" / f"{mpn}.json").resolve()
@@ -1270,6 +1305,25 @@ def parts_tools() -> list[ToolSpec]:
             },
             kind="file_read",
             handler=_read_extraction,
+        ),
+        ToolSpec(
+            name="pinout_section",
+            description=(
+                "Render a part's extracted pin map as the markdown pinout section Stage 0 "
+                "parses — one row per pin, anchored to its refdes. Use this instead of "
+                "writing a pinout table by hand: the format is exact and the pin map has "
+                "already been checked against the datasheet."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "mpn": {"type": "string"},
+                    "refdes": {"type": "string", "description": "e.g. U1, U_CELL — must start U or J"},
+                },
+                "required": ["mpn", "refdes"],
+            },
+            kind="file_read",
+            handler=_pinout_section,
         ),
     ]
 
