@@ -295,10 +295,15 @@ net tables instead.
 pin map for a part into exactly the form above. What you type from memory is an
 approximation of a datasheet; what it emits is the datasheet.
 
-**`TBD` is a real answer, and an abbreviation is not.** `TBD` in a Package cell
-halts the run and asks. A shortened footprint name does not: it looks like a
-name, and Stage 5 quietly substitutes a placeholder, so the board opens and
-routes with the wrong copper under a part nobody thinks to re-check.
+**Nothing stands in for a value inside a table — including `TBD`.** This page
+said the opposite until a real design was checked against it: doctor's footprint
+rule is `if ":" not in fp: continue`, so a Package cell reading `TBD` raises
+nothing whatsoever, and Stage 5 lays down a placeholder in silence. A `TBD` in a
+net-class row becomes a *default* trace width, which for a 50 Ω RF line or a
+100 Ω differential pair is not a gap, it is a wrong answer that looks like an
+answer. Prose may say a thing is undecided, and a diagram label may; a cell may
+not. When a value is genuinely unknown, leave the row out and say plainly that
+the project is not ready for Stage 0 and what is missing.
 
 **Qualify a signal name that is not genuinely shared.** Two pins with the same
 signal name become one net, across components. `P0.00` on both a BLE module and
@@ -311,8 +316,15 @@ electrical values live in `project.yaml`, not in a table — Stage 5 halts witho
 it. A net-class table in the document is reference material; it is read from
 `project.yaml`. Run `blpl init --project-dir <p>` to build one.
 
-Run `blpl doctor --project-dir <p>` before handing the document on. It reports
-what each stage will do with what you wrote, including what it will ignore.
+**Check it before proposing it, and keep checking.** `run_doctor` reports what
+each stage will do with what you wrote, including what it will silently ignore.
+Every error goes before the document is proposed as finished. Then each warning
+in turn: correct it, or state exactly why it is not a problem in this design and
+ask the user whether to proceed with it outstanding — silence is not agreement.
+As many rounds as it takes. When doctor is clean or every remaining warning has
+been explicitly accepted, `check_stage0` shows what Stage 0 actually took: a
+component with no pinout, or a table it ignored, is design content the pipeline
+will never see. Only then is the design worth spending the LLM stages on.
 
 ## Output contract — the Markdown format Stage 0 parses
 

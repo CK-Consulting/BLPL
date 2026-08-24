@@ -755,3 +755,57 @@ def test_the_same_failing_call_is_stopped(project) -> None:
     assert "already failed" in seen[-1].content
     # One path's failures must not gag a different one.
     assert "already failed" not in read("datasheets/else.pdf").content
+
+
+# ---------------------------------------------------------------------------
+# Validating a document before proposing it
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_and_stage0_are_available_to_the_assistant(project) -> None:
+    """Instructions the model cannot act on are worse than none.
+
+    The preamble tells it to check a document before proposing it. That is only
+    true if the tools exist — the same trap as telling it to link a pinout file
+    nothing reads."""
+    names = {t.name for t in default_tools()}
+    assert {"run_doctor", "check_stage0", "pinout_section"} <= names
+
+
+def test_doctor_reports_errors_and_warnings_apart(project) -> None:
+    (project / "board.md").write_text(
+        "# B\n\n## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+        "| U1 | X | Package_BGA:does_not_exist |\n",
+        encoding="utf-8",
+    )
+    out = json.loads(_call(_ctx(project), "run_doctor").content)
+    assert set(out) >= {"errors", "warnings", "counts", "ready_for_stage0"}
+    assert out["counts"]["errors"] == len(out["errors"])
+    assert out["ready_for_stage0"] is (out["counts"]["errors"] == 0)
+
+
+def test_a_tbd_footprint_raises_nothing_which_is_why_it_is_banned(project) -> None:
+    """The reason the instruction changed.
+
+    Doctor's footprint rule skips any cell without a ':' in it, so `TBD` there is
+    not a question the pipeline ever asks — Stage 5 substitutes a placeholder and
+    the board routes with the wrong copper."""
+    (project / "board.md").write_text(
+        "# B\n\n## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | TBD |\n",
+        encoding="utf-8",
+    )
+    out = json.loads(_call(_ctx(project), "run_doctor").content)
+    assert not [f for f in out["errors"] if f.get("code") == "DOC-010"]
+
+
+def test_check_stage0_reports_without_writing(project) -> None:
+    before = sorted(p.name for p in (project / ".pipeline").iterdir())
+    (project / "board.md").write_text(
+        "# B\n\n## U1 — pinout\n\n| Pin | Signal |\n|---|---|\n| 1 | GND |\n| 2 | VDD |\n",
+        encoding="utf-8",
+    )
+    out = json.loads(_call(_ctx(project), "check_stage0").content)
+    assert out["total_pins"] == 2
+    assert {"refdes": "U1", "pins": 2} in out["connectors"]
+    # The point of a check is that it changes nothing.
+    assert sorted(p.name for p in (project / ".pipeline").iterdir()) == before

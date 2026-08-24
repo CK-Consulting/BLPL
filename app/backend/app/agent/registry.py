@@ -619,6 +619,67 @@ async def _pinout_section(ctx: ToolContext, args: dict) -> str:
     return pinout_table.render(refdes, mpn, data, source=path.name)
 
 
+async def _run_doctor(ctx: ToolContext, args: dict) -> str:
+    """Doctor's report on this project's markdown, as the model can act on it.
+
+    In-process rather than a subprocess: doctor only reads markdown and compares
+    footprint names against the library, so there is nothing to sandbox and no
+    reason to make the model wait on a process start. It is also the reason this
+    needs no approval — it writes nothing.
+    """
+    from blpl.core import doctor
+
+    report = doctor.run(ctx.project_dir).to_dict()
+    findings = report.get("findings") or []
+    errors = [f for f in findings if f.get("severity") == "error"]
+    warnings = [f for f in findings if f.get("severity") != "error"]
+    return json.dumps(
+        {
+            "errors": errors,
+            "warnings": warnings,
+            "counts": {"errors": len(errors), "warnings": len(warnings)},
+            "ready_for_stage0": not errors,
+            "note": (
+                "Clear every error. Then take each warning in turn: fix it, or explain to "
+                "the user why it is not a problem here and ask whether to proceed with it "
+                "outstanding. Do not propose the file as finished while an error remains."
+            ),
+        },
+        indent=2,
+    )
+
+
+async def _check_stage0(ctx: ToolContext, args: dict) -> str:
+    """What Stage 0 would take from the markdown, without writing an artifact.
+
+    The second half of the check doctor starts. Doctor says what *would* be
+    dropped; this says what actually came out — how many components and pins the
+    deterministic pass got, and what it ignored on the way.
+    """
+    from blpl.core import stage0_deterministic
+
+    md_files = sorted(Path(ctx.project_dir).glob("*.md"))
+    if not md_files:
+        raise FileNotFoundError("no markdown at the project root — Stage 0 reads *.md there only")
+    out = stage0_deterministic.extract(md_files)
+    connectors = out.get("connectors") or []
+    return json.dumps(
+        {
+            "components": len(out.get("components") or []),
+            "connectors": [
+                {"refdes": c.get("local_id"), "pins": len(c.get("pins") or [])} for c in connectors
+            ],
+            "total_pins": sum(len(c.get("pins") or []) for c in connectors),
+            "warnings": out.get("warnings") or [],
+            "note": (
+                "Nothing was written; this is what Stage 0 would read. A component with no "
+                "pinout, or a table listed as ignored, is content the pipeline will not see."
+            ),
+        },
+        indent=2,
+    )
+
+
 async def _read_extraction(ctx: ToolContext, args: dict) -> str:
     mpn = str(args.get("mpn", "")).strip()
     path = (ctx.project_dir / "datasheets" / "extracted" / f"{mpn}.json").resolve()
@@ -1324,6 +1385,29 @@ def parts_tools() -> list[ToolSpec]:
             },
             kind="file_read",
             handler=_pinout_section,
+        ),
+        ToolSpec(
+            name="run_doctor",
+            description=(
+                "Check this project's markdown the way the pipeline will read it: what Stage 0 "
+                "would drop, footprints that do not exist, signal names that will merge into "
+                "one net, ICs with no pinout. Run this on every document you write or edit, "
+                "before proposing it — an error here is a stage that halts later."
+            ),
+            input_schema={"type": "object", "properties": {}},
+            kind="file_read",
+            handler=_run_doctor,
+        ),
+        ToolSpec(
+            name="check_stage0",
+            description=(
+                "What Stage 0 would actually take from the markdown — component and pin counts, "
+                "and the tables it ignored. Writes nothing. Run it after doctor is clean, to "
+                "confirm the design that reaches the LLM stages is the one you wrote."
+            ),
+            input_schema={"type": "object", "properties": {}},
+            kind="file_read",
+            handler=_check_stage0,
         ),
     ]
 
