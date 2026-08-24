@@ -31,17 +31,32 @@ export function parseTimestamp(value: string | null | undefined): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+/**
+ * `2026-08-23_201433Z` — UTC, sortable, and the same stamp the rest of the
+ * project uses for conversation files and artifact names.
+ *
+ * It was a localised "Aug 23, 08:14 PM", which is friendlier to read and worse
+ * at the job: run history exists to be lined up against a log line, a commit,
+ * or a file on disk, and none of those are in the reader's timezone or use a
+ * twelve-hour clock. A stamp you can paste into a filename and grep for beats
+ * one that reads nicely.
+ */
 export function when(utc: string | null | undefined): string {
   const d = parseTimestamp(utc);
   if (!d) return "—";
-  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const [day, rest] = d.toISOString().split("T");
+  return `${day}_${rest.slice(0, 8).replace(/:/g, "")}Z`;
 }
 
 export function duration(run: Pick<Run, "started_at" | "ended_at">): string {
   const started = parseTimestamp(run.started_at);
   const ended = parseTimestamp(run.ended_at);
   if (!started || !ended) return "…";
-  const s = Math.max(0, Math.round((ended.getTime() - started.getTime()) / 1000));
+  const ms = Math.max(0, ended.getTime() - started.getTime());
+  // A deterministic stage really does finish in 84 ms, and rounding that to "0s"
+  // reads as "nothing happened" rather than "fast".
+  if (ms < 1000) return `${(ms / 1000).toFixed(1)}s`;
+  const s = Math.round(ms / 1000);
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
 }
 

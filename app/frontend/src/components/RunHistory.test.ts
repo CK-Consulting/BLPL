@@ -30,6 +30,20 @@ describe("timestamps from the API", () => {
     expect(when("not a date")).toBe("—");
   });
 
+  it("stamps in UTC, sortable, the way the rest of the project does", () => {
+    // `date -u '+%Y-%m-%d_%H%M%SZ'` — the same shape as a conversation filename,
+    // so a run can be lined up against one by eye or by grep.
+    expect(when("2026-08-23T20:14:33.123456+00:00")).toBe("2026-08-23_201433Z");
+    // A non-UTC offset is converted, not printed as written.
+    expect(when("2026-08-23T22:14:33+02:00")).toBe("2026-08-23_201433Z");
+    expect(when("2026-08-23 05:12:33")).toBe("2026-08-23_051233Z");
+  });
+
+  it("does not round a fast stage down to nothing", () => {
+    expect(duration({ started_at: "2026-08-24T00:14:39.323645+00:00", ended_at: "2026-08-24T00:14:39.407423+00:00" } as never)).toBe("0.1s");
+    expect(duration({ started_at: "2026-08-24T00:00:00+00:00", ended_at: "2026-08-24T00:00:00+00:00" } as never)).toBe("0.0s");
+  });
+
   it("measures a duration across the two forms", () => {
     expect(duration({ started_at: "2026-08-23T05:12:33+00:00", ended_at: "2026-08-23T05:13:41+00:00" } as never)).toBe("1m8s");
     expect(duration({ started_at: "2026-08-23 05:12:33", ended_at: "2026-08-23 05:12:40" } as never)).toBe("7s");
