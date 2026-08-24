@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Run, del, getJSON, readSSE } from "../api";
+import { Verbosity, classifyAll } from "../runlog";
+import { RunLog } from "./RunLog";
 
 /**
  * The durable record behind the stage runner: every run this project has ever
@@ -8,18 +10,38 @@ import { Run, del, getJSON, readSSE } from "../api";
  * refresh (or a second workstation) a non-event mid-run.
  */
 
-function when(utc: string): string {
-  // SQLite hands us UTC "YYYY-MM-DD HH:MM:SS" with no zone marker.
-  const d = new Date(utc.replace(" ", "T") + "Z");
+/**
+ * A timestamp from the API, whatever shape it arrives in.
+ *
+ * This appended a "Z" unconditionally, because SQLite handed back a naive
+ * "YYYY-MM-DD HH:MM:SS". Postgres does not: the column is `timestamp with time
+ * zone` and the API sends `.isoformat()`, so the string already ends in
+ * "+00:00" — and "…+00:00Z" is not a date. Every run in the history read
+ * "Invalid Date", and the duration built from two of them read "NaNmNaNs".
+ *
+ * So the marker is added only when there is none, and an unparseable value
+ * returns null rather than NaN — a gap says "not known", where NaN says
+ * nothing at all and says it loudly.
+ */
+export function parseTimestamp(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const text = value.trim().replace(" ", "T");
+  const zoned = /(Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  const d = new Date(zoned ? text : `${text}Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+export function when(utc: string | null | undefined): string {
+  const d = parseTimestamp(utc);
+  if (!d) return "—";
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
-function duration(run: Run): string {
-  if (!run.ended_at) return "…";
-  const ms =
-    new Date(run.ended_at.replace(" ", "T") + "Z").getTime() -
-    new Date(run.started_at.replace(" ", "T") + "Z").getTime();
-  const s = Math.max(0, Math.round(ms / 1000));
+export function duration(run: Pick<Run, "started_at" | "ended_at">): string {
+  const started = parseTimestamp(run.started_at);
+  const ended = parseTimestamp(run.ended_at);
+  if (!started || !ended) return "…";
+  const s = Math.max(0, Math.round((ended.getTime() - started.getTime()) / 1000));
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
 }
 
@@ -37,6 +59,9 @@ export function RunHistory({ projectId, reloadToken }: Props) {
   const [open, setOpen] = useState<string | null>(null); // run id whose log is shown
   const [lines, setLines] = useState<string[]>([]);
   const [following, setFollowing] = useState(false);
+  // Same control the stage runner has: a doctor run emits a hundred lines and
+  // the history is exactly where somebody goes looking for the four that matter.
+  const [verbosity, setVerbosity] = useState<Verbosity>("normal");
   const openRef = useRef<string | null>(null);
 
   const refresh = useCallback(
@@ -107,10 +132,11 @@ export function RunHistory({ projectId, reloadToken }: Props) {
               </button>
             )}
             {open === r.id && (
-              <pre className="log">
-                {lines.join("\n")}
-                {following ? "\n…" : ""}
-              </pre>
+              <RunLog
+                lines={classifyAll(following ? [...lines, "…"] : lines)}
+                verbosity={verbosity}
+                onVerbosityChange={setVerbosity}
+              />
             )}
           </li>
         ))}

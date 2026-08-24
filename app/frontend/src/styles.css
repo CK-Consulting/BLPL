@@ -517,7 +517,7 @@ body.resizing-y * { pointer-events: none; }
 .run-log { padding: .5rem .7rem; background: #0f1115; border: 1px solid #6b6f75; border-radius: 6px; font: 12px/1.5 ui-monospace, monospace; max-height: 45vh; overflow: auto; }
 .run-line { white-space: pre-wrap; word-break: break-word; }
 .run-line.plain { color: #b8c0c9; }
-.run-line.detail { color: #7d8590; padding-left: .8rem; }
+.run-line.detail { color: #90a1b9; padding-left: .8rem; } /* 7.18:1 on #0f1115 — was #7d8590 at 5.07, under AAA, and this is the `fix:` text people actually read */
 .run-line.summary { color: #cfd6df; }
 .run-line.warning { color: #f0c674; }
 .run-line.error { color: #ff8b8b; }

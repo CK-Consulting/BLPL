@@ -31,6 +31,21 @@ const STAGE_HEADER = /^==>\s+(\S+)(.*)$/;
 const STAGE_SUMMARY = /^(?:doctor|stage\d[\w-]*)\s*:/;
 const ERROR_LINE = /^(error|fatal|traceback)\b|^\s*File ".*", line \d+|^\w+Error:/i;
 const WARNING_LINE = /^(warn|warning)\b/i;
+/**
+ * `[ERROR  ] DOC-003 …` and `[WARNING] DOC-001 …` — how `blpl doctor` labels a
+ * finding. Padded to a fixed width so the codes line up, which is also why a
+ * bare /^error/ never matched one: doctor's entire output was arriving as
+ * "plain", the severity it had gone to the trouble of stating thrown away at
+ * the last step, leaving a wall of grey to read line by line.
+ */
+const TAGGED = /^\[\s*(ERROR|WARNING|WARN|INFO)\s*\]/i;
+/**
+ * `stage0: warning [STAGE0-004] …` — a stage naming its own severity after the
+ * colon. These matched the summary rule first and came out the neutral colour
+ * of a result line, so a stage reporting five discarded tables looked exactly
+ * like one reporting success.
+ */
+const STAGE_LEVEL = /^(?:doctor|stage\d[\w-]*)\s*:\s*(error|warning|warn)\b/i;
 
 export function classify(text: string, activeStage?: string): RunLine {
   const header = STAGE_HEADER.exec(text);
@@ -43,6 +58,20 @@ export function classify(text: string, activeStage?: string): RunLine {
       return { text, kind: "error", underStage: name };
     }
     return { text, kind: "stage", stage: name, underStage: name };
+  }
+  const tagged = TAGGED.exec(text);
+  if (tagged) {
+    const level = tagged[1].toUpperCase();
+    if (level === "ERROR") return { text, kind: "error", underStage: activeStage };
+    if (level.startsWith("WARN")) return { text, kind: "warning", underStage: activeStage };
+    return { text, kind: "plain", underStage: activeStage };
+  }
+  // Severity the stage stated itself outranks the fact that it looks like a
+  // summary — checked before STAGE_SUMMARY, which would otherwise claim it.
+  const stated = STAGE_LEVEL.exec(text);
+  if (stated) {
+    const kind: LineKind = /^error/i.test(stated[1]) ? "error" : "warning";
+    return { text, kind, underStage: activeStage };
   }
   if (ERROR_LINE.test(text)) return { text, kind: "error", underStage: activeStage };
   if (WARNING_LINE.test(text)) return { text, kind: "warning", underStage: activeStage };
