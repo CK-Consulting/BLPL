@@ -83,7 +83,11 @@ export function FileView({
       try {
         const res = await fetch(
           `/api/projects/${projectId}/blob?path=${encodeURIComponent(path)}`,
-          { credentials: "same-origin" },
+          // no-store on both ends: the server says not to keep it, and this says
+          // not to answer from anything already kept. A reload that returns the
+          // version the reader is trying to get away from is worse than no
+          // reload, because it looks like the file itself did not change.
+          { credentials: "same-origin", cache: "no-store" },
         );
         if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         const text = await res.text();

@@ -169,6 +169,31 @@ async def _seal_idle_workspaces() -> None:
 app = FastAPI(title="BLPL", version="0.5.0", lifespan=_lifespan)
 
 
+@app.middleware("http")
+async def _never_cache(request, call_next):
+    """No API response is ever cached, by anything, for any length of time.
+
+    Everything this server returns is the state of a project *right now* — a
+    file being edited, a run's log, the tree, a proposal. None of it is worth
+    keeping and all of it goes wrong when it is kept.
+
+    Per-endpoint headers were the obvious fix and the wrong shape. `FileResponse`
+    sets last-modified and an etag but no Cache-Control, and a response carrying
+    a validator with no freshness directive is one a browser may hold as fresh on
+    its own account — heuristically, about a tenth of the file's age — answering
+    a fetch from cache without asking the server anything. That is how a pane
+    kept showing a design document that no longer existed on disk, through a
+    refetch that was working perfectly. Any endpoint added later would have had
+    the same hole, so the rule belongs here rather than in each of them.
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 # State roots. All three are volumes on the deploy; all three default under one
 # data dir so a bare `docker run` still works.
 _DATA = Path(os.environ.get("BLPL_DATA_ROOT", "/app/data"))
@@ -2291,6 +2316,8 @@ def get_blob(
             },
         )
     return FileResponse(target)
+
+
 
 
 def _is_quarantined(proj: Path, target: Path) -> bool:
