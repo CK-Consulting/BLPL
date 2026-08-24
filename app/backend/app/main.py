@@ -216,6 +216,12 @@ _PROVIDER_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
 
 VALID_STAGES = {
     "doctor",
+    # Not a stage, and runnable for the same reason doctor is: it is
+    # deterministic, it reads the markdown that is already here, and doctor
+    # tells you to run it. DOC-007 said "Run `blpl init`" while the workbench
+    # offered no way to — so the one thing standing between a design and Stage 5
+    # could only be done by finding a shell.
+    "init",
     "stage0-det", "stage0-llm", "stage0-compare",
     "stage1", "stage1-synthesize-connectors",
     "stage2", "stage3", "stage4", "stage5",

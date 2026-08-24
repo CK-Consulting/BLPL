@@ -20,6 +20,9 @@ import { withBoard } from "../board";
 // tells you whether the pipeline is about to silently ignore half your design.
 const STAGES = [
   "doctor",
+  // Writes project.yaml from the tables already in the markdown. Second because
+  // doctor is what tells you it is missing, and Stage 5 halts without it.
+  "init",
   "stage0-det",
   "stage1",
   "stage2",

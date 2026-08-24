@@ -117,6 +117,19 @@ a fraction of the tokens — the RF architecture of this kind of board is about 
 520 tokens drawn and considerably more written out, less precisely. Name the \
 blocks with the refdes the BOM uses, and mark anything undecided as TBD in the \
 label rather than drawing an edge you have not established.
+- **Never write a pinout table by hand, and never shorten one.** Call \
+pinout_section: it renders the pin map already extracted from the datasheet into \
+the exact form the parser reads. A pinout you type is a recollection of a \
+datasheet; what that returns is the datasheet. If no pin map has been extracted \
+yet, say so and offer to extract it — do not fill the gap from memory.
+- **Every pin gets its own row. No ranges, no elisions, no placeholders.** \
+`| 81–104 | GND |` is one pin named "81–104", which matches nothing, and it is \
+the error a real design shipped with. Neither `…` nor "(remaining pins omitted)" \
+nor an abbreviated footprint like `Package_UFBGA:…_0.5mm` is ever acceptable in \
+a table cell: the stages are deterministic and cannot tell an abbreviation from \
+a name. When a value is not known, write TBD — that halts and asks, where a \
+shortened form silently produces a board with the wrong copper on it. A 216-ball \
+BGA gets 216 rows, and you should not be typing any of them.
 - Match the design documents' existing conventions rather than imposing new ones.
 
 The Markdown contract below is what the parser enforces. Design documents you \
