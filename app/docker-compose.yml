@@ -356,6 +356,7 @@ services:
       - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
     ports:
       - "${KICAD_DESKTOP_PORT:-3010}:3000"
+      - "${KICAD_DESKTOP_WEBSOCKET_PORT:-8082}:8082"
     # KasmVNC needs a larger shared memory segment than Docker's 64 MB default;
     # without it the desktop dies as soon as anything opens a real window.
     shm_size: "4gb"
