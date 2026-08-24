@@ -293,3 +293,69 @@ def test_passives_and_connectors_are_never_flagged_as_halting(tmp_path: Path) ->
         ),
     )
     assert "DOC-011" not in _codes(doctor.run(proj))
+
+
+# --- DOC-012: a bare package that names nothing -----------------------------
+
+
+def test_a_bare_hint_that_names_something_real_is_left_alone(tmp_path: Path) -> None:
+    """`0402` lands inside `R_0402_1005Metric`. That is a hint doing its job."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| R1 | RC0402 | 0402 |\n"
+        ),
+    )
+    root = _fp_root(tmp_path, "Resistor_SMD", "R_0402_1005Metric")
+    assert "DOC-012" not in _codes(doctor.run(proj, footprints_root=root))
+
+
+def test_a_bare_package_that_matches_no_footprint_is_an_error(tmp_path: Path) -> None:
+    """The failure this exists to catch.
+
+    A package *description* reads like a reference and resolves to nothing:
+    `resolve_footprint` substitutes a placeholder for anything without a ':',
+    so the board opens, renders and routes with a generic outline where the part
+    should be. Skipping every colon-less value meant doctor reported success on
+    a design whose thirty components would every one be placeholdered."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| U1 | AN7002Q-U | Module_25Pin |\n"
+            "| R1 | RC0402 | 0402 |\n"
+        ),
+    )
+    root = _fp_root(tmp_path, "Resistor_SMD", "R_0402_1005Metric")
+    hits = [f for f in doctor.run(proj, footprints_root=root).findings if f.code == "DOC-012"]
+    assert len(hits) == 1, "only the one that names nothing"
+    assert "Module_25Pin" in hits[0].summary
+    assert hits[0].severity == "error"
+
+
+def test_tbd_in_a_package_cell_is_no_longer_invisible(tmp_path: Path) -> None:
+    """It used to raise nothing at all, which is how it got written."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md="## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | TBD |\n",
+    )
+    root = _fp_root(tmp_path, "Resistor_SMD", "R_0402_1005Metric")
+    assert "DOC-012" in _codes(doctor.run(proj, footprints_root=root))
+
+
+def test_without_a_footprint_library_it_says_nothing(tmp_path: Path) -> None:
+    """A checkout without the submodules must not condemn every row in the BOM.
+    An empty index means "cannot tell", not "matches nothing"."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md="## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | Whatever |\n",
+    )
+    assert "DOC-012" not in _codes(doctor.run(proj, footprints_root=tmp_path / "nope"))

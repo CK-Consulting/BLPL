@@ -132,6 +132,63 @@ def _footprint_column(row: dict) -> str:
     return ""
 
 
+def _footprint_name_index(footprints_root: Path) -> set[str]:
+    """Every footprint name in the stock libraries, lowercased.
+
+    Built once per report and only when something needs it, because it is a walk
+    of some fifteen thousand files.
+    """
+    root = Path(footprints_root)
+    if not root.is_dir():
+        return set()
+    return {m.stem.lower() for lib in root.glob("*.pretty") for m in lib.glob("*.kicad_mod")}
+
+
+def _check_bare_footprint(
+    report: Report, ref: str, fp: str, known: set[str], rel: str, line: int
+) -> None:
+    """A package value with no library prefix, checked for being a real hint.
+
+    Skipping these entirely was deliberate and half right. A bare ``0402`` is a
+    hint the classifier turns into a real footprint later, and testing it against
+    the filesystem would report a problem the pipeline exists to solve. But a
+    value that appears nowhere in any footprint name is not a hint — there is
+    nothing for the classifier to land on, and ``resolve_footprint`` substitutes
+    a placeholder for anything without a colon in it. The board opens, renders
+    and routes, with a generic outline where the part should be.
+
+    So the test is whether the string occurs in any footprint name at all.
+    ``0402`` does, inside ``R_0402_1005Metric``. ``VSON-10_2x3mm_P0.5mm`` and
+    ``Module_25Pin`` do not, anywhere in fifteen thousand of them — they are
+    package *descriptions*, which read like references and resolve to nothing.
+    """
+    if not known:
+        # No library to compare against — on a checkout without the footprint
+        # submodules, say nothing rather than condemning every row in the BOM.
+        # An empty index means "cannot tell", which is not the same as "no match".
+        return
+    needle = fp.lower()
+    if any(needle in name for name in known):
+        return
+    report.findings.append(
+        Finding(
+            code="DOC-012",
+            severity="error",
+            summary=f"{ref}: package '{fp}' matches no footprint in any library.",
+            fix=(
+                "It is not a library reference — no ':' — so Stage 5 substitutes a generic "
+                "placeholder and the board opens, renders and routes with the wrong copper "
+                "under the part. A bare hint is fine when it names something real ('0402' "
+                "lands on R_0402_1005Metric); this one lands on nothing. Give the full "
+                "'Lib:Name' from kicad-footprints, or draw the part into the project's "
+                "libraries/ directory. A module usually has no stock footprint at all."
+            ),
+            file=rel,
+            line=line,
+        )
+    )
+
+
 def _check_footprints(
     report: Report, bom_rows: list[tuple[str, dict, str, int]], footprints_root: Path
 ) -> None:
@@ -145,9 +202,14 @@ def _check_footprints(
     standing in for a QFN on a board that opens and renders perfectly.
     """
     checked: dict[str, bool] = {}
+    known: set[str] | None = None
     for ref, row, rel, line in bom_rows:
         fp = _footprint_column(row)
         if ":" not in fp:
+            if fp:
+                if known is None:
+                    known = _footprint_name_index(footprints_root)
+                _check_bare_footprint(report, ref, fp, known, rel, line)
             continue
         if fp not in checked:
             lib, _, name = fp.partition(":")
