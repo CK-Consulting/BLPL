@@ -338,6 +338,12 @@ services:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
       - TZ=${TZ:-Etc/UTC}
+      - AUTO_GPU=true
+      - PIXELFLUX_WAYLAND=true
+      - DRINODE=/dev/dri/renderD128
+      - DRI_NODE=/dev/dri/renderD128
+    devices:
+      - /dev/dri:/dev/dri
     volumes:
       - ./data/kicad-desktop:/config
       # Deliberately ONE project, named explicitly, rather than the projects
@@ -352,7 +358,7 @@ services:
       - "${KICAD_DESKTOP_PORT:-3010}:3000"
     # KasmVNC needs a larger shared memory segment than Docker's 64 MB default;
     # without it the desktop dies as soon as anything opens a real window.
-    shm_size: "1gb"
+    shm_size: "4gb"
     security_opt:
       - seccomp:unconfined
     # devices:

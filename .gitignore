@@ -90,3 +90,5 @@ desktop.ini
 # submodules, which cost a pointer each.
 mermaid/customization-inspirations/electronics-symbols/
 mermaid/customization-inspirations/Electrical_symbols_library.svg
+
+app/certs/*
