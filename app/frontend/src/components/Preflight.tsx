@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getJSON } from "../api";
+import { LaunchKicad } from "./LaunchKicad";
 
 /**
  * Preflight — what Stage 0 would drop or misread, before anything runs.
@@ -84,6 +85,17 @@ export function Preflight({
             board missing part of the design. Fix these first.
           </>
         )}
+      </div>
+
+      {/* Beside the findings rather than buried in a menu: a footprint that does
+          not exist is fixed by drawing one, and this is where you learn it does
+          not exist. */}
+      <div className="preflight-tools">
+        <LaunchKicad className="btn kicad-launch" label="Launch KiCad in a new tab" />
+        <span className="muted small">
+          For drawing a footprint or symbol the libraries do not have. Save it into this
+          project's <code>libraries/footprints/</code> — doctor and Stage 5 both look there.
+        </span>
       </div>
 
       <section className="report-block">

@@ -754,7 +754,7 @@ def _cmd_stage7(args: argparse.Namespace) -> int:
 def _cmd_init(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
     try:
-        target, result = _init.write_config(proj, force=args.force)
+        target, result = _init.write_config(proj, force=args.force, board=_board(args, proj))
     except FileExistsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -770,7 +770,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    report = _doctor.run(proj)
+    report = _doctor.run(proj, board=_board(args, proj))
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
     else:

@@ -68,6 +68,10 @@ services:
       db:
         condition: service_healthy
     environment:
+      # Which project the desktop KiCad has mounted, so the gate in front of
+      # it can require membership of that project rather than merely a
+      # signed-in account.
+      - KICAD_DESKTOP_PROJECT=${KICAD_DESKTOP_PROJECT:-none}
       - BLPL_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-blpl}:${POSTGRES_PASSWORD:-blpl}@db:5432/${POSTGRES_DB:-blpl}
       # One data root holds what is not in Postgres: the server key, the
       # declarative config, and the project working copies.

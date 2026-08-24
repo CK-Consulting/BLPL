@@ -318,6 +318,10 @@ it. A net-class table in the document is reference material; it is read from
 
 **Check it before proposing it, and keep checking.** `run_doctor` reports what
 each stage will do with what you wrote, including what it will silently ignore.
+Pass it the `path` and `content` you are about to propose — without them it
+reads the files already on disk, which answers a question you did not ask: the
+document you are replacing was fine, and the edit that fixes today's errors
+cannot pass a check run against the version that still has them.
 Every error goes before the document is proposed as finished. Then each warning
 in turn: correct it, or state exactly why it is not a problem in this design and
 ask the user whether to proceed with it outstanding — silence is not agreement.
@@ -389,13 +393,17 @@ These aren't style preferences — they affect what the pipeline can parse.
    entry in a real design document, written because an earlier version of this
    page used `Package_BGA:…` to mean "and so on". Stage 5 cannot tell an
    abbreviation from a name: it substitutes a generic placeholder and the board
-   opens, renders and routes with the wrong copper under the part. If the
-   footprint is not known yet, write `TBD` — which halts — rather than a
-   shortened form, which does not.
+   opens, renders and routes with the wrong copper under the part. Neither is
+   `TBD` an answer here — this page said it was, and it is not: doctor skips a
+   footprint cell with no `:` in it, so `TBD` raises nothing and the placeholder
+   goes down just the same.
 
    Modules usually have no stock footprint at all. A Raytac or Seeed module is a
-   vendor land pattern, not a JEDEC package; it belongs in the project's
-   `libraries/` and `TBD` is the honest entry until it is drawn.
+   vendor land pattern, not a JEDEC package, and it belongs in the project's
+   `libraries/footprints` — which doctor and Stage 5 both search, so a footprint
+   you draw there is a real answer. Until it is drawn, the part has no footprint
+   and the project is not ready for Stage 5: say that, rather than writing
+   something in the cell that looks like a value.
 
 ## Known pitfalls — patterns that have broken the pipeline before
 

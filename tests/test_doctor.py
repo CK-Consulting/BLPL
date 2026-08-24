@@ -359,3 +359,60 @@ def test_without_a_footprint_library_it_says_nothing(tmp_path: Path) -> None:
         design__md="## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | Whatever |\n",
     )
     assert "DOC-012" not in _codes(doctor.run(proj, footprints_root=tmp_path / "nope"))
+
+
+# --- init harvests the board it was asked about ------------------------------
+
+
+def test_init_reads_the_selected_boards_markdown(tmp_path: Path) -> None:
+    """Codex, PR #17. `--board` was validated, passed, and then ignored.
+
+    On a multi-board project the identity and stackup tables for a board live in
+    that board's directory. build_config globbed the project root only, so
+    `init --board sb-ant` harvested nothing of sb-ant and wrote defaults, which
+    Stage 5 then accepted for the generated board."""
+    from blpl.core import init_project
+
+    proj = tmp_path / "p"
+    (proj / "sb-ant").mkdir(parents=True)
+    (proj / "project.md").write_text(
+        "# P\n\n## Boards\n\n- core — the carrier\n- sb-ant — the RF distribution board\n",
+        encoding="utf-8",
+    )
+    (proj / "sb-ant" / "board.md").write_text(
+        "# sb-ant\n\n## Project identity\n\n| Field | Value |\n|---|---|\n"
+        "| Board ID | SBANT-V3 |\n",
+        encoding="utf-8",
+    )
+
+    # Without the board it sees only the root, and the board's id is invisible.
+    assert not any("SBANT-V3" in f for f in init_project.build_config(proj).found)
+    # With it, the board's own tables are harvested.
+    assert any("SBANT-V3" in f for f in init_project.build_config(proj, board="sb-ant").found)
+
+
+def test_doctor_reports_on_the_board_it_was_asked_about(tmp_path: Path) -> None:
+    """Codex, PR #22. `--board` was accepted and ignored, exactly as init's was.
+
+    A board's design markdown lives in its own directory. doctor read the project
+    root whatever it was asked about, so it reported on the carrier and called
+    the sub-board clean — including through the pre-proposal check, whose whole
+    purpose is to catch a malformed sub-board edit before it is proposed."""
+    proj = tmp_path / "p"
+    (proj / "sb-ant").mkdir(parents=True)
+    (proj / "project.md").write_text(
+        "# P\n\n## Boards\n\n- core — the carrier\n- sb-ant — the RF board\n", encoding="utf-8"
+    )
+    (proj / "core.md").write_text(
+        "# core\n\n## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | 0402 |\n",
+        encoding="utf-8",
+    )
+    (proj / "sb-ant" / "board.md").write_text(
+        "# sb-ant\n\n## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U9 | Y | Module_9Pin |\n",
+        encoding="utf-8",
+    )
+    root = _fp_root(tmp_path, "Resistor_SMD", "R_0402_1005Metric")
+
+    # The root is clean; the board is not.
+    assert "DOC-012" not in _codes(doctor.run(proj, footprints_root=root))
+    assert "DOC-012" in _codes(doctor.run(proj, footprints_root=root, board="sb-ant"))

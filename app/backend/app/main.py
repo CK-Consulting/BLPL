@@ -187,10 +187,14 @@ async def _never_cache(request, call_next):
     the same hole, so the rule belongs here rather than in each of them.
     """
     response = await call_next(request)
-    if request.url.path.startswith("/api/"):
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
+    # Everything, not only /api/. In `blpl serve` there is no nginx: this app
+    # serves index.html and the fingerprinted bundle itself, and a response with
+    # a validator and no freshness directive is one the browser may hold on its
+    # own account — so a rebuilt frontend kept loading the old bundle locally,
+    # which is exactly the failure the nginx rules were written to stop.
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     return response
 
 
@@ -344,6 +348,42 @@ def _load_config() -> AppConfig:
 # --------------------------------------------------------------------------
 # Health + auth (the only routes reachable while locked)
 # --------------------------------------------------------------------------
+
+
+@app.api_route("/api/authz/gate", methods=["GET", "HEAD"])
+def authz_gate(
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> Response:
+    """A yes/no for nginx, so a proxied app can be put behind this app's sign-in.
+
+    The desktop KiCad has no authentication of its own — it answers 200 and
+    hands over a session with the project directory mounted. Serving it at a
+    path under this origin does not by itself change that: nginx proxies, it
+    does not know what a Clerk session is. `auth_request` is how it asks.
+
+    It works because Clerk's `__session` cookie rides a same-origin request, so
+    a top-level navigation to /kicad/ carries credentials that a Bearer token in
+    JavaScript would not. Empty body and no cache: the answer is about this
+    request, and nginx discards everything but the status.
+
+    HEAD as well as GET, because nginx issues the sub-request with the original
+    request's method and the probe deciding whether to show the launch button
+    used HEAD — a GET-only route answered 405, which auth_request reads as a
+    denial, so the button stayed hidden while the desktop was running.
+
+    And signed in is not enough. The desktop mounts one project, named by
+    KICAD_DESKTOP_PROJECT, and every project route in this app checks membership
+    before opening anything. Letting any onboarded account through would put
+    that project's files, and a shared desktop session, in front of people who
+    are not on it.
+    """
+    project_id = (os.environ.get("KICAD_DESKTOP_PROJECT") or "").strip()
+    if project_id and project_id != "none":
+        # Raises exactly as every other project route does when the caller is
+        # not a member.
+        _project_dir(session, user, project_id)
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/health")

@@ -53,11 +53,20 @@ export function FileView({
   // sees whether there is unsaved work right now.
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
-  const shownPath = useRef<string | null>(null);
+  // Keyed by project *and* path. Path alone was not enough: switching project
+  // with the same filename open left `openedAnother` false, so a dirty editor
+  // kept the previous project's draft and Save wrote it into the new project.
+  const shownKey = useRef<string | null>(null);
+  // A reload that arrived while there was unsaved work, waiting for there not
+  // to be. Without this the token change is consumed by the early return and
+  // the pane keeps its pre-change content until something unrelated reloads it.
+  const pending = useRef(false);
+  const [retry, setRetry] = useState(0);
 
   useEffect(() => {
-    const openedAnother = shownPath.current !== path;
-    shownPath.current = path;
+    const key = `${projectId}\u0000${path ?? ""}`;
+    const openedAnother = shownKey.current !== key;
+    shownKey.current = key;
     // Accepting a proposal rewrites the file under this pane. Until now nothing
     // told it so: the fetch ran once per path and the reader went on looking at
     // the version from whenever they opened it — including, in one case, right
@@ -67,7 +76,10 @@ export function FileView({
     // The exception is unsaved work. A refetch mid-edit would replace a draft
     // with what is on disk, which is a worse failure than a stale view, so the
     // reload is skipped while the editor is dirty and the file is unchanged.
-    if (!openedAnother && dirtyRef.current) return;
+    if (!openedAnother && dirtyRef.current) {
+      pending.current = true;
+      return;
+    }
     if (openedAnother) {
       setEditing(false);
       setSource(false);
@@ -92,6 +104,13 @@ export function FileView({
         if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         const text = await res.text();
         if (cancelled) return;
+        // Checked again here, not only before the request: the reader can open
+        // the editor and start typing while it is in flight, and applying the
+        // response then would erase what they had just written.
+        if (!openedAnother && dirtyRef.current) {
+          pending.current = true;
+          return;
+        }
         setContent((prev) => {
           // Say so when the file moved underneath, rather than swapping the
           // text out in silence and leaving the reader to wonder.
@@ -106,7 +125,16 @@ export function FileView({
     return () => {
       cancelled = true;
     };
-  }, [projectId, path, reloadToken]);
+  }, [projectId, path, reloadToken, retry]);
+
+  // Once the unsaved work is gone — saved, or abandoned by leaving the editor —
+  // any reload that was held back happens.
+  useEffect(() => {
+    if (!dirty && pending.current) {
+      pending.current = false;
+      setRetry((n) => n + 1);
+    }
+  }, [dirty]);
 
   const save = async () => {
     if (!path || !savable) return;

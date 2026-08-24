@@ -10,6 +10,7 @@ import { Invitations } from "./components/Invitations";
 import { Logo } from "./components/Logo";
 import { NewProject, ProjectSync } from "./components/ProjectControls";
 import { FileView } from "./components/FileView";
+import { LaunchKicad } from "./components/LaunchKicad";
 import { KicadFileView } from "./components/KicadFileView";
 import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
@@ -122,6 +123,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
             </option>
           ))}
         </select>
+        <LaunchKicad className="link kicad-launch" />
         {(() => {
           const cur = projects.find((p) => p.id === selected);
           if (!cur?.fab?.blocked) return null;

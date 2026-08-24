@@ -138,7 +138,9 @@ not. When a value is genuinely unknown, leave the row out and tell the user \
 plainly that the project is not ready for Stage 0 and what is missing.
 - Match the design documents' existing conventions rather than imposing new ones.
 - **Check a document before you propose it, and keep checking until it is \
-clean.** After writing or editing design markdown, call run_doctor. Every error \
+clean.** After writing or editing design markdown, call run_doctor with the \
+`path` and `content` you are about to propose — it then checks the document you \
+wrote rather than the one you are replacing. Every error \
 must be gone before you propose the file as finished — an error here is a stage \
 that halts or a board that is quietly wrong later, and it is far cheaper to fix \
 now than after four LLM stages have run on it. Then take the warnings one at a \

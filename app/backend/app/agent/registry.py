@@ -28,6 +28,7 @@ called at the wrong moments, and this set has expensive members.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import subprocess
@@ -584,6 +585,20 @@ async def _diff_file(ctx: ToolContext, args: dict) -> str:
     return out
 
 
+def _pins_in(payload: dict) -> list[dict] | None:
+    """The pin list inside a stored extraction, whichever shape it was kept in."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("pinout", "pins"):
+        got = payload.get(key)
+        if isinstance(got, list) and got:
+            return got
+        if isinstance(got, dict) and isinstance(got.get("data"), list) and got["data"]:
+            return got["data"]
+    data = payload.get("data")
+    return data if isinstance(data, list) and data else None
+
+
 async def _pinout_section(ctx: ToolContext, args: dict) -> str:
     """The markdown pinout section for a part, built from its extracted pin map.
 
@@ -608,6 +623,22 @@ async def _pinout_section(ctx: ToolContext, args: dict) -> str:
             "CMB1 carry their connections in the BOM and net tables instead."
         )
     path = pinout_table.extracted_path(ctx.project_dir, mpn)
+    if path is None and ctx.library is not None:
+        # A part already in this user's component library never produced a
+        # project-local extraction: extract_datasheet_specs returns the stored
+        # payload and stops. So this found nothing and told the caller to run
+        # extraction, which returned the same stored payload again — advice that
+        # could not be taken. A pinout is a property of the part, so the stored
+        # one is the same answer.
+        prior = ctx.library.get(mpn)
+        pins = _pins_in(prior) if prior else None
+        if pins:
+            return pinout_table.render(refdes, mpn, pins, source="your component library")
+    if path is not None:
+        # Belt and braces with the containment check inside extracted_path: this
+        # is a model-facing file read, and the sandbox is the thing that owns
+        # the question of what this project may look at.
+        ctx.sandbox.check_read(path)
     if path is None:
         raise FileNotFoundError(
             f"no extracted pin map for {mpn} — run extract_datasheet_specs first, "
@@ -617,6 +648,78 @@ async def _pinout_section(ctx: ToolContext, args: dict) -> str:
     if not data:
         raise FileNotFoundError(f"the extracted pin map for {mpn} has no pins in it")
     return pinout_table.render(refdes, mpn, data, source=path.name)
+
+
+@contextlib.contextmanager
+def _shadow_project(project_dir: Path, path: str, content: str):
+    """The project as it *would* be, with one document replaced.
+
+    The check the assistant is told to run before proposing an edit was reading
+    the files already on disk — so a clean document could be validated and then
+    replaced by a broken proposal, and an edit written to fix existing errors
+    could never make the check pass, because the errors it fixes were still
+    there when the check ran. It was answering a question nobody had asked.
+
+    A shadow directory of symlinks, with the one file written for real. Doctor
+    resolves footprints through libraries/ and reads every *.md at the root, so
+    the shape has to be the project's shape; symlinks give that for nothing and
+    guarantee the real project is never written to.
+    """
+    import shutil
+    import tempfile
+
+    project_dir = Path(project_dir).resolve()
+    rel = Path(path)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ToolDenied(f"{path!r} is not a project-relative path")
+
+    tmp = Path(tempfile.mkdtemp(prefix="blpl-check-"))
+    try:
+        for entry in project_dir.iterdir():
+            (tmp / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+        target = tmp / rel
+        if target.parent != tmp:
+            # A document in a sub-board directory: that directory has to become
+            # real too, or writing into it would write through the symlink.
+            link = tmp / rel.parts[0]
+            if link.is_symlink():
+                original = link.resolve()
+                link.unlink()
+                shutil.copytree(original, tmp / rel.parts[0], symlinks=True)
+            target.parent.mkdir(parents=True, exist_ok=True)
+        elif target.is_symlink():
+            target.unlink()
+        target.write_text(content, encoding="utf-8")
+        yield tmp
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _project_under_test(ctx: ToolContext, args: dict):
+    """The project as it is, or as the pending edit would leave it, and which
+    board the edit belongs to.
+
+    The board matters as much as the content. A proposed `sb-ant/board.md` was
+    written into the shadow correctly and then never read, because doctor and
+    Stage 0 both take their markdown from the project root — so a malformed
+    sub-board edit was reported clean by a check whose whole purpose was to
+    catch it.
+    """
+    path = str(args.get("path") or "").strip()
+    content = args.get("content")
+    board = _board_of(path)
+    if path and content is not None:
+        with _shadow_project(ctx.project_dir, path, str(content)) as shadow:
+            yield shadow, board
+    else:
+        yield Path(ctx.project_dir), board
+
+
+def _board_of(path: str) -> str | None:
+    """The board a document belongs to, or None when it sits at the root."""
+    parts = Path(path).parts if path else ()
+    return parts[0] if len(parts) > 1 else None
 
 
 async def _run_doctor(ctx: ToolContext, args: dict) -> str:
@@ -629,7 +732,8 @@ async def _run_doctor(ctx: ToolContext, args: dict) -> str:
     """
     from blpl.core import doctor
 
-    report = doctor.run(ctx.project_dir).to_dict()
+    with _project_under_test(ctx, args) as (proj, board):
+        report = doctor.run(proj, board=board).to_dict()
     findings = report.get("findings") or []
     errors = [f for f in findings if f.get("severity") == "error"]
     warnings = [f for f in findings if f.get("severity") != "error"]
@@ -658,10 +762,20 @@ async def _check_stage0(ctx: ToolContext, args: dict) -> str:
     """
     from blpl.core import stage0_deterministic
 
-    md_files = sorted(Path(ctx.project_dir).glob("*.md"))
-    if not md_files:
-        raise FileNotFoundError("no markdown at the project root — Stage 0 reads *.md there only")
-    out = stage0_deterministic.extract(md_files)
+    with _project_under_test(ctx, args) as (proj, board):
+        root = Path(proj)
+        if board:
+            from blpl.core import project_manifest
+
+            root = project_manifest.board_dir(
+                root, project_manifest.discover(root), board
+            )
+        md_files = sorted(root.glob("*.md"))
+        if not md_files:
+            raise FileNotFoundError(
+                "no markdown at the project root — Stage 0 reads *.md there only"
+            )
+        out = stage0_deterministic.extract(md_files)
     connectors = out.get("connectors") or []
     return json.dumps(
         {
@@ -1394,7 +1508,21 @@ def parts_tools() -> list[ToolSpec]:
                 "one net, ICs with no pinout. Run this on every document you write or edit, "
                 "before proposing it — an error here is a stage that halts later."
             ),
-            input_schema={"type": "object", "properties": {}},
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Optional: check the project as it would be with this file "
+                            "replaced. Pass the same path and content you are about to "
+                            "propose, so the check sees the edit rather than the file it "
+                            "is replacing."
+                        ),
+                    },
+                    "content": {"type": "string", "description": "The prospective file content."},
+                },
+            },
             kind="file_read",
             handler=_run_doctor,
         ),
@@ -1405,7 +1533,21 @@ def parts_tools() -> list[ToolSpec]:
                 "and the tables it ignored. Writes nothing. Run it after doctor is clean, to "
                 "confirm the design that reaches the LLM stages is the one you wrote."
             ),
-            input_schema={"type": "object", "properties": {}},
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Optional: check the project as it would be with this file "
+                            "replaced. Pass the same path and content you are about to "
+                            "propose, so the check sees the edit rather than the file it "
+                            "is replacing."
+                        ),
+                    },
+                    "content": {"type": "string", "description": "The prospective file content."},
+                },
+            },
             kind="file_read",
             handler=_check_stage0,
         ),

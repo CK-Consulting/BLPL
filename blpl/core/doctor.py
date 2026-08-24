@@ -132,16 +132,41 @@ def _footprint_column(row: dict) -> str:
     return ""
 
 
-def _footprint_name_index(footprints_root: Path) -> set[str]:
-    """Every footprint name in the stock libraries, lowercased.
+def _footprint_name_index(footprints_root: Path, project_dir: Path | None = None) -> set[str]:
+    """Every footprint name Stage 5 could find, normalized.
 
     Built once per report and only when something needs it, because it is a walk
     of some fifteen thousand files.
     """
-    root = Path(footprints_root)
-    if not root.is_dir():
+    from .symbol_resolution import footprint_search_path
+
+    roots = (
+        [r for r, _ in footprint_search_path(project_dir, footprints_root)]
+        if project_dir is not None
+        else [Path(footprints_root)]
+    )
+    names = {
+        re.sub(r"[^a-z0-9]", "", m.stem.lower())
+        for root in roots
+        if root.is_dir()
+        for lib in root.glob("*.pretty")
+        for m in lib.glob("*.kicad_mod")
+    }
+    if not names:
         return set()
-    return {m.stem.lower() for lib in root.glob("*.pretty") for m in lib.glob("*.kicad_mod")}
+    root = Path(footprints_root)
+    _INDEX_ROOTS[frozenset(names)] = root
+    return names
+
+
+# The matcher needs the root the index came from; the index itself is a set of
+# names, so the association is kept beside it rather than threaded through every
+# caller.
+_INDEX_ROOTS: dict[frozenset, Path] = {}
+
+
+def _footprints_root_for(known: set[str]) -> Path:
+    return _INDEX_ROOTS.get(frozenset(known), Path("."))
 
 
 def _check_bare_footprint(
@@ -167,9 +192,26 @@ def _check_bare_footprint(
         # submodules, say nothing rather than condemning every row in the BOM.
         # An empty index means "cannot tell", which is not the same as "no match".
         return
-    needle = fp.lower()
-    if any(needle in name for name in known):
-        return
+
+    # Two ways a bare value can be a real hint, and the first version of this
+    # check only had a bad approximation of the second.
+    #
+    # If the string names a family and a pin count — `QFN-38 (exposed pad)`,
+    # `SOIC-8` — the library can be asked directly, annotations and all.
+    from . import footprint_match
+
+    if footprint_match.parse(fp).specific_enough:
+        if footprint_match.find(fp, _footprints_root_for(known)).candidates:
+            return
+    else:
+        # Otherwise it is a size or a description — `0402`, `USB-C Receptacle` —
+        # and the test is whether it occurs in a footprint name once punctuation
+        # is set aside. A literal substring test failed here: `usb-c receptacle`
+        # is not inside `usb_c_receptacle_amphenol_...` because of one hyphen
+        # against one underscore, and a resolvable part was called an error.
+        needle = re.sub(r"[^a-z0-9]", "", fp.lower())
+        if needle and any(needle in name for name in known):
+            return
     report.findings.append(
         Finding(
             code="DOC-012",
@@ -180,8 +222,12 @@ def _check_bare_footprint(
                 "placeholder and the board opens, renders and routes with the wrong copper "
                 "under the part. A bare hint is fine when it names something real ('0402' "
                 "lands on R_0402_1005Metric); this one lands on nothing. Give the full "
-                "'Lib:Name' from kicad-footprints, or draw the part into the project's "
-                "libraries/ directory. A module usually has no stock footprint at all."
+                "'Lib:Name' from kicad-footprints, or add or create the footprint in KiCad "
+                "— which you can launch in a new tab with the button above — and save it "
+                "into this project's libraries/footprints/, which is searched first. A "
+                "module usually has no stock footprint at all, and a standard package the "
+                "library happens to lack can be generated from its datasheet dimensions "
+                "with kicad-footprint-generator rather than drawn by hand."
             ),
             file=rel,
             line=line,
@@ -190,7 +236,10 @@ def _check_bare_footprint(
 
 
 def _check_footprints(
-    report: Report, bom_rows: list[tuple[str, dict, str, int]], footprints_root: Path
+    report: Report,
+    bom_rows: list[tuple[str, dict, str, int]],
+    footprints_root: Path,
+    project_dir: Path | None = None,
 ) -> None:
     """Library-form footprints that do not exist on disk.
 
@@ -208,12 +257,24 @@ def _check_footprints(
         if ":" not in fp:
             if fp:
                 if known is None:
-                    known = _footprint_name_index(footprints_root)
+                    known = _footprint_name_index(footprints_root, project_dir)
                 _check_bare_footprint(report, ref, fp, known, rel, line)
             continue
         if fp not in checked:
-            lib, _, name = fp.partition(":")
-            checked[fp] = (Path(footprints_root) / f"{lib}.pretty" / f"{name}.kicad_mod").is_file()
+            # Resolved the way Stage 5 resolves it, rather than probed in one
+            # directory. Stage 5 searches libraries/footprints, each module's
+            # library, generated footprints and only then stock — so a footprint
+            # a project legitimately owns was reported here as missing, and the
+            # remedy for a part with no stock footprint (draw one into
+            # libraries/) produced a blocking error of its own.
+            if project_dir is not None:
+                from .symbol_resolution import PLACEHOLDER, resolve_footprint
+
+                got = resolve_footprint(fp, project_dir=project_dir, stock_root=Path(footprints_root))
+                checked[fp] = got.source != PLACEHOLDER
+            else:
+                lib, _, name = fp.partition(":")
+                checked[fp] = (Path(footprints_root) / f"{lib}.pretty" / f"{name}.kicad_mod").is_file()
         if checked[fp]:
             continue
         report.findings.append(
@@ -224,8 +285,10 @@ def _check_footprints(
                 fix=(
                     "Stage 5 substitutes a generic placeholder for a footprint it cannot "
                     "find, so the board still opens, renders and routes — with the wrong "
-                    "copper. Check the spelling against kicad-footprints, or draw the part "
-                    "into the project's libraries/ directory."
+                    "copper. Check the spelling against kicad-footprints, or add or create "
+                    "the footprint in KiCad — which you can launch in a new tab with the "
+                    "button above — and save it into this project's libraries/footprints/, "
+                    "which is searched before the stock libraries."
                 ),
                 file=rel,
                 line=line,
@@ -285,6 +348,7 @@ def run(
     *,
     symbols_root: Path | None = None,
     footprints_root: Path | None = None,
+    board: str | None = None,
 ) -> Report:
     """Inspect a project's Markdown and report what Stage 0 would drop or misread."""
     from .stage6_compile_kicad import _DEFAULT_FOOTPRINTS, _DEFAULT_SYMBOLS
@@ -294,7 +358,19 @@ def run(
     footprints_root = Path(footprints_root) if footprints_root else _DEFAULT_FOOTPRINTS
     report = Report()
 
-    md_files = sorted(project_dir.glob("*.md"))
+    # A board's design markdown lives in its own directory, and this read the
+    # project root whatever it was asked about — so `doctor --board sb-ant`
+    # reported on the carrier and called the sub-board clean. The project
+    # directory is still what footprint resolution and libraries/ are relative
+    # to; only the documents change.
+    md_root = project_dir
+    if board is not None:
+        from . import project_manifest
+
+        md_root = project_manifest.board_dir(
+            project_dir, project_manifest.discover(project_dir), board
+        )
+    md_files = sorted(md_root.glob("*.md"))
     if not md_files:
         report.findings.append(
             Finding(
@@ -500,7 +576,7 @@ def run(
                 )
             )
 
-    _check_footprints(report, bom_rows, footprints_root)
+    _check_footprints(report, bom_rows, footprints_root, project_dir)
     _check_pin_maps(report, bom_rows, pinout_refs)
 
     # A connector with a pinout but no BOM row gets no footprint placed.

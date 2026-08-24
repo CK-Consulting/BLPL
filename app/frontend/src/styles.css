@@ -786,3 +786,14 @@ header .logo-lockup { font-size: 13px; }
 }
 .numbered-line { flex: 1; white-space: pre-wrap; word-break: break-word; }
 .numbered-row:hover { background: #171a21; }
+
+/* The KiCad launcher. A link, not a tab: it leaves the workbench, and looking
+   like a tab would promise it comes back. */
+.kicad-launch { white-space: nowrap; }
+header .kicad-launch { margin-left: .4rem; }
+.preflight-tools {
+  display: flex; align-items: center; gap: .7rem; flex-wrap: wrap;
+  margin: .2rem 0 .8rem; padding: .55rem .7rem;
+  border: 1px solid #2a2f38; border-radius: 6px; background: #14171d;
+}
+.preflight-tools code { color: #90a1b9; }

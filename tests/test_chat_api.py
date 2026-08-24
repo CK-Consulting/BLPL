@@ -809,3 +809,31 @@ def test_check_stage0_reports_without_writing(project) -> None:
     assert {"refdes": "U1", "pins": 2} in out["connectors"]
     # The point of a check is that it changes nothing.
     assert sorted(p.name for p in (project / ".pipeline").iterdir()) == before
+
+
+def test_a_part_in_the_component_library_can_still_be_rendered(project) -> None:
+    """Codex, PR #14. The advice could not be taken.
+
+    extract_datasheet_specs returns early with a stored payload for a part
+    already in the user's library and never writes a project-local extraction —
+    so pinout_section found nothing and said to run extraction, which returned
+    the same stored payload again."""
+    from app.agent import ToolExecutor, default_tools
+
+    class Lib:
+        def get(self, mpn):
+            return {"pinout": {"data": [{"numbers": ["1", "2"], "name": "VDD"}]}} if mpn == "X1" else None
+
+        def put(self, mpn, payload):
+            pass
+
+    ctx = _ctx(project)
+    ctx.library = Lib()
+
+    async def approve(_r):
+        return True
+
+    ex = ToolExecutor(default_tools(), ctx, approve=approve)
+    r = asyncio.run(ex(ToolUseBlock(id="t", name="pinout_section", input={"refdes": "U1", "mpn": "X1"})))
+    assert not r.is_error, r.content
+    assert "| 1 | VDD" in r.content and "| 2 | VDD" in r.content

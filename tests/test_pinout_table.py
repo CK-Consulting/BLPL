@@ -41,11 +41,24 @@ def test_a_row_missing_either_half_is_left_out() -> None:
     assert not [r for r in pt.rows(SAMPLE) if r["signal"] in ("", "NOPINS")]
 
 
-def test_a_pipe_in_a_value_cannot_break_the_table() -> None:
-    out = pt.render("U1", "X", [{"numbers": ["1"], "name": "A|B", "description": "c|d"}])
-    body = [l for l in out.splitlines() if l.startswith("| 1 ")][0]
-    assert body.count("|") == 4 + 2  # cell borders only; the two in the values are escaped
-    assert "\\|" in body
+def test_a_pipe_in_a_value_survives_the_round_trip(tmp_path) -> None:
+    """This test used to count pipes in the rendered row and call that safe.
+
+    It was not. Stage 0 split on every pipe, escaped or not, so `A|B` arrived as
+    a signal named `A\\` with the description shifted a column along — and the
+    test passed, because counting characters is not reading the row back. The
+    splitter honours the escape now, and the assertion is what Stage 0 got."""
+    doc = tmp_path / "d.md"
+    doc.write_text(
+        "# T\n\n" + pt.render("U1", "X", [
+            {"numbers": ["1"], "name": "A|B", "description": "c|d"},
+            {"numbers": ["2"], "name": "VDD", "description": "power"},
+        ]),
+        encoding="utf-8",
+    )
+    pins = s0.extract([doc])["connectors"][0]["pins"]
+    assert pins[0] == {"pin": "1", "signal": "A|B", "function": "c|d"}
+    assert pins[1]["signal"] == "VDD"
 
 
 def test_it_round_trips_through_the_real_stage_0(tmp_path) -> None:
@@ -66,10 +79,32 @@ def test_the_extracted_file_is_found_by_a_differently_spelled_mpn(tmp_path) -> N
     (d / "BD0926-V9.3.pinout.result.json").write_text(
         json.dumps({"data": [{"numbers": ["1"], "name": "RF"}]}), encoding="utf-8"
     )
-    # The BOM may spell it without the revision the datasheet carries.
+    # Punctuation and case may differ between the BOM and the datasheet.
     assert pt.extracted_path(tmp_path, "BD0926-V9.3") is not None
-    assert pt.extracted_path(tmp_path, "BD0926-V9.3-EXTRA") is not None
+    assert pt.extracted_path(tmp_path, "bd0926v93") is not None
+    # But a different orderable part must not be answered with this one's map.
+    # This test previously asserted the opposite, which is how the behaviour got
+    # written: variants routinely share a prefix and differ in package or pinout,
+    # so a near miss is a plausible board that is wrong.
+    assert pt.extracted_path(tmp_path, "BD0926-V9.32") is None
     assert pt.extracted_path(tmp_path, "SOMETHINGELSE") is None
+
+
+def test_it_cannot_be_walked_out_of_the_project(tmp_path) -> None:
+    """An MPN is a string out of a design document, and it was used to build a
+    path. `../../../` in it resolved into another project's extraction and
+    loaded it, because the check was whether a file was there rather than
+    whether it was ours."""
+    here = tmp_path / "proj" / "datasheets" / "extracted"
+    here.mkdir(parents=True)
+    elsewhere = tmp_path / "other" / "datasheets" / "extracted"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "SECRET.pinout.result.json").write_text(
+        json.dumps({"data": [{"numbers": ["1"], "name": "LEAK"}]}), encoding="utf-8"
+    )
+    assert pt.extracted_path(
+        tmp_path / "proj", "../../../../other/datasheets/extracted/SECRET"
+    ) is None
 
 
 def test_load_accepts_both_shapes(tmp_path) -> None:

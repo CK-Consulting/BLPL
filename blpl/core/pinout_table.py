@@ -86,20 +86,48 @@ def render(refdes: str, mpn: str, data: list[dict], *, source: str = "") -> str:
 
 
 def extracted_path(project_dir: Path, mpn: str) -> Path | None:
-    """The extracted pin map for this MPN, if one has been produced."""
-    d = Path(project_dir) / "datasheets" / "extracted"
+    """The extracted pin map for this MPN, if one has been produced.
+
+    Two things this must not do, both found in review.
+
+    It must not leave the folder. An MPN is a string from a design document, and
+    ``d / f"{mpn}.pinout.result.json"`` with ``../../../`` in it resolved to
+    another project's extraction and loaded it — the existence check was "is
+    there a file there", which is not the same question as "is it ours". Every
+    candidate is now resolved and required to sit inside this project's
+    ``datasheets/extracted``.
+
+    And it must not answer for a part that was not asked for. Matching on a
+    shared prefix meant that with ``BD0926-V9.3`` cached, asking for
+    ``BD0926-V9.32`` — a different orderable part — returned the first one's pin
+    map. Orderable variants routinely share a prefix and differ in package or
+    pinout, so a near miss here is a plausible, wrong board. The name must match
+    exactly once punctuation and case are set aside; anything else returns None
+    and the caller is told to extract.
+    """
+    d = (Path(project_dir) / "datasheets" / "extracted").resolve()
     if not d.is_dir():
         return None
-    exact = d / f"{mpn}.pinout.result.json"
-    if exact.is_file():
+
+    def inside(p: Path) -> Path | None:
+        try:
+            r = p.resolve()
+        except OSError:
+            return None
+        return r if r.is_file() and r.is_relative_to(d) else None
+
+    exact = inside(d / f"{mpn}.pinout.result.json")
+    if exact:
         return exact
-    # Extraction files are named for the MPN as the datasheet gave it, which is
-    # not always how the BOM spells it.
+    # The datasheet may spell the part differently from the BOM — case, dashes,
+    # dots — but it is the same string underneath or it is a different part.
     flat = re.sub(r"[^A-Za-z0-9]", "", mpn).upper()
+    if not flat:
+        return None
     for f in sorted(d.glob("*.pinout.result.json")):
         stem = re.sub(r"[^A-Za-z0-9]", "", f.name[: -len(".pinout.result.json")]).upper()
-        if stem and (stem == flat or flat.startswith(stem)):
-            return f
+        if stem == flat:
+            return inside(f)
     return None
 
 

@@ -24,16 +24,24 @@ class ParsedTable:
 
 
 def _clean_cell(cell: str) -> str:
-    return cell.strip().strip("*").strip()
+    # The escape comes off here, at the end, so the value is what was written.
+    return cell.strip().strip("*").strip().replace("\\|", "|")
+
+
+# A pipe that is part of a value rather than a cell boundary, written the way
+# every Markdown renderer expects. Splitting on it as a delimiter turned a
+# signal named `A|B` into a cell `A\\` and shifted every column after it along —
+# silently, because the row still had the shape of a row.
+_UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
 
 
 def _split_row(line: str) -> list[str]:
     stripped = line.strip()
-    if stripped.startswith("|"):
+    if stripped.startswith("|") :
         stripped = stripped[1:]
-    if stripped.endswith("|"):
+    if stripped.endswith("|") and not stripped.endswith("\\|"):
         stripped = stripped[:-1]
-    return [_clean_cell(c) for c in stripped.split("|")]
+    return [_clean_cell(c) for c in _UNESCAPED_PIPE.split(stripped)]
 
 
 def extract_tables(text: str, source_file: str) -> list[ParsedTable]:
