@@ -722,6 +722,77 @@ def _board_of(path: str) -> str | None:
     return parts[0] if len(parts) > 1 else None
 
 
+async def _suggest_footprint(ctx: ToolContext, args: dict) -> str:
+    """Which footprints a package string could mean, and what would narrow it.
+
+    A BOM names a package and the pipeline needs a land pattern, and the gap
+    between them is not closable by resemblance: "SOIC-8" is five different
+    bodies in the stock library, and "QFN-24, 4x4mm, 0.5mm pitch" — already
+    pinned down in body and pitch — is a couple of dozen footprints differing
+    only in the pad under the part.
+
+    So this answers with the whole set rather than a favourite, and says what
+    the design would have to state to cut it down. Choosing is a decision with
+    copper consequences and it belongs to whoever can read the datasheet.
+    """
+    from blpl.core import doctor as _doctor
+    from blpl.core import footprint_match
+    from blpl.core.stage6_compile_kicad import _DEFAULT_FOOTPRINTS
+
+    package = str(args.get("package") or "").strip()
+    mpn = str(args.get("mpn") or "").strip()
+    if not package:
+        raise ToolDenied("'package' is needed — the package string as the BOM spells it")
+
+    pad = _doctor._exposed_pad_for(ctx.project_dir, mpn) if mpn else None
+    # Every root, not the first that answers. Stopping early turned "one custom
+    # match and eight stock matches" into "one match" — the outcome that means
+    # use it without asking — which is the opposite of what this tool is for.
+    roots = [r for r, _ in _footprint_roots(ctx.project_dir, _DEFAULT_FOOTPRINTS)]
+    found = footprint_match.find_all(package, roots, exposed_pad=pad)
+
+    q = found.parsed
+    missing = []
+    if not q.body:
+        missing.append("body size")
+    if not q.pitch:
+        missing.append("pitch")
+    if q.body and q.pitch and not pad:
+        missing.append("exposed pad (from the datasheet, not the BOM)")
+
+    return json.dumps(
+        {
+            "package": package,
+            "read_as": {
+                "family": q.family or None,
+                "pins": q.pins,
+                "body_mm": list(q.body) if q.body else None,
+                "pitch_mm": q.pitch,
+                "exposed_pad_mm": list(pad) if pad else None,
+            },
+            "outcome": found.outcome,
+            "candidates": found.candidates[:40],
+            "candidates_omitted": max(0, len(found.candidates) - 40),
+            "would_narrow_it": missing,
+            "note": (
+                "One candidate is an answer. Several is a decision — take the missing "
+                "dimensions from the datasheet's package drawing, or name the footprint in "
+                "full. None means nothing in the libraries fits: draw it into "
+                "libraries/footprints/, or generate it from the package drawing with "
+                "kicad-footprint-generator, which is what a standard package the stock "
+                "library happens to lack is for."
+            ),
+        },
+        indent=2,
+    )
+
+
+def _footprint_roots(project_dir, stock_root):
+    from blpl.core.symbol_resolution import footprint_search_path
+
+    return footprint_search_path(project_dir, stock_root)
+
+
 async def _run_doctor(ctx: ToolContext, args: dict) -> str:
     """Doctor's report on this project's markdown, as the model can act on it.
 
@@ -1499,6 +1570,24 @@ def parts_tools() -> list[ToolSpec]:
             },
             kind="file_read",
             handler=_pinout_section,
+        ),
+        ToolSpec(
+            name="suggest_footprint",
+            description=(
+                "Which footprints in the libraries a package string could mean, and what the "
+                "design would have to state to narrow it. Use it before writing a Package cell, "
+                "and whenever doctor reports a package matching several footprints or none."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "package": {"type": "string", "description": "The package as the BOM spells it, e.g. 'QFN-24-EP_4x4mm_P0.5mm'."},
+                    "mpn": {"type": "string", "description": "Optional: lets the exposed pad from this part's extracted datasheet narrow the list."},
+                },
+                "required": ["package"],
+            },
+            kind="file_read",
+            handler=_suggest_footprint,
         ),
         ToolSpec(
             name="run_doctor",

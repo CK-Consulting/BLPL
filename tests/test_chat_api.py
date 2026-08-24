@@ -837,3 +837,32 @@ def test_a_part_in_the_component_library_can_still_be_rendered(project) -> None:
     r = asyncio.run(ex(ToolUseBlock(id="t", name="pinout_section", input={"refdes": "U1", "mpn": "X1"})))
     assert not r.is_error, r.content
     assert "| 1 | VDD" in r.content and "| 2 | VDD" in r.content
+
+
+def test_suggest_footprint_answers_with_the_set_not_a_favourite(project) -> None:
+    """A BOM names a package and the pipeline needs a land pattern, and the gap
+    is not closable by resemblance. Choosing is a decision with copper
+    consequences, so this returns the whole set and what would narrow it."""
+    fp = project / "libraries" / "footprints" / "Package_DFN_QFN.pretty"
+    fp.mkdir(parents=True)
+    for ep in ("2.5x2.5", "2.6x2.6"):
+        (fp / f"QFN-24-1EP_4x4mm_P0.5mm_EP{ep}mm.kicad_mod").write_text("(footprint)")
+
+    out = json.loads(
+        _call(_ctx(project), "suggest_footprint", package="QFN-24-1EP_4x4mm_P0.5mm").content
+    )
+    assert out["outcome"] == "several"
+    # The project's own come first, and the stock library's are here too — the
+    # count is not pinned because it is a property of whatever kicad-footprints
+    # is checked out, and the point is that no root is skipped.
+    assert out["candidates"][0].startswith("Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm_EP2.")
+    assert len(out["candidates"]) > 2
+    assert "exposed pad (from the datasheet, not the BOM)" in out["would_narrow_it"]
+    assert out["read_as"]["pins"] == 24 and out["read_as"]["body_mm"] == [4.0, 4.0]
+
+
+def test_suggest_footprint_says_when_nothing_fits(project) -> None:
+    out = json.loads(_call(_ctx(project), "suggest_footprint", package="Module_25Pin").content)
+    assert out["outcome"] == "none"
+    assert not out["candidates"]
+    assert "kicad-footprint-generator" in out["note"]

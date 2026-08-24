@@ -124,6 +124,14 @@ def _is_pin_range(cell: str) -> bool:
     return False
 
 
+def _mpn_of(row: dict) -> str:
+    for key in ("mpn", "part number", "part", "part_hint"):
+        val = (row.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
 def _footprint_column(row: dict) -> str:
     for key in ("footprint", "footprint_hint", "package"):
         val = (row.get(key) or "").strip()
@@ -154,23 +162,164 @@ def _footprint_name_index(footprints_root: Path, project_dir: Path | None = None
     }
     if not names:
         return set()
-    root = Path(footprints_root)
-    _INDEX_ROOTS[frozenset(names)] = root
     return names
 
 
-# The matcher needs the root the index came from; the index itself is a set of
-# names, so the association is kept beside it rather than threaded through every
-# caller.
-_INDEX_ROOTS: dict[frozenset, Path] = {}
+def _search_roots(footprints_root: Path, project_dir: Path | None) -> list[Path]:
+    """Every footprint library Stage 5 would look in, in its order.
+
+    The index above is a set of *names* drawn from all of these, which is enough
+    to answer "does this string resemble anything". It is not enough to answer
+    "which footprints", and associating that combined index with the stock root
+    alone meant the candidate search ran against stock only — so a project's own
+    footprints were invisible to it while their names were not.
+    """
+    from .symbol_resolution import footprint_search_path
+
+    if project_dir is None:
+        return [Path(footprints_root)]
+    return [r for r, _ in footprint_search_path(project_dir, footprints_root)]
 
 
-def _footprints_root_for(known: set[str]) -> Path:
-    return _INDEX_ROOTS.get(frozenset(known), Path("."))
+def _exposed_pad_for(project_dir: Path | None, mpn: str) -> tuple[float, float] | None:
+    """The thermal pad this part's datasheet states, if it has been extracted.
+
+    The one fact that separates a dozen otherwise identical no-lead footprints,
+    and the one a BOM never carries. It is a property of the part, so it comes
+    from the extraction rather than from the design document.
+
+    Tolerated shapes, because this field has been written more than one way: a
+    mapping with x/y or length/width, and a bare pair. A boolean — which is what
+    the extraction records today for most parts — says only that there *is* a
+    pad, which cannot narrow anything and is treated as not knowing.
+    """
+    if project_dir is None or not mpn:
+        return None
+    # An MPN is a string out of a design document or a tool argument, and this
+    # builds a path from it. The same mistake was made and fixed in
+    # pinout_table.extracted_path, and then written again here: `../` in an MPN
+    # resolved into a sibling project's extraction and read it. Rejected by
+    # shape, and then the resolved path is required to still be inside.
+    if "/" in mpn or "\\" in mpn or ".." in mpn:
+        return None
+    import json as _json
+
+    d = (Path(project_dir) / "datasheets" / "extracted").resolve()
+    if not d.is_dir():
+        return None
+    for name in (f"{mpn}.base.result.json", f"{mpn}.json"):
+        f = d / name
+        try:
+            f = f.resolve()
+        except OSError:
+            continue
+        # Symlinks resolve too, so a link inside the folder cannot point out of it.
+        if not (f.is_file() and f.is_relative_to(d)):
+            continue
+        try:
+            payload = _json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        package = (payload.get("data") or payload).get("package") or {}
+        # thermal_pad_mm is where the dimensions belong; thermal_pad is a boolean
+        # saying only that a pad exists, and older extractions sometimes put a
+        # shape there anyway.
+        pad = package.get("thermal_pad_mm") or package.get("thermal_pad")
+        if isinstance(pad, dict):
+            x = pad.get("x") or pad.get("length")
+            y = pad.get("y") or pad.get("width")
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                return (float(x), float(y))
+        if isinstance(pad, (list, tuple)) and len(pad) == 2:
+            try:
+                return (float(pad[0]), float(pad[1]))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _several(
+    report: Report,
+    ref: str,
+    fp: str,
+    found,
+    exposed_pad: tuple[float, float] | None,
+    rel: str,
+    line: int,
+) -> None:
+    """A package name that names more than one land pattern.
+
+    This is the ordinary case for a no-lead package and it used to pass in
+    silence, which is the worst of the three outcomes. Stage 2 picks by
+    similarity score and Stage 5 emits what it picked: on this project that was
+    an exposed pad of 2.45mm chosen at 0.50 confidence, for a part whose real
+    pad nobody had looked up. A thermal pad that does not match the part is a
+    manufacturing defect on a board that opens, renders and routes perfectly.
+
+    Named rather than counted, up to a point — the difference between the
+    candidates is what the reader has to decide, and eight file names they can
+    compare is more use than "eight matches".
+    """
+    names = [c.split(":", 1)[1] for c in found.candidates]
+    shown = ", ".join(names[:8]) + (f" … and {len(names) - 8} more" if len(names) > 8 else "")
+    # What is missing decides the advice. Telling somebody to look up an exposed
+    # pad for a SOIC-8 is noise: there is no pad, and what separates those is the
+    # body width — 3.9mm against 5.3mm against 7.5mm, all of them "SOIC-8".
+    q = found.parsed
+    missing: list[str] = []
+    if not q.body:
+        missing.append("the body size (e.g. 4x4mm)")
+    if not q.pitch:
+        missing.append("the pitch (e.g. P0.5mm)")
+    if q.body and q.pitch and not exposed_pad:
+        missing.append("the exposed pad, if it has one (e.g. EP2.6x2.6mm)")
+
+    if exposed_pad:
+        why = (
+            f"even with the exposed pad from its datasheet "
+            f"({exposed_pad[0]}x{exposed_pad[1]}mm), these remain"
+        )
+    else:
+        why = "and the package name does not say which"
+
+    if missing:
+        fix = (
+            "Add " + ", then ".join(missing) + " from the datasheet's package drawing — a BOM "
+            "carries a package name and none of these, which is why the name alone cannot "
+            "settle it. Or give the full 'Lib:Name' of the footprint that matches the "
+            "manufacturer's recommended land pattern."
+        )
+    else:
+        fix = (
+            "Give the full 'Lib:Name' of the one that matches the manufacturer's recommended "
+            "land pattern. Where they differ only by _ThermalVias, that is a decision about "
+            "your stackup rather than about the part."
+        )
+    fix += (
+        " Left as it is, Stage 2 picks by resemblance and Stage 5 emits what it picked, which "
+        "is how a land pattern that does not match the part reaches a board that looks right."
+    )
+    report.findings.append(
+        Finding(
+            code="DOC-013",
+            severity="error",
+            summary=f"{ref}: package '{fp}' matches {len(names)} footprints {why}: {shown}.",
+            fix=fix,
+            file=rel,
+            line=line,
+        )
+    )
 
 
 def _check_bare_footprint(
-    report: Report, ref: str, fp: str, known: set[str], rel: str, line: int
+    report: Report,
+    ref: str,
+    fp: str,
+    known: set[str],
+    rel: str,
+    line: int,
+    exposed_pad: tuple[float, float] | None = None,
+    roots: list[Path] | None = None,
 ) -> None:
     """A package value with no library prefix, checked for being a real hint.
 
@@ -201,7 +350,11 @@ def _check_bare_footprint(
     from . import footprint_match
 
     if footprint_match.parse(fp).specific_enough:
-        if footprint_match.find(fp, _footprints_root_for(known)).candidates:
+        found = footprint_match.find_all(fp, roots, exposed_pad=exposed_pad)
+        if len(found.candidates) == 1:
+            return
+        if found.candidates:
+            _several(report, ref, fp, found, exposed_pad, rel, line)
             return
     else:
         # Otherwise it is a size or a description — `0402`, `USB-C Receptacle` —
@@ -258,7 +411,16 @@ def _check_footprints(
             if fp:
                 if known is None:
                     known = _footprint_name_index(footprints_root, project_dir)
-                _check_bare_footprint(report, ref, fp, known, rel, line)
+                _check_bare_footprint(
+                    report,
+                    ref,
+                    fp,
+                    known,
+                    rel,
+                    line,
+                    exposed_pad=_exposed_pad_for(project_dir, _mpn_of(row)),
+                    roots=_search_roots(footprints_root, project_dir),
+                )
             continue
         if fp not in checked:
             # Resolved the way Stage 5 resolves it, rather than probed in one

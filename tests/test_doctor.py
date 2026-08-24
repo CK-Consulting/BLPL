@@ -416,3 +416,168 @@ def test_doctor_reports_on_the_board_it_was_asked_about(tmp_path: Path) -> None:
     # The root is clean; the board is not.
     assert "DOC-012" not in _codes(doctor.run(proj, footprints_root=root))
     assert "DOC-012" in _codes(doctor.run(proj, footprints_root=root, board="sb-ant"))
+
+
+# --- DOC-013: a package that names more than one land pattern ----------------
+
+
+def test_a_package_matching_several_footprints_is_an_error(tmp_path: Path) -> None:
+    """The ordinary case for a no-lead package, and it used to pass in silence.
+
+    Stage 2 picks by similarity and Stage 5 emits what it picked — on a real
+    design that was an exposed pad of 2.45mm chosen at 0.50 confidence, for a
+    part nobody had looked up. A thermal pad that does not match the part is a
+    defect on a board that opens, renders and routes perfectly."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| U1 | BQ25895 | QFN-24-1EP_4x4mm_P0.5mm |\n"
+        ),
+    )
+    root = tmp_path / "fp"
+    lib = root / "Package_DFN_QFN.pretty"
+    lib.mkdir(parents=True)
+    for ep in ("2.5x2.5", "2.6x2.6", "2.7x2.7"):
+        (lib / f"QFN-24-1EP_4x4mm_P0.5mm_EP{ep}mm.kicad_mod").write_text("(footprint)")
+
+    hits = [f for f in doctor.run(proj, footprints_root=root).findings if f.code == "DOC-013"]
+    assert len(hits) == 1
+    assert hits[0].severity == "error"
+    assert "3 footprints" in hits[0].summary
+    # The advice names what is missing, not a generic instruction.
+    assert "exposed pad" in hits[0].fix
+
+
+def test_one_candidate_is_an_answer_not_a_finding(tmp_path: Path) -> None:
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| U1 | X | QFN-24-1EP_4x4mm_P0.5mm |\n"
+        ),
+    )
+    root = tmp_path / "fp"
+    lib = root / "Package_DFN_QFN.pretty"
+    lib.mkdir(parents=True)
+    (lib / "QFN-24-1EP_4x4mm_P0.5mm_EP2.6x2.6mm.kicad_mod").write_text("(footprint)")
+    assert "DOC-013" not in _codes(doctor.run(proj, footprints_root=root))
+
+
+def test_the_advice_fits_a_leaded_package(tmp_path: Path) -> None:
+    """Telling somebody to look up an exposed pad for a SOIC-8 is noise: there is
+    no pad, and what separates those is the body width."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(proj, design__md="## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | SOIC-8 |\n")
+    root = tmp_path / "fp"
+    lib = root / "Package_SO.pretty"
+    lib.mkdir(parents=True)
+    for body in ("3.9x4.9mm_P1.27mm", "5.3x5.3mm_P1.27mm"):
+        (lib / f"SOIC-8_{body}.kicad_mod").write_text("(footprint)")
+    hits = [f for f in doctor.run(proj, footprints_root=root).findings if f.code == "DOC-013"]
+    assert hits and "body size" in hits[0].fix
+    assert "exposed pad" not in hits[0].fix
+
+
+def test_the_exposed_pad_from_the_datasheet_narrows_it(tmp_path: Path) -> None:
+    """The one fact that separates a dozen no-lead footprints, and the one a BOM
+    never carries — so it comes from the extraction."""
+    import json as _json
+
+    proj = tmp_path / "p"
+    (proj / "datasheets" / "extracted").mkdir(parents=True)
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| U1 | BQ25895 | QFN-24-1EP_4x4mm_P0.5mm |\n"
+        ),
+    )
+    (proj / "datasheets" / "extracted" / "BQ25895.base.result.json").write_text(
+        _json.dumps({"data": {"package": {"thermal_pad": {"x": 2.6, "y": 2.6}}}}), encoding="utf-8"
+    )
+    root = tmp_path / "fp"
+    lib = root / "Package_DFN_QFN.pretty"
+    lib.mkdir(parents=True)
+    for ep in ("2.5x2.5", "2.6x2.6", "2.7x2.7"):
+        (lib / f"QFN-24-1EP_4x4mm_P0.5mm_EP{ep}mm.kicad_mod").write_text("(footprint)")
+
+    # Three candidates without it, one with it — so no finding at all.
+    assert "DOC-013" not in _codes(doctor.run(proj, footprints_root=root))
+
+
+def test_the_pad_dimensions_are_read_from_where_the_schema_puts_them(tmp_path: Path) -> None:
+    """`thermal_pad` is a boolean — it says a pad exists and narrows nothing.
+    The dimensions live in `thermal_pad_mm`, which is what the extraction schema
+    gained so the model could record them at all."""
+    import json as _json
+
+    proj = tmp_path / "p"
+    (proj / "datasheets" / "extracted").mkdir(parents=True)
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| U1 | PART9 | QFN-24-1EP_4x4mm_P0.5mm |\n"
+        ),
+    )
+    (proj / "datasheets" / "extracted" / "PART9.base.result.json").write_text(
+        _json.dumps(
+            {"data": {"package": {"thermal_pad": True, "thermal_pad_mm": {"length": 2.6, "width": 2.6}}}}
+        ),
+        encoding="utf-8",
+    )
+    root = tmp_path / "fp"
+    lib = root / "Package_DFN_QFN.pretty"
+    lib.mkdir(parents=True)
+    for ep in ("2.5x2.5", "2.6x2.6", "2.7x2.7"):
+        (lib / f"QFN-24-1EP_4x4mm_P0.5mm_EP{ep}mm.kicad_mod").write_text("(footprint)")
+
+    # `thermal_pad: true` alone would leave three candidates and an error.
+    assert "DOC-013" not in _codes(doctor.run(proj, footprints_root=root))
+
+
+def test_candidates_come_from_every_library_stage_5_searches(tmp_path: Path) -> None:
+    """Codex, PR #23. Searching one root and stopping loses the count.
+
+    Stage 5 looks in libraries/footprints, module libraries, generated, then
+    stock. Counting candidates in stock alone turns "one custom match and eight
+    stock matches" into "one match" — the outcome that means use it without
+    asking."""
+    from blpl.core import footprint_match
+
+    proj = tmp_path / "p"
+    mine = proj / "libraries" / "footprints" / "Mine.pretty"
+    mine.mkdir(parents=True)
+    (mine / "QFN-8-1EP_2x2mm_P0.5mm_EP1x1mm.kicad_mod").write_text("(footprint)")
+    stock = tmp_path / "stock"
+    lib = stock / "Package_DFN_QFN.pretty"
+    lib.mkdir(parents=True)
+    (lib / "QFN-8-1EP_2x2mm_P0.5mm_EP0.9x0.9mm.kicad_mod").write_text("(footprint)")
+
+    roots = doctor._search_roots(stock, proj)
+    got = footprint_match.find_all("QFN-8-1EP_2x2mm_P0.5mm", roots)
+    assert len(got.candidates) == 2, got.candidates
+    assert got.candidates[0].startswith("Mine:"), "the project's own comes first"
+    # And the same name in two roots is one footprint.
+    assert len(footprint_match.find_all("QFN-8-1EP_2x2mm_P0.5mm", roots + roots).candidates) == 2
+
+
+def test_an_mpn_cannot_walk_out_of_the_extraction_folder(tmp_path: Path) -> None:
+    """Codex, PR #23. The same mistake as pinout_table.extracted_path, written
+    again in a new function: an MPN is a string from a document, and this builds
+    a path from it."""
+    proj = tmp_path / "p"
+    (proj / "datasheets" / "extracted").mkdir(parents=True)
+    other = tmp_path / "other" / "datasheets" / "extracted"
+    other.mkdir(parents=True)
+    (other / "LEAK.base.result.json").write_text(
+        '{"data":{"package":{"thermal_pad_mm":{"length":9.9,"width":9.9}}}}', encoding="utf-8"
+    )
+    assert doctor._exposed_pad_for(proj, "../../../other/datasheets/extracted/LEAK") is None
+    assert doctor._exposed_pad_for(proj, "sub/dir") is None

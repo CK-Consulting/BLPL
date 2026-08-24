@@ -389,6 +389,14 @@ These aren't style preferences — they affect what the pipeline can parse.
 4. **Power-rail naming**: `GND`, `VBUS`, `VCC_3V3`, `VCC_1V8`, `VCC_0V85`, `1.5V`. The regex `^\d+(\.\d+)?V` classifies these as `Power_Bulk` automatically. Don't write `3.3V RAIL` — that won't match.
 5. **Package strings use KiCad library form, complete**: `Package_BGA:TFBGA-216_13x13mm_Layout15x15_P0.8mm`, `Connector_USB:USB_C_Receptacle_Amphenol_12401548E4-2A`, `Connector_FFC-FPC:Hirose_FH12-40S-0.5SH_1x40-1MP_P0.50mm_Horizontal`. Check it exists in `kicad-footprints/<Lib>.pretty/` before writing it.
 
+   **Ask before you write one.** `suggest_footprint` answers with every footprint
+   in the libraries a package string could mean, and what the design would have
+   to state to narrow it. One candidate is an answer. Several is a decision —
+   "SOIC-8" is five different bodies, and "QFN-24, 4x4mm, 0.5mm pitch" is a
+   couple of dozen footprints differing only in the pad under the part, which no
+   BOM carries and only the datasheet's package drawing knows. None means
+   nothing in the libraries fits and one has to be drawn or generated.
+
    **Never abbreviate one.** A cell reading `Package_UFBGA:…_0.5mm` is a real
    entry in a real design document, written because an earlier version of this
    page used `Package_BGA:…` to mean "and so on". Stage 5 cannot tell an

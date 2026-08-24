@@ -190,6 +190,39 @@ def find(
     return match
 
 
+def find_all(
+    package: str,
+    roots,
+    *,
+    exposed_pad: tuple[float, float] | None = None,
+) -> Match:
+    """Every candidate across every library Stage 5 would search, deduplicated.
+
+    Searching one root and stopping is the mistake this exists to prevent. Stage
+    5 looks in libraries/footprints, each module's library, generated footprints
+    and then stock; asking only the first that answers turns "one custom match
+    and eight stock matches" into "one match", which is the outcome that means
+    *use it without asking*. The whole point of counting candidates is lost if
+    the count is taken from part of the library.
+
+    Order is preserved — the search path is in priority order and a reader
+    comparing candidates benefits from seeing the project's own first — and a
+    `Lib:Name` seen twice is counted once, because a name that appears in two
+    roots is one footprint as far as resolution is concerned.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    parsed = None
+    for root in roots:
+        got = find(package, root, exposed_pad=exposed_pad)
+        parsed = parsed or got.parsed
+        for ref in got.candidates:
+            if ref not in seen:
+                seen.add(ref)
+                merged.append(ref)
+    return Match(parsed=parsed or parse(package), candidates=merged)
+
+
 def _apart(a: tuple[float, float], b: tuple[float, float], *, tol: float = 0.15) -> bool:
     """Whether two body sizes are different parts rather than rounding.
 
