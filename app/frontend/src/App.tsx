@@ -284,6 +284,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                 <FileView
                   projectId={selected}
                   onSaved={refresh}
+                  reloadToken={reloadToken}
                   path={
                     openFile && destinationFor(openFile) === "text" ? openFile.path : null
                   }

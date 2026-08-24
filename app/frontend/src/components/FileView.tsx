@@ -26,11 +26,15 @@ export function FileView({
   projectId,
   path,
   onSaved,
+  reloadToken,
 }: {
   projectId: string;
   /** Project-relative path chosen in the file tree. */
   path: string | null;
   onSaved: () => void;
+  /** Bumped when something outside this pane changes the project — a proposal
+   *  applied from the chat, a sync, a run that rewrote a document. */
+  reloadToken: number;
 }) {
   const [content, setContent] = useState("");
   const [draft, setDraft] = useState("");
@@ -45,8 +49,29 @@ export function FileView({
   const savable = !!path && SAVABLE.test(path);
   const dirty = editing && draft !== content;
 
+  // Read in the effect rather than closed over, so re-running on reloadToken
+  // sees whether there is unsaved work right now.
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
+  const shownPath = useRef<string | null>(null);
+
   useEffect(() => {
-    setEditing(false);
+    const openedAnother = shownPath.current !== path;
+    shownPath.current = path;
+    // Accepting a proposal rewrites the file under this pane. Until now nothing
+    // told it so: the fetch ran once per path and the reader went on looking at
+    // the version from whenever they opened it — including, in one case, right
+    // after accepting the change they were looking for. Every other panel took
+    // reloadToken; this one was missed.
+    //
+    // The exception is unsaved work. A refetch mid-edit would replace a draft
+    // with what is on disk, which is a worse failure than a stale view, so the
+    // reload is skipped while the editor is dirty and the file is unchanged.
+    if (!openedAnother && dirtyRef.current) return;
+    if (openedAnother) {
+      setEditing(false);
+      setSource(false);
+    }
     setStatus(null);
     setError(null);
     if (!path) {
@@ -63,7 +88,12 @@ export function FileView({
         if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         const text = await res.text();
         if (cancelled) return;
-        setContent(text);
+        setContent((prev) => {
+          // Say so when the file moved underneath, rather than swapping the
+          // text out in silence and leaving the reader to wonder.
+          if (!openedAnother && prev && prev !== text) setStatus("reloaded — changed on disk");
+          return text;
+        });
         setDraft(text);
       } catch (e) {
         if (!cancelled) setError((e as Error).message);
@@ -72,7 +102,7 @@ export function FileView({
     return () => {
       cancelled = true;
     };
-  }, [projectId, path]);
+  }, [projectId, path, reloadToken]);
 
   const save = async () => {
     if (!path || !savable) return;
