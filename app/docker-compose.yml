@@ -305,8 +305,17 @@ services:
     environment:
         - BLPL_CLERK_ISSUER=${BLPL_CLERK_ISSUER:-}
     restart: unless-stopped
+    volumes:
+      # The Cloudflare Origin CA keypair for the 443 listener. Mounted, not
+      # copied into the image, so the private key never becomes a layer.
+      # Absent on a deployment that has not issued one — nginx then fails to
+      # start rather than quietly serving http only, which is the failure worth
+      # having: a tunnel configured for https against an origin that silently
+      # dropped it is a broken deployment that looks fine.
+      - ./certs:/etc/nginx/certs:ro
     ports:
       - "1800:80"
+      - "1443:443"
     depends_on:
       - backend
     networks:
@@ -325,8 +334,8 @@ services:
   #
   #     docker compose --profile desktop up -d kicad-desktop
   #
-  # A GPU helps here and only here — the 3D viewer's OpenGL, for a human
-  # spinning a board. Uncomment the device passthrough on a host that has one.
+  # A GPU would help here and only here — the 3D viewer's OpenGL, for a human
+  # spinning a board. It is not usable on this host; see the environment block.
   kicad-desktop:
  #   profiles: ["desktop"]
     image: lscr.io/linuxserver/kicad:latest
@@ -335,35 +344,130 @@ services:
     networks:
       - blpl
     environment:
-      - PUID=${PUID:-1000}
-      - PGID=${PGID:-1000}
+      # Root, and not by carelessness — by matching the uid that already owns
+      # the files. The backend and the worker run as root, so every project
+      # directory, every .git, and every file the pipeline writes under
+      # data/projects is root:root 755. A desktop running as 1000 can read all
+      # of it and write none of it, which makes "open KiCad and add the missing
+      # footprint" a desktop that opens the board and cannot save it.
+      #
+      # The obvious repair — chown -R 1000:1000 data/projects — breaks the
+      # pipeline. Each project working copy is a git repository, git refuses a
+      # repository owned by someone other than the user running it ("detected
+      # dubious ownership"), and nothing in this codebase sets safe.directory.
+      # Root would stop being able to commit. Matching uids the other way costs
+      # nothing and leaves the ownership on disk untouched.
+      #
+      # This does mean KiCad runs as root inside the container. That is a
+      # smaller step than it sounds: it is already a container whose entire
+      # purpose is handing someone an interactive desktop, it holds no
+      # capabilities beyond the default set, and it can only reach what is
+      # mounted below. Set PUID/PGID to a real user on a deployment whose
+      # pipeline does not run as root.
+      - PUID=${PUID:-0}
+      - PGID=${PGID:-0}
       - TZ=${TZ:-Etc/UTC}
-      - AUTO_GPU=true
       - PIXELFLUX_WAYLAND=true
-      - DRINODE=/dev/dri/renderD128
-      - DRI_NODE=/dev/dri/renderD128
-    devices:
-      - /dev/dri:/dev/dri
+      # Software rendering, on purpose, on this host. The three lines below are
+      # not a fallback that got left in — they are the only configuration that
+      # produces a desktop here, and the reason is worth writing down because
+      # the obvious change (AUTO_GPU=true + /dev/dri passthrough, straight out
+      # of https://docs.linuxserver.io/images/docker-kicad/) makes it strictly
+      # worse.
+      #
+      # This box has one GPU: an RTX 5090 on the proprietary `nvidia` kernel
+      # driver (/dev/dri/renderD128, /dev/dri/card1 — card0 is the ASPEED BMC
+      # and has no render node at all). This image is Alpine/musl, and it ships
+      # Mesa: /usr/lib/dri has nouveau_dri.so and swrast, and nothing that can
+      # drive a card bound to the closed driver. NVIDIA's own userspace is
+      # glibc-linked, so the NVIDIA container runtime cannot supply it here
+      # either.
+      #
+      # So passing the node in does not enable acceleration; it only gives
+      # wlroots something to fail on. With /dev/dri mounted, labwc picks
+      # renderD128, Mesa answers "pci id for fd 14: 10de:2b85, driver (null)",
+      # EGL fails, Vulkan cannot match the DRM device, and labwc exits with
+      # "unable to create renderer". s6 restarts it, it exits again, and the
+      # browser gets a served page with no desktop behind it — a blank screen
+      # and a log looping on "[svc-de] ... found launching de". That is exactly
+      # the failure the GPU flags introduced.
+      #
+      # Pixman for the compositor and llvmpipe for GL inside it is the correct
+      # end state for this host, not a compromise. It is also what the earlier,
+      # working configuration was doing when it logged "No render node.
+      # Initializing Software Renderer (Pixman)" — that line was the desktop
+      # coming up, not a warning.
+      #
+      # On a host with an Intel or AMD GPU (or NVIDIA under a glibc image with
+      # the NVIDIA container runtime and NVIDIA_DRIVER_CAPABILITIES including
+      # `graphics`), drop these three, add `AUTO_GPU=true`, and pass the node:
+      #
+      #     devices:
+      #       - /dev/dri:/dev/dri
+      - WLR_RENDERER=pixman
+      - WLR_RENDERER_ALLOW_SOFTWARE=1
+      - LIBGL_ALWAYS_SOFTWARE=1
     volumes:
       - ./data/kicad-desktop:/config
-      # Deliberately ONE project, named explicitly, rather than the projects
-      # root. Mounting the root would hand every project to whoever opens this
-      # desktop, which is precisely the boundary the app spent this phase
-      # building.
-      - ./data/projects/${KICAD_DESKTOP_PROJECT:-none}:/config/project
+      # One variable, two shapes, and the empty default is the useful one.
+      #
+      # Unset, this expands to `./data/projects/` — the whole root, so every
+      # project is on the desktop at once. That is what a person moving between
+      # boards actually needs, and it is why the gate in front of this
+      # (/api/authz/gate) asks for membership of every project in the root
+      # rather than of one named project: the desktop is a single shared Unix
+      # session and cannot show different files to different callers, so the
+      # permission check has to cover everything mounted. Adding a project
+      # therefore narrows who may open the desktop, automatically, with no
+      # second list to keep in step.
+      #
+      # Set it to a project name and only that project is mounted, and the gate
+      # asks only about it. That is the shape for a deployment with members who
+      # are not on everything.
+      #
+      # Two things to mind about the root form.
+      #
+      # Docker creates a missing bind source, so a misspelt name yields an empty
+      # directory and a desktop with nothing in it rather than an error.
+      # `data/projects/none` is one of those, left over from the default this
+      # used to carry.
+      #
+      # And the gate authorizes *opening* the desktop, which is a narrower claim
+      # than it reads as. This is a live mount under a long-lived session: a
+      # project created by someone else after you opened the desktop shows up in
+      # your running session, and per-request membership cannot bound a session
+      # that makes no further request. Closing that needs revocation inside the
+      # desktop, which does not exist. Nothing on a one-operator deployment; the
+      # reason a deployment with accounts that are not on everything should name
+      # a single project here rather than mount the root.
+      - ./data/projects/${KICAD_DESKTOP_PROJECT:-}:/config/projects
       - ../kicad-symbols:/usr/share/kicad/symbols:ro
       - ../kicad-footprints:/usr/share/kicad/footprints:ro
       - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
+    # Loopback only, and no websocket port. Both halves matter.
+    #
+    # The stream does not need a second published port. Selkies' client builds
+    # its socket URL from the page it was served by — location.pathname up to
+    # the last slash, plus "websockets" — and the container's own nginx has a
+    # `location /websocket` (a prefix, so /websockets matches) proxying to
+    # 127.0.0.1:8082 internally. Served at /kicad/ it therefore asks for
+    # /kicad/websockets on this origin, which the frontend passes through with
+    # the prefix stripped. Publishing 8082 adds nothing the browser uses.
+    #
+    # What it does add is a way around the gate. This desktop has no
+    # authentication of its own; the only thing standing in front of it is the
+    # `auth_request` in the frontend's /kicad/ location. A port published on
+    # 0.0.0.0 is reachable without passing through that, which is the whole
+    # boundary undone by a line in a ports list. 3010 stays for looking at the
+    # container directly from this machine, bound where only this machine can
+    # reach it.
     ports:
-      - "${KICAD_DESKTOP_PORT:-3010}:3000"
-      - "${KICAD_DESKTOP_WEBSOCKET_PORT:-8082}:8082"
+      - "127.0.0.1:${KICAD_DESKTOP_PORT:-3010}:3000"
     # KasmVNC needs a larger shared memory segment than Docker's 64 MB default;
     # without it the desktop dies as soon as anything opens a real window.
     shm_size: "4gb"
     security_opt:
       - seccomp:unconfined
-    # devices:
-    #   - /dev/dri:/dev/dri   # GPU for the 3D viewer, on a host that has one
 
 
   # Malware scanning for retrieved files. Optional, and off unless you start it:

@@ -352,8 +352,10 @@ def _load_config() -> AppConfig:
 
 @app.api_route("/api/authz/gate", methods=["GET", "HEAD"])
 def authz_gate(
-    user: User = Depends(require_onboarded),
+    request: Request,
     session: Session = Depends(session_scope),
+    authorization: str | None = Header(default=None),
+    __session: str | None = Cookie(default=None, alias="__session"),
 ) -> Response:
     """A yes/no for nginx, so a proxied app can be put behind this app's sign-in.
 
@@ -372,17 +374,95 @@ def authz_gate(
     used HEAD — a GET-only route answered 405, which auth_request reads as a
     denial, so the button stayed hidden while the desktop was running.
 
-    And signed in is not enough. The desktop mounts one project, named by
-    KICAD_DESKTOP_PROJECT, and every project route in this app checks membership
-    before opening anything. Letting any onboarded account through would put
-    that project's files, and a shared desktop session, in front of people who
-    are not on it.
+    And signed in is not enough. Every project route in this app checks
+    membership before opening anything; letting any onboarded account through
+    would put project files, and a shared desktop session, in front of people
+    who are not on them.
+
+    What "membership" means here depends on what is mounted, and there are two
+    shapes because a desktop cannot do what an HTTP route does. A route answers
+    one request and can hand a different caller different files. This is one
+    long-lived Unix session on one filesystem, shared by whoever opens it — two
+    people looking at /kicad/ are looking at the same screen. So the gate can
+    only ever be all-or-nothing over the mounted set, and the honest thing is to
+    make it say so:
+
+      * KICAD_DESKTOP_PROJECT names a project — that one is mounted, so
+        membership of it is the question, exactly as before.
+
+      * It is unset (the default, and what a multi-project workspace wants) —
+        the whole projects root is mounted, so the question is membership of
+        every project in it. Computed per request from the directory rather
+        than from a list someone has to remember to update, which means adding
+        a project cannot silently widen who may open the desktop.
+
+    For a single-operator deployment the second form is simply "all of mine",
+    with nothing to configure. On a shared one it denies anybody who is not on
+    all of them — which is not a regression but the truth about a shared
+    filesystem, and the reason to name a single project instead.
+
+    Directories with no project row are ignored rather than treated as a denial.
+    Nothing but this app writes into the root, so such a directory holds nothing
+    the ACL governs — and a leftover empty one (KICAD_DESKTOP_PROJECT pointing
+    at a name that did not exist creates one, which is how `projects/none`
+    appeared) would otherwise lock every account out of the desktop.
+
+    What this route authorizes is *opening* the desktop, and that is a narrower
+    claim than it may read as. The desktop is a long-lived session over a live
+    bind mount, so a project created after someone opened it appears in their
+    already-running session without another trip through here. Per-request
+    membership cannot bound a session that never makes another request; closing
+    that gap needs revocation inside the desktop, which does not exist. It is
+    not a problem on a deployment with one operator, and it is the reason a
+    deployment with accounts that are not on everything should name a single
+    project in KICAD_DESKTOP_PROJECT instead of mounting the root.
+
+    Every answer here is 204, 401 or 403, and nothing else — which is why this
+    route resolves its own user instead of taking Depends(require_onboarded).
+    nginx's auth_request understands exactly those denial codes and turns every
+    other non-2xx into a bare 500 for the browser; `error_page 404` does not
+    catch it, which is measurable:
+
+        gate returns 403  -> client gets 302   (error_page runs)
+        gate returns 404  -> client gets 500   "auth request unexpected status"
+        gate returns 428  -> client gets 500   "auth request unexpected status"
+
+    The dependency chain answers 428 for an unfinished profile, 404 for a
+    non-member, 423 for a sealed project and 503 when Clerk is unconfigured, and
+    every one of those reached the browser as a server error. Collapsing them to
+    403 loses nothing: this response is read by nginx, never rendered, and the
+    person is redirected to sign in either way.
     """
-    project_id = (os.environ.get("KICAD_DESKTOP_PROJECT") or "").strip()
-    if project_id and project_id != "none":
-        # Raises exactly as every other project route does when the caller is
-        # not a member.
-        _project_dir(session, user, project_id)
+    try:
+        user = require_user(request, session, authorization, __session)
+        if not profile_mod.is_complete(user):
+            raise HTTPException(status_code=403, detail="onboarding incomplete")
+
+        project_id = (os.environ.get("KICAD_DESKTOP_PROJECT") or "").strip()
+        if project_id and project_id != "none":
+            # Raises exactly as every other project route does when the caller
+            # is not a member.
+            _project_dir(session, user, project_id)
+        else:
+            try:
+                mounted = {d.name for d in PROJECTS_ROOT.iterdir() if d.is_dir()}
+            except FileNotFoundError:
+                mounted = set()
+            known = set(session.execute(select(Project.name)).scalars())
+            mine = {p.name for p in projectacl.visible(session, user)}
+            # Checked against `visible`, not `require_member` in a loop: one
+            # query, and a sealed project does not become a 423 that would deny
+            # the whole desktop over one project nobody has opened yet. Its
+            # files are ciphertext on disk either way — useless in KiCad, but
+            # not a leak.
+            if not ((mounted & known) <= mine):
+                raise HTTPException(status_code=403, detail="not a member of every mounted project")
+    except HTTPException as exc:
+        # 401 is the one code worth preserving: it is what nginx expects for
+        # "not signed in", and it is already correct. Everything else becomes
+        # 403 so that no denial can arrive at the browser as a 500.
+        raise HTTPException(status_code=401 if exc.status_code == 401 else 403) from exc
+
     return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
 

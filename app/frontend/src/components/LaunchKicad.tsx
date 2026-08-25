@@ -31,7 +31,15 @@ export function useKicadDesktop(): string | null {
     // method, so a HEAD probe asked a GET-only gate and got 405 — read as a
     // denial, leaving the button hidden while the desktop was running. The gate
     // answers both now; the probe stays on the method that cannot surprise it.
-    fetch(KICAD_PATH, { method: "GET", credentials: "same-origin" })
+    //
+    // redirect: "manual", because the default hides the answer. A denial is a
+    // 302 to the workbench, fetch follows it, and the 200 that comes back from
+    // the app root sets r.ok — so the button appeared whenever the app was up,
+    // whatever the gate said, and clicking it opened a new tab that bounced
+    // straight back to BLPL. Which reads, from the outside, exactly like KiCad
+    // failing to load. Manual turns that 302 into an opaque redirect: status 0,
+    // ok false, which is the honest reading of "you may not open this".
+    fetch(KICAD_PATH, { method: "GET", credentials: "same-origin", redirect: "manual" })
       .then((r) => {
         if (!gone) setOk(r.ok);
       })
