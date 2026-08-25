@@ -195,9 +195,22 @@ def emit(
     board_dim = tuple(project_config.get("project", {}).get("dimensions", [100, 80]))
     components_out: dict[str, Any] = {}
     rows = bom["rows"]
+    not_placed: list[str] = []
     for i, row in enumerate(rows):
         refdes = row.get("refdes") or row["local_id"]
         coverage_row = cov_by_id.get(row["local_id"])
+        if symbol_resolution.is_not_placed(
+            row.get("footprint") or row.get("footprint_hint") or row.get("package") or ""
+        ):
+            # Declared as never landing on the board — a bare coin cell in a
+            # retainer clip, a wire-terminated speaker whose connector has its
+            # own row. Emitting it would put copper under a part that must have
+            # none; resolve_footprint would substitute a placeholder header,
+            # which is exactly the wrong-copper failure this stage exists to
+            # prevent. The row stays in bom.json, so ordering still sees it —
+            # the part is bought, just never soldered.
+            not_placed.append(refdes)
+            continue
         comp: dict[str, Any] = {
             "value": row["mpn"],
             "placement": _default_placement(i, len(rows), board_dim),
@@ -270,6 +283,10 @@ def emit(
             hdm[key] = project_config[key]
     hdm["components"] = components_out
     hdm["nets"] = nets_out
+    if not_placed:
+        # Recorded rather than dropped: anyone diffing bom.json against the HDM
+        # would otherwise find rows that vanished with nothing saying why.
+        hdm["not_placed"] = sorted(not_placed)
     return hdm, resolutions, footprint_resolutions
 
 

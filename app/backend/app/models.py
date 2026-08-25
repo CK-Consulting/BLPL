@@ -89,6 +89,57 @@ class User(Base):
     )
 
 
+class ProjectPolicy(Base):
+    """What one project has declared about the shared component library.
+
+    In the database rather than in the project, and that is the point rather
+    than a convenience. Everything inside a project directory is proposable: the
+    design assistant can offer an edit to any file there, and a person accepting
+    a diff is not reading it as a permissions change. A consent setting a model
+    can propose relaxing is not a consent setting. This sits where no tool can
+    reach it, and only an explicit settings call moves it.
+
+    Three declarations, and none has a silent default. A project is created with
+    them stated, because "nobody asked, so we assumed the permissive thing" is
+    the failure this exists to prevent.
+
+    ``unique_components`` is the subtle one, and the reason the other two are not
+    enough by themselves. A component nobody else holds is identifying by its
+    mere presence: stripping a record of any mention of the project does not
+    hide that somebody is designing with an exotic part. So the safe
+    contribution is *enriching a record that already exists* — adding a footprint
+    to a part several people already hold reveals nothing — and creating a new
+    record is a separate act needing its own answer.
+    """
+
+    __tablename__ = "project_policy"
+    __table_args__ = (
+        UniqueConstraint("project_id", name="uq_project_policy_project"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("project.id", ondelete="CASCADE"))
+
+    #: never | enrich_existing | ask
+    contribute: Mapped[str] = mapped_column(String(32), default="never")
+    #: ask | freely
+    consume: Mapped[str] = mapped_column(String(32), default="ask")
+    #: never_contribute | allow
+    unique_components: Mapped[str] = mapped_column(String(32), default="never_contribute")
+
+    #: The consent wording in force when this was agreed, by hash, and when.
+    #: Consent to a policy that later changes is not consent to the new one, so
+    #: the text is pinned; a changed hash means asking again rather than assuming
+    #: the old answer still stands.
+    consent_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ProviderKey(Base):
     """One user's API key for one configured endpoint, sealed at rest.
 

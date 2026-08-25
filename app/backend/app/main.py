@@ -94,7 +94,7 @@ from . import (
 )
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
-from .models import Project, ProjectInvitation, Run, User
+from .models import Project, ProjectInvitation, ProjectPolicy, Run, User
 from blpl.core import limits, project_manifest, quarantine
 from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
@@ -1485,7 +1485,25 @@ def list_projects(
     return out
 
 
-class CloneBody(BaseModel):
+class PolicyFields(BaseModel):
+    """A project's declaration about the shared component library.
+
+    Optional on the wire and closed when omitted, which is the only safe way for
+    a field to be missing: an older client, a truncated body or a forgotten
+    parameter must never be the reason a project starts sharing. The dialog asks
+    for all three explicitly — "we never asked, so we assumed the permissive
+    thing" is the failure this exists to prevent — but the server does not rely
+    on the dialog to be the thing that keeps it closed.
+    """
+
+    contribute: str = "never"
+    consume: str = "ask"
+    unique_components: str = "never_contribute"
+    #: True only when the person ticked the consent wording currently in force.
+    consented: bool = False
+
+
+class CloneBody(PolicyFields):
     name: str
     remote: str
     branch: str = "main"
@@ -1571,12 +1589,51 @@ def clone_project(
         grants.create_project_key(session, project, user, master_key),
         user.id,
     )
+    _record_policy(session, project, body, actor_id=user.id)
     activity.record(session, project, user, activity.IMPORTED, f"cloned from {body.remote}")
     return {"ok": True, "id": body.name}
 
 
-class InitBody(BaseModel):
+class InitBody(PolicyFields):
     name: str
+
+
+def _record_policy(session: Session, project, decl, *, actor_id: int) -> None:
+    """Write a project's library declaration, at creation or on change.
+
+    Validated rather than coerced: a value that is not one of the choices is a
+    stale client or a bug, and quietly reading it as the default would hide that
+    while appearing to work.
+
+    The consent hash is only stored when the caller both ticked the box and the
+    settings actually permit contributing. Recording agreement for a project
+    that shares nothing would leave a record of consent nobody acted on, and it
+    would silently become live the day somebody changed one dropdown.
+    """
+    from . import library_policy
+
+    try:
+        values = library_policy.validate(
+            decl.contribute, decl.consume, decl.unique_components
+        )
+    except library_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    row = session.scalar(
+        select(ProjectPolicy).where(ProjectPolicy.project_id == project.id)
+    ) or ProjectPolicy(project_id=project.id)
+    row.contribute = values["contribute"]
+    row.consume = values["consume"]
+    row.unique_components = values["unique_components"]
+    shares = values["contribute"] != "never"
+    if decl.consented and shares:
+        row.consent_sha = library_policy.consent_sha()
+        row.consent_at = datetime.now(timezone.utc)
+    elif not shares:
+        row.consent_sha = None
+        row.consent_at = None
+    session.add(row)
+    session.flush()
 
 
 @app.post("/api/projects/init")
@@ -1598,6 +1655,7 @@ def init_project(
         grants.create_project_key(session, project, user, master_key),
         user.id,
     )
+    _record_policy(session, project, body, actor_id=user.id)
     activity.record(session, project, user, activity.IMPORTED, "created empty")
     return {"ok": True, "id": body.name}
 
@@ -2049,6 +2107,12 @@ def decline_invitation(
 async def import_project(
     name: str = Form(...),
     files: list[UploadFile] = File(...),
+    # Same declaration as the other two creation paths, as form fields because
+    # this one is multipart. Closed when absent, for the same reason.
+    contribute: str = Form("never"),
+    consume: str = Form("ask"),
+    unique_components: str = Form("never_contribute"),
+    consented: bool = Form(False),
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -2107,6 +2171,12 @@ async def import_project(
         project.name, PROJECTS_ROOT / project.name,
         grants.create_project_key(session, project, user, master_key),
         user.id,
+    )
+    _record_policy(
+        session, project,
+        PolicyFields(contribute=contribute, consume=consume,
+                     unique_components=unique_components, consented=consented),
+        actor_id=user.id,
     )
     activity.record(session, project, user, activity.IMPORTED, f"{len(imported)} files uploaded")
     return {
@@ -2942,6 +3012,14 @@ class _Library:
     def put(self, mpn: str, payload: dict) -> None:
         components.save_extraction(_DATA, self._user_id, mpn, payload)
 
+    def find(self, mpn: str) -> list[dict]:
+        """What this user already holds for a part, fuzzily. Same closure, same
+        boundary: a tool asking this cannot ask it about anyone else."""
+        return components.find(_DATA, self._user_id, mpn)
+
+    def documents(self, mpn: str) -> list[dict]:
+        return components.documents(_DATA, self._user_id, mpn)
+
 
 class ComponentDocBody(BaseModel):
     mpn: str
@@ -3575,6 +3653,76 @@ def list_tool_calls(project_id: str, user: User = Depends(require_onboarded),
     """What the agents have actually done in this project, newest first."""
     _project_dir(session, user, project_id)
     return run_manager.tool_calls_for_project(project_id)
+
+
+class PolicyUpdate(PolicyFields):
+    """A change to an existing project's declaration.
+
+    Same shape as at creation. Absent fields close rather than preserve, because
+    a partial update that inherited the permissive half of a previous answer
+    would be a way to widen sharing without saying so.
+    """
+
+
+@app.get("/api/projects/{project_id}/policy")
+def read_policy(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """This project's library declaration, and the consent wording in force.
+
+    Membership, not ownership: everyone working on a board should be able to see
+    what it shares. Changing it is a separate question, answered below.
+    """
+    from . import library_policy
+
+    project = _project_or_404(session, user, project_id)
+    row = session.scalar(select(ProjectPolicy).where(ProjectPolicy.project_id == project.id))
+    return {
+        "contribute": row.contribute if row else library_policy.DEFAULTS["contribute"],
+        "consume": row.consume if row else library_policy.DEFAULTS["consume"],
+        "unique_components": (
+            row.unique_components if row else library_policy.DEFAULTS["unique_components"]
+        ),
+        # Whether the agreement on file is to the wording below, rather than to
+        # an earlier one — a project that agreed to a different sentence has not
+        # agreed to this one.
+        "consented": library_policy.has_consented(row),
+        "consent_text": library_policy.CONSENT_TEXT,
+        "declared": row is not None,
+        "choices": {
+            "contribute": list(library_policy.CONTRIBUTE),
+            "consume": list(library_policy.CONSUME),
+            "unique_components": list(library_policy.UNIQUE),
+        },
+    }
+
+
+@app.put("/api/projects/{project_id}/policy")
+def update_policy(
+    project_id: str,
+    body: PolicyUpdate,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Change what a project shares. Owner only.
+
+    Deliberately narrower than reading it. Membership is enough to *see* what a
+    board shares — that is information anyone working on it should have — but
+    widening it is a decision about someone else's data as much as your own, and
+    it belongs with whoever owns the project.
+    """
+    try:
+        project = projectacl.require_owner(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    except projectacl.NotTheOwner:
+        raise HTTPException(
+            status_code=403, detail="only the owner can change what this project shares"
+        )
+    _record_policy(session, project, body, actor_id=user.id)
+    return read_policy(project_id, user=user, session=session)
 
 
 @app.get("/api/projects/{project_id}/proposals")

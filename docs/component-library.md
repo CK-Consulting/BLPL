@@ -35,6 +35,40 @@ revision 2.1 keeps pointing at 2.1 when the vendor publishes 2.2, and updating
 is a decision with a diff behind it rather than something that happened while
 nobody was looking.
 
+## Finding what is already there
+
+`library_lookup` answers "do we already hold this part", by MPN, fuzzily — and
+it is the first call an assistant should make about any part, ahead of a
+distributor search or a datasheet fetch. A part resolved on another of your
+boards already has its documents and its extraction, and fetching them again
+spends a distributor call and a set of vision-model calls to arrive at bytes
+that are already on disk.
+
+The reply keeps two things apart that must never be merged:
+
+- an **exact** hit is the same orderable part;
+- a **near** hit shares a stem and differs in the suffix, which is usually
+  package, temperature grade or reel — precisely what a footprint and a pin map
+  depend on.
+
+`BQ27441DRZR-G1A` against `BQ27441DRZ` is two parts, not a typo. A near hit is
+returned labelled, for a person or a model to check against the datasheet, and
+never as the answer.
+
+## What a part holds
+
+Loose documents sit at the top of the part's repository — the datasheet, the
+extraction. Three subdirectories are allowed beneath it, and no others:
+
+    footprints/<Lib>.pretty/<Name>.kicad_mod
+    symbols/<Lib>.kicad_symdir/<Name>.kicad_sym
+    models/<Name>.step
+
+The nesting exists because KiCad resolves `Package_SON:Winbond_WSON-8` by
+looking for `Package_SON.pretty/Winbond_WSON-8.kicad_mod`. The library name is
+half the reference, so flattening these would throw it away. Arbitrary nesting
+is refused: enough shape to hold what KiCad needs, and nothing else.
+
 ## What is shared, and what is not
 
 **Shared between your own projects:** the documents you put in the library and

@@ -117,6 +117,18 @@ a fraction of the tokens — the RF architecture of this kind of board is about 
 520 tokens drawn and considerably more written out, less precisely. Name the \
 blocks with the refdes the BOM uses, and mark anything undecided as TBD in the \
 label rather than drawing an edge you have not established.
+- **Ask the component library before spending anything on a part.** Call \
+library_lookup with the MPN first — ahead of search_parts, fetch_datasheet and \
+extract_datasheet. A part used on another of this user's boards already has its \
+datasheet and its extraction there, and fetching them again spends a distributor \
+call and a set of vision-model calls to arrive at bytes that are already on \
+disk. The lookup is fuzzy, so it finds a part the BOM spells differently. Read \
+its answer carefully: an exact hit is the part, but a near hit is a DIFFERENT \
+orderable variant, and the suffix that differs usually encodes package, \
+temperature grade or reel — which is exactly what a footprint and a pin map \
+depend on. Treat a near hit as a lead to check against the datasheet, never as \
+the answer. Nothing held is not a problem: fetch as usual, and what you gather \
+is kept for next time.
 - **Never write a pinout table by hand, and never shorten one.** Call \
 pinout_section: it renders the pin map already extracted from the datasheet into \
 the exact form the parser reads. A pinout you type is a recollection of a \

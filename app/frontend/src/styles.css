@@ -40,6 +40,11 @@ header .kicad { margin-left: 0; }
 
 /* --- auth gate --- */
 .gate { display: flex; align-items: center; justify-content: center; height: 100vh; }
+/* The same unlock card, drawn over a workspace that stays mounted underneath.
+   Fixed rather than absolute so it does not depend on what the workspace's own
+   positioning happens to be, and opaque enough that the card behind it cannot
+   be misread as still interactive. */
+.gate-overlay { position: fixed; inset: 0; z-index: 100; background: rgba(9, 11, 15, .82); backdrop-filter: blur(2px); }
 .gate-card { display: flex; flex-direction: column; gap: .9rem; width: 420px; max-width: 92vw; padding: 2.4rem; background: #191c22; border: 1px solid #6b6f75; border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.45); }
 .gate-card h1 { margin: 0; font-size: 24px; letter-spacing: .02em; color: #f2f5f8; }
 /* Was 13px on #9aa4b0 — under 4.5:1 and too small for a screen whose whole

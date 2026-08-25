@@ -43,6 +43,8 @@ assuming:
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -103,6 +105,39 @@ def ensure_part(data_root: Path, user_id: int, mpn: str) -> Path:
     return d
 
 
+#: Subdirectories a part may hold, beyond loose documents at its root.
+#:
+#: A datasheet is one file and lives at the top. A footprint is not: KiCad
+#: resolves ``Package_SON:Winbond_WSON-8`` by looking for
+#: ``Package_SON.pretty/Winbond_WSON-8.kicad_mod``, so the library name is part
+#: of the path and flattening it would throw away the half of the reference that
+#: says which library. Hence a small allowlist rather than arbitrary nesting —
+#: enough shape to hold what KiCad needs, and nothing else.
+_SUBDIRS = ("footprints", "symbols", "models")
+
+
+def _document_path(filename: str) -> str:
+    """A document's path inside a part repo, or a refusal.
+
+    Accepts a bare name, or one of the allowlisted subdirectories followed by
+    anything that stays underneath it. Rejects absolute paths, traversal, and
+    the dotfiles that would collide with git's own state.
+    """
+    raw = (filename or "").strip().replace("\\", "/").strip("/")
+    if not raw:
+        raise ComponentError("a document name is required")
+    parts_ = [seg for seg in raw.split("/") if seg]
+    if any(seg in {".", ".."} or seg.startswith(".") for seg in parts_):
+        raise ComponentError(f"{filename!r} is not a usable document name")
+    if len(parts_) == 1:
+        return parts_[0]
+    if parts_[0] not in _SUBDIRS:
+        raise ComponentError(
+            f"{filename!r} must be a bare filename or sit under one of: {', '.join(_SUBDIRS)}"
+        )
+    return "/".join(parts_)
+
+
 def add_document(data_root: Path, user_id: int, mpn: str, filename: str, data: bytes) -> dict:
     """Store a document for a part and commit it.
 
@@ -110,11 +145,12 @@ def add_document(data_root: Path, user_id: int, mpn: str, filename: str, data: b
     commit on top rather than an overwrite — which is the whole point of the
     part being a repository. The previous text stays readable at its commit.
     """
-    safe = Path(filename).name
-    if not safe or safe.startswith("."):
-        raise ComponentError(f"{filename!r} is not a usable document name")
+    safe = _document_path(filename)
     d = ensure_part(data_root, user_id, mpn)
-    target = d / safe
+    target = (d / safe).resolve()
+    if not target.is_relative_to(d.resolve()):
+        raise ComponentError(f"{filename!r} would write outside the part")
+    target.parent.mkdir(parents=True, exist_ok=True)
     replacing = target.is_file() and target.read_bytes() != data
     if target.is_file() and not replacing:
         return {"path": safe, "commit": head(d), "changed": False}
@@ -128,14 +164,21 @@ def head(repo: Path) -> str:
     return _git(repo, "rev-parse", "--short", "HEAD").strip()
 
 
-def documents(data_root: Path, user_id: int, mpn: str) -> list[dict]:
-    d = part_repo(data_root, user_id, mpn)
+def _held_files(d: Path) -> list[Path]:
+    """Every document in a part repo, git's own state excluded."""
     if not d.is_dir():
         return []
+    return sorted(
+        f for f in d.rglob("*")
+        if f.is_file() and not any(seg.startswith(".") for seg in f.relative_to(d).parts)
+    )
+
+
+def documents(data_root: Path, user_id: int, mpn: str) -> list[dict]:
+    d = part_repo(data_root, user_id, mpn)
     return [
-        {"name": f.name, "bytes": f.stat().st_size}
-        for f in sorted(d.iterdir())
-        if f.is_file() and not f.name.startswith(".")
+        {"name": str(f.relative_to(d)), "bytes": f.stat().st_size}
+        for f in _held_files(d)
     ]
 
 
@@ -149,10 +192,61 @@ def parts(data_root: Path, user_id: int) -> list[dict]:
             continue
         out.append({
             "mpn": d.name,
-            "documents": len([f for f in d.iterdir() if f.is_file() and not f.name.startswith(".")]),
+            "documents": len(_held_files(d)),
             "commit": head(d),
         })
     return out
+
+
+def _flat(mpn: str) -> str:
+    """A part number reduced to what distinguishes it from another part.
+
+    Case and punctuation only — suppliers disagree about both for one orderable
+    part (``BQ27441DRZR-G1A``, ``bq27441drzr g1a``) while every remaining
+    character is load-bearing.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "", mpn or "").upper()
+
+
+def find(data_root: Path, user_id: int, mpn: str, limit: int = 5) -> list[dict]:
+    """What this user's library already holds for a part, exact hits marked.
+
+    The cheap question that belongs in front of the expensive ones: a part they
+    resolved on another board already has its datasheet and its extraction, and
+    fetching them again spends a distributor call and a set of vision-model
+    calls to arrive at bytes that are already on disk.
+
+    Exact and near are kept apart deliberately, and never merged. An exact match
+    is the same orderable part. A near one shares a stem and differs in the
+    suffix that encodes package, temperature grade or reel — precisely what a
+    footprint and a pin map depend on — so ``BQ27441DRZR-G1A`` against
+    ``BQ27441DRZ`` is two parts, not a typo. Returning the second as though it
+    were the first is a plausible, wrong board, so it comes back labelled for
+    someone to judge.
+    """
+    want = _flat(mpn)
+    if not want:
+        return []
+    exact: list[dict] = []
+    near: list[tuple[int, dict]] = []
+    for part in parts(data_root, user_id):
+        got = _flat(part["mpn"])
+        if got == want:
+            exact.append({**part, "exact": True, "why": "exact match on the part number"})
+            continue
+        stem = os.path.commonprefix([got, want])
+        # A stem worth mentioning is most of the shorter name — not the two or
+        # three characters every part a manufacturer makes has in common.
+        if len(stem) >= 6 and len(stem) >= min(len(got), len(want)) * 0.7:
+            near.append((-len(stem), {
+                **part, "exact": False,
+                "why": (
+                    f"shares '{stem}' with {mpn}, but is a different orderable part — its "
+                    "package and pin map may not apply. Check before using anything from it."
+                ),
+            }))
+    near.sort(key=lambda t: t[0])
+    return exact + [m for _, m in near[:limit]]
 
 
 # -- attaching to a project ---------------------------------------------------

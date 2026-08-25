@@ -152,3 +152,32 @@ def test_run_writes_valid_yaml(tmp_path: Path) -> None:
     loaded = yaml.safe_load(out.read_text())
     assert loaded["project"]["name"] == "TestProj"
     assert loaded["components"]["J1"]["value"] == "PJ-037A"
+
+
+def test_a_not_placed_row_becomes_no_copper_and_is_not_dropped_silently() -> None:
+    """The other half of doctor's not_placed flag.
+
+    If Stage 5 did not honor it, resolve_footprint would substitute a
+    placeholder header for the flag string — copper under a part that must
+    have none, on a board doctor just declared clean. The row stays in
+    bom.json so ordering still sees it; the HDM records who was skipped so a
+    diff against the BOM does not show rows that vanished with nothing
+    saying why.
+    """
+    bom = _bom()
+    bom["rows"].append({
+        "local_id": "BAT_RTC",
+        "refdes": "BAT_RTC",
+        "mpn": "ML1220",
+        "package": "not_placed",
+        "confidence": 1.0,
+    })
+    schema.validate("bom", bom)
+
+    hdm, _, fresolutions = s5.emit(bom, _nets(), _design_artifact(), _project_config())
+
+    assert "BAT_RTC" not in hdm["components"]
+    assert "BAT_RTC" not in fresolutions
+    assert hdm["not_placed"] == ["BAT_RTC"]
+    # The placed part is untouched.
+    assert "J1" in hdm["components"]

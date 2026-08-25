@@ -7,7 +7,15 @@ import {
   UserButton,
   useAuth,
 } from "@clerk/react";
-import { AuthConfig, LockState, OnboardingState, getJSON, setLockedHandler, setTokenGetter } from "../api";
+import {
+  AuthConfig,
+  LockState,
+  OnboardingState,
+  getJSON,
+  setLockedHandler,
+  setTokenGetter,
+  setUnlockNeededHandler,
+} from "../api";
 import { Logo } from "./Logo";
 import { InviteLanding } from "./InviteLanding";
 import { Onboarding } from "./Onboarding";
@@ -52,6 +60,16 @@ export function AuthGate({ children }: Props) {
   // but locked, and ready. Collapsing any two of them produces a screen that
   // asks for the wrong thing.
   const [state, setState] = useState<{ onboarded: boolean; unlocked: boolean } | null>(null);
+  // Locked *again*, after the gate had already opened — which is a different
+  // situation from being locked on arrival and needs a different screen.
+  //
+  // The server keeps the derived key in memory only, so every restart relocks
+  // every session while the workspace is still on screen with unsaved edits in
+  // it. Flipping `state.unlocked` back to false would render UnlockScreen
+  // instead of `children`, unmounting the whole workspace and taking the
+  // editor's buffer with it — for a reason the user did not cause and cannot
+  // see coming. So this is tracked separately and drawn on top instead.
+  const [relocked, setRelocked] = useState(false);
 
   const refreshState = () =>
     Promise.all([
@@ -67,6 +85,7 @@ export function AuthGate({ children }: Props) {
   useEffect(() => {
     setTokenGetter(() => getToken());
     setLockedHandler(() => setRejected(true));
+    setUnlockNeededHandler(() => setRelocked(true));
   }, [getToken]);
 
   // Asked unauthenticated, so a server with no Clerk issuer can say so instead
@@ -207,7 +226,22 @@ export function AuthGate({ children }: Props) {
               }}
             />
           ) : (
-            children
+            <>
+              {children}
+              {relocked && (
+                // Over the workspace, not instead of it. Everything underneath
+                // stays mounted, so an unsaved edit is still there when the key
+                // is back — the point of not reusing the `state.unlocked` path.
+                <div className="gate-overlay" role="dialog" aria-modal="true">
+                  <UnlockScreen
+                    onUnlocked={() => {
+                      setRelocked(false);
+                      void refreshState();
+                    }}
+                  />
+                </div>
+              )}
+            </>
           )}
         </Show>
       </ClerkLoaded>

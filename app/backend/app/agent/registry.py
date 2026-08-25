@@ -375,6 +375,49 @@ async def _propose_edit(ctx: ToolContext, args: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+async def _library_lookup(ctx: ToolContext, args: dict) -> str:
+    """What this user's component library already holds for a part.
+
+    The cheap step that belongs in front of the expensive ones. A part resolved
+    on another of their boards already has its datasheet and its extraction, and
+    fetching them again spends a distributor call and a set of vision-model
+    calls to arrive at bytes already on disk.
+
+    Answers only about the caller's own library — `ctx.library` is a closure over
+    the request's user, so this tool has no way to ask about anyone else's, which
+    is the whole of the answer to what happens to a datasheet under NDA.
+    """
+    mpn = str(args.get("mpn", "")).strip()
+    if not mpn:
+        raise ToolDenied("mpn is required")
+    if ctx.library is None:
+        return json.dumps({
+            "mpn": mpn,
+            "note": "No component library is reachable in this session — fetch as usual.",
+        }, indent=2)
+
+    hits = ctx.library.find(mpn)
+    exact = next((h for h in hits if h.get("exact")), None)
+    near = [h for h in hits if not h.get("exact")]
+    if exact is not None:
+        exact = {**exact, "documents": ctx.library.documents(exact["mpn"])}
+    return json.dumps({
+        "mpn": mpn,
+        "exact": exact,
+        "near": near,
+        "note": (
+            "The exact record is this part — use its documents and its extraction rather "
+            "than fetching again."
+            if exact else
+            "No exact record. Anything under 'near' is a DIFFERENT orderable part; check its "
+            "package and pin count against yours before using it. Otherwise fetch as usual — "
+            "what you gather is kept, so your next board does not pay for it again."
+            if near else
+            "Nothing held for this part yet. Fetch as usual; what you gather is kept."
+        ),
+    }, indent=2, ensure_ascii=False)
+
+
 async def _search_parts(ctx: ToolContext, args: dict) -> str:
     mpn = str(args.get("mpn", "")).strip()
     if not mpn:
@@ -1507,6 +1550,30 @@ def project_tools() -> list[ToolSpec]:
 
 def parts_tools() -> list[ToolSpec]:
     return [
+        ToolSpec(
+            name="library_lookup",
+            description=(
+                "Ask your component library what it already holds for a part, by MPN, with "
+                "fuzzy matching. CALL THIS FIRST — before search_parts, fetch_datasheet or "
+                "extract_datasheet. A part used on another of your boards already has its "
+                "datasheet and its extraction here, and fetching them again spends a "
+                "distributor call and a set of vision-model calls to arrive at bytes that are "
+                "already on disk.\n\n"
+                "The reply keeps an exact hit apart from near ones. An exact hit is this part; "
+                "use it. A near hit is a DIFFERENT orderable part whose differing suffix "
+                "usually encodes package, temperature grade or reel — exactly what a footprint "
+                "and a pin map depend on — so treat it as a lead to check, never as an answer. "
+                "Nothing held is not a problem: fetch as usual, and what you gather is kept for "
+                "next time."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"mpn": {"type": "string", "description": "Manufacturer part number."}},
+                "required": ["mpn"],
+            },
+            kind="file_read",
+            handler=_library_lookup,
+        ),
         ToolSpec(
             name="search_parts",
             description=(

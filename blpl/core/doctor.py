@@ -140,8 +140,15 @@ def _footprint_column(row: dict) -> str:
     return ""
 
 
-def _footprint_name_index(footprints_root: Path, project_dir: Path | None = None) -> set[str]:
-    """Every footprint name Stage 5 could find, normalized.
+def _footprint_name_index(
+    footprints_root: Path, project_dir: Path | None = None
+) -> dict[str, list[str]]:
+    """Every footprint Stage 5 could find: normalized name -> the refs that spell it.
+
+    A mapping rather than the set this used to be, because two questions need
+    answering and only one of them is "does this string occur anywhere". The
+    other is "which footprint, exactly" — and for a value that names one whole
+    footprint the answer is a reference that can be printed in the fix.
 
     Built once per report and only when something needs it, because it is a walk
     of some fifteen thousand files.
@@ -153,16 +160,18 @@ def _footprint_name_index(footprints_root: Path, project_dir: Path | None = None
         if project_dir is not None
         else [Path(footprints_root)]
     )
-    names = {
-        re.sub(r"[^a-z0-9]", "", m.stem.lower())
-        for root in roots
-        if root.is_dir()
-        for lib in root.glob("*.pretty")
-        for m in lib.glob("*.kicad_mod")
-    }
-    if not names:
-        return set()
-    return names
+    index: dict[str, list[str]] = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for lib in root.glob("*.pretty"):
+            for m in lib.glob("*.kicad_mod"):
+                key = re.sub(r"[^a-z0-9]", "", m.stem.lower())
+                ref = f"{lib.stem}:{m.stem}"
+                refs = index.setdefault(key, [])
+                if ref not in refs:
+                    refs.append(ref)
+    return index
 
 
 def _search_roots(footprints_root: Path, project_dir: Path | None) -> list[Path]:
@@ -311,11 +320,55 @@ def _several(
     )
 
 
+def _unprefixed(
+    report: Report,
+    ref: str,
+    fp: str,
+    matches: list[str],
+    rel: str,
+    line: int,
+) -> None:
+    """A package value that names one whole footprint, without saying which library.
+
+    Split from DOC-012 because the situation is the opposite one. DOC-012 is
+    "this matches nothing, so a placeholder is certain". This is "this matches
+    something exactly, and the reference that would make it certain can be
+    printed" — which makes it the rare error that carries its own answer.
+    """
+    if len(matches) == 1:
+        fix = (
+            f"Spell it `{matches[0]}`. Stage 2 only looks a footprint up exactly when the "
+            "value carries its library — without the colon it falls through to a fuzzy "
+            "match over every library at once, so the right answer here is reached by "
+            "guesswork or not at all. The name is already exact; only the library is "
+            "missing."
+        )
+    else:
+        listed = ", ".join(f"`{m}`" for m in sorted(matches))
+        fix = (
+            f"That name exists in more than one library: {listed}. Pick the one this part "
+            "is, and spell the package as that full 'Lib:Name'. Without the colon Stage 2 "
+            "fuzzy-matches across all of them and nothing reports which it chose."
+        )
+    report.findings.append(
+        Finding(
+            code="DOC-014",
+            severity="error",
+            summary=(
+                f"{ref}: package '{fp}' names a real footprint but omits its library."
+            ),
+            fix=fix,
+            file=rel,
+            line=line,
+        )
+    )
+
+
 def _check_bare_footprint(
     report: Report,
     ref: str,
     fp: str,
-    known: set[str],
+    known: dict[str, list[str]],
     rel: str,
     line: int,
     exposed_pad: tuple[float, float] | None = None,
@@ -363,6 +416,24 @@ def _check_bare_footprint(
         # is not inside `usb_c_receptacle_amphenol_...` because of one hyphen
         # against one underscore, and a resolvable part was called an error.
         needle = re.sub(r"[^a-z0-9]", "", fp.lower())
+        # An exact whole-name match is not a hint, and treating it as one is how
+        # a name with a certain answer got resolved by guesswork.
+        #
+        # `0402` occurs *inside* `R_0402_1005Metric` and is genuinely a hint: it
+        # names a size, several footprints carry it, and which one is right
+        # depends on what the part is. `microSD_HC_Molex_104031-0811` occurs
+        # inside exactly one name because it *is* that name, missing only its
+        # library. The substring test could not tell those apart and passed both.
+        #
+        # The difference matters because Stage 2's exact lookup requires a colon
+        # and returns nothing without one, so a bare value — however precise —
+        # falls through to fuzzy matching. Connector_Card holds
+        # microSD_HC_Molex_47219-2001 and microSD_HC_Wuerth_693072010801 as well;
+        # a guess among those is a different socket's land pattern, chosen with
+        # no warning, when the exact reference was computable all along.
+        if needle and needle in known:
+            _unprefixed(report, ref, fp, known[needle], rel, line)
+            return
         if needle and any(needle in name for name in known):
             return
     report.findings.append(
@@ -403,10 +474,19 @@ def _check_footprints(
     absent Stage 5 substitutes a placeholder, which is how a 2.54mm header ends up
     standing in for a QFN on a board that opens and renders perfectly.
     """
+    from .symbol_resolution import is_not_placed
+
     checked: dict[str, bool] = {}
-    known: set[str] | None = None
+    known: dict[str, list[str]] | None = None
     for ref, row, rel, line in bom_rows:
         fp = _footprint_column(row)
+        # Declared as never landing on the board at all — a bare coin cell in a
+        # retainer clip, a wire-terminated part whose connector has its own row.
+        # There is no footprint to check because there must not be one: any
+        # footprint for this row would be wrong copper, which makes "matches no
+        # footprint" the correct state rather than an error.
+        if is_not_placed(fp):
+            continue
         if ":" not in fp:
             if fp:
                 if known is None:
@@ -482,8 +562,14 @@ def _check_pin_maps(
     FPGA/MCU/PMIC case that actually halts. Passives and connectors are left
     alone because the classifier really will handle them.
     """
+    from .symbol_resolution import is_not_placed
+
     for ref, row, rel, line in bom_rows:
         if ref in pinout_refs or not _IC_REFDES.match(ref):
+            continue
+        if is_not_placed(_footprint_column(row)):
+            # Never on the board, so never in the netlist: there are no pins for
+            # a pin_map to describe, and Stage 3 will not be asked about it.
             continue
         report.findings.append(
             Finding(

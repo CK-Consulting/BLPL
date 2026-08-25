@@ -128,6 +128,36 @@ def _footprint_exists_in(root: Path, lib: str, name: str) -> bool:
     return (root / f"{lib}.pretty" / f"{name}.kicad_mod").is_file()
 
 
+_NOT_PLACED = "notplaced"
+
+
+def is_not_placed(value: str | None) -> bool:
+    """Whether a package cell says this part never lands on the board at all.
+
+    The case that forced this: a bare coin cell. It is bought, it is in the BOM,
+    and it is never soldered — it sits in a retainer clip that has its own row
+    and its own footprint. Before this flag existed there was no way to say so,
+    and doctor reported the cell as a package matching no footprint, which is
+    an error with no fix: any footprint for it would be *wrong* copper.
+
+    Spelled ``not_placed`` in the Package column, with case, spaces, hyphens
+    and surrounding punctuation forgiven — a design document is written by
+    hand and by models, and ``Not placed`` must not silently mean "a package
+    called Not placed".
+
+    Deliberately NOT the same thing as DNP. "Do not populate" means the copper
+    is on the board and the part is not fitted — the footprint must exist and
+    be right. This flag means there is no copper at all. Accepting "dnp" here
+    would conflate the two, and a board where a DNP part lost its land pattern
+    is a board that cannot be populated later.
+    """
+    if not value:
+        return False
+    import re as _re
+
+    return _re.sub(r"[^a-z0-9]", "", value.lower()) == _NOT_PLACED
+
+
 def placeholder_footprint_for(pin_count: int | None) -> str:
     """A stock through-hole header with the right number of pads.
 

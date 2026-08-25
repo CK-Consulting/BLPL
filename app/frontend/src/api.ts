@@ -10,6 +10,7 @@
 
 let getToken: () => Promise<string | null> = async () => null;
 let onLocked: () => void = () => {};
+let onNeedsUnlock: () => void = () => {};
 
 /** Installed once by AuthGate from Clerk's useAuth(). */
 export function setTokenGetter(fn: () => Promise<string | null>) {
@@ -18,6 +19,19 @@ export function setTokenGetter(fn: () => Promise<string | null>) {
 
 export function setLockedHandler(fn: () => void) {
   onLocked = fn;
+}
+
+/**
+ * Installed by AuthGate. Called when a route answers 423 without naming a
+ * project to open — the session holds no key, and only the user can supply it.
+ *
+ * Separate from setLockedHandler because the two need opposite screens: that
+ * one means the server rejected the token entirely, this one means the token is
+ * fine and the key derived from a passphrase is gone. The server keeps that key
+ * in memory only, so this arrives on every restart — routine, not an error.
+ */
+export function setUnlockNeededHandler(fn: () => void) {
+  onNeedsUnlock = fn;
 }
 
 /**
@@ -79,6 +93,12 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
     // would turn one bad state into a request storm.
     const opened = await send(`/api/projects/${sealed}/open`, { method: "POST" });
     if (opened.ok) res = await send(path, init);
+  } else if (res.status === 423) {
+    // The other 423: the session has no key. Nothing to retry — a passphrase
+    // has to be typed — so ask for it instead of letting the status reach a
+    // component, which rendered it as the bare number "423" in whichever pane
+    // happened to make the request.
+    onNeedsUnlock();
   }
 
   // 401 anywhere means the session is gone — surface it once, centrally, and

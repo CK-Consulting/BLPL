@@ -581,3 +581,212 @@ def test_an_mpn_cannot_walk_out_of_the_extraction_folder(tmp_path: Path) -> None
     )
     assert doctor._exposed_pad_for(proj, "../../../other/datasheets/extracted/LEAK") is None
     assert doctor._exposed_pad_for(proj, "sub/dir") is None
+
+
+# --- DOC-014: a bare package that names one whole footprint ------------------
+
+
+def _fp_roots(tmp_path: Path, *entries: tuple[str, str]) -> Path:
+    root = tmp_path / "fps"
+    for lib, name in entries:
+        (root / f"{lib}.pretty").mkdir(parents=True, exist_ok=True)
+        (root / f"{lib}.pretty" / f"{name}.kicad_mod").write_text("(footprint)", encoding="utf-8")
+    return root
+
+
+def _find(report: doctor.Report, code: str):
+    return next(f for f in report.findings if f.code == code)
+
+
+def test_a_bare_value_that_is_a_whole_footprint_name_is_an_error(tmp_path: Path) -> None:
+    """The gap this closes, found on a real board.
+
+    `microSD_HC_Molex_104031-0811` is not a hint — it is the entire name of one
+    stock footprint, missing only its library. Doctor said nothing about it,
+    because the test for a bare value was "does this string occur in any
+    footprint name" and it occurs in exactly one: itself.
+
+    Passing it is not harmless. Stage 2 looks a footprint up exactly only when
+    the value carries its library and returns nothing without a colon, so this
+    fell through to a fuzzy match over every library at once — in a directory
+    that also holds microSD_HC_Molex_47219-2001 and microSD_HC_Wuerth_693072010801.
+    A different socket's land pattern, chosen by guesswork, with nothing
+    reporting which was picked.
+    """
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| J_SD | 1040310811 | microSD_HC_Molex_104031-0811 |\n"
+        ),
+    )
+    root = _fp_roots(
+        tmp_path,
+        ("Connector_Card", "microSD_HC_Molex_104031-0811"),
+        ("Connector_Card", "microSD_HC_Molex_47219-2001"),
+    )
+    report = doctor.run(proj, footprints_root=root)
+
+    assert "DOC-014" in _codes(report)
+    # The rare error that carries its own answer, so name it rather than
+    # describing it.
+    assert "Connector_Card:microSD_HC_Molex_104031-0811" in _find(report, "DOC-014").fix
+
+
+def test_a_size_hint_is_not_mistaken_for_an_unprefixed_reference(tmp_path: Path) -> None:
+    """`0402` occurs *inside* `R_0402_1005Metric` and does not equal it.
+
+    That is the whole distinction. A size names many footprints and which one is
+    right depends on what the part is, so it is a hint the classifier resolves
+    later — flagging it would put an error on every passive in the BOM, which is
+    how a preflight gets ignored.
+    """
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| R1 | RC0402 | 0402 |\n"
+        ),
+    )
+    root = _fp_roots(tmp_path, ("Resistor_SMD", "R_0402_1005Metric"))
+
+    assert "DOC-014" not in _codes(doctor.run(proj, footprints_root=root))
+
+
+def test_the_same_name_in_two_libraries_offers_both(tmp_path: Path) -> None:
+    """Nothing here can pick, so it must not pretend to."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| J1 | X | Widget_A |\n"
+        ),
+    )
+    root = _fp_roots(tmp_path, ("LibOne", "Widget_A"), ("LibTwo", "Widget_A"))
+    fix = _find(doctor.run(proj, footprints_root=root), "DOC-014").fix
+
+    assert "LibOne:Widget_A" in fix and "LibTwo:Widget_A" in fix
+
+
+def test_punctuation_does_not_hide_an_exact_match(tmp_path: Path) -> None:
+    """Names are compared with punctuation set aside, as the substring test was.
+
+    `USB-C Receptacle` is not literally inside `usb_c_receptacle` — one hyphen
+    against one underscore — which is the bug that made the old check call a
+    resolvable part an error. The exact test inherits the same normalization.
+    """
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| J1 | X | USB-C Receptacle |\n"
+        ),
+    )
+    root = _fp_roots(tmp_path, ("Connector_USB", "USB_C_Receptacle"))
+    report = doctor.run(proj, footprints_root=root)
+
+    assert "DOC-014" in _codes(report)
+    assert "Connector_USB:USB_C_Receptacle" in _find(report, "DOC-014").fix
+
+
+def test_a_value_that_names_nothing_is_still_DOC_012(tmp_path: Path) -> None:
+    """The two rules are opposites and must not absorb each other: DOC-012 is
+    "matches nothing, a placeholder is certain", DOC-014 is "matches exactly one
+    thing, and the certain reference can be printed"."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | Module_25Pin |\n"
+        ),
+    )
+    root = _fp_roots(tmp_path, ("Connector_Card", "microSD_HC_Molex_104031-0811"))
+    codes = _codes(doctor.run(proj, footprints_root=root))
+
+    assert "DOC-012" in codes and "DOC-014" not in codes
+
+
+# --- not_placed: a BOM row that must never become copper ---------------------
+
+
+def test_a_part_declared_not_placed_is_not_a_footprint_error(tmp_path: Path) -> None:
+    """The case that forced the flag, from a real board.
+
+    A bare coin cell is bought, is in the BOM, and is never soldered — it sits
+    in a retainer clip that has its own row and its own footprint. Before the
+    flag, doctor reported it as a package matching no footprint: an error with
+    no fix, because any footprint for that row would be *wrong* copper.
+    """
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| BAT_RTC | ML1220 | not_placed |\n"
+            "| J_BAT_RTC | BH-122A-5 | Battery:BatteryHolder_Keystone_3000_1x12mm |\n"
+        ),
+    )
+    root = _fp_roots(tmp_path, ("Battery", "BatteryHolder_Keystone_3000_1x12mm"))
+    codes = _codes(doctor.run(proj, footprints_root=root))
+
+    assert "DOC-012" not in codes and "DOC-014" not in codes
+
+
+def test_the_flag_forgives_hand_written_spellings(tmp_path: Path) -> None:
+    """Design documents are written by hand and by models. `Not placed` must
+    not silently mean "a package called Not placed"."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| BAT1 | ML1220 | Not placed |\n"
+            "| BAT2 | CR2032 | NOT-PLACED |\n"
+        ),
+    )
+    root = _fp_roots(tmp_path, ("Battery", "Whatever"))
+
+    assert "DOC-012" not in _codes(doctor.run(proj, footprints_root=root))
+
+
+def test_dnp_is_not_the_same_flag(tmp_path: Path) -> None:
+    """"Do not populate" means the copper is on the board and the part is not
+    fitted — the footprint must exist and be right. Accepting `dnp` as
+    not-placed would conflate the two, and a board where a DNP part lost its
+    land pattern cannot be populated later. So `dnp` still has to name a real
+    footprint, and here it does not."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| R9 | X | dnp |\n"
+        ),
+    )
+    root = _fp_roots(tmp_path, ("Battery", "Whatever"))
+
+    assert "DOC-012" in _codes(doctor.run(proj, footprints_root=root))
+
+
+def test_a_not_placed_ic_is_not_asked_for_a_pinout(tmp_path: Path) -> None:
+    """Never on the board means never in the netlist — no pins to map, and
+    Stage 3 will not halt over it."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"
+            "| U_OFFBOARD | XYZ123 | not_placed |\n"
+        ),
+    )
+
+    assert "DOC-011" not in _codes(doctor.run(proj))
