@@ -437,6 +437,22 @@ def test_the_question_survives_a_failing_turn(chat_client, monkeypatch) -> None:
     assert convo["events"][0]["content"] == "hello?"
 
 
+
+def _read_then(call: ToolUseBlock) -> list:
+    """A scripted turn that reads the file before proposing an edit to it.
+
+    propose_file_edit refuses an edit with no read behind it in the same turn,
+    which is the rule that stops a model rewriting a file from a stale copy in
+    its context. These turns have to satisfy it the way a real one does.
+    """
+    read = ToolUseBlock(
+        id="t0", name="read_project_file", input={"path": call.input["path"]}
+    )
+    return [
+        ToolCall(id=read.id, name=read.name, input=read.input),
+        Done("tool_use", Msg(role="assistant", content=[read])),
+    ]
+
 def test_a_proposal_surfaces_as_its_own_event_and_can_be_accepted(chat_client, monkeypatch) -> None:
     call = ToolUseBlock(
         id="t1",
@@ -446,6 +462,7 @@ def test_a_proposal_surfaces_as_its_own_event_and_can_be_accepted(chat_client, m
     _script(
         monkeypatch,
         [
+            _read_then(call),
             [
                 ToolCall(id=call.id, name=call.name, input=call.input),
                 Done("tool_use", Msg(role="assistant", content=[call])),
@@ -483,6 +500,7 @@ def test_rejecting_leaves_the_file_alone(chat_client, monkeypatch) -> None:
     _script(
         monkeypatch,
         [
+            _read_then(call),
             [ToolCall(id=call.id, name=call.name, input=call.input), Done("tool_use", Msg(role="assistant", content=[call]))],
             [Done("end_turn", Msg.assistant("ok"))],
         ],
@@ -510,6 +528,7 @@ def test_accepting_a_stale_proposal_is_a_409_not_a_clobber(chat_client, monkeypa
     _script(
         monkeypatch,
         [
+            _read_then(call),
             [ToolCall(id=call.id, name=call.name, input=call.input), Done("tool_use", Msg(role="assistant", content=[call]))],
             [Done("end_turn", Msg.assistant("ok"))],
         ],
@@ -866,3 +885,114 @@ def test_suggest_footprint_says_when_nothing_fits(project) -> None:
     assert out["outcome"] == "none"
     assert not out["candidates"]
     assert "kicad-footprint-generator" in out["note"]
+
+
+def test_an_edit_built_without_reading_is_refused(project) -> None:
+    """The failure this exists to stop, and it is not hypothetical.
+
+    A model with the file in its context from an earlier turn can compose a
+    whole-file rewrite without re-reading. base_sha used to fall back to the
+    live file's hash when nothing had been read, so apply_proposal compared the
+    file against itself, found no conflict, and wrote a rewrite built from a
+    snapshot several edits old. Every check passed; the checks were asking the
+    wrong question.
+
+    That cost a design document fourteen footprint references, four connector
+    rows, and a part silently reverted to a different orderable variant — in an
+    edit that reported success.
+    """
+    ctx = _ctx(project)
+    # No read_project_file call. This is the whole point.
+    res = _call(
+        ctx, "propose_file_edit", path="overview.md",
+        new_content="# Board\n\nRewritten from memory.\n", rationale="from memory",
+    )
+
+    assert res.is_error and "has not been read in this turn" in res.content
+    assert ProposalStore(project).pending() == []
+    assert (project / "overview.md").read_text() == "# Board\n\nOne connector.\n"
+
+
+def test_an_edit_is_refused_when_the_file_moved_after_the_read(project) -> None:
+    """Read early in a long turn, changed since: the edit is anchored to content
+    that no longer exists. Caught at propose rather than at accept, so the model
+    is told while it can still act and the stale proposal never exists to be
+    accepted by mistake."""
+    ctx = _ctx(project)
+    _call(ctx, "read_project_file", path="overview.md")
+    (project / "overview.md").write_text("# Board\n\nSomeone else got here first.\n")
+
+    res = _call(
+        ctx, "propose_file_edit", path="overview.md",
+        new_content="# Board v2\n", rationale="stale base",
+    )
+
+    assert res.is_error and "changed after you read it" in res.content
+    assert ProposalStore(project).pending() == []
+
+
+def test_creating_a_new_file_still_needs_no_prior_read(project) -> None:
+    """There is nothing to read, so requiring a read would make creation
+    impossible. base_sha is None here and apply_proposal already understands
+    that as "must not exist yet"."""
+    ctx = _ctx(project)
+    res = _call(
+        ctx, "propose_file_edit", path="new-board.md",
+        new_content="# New\n", rationale="create",
+    )
+
+    assert not res.is_error
+    pending = ProposalStore(project).pending()
+    assert len(pending) == 1 and pending[0].base_sha is None
+
+
+def test_an_edit_is_refused_when_the_file_was_deleted_after_the_read(project) -> None:
+    """Read it, delete it, propose the old content back.
+
+    The first version of this check let this through as a creation: with the
+    file gone, base_sha became None, and apply_proposal only tests staleness for
+    a path that still exists — so the edit sailed through and recreated a
+    document somebody had deleted, from a copy predating the deletion, with no
+    conflict reported because nothing conflicted.
+
+    Deleting a file is a decision. Undoing it silently is not this tool's to
+    make.
+    """
+    ctx = _ctx(project)
+    _call(ctx, "read_project_file", path="overview.md")
+    (project / "overview.md").unlink()
+
+    res = _call(
+        ctx, "propose_file_edit", path="overview.md",
+        new_content="# Board\n\nOne connector.\n", rationale="put it back",
+    )
+
+    assert res.is_error and "deleted or replaced" in res.content
+    assert ProposalStore(project).pending() == []
+    assert not (project / "overview.md").exists()
+
+
+def test_an_edit_is_refused_when_a_directory_took_the_files_place(project) -> None:
+    """Same branch, and it would otherwise fail mid-write inside apply_proposal
+    rather than being caught while the model can still react."""
+    ctx = _ctx(project)
+    _call(ctx, "read_project_file", path="overview.md")
+    (project / "overview.md").unlink()
+    (project / "overview.md").mkdir()
+
+    res = _call(
+        ctx, "propose_file_edit", path="overview.md", new_content="# x\n", rationale="r"
+    )
+
+    assert res.is_error and "deleted or replaced" in res.content
+    assert ProposalStore(project).pending() == []
+
+
+def test_a_directory_in_the_way_of_a_new_file_is_refused_too(project) -> None:
+    """Never read, so there is no base to preserve — but still not creatable."""
+    ctx = _ctx(project)
+    (project / "notes.md").mkdir()
+
+    res = _call(ctx, "propose_file_edit", path="notes.md", new_content="# x\n", rationale="r")
+
+    assert res.is_error and "is not a file" in res.content

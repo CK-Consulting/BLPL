@@ -301,7 +301,62 @@ async def _propose_edit(ctx: ToolContext, args: dict) -> str:
     if current is not None and sha_of(current) == sha_of(new_content):
         raise ToolDenied(f"{target.name} already has exactly this content — nothing to propose")
 
-    base_sha = ctx.read_shas.get(target.name) or (sha_of(current) if current is not None else None)
+    # The base this edit claims to be built on, and it must come from an actual
+    # read in this turn — never from the file itself.
+    #
+    # This used to fall back: `ctx.read_shas.get(name) or sha_of(current)`. That
+    # one `or` disarmed the staleness check in precisely the case it exists for.
+    # A model working from a copy in its context, without re-reading, left
+    # read_shas empty, so base_sha silently became the *live* file's hash;
+    # apply_proposal then compared the live file against itself, found no
+    # conflict, and applied a whole-file rewrite built from a stale snapshot.
+    #
+    # That is not hypothetical. It is how a design document lost fourteen
+    # footprint references and four connector rows, and had a part reverted to a
+    # different orderable variant, in an edit that reported success — because
+    # every check it passed was asking the wrong question.
+    #
+    # No fallback now. If the file exists and was not read in this turn, there is
+    # no honest base to anchor to and the proposal is refused.
+    prior = ctx.read_shas.get(target.name)
+    if current is not None:
+        if prior is None:
+            raise ToolDenied(
+                f"{target.name} has not been read in this turn, so there is nothing to base an "
+                "edit on. Read it first and build the edit from what it actually contains — a "
+                "copy from earlier in the conversation may be several edits behind."
+            )
+        if prior != sha_of(current):
+            # Read earlier in this turn, changed since. Catching it here rather
+            # than at accept time means the model is told while it can still act,
+            # and the proposal never exists to be accepted by mistake.
+            raise ToolDenied(
+                f"{target.name} changed after you read it, so this edit is built on a version "
+                "that no longer exists. Read it again and rebuild the edit from the new content."
+            )
+        base_sha = prior
+    elif prior is not None:
+        # Read in this turn, so it existed; not a file now. Deleted, or replaced
+        # by a directory.
+        #
+        # Letting this through as a creation is worse than it sounds, and it is
+        # what the first version of this check did. base_sha would be None,
+        # apply_proposal only tests staleness for a path that still exists, and
+        # the edit would sail through — recreating a document somebody deleted,
+        # from a copy that predates the deletion, with no conflict reported
+        # because nothing conflicted. Deleting a file is a decision; undoing it
+        # silently is not this tool's to make.
+        raise ToolDenied(
+            f"{target.name} existed when you read it and is not a file any more — it has been "
+            "deleted or replaced. Proposing the old content back would undo that silently. "
+            "Check what happened before deciding whether it should be recreated."
+        )
+    elif target.exists():
+        # Never read, and something is there that is not a file. Refused rather
+        # than left for apply_proposal to fail on mid-write.
+        raise ToolDenied(f"{target.name} exists and is not a file — nothing here can edit it")
+    else:
+        base_sha = None
     proposal = ProposalStore(ctx.project_dir).create(
         path=target.name,
         new_content=new_content,
@@ -1362,7 +1417,16 @@ def project_tools() -> list[ToolSpec]:
             description=(
                 "Propose new content for a design document. The user reviews it as a diff and "
                 "accepts or rejects — nothing is written until they do. Supply the COMPLETE new "
-                "file content. Read the file first unless you are creating it."
+                "file content.\n\n"
+                "You MUST call read_project_file on it first, in THIS turn, and build the edit "
+                "from what that returned. This is enforced, not advice: an edit with no read "
+                "behind it is refused. A copy of the file from earlier in the conversation is "
+                "not a substitute — the document may have been edited since by the user, by an "
+                "accepted proposal, or by another agent, and you cannot tell from your own "
+                "context that it has. Because this tool takes the whole file, an edit written "
+                "from a stale copy does not fail loudly; it silently reverts every change made "
+                "in between while appearing to succeed.\n\n"
+                "Creating a file that does not exist yet is the one case with nothing to read."
             ),
             input_schema={
                 "type": "object",
