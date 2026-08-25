@@ -77,6 +77,22 @@ services:
       # declarative config, and the project working copies.
       - BLPL_DATA_ROOT=/app/data
       - BLPL_PROJECTS_ROOT=/app/data/projects
+      # Libraries shared across every project, rather than copied into each.
+      #
+      # symbol_resolution puts this between a project's own libraries/ and the
+      # Stage 3 generated ones: a part somebody drew for THIS board still wins,
+      # but a vendor footprint four boards need is written once. Each
+      # subdirectory is a library root in its own right, holding <Lib>.pretty
+      # and <Lib>.kicad_symdir, so a lib_id resolves exactly as it would from
+      # stock.
+      #
+      # Under BLPL_DATA_ROOT deliberately. It is not derivable from anything in
+      # git — it is a working library people add to — so it belongs beside the
+      # project working copies and the server key, covered by whatever backs
+      # those up. The code's own default is ~/.blpl/modules, which inside a
+      # container is a path that vanishes on the next recreate; naming it here
+      # is what makes it outlive one.
+      - BLPL_MODULES_ROOT=/app/data/modules
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
       # Where the local model server is, for both inference and for the
@@ -258,6 +274,10 @@ services:
       - BLPL_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-blpl}:${POSTGRES_PASSWORD:-blpl}@db:5432/${POSTGRES_DB:-blpl}
       - BLPL_DATA_ROOT=/app/data
       - BLPL_PROJECTS_ROOT=/app/data/projects
+      # The same shared library root the backend uses — a stage resolves
+      # footprints here, so the two must agree or a run resolves differently
+      # depending on which container picked it up.
+      - BLPL_MODULES_ROOT=/app/data/modules
       - BLPL_CONFIG=/app/data/blpl.toml
       - BLPL_KICAD_HAPPY=/app/kicad-happy
       # Where the local model server is, for both inference and for the
@@ -441,6 +461,34 @@ services:
       # reason a deployment with accounts that are not on everything should name
       # a single project here rather than mount the root.
       - ./data/projects/${KICAD_DESKTOP_PROJECT:-}:/config/projects
+      # The shared component library, READ-ONLY by default, and the default is
+      # the point.
+      #
+      # This mount is deployment-wide while the gate in front of the desktop may
+      # not be. With KICAD_DESKTOP_PROJECT naming a project, /api/authz/gate
+      # admits any member of *that* project — correctly, it is their project —
+      # and a writable mount would then let them alter footprints and symbols
+      # that every other project's runs resolve against, including projects they
+      # cannot open. Membership of one board would become write access to the
+      # library behind all of them, which is a wider grant than anything else
+      # here hands out and is not one anybody asked for.
+      #
+      # There is no per-user answer available: the desktop is a single shared
+      # Unix session and cannot show one caller a writable library and another a
+      # read-only one. So the boundary has to be the mount, and the safe side
+      # has to be the default.
+      #
+      # Set KICAD_SHARED_LIBRARIES=rw only where the desktop is already
+      # deployment-wide — that is, with KICAD_DESKTOP_PROJECT unset, where the
+      # gate demands membership of every project in the root and so already
+      # implies the standing to edit what they share. Pairing it with a named
+      # project is the combination this default exists to stop.
+      #
+      # Read-only does not block the drawing workflow, it stages it: save into
+      # the project's own libraries/, which is writable and searched first, and
+      # promote deliberately. A part earning a place in the shared library is a
+      # decision worth making on purpose rather than by autosave.
+      - ./data/modules:/config/shared-libraries:${KICAD_SHARED_LIBRARIES:-ro}
       - ../kicad-symbols:/usr/share/kicad/symbols:ro
       - ../kicad-footprints:/usr/share/kicad/footprints:ro
       - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
