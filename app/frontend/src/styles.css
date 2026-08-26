@@ -211,11 +211,17 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8e8e; }
 .conf.lo { background: #3a1a1d; color: #ff8e8e; }
 
 /* --- diff / changes --- */
-.diff { overflow: auto; height: 100%; padding: .8rem; display: flex; flex-direction: column; gap: .6rem; }
+.diff { overflow-y: auto; min-height: 0; height: 100%; padding: .8rem; display: flex; flex-direction: column; gap: .6rem; }
 .diff-summary { padding: 0 .2rem; }
 .add { color: #6ee7a0; }
 .del { color: #ff8b8b; }
-.diff-file { border: 1px solid #6b6f75; border-radius: 6px; overflow: hidden; background: #15181d; }
+/* flex: none is load-bearing, not tidiness. overflow: hidden (needed for the
+   border-radius clip) zeroes a flex child's automatic minimum size — so with
+   25 changed files the column SHRANK every block to 1/25th of the pane instead
+   of overflowing it. The container never overflowed, so its overflow: auto
+   never engaged, and the tab read as "everything crammed, nothing scrolls".
+   Blocks keep their natural height; the .diff column scrolls. */
+.diff-file { flex: none; border: 1px solid #6b6f75; border-radius: 6px; overflow: hidden; background: #15181d; }
 .diff-file-head { display: flex; align-items: center; gap: .6rem; width: 100%; text-align: left; background: transparent; border: none; color: #e6e6e6; padding: .5rem .7rem; font: inherit; }
 .diff-file-head:hover { background: #1c2027; }
 .diff-path { background: transparent; padding: 0; }
