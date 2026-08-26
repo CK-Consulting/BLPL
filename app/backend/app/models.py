@@ -178,6 +178,59 @@ class ProviderKey(Base):
     user: Mapped[User] = relationship(back_populates="keys")
 
 
+class GitEndpoint(Base):
+    """One user's credential for one git host, sealed at rest.
+
+    The clone dialog used to say "auth to the remote uses the deploy's git
+    credentials" — credentials that had no storage, no env var, and no way to
+    exist. This is their home, and it is per-user for the same reason provider
+    keys are: a shared deploy credential would mean every signed-in user pushing
+    and pulling as the operator, on the operator's account.
+
+    Modeled on ProviderKey deliberately. Only ciphertext and nonce are stored,
+    sealed under the user's master key with the endpoint's own name as the
+    AES-GCM associated data — so a ciphertext cannot be replayed into another
+    endpoint or another user, and no SELECT or pg_dump can produce a plaintext
+    token. The secret is the token for HTTPS or the private key for SSH; it
+    exists in this process only inside a request, on its way into a git
+    subprocess's environment.
+
+    ``host`` is what a remote URL is matched against, so the clone form never
+    asks "which credential" — pasting a GitHub URL finds the GitHub row. Which
+    is exactly why host is unique per user: matching is the ONLY selection
+    mechanism there is, and a second credential for the same host would make
+    every clone, pull and push a coin toss between identities — a wrong-account
+    push being the kind of failure that looks like success. Two accounts on one
+    host need a selector this app does not have; until it does, the store
+    refuses the second row rather than guessing.
+    """
+
+    __tablename__ = "git_endpoint"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_git_endpoint_user_name"),
+        UniqueConstraint("user_id", "host", name="uq_git_endpoint_user_host"),
+        Index("ix_git_endpoint_user", "user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    #: User-facing label: "github", "work-gitlab". The AES-GCM associated data.
+    name: Mapped[str] = mapped_column(String(64))
+    #: The hostname remotes are matched against: "github.com", "git.corp.example".
+    host: Mapped[str] = mapped_column(String(255))
+    #: https_token | ssh_key
+    method: Mapped[str] = mapped_column(String(16))
+    #: The username the credential belongs to. Required for HTTPS (basic auth
+    #: needs one; GitLab tokens want "oauth2", GitHub accepts anything). Unused
+    #: for SSH, where the key is the identity.
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=_now
+    )
+
+
 class UserMasterKey(Base):
     """One user's master key, wrapped under their passphrase.
 

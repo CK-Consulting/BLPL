@@ -39,7 +39,7 @@ import shutil
 import subprocess
 import sys
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1302,6 +1302,82 @@ def delete_secret(
     return {"ok": True, "removed": keystore.delete(session, user, provider)}
 
 
+@app.get("/api/library-policy")
+def library_policy_defaults(user: User = Depends(require_onboarded)) -> dict:
+    """The choices and the consent wording, for a dialog with no project yet.
+
+    The New Project form asks for the declaration before the project exists, so
+    it cannot read /api/projects/{id}/policy. Same source of truth either way —
+    this returns the module's constants, not a copy."""
+    from . import library_policy
+
+    return {
+        "defaults": dict(library_policy.DEFAULTS),
+        "choices": {
+            "contribute": list(library_policy.CONTRIBUTE),
+            "consume": list(library_policy.CONSUME),
+            "unique_components": list(library_policy.UNIQUE),
+        },
+        "consent_text": library_policy.CONSENT_TEXT,
+    }
+
+
+class GitEndpointBody(BaseModel):
+    host: str
+    method: str
+    secret: str
+    username: str | None = None
+
+
+@app.get("/api/settings/git")
+def list_git_endpoints(
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """This user's git credentials — names and hosts, never secrets — plus the
+    presets the form pre-fills. Presets are advisory: by the time a row is
+    stored, GitHub is just a host like any other."""
+    from . import gitstore
+
+    return {"endpoints": gitstore.list_endpoints(session, user), "presets": gitstore.PRESETS,
+            "methods": list(gitstore.METHODS)}
+
+
+@app.put("/api/settings/git/{name}")
+def put_git_endpoint(
+    name: str,
+    body: GitEndpointBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Store one git credential. The secret is a PAT for HTTPS or a private key
+    for SSH, sealed under this user's master key exactly as provider keys are —
+    it never appears in a response body."""
+    from . import gitstore
+
+    try:
+        gitstore.put(
+            session, master_key, user,
+            name=name, host=body.host, method=body.method,
+            secret=body.secret, username=body.username,
+        )
+    except gitstore.GitStoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "name": name.strip().lower()}
+
+
+@app.delete("/api/settings/git/{name}")
+def delete_git_endpoint(
+    name: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    from . import gitstore
+
+    return {"ok": True, "removed": gitstore.delete(session, user, name)}
+
+
 # --------------------------------------------------------------------------
 # Projects
 # --------------------------------------------------------------------------
@@ -1570,6 +1646,25 @@ def _iso(when) -> str | None:
     return when.isoformat() if when is not None else None
 
 
+@contextmanager
+def _git_credentials(session: Session, master_key: bytes, user: User, remote: str):
+    """The environment for one remote git operation: a leased credential, or None.
+
+    None is the public-repository case and must stay working — it was the only
+    case that ever worked. A row that matches the remote's host is decrypted for
+    the length of the operation and gone after; see gitstore.lease for why HTTPS
+    rides the environment and SSH is briefly a file.
+    """
+    from . import gitstore
+
+    row = gitstore.for_remote(session, user, remote)
+    if row is None:
+        yield None
+        return
+    with gitstore.lease(master_key, row) as cred:
+        yield cred.env
+
+
 @app.post("/api/projects/clone")
 def clone_project(
     body: CloneBody,
@@ -1580,7 +1675,8 @@ def clone_project(
     """Clone a remote into a new working copy, owned by whoever cloned it."""
     _refuse_taken_name(session, body.name)
     try:
-        projects.clone(body.name, body.remote, body.branch)
+        with _git_credentials(session, master_key, user, body.remote) as env:
+            projects.clone(body.name, body.remote, body.branch, env=env)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     project = projectacl.create(session, user, body.name, remote=body.remote, branch=body.branch)
@@ -2231,10 +2327,12 @@ def git_diff(project_id: str, user: User = Depends(require_onboarded),
 
 @app.post("/api/projects/{project_id}/git/pull")
 def git_pull(project_id: str, user: User = Depends(require_onboarded),
-    session: Session = Depends(session_scope)) -> dict:
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key)) -> dict:
     _project_dir(session, user, project_id)
     try:
-        out = projects.pull(project_id)
+        with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
+            out = projects.pull(project_id, env=env)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}
@@ -2242,10 +2340,12 @@ def git_pull(project_id: str, user: User = Depends(require_onboarded),
 
 @app.post("/api/projects/{project_id}/git/push")
 def git_push(project_id: str, user: User = Depends(require_onboarded),
-    session: Session = Depends(session_scope)) -> dict:
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key)) -> dict:
     _project_dir(session, user, project_id)
     try:
-        out = projects.push(project_id)
+        with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
+            out = projects.push(project_id, env=env)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}

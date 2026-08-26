@@ -8,7 +8,7 @@ import { Sharing } from "./components/Sharing";
 import { Dashboard } from "./components/Dashboard";
 import { Invitations } from "./components/Invitations";
 import { Logo } from "./components/Logo";
-import { NewProject, ProjectSync } from "./components/ProjectControls";
+import { NewProject, ProjectSettings, ProjectSync } from "./components/ProjectControls";
 import { FileView } from "./components/FileView";
 import { LaunchKicad } from "./components/LaunchKicad";
 import { KicadFileView } from "./components/KicadFileView";
@@ -108,7 +108,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
       <Invitations onChanged={refresh} />
       <header>
         <button className="link dash-back" onClick={onLeave} title="All projects">
-          ← <Logo size={20} />
+          ← <Logo size={30} />
         </button>
         <span className="sep">/</span>
         <select
@@ -123,6 +123,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
             </option>
           ))}
         </select>
+        {selected && <ProjectSettings projectId={selected} />}
         <LaunchKicad className="link kicad-launch" />
         {(() => {
           const cur = projects.find((p) => p.id === selected);
@@ -143,7 +144,8 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
         />
         <span className="spacer" />
         <span className="kicad" title="KiCad running server-side, in the container">
-          {kicad ?? "kicad-cli: not found"}
+          {/* Named, not bare: "10.0.0" alone reads as an app version. */}
+          {kicad ? `KiCad ${kicad}` : "KiCad: not found"}
         </span>
         <button className={showChat ? "link on" : "link"} onClick={toggleChat}>
           Chat

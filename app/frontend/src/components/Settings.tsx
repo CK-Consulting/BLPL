@@ -1,5 +1,13 @@
 import { useEffect, useState } from "react";
-import { EndpointConfig, Settings as SettingsData, del, getJSON, postJSON, putJSON } from "../api";
+import {
+  EndpointConfig,
+  GitEndpoints as GitEndpointsData,
+  Settings as SettingsData,
+  del,
+  getJSON,
+  postJSON,
+  putJSON,
+} from "../api";
 import { PasskeyInfo, enrolPasskey, passkeysAvailable } from "../passkey";
 
 /**
@@ -16,14 +24,17 @@ import { PasskeyInfo, enrolPasskey, passkeysAvailable } from "../passkey";
  * model, and datasheet extraction must be able to see."
  */
 
-type SectionId = "endpoints" | "routing" | "security";
+type SectionId = "endpoints" | "routing" | "git" | "security";
 
-// "Security" rather than "Passkeys": you go looking for where the lock lives,
-// not for the name of the mechanism that opens it.
+// Labels say what the section holds, not the mechanism inside it — "Data
+// security" rather than "Passkeys" because you go looking for where the lock
+// lives, and "AI model providers/endpoints" because "Endpoints" alone stopped
+// meaning one thing the day git endpoints arrived.
 const SECTIONS: { id: SectionId; label: string }[] = [
-  { id: "endpoints", label: "Endpoints" },
+  { id: "endpoints", label: "AI model providers/endpoints" },
   { id: "routing", label: "Task routing" },
-  { id: "security", label: "Security" },
+  { id: "git", label: "Git endpoints/accounts" },
+  { id: "security", label: "Data security" },
 ];
 
 export function SettingsPanel({ onClose }: { onClose: () => void }) {
@@ -89,6 +100,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
           {tab === "routing" && (
             <Routing data={data} onChanged={refresh} onError={setError} />
           )}
+          {tab === "git" && <GitEndpoints onError={setError} />}
           {tab === "security" && <Passkeys onError={setError} />}
         </div>
       </div>
@@ -810,6 +822,147 @@ function Passkeys({ onError }: { onError: (msg: string | null) => void }) {
           {busy ? "Waiting for your key…" : "Add a passkey"}
         </button>
       </div>
+    </section>
+  );
+}
+
+
+// -- git endpoints -----------------------------------------------------------
+
+/**
+ * Per-user git credentials, one row per host. The clone dialog used to promise
+ * "the deploy's git credentials" — credentials that had nowhere to exist. These
+ * are theirs: sealed like provider keys, matched by the host in a remote URL,
+ * and never echoed back once stored.
+ */
+function GitEndpoints({ onError }: { onError: (m: string) => void }) {
+  const [data, setData] = useState<GitEndpointsData | null>(null);
+  const [name, setName] = useState("");
+  const [host, setHost] = useState("");
+  const [method, setMethod] = useState("https_token");
+  const [username, setUsername] = useState("");
+  const [secret, setSecret] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = () =>
+    getJSON<GitEndpointsData>("/api/settings/git")
+      .then(setData)
+      .catch((e) => onError(String((e as Error).message)));
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  if (!data) return <p className="muted">Loading…</p>;
+
+  const preset = (p: GitEndpointsData["presets"][number]) => {
+    setName(p.name);
+    setHost(p.host);
+    setMethod(p.method);
+    setUsername(p.username);
+  };
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await putJSON(`/api/settings/git/${encodeURIComponent(name)}`, {
+        host,
+        method,
+        username: username || null,
+        secret,
+      });
+      setName("");
+      setHost("");
+      setUsername("");
+      setSecret("");
+      await refresh();
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section>
+      <p className="muted">
+        A credential is matched by the host in a remote URL — paste a GitHub remote and the
+        github row answers. The secret is a personal access token (HTTPS) or a private key
+        (SSH), stored sealed under your master key; it is used during clone, pull and push and
+        never shown again.
+      </p>
+      {data.endpoints.length > 0 && (
+        <table className="kv">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Host</th>
+              <th>Access</th>
+              <th>Username</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {data.endpoints.map((e) => (
+              <tr key={e.name}>
+                <td>{e.name}</td>
+                <td>{e.host}</td>
+                <td>{e.method === "ssh_key" ? "SSH key" : "HTTPS token"}</td>
+                <td>{e.username ?? "—"}</td>
+                <td>
+                  <button
+                    className="link"
+                    onClick={() =>
+                      del(`/api/settings/git/${encodeURIComponent(e.name)}`).then(refresh)
+                    }
+                  >
+                    Remove
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <h4>Add an endpoint</h4>
+      <div className="row">
+        {data.presets.map((p) => (
+          <button key={p.name} className="link" onClick={() => preset(p)}>
+            {p.name === "github" ? "GitHub" : p.name === "gitlab" ? "GitLab" : p.name}
+          </button>
+        ))}
+        <span className="muted">— or define your own below</span>
+      </div>
+      <input placeholder="name (e.g. github, work-gitlab)" value={name} onChange={(e) => setName(e.target.value)} />
+      <input placeholder="host (e.g. github.com)" value={host} onChange={(e) => setHost(e.target.value)} />
+      <select value={method} onChange={(e) => setMethod(e.target.value)}>
+        <option value="https_token">HTTPS with access token</option>
+        <option value="ssh_key">SSH with private key</option>
+      </select>
+      {method === "https_token" && (
+        <input
+          placeholder="username the token belongs to (GitLab tokens use oauth2)"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
+      )}
+      {method === "https_token" ? (
+        <input
+          type="password"
+          placeholder="access token"
+          value={secret}
+          onChange={(e) => setSecret(e.target.value)}
+        />
+      ) : (
+        <textarea
+          placeholder="private key (PEM/OpenSSH). Use a deploy key scoped to the repositories this server should reach."
+          rows={5}
+          value={secret}
+          onChange={(e) => setSecret(e.target.value)}
+        />
+      )}
+      <button onClick={save} disabled={busy || !name || !host || !secret}>
+        {busy ? "…" : "Save endpoint"}
+      </button>
     </section>
   );
 }

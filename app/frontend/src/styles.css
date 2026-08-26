@@ -6,7 +6,12 @@
    than by eye — dark grey on near-black looks deliberate and measures badly. */
 body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; color: #e6e6e6; background: #14161a; }
 .app { display: flex; flex-direction: column; height: 100vh; }
-header { display: flex; align-items: center; gap: .6rem; padding: .6rem 1rem; border-bottom: 1px solid #6b6f75; background: #191c22; }
+/* ~50% taller than the original .6rem: the bar carries the project picker,
+   settings, and the KiCad launcher now, and at the old height the settings
+   gear read as a stray character. */
+header { display: flex; align-items: center; gap: .6rem; padding: .9rem 1rem; border-bottom: 1px solid #6b6f75; background: #191c22; }
+/* 150% of the surrounding text — a target you can hit, not a stray glyph. */
+header .proj-settings { font-size: 1.5em; line-height: 1; padding: 0 .15rem; }
 header .sep { color: #555; }
 header .kicad { margin-left: auto; color: #7d8590; font-size: 12px; }
 main { display: flex; flex: 1; min-height: 0; }
@@ -802,3 +807,16 @@ header .kicad-launch { margin-left: .4rem; }
   border: 1px solid #2a2f38; border-radius: 6px; background: #14171d;
 }
 .preflight-tools code { color: #90a1b9; }
+
+/* --- project permissions for component library --- */
+.policy-fields { border: 1px solid #414a57; border-radius: 10px; padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: .55rem; }
+.policy-fields legend { padding: 0 .4rem; font-size: 14px; color: #c3ccd6; }
+.policy-fields h4 { margin: .35rem 0 0; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: #b9c3d0; }
+.policy-group { display: flex; flex-direction: column; gap: .3rem; }
+.policy-option { display: flex; gap: .55rem; align-items: flex-start; font-size: 14px; line-height: 1.45; color: #e6ebf1; }
+.policy-option input { margin-top: .22rem; }
+/* The consent statement is the sentence someone is held to, so it reads as a
+   paragraph beside its checkbox rather than a label squeezed onto one line. */
+.policy-consent { display: flex; gap: .6rem; align-items: flex-start; font-size: 14px; line-height: 1.5; color: #e6ebf1; background: #10141b; border: 1px solid #414a57; border-radius: 8px; padding: .7rem .8rem; }
+.policy-consent input { margin-top: .25rem; }
+.policy-panel { display: flex; flex-direction: column; gap: .9rem; }

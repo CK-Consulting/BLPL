@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { GitStatus, ImportResult, getJSON, postForm, postJSON } from "../api";
+import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
 
 // The git strip: what state the server's working copy is in, and the three
 // buttons that keep it in sync with the remote you roam through — pull, commit,
@@ -97,16 +98,23 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
   const [skipped, setSkipped] = useState<ImportResult["skipped"]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The library declaration, common to all three tabs: how a project arrives
+  // says nothing about what it shares.
+  const policy = useNewProjectPolicy();
 
   const create = async () => {
     setBusy(true);
     setError(null);
     try {
       if (mode === "clone") {
-        await postJSON("/api/projects/clone", { name, remote, branch });
+        await postJSON("/api/projects/clone", { name, remote, branch, ...policy.value });
       } else if (mode === "import") {
         const form = new FormData();
         form.append("name", name);
+        form.append("contribute", policy.value.contribute);
+        form.append("consume", policy.value.consume);
+        form.append("unique_components", policy.value.unique_components);
+        form.append("consented", String(policy.value.consented));
         // webkitRelativePath is set when a folder was selected; sending it as
         // the filename preserves the layout so the server can flatten the
         // common root the same way it does for a zip.
@@ -120,7 +128,7 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
           return;
         }
       } else {
-        await postJSON("/api/projects/init", { name });
+        await postJSON("/api/projects/init", { name, ...policy.value });
       }
       setOpen(false);
       setName("");
@@ -136,7 +144,17 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
 
   if (!open)
     return (
-      <button className="link" onClick={() => setOpen(true)}>
+      <button
+        className="link"
+        onClick={() => {
+          // Fresh declaration per project. The component stays mounted while
+          // closed, and a consent carried over from the last project would be
+          // submitted for this one unread.
+          policy.reset();
+          setSkipped([]);
+          setOpen(true);
+        }}
+      >
         + Project
       </button>
     );
@@ -168,8 +186,9 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
               <input placeholder="git@github.com:you/board.git" value={remote} onChange={(e) => setRemote(e.target.value)} />
               <input placeholder="branch" value={branch} onChange={(e) => setBranch(e.target.value)} />
               <p className="muted">
-                The server clones and holds a working copy. Auth to the remote uses the deploy's git
-                credentials.
+                The server clones and holds a working copy. A private remote authenticates with your
+                own git credential for its host — add one under Settings → Git endpoints/accounts.
+                Public remotes need none.
               </p>
             </>
           )}
@@ -202,6 +221,14 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
               )}
             </>
           )}
+          {policy.meta && (
+            <PolicyFields
+              value={policy.value}
+              onChange={policy.setValue}
+              choices={policy.meta.choices}
+              consentText={policy.meta.consent_text}
+            />
+          )}
           {error && <div className="gate-error">{error}</div>}
           <button
             onClick={create}
@@ -215,6 +242,43 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
           >
             {busy ? "…" : mode === "clone" ? "Clone" : mode === "import" ? "Import" : "Create"}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+/**
+ * Per-project settings, reached from the button beside the project picker.
+ *
+ * One tab today — the component-library declaration — but a dialog rather than
+ * an inline panel because the next per-project setting should have somewhere to
+ * live that is not a new button.
+ */
+export function ProjectSettings({ projectId }: { projectId: string }) {
+  const [open, setOpen] = useState(false);
+  if (!open)
+    return (
+      <button
+        className="link proj-settings"
+        title="Project settings — what this project shares with the component library"
+        onClick={() => setOpen(true)}
+      >
+        ⚙
+      </button>
+    );
+  return (
+    <div className="modal-backdrop" onClick={() => setOpen(false)}>
+      <div className="modal small" onClick={(e) => e.stopPropagation()}>
+        <header className="modal-head">
+          <h2>Project settings — {projectId}</h2>
+          <button className="link" onClick={() => setOpen(false)}>
+            Close
+          </button>
+        </header>
+        <div className="modal-body">
+          <ProjectPolicyPanel projectId={projectId} />
         </div>
       </div>
     </div>

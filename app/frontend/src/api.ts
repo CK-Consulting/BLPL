@@ -389,6 +389,39 @@ export type GitStatus = {
   has_remote: boolean;
 };
 
+export type LibraryPolicyValues = {
+  contribute: string;
+  consume: string;
+  unique_components: string;
+  consented: boolean;
+};
+
+export type LibraryPolicy = LibraryPolicyValues & {
+  consent_text: string;
+  declared: boolean;
+  choices: { contribute: string[]; consume: string[]; unique_components: string[] };
+};
+
+export type LibraryPolicyDefaults = {
+  defaults: { contribute: string; consume: string; unique_components: string };
+  choices: { contribute: string[]; consume: string[]; unique_components: string[] };
+  consent_text: string;
+};
+
+export type GitEndpointMeta = {
+  name: string;
+  host: string;
+  method: string;
+  username: string | null;
+  updated_at: string;
+};
+
+export type GitEndpoints = {
+  endpoints: GitEndpointMeta[];
+  presets: { name: string; host: string; method: string; username: string }[];
+  methods: string[];
+};
+
 export type ConversationMeta = {
   slug: string;
   filename: string;

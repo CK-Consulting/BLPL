@@ -23,6 +23,7 @@ ever passes through application code or lands in a log line.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,7 +130,10 @@ class Projects:
 
     # -- lifecycle -----------------------------------------------------------
 
-    def clone(self, name: str, remote: str, branch: str = "main") -> Path:
+    def clone(
+        self, name: str, remote: str, branch: str = "main",
+        *, env: dict[str, str] | None = None,
+    ) -> Path:
         """Clone a remote into a new working copy. Fails if the dir already exists,
         rather than clobbering whatever is there.
 
@@ -142,7 +146,7 @@ class Projects:
         dest = self.project_dir(name)
         if dest.exists():
             raise ProjectError(f"project {name!r} already exists at {dest}")
-        self._git(self.root, "clone", "--branch", branch, remote, dest.name)
+        self._git(self.root, "clone", "--branch", branch, remote, dest.name, env=env)
         self._ensure_identity(dest)
         return dest
 
@@ -220,7 +224,13 @@ class Projects:
 
     # -- sync ----------------------------------------------------------------
 
-    def pull(self, name: str) -> str:
+    def remote_of(self, name: str) -> str:
+        """The origin URL, or "" for a local-only project. For credential
+        matching — which is why a missing remote is an empty answer, not an
+        error: no remote means no credential could apply."""
+        return self._git_allow_fail(self.project_dir(name), "remote", "get-url", "origin")
+
+    def pull(self, name: str, *, env: dict[str, str] | None = None) -> str:
         """Fast-forward the working copy from its remote. Returns git's output.
 
         Deliberately not a merge or rebase of divergent history: if the server
@@ -228,7 +238,7 @@ class Projects:
         app papers over. --ff-only turns divergence into a clear error.
         """
         d = self._require(name)
-        return self._git(d, "pull", "--ff-only")
+        return self._git(d, "pull", "--ff-only", env=env)
 
     def commit_all(self, name: str, message: str) -> str | None:
         """Stage everything and commit. Returns the commit output, or None if the
@@ -239,9 +249,9 @@ class Projects:
             return None
         return self._git(d, "commit", "-m", message)
 
-    def push(self, name: str) -> str:
+    def push(self, name: str, *, env: dict[str, str] | None = None) -> str:
         d = self._require(name)
-        return self._git(d, "push")
+        return self._git(d, "push", env=env)
 
     # -- inspection ----------------------------------------------------------
 
@@ -374,7 +384,10 @@ class Projects:
                 return True
         return False
 
-    def _git(self, cwd: Path, *args: str) -> str:
+    def _git(self, cwd: Path, *args: str, env: dict[str, str] | None = None) -> str:
+        # `env` is extra environment for this one invocation — a leased
+        # credential, never a stored one. Merged over the process environment
+        # rather than replacing it, because git needs PATH and HOME too.
         proc = subprocess.run(
             ["git", *args],
             cwd=str(cwd),
@@ -382,6 +395,7 @@ class Projects:
             text=True,
             check=False,
             timeout=300,
+            env={**os.environ, **env} if env else None,
         )
         if proc.returncode != 0:
             raise ProjectError(
