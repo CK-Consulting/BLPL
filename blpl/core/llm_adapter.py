@@ -272,6 +272,13 @@ class _OpenAIAdapter:
             kwargs["api_key"] = "not-required"
         if self.base_url:
             kwargs["base_url"] = self.base_url
+        # A bounded wait, everywhere. The run that forced this sat inside an
+        # unbounded request to a wedged local model while the worker's stop
+        # signal had no process to land on — ten minutes is enough for a large
+        # local model to load and generate, and "the endpoint is not answering"
+        # must become an error a run can report, not a hang a person has to
+        # diagnose from a frozen heartbeat.
+        kwargs.setdefault("timeout", 600)
         client = OpenAI(**kwargs)  # falls back to OPENAI_API_KEY
         # OpenAI strict mode requires all properties be in `required` and no open
         # unions. We pass the schema as-is; callers are responsible for strict-compatible shapes.
@@ -314,7 +321,10 @@ class _OllamaAdapter:
         import ollama  # lazy import; optional dep
 
         host = self.base_url or os.environ.get("OLLAMA_HOST")
-        client = ollama.Client(host=host) if host else ollama.Client()
+        # ollama.Client's default is NO timeout — an accepted connection that
+        # never answers (a wedged serve, a model stuck loading) blocks forever.
+        # Same bound and same reasoning as the OpenAI path above.
+        client = ollama.Client(host=host, timeout=600) if host else ollama.Client(timeout=600)
         resp = client.chat(
             model=model or self.model,
             messages=[
