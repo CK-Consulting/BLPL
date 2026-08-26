@@ -33,12 +33,14 @@ class PartHit:
     description: str = ""
     datasheet_url: str = ""
     # Parametric data as the distributor states it — voltage rating, tolerance,
-    # dielectric, power. Distributor APIs return these (Mouser as
-    # ProductAttributes, DigiKey as Parameters), but the resolver scripts in the
-    # kicad-happy submodule currently keep only manufacturer, description and
-    # datasheet URL. Read here so the moment those scripts pass the field
-    # through, everything downstream already uses it; empty until then, which
-    # costs nothing and breaks nothing.
+    # dielectric, power (Mouser as ProductAttributes, DigiKey as Parameters),
+    # and since kicad-happy PR #1 what it says about the package: `package`,
+    # `supplier_package`, `body_mm`, `height_mm`.
+    #
+    # The package half is a *hint*, not a land pattern. "24-WQFN (4x4)" narrows a
+    # footprint search and does not settle it: no distributor states the exposed
+    # pad, which is the dimension that tells a dozen no-lead footprints apart,
+    # and that comes only from the datasheet's package drawing.
     attributes: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
