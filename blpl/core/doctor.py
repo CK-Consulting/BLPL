@@ -814,6 +814,36 @@ def run(
         refs = {r for r, _ in owners}
         if len(refs) < 2 or _is_power_signal(sig):
             continue
+        # The placeholder trap outranks every exemption below: RESERVED on
+        # thirty pins shorts them all into one net whether the owners are
+        # chips, connectors, or a declared bus, so it is decided first.
+        if sig.upper() in _FAKE_NC_PLACEHOLDERS:
+            report.findings.append(
+                Finding(
+                    code="DOC-004",
+                    severity="error",
+                    summary=(
+                        f"'{sig}' is used as a signal name on {len(refs)} components "
+                        f"({', '.join(sorted(refs))}) — every one of those pins will be "
+                        "shorted together into a single net."
+                    ),
+                    fix=(
+                        f"Stage 4 only drops {sorted(_NC_SIGNALS)} — '{sig}' is not in that "
+                        "list, so it is treated as a real net name. Give each unconnected pin "
+                        "a unique name: NC_J2_17, NC_J3_19."
+                    ),
+                    file=owners[0][1],
+                )
+            )
+            continue
+
+        # Connectors do not count toward the collision threshold — a net on a
+        # chip and a connector is the connector doing its job, carrying that
+        # net off the board, and warning would fire on every routed interface
+        # pin. The hazard DOC-008 exists for is two unrelated chips silently
+        # sharing a name.
+        if len({r for r in refs if not r.startswith("J")}) < 2:
+            continue
         declared = declared_buses.get(sig)
         if declared is not None:
             # The design already answered "is this sharing intended". Verified
@@ -821,7 +851,11 @@ def run(
             # name has joined the bus since it was written, and that is a change
             # worth surfacing — quietly absorbing it would make the declaration
             # a permanent mute button.
-            undeclared = refs - declared
+            # Connectors are exempt here for the same reason they do not count
+            # toward the collision threshold: a receptacle carrying the bus off
+            # the board is the interface working, not a new bus member with
+            # intentions of its own. Only a *chip* joining unannounced is news.
+            undeclared = {r for r in refs - declared if not r.startswith("J")}
             if not undeclared:
                 continue
             report.findings.append(
@@ -841,27 +875,8 @@ def run(
             )
             continue
 
-        if sig.upper() in _FAKE_NC_PLACEHOLDERS:
-            report.findings.append(
-                Finding(
-                    code="DOC-004",
-                    severity="error",
-                    summary=(
-                        f"'{sig}' is used as a signal name on {len(refs)} components "
-                        f"({', '.join(sorted(refs))}) — every one of those pins will be "
-                        "shorted together into a single net."
-                    ),
-                    fix=(
-                        f"Stage 4 only drops {sorted(_NC_SIGNALS)} — '{sig}' is not in that "
-                        "list, so it is treated as a real net name. Give each unconnected pin "
-                        "a unique name: NC_J2_17, NC_J3_19."
-                    ),
-                    file=owners[0][1],
-                )
-            )
-        else:
-            report.findings.append(
-                Finding(
+        report.findings.append(
+            Finding(
                     code="DOC-008",
                     severity="warning",
                     summary=(

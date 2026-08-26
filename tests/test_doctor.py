@@ -877,3 +877,55 @@ def test_an_undeclared_collision_still_warns(tmp_path: Path) -> None:
         ),
     )
     assert "DOC-008" in _codes(doctor.run(proj))
+
+
+def test_a_net_shared_with_a_connector_is_the_connector_working(tmp_path: Path) -> None:
+    """SPI_NSS on the radio chip and on the board-to-board receptacle is one
+    net routed off the board — the interface existing, not a collision. Warning
+    here would fire on every routed interface pin of every connector."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## U_LORA — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n"
+            "| 1 | SPI_NSS | chip select |\n"
+            "## J_SBIO_LORA — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n"
+            "| A2 | SPI_NSS | lane to the sub-board |\n"
+        ),
+    )
+    assert "DOC-008" not in _codes(doctor.run(proj))
+
+
+def test_two_chips_sharing_still_warns_even_with_a_connector_involved(tmp_path: Path) -> None:
+    """The exemption is for connectors, not for whatever rides along with one."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## U_A — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n| 1 | BUSY | b |\n"
+            "## U_B — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n| 1 | BUSY | b |\n"
+            "## J_X — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n| A2 | BUSY | b |\n"
+        ),
+    )
+    assert "DOC-008" in _codes(doctor.run(proj))
+
+
+def test_a_connector_joining_a_declared_bus_is_not_news(tmp_path: Path) -> None:
+    """Six management receptacles carry the system I2C off to their slots —
+    the interface working, not six unannounced bus members."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## Shared buses\n\n"
+            "| Signal | Components | Purpose |\n|---|---|---|\n"
+            "| I2C_SDA | U_A, U_B | system I2C |\n\n"
+            "## U_A — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n| 1 | I2C_SDA | d |\n"
+            "## U_B — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n| 1 | I2C_SDA | d |\n"
+            "## J_MGMT_X — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n| A6 | I2C_SDA | d |\n"
+        ),
+    )
+    assert "DOC-008" not in _codes(doctor.run(proj))
