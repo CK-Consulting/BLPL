@@ -3020,6 +3020,9 @@ class _Library:
     def documents(self, mpn: str) -> list[dict]:
         return components.documents(_DATA, self._user_id, mpn)
 
+    def document(self, mpn: str, name: str) -> bytes:
+        return components.document_bytes(_DATA, self._user_id, mpn, name)
+
 
 class ComponentDocBody(BaseModel):
     mpn: str

@@ -66,8 +66,31 @@ def root(data_root: Path, user_id: int) -> Path:
     return Path(data_root) / "components" / f"u{int(user_id)}"
 
 
-def part_repo(data_root: Path, user_id: int, mpn: str) -> Path:
+def canonical_mpn(data_root: Path, user_id: int, mpn: str) -> str:
+    """The stored spelling for this part, when a record already exists.
+
+    Suppliers disagree about case and punctuation for one orderable part, and
+    ``find`` matches across that — but a caller then reads or writes with its
+    own spelling. Resolving here keeps every operation landing on the record
+    ``find`` matched, instead of missing it on a read or splitting it in two
+    on a write. The literal spelling wins when its repository exists; among
+    normalized-equal records the choice is sorted, the same deterministic
+    order ``find`` reports.
+    """
     name = folder_name(mpn)
+    r = root(data_root, user_id)
+    if not name or (r / name / ".git").exists() or not r.is_dir():
+        return mpn
+    want = _flat(name)
+    same = sorted(
+        d.name for d in r.iterdir()
+        if (d / ".git").exists() and _flat(d.name) == want
+    )
+    return same[0] if same else mpn
+
+
+def part_repo(data_root: Path, user_id: int, mpn: str) -> Path:
+    name = folder_name(canonical_mpn(data_root, user_id, mpn))
     if not name:
         raise ComponentError("a part number is required")
     return root(data_root, user_id) / name
@@ -105,23 +128,39 @@ def ensure_part(data_root: Path, user_id: int, mpn: str) -> Path:
     return d
 
 
-#: Subdirectories a part may hold, beyond loose documents at its root.
+#: The shapes a part may hold beyond loose documents at its root, exactly.
 #:
 #: A datasheet is one file and lives at the top. A footprint is not: KiCad
 #: resolves ``Package_SON:Winbond_WSON-8`` by looking for
 #: ``Package_SON.pretty/Winbond_WSON-8.kicad_mod``, so the library name is part
 #: of the path and flattening it would throw away the half of the reference that
 #: says which library. Hence a small allowlist rather than arbitrary nesting —
-#: enough shape to hold what KiCad needs, and nothing else.
-_SUBDIRS = ("footprints", "symbols", "models")
+#: enough shape to hold what KiCad needs, and nothing else. The whole shape is
+#: enforced, not just the first segment: a file KiCad's direct lookup cannot
+#: resolve would still be committed and reported as held, which is worse than
+#: refusing it here.
+#:
+#: subdirectory → (suffix of each intermediate directory or () for none,
+#: suffix of the file).
+_ASSET_SHAPES: dict[str, tuple[tuple[str, ...], str]] = {
+    "footprints": ((".pretty",), ".kicad_mod"),
+    "symbols": ((".kicad_symdir",), ".kicad_sym"),
+    "models": ((), ".step"),
+}
+
+_ASSET_SHAPE_DOC = ", ".join(
+    f"{sub}/" + "/".join(f"<Lib>{s}" for s in dirs) + ("/" if dirs else "") + f"<Name>{leaf}"
+    for sub, (dirs, leaf) in _ASSET_SHAPES.items()
+)
 
 
 def _document_path(filename: str) -> str:
     """A document's path inside a part repo, or a refusal.
 
-    Accepts a bare name, or one of the allowlisted subdirectories followed by
-    anything that stays underneath it. Rejects absolute paths, traversal, and
-    the dotfiles that would collide with git's own state.
+    Accepts a bare name, or one of the documented asset shapes in full —
+    ``footprints/<Lib>.pretty/<Name>.kicad_mod`` and its siblings. Rejects
+    absolute paths, traversal, the dotfiles that would collide with git's own
+    state, and anything nested in a way KiCad's direct lookup cannot resolve.
     """
     raw = (filename or "").strip().replace("\\", "/").strip("/")
     if not raw:
@@ -131,9 +170,23 @@ def _document_path(filename: str) -> str:
         raise ComponentError(f"{filename!r} is not a usable document name")
     if len(parts_) == 1:
         return parts_[0]
-    if parts_[0] not in _SUBDIRS:
+    shape = _ASSET_SHAPES.get(parts_[0])
+    if shape is None:
         raise ComponentError(
-            f"{filename!r} must be a bare filename or sit under one of: {', '.join(_SUBDIRS)}"
+            f"{filename!r} must be a bare filename or sit under one of: "
+            f"{', '.join(_ASSET_SHAPES)}"
+        )
+    dir_suffixes, leaf_suffix = shape
+    dirs, leaf = parts_[1:-1], parts_[-1]
+    well_shaped = (
+        len(dirs) == len(dir_suffixes)
+        and all(d.endswith(s) for d, s in zip(dirs, dir_suffixes))
+        and leaf.endswith(leaf_suffix)
+    )
+    if not well_shaped:
+        raise ComponentError(
+            f"{filename!r} does not match a supported asset shape — expected one of: "
+            f"{_ASSET_SHAPE_DOC}"
         )
     return "/".join(parts_)
 
@@ -182,6 +235,19 @@ def documents(data_root: Path, user_id: int, mpn: str) -> list[dict]:
     ]
 
 
+def document_bytes(data_root: Path, user_id: int, mpn: str, name: str) -> bytes:
+    """One held document's bytes, by the name ``documents`` reported it under."""
+    d = part_repo(data_root, user_id, mpn).resolve()
+    f = (d / name).resolve()
+    if (
+        not f.is_relative_to(d)
+        or not f.is_file()
+        or any(seg.startswith(".") for seg in f.relative_to(d).parts)
+    ):
+        raise ComponentError(f"{name!r} is not a document of {mpn}")
+    return f.read_bytes()
+
+
 def parts(data_root: Path, user_id: int) -> list[dict]:
     r = root(data_root, user_id)
     if not r.is_dir():
@@ -223,6 +289,13 @@ def find(data_root: Path, user_id: int, mpn: str, limit: int = 5) -> list[dict]:
     ``BQ27441DRZ`` is two parts, not a typo. Returning the second as though it
     were the first is a plausible, wrong board, so it comes back labelled for
     someone to judge.
+
+    New writes resolve to the stored spelling (``canonical_mpn``), so ``ABC-123``
+    and ``ABC123`` no longer end up as two records — but stores written before
+    that was enforced can still hold both. When they do, the record written
+    exactly as asked is listed first — a caller taking the first exact hit gets
+    the literal one, not whichever sorts first — and every exact hit says the
+    collision exists, because the records may hold different revisions.
     """
     want = _flat(mpn)
     if not want:
@@ -245,6 +318,20 @@ def find(data_root: Path, user_id: int, mpn: str, limit: int = 5) -> list[dict]:
                     "package and pin map may not apply. Check before using anything from it."
                 ),
             }))
+    if len(exact) > 1:
+        literal = folder_name(mpn)
+        exact.sort(key=lambda h: (h["mpn"] != literal, h["mpn"]))
+        names = ", ".join(h["mpn"] for h in exact)
+        caveat = (
+            f" — {len(exact)} library records normalize to this part number ({names}) "
+            "and may hold different revisions; "
+        ) + (
+            "the one written exactly as asked is listed first"
+            if exact[0]["mpn"] == literal
+            else "none is written exactly as asked, so check which was meant"
+        )
+        for h in exact:
+            h["why"] += caveat
     near.sort(key=lambda t: t[0])
     return exact + [m for _, m in near[:limit]]
 
@@ -283,7 +370,10 @@ def attach(project_dir: Path, data_root: Path, user_id: int, mpn: str) -> dict:
     src = part_repo(data_root, user_id, mpn)
     if not (src / ".git").exists():
         raise ComponentError(f"{mpn} is not in your component library")
-    name = folder_name(mpn)
+    # The repository's own name, which part_repo has already resolved to the
+    # stored spelling — so a variant spelling mounts the record it matched
+    # rather than minting a second path for the same part.
+    name = src.name
     rel = f"{MOUNT}/{name}"
     project_dir = Path(project_dir)
     if name in attached(project_dir):

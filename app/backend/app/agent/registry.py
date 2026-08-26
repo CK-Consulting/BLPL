@@ -397,15 +397,23 @@ async def _library_lookup(ctx: ToolContext, args: dict) -> str:
         }, indent=2)
 
     hits = ctx.library.find(mpn)
-    exact = next((h for h in hits if h.get("exact")), None)
+    # find() puts the record written exactly as asked first when several
+    # normalize to the same part number, so [0] is the literal one, not
+    # whichever sorts first.
+    exacts = [h for h in hits if h.get("exact")]
+    exact = exacts[0] if exacts else None
     near = [h for h in hits if not h.get("exact")]
     if exact is not None:
         exact = {**exact, "documents": ctx.library.documents(exact["mpn"])}
-    return json.dumps({
+    payload = {
         "mpn": mpn,
         "exact": exact,
         "near": near,
         "note": (
+            f"{len(exacts)} library records normalize to this part number. The one shown "
+            "as exact is preferred; the rest are under 'also_exact' and may hold different "
+            "revisions — check which holds what you need before relying on it."
+            if len(exacts) > 1 else
             "The exact record is this part — use its documents and its extraction rather "
             "than fetching again."
             if exact else
@@ -415,7 +423,10 @@ async def _library_lookup(ctx: ToolContext, args: dict) -> str:
             if near else
             "Nothing held for this part yet. Fetch as usual; what you gather is kept."
         ),
-    }, indent=2, ensure_ascii=False)
+    }
+    if len(exacts) > 1:
+        payload["also_exact"] = exacts[1:]
+    return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
 async def _search_parts(ctx: ToolContext, args: dict) -> str:
@@ -468,6 +479,44 @@ def usable_extraction(payload: object) -> bool:
     return True
 
 
+def _stage_library_documents(ctx: ToolContext, mpn: str) -> int:
+    """Copy the PDFs a library part holds into this project's ``datasheets/``.
+
+    library_lookup promises an exact record's documents can be reused, and
+    extraction reads only from the project — without this step a held PDF with
+    no extraction beside it was unreachable from any tool and got downloaded
+    again. Copied rather than referenced, because the resolver, the sandbox and
+    the seal already govern ``datasheets/`` and nothing downstream needs to
+    learn a second location. Returns how many files landed.
+    """
+    docs = getattr(ctx.library, "documents", None)
+    read = getattr(ctx.library, "document", None)
+    if docs is None or read is None:
+        return 0
+    from blpl.agent.tools import datasheet_files
+
+    # Top-level PDFs only: what sits in subdirectories is footprints and
+    # models, and extracted.json is consumed through library.get already.
+    names = [
+        d["name"] for d in docs(mpn)
+        if "/" not in d["name"] and d["name"].lower().endswith(".pdf")
+    ]
+    if not names:
+        return 0
+    dest = datasheet_files.part_dir(ctx.project_dir, mpn)
+    ctx.sandbox.check_write(dest)
+    copied = 0
+    for name in names:
+        target = dest / name
+        if target.is_file():
+            continue
+        data = read(mpn, name)
+        dest.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        copied += 1
+    return copied
+
+
 async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
     from blpl.agent.tools.datasheets import extract_datasheet
 
@@ -490,6 +539,16 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
     # A vendor almost never names a PDF after the orderable part number, so
     # `<MPN>.pdf` only ever worked for files this tool downloaded itself.
     found = datasheet_files.resolve(ctx.project_dir, mpn, file=str(args.get("file") or ""))
+    if not found.ok and not found.candidates and ctx.library is not None:
+        # The project holds nothing at all for this part — but the library
+        # might, and a datasheet already held must not cost a second download.
+        # Ambiguity in the project (candidates present) is left to the
+        # resolver's own refusal rather than papered over with more files.
+        if _stage_library_documents(ctx, mpn):
+            ctx.note(f"{mpn}: using the datasheet held in your component library")
+            found = datasheet_files.resolve(
+                ctx.project_dir, mpn, file=str(args.get("file") or "")
+            )
     if not found.ok:
         raise FileNotFoundError(
             f"no datasheet resolved for {mpn}: {found.detail}. "

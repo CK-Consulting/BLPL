@@ -55,6 +55,15 @@ The reply keeps two things apart that must never be merged:
 returned labelled, for a person or a model to check against the datasheet, and
 never as the answer.
 
+Spelling variants of one part are one record. Reads and writes under
+`bq27441drzr g1a` resolve to the stored `BQ27441DRZR-G1A` repository, so a
+lookup that matched fuzzily is followed by operations that land on the record
+it matched — not a miss, and not a second repository for the same part. And
+the reuse is real for documents, not only extractions: when a part holds a
+datasheet but no extraction yet, `extract_datasheet_specs` copies the held PDF
+into the project's `datasheets/` and reads it there, instead of downloading it
+again.
+
 ## What a part holds
 
 Loose documents sit at the top of the part's repository — the datasheet, the
