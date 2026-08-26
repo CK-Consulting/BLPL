@@ -404,9 +404,12 @@ def test_preflight_reports_what_stage0_would_discard(unlocked) -> None:
 
     unlocked.post("/api/projects/init", json={"name": "scratch"})
     proj = main.PROJECTS_ROOT / "scratch"
+    # A parts-comparison matrix, not a net-classes table: doctor now knows the
+    # net-classes table is consumed by `blpl init`, so it stopped being a valid
+    # example of a discarded one.
     (proj / "design.md").write_text(
-        "## Net classes\n\n"
-        "| Class | Trace width | Clearance |\n|---|---|---|\n| Power | 0.5 | 0.2 |\n\n"
+        "## Candidate parts compared\n\n"
+        "| Candidate | Price | Stock |\n|---|---|---|\n| A | 1.20 | 400 |\n\n"
         "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U_MCU | ESP32-S3 | Module |\n",
         encoding="utf-8",
     )
@@ -414,7 +417,7 @@ def test_preflight_reports_what_stage0_would_discard(unlocked) -> None:
     assert r.status_code == 200
     body = r.json()
     codes = {f["code"] for f in body["findings"]}
-    # The net-class table matches neither a BOM nor a pinout, so it is silently
+    # The comparison table matches neither a BOM nor a pinout, so it is silently
     # dropped; the MCU has no pinout, so Stage 3 will halt on it.
     assert "DOC-001" in codes
     assert "DOC-011" in codes

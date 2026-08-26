@@ -68,21 +68,49 @@ async def _run_job(job: runqueue.Claimed) -> int:
             stderr=asyncio.subprocess.STDOUT,
         )
         assert proc.stdout is not None
-        async for raw in proc.stdout:
-            # Line-buffered and flushed as it goes: a reader is tailing this
-            # file, so anything held back is a log that appears to stall.
-            log.write(raw.decode("utf-8", "replace"))
+
+        async def beat() -> str:
+            with SessionFactory() as session:
+                status = runqueue.heartbeat(session, job.run_id)
+                session.commit()
+            return status
+
+        # The read is bounded by the heartbeat interval, and that bound is the
+        # whole fix for a real wedge: this loop used to be `async for raw in
+        # proc.stdout`, which only wakes when the stage PRINTS something. A
+        # stage stuck in a network call prints nothing — so the worker never
+        # heartbeat, never saw `cancelling`, and the stop button read as
+        # broken while both sides waited on a nemotron reply that was never
+        # coming. Silence now ticks the same clock output does.
+        while True:
+            try:
+                raw = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=_HEARTBEAT_EVERY
+                )
+            except asyncio.TimeoutError:
+                raw = None
+            if raw:
+                # Line-buffered and flushed as it goes: a reader is tailing
+                # this file, so anything held back is a log that appears to
+                # stall.
+                log.write(raw.decode("utf-8", "replace"))
+            elif raw == b"":
+                break  # EOF: the process closed stdout; collect it below.
 
             now = asyncio.get_running_loop().time()
-            if now - last_beat > _HEARTBEAT_EVERY:
+            if raw is None or now - last_beat > _HEARTBEAT_EVERY:
                 last_beat = now
-                with SessionFactory() as session:
-                    status = runqueue.heartbeat(session, job.run_id)
-                    session.commit()
-                if status == runqueue.CANCELLING:
+                if await beat() == runqueue.CANCELLING:
                     logger.info("%s was cancelled; terminating", job.run_id)
                     proc.terminate()
-                    break
+                    try:
+                        # A process hung hard enough to need cancelling may be
+                        # hung hard enough to ignore SIGTERM.
+                        return await asyncio.wait_for(proc.wait(), timeout=10)
+                    except asyncio.TimeoutError:
+                        logger.warning("%s ignored SIGTERM; killing", job.run_id)
+                        proc.kill()
+                        return await proc.wait()
         return await proc.wait()
 
 

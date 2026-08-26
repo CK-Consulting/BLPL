@@ -633,6 +633,10 @@ def run(
         )
         return report
 
+    # Shared buses the design declares on purpose, so DOC-008 can stop asking a
+    # question whose answer is already written down: signal -> declared members.
+    declared_buses: dict[str, set[str]] = {}
+
     # signal name -> [(refdes, file)] so we can spot accidental net collisions
     signal_owners: dict[str, list[tuple[str, str]]] = {}
     bom_refs: set[str] = set()
@@ -652,6 +656,29 @@ def run(
             if kind == "other":
                 heading, _ = _heading_above(text, table.line_start)
                 label = (heading or "").lstrip("# ").strip() or "(no heading)"
+                low = label.lower()
+                # Not every non-BOM, non-pinout table is discarded, and saying
+                # so about these was actively misleading. `blpl init` reads the
+                # identity and net-class tables to generate project.yaml — the
+                # old fix text told people to move exactly the content init
+                # needs OUT of the markdown it reads. And a "Shared buses"
+                # table is consumed right here, by DOC-008 below.
+                if "net class" in low or "identity" in low or (
+                    "project" in low and {h.lower() for h in table.headers} >= {"field", "value"}
+                ):
+                    continue
+                if "shared bus" in low:
+                    for row in table.rows:
+                        lower = {k.lower(): v for k, v in row.items()}
+                        sig = (lower.get("signal") or "").strip().strip("`")
+                        members = {
+                            m.strip().strip("`")
+                            for m in (lower.get("components") or "").replace(";", ",").split(",")
+                            if m.strip()
+                        }
+                        if sig and members:
+                            declared_buses.setdefault(sig, set()).update(members)
+                    continue
                 report.findings.append(
                     Finding(
                         code="DOC-001",
@@ -787,7 +814,9 @@ def run(
         refs = {r for r, _ in owners}
         if len(refs) < 2 or _is_power_signal(sig):
             continue
-
+        # The placeholder trap outranks every exemption below: RESERVED on
+        # thirty pins shorts them all into one net whether the owners are
+        # chips, connectors, or a declared bus, so it is decided first.
         if sig.upper() in _FAKE_NC_PLACEHOLDERS:
             report.findings.append(
                 Finding(
@@ -806,9 +835,48 @@ def run(
                     file=owners[0][1],
                 )
             )
-        else:
+            continue
+
+        # Connectors do not count toward the collision threshold — a net on a
+        # chip and a connector is the connector doing its job, carrying that
+        # net off the board, and warning would fire on every routed interface
+        # pin. The hazard DOC-008 exists for is two unrelated chips silently
+        # sharing a name.
+        if len({r for r in refs if not r.startswith("J")}) < 2:
+            continue
+        declared = declared_buses.get(sig)
+        if declared is not None:
+            # The design already answered "is this sharing intended". Verified
+            # rather than trusted blindly: a component the declaration does not
+            # name has joined the bus since it was written, and that is a change
+            # worth surfacing — quietly absorbing it would make the declaration
+            # a permanent mute button.
+            # Connectors are exempt here for the same reason they do not count
+            # toward the collision threshold: a receptacle carrying the bus off
+            # the board is the interface working, not a new bus member with
+            # intentions of its own. Only a *chip* joining unannounced is news.
+            undeclared = {r for r in refs - declared if not r.startswith("J")}
+            if not undeclared:
+                continue
             report.findings.append(
                 Finding(
+                    code="DOC-008",
+                    severity="warning",
+                    summary=(
+                        f"Signal '{sig}' is a declared shared bus, but "
+                        f"{', '.join(sorted(undeclared))} carries it without being listed."
+                    ),
+                    fix=(
+                        "If it belongs on the bus, add it to the Shared buses table. If it "
+                        f"does not, qualify its pin name (e.g. {sorted(undeclared)[0]}_{sig})."
+                    ),
+                    file=owners[0][1],
+                )
+            )
+            continue
+
+        report.findings.append(
+            Finding(
                     code="DOC-008",
                     severity="warning",
                     summary=(
