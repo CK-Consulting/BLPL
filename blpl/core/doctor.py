@@ -633,6 +633,10 @@ def run(
         )
         return report
 
+    # Shared buses the design declares on purpose, so DOC-008 can stop asking a
+    # question whose answer is already written down: signal -> declared members.
+    declared_buses: dict[str, set[str]] = {}
+
     # signal name -> [(refdes, file)] so we can spot accidental net collisions
     signal_owners: dict[str, list[tuple[str, str]]] = {}
     bom_refs: set[str] = set()
@@ -652,6 +656,29 @@ def run(
             if kind == "other":
                 heading, _ = _heading_above(text, table.line_start)
                 label = (heading or "").lstrip("# ").strip() or "(no heading)"
+                low = label.lower()
+                # Not every non-BOM, non-pinout table is discarded, and saying
+                # so about these was actively misleading. `blpl init` reads the
+                # identity and net-class tables to generate project.yaml — the
+                # old fix text told people to move exactly the content init
+                # needs OUT of the markdown it reads. And a "Shared buses"
+                # table is consumed right here, by DOC-008 below.
+                if "net class" in low or "identity" in low or (
+                    "project" in low and {h.lower() for h in table.headers} >= {"field", "value"}
+                ):
+                    continue
+                if "shared bus" in low:
+                    for row in table.rows:
+                        lower = {k.lower(): v for k, v in row.items()}
+                        sig = (lower.get("signal") or "").strip().strip("`")
+                        members = {
+                            m.strip().strip("`")
+                            for m in (lower.get("components") or "").replace(";", ",").split(",")
+                            if m.strip()
+                        }
+                        if sig and members:
+                            declared_buses.setdefault(sig, set()).update(members)
+                    continue
                 report.findings.append(
                     Finding(
                         code="DOC-001",
@@ -786,6 +813,32 @@ def run(
     for sig, owners in sorted(signal_owners.items()):
         refs = {r for r, _ in owners}
         if len(refs) < 2 or _is_power_signal(sig):
+            continue
+        declared = declared_buses.get(sig)
+        if declared is not None:
+            # The design already answered "is this sharing intended". Verified
+            # rather than trusted blindly: a component the declaration does not
+            # name has joined the bus since it was written, and that is a change
+            # worth surfacing — quietly absorbing it would make the declaration
+            # a permanent mute button.
+            undeclared = refs - declared
+            if not undeclared:
+                continue
+            report.findings.append(
+                Finding(
+                    code="DOC-008",
+                    severity="warning",
+                    summary=(
+                        f"Signal '{sig}' is a declared shared bus, but "
+                        f"{', '.join(sorted(undeclared))} carries it without being listed."
+                    ),
+                    fix=(
+                        "If it belongs on the bus, add it to the Shared buses table. If it "
+                        f"does not, qualify its pin name (e.g. {sorted(undeclared)[0]}_{sig})."
+                    ),
+                    file=owners[0][1],
+                )
+            )
             continue
 
         if sig.upper() in _FAKE_NC_PLACEHOLDERS:

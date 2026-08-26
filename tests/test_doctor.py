@@ -170,14 +170,17 @@ def test_shared_bus_signal_warns_but_does_not_fail(tmp_path: Path) -> None:
 
 
 def test_unrecognized_table_is_reported_as_discarded(tmp_path: Path) -> None:
+    # The fixture used to be a "Net classes" table — which stopped being a
+    # valid example the day doctor learned `blpl init` consumes that table.
+    # A parts-comparison matrix is a table nothing consumes.
     _project(
         tmp_path,
         design__md="""
-## Net classes
+## Candidate parts compared
 
-| Class | Trace width (mm) |
-|-------|------------------|
-| Power | 0.5              |
+| Candidate | Price | Stock |
+|-----------|-------|-------|
+| A         | 1.20  | 400   |
 """,
     )
     report = doctor.run(tmp_path)
@@ -790,3 +793,87 @@ def test_a_not_placed_ic_is_not_asked_for_a_pinout(tmp_path: Path) -> None:
     )
 
     assert "DOC-011" not in _codes(doctor.run(proj))
+
+
+# --- consumed tables, and buses the design declares --------------------------
+
+
+def test_the_net_class_table_is_not_called_discarded(tmp_path: Path) -> None:
+    """`blpl init` READS this table to generate project.yaml. DOC-001's old fix
+    text told people to move exactly the content init needs out of the markdown
+    init reads — following the advice would have broken the tool it pointed at."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## Net classes\n\n"
+            "| Class | Applies to | trace_width | clearance | via_dia | via_drill |\n"
+            "|---|---|---|---|---|---|\n"
+            "| Default | everything else | 0.2 | 0.15 | 0.6 | 0.3 |\n"
+        ),
+    )
+    assert "DOC-001" not in _codes(doctor.run(proj))
+
+
+def test_a_declared_shared_bus_stops_the_collision_question(tmp_path: Path) -> None:
+    """DOC-008 asks "is this sharing intended?" — a question with a stable
+    answer the design can write down once, instead of re-answering at every
+    doctor run forever."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## Shared buses\n\n"
+            "| Signal | Components | Purpose |\n|---|---|---|\n"
+            "| I2C_SDA | U_A, U_B | system I2C |\n"
+            "| I2C_SCL | U_A, U_B | system I2C |\n\n"
+            "## U_A — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n"
+            "| 1 | I2C_SDA | data |\n| 2 | I2C_SCL | clock |\n"
+            "## U_B — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n"
+            "| 1 | I2C_SDA | data |\n| 2 | I2C_SCL | clock |\n"
+        ),
+    )
+    codes = _codes(doctor.run(proj))
+    assert "DOC-008" not in codes
+    # The declaration table itself is consumed, not discarded.
+    assert "DOC-001" not in codes
+
+
+def test_a_component_joining_a_declared_bus_unannounced_is_surfaced(tmp_path: Path) -> None:
+    """Verified rather than trusted blindly: quietly absorbing new members
+    would make the declaration a permanent mute button."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## Shared buses\n\n"
+            "| Signal | Components | Purpose |\n|---|---|---|\n"
+            "| I2C_SDA | U_A, U_B | system I2C |\n\n"
+            "## U_A — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n"
+            "| 1 | I2C_SDA | data |\n"
+            "## U_B — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n"
+            "| 1 | I2C_SDA | data |\n"
+            "## U_C — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n"
+            "| 1 | I2C_SDA | data |\n"
+        ),
+    )
+    report = doctor.run(proj)
+    hits = [f for f in report.findings if f.code == "DOC-008"]
+    assert len(hits) == 1 and "U_C" in hits[0].summary and "without being listed" in hits[0].summary
+
+
+def test_an_undeclared_collision_still_warns(tmp_path: Path) -> None:
+    """The original check is untouched for signals no declaration covers."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## U_A — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n| 1 | BUSY | b |\n"
+            "## U_B — pinout\n\n| Pin | Signal | Function |\n|---|---|---|\n| 1 | BUSY | b |\n"
+        ),
+    )
+    assert "DOC-008" in _codes(doctor.run(proj))
