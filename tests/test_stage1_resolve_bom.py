@@ -135,3 +135,53 @@ def test_an_explicit_library_reference_survives_the_llm(tmp_path: Path) -> None:
     assert rows["U_LORA"]["footprint_hint"] == "Seeed:Wio-LR2021_V1"
     # …while a bare hint stays the LLM's to canonicalise.
     assert rows["R1"]["footprint_hint"] == "Resistor_SMD:R_0402_1005Metric"
+
+
+def test_an_explicit_symbol_reference_survives_the_llm(tmp_path: Path) -> None:
+    """Symbols get the same pinning as footprints, from the same failure — and
+    a worse one: the LLM's paraphrases included real stock symbols for the
+    WRONG silicon (Raytac's nRF52 module offered for an nRF54 board). A
+    `Lib:Name` in the Symbol column is the designer's exact choice."""
+    artifact = {
+        "project_id": "proj",
+        "schema_version": 1,
+        "components": [
+            {
+                "local_id": "U_BLE",
+                "description": "BLE module",
+                "part_hint": "AN54LV-U15",
+                "symbol_hint": "Raytac:AN54LV-U15",
+            },
+            {
+                "local_id": "R1",
+                "description": "resistor",
+                "package_hint": "0402",
+            },
+        ],
+        "connectors": [],
+        "subsystems": [],
+        "raw_nets": [],
+    }
+    schema.validate("design_artifact", artifact)
+    adapter = _StubAdapter({"rows": [
+        {"local_id": "U_BLE", "mpn": "AN54LV-U15", "manufacturer": "Raytac",
+         "package": "Module", "pin_count": 40, "datasheet_url": None,
+         "description": "BLE", "role": None,
+         "symbol_hint": "RF_Module:MDBT50Q-1MV2",  # real stock symbol, wrong silicon
+         "footprint_hint": None,
+         "confidence": 0.9, "notes": None, "value": None, "tolerance": None,
+         "voltage_v": None, "power_w": None, "dielectric": None, "safety_class": None},
+        {"local_id": "R1", "mpn": "RC0402", "manufacturer": "Yageo",
+         "package": "0402", "pin_count": 2, "datasheet_url": None,
+         "description": "resistor", "role": None, "symbol_hint": "Device:R",
+         "footprint_hint": "Resistor_SMD:R_0402_1005Metric",
+         "confidence": 0.9, "notes": None, "value": "10k", "tolerance": None,
+         "voltage_v": None, "power_w": None, "dielectric": None, "safety_class": None},
+    ]})
+
+    bom = s1.resolve(artifact, adapter=adapter, synthesize_connectors=False)
+    rows = {r["local_id"]: r for r in bom["rows"]}
+
+    assert rows["U_BLE"]["symbol_hint"] == "Raytac:AN54LV-U15"
+    # A row with no explicit symbol keeps the LLM's canonicalisation.
+    assert rows["R1"]["symbol_hint"] == "Device:R"

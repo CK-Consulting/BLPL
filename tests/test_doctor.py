@@ -929,3 +929,73 @@ def test_a_connector_joining_a_declared_bus_is_not_news(tmp_path: Path) -> None:
         ),
     )
     assert "DOC-008" not in _codes(doctor.run(proj))
+
+
+# --- DOC-015: symbols that don't exist on disk ------------------------------
+
+
+def _sym_root(tmp_path: Path, lib: str, name: str) -> Path:
+    root = tmp_path / "syms"
+    (root / f"{lib}.kicad_symdir").mkdir(parents=True, exist_ok=True)
+    (root / f"{lib}.kicad_symdir" / f"{name}.kicad_sym").write_text("(symbol)", encoding="utf-8")
+    return root
+
+
+def test_a_library_form_symbol_that_does_not_exist_is_an_error(tmp_path: Path) -> None:
+    """DOC-010's twin. A Symbol column pins the schematic symbol past Stage 1's
+    paraphrasing, so a `Lib:Name` there is a claim about a file — and when the
+    file is absent, Stage 5 substitutes a placeholder and the part on the
+    schematic is not the part."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n"
+            "| Ref | MPN | Package | Symbol |\n|---|---|---|---|\n"
+            "| SW1 | BGS12P2L6 | 0402 | Infineon:BGS12P2L6E6327XTSA1 |\n"
+            "| U1 | MM8108 | QFN-48 | MorseMicro:Definitely_Not_Real |\n"
+        ),
+    )
+    root = _sym_root(tmp_path, "Infineon", "BGS12P2L6E6327XTSA1")
+    report = doctor.run(proj, symbols_root=root)
+    hits = [f for f in report.findings if f.code == "DOC-015"]
+    assert len(hits) == 1
+    assert "Definitely_Not_Real" in hits[0].summary
+    assert hits[0].severity == "error"
+
+
+def test_a_symbol_in_the_projects_own_library_is_not_an_error(tmp_path: Path) -> None:
+    """Resolved the way Stage 5 resolves it: libraries/symbols is searched
+    before stock, so a symbol the project owns must not be reported missing —
+    that is the exact remedy DOC-015's fix text prescribes."""
+    proj = tmp_path / "p"
+    (proj / "libraries" / "symbols" / "Raytac.kicad_symdir").mkdir(parents=True)
+    (proj / "libraries" / "symbols" / "Raytac.kicad_symdir" / "AN54LV-U15.kicad_sym").write_text(
+        "(symbol)", encoding="utf-8"
+    )
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package | Symbol |\n|---|---|---|---|\n"
+            "| U_BLE | AN54LV-U15 | Module | Raytac:AN54LV-U15 |\n"
+        ),
+    )
+    report = doctor.run(proj, symbols_root=tmp_path / "empty")
+    assert "DOC-015" not in _codes(report)
+
+
+def test_a_bare_symbol_value_is_not_checked_against_disk(tmp_path: Path) -> None:
+    """Without a colon the column is a hint for Stage 2's matching, not a claim
+    about a file."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package | Symbol |\n|---|---|---|---|\n"
+            "| U1 | LTC4015 | QFN-38 | LTC4015 |\n"
+        ),
+    )
+    report = doctor.run(proj, symbols_root=tmp_path / "empty")
+    assert "DOC-015" not in _codes(report)

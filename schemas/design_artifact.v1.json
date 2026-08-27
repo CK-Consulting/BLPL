@@ -79,6 +79,10 @@
           "package_hint": {
             "type": "string"
           },
+          "symbol_hint": {
+            "type": "string",
+            "description": "Explicit 'Lib:Name' symbol from the Symbol column, pinned verbatim through Stage 1 exactly as an explicit package is."
+          },
           "pin_count_hint": {
             "type": "integer",
             "minimum": 1

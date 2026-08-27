@@ -226,10 +226,23 @@ def resolve(
         for c in components
         if ":" in (c.get("package_hint") or "")
     }
+    # Symbols get the same protection, from the same failure: the LLM
+    # paraphrased known-good refs into plausible stock spellings, two of which
+    # named real stock symbols for the WRONG silicon (Raytac's nRF52 module
+    # for an nRF54 board, an nRF9160 for an nRF9151). A Symbol column entry is
+    # the designer's exact choice, not raw material.
+    explicit_sym = {
+        c["local_id"]: c["symbol_hint"]
+        for c in components
+        if ":" in (c.get("symbol_hint") or "")
+    }
     for r in rows:
         pinned = explicit.get(r.get("local_id"))
         if pinned:
             r["footprint_hint"] = pinned
+        pinned_sym = explicit_sym.get(r.get("local_id"))
+        if pinned_sym:
+            r["symbol_hint"] = pinned_sym
 
     bom = _post_process({"rows": rows}, project_id=design_artifact["project_id"])
     if synthesize_connectors:

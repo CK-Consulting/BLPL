@@ -538,6 +538,61 @@ def _check_footprints(
         )
 
 
+def _check_symbols(
+    report: Report,
+    bom_rows: list[tuple[str, dict, str, int]],
+    symbols_root: Path,
+    project_dir: Path | None = None,
+) -> None:
+    """Library-form symbols that do not exist on disk — DOC-010's twin.
+
+    A Symbol column is how a design pins the schematic symbol past Stage 1's
+    paraphrasing, exactly as an explicit package pins the footprint. The same
+    check has to exist on the same terms: a ``Lib:Name`` symbol is a claim
+    about a file, and when the file is absent Stage 5 substitutes a generic
+    placeholder — the board compiles, and the part on the schematic is not the
+    part. Bare values are left alone; without a colon the column is a hint for
+    Stage 2's matching, not a claim.
+    """
+    from .symbol_resolution import PLACEHOLDER, is_not_placed, resolve
+
+    checked: dict[str, bool] = {}
+    for ref, row, rel, line in bom_rows:
+        sym = (row.get("symbol") or "").strip()
+        if ":" not in sym:
+            continue
+        if is_not_placed(_footprint_column(row)):
+            # Never on the board, never in the netlist — no symbol to check.
+            continue
+        if sym not in checked:
+            if project_dir is not None:
+                got = resolve(sym, project_dir=Path(project_dir), stock_root=Path(symbols_root))
+                checked[sym] = got.source != PLACEHOLDER
+            else:
+                lib, _, name = sym.partition(":")
+                checked[sym] = (
+                    Path(symbols_root) / f"{lib}.kicad_symdir" / f"{name}.kicad_sym"
+                ).is_file()
+        if checked[sym]:
+            continue
+        report.findings.append(
+            Finding(
+                code="DOC-015",
+                severity="error",
+                summary=f"{ref}: symbol '{sym}' does not exist in the library.",
+                fix=(
+                    "Stage 5 substitutes a generic placeholder for a symbol it cannot "
+                    "find, so the schematic still opens — with the wrong part on it. "
+                    "Check the spelling against kicad-symbols, or draw the symbol in "
+                    "KiCad and save it into this project's libraries/symbols/, which "
+                    "is searched before the stock libraries."
+                ),
+                file=rel,
+                line=line,
+            )
+        )
+
+
 def _check_pin_maps(
     report: Report, bom_rows: list[tuple[str, dict, str, int]], pinout_refs: set[str]
 ) -> None:
@@ -893,6 +948,7 @@ def run(
             )
 
     _check_footprints(report, bom_rows, footprints_root, project_dir)
+    _check_symbols(report, bom_rows, symbols_root, project_dir)
     _check_pin_maps(report, bom_rows, pinout_refs)
 
     # A connector with a pinout but no BOM row gets no footprint placed.

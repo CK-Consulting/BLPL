@@ -287,6 +287,13 @@ def _absorb_bom_table(table: _md.ParsedTable, components: dict[str, dict]) -> No
             continue
         description = _column_lookup(row, ["Description"])
         package_hint = _column_lookup(row, ["Package"])
+        # A Symbol column, when the design carries one, is the same statement
+        # about schematic symbols that Package is about land patterns: the
+        # designer naming the exact library part, not a hint for a model to
+        # improve on. Added after an LLM paraphrased known-good symbol refs
+        # into plausible stock spellings — two of which named real stock
+        # symbols for the WRONG silicon.
+        symbol_hint = _column_lookup(row, ["Symbol"])
         part_hint = _column_lookup(row, ["Part Number", "MPN", "Part"])
         manufacturer_hint = _column_lookup(row, ["Manufacturer"])
         comp = components.setdefault(
@@ -297,6 +304,8 @@ def _absorb_bom_table(table: _md.ParsedTable, components: dict[str, dict]) -> No
             comp["description"] = description
         if package_hint:
             comp["package_hint"] = package_hint
+        if symbol_hint:
+            comp["symbol_hint"] = symbol_hint
         if part_hint:
             comp["part_hint"] = part_hint
         if manufacturer_hint:

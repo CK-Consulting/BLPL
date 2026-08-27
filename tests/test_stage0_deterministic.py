@@ -232,3 +232,24 @@ def test_a_clean_design_produces_no_warnings_at_all(tmp_path: Path) -> None:
     )
     artifact = s0.extract([md])
     assert "warnings" not in artifact
+
+
+def test_a_symbol_column_is_absorbed_as_symbol_hint(tmp_path: Path) -> None:
+    """A Symbol column is the designer naming the exact schematic symbol, the
+    same statement Package makes about land patterns. It has to survive Stage 0
+    or Stage 1's pinning has nothing to pin."""
+    bom_md = _write(
+        tmp_path,
+        "bom.md",
+        "# BOM\n"
+        "\n"
+        "| Ref | Part Number | Package | Symbol |\n"
+        "|-----|-------------|---------|--------|\n"
+        "| U_BLE | AN54LV-U15 | Module | Raytac:AN54LV-U15 |\n"
+        "| R1  | RC0402 | 0402 | |\n",
+    )
+    artifact = s0.extract([bom_md])
+    schema.validate("design_artifact", artifact)
+    comps = {c["local_id"]: c for c in artifact["components"]}
+    assert comps["U_BLE"]["symbol_hint"] == "Raytac:AN54LV-U15"
+    assert "symbol_hint" not in comps["R1"]
