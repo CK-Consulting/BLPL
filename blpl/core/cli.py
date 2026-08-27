@@ -595,6 +595,10 @@ def _cmd_stage2(args: argparse.Namespace) -> int:
         bom_path=bom_path,
         symbols_root=Path(args.symbols_root).resolve(),
         footprints_root=Path(args.footprints_root).resolve(),
+        # Coverage must see every root Stage 5 resolves against, or a part the
+        # shared library holds is re-reported as a gap forever — and worse, the
+        # LLM's hint (which coverage exists to outrank) decides instead.
+        project_dir=proj,
         output_path=output_path,
     )
     s = report["summary"]
@@ -682,7 +686,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             if rc != 0 and not args.continue_on_error:
                 return rc
         elif stage == "stage8":
-            ns = argparse.Namespace(**vars(base), no_emc=False)
+            ns = argparse.Namespace(**vars(base), no_emc=False, no_spice=False)
             rc = _attempt("stage8", lambda: _cmd_stage8(ns))
             if rc != 0 and not args.continue_on_error:
                 return rc

@@ -84,3 +84,54 @@ def test_low_confidence_rows_reported() -> None:
     }
     low = s1.low_confidence_rows(bom, threshold=0.9)
     assert {r["local_id"] for r in low} == {"B", "C"}
+
+
+def test_an_explicit_library_reference_survives_the_llm(tmp_path: Path) -> None:
+    """`Lib:Name` in the Package column is the designer naming the exact
+    footprint — not a hint to improve on. The LLM sees it in its prompt and
+    still paraphrases: on a real board `Seeed:Wio-LR2021_V1` came back as
+    `RF_Module:Seeed_Wio-LR2021_V1`, a plausible stock spelling that exists
+    nowhere, and ten resolved parts were emitted as placeholder headers."""
+    artifact = {
+        "project_id": "proj",
+        "schema_version": 1,
+        "components": [
+            {
+                "local_id": "U_LORA",
+                "description": "LoRa module",
+                "part_hint": "100058045",
+                "package_hint": "Seeed:Wio-LR2021_V1",
+            },
+            {
+                "local_id": "R1",
+                "description": "resistor",
+                "package_hint": "0402",
+            },
+        ],
+        "connectors": [],
+        "subsystems": [],
+        "raw_nets": [],
+    }
+    schema.validate("design_artifact", artifact)
+    adapter = _StubAdapter({"rows": [
+        {"local_id": "U_LORA", "mpn": "100058045", "manufacturer": "Seeed",
+         "package": "Module", "pin_count": 22, "datasheet_url": None,
+         "description": "LoRa", "role": None, "symbol_hint": "RF_Module:LR2021",
+         "footprint_hint": "RF_Module:Seeed_Wio-LR2021_V1",  # the paraphrase
+         "confidence": 0.9, "notes": None, "value": None, "tolerance": None,
+         "voltage_v": None, "power_w": None, "dielectric": None, "safety_class": None},
+        {"local_id": "R1", "mpn": "RC0402", "manufacturer": "Yageo",
+         "package": "0402", "pin_count": 2, "datasheet_url": None,
+         "description": "resistor", "role": None, "symbol_hint": "Device:R",
+         "footprint_hint": "Resistor_SMD:R_0402_1005Metric",  # canonicalised hint: the LLM's job
+         "confidence": 0.9, "notes": None, "value": "10k", "tolerance": None,
+         "voltage_v": None, "power_w": None, "dielectric": None, "safety_class": None},
+    ]})
+
+    bom = s1.resolve(artifact, adapter=adapter, synthesize_connectors=False)
+    rows = {r["local_id"]: r for r in bom["rows"]}
+
+    # The explicit reference is pinned back over the paraphrase…
+    assert rows["U_LORA"]["footprint_hint"] == "Seeed:Wio-LR2021_V1"
+    # …while a bare hint stays the LLM's to canonicalise.
+    assert rows["R1"]["footprint_hint"] == "Resistor_SMD:R_0402_1005Metric"

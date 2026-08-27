@@ -212,6 +212,25 @@ def resolve(
     # design, not extend it.
     rows = [r for r in rows if r.get("local_id") in expected]
 
+    # An explicit `Lib:Name` in the design's Package column is not a hint — it
+    # is the designer naming the exact footprint, usually after doctor walked
+    # them through making it resolve. The LLM sees it in the prompt and still
+    # paraphrases: on a real board `Seeed:Wio-LR2021_V1` came back as
+    # `RF_Module:Seeed_Wio-LR2021_V1` and `Infineon:PG-TSLP-6-4_INF` as
+    # `Package_DFN_QFN:Infineon_PG-TSLP-6-4` — plausible stock-library
+    # spellings that exist nowhere, so ten resolved parts were emitted as
+    # 2.54mm placeholder headers. Deterministic truth is pinned back over the
+    # paraphrase; bare hints ("0402", "Module") stay the LLM's to canonicalise.
+    explicit = {
+        c["local_id"]: c["package_hint"]
+        for c in components
+        if ":" in (c.get("package_hint") or "")
+    }
+    for r in rows:
+        pinned = explicit.get(r.get("local_id"))
+        if pinned:
+            r["footprint_hint"] = pinned
+
     bom = _post_process({"rows": rows}, project_id=design_artifact["project_id"])
     if synthesize_connectors:
         existing_ids = {r["local_id"] for r in bom["rows"]}

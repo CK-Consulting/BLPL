@@ -43,22 +43,27 @@ def _utc_stamp() -> str:
 
 
 def _symbol_roots(symbols_root: Path, project_dir: Path | None) -> list[Path]:
-    """Ordered symbol-library roots for the emitter — custom → generated → stock.
+    """Ordered symbol-library roots for the emitter — the SAME roots Stage 5 uses.
 
-    This mirrors ``symbol_resolution.search_path``, which Stage 5 uses to decide a
-    symbol is real before writing its ``Lib:Name`` into the HDM. If the emitter only
-    looked in the stock root, any symbol Stage 5 resolved from ``<project>/libraries``
-    or ``<project>/generated`` would fail here with ``LibraryMiss`` (or silently get a
-    stock symbol of the same name), so Stage 6 must search the same roots.
+    Delegated to ``symbol_resolution.search_path`` rather than mirrored, because
+    the mirror drifted exactly the way its old docstring warned it might: when
+    the shared module library joined the search path, Stage 5 started resolving
+    symbols from it and this hand-written copy — custom → generated → stock,
+    no modules — kept the emitter blind to them. One authority, consulted twice.
     """
     if project_dir is None:
         return [Path(symbols_root)]
-    project_dir = Path(project_dir)
-    return [
-        project_dir / symbol_resolution.CUSTOM_LIB_DIRNAME / "symbols",
-        project_dir / symbol_resolution.GENERATED_LIB_DIRNAME / "symbols",
-        Path(symbols_root),
-    ]
+    return [r for r, _ in symbol_resolution.search_path(Path(project_dir), Path(symbols_root))]
+
+
+def _footprint_roots(footprints_root: Path, project_dir: Path | None) -> list[Path]:
+    """Ordered footprint roots for the emitter — the same delegation, and the
+    fix for the crash that revealed all of this: Stage 5 resolved
+    Package_SON:Texas_VSON-HR-10 from the shared library, and the PCB emitter
+    then looked for it in stock alone."""
+    if project_dir is None:
+        return [Path(footprints_root)]
+    return [r for r, _ in symbol_resolution.footprint_search_path(Path(project_dir), Path(footprints_root))]
 
 
 def run(
@@ -101,7 +106,7 @@ def run(
 
     symbol_roots = _symbol_roots(symbols_root, project_dir)
     _sch.write(hdm, sch_path, symbols_root=symbol_roots)
-    _pcb.write(hdm, pcb_path, footprints_root=Path(footprints_root))
+    _pcb.write(hdm, pcb_path, footprints_root=_footprint_roots(Path(footprints_root), project_dir))
     _pro.write(hdm, pro_path)
 
     # What the emitter did that the emitted files cannot show. kicad-happy's rail

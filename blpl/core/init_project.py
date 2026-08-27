@@ -51,7 +51,13 @@ class InitResult:
 
 
 def _cell(row: dict[str, str], *names: str) -> str:
-    lower = {k.lower().strip(): v for k, v in row.items()}
+    # Headers are normalized to spaces before matching, because a design doc
+    # writes `via_dia` where this searches for "via dia" — and the miss was
+    # silent: on a real board every via dimension quietly became the default
+    # (0.6/0.3 emitted where the table said 0.8/0.4), while trace_width only
+    # survived by the accident of "width" being a substring of it. Board rules
+    # are the one place a silent default is copper.
+    lower = {k.lower().strip().replace("_", " ").replace("-", " "): v for k, v in row.items()}
     for n in names:
         for k, v in lower.items():
             if n in k:
@@ -157,6 +163,20 @@ def build_config(project_dir: Path, *, board: str | None = None) -> InitResult:
                         "via_dia": vd if vd is not None else _DEFAULT_NET_CLASS["via_dia"],
                         "via_drill": vdr if vdr is not None else _DEFAULT_NET_CLASS["via_drill"],
                     }
+                    # A class row that parsed PARTIALLY is the dangerous case:
+                    # the class name is recognized, so nothing looked wrong,
+                    # while individual fields fell to defaults without a word.
+                    # Say which, per class, in the same place the other
+                    # defaults are reported.
+                    for field_name, got in (
+                        ("trace_width", tw), ("clearance", cl),
+                        ("via_dia", vd), ("via_drill", vdr),
+                    ):
+                        if got is None:
+                            defaulted.append(
+                                f"net class {cls}: {field_name} = "
+                                f"{_DEFAULT_NET_CLASS[field_name]} (not found in its row)"
+                            )
                 if net_classes:
                     found.append(f"net_classes = {', '.join(net_classes)}")
 

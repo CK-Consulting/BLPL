@@ -45,7 +45,7 @@
                   "lib": {"type": "string"},
                   "name": {"type": "string"},
                   "path": {"type": "string"},
-                  "match_type": {"type": "string", "enum": ["exact", "fuzzy"]},
+                  "match_type": {"type": "string", "enum": ["exact", "fuzzy", "mpn"]},
                   "score": {"type": "number", "minimum": 0, "maximum": 1}
                 }
               }
@@ -62,7 +62,7 @@
                   "lib": {"type": "string"},
                   "name": {"type": "string"},
                   "path": {"type": "string"},
-                  "match_type": {"type": "string", "enum": ["exact", "fuzzy"]},
+                  "match_type": {"type": "string", "enum": ["exact", "fuzzy", "mpn"]},
                   "score": {"type": "number", "minimum": 0, "maximum": 1}
                 }
               }

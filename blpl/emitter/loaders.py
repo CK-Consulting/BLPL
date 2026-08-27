@@ -76,13 +76,24 @@ def _load_symbol_node(
     raise LibraryMiss(f"symbol {ref} not found in any of: {', '.join(searched)}")
 
 
-def load_footprint(ref: str, footprints_root: Path) -> sexpr.Sexp:
-    """Return the parsed ``(footprint ...)`` S-expression for a library reference."""
+def load_footprint(ref: str, footprints_root: Path | str | Sequence[Path | str]) -> sexpr.Sexp:
+    """Return the parsed ``(footprint ...)`` S-expression for a library reference.
+
+    Accepts one root or an ordered sequence, exactly like the symbol loaders —
+    and for the same reason, learned the same way twice. Stage 5 decides a
+    footprint is real by searching custom → modules → generated → stock; this
+    loader used to look in stock alone, so the first footprint Stage 5 resolved
+    from the shared module library crashed Stage 6 with a LibraryMiss for a
+    file that existed all along, one directory over.
+    """
     lib, name = split_ref(ref)
-    path = Path(footprints_root) / f"{lib}.pretty" / f"{name}.kicad_mod"
-    if not path.exists():
-        raise LibraryMiss(f"footprint {ref} not found at {path}")
-    return sexpr.parse(path.read_text(encoding="utf-8"))
+    tried: list[str] = []
+    for root in _normalize_roots(footprints_root):
+        path = root / f"{lib}.pretty" / f"{name}.kicad_mod"
+        if path.is_file():
+            return sexpr.parse(path.read_text(encoding="utf-8"))
+        tried.append(str(path))
+    raise LibraryMiss(f"footprint {ref} not found in any of: {', '.join(tried)}")
 
 
 def load_symbol_def(ref: str, symbols_root: Path | str | Sequence[Path | str]) -> sexpr.Sexp:

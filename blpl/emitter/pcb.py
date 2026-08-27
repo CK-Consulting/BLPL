@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid as _uuid
 from copy import deepcopy
+from collections.abc import Sequence
 from pathlib import Path
 
 from . import loaders, sexpr
@@ -243,7 +244,7 @@ def _auto_grid_position(
 def build(
     hdm: dict,
     *,
-    footprints_root: Path,
+    footprints_root: Path | str | Sequence[Path | str],
 ) -> sexpr.Node:
     """Build a v10 (kicad_pcb ...) node from an HDM dict."""
     project = hdm.get("project", {})
@@ -391,12 +392,12 @@ def _default_setup() -> sexpr.Node:
     ]
 
 
-def emit(hdm: dict, *, footprints_root: Path) -> str:
+def emit(hdm: dict, *, footprints_root: Path | str | Sequence[Path | str]) -> str:
     """Render a full .kicad_pcb file content from an HDM."""
     return sexpr.dump_top(build(hdm, footprints_root=footprints_root))
 
 
-def write(hdm: dict, output_path: Path, *, footprints_root: Path) -> Path:
+def write(hdm: dict, output_path: Path, *, footprints_root: Path | str | Sequence[Path | str]) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(emit(hdm, footprints_root=footprints_root), encoding="utf-8")
     return output_path

@@ -218,6 +218,17 @@ def extract(md_files: list[Path]) -> dict:
                 else:
                     _absorb_gpio_table(table, host, gpio_assignments)
             else:
+                # Tables other tools consume are not "ignored" — blpl init reads
+                # the identity and net-class tables to generate project.yaml,
+                # and doctor consumes the Shared buses declaration. Warning
+                # about them here taught people the warning was noise, which is
+                # the one thing a warning cannot afford.
+                heading = (_heading_text_above(text, table.line_start) or "").lower()
+                if ("net class" in heading or "shared bus" in heading
+                        or "identity" in heading
+                        or ("project" in heading
+                            and {h.lower() for h in table.headers} >= {"field", "value"})):
+                    continue
                 # Classified as neither BOM nor pinout, so nothing reads it. Often
                 # that is right (a file index, a prose table), but on a real design
                 # it also swallowed the net-classes table and a GPIO map — design

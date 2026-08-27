@@ -86,3 +86,41 @@ def test_refuses_to_clobber_an_existing_config(tmp_path: Path) -> None:
 
     target, _ = init_project.write_config(tmp_path, force=True)
     assert "EXAMPLE-S" in target.read_text()
+
+
+def test_underscored_headers_parse_instead_of_silently_defaulting(tmp_path):
+    """The header spelling a design doc actually uses. `via_dia` never matched
+    the search for "via dia", and the miss was silent: on a real board every
+    via dimension quietly became the default — 0.6/0.3 emitted where the table
+    said 0.8/0.4 — while trace_width survived only because "width" happens to
+    be a substring of it. Board rules are the one place a silent default is
+    copper."""
+    md = tmp_path / "design.md"
+    md.write_text(
+        "## Net classes\n\n"
+        "| Class | Applies to | trace_width | clearance | via_dia | via_drill |\n"
+        "|---|---|---|---|---|---|\n"
+        "| Power_Bulk | rails | 0.40 | 0.20 | 0.80 | 0.40 |\n"
+    )
+    result = init_project.build_config(tmp_path)
+
+    power = result.config["net_classes"]["Power_Bulk"]
+    assert power["via_dia"] == 0.8
+    assert power["via_drill"] == 0.4
+    assert power["trace_width"] == 0.4
+    assert not any("Power_Bulk" in d for d in result.defaulted)
+
+
+def test_a_partially_parsed_class_row_names_its_defaulted_fields(tmp_path):
+    """The dangerous case: the class name is recognized so nothing looks
+    wrong, while individual fields fall to defaults. Each one is named."""
+    md = tmp_path / "design.md"
+    md.write_text(
+        "## Net classes\n\n"
+        "| Class | trace_width |\n|---|---|\n| RF_50Ohm | 0.35 |\n"
+    )
+    result = init_project.build_config(tmp_path)
+
+    assert result.config["net_classes"]["RF_50Ohm"]["trace_width"] == 0.35
+    assert any("RF_50Ohm: via_dia" in d for d in result.defaulted)
+    assert any("RF_50Ohm: via_drill" in d for d in result.defaulted)

@@ -2913,7 +2913,13 @@ def list_artifacts(project_id: str, board: str | None = None,
     list stops being useful. /design already falls back to the archive when it
     has to, and says so.
     """
-    pipeline = _project_dir(session, user, project_id) / ".pipeline"
+    proj = _project_dir(session, user, project_id)
+    # The same normalization the run routes get from _resolve_board: on a
+    # single-board project the implicit board's name is legal to pass and
+    # means "no qualifier" — filtering filenames by it would drop everything,
+    # because single-board artifacts carry no board in their names.
+    board = _resolve_board(proj, board)
+    pipeline = proj / ".pipeline"
     if not pipeline.is_dir():
         return {"artifacts": []}
     files = [p for p in sorted(pipeline.iterdir()) if p.is_file()]

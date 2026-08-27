@@ -47,6 +47,19 @@ def _index_symbols(root: Path) -> dict[str, list[_LibEntry]]:
             sym_name = sym_file.stem
             entry = _LibEntry(lib=lib_name, name=sym_name, path=sym_file)
             index.setdefault(_normalize(sym_name), []).append(entry)
+    # Flat <Lib>.kicad_sym files — one library, many symbols — are the layout
+    # Stage 3 GENERATES, and symbol_resolution has always resolved them. The
+    # index only ever read the directory layout, so every generated symbol was
+    # invisible to coverage and got re-reported as a gap forever.
+    for flat in sorted(root.glob(f"*{_SYMBOL_FILE_SUFFIX}")):
+        lib_name = flat.stem
+        try:
+            text = flat.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r'\(symbol "([^":]+)"', text):
+            entry = _LibEntry(lib=lib_name, name=m.group(1), path=flat)
+            index.setdefault(_normalize(m.group(1)), []).append(entry)
     return index
 
 
@@ -149,6 +162,31 @@ def _footprint_query_tokens(row: dict) -> set[str]:
     return tokens
 
 
+def _lookup_mpn(mpn: str | None, all_entries: dict[str, list[_LibEntry]]) -> tuple[_LibEntry, float] | None:
+    """Match an MPN against library names by containment, not token overlap.
+
+    Token-set Jaccard cannot see that BGS12P2L6 names the same silicon as the
+    library's BGS12P2L6E6327XTSA1 — one token each, zero overlap — nor that
+    PAM8302AASCR is the stock PAM8302AAS plus a packing suffix. Flattened
+    containment can, and it is the same semantic the component library's
+    fuzzy lookup already uses. Six characters minimum on the contained side,
+    because every part a manufacturer makes shares its first few.
+    """
+    if not mpn:
+        return None
+    flat_m = re.sub(r"[^a-z0-9]", "", mpn.lower())
+    if len(flat_m) < 6:
+        return None
+    best: tuple[_LibEntry, float] | None = None
+    for key, entries in all_entries.items():
+        flat_k = key.replace("_", "")
+        if flat_m in flat_k or (len(flat_k) >= 6 and flat_k in flat_m):
+            score = min(len(flat_k), len(flat_m)) / max(len(flat_k), len(flat_m))
+            if best is None or score > best[1]:
+                best = (entries[0], score)
+    return best
+
+
 def _entry_to_match(entry: _LibEntry, match_type: str, score: float | None, root: Path) -> dict:
     m: dict = {
         "lib": entry.lib,
@@ -161,18 +199,51 @@ def _entry_to_match(entry: _LibEntry, match_type: str, score: float | None, root
     return m
 
 
+def _merged_index(roots, index_one) -> dict[str, list[_LibEntry]]:
+    """One index over several roots, earlier roots listed first per name.
+
+    Order matters because _lookup_exact and _lookup_fuzzy take the first
+    acceptable candidate: a part the project vendored or the shared library
+    holds must beat a stock part of the same name, exactly as it does at
+    resolution time in Stage 5.
+    """
+    merged: dict[str, list[_LibEntry]] = {}
+    for root in roots:
+        for key, entries in index_one(Path(root)).items():
+            merged.setdefault(key, []).extend(entries)
+    return merged
+
+
 def run(
     bom_path: Path,
     symbols_root: Path,
     footprints_root: Path,
     output_path: Path,
+    *,
+    project_dir: Path | None = None,
 ) -> dict:
-    """Run Stage 2 and write a coverage report. Returns the report dict."""
+    """Run Stage 2 and write a coverage report. Returns the report dict.
+
+    With ``project_dir``, coverage searches the same roots Stage 5 resolves
+    against — the project's own libraries, the shared module library, the
+    generated set, then stock. Stock-only coverage was how six installed
+    symbols sat invisible while the LLM's paraphrased hints sent every one of
+    those parts to a placeholder: coverage is what OUTRANKS the hint in Stage
+    5, so a library coverage cannot see is a library the pipeline cannot use.
+    """
     bom = schema.load_json(bom_path)
     schema.validate("bom", bom)
 
-    sym_index = _index_symbols(symbols_root)
-    fp_index = _index_footprints(footprints_root)
+    if project_dir is not None:
+        from .symbol_resolution import footprint_search_path, search_path
+
+        sym_roots = [r for r, _ in search_path(Path(project_dir), Path(symbols_root))]
+        fp_roots = [r for r, _ in footprint_search_path(Path(project_dir), Path(footprints_root))]
+    else:
+        sym_roots, fp_roots = [Path(symbols_root)], [Path(footprints_root)]
+
+    sym_index = _merged_index(sym_roots, _index_symbols)
+    fp_index = _merged_index(fp_roots, _index_footprints)
 
     rows_out: list[dict] = []
     summary = {"total": 0, "hit": 0, "needs_variant": 0, "miss": 0}
@@ -183,6 +254,8 @@ def run(
         sym_exact = _lookup_exact(row.get("symbol_hint"), sym_index)
         if sym_exact is not None:
             sym_match: dict | None = _entry_to_match(sym_exact, "exact", None, symbols_root)
+        elif (by_mpn := _lookup_mpn(row.get("mpn"), sym_index)) is not None:
+            sym_match = _entry_to_match(by_mpn[0], "mpn", by_mpn[1], symbols_root)
         else:
             tokens = _symbol_query_tokens(row)
             fuzzy = _lookup_fuzzy(tokens, sym_index)
@@ -191,6 +264,8 @@ def run(
         fp_exact = _lookup_exact(row.get("footprint_hint"), fp_index)
         if fp_exact is not None:
             fp_match: dict | None = _entry_to_match(fp_exact, "exact", None, footprints_root)
+        elif (fp_by_mpn := _lookup_mpn(row.get("mpn"), fp_index)) is not None:
+            fp_match = _entry_to_match(fp_by_mpn[0], "mpn", fp_by_mpn[1], footprints_root)
         else:
             tokens = _footprint_query_tokens(row)
             fuzzy = _lookup_fuzzy(tokens, fp_index)

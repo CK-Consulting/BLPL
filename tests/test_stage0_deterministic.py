@@ -181,13 +181,15 @@ def test_warnings_survive_schema_validation(tmp_path: Path) -> None:
 
 
 def test_tables_matching_neither_shape_are_reported(tmp_path: Path) -> None:
-    """On a real design this silently swallowed the net-classes table and a GPIO
-    map — design intent the user wrote and the pipeline ignored without a word."""
+    """On a real design this silently swallowed a GPIO map — design intent the
+    user wrote and the pipeline ignored without a word. (The fixture used to be
+    a net-classes table, which stopped being a valid example when stage 0
+    learned that blpl init consumes it.)"""
     md = _write(
         tmp_path,
         "overview.md",
-        "# Overview\n\n## Net classes\n\n"
-        "| Class | Trace width (mm) | Clearance (mm) |\n"
+        "# Overview\n\n## Candidate parts compared\n\n"
+        "| Candidate | Trace width (mm) | Clearance (mm) |\n"
         "|-------|------------------|----------------|\n"
         "| Power | 0.5 | 0.2 |\n",
     )
@@ -197,6 +199,25 @@ def test_tables_matching_neither_shape_are_reported(tmp_path: Path) -> None:
     # The columns are what make it triageable without opening the file.
     assert "Trace width (mm)" in ignored[0]["summary"]
     assert ignored[0]["source_ref"]["file"].endswith("overview.md")
+
+
+def test_tables_other_tools_consume_are_not_called_ignored(tmp_path: Path) -> None:
+    """blpl init reads the net-classes and identity tables; doctor consumes the
+    Shared buses declaration. A warning that fires on them every run teaches
+    people the warning is noise — which is the one thing a warning cannot
+    afford."""
+    md = _write(
+        tmp_path,
+        "overview.md",
+        "# Overview\n\n"
+        "## Net classes\n\n"
+        "| Class | trace_width | clearance |\n|---|---|---|\n| Default | 0.2 | 0.15 |\n\n"
+        "## Shared buses\n\n"
+        "| Signal | Components | Purpose |\n|---|---|---|\n| I2C_SDA | U_A, U_B | bus |\n",
+    )
+    artifact = s0.extract([md])
+    # No warnings at all means the key is absent — which is itself the pass.
+    assert [w for w in artifact.get("warnings", []) if w["code"] == "STAGE0-004"] == []
 
 
 def test_a_clean_design_produces_no_warnings_at_all(tmp_path: Path) -> None:

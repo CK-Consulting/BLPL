@@ -47,7 +47,15 @@ export function BoardPanel({
         // Select something on first load so nothing below has to cope with a
         // null board. The first board is the required one in practice, since
         // the manifest lists the carrier before what plugs into it.
-        if (!board && d.boards.length > 0) onBoard(d.boards[0].name);
+        //
+        // But NOT on a single-board project. Its one board is implicit — a
+        // rendering convenience named after the project — and its artifacts
+        // carry no board qualifier on disk (bom.json, not bom.<name>.json).
+        // Selecting it made every tab ask for files that are never written:
+        // "No BOM yet" after ten stage1 runs, an empty artifacts list with a
+        // .pipeline full of artifacts. Null is the truthful value here, and
+        // every consumer already handles it.
+        if (!board && !d.implicit && d.boards.length > 0) onBoard(d.boards[0].name);
       })
       .catch(() => {});
     return () => {
