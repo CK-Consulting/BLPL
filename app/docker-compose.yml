@@ -358,7 +358,13 @@ services:
   # spinning a board. It is not usable on this host; see the environment block.
   kicad-desktop:
  #   profiles: ["desktop"]
-    image: lscr.io/linuxserver/kicad:latest
+    # Built on the published image rather than pulled from it: the one layer
+    # added installs the KiKit backend (and CopperFiller's psutil) into the
+    # python KiCad's plugins run in — the piece PCM cannot deliver, and the
+    # piece a live `pip install` into the container loses on every recreate.
+    # See kicad-desktop/Dockerfile.
+    build: ./kicad-desktop
+    image: blpl-kicad-desktop
     container_name: blpl-kicad-desktop
     restart: unless-stopped
     networks:
