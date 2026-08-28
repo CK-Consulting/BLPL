@@ -33,6 +33,7 @@ _LLM_OUTPUT_SCHEMA: dict = {
                     "local_id",
                     "description",
                     "package_hint",
+                    "symbol_hint",
                     "part_hint",
                     "manufacturer_hint",
                     "role",
@@ -42,6 +43,7 @@ _LLM_OUTPUT_SCHEMA: dict = {
                     "local_id": {"type": "string"},
                     "description": {"type": "string"},
                     "package_hint": {"type": ["string", "null"]},
+                    "symbol_hint": {"type": ["string", "null"]},
                     "part_hint": {"type": ["string", "null"]},
                     "manufacturer_hint": {"type": ["string", "null"]},
                     "role": {"type": ["string", "null"]},
@@ -125,7 +127,10 @@ _SYSTEM_PROMPT = (
     "Use canonical reference designators (U1, J2, J_HALOW, etc.) as local_id values. "
     "Skip section headings (Core, Power, Connectivity) — they are not components. "
     "Expand refdes ranges like 'U2-U3' into separate entries (U2 and U3). "
-    "Only emit a connector entry when the document shows a pin/signal table for it."
+    "Only emit a connector entry when the document shows a pin/signal table for it. "
+    "If a BOM row has a Symbol column, copy its value into symbol_hint VERBATIM — "
+    "character for character, even if you believe a more canonical library "
+    "spelling exists. It is the designer naming an exact file, not a suggestion."
 )
 
 

@@ -186,3 +186,46 @@ def test_connector_pins_are_unioned_across_files(tmp_path: Path) -> None:
     pins = {p["pin"] for p in j2["pins"]}
     assert pins == {"1", "2", "3"}
     assert j2["pin_count"] == 3  # recomputed from merged pins
+
+
+def test_symbol_hint_is_asked_for_and_survives_into_the_artifact(tmp_path: Path) -> None:
+    """The LLM extractor's schema is a whitelist (additionalProperties: false),
+    so a field it does not declare is a field the whole llm/both path silently
+    drops — which for symbol_hint would mean the Symbol column's pin never
+    reaches Stage 1, exactly the wrong-silicon substitutions it exists to
+    prevent."""
+    a_md = _write_md(tmp_path, "a.md", "# A\n| Ref | Symbol |\n|---|---|\n| U_BLE | Raytac:AN54LV-U15 |\n")
+    adapter = _StubAdapter(
+        {
+            "a.md": {
+                "components": [
+                    {
+                        "local_id": "U_BLE",
+                        "description": "BLE module",
+                        "package_hint": None,
+                        "symbol_hint": "Raytac:AN54LV-U15",
+                        "part_hint": None,
+                        "manufacturer_hint": None,
+                        "role": None,
+                        "pin_count_hint": None,
+                    }
+                ],
+                "connectors": [],
+                "subsystems": [],
+                "raw_nets": [],
+            },
+        }
+    )
+
+    out = tmp_path / "design_artifact.json"
+    artifact = s0llm.run([a_md], out, adapter=adapter)
+    schema.validate("design_artifact", artifact)
+
+    # The schema handed to the LLM must declare the field, or a conforming
+    # model is FORBIDDEN from returning it.
+    _, sent_schema = adapter.calls[0]
+    comp_props = sent_schema["properties"]["components"]["items"]["properties"]
+    assert "symbol_hint" in comp_props
+
+    u = next(c for c in artifact["components"] if c["local_id"] == "U_BLE")
+    assert u["symbol_hint"] == "Raytac:AN54LV-U15"

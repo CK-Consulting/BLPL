@@ -15,6 +15,7 @@ from . import schema
 _COMPONENT_FIELDS = [
     "description",
     "package_hint",
+    "symbol_hint",
     "part_hint",
     "manufacturer_hint",
     "role",

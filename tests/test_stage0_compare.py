@@ -89,3 +89,17 @@ def test_to_markdown_produces_nonempty_report() -> None:
     md = stage0_compare.to_markdown(diff)
     assert "Stage 0 comparison: det vs llm" in md
     assert "U2" in md  # the missing component should be called out
+
+
+def test_symbol_hint_disagreement_is_reported() -> None:
+    """In --stage0-mode both, a pinned symbol the LLM artifact lost or changed
+    is precisely the extraction loss the comparison exists to expose — 100%
+    agreement while symbol_hint silently differs would hide it."""
+    a = _artifact([{"local_id": "U1", "description": "x", "symbol_hint": "Raytac:AN54LV-U15"}])
+    b = _artifact([{"local_id": "U1", "description": "x", "symbol_hint": "RF_Module:MDBT50Q-1MV2"}])
+    diff = stage0_compare.compare(a, b, a_label="det", b_label="llm")
+    (dis,) = diff["components"]["disagreements"]
+    (row,) = dis["diffs"]
+    assert row["field"] == "symbol_hint"
+    assert row["det"] == "Raytac:AN54LV-U15"
+    assert row["llm"] == "RF_Module:MDBT50Q-1MV2"
