@@ -429,6 +429,14 @@ services:
       - LIBGL_ALWAYS_SOFTWARE=1
     volumes:
       - ./data/kicad-desktop:/config
+      # Start-up scripts (linuxserver convention). The one script in here
+      # registers each project's libraries/ as a WRITABLE KiCad library named
+      # after the project, and the shared vendor libraries read-only under
+      # their pipeline names. Without it the desktop's save dialogs offer only
+      # the read-only stock mounts and PCM installs — so "draw the missing
+      # symbol", the task this desktop exists for, either fails on a
+      # read-only filesystem or saves into a file no pipeline stage searches.
+      - ./kicad-desktop-init:/custom-cont-init.d:ro
       # One variable, two shapes, and the empty default is the useful one.
       #
       # Unset, this expands to `./data/projects/` — the whole root, so every
