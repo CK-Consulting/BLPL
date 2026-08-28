@@ -157,3 +157,28 @@ def test_report_is_written_even_when_there_is_nothing_wrong(tmp_path: Path) -> N
         {"R1": sr.Resolution(ref="Device:R", source=sr.STOCK, requested="Device:R")}, tmp_path
     )
     assert "None" in md
+
+
+def test_a_property_value_does_not_satisfy_a_symbol_existence_check(tmp_path: Path) -> None:
+    """The flat-file check was a bare quoted-string containment, and property
+    values satisfied it: a symbol drawn as A7002Q-U with its Value set to the
+    MPN AN7002Q-U made the misspelled reference AN7002Q-U pass — against a
+    symbol that does not exist. Only a symbol DEFINITION may answer."""
+    lib = tmp_path / "libraries" / "symbols"
+    lib.mkdir(parents=True)
+    (lib / "proj.kicad_sym").write_text(
+        '(kicad_symbol_lib\n'
+        '\t(symbol "A7002Q-U"\n'
+        '\t\t(property "Value" "AN7002Q-U")\n'
+        '\t)\n'
+        ')\n',
+        encoding="utf-8",
+    )
+    stock = tmp_path / "stock"
+    stock.mkdir()
+
+    hit = sr.resolve("proj:A7002Q-U", project_dir=tmp_path, stock_root=stock)
+    assert hit.source == sr.CUSTOM
+
+    miss = sr.resolve("proj:AN7002Q-U", project_dir=tmp_path, stock_root=stock)
+    assert miss.source == sr.PLACEHOLDER

@@ -188,6 +188,14 @@ def emit(
     schema.validate("nets", nets)
     schema.validate("design_artifact", design_artifact)
 
+    # The doc's explicit pins, applied at read time — the same overlay Stage 2
+    # ran its coverage under. bom.json is Stage 1's output and Stage 1 is the
+    # LLM stage, so without this a Symbol cell edited in the design doc
+    # changed nothing here until a paid rerun regenerated the file.
+    from . import explicit_pins
+
+    explicit_pins.apply(bom["rows"], project_dir)
+
     cov_by_id = _index_coverage(coverage)
     resolutions: dict[str, symbol_resolution.Resolution] = {}
     footprint_resolutions: dict[str, symbol_resolution.Resolution] = {}

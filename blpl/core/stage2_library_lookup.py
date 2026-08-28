@@ -234,6 +234,14 @@ def run(
     bom = schema.load_json(bom_path)
     schema.validate("bom", bom)
 
+    # The doc's explicit pins, applied at read time. Without this, a Symbol
+    # or Package cell edited after Stage 1 changes nothing until the LLM
+    # stage reruns — coverage kept scoring the stale hints while the design
+    # doc plainly said otherwise.
+    from . import explicit_pins
+
+    explicit_pins.apply(bom["rows"], project_dir)
+
     if project_dir is not None:
         from .symbol_resolution import footprint_search_path, search_path
 

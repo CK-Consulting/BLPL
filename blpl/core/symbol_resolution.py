@@ -105,9 +105,14 @@ def _exists_in(root: Path, lib: str, name: str) -> bool:
         return True
     flat = root / f"{lib}.kicad_sym"
     if flat.is_file():
-        # Cheap containment check; the file is one library, many symbols.
+        # Anchored to a symbol DEFINITION, not any quoted string. The bare
+        # '"{name}"' containment this used to be was satisfied by property
+        # values: a symbol drawn as "A7002Q-U" with its Value set to the MPN
+        # "AN7002Q-U" made the misspelled reference AN7002Q-U pass an
+        # existence check against a symbol that does not exist — which Stage 6
+        # then discovers the hard way.
         try:
-            return f'"{name}"' in flat.read_text(encoding="utf-8", errors="replace")
+            return f'(symbol "{name}"' in flat.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return False
     return False
