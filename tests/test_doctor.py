@@ -999,3 +999,24 @@ def test_a_bare_symbol_value_is_not_checked_against_disk(tmp_path: Path) -> None
     )
     report = doctor.run(proj, symbols_root=tmp_path / "empty")
     assert "DOC-015" not in _codes(report)
+
+
+def test_a_pcm_library_symbol_gets_the_desktop_specific_fix(tmp_path: Path) -> None:
+    """PCM_* nicknames are libraries the KiCad desktop installs into its own
+    container home — real in the editor, invisible to every pipeline stage.
+    Both hand-drawn symbols on the first deployment landed in one, and the
+    correct-but-unexplained DOC-015 read as doctor being wrong. The error must
+    say what actually happened and where the symbol belongs."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package | Symbol |\n|---|---|---|---|\n"
+            "| U2 | APS25608N-OBR-BD | BGA-24 | PCM_SparkFun-IC-Memory:APS25608N-OBRx |\n"
+        ),
+    )
+    report = doctor.run(proj, symbols_root=tmp_path / "empty")
+    (hit,) = [f for f in report.findings if f.code == "DOC-015"]
+    assert "Plugin-and-Content-Manager" in hit.fix
+    assert "APS25608N-OBRx" in hit.fix

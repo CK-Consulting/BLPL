@@ -575,18 +575,37 @@ def _check_symbols(
                 ).is_file()
         if checked[sym]:
             continue
+        if sym.startswith("PCM_"):
+            # A library nickname the KiCad desktop invented for a Plugin and
+            # Content Manager install. Those live inside the desktop
+            # container's own home — not in the resolution path, not even
+            # mounted into the backend — so a symbol saved there is real,
+            # openable in the editor, and invisible to every pipeline stage.
+            # Both hand-drawn symbols on this deployment landed in one before
+            # this message existed, and the correct-but-unexplained error
+            # read as doctor being wrong.
+            fix = (
+                "This names a KiCad Plugin-and-Content-Manager library, which exists "
+                "only inside the desktop — no pipeline stage can search it. In the "
+                "desktop's symbol editor, copy the symbol into the library named after "
+                "this project (it is writable, and it is the first place every stage "
+                "looks), then spell the reference as "
+                f"'<project-name>:{sym.partition(':')[2]}'."
+            )
+        else:
+            fix = (
+                "Stage 5 substitutes a generic placeholder for a symbol it cannot "
+                "find, so the schematic still opens — with the wrong part on it. "
+                "Check the spelling against kicad-symbols, or draw the symbol in "
+                "KiCad and save it into this project's libraries/symbols/, which "
+                "is searched before the stock libraries."
+            )
         report.findings.append(
             Finding(
                 code="DOC-015",
                 severity="error",
                 summary=f"{ref}: symbol '{sym}' does not exist in the library.",
-                fix=(
-                    "Stage 5 substitutes a generic placeholder for a symbol it cannot "
-                    "find, so the schematic still opens — with the wrong part on it. "
-                    "Check the spelling against kicad-symbols, or draw the symbol in "
-                    "KiCad and save it into this project's libraries/symbols/, which "
-                    "is searched before the stock libraries."
-                ),
+                fix=fix,
                 file=rel,
                 line=line,
             )
