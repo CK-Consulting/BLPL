@@ -2377,11 +2377,28 @@ def _editable_file(session: Session, user: User, project_id: str, name: str) -> 
     """
     proj = _project_dir(session, user, project_id)
     parts = [seg for seg in name.split("/") if seg]
+    if any(seg.startswith(".") and seg != ".." for seg in parts):
+        # The refusal is deliberate, and "invalid filename" taught nobody why:
+        # a user trying to fix a wrong requested_symbol edited .pipeline/hdm.yaml
+        # in the workbench, got the generic error, and went looking for the
+        # cause in container logs. The dot-directories hold generated artifacts
+        # — an edit there is overwritten by the next run of the stage that
+        # writes it, so the honest answer names the file that actually holds
+        # the fact.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "files under dot-directories are pipeline artifacts — regenerated "
+                "on every run, so an edit here would not survive. Change the "
+                "design markdown (it is the source of every artifact) and rerun "
+                "the stage instead."
+            ),
+        )
     if (
         not parts
         or "\\" in name
         or name.startswith("/")
-        or any(seg == ".." or seg.startswith(".") for seg in parts)
+        or any(seg == ".." for seg in parts)
     ):
         raise HTTPException(status_code=400, detail="invalid filename")
     target = proj.joinpath(*parts).resolve()
