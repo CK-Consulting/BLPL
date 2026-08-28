@@ -554,16 +554,21 @@ def _check_symbols(
     part. Bare values are left alone; without a colon the column is a hint for
     Stage 2's matching, not a claim.
     """
-    from .symbol_resolution import PLACEHOLDER, is_not_placed, resolve
+    from .symbol_resolution import PLACEHOLDER, resolve
 
     checked: dict[str, bool] = {}
     for ref, row, rel, line in bom_rows:
         sym = (row.get("symbol") or "").strip()
         if ":" not in sym:
             continue
-        if is_not_placed(_footprint_column(row)):
-            # Never on the board, never in the netlist — no symbol to check.
-            continue
+        # not_placed rows are NOT exempt here, unlike every footprint check:
+        # those skip because a footprint for such a part would be wrong
+        # copper, so "matches nothing" is the correct state. A Symbol cell is
+        # the opposite case — the designer wrote an explicit claim about a
+        # file, and a claim made deserves checking whether or not Stage 5
+        # currently emits the part. The row that forced this carried a
+        # PCM-library reference that sat unvalidated for days behind the
+        # not_placed skip.
         if sym not in checked:
             if project_dir is not None:
                 got = resolve(sym, project_dir=Path(project_dir), stock_root=Path(symbols_root))

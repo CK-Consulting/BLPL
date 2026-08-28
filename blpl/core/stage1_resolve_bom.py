@@ -236,6 +236,16 @@ def resolve(
         for c in components
         if ":" in (c.get("symbol_hint") or "")
     }
+    # not_placed is pinned for the same reason, and it is easier to lose: it
+    # has no colon, so the explicit-reference net above never catches it, and
+    # the LLM "helpfully" rewrites it into a real-looking package ("Coin Cell
+    # 1220" for a bare coin cell). Stage 5 then emits a placeholder header for
+    # a part whose entire meaning is that it must have NO copper.
+    from .symbol_resolution import is_not_placed
+
+    not_placed_ids = {
+        c["local_id"] for c in components if is_not_placed(c.get("package_hint"))
+    }
     for r in rows:
         pinned = explicit.get(r.get("local_id"))
         if pinned:
@@ -243,6 +253,9 @@ def resolve(
         pinned_sym = explicit_sym.get(r.get("local_id"))
         if pinned_sym:
             r["symbol_hint"] = pinned_sym
+        if r.get("local_id") in not_placed_ids:
+            r["package"] = "not_placed"
+            r["footprint_hint"] = None
 
     bom = _post_process({"rows": rows}, project_id=design_artifact["project_id"])
     if synthesize_connectors:

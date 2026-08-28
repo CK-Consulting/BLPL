@@ -1020,3 +1020,23 @@ def test_a_pcm_library_symbol_gets_the_desktop_specific_fix(tmp_path: Path) -> N
     (hit,) = [f for f in report.findings if f.code == "DOC-015"]
     assert "Plugin-and-Content-Manager" in hit.fix
     assert "APS25608N-OBRx" in hit.fix
+
+
+def test_an_explicit_symbol_on_a_not_placed_row_is_still_checked(tmp_path: Path) -> None:
+    """not_placed exempts every FOOTPRINT check, because a footprint for such
+    a part would be wrong copper. A Symbol cell is the opposite case: an
+    explicit claim about a file, which deserves checking whether or not Stage
+    5 currently emits the part. The row that forced this carried a PCM-library
+    reference that sat unvalidated behind the skip."""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _project(
+        proj,
+        design__md=(
+            "## BOM\n\n| Ref | MPN | Package | Symbol |\n|---|---|---|---|\n"
+            "| BAT_RTC | ML1220 | not_placed | PCM_Elektuur_1:BAT_RTC |\n"
+        ),
+    )
+    report = doctor.run(proj, symbols_root=tmp_path / "empty")
+    (hit,) = [f for f in report.findings if f.code == "DOC-015"]
+    assert "PCM_Elektuur_1:BAT_RTC" in hit.summary

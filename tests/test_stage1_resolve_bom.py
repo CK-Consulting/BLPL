@@ -185,3 +185,42 @@ def test_an_explicit_symbol_reference_survives_the_llm(tmp_path: Path) -> None:
     assert rows["U_BLE"]["symbol_hint"] == "Raytac:AN54LV-U15"
     # A row with no explicit symbol keeps the LLM's canonicalisation.
     assert rows["R1"]["symbol_hint"] == "Device:R"
+
+
+def test_not_placed_survives_the_llm(tmp_path: Path) -> None:
+    """not_placed has no colon, so the explicit-reference pinning never caught
+    it — and the LLM rewrites it into a real-looking package ("Coin Cell 1220"
+    for a bare coin cell). Stage 5 then emits a placeholder header for a part
+    whose entire meaning is that it must have NO copper."""
+    artifact = {
+        "project_id": "proj",
+        "schema_version": 1,
+        "components": [
+            {
+                "local_id": "BAT_RTC",
+                "description": "bare coin cell in a retainer clip",
+                "part_hint": "ML1220",
+                "package_hint": "not_placed",
+            },
+        ],
+        "connectors": [],
+        "subsystems": [],
+        "raw_nets": [],
+    }
+    schema.validate("design_artifact", artifact)
+    adapter = _StubAdapter({"rows": [
+        {"local_id": "BAT_RTC", "mpn": "ML1220", "manufacturer": "Jauch",
+         "package": "Coin Cell 1220",  # the paraphrase
+         "pin_count": 2, "datasheet_url": None,
+         "description": "coin cell", "role": None, "symbol_hint": None,
+         "footprint_hint": "Battery:BatteryHolder_1220",  # invented copper
+         "confidence": 0.9, "notes": None, "value": None, "tolerance": None,
+         "voltage_v": None, "power_w": None, "dielectric": None, "safety_class": None},
+    ]})
+
+    bom = s1.resolve(artifact, adapter=adapter, synthesize_connectors=False)
+    row = bom["rows"][0]
+
+    from blpl.core.symbol_resolution import is_not_placed
+    assert is_not_placed(row["package"])
+    assert not row.get("footprint_hint")
