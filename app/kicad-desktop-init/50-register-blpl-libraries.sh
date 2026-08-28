@@ -80,6 +80,40 @@ for proj in "$PROJECTS_DIR"/*/; do
     add_entry "$FP_TABLE" "$name" "$fpdir/$name.pretty" "BLPL project library (writable) — searched FIRST by the pipeline"
 done
 
+# --- stock symbols: repair the registration the mount breaks ----------------
+# The image's template sym-lib-table lists the flat <Lib>.kicad_sym files the
+# Alpine kicad-library package installs — and the compose mount replaces
+# /usr/share/kicad/symbols with the fork's one-file-per-symbol .kicad_symdir
+# layout, so every one of those entries dangles and the symbol editor shows
+# no stock library at all. (Footprints never had the problem: .pretty
+# directories are the same layout in both.) When the mounted layout is the
+# symdir one, generate a table that names what is actually there and repoint
+# the global table's "KiCad" include row at it. Regenerated every start, so
+# the registration tracks the fork as it grows.
+STOCK_SYMBOLS="/usr/share/kicad/symbols"
+stock_table="$KICAD_CONFIG_DIR/$ver/blpl-stock-sym-lib-table"
+if ls "$STOCK_SYMBOLS"/*.kicad_symdir >/dev/null 2>&1; then
+    {
+        printf '(sym_lib_table\n\t(version 7)\n'
+        for d in "$STOCK_SYMBOLS"/*.kicad_symdir; do
+            printf '\t(lib (name "%s") (type "KiCad") (uri "%s") (options "") (descr "stock symbols (read-only)"))\n' \
+                "$(basename "$d" .kicad_symdir)" "$d"
+        done
+        printf ')\n'
+    } > "$stock_table"
+    sed -i 's|(lib (name "KiCad") (type "Table") (uri "[^"]*")|(lib (name "KiCad") (type "Table") (uri "'"$stock_table"'")|' "$SYM_TABLE"
+    if ! grep -qF "$stock_table" "$SYM_TABLE"; then
+        # No include row to repoint (a fresh table this script created):
+        # add one. Type "Table" — a nested table include, not a library.
+        tmp="$SYM_TABLE.blpl-tmp"
+        sed '$d' "$SYM_TABLE" > "$tmp"
+        printf '\t(lib (name "KiCad") (type "Table") (uri "%s") (options "") (descr "KiCad Default Libraries"))\n)\n' \
+            "$stock_table" >> "$tmp"
+        mv "$tmp" "$SYM_TABLE"
+    fi
+    echo "kicad-init: stock symbol table -> $stock_table ($(grep -c '(lib ' "$stock_table") libraries)"
+fi
+
 # --- the shared vendor libraries, read-only, under their pipeline names -----
 if [ -d "$SHARED_DIR" ]; then
     find "$SHARED_DIR" -maxdepth 2 -name '*.kicad_symdir' -type d 2>/dev/null | while read -r d; do
