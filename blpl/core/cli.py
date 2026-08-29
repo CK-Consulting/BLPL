@@ -603,6 +603,26 @@ def _cmd_stage2(args: argparse.Namespace) -> int:
     )
     s = report["summary"]
     print(f"stage2: {s['hit']} hit / {s['needs_variant']} needs_variant / {s['miss']} miss (of {s['total']})")
+    # The counts alone sent people digging through the report json for which
+    # rows they meant — and the json needed a cross-reference to bom.json to
+    # say what was even searched. Name them, with what was tried and what
+    # (if anything) was found.
+    def _side(match: dict | None, query: str) -> str:
+        if match is None:
+            return f"NO MATCH for '{query}'"
+        if match["match_type"] == "exact":
+            return "exact"
+        score = f" {match['score']:.2f}" if "score" in match else ""
+        return f"'{query}' ~ {match['lib']}:{match['name']} ({match['match_type']}{score})"
+
+    for status in ("miss", "needs_variant"):
+        rows = [r for r in report["rows"] if r["status"] == status]
+        if not rows:
+            continue
+        print(f"        {status}:")
+        for r in rows:
+            print(f"          {r['local_id']:<14} symbol: {_side(r['symbol_match'], r['symbol_query'])}")
+            print(f"          {'':<14} footprint: {_side(r['footprint_match'], r['footprint_query'])}")
     print(f"        wrote {output_path}")
     return 0 if s["miss"] == 0 else 1
 

@@ -29,6 +29,14 @@
         "properties": {
           "local_id": {"type": "string"},
           "mpn": {"type": "string"},
+          "symbol_query": {
+            "type": "string",
+            "description": "What the symbol lookup searched with — the explicit hint or the tokens tried. Present so a needs_variant or miss row explains itself without cross-referencing bom.json."
+          },
+          "footprint_query": {
+            "type": "string",
+            "description": "What the footprint lookup searched with."
+          },
           "status": {
             "type": "string",
             "enum": ["hit", "needs_variant", "miss"],
