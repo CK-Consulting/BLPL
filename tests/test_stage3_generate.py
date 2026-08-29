@@ -475,3 +475,48 @@ def test_a_pinned_symbol_supplies_its_own_pin_map(tmp_path):
     row = json.loads(bom_path.read_text())["rows"][0]
     assert row["pin_map"] == {"RF1": "1", "GND": "2", "RF2": "3"}
     assert row["pin_map_source"] == "pinned_symbol"
+
+
+def test_an_unresolvable_connector_hint_is_repaired_to_the_stock_generic(tmp_path):
+    """The LLM invents connector symbol names; Stage 5 turned each into a
+    'NO REAL SYMBOL' placeholder for parts whose whole point is being
+    standard — a 40-pin FFC is generic by design. A hint that resolves is
+    respected; one that resolves to nothing yields to the connector
+    bucket's stock symbol."""
+    import json
+    proj = tmp_path
+    (proj / ".pipeline").mkdir()
+    stock = tmp_path / "stock"
+    lib = stock / "Connector_Generic.kicad_symdir"
+    lib.mkdir(parents=True)
+    (lib / "Conn_01x40.kicad_sym").write_text(
+        '(kicad_symbol_lib\n(symbol "Conn_01x40"\n\t(symbol "Conn_01x40_1_1"\n'
+        + "".join(
+            f'\t\t(pin passive line (at 0 0 0) (length 2.54)\n\t\t\t(name "Pin_{i}") (number "{i}"))\n'
+            for i in range(1, 41)
+        )
+        + "\t)\n)\n)\n"
+    )
+    bom_path = proj / ".pipeline" / "bom.json"
+    bom_path.write_text(json.dumps({
+        "project_id": "p", "schema_version": 1,
+        "rows": [{"local_id": "J_DISP", "mpn": "IMSA-9631S-40Y801", "package": "FFC 40P",
+                  "description": "MIPI-DSI display FPC connector, 40-pos 0.5 mm FFC",
+                  "pin_count": 40,
+                  "symbol_hint": "Connector_FFC-FPC:Conn_FFC-FPC_40P"}],  # LLM invention
+    }))
+    cov_path = proj / ".pipeline" / "coverage_report.json"
+    cov_path.write_text(json.dumps({
+        "project_id": "p", "schema_version": 1,
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "library_roots": {"symbols": "s", "footprints": "f"},
+        "rows": [{"local_id": "J_DISP", "mpn": "IMSA-9631S-40Y801", "status": "hit",
+                  "symbol_match": None,
+                  "footprint_match": {"lib": "C", "name": "F", "match_type": "exact"}}],
+        "summary": {"total": 1, "hit": 1, "needs_variant": 0, "miss": 0},
+    }))
+
+    s3.run(cov_path, bom_path, proj, symbols_root=stock)
+
+    row = json.loads(bom_path.read_text())["rows"][0]
+    assert row["symbol_hint"] == "Connector_Generic:Conn_01x40"

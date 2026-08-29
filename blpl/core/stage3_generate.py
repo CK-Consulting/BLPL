@@ -301,6 +301,15 @@ def _project_rel(path: Path) -> Path:
         return path
 
 
+def _symbol_exists(ref: str, symbols_root) -> bool:
+    """Whether a Lib:Name reference resolves in any of the given roots."""
+    try:
+        _emitter_loaders._load_symbol_node(ref, symbols_root)
+        return True
+    except _emitter_loaders.LibraryMiss:
+        return False
+
+
 def _classify_and_resolve_pin_map(
     bom_row: dict,
     paths: Stage3Paths,
@@ -557,9 +566,40 @@ def run(
     # an FPGA may have a library-matched symbol but still need a pin_map.
     from . import explicit_pins
 
+    explicit_pins.apply(bom["rows"], project_dir)
     doc_pin_maps = explicit_pins.pin_maps(project_dir)
     bom_mutated = False
     for bom_row in bom["rows"]:
+        # A connector hint that names no symbol anywhere is the LLM's
+        # invention, and Stage 5 turns it into a "NO REAL SYMBOL" placeholder
+        # for a part whose whole point is being standard — a 40-pin FFC is
+        # generic BY DESIGN. The connector bucket already knows the right
+        # stock symbol; it just refused to overwrite an existing hint. An
+        # existing hint that resolves is respected (the designer may have
+        # pinned it); one that resolves to nothing defends nothing.
+        sym_hint = bom_row.get("symbol_hint") or ""
+        if ":" in sym_hint and not _symbol_exists(sym_hint, symbols_root):
+            repaired = component_classifier._classify_connector(bom_row, symbols_root)
+            if (
+                repaired is not None
+                and repaired.lib_symbol
+                and _symbol_exists(repaired.lib_symbol, symbols_root)
+            ):
+                bom_row["symbol_hint"] = repaired.lib_symbol
+                bom_mutated = True
+                gaps.append(
+                    {
+                        "local_id": bom_row["local_id"],
+                        "mpn": bom_row["mpn"],
+                        "kind": "symbol",
+                        "status": "resolved",
+                        "auto_generated": True,
+                        "user_prompt": (
+                            f"Replaced symbol hint '{sym_hint}' — it names no symbol in any "
+                            f"library — with {repaired.lib_symbol} ({repaired.reason})."
+                        ),
+                    }
+                )
         pin_map_gap = _classify_and_resolve_pin_map(
             bom_row,
             paths,
