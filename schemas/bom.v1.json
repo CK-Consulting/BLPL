@@ -95,7 +95,8 @@
       "connector_lookup",
       "small_signal_3pin",
       "user_provided",
-      "design_artifact"
+      "design_artifact",
+      "pinned_symbol"
      ],
      "description": "Audit trail: where the pin_map came from. passive_identity = auto-generated from 2-pin passive classification. connector_lookup = Stage 3 matched a generic connector and derived the map from the library symbol's pin names. user_provided = filled in by the user via the interactive prompt."
     },

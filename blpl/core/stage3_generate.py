@@ -307,6 +307,7 @@ def _classify_and_resolve_pin_map(
     *,
     symbols_root: Path,
     footprints_root: Path,
+    doc_pin_maps: dict[str, dict[str, str]] | None = None,
 ) -> dict | None:
     """Run the component classifier against a BOM row.
 
@@ -319,6 +320,71 @@ def _classify_and_resolve_pin_map(
     """
     if bom_row.get("pin_map"):
         return None
+
+    from .symbol_resolution import is_not_placed
+
+    if is_not_placed(bom_row.get("footprint_hint") or bom_row.get("package") or ""):
+        # Never on the board, never in the netlist: there are no pins for a
+        # pin_map to describe — the same exemption doctor's DOC-011 applies.
+        return None
+
+    # The design doc's own pinout table, before any classifier guessing: it
+    # is the durable statement of signal→pin (DOC-011 tells people to write
+    # exactly this table), where bom.json's pin_map is a regenerated
+    # artifact one Stage 1 rerun wipes. What a rerun destroys, this
+    # re-derives.
+    doc_map = (doc_pin_maps or {}).get(bom_row["local_id"])
+    if doc_map:
+        bom_row["pin_map"] = dict(doc_map)
+        bom_row["pin_map_source"] = "design_artifact"
+        return {
+            "local_id": bom_row["local_id"],
+            "mpn": bom_row["mpn"],
+            "kind": "pin_map",
+            "status": "resolved",
+            "auto_generated": True,
+            "user_prompt": (
+                f"Resolved pin_map for {bom_row['local_id']} ({bom_row['mpn']}) from its "
+                f"pinout table in the design doc.\n  pin_map entries={len(doc_map)}"
+            ),
+            "notes": "design_artifact",
+            "pin_map_resolution": _clean_resolution(
+                source="design_artifact", pin_map=doc_map
+            ),
+        }
+
+    # An explicitly pinned symbol, before any classifier guessing: gap
+    # prompts have always told the user to run resolve-pin-map --lib-symbol
+    # against exactly this reference ("fastest; derives signal→pin from a
+    # KiCad symbol's pin-name table"). When the designer already named the
+    # symbol in the doc, asking them to type its name back is a form with
+    # one field and one possible answer — derive it.
+    sym_hint = bom_row.get("symbol_hint") or ""
+    if ":" in sym_hint:
+        pin_map, warns = component_classifier._pin_map_from_symbol(
+            sym_hint, symbols_root, pin_count_hint=bom_row.get("pin_count")
+        )
+        if pin_map:
+            bom_row["pin_map"] = pin_map
+            bom_row["pin_map_source"] = "pinned_symbol"
+            prompt = [
+                f"Resolved pin_map for {bom_row['local_id']} ({bom_row['mpn']}) from its "
+                f"pinned symbol {sym_hint}.\n  pin_map entries={len(pin_map)}"
+            ]
+            if warns:
+                prompt.append("  warnings: " + "; ".join(warns))
+            return {
+                "local_id": bom_row["local_id"],
+                "mpn": bom_row["mpn"],
+                "kind": "pin_map",
+                "status": "resolved",
+                "auto_generated": True,
+                "user_prompt": "\n".join(prompt),
+                "notes": "pinned_symbol",
+                "pin_map_resolution": _clean_resolution(
+                    source="pinned_symbol", lib_symbol=sym_hint, pin_map=pin_map
+                ),
+            }
 
     result = component_classifier.classify(
         bom_row, symbols_root=symbols_root, footprints_root=footprints_root
@@ -430,10 +496,21 @@ def run(
     paths = paths_for(project_dir)
     paths.gaps_json_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Resolve library roots. Default to the pipeline's bundled submodules.
-    pipeline_root = Path(__file__).resolve().parent.parent
-    symbols_root = Path(symbols_root) if symbols_root else pipeline_root / "kicad-symbols"
-    footprints_root = Path(footprints_root) if footprints_root else pipeline_root / "kicad-footprints"
+    # Resolve library roots the way Stage 5 resolves them: project libraries
+    # first, then modules, generated, stock. Two bugs lived here. The old
+    # fallback computed pipeline_root/"kicad-symbols" — one directory short
+    # of the repo root, a path that exists nowhere — so every classifier
+    # symbol lookup raised LibraryMiss and every connector fell through to
+    # "specific": 19 hand-prompts for parts the connector bucket handles
+    # fine. And stock-only would repeat Stage 2's old blindness: a connector
+    # symbol the project owns must be usable for pin_map derivation too.
+    from .stage6_compile_kicad import _DEFAULT_FOOTPRINTS, _DEFAULT_SYMBOLS
+    from .symbol_resolution import footprint_search_path, search_path
+
+    stock_syms = Path(symbols_root) if symbols_root else _DEFAULT_SYMBOLS
+    stock_fps = Path(footprints_root) if footprints_root else _DEFAULT_FOOTPRINTS
+    symbols_root = [r for r, _ in search_path(Path(project_dir), stock_syms)]
+    footprints_root = [r for r, _ in footprint_search_path(Path(project_dir), stock_fps)]
 
     gaps: list[dict] = []
     for cov_row in coverage["rows"]:
@@ -478,6 +555,9 @@ def run(
 
     # Classify every BOM row for pin_map, not just those with coverage misses —
     # an FPGA may have a library-matched symbol but still need a pin_map.
+    from . import explicit_pins
+
+    doc_pin_maps = explicit_pins.pin_maps(project_dir)
     bom_mutated = False
     for bom_row in bom["rows"]:
         pin_map_gap = _classify_and_resolve_pin_map(
@@ -485,6 +565,7 @@ def run(
             paths,
             symbols_root=symbols_root,
             footprints_root=footprints_root,
+            doc_pin_maps=doc_pin_maps,
         )
         if pin_map_gap is not None:
             gaps.append(pin_map_gap)

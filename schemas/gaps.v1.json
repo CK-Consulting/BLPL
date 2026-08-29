@@ -31,7 +31,7 @@
             "description": "Audit record for kind=pin_map gaps. Captures how Stage 3 resolved the mapping (or why it could not).",
             "additionalProperties": false,
             "properties": {
-              "source": {"type": "string", "enum": ["passive_identity", "connector_lookup", "small_signal_3pin", "specific_needs_user"]},
+              "source": {"type": "string", "enum": ["passive_identity", "connector_lookup", "small_signal_3pin", "specific_needs_user", "design_artifact", "pinned_symbol"]},
               "lib_symbol": {"type": "string"},
               "lib_footprint": {"type": "string"},
               "pin_map": {"type": "object", "additionalProperties": {"type": "string"}},

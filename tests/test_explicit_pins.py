@@ -61,3 +61,27 @@ def test_a_missing_artifact_is_a_no_op(tmp_path: Path) -> None:
     rows = [{"local_id": "U1", "symbol_hint": "Device:R"}]
     assert explicit_pins.apply(rows, tmp_path) == 0
     assert explicit_pins.apply(rows, None) == 0
+
+
+def test_pin_maps_come_from_the_docs_pinout_tables(tmp_path: Path) -> None:
+    _artifact_full(tmp_path, connectors=[
+        {"local_id": "U_GAUGE", "pins": [
+            {"pin": "1", "signal": "GND"},
+            {"pin": "2", "signal": "SDA"},
+            {"pin": "3", "signal": "SCL"},
+            {"pin": "4", "signal": "GND"},
+        ]},
+        {"local_id": "J_EMPTY", "pins": []},
+    ])
+    maps = explicit_pins.pin_maps(tmp_path)
+    # last-pin-wins for a multi-pin signal — the CSV path's collapse.
+    assert maps == {"U_GAUGE": {"GND": "4", "SDA": "2", "SCL": "3"}}
+
+
+def _artifact_full(tmp_path: Path, components: list | None = None, connectors: list | None = None) -> None:
+    p = tmp_path / ".pipeline"
+    p.mkdir(exist_ok=True)
+    (p / "design_artifact.deterministic.json").write_text(
+        json.dumps({"components": components or [], "connectors": connectors or []}),
+        encoding="utf-8",
+    )

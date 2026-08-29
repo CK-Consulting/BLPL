@@ -57,6 +57,40 @@ def load(project_dir: Path) -> dict[str, dict[str, Any]]:
     return pins
 
 
+def pin_maps(project_dir: Path) -> dict[str, dict[str, str]]:
+    """local_id -> {signal: pin} derived from the doc's pinout tables.
+
+    The doc's pinout tables are the durable statement of signal→pin — the
+    thing DOC-011 tells people to write, the thing datasheet extraction
+    lands in. But the pin_map a run actually uses lived only in bom.json,
+    put there by resolve-pin-map calls and classifier write-backs — and
+    bom.json is Stage 1's output, so one Stage 1 rerun silently destroyed
+    every accumulated pin_map and Stage 3 asked for 48 of them again by
+    hand. Deriving from the artifact makes the doc the source: what a rerun
+    wipes, the next Stage 3 re-derives.
+
+    A signal on several pins (GND, VDD) keeps the last pin listed — the same
+    collapse the CSV path has always performed; Stage 4 wires multi-pin nets
+    from the pinout tables themselves, not from this map.
+    """
+    path = Path(project_dir) / _ARTIFACT
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for conn in artifact.get("connectors", []):
+        pin_map: dict[str, str] = {}
+        for p in conn.get("pins") or []:
+            signal = str(p.get("signal") or "").strip()
+            pin = str(p.get("pin") or "").strip()
+            if signal and pin:
+                pin_map[signal] = pin
+        if pin_map:
+            out[conn["local_id"]] = pin_map
+    return out
+
+
 def apply(rows: list[dict], project_dir: Path | None) -> int:
     """Overlay the doc's explicit pins onto BOM rows, in place.
 

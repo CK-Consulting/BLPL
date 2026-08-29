@@ -357,3 +357,121 @@ def test_gaps_md_is_written_with_sections(tmp_path: Path) -> None:
     md = (proj / ".pipeline" / "gaps.md").read_text()
     assert "Auto-generated" in md
     assert "Needs your attention" in md  # for the footprint prompt
+
+
+def test_a_doc_pinout_beats_the_classifier_and_survives_a_stage1_rerun(tmp_path):
+    """pin_maps lived only in bom.json — Stage 1's output — so one Stage 1
+    rerun silently destroyed every accumulated pin_map and Stage 3 asked for
+    48 of them again by hand. The doc's pinout table is the durable source,
+    and it also outranks the classifier: the 12-pin fuel gauge whose
+    description says 'integrated sense resistor' was auto-resolved as a
+    2-pin passive; its pinout table says otherwise."""
+    import json
+    proj = tmp_path
+    (proj / ".pipeline").mkdir()
+    (proj / ".pipeline" / "design_artifact.deterministic.json").write_text(json.dumps({
+        "components": [],
+        "connectors": [{"local_id": "U_GAUGE", "pins": [
+            {"pin": str(i), "signal": s} for i, s in enumerate(
+                ["GND", "SDA", "SCL", "VDD"], start=1)
+        ]}],
+    }))
+    bom_path = proj / ".pipeline" / "bom.json"
+    bom_path.write_text(json.dumps({
+        "project_id": "p", "schema_version": 1,
+        "rows": [{"local_id": "U_GAUGE", "mpn": "BQ27441DRZR-G1A", "package": "VSON-12",
+                  "description": "Fuel gauge with integrated sense resistor",
+                  "pin_count": 12}],
+    }))
+    cov_path = proj / ".pipeline" / "coverage_report.json"
+    cov_path.write_text(json.dumps({
+        "project_id": "p", "schema_version": 1,
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "library_roots": {"symbols": "s", "footprints": "f"},
+        "rows": [{"local_id": "U_GAUGE", "mpn": "BQ27441DRZR-G1A", "status": "hit",
+                  "symbol_match": {"lib": "BM", "name": "BQ27441", "match_type": "exact"},
+                  "footprint_match": {"lib": "P", "name": "VSON12", "match_type": "exact"}}],
+        "summary": {"total": 1, "hit": 1, "needs_variant": 0, "miss": 0},
+    }))
+
+    out = s3.run(cov_path, bom_path, proj)
+
+    bom = json.loads(bom_path.read_text())
+    row = bom["rows"][0]
+    assert row["pin_map"] == {"GND": "1", "SDA": "2", "SCL": "3", "VDD": "4"}
+    assert row["pin_map_source"] == "design_artifact"
+    (gap,) = [g for g in out["gaps"] if g["local_id"] == "U_GAUGE"]
+    assert gap["auto_generated"] is True
+
+
+def test_a_not_placed_row_needs_no_pin_map(tmp_path):
+    """Never on the board, never in the netlist — the DOC-011 exemption,
+    applied where Stage 3 asks its own version of the question."""
+    import json
+    proj = tmp_path
+    (proj / ".pipeline").mkdir()
+    bom_path = proj / ".pipeline" / "bom.json"
+    bom_path.write_text(json.dumps({
+        "project_id": "p", "schema_version": 1,
+        "rows": [{"local_id": "BAT_RTC", "mpn": "ML1220", "package": "not_placed"}],
+    }))
+    cov_path = proj / ".pipeline" / "coverage_report.json"
+    cov_path.write_text(json.dumps({
+        "project_id": "p", "schema_version": 1,
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "library_roots": {"symbols": "s", "footprints": "f"},
+        "rows": [{"local_id": "BAT_RTC", "mpn": "ML1220", "status": "hit",
+                  "symbol_match": {"lib": "D", "name": "Battery_Cell", "match_type": "exact"},
+                  "footprint_match": None}],
+        "summary": {"total": 1, "hit": 1, "needs_variant": 0, "miss": 0},
+    }))
+
+    out = s3.run(cov_path, bom_path, proj)
+    assert [g for g in out["gaps"] if g["local_id"] == "BAT_RTC"] == []
+
+
+def test_a_pinned_symbol_supplies_its_own_pin_map(tmp_path):
+    """The gap prompt has always told the user to run resolve-pin-map
+    --lib-symbol against the symbol they already named in the doc — a form
+    with one field and one possible answer. Stage 3 fills it in itself."""
+    import json
+    proj = tmp_path
+    (proj / ".pipeline").mkdir()
+    lib = proj / "libraries" / "symbols" / "Infineon.kicad_symdir"
+    lib.mkdir(parents=True)
+    (lib / "BGS12P2L6E6327XTSA1.kicad_sym").write_text(
+        '(kicad_symbol_lib\n'
+        '(symbol "BGS12P2L6E6327XTSA1"\n'
+        '\t(symbol "BGS12P2L6E6327XTSA1_1_1"\n'
+        '\t\t(pin passive line (at 0 0 0) (length 2.54)\n'
+        '\t\t\t(name "RF1") (number "1"))\n'
+        '\t\t(pin passive line (at 0 0 0) (length 2.54)\n'
+        '\t\t\t(name "GND") (number "2"))\n'
+        '\t\t(pin passive line (at 0 0 0) (length 2.54)\n'
+        '\t\t\t(name "RF2") (number "3"))\n'
+        '\t)\n'
+        ')\n'
+        ')\n'
+    )
+    bom_path = proj / ".pipeline" / "bom.json"
+    bom_path.write_text(json.dumps({
+        "project_id": "p", "schema_version": 1,
+        "rows": [{"local_id": "SW1", "mpn": "BGS12P2L6", "package": "TSLP-6",
+                  "symbol_hint": "Infineon:BGS12P2L6E6327XTSA1", "pin_count": 3}],
+    }))
+    cov_path = proj / ".pipeline" / "coverage_report.json"
+    cov_path.write_text(json.dumps({
+        "project_id": "p", "schema_version": 1,
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "library_roots": {"symbols": "s", "footprints": "f"},
+        "rows": [{"local_id": "SW1", "mpn": "BGS12P2L6", "status": "hit",
+                  "symbol_match": {"lib": "Infineon", "name": "BGS12P2L6E6327XTSA1", "match_type": "exact"},
+                  "footprint_match": {"lib": "P", "name": "TSLP6", "match_type": "exact"}}],
+        "summary": {"total": 1, "hit": 1, "needs_variant": 0, "miss": 0},
+    }))
+
+    s3.run(cov_path, bom_path, proj)
+
+    row = json.loads(bom_path.read_text())["rows"][0]
+    assert row["pin_map"] == {"RF1": "1", "GND": "2", "RF2": "3"}
+    assert row["pin_map_source"] == "pinned_symbol"
