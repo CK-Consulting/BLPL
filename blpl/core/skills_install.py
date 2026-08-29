@@ -36,7 +36,7 @@ _PACKAGE_SKILLS = Path(__file__).resolve().parent.parent / "skills"
 # fab-prep skills (distributor APIs, order prep) are opt-in via --all/--skill —
 # they activate on vocabulary common enough that installing them everywhere
 # would make Claude load them on unrelated conversations.
-DEFAULT_SET = ["hardware-design", "kicad", "emc", "bom", "datasheets", "spice"]
+DEFAULT_SET = ["hardware-design", "protection-circuits", "kicad", "emc", "bom", "datasheets", "spice"]
 
 _MARKER = ".blpl-installed"
 
@@ -57,8 +57,9 @@ def available(source: Path | None = None) -> dict[str, Path]:
     Stage 8 does — one locator, not two that drift.
     """
     skills: dict[str, Path] = {}
-    if (_PACKAGE_SKILLS / "hardware-design" / "SKILL.md").exists():
-        skills["hardware-design"] = _PACKAGE_SKILLS / "hardware-design"
+    for name in ("hardware-design", "protection-circuits"):
+        if (_PACKAGE_SKILLS / name / "SKILL.md").exists():
+            skills[name] = _PACKAGE_SKILLS / name
 
     base = Path(source) if source else _find_kicad_happy()
     if base is not None:
