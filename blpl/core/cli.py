@@ -109,6 +109,21 @@ def _artifact(
     return project_manifest.artifact_path(proj, name, board=_board(args, proj), suffix=suffix)
 
 
+def _project_config(args: argparse.Namespace, proj: Path) -> Path:
+    """Where this board's project.yaml is: board dir, then project root, then legacy."""
+    board = _board(args, proj)
+    candidates: list[Path] = []
+    if board is not None:
+        man = project_manifest.discover(proj)
+        candidates.append(project_manifest.board_dir(proj, man, board) / "project.yaml")
+    candidates.append(proj / "project.yaml")
+    for c in candidates:
+        if c.exists():
+            return c
+    legacy = _artifact(args, proj, "project", suffix="yaml")
+    return legacy if legacy.exists() else candidates[0]
+
+
 def _md_inputs(project_dir: Path, board: str | None = None) -> list[Path]:
     """Return the Markdown input files for a board.
 
@@ -216,6 +231,7 @@ def _cmd_stage3(args: argparse.Namespace) -> int:
         coverage_path=coverage,
         bom_path=bom,
         project_dir=proj,
+            board=_board(args, proj),
         auto_generate=args.auto_fill_gaps,
     )
     auto_count = sum(1 for g in result["gaps"] if g["auto_generated"])
@@ -516,11 +532,11 @@ def _cmd_stage5(args: argparse.Namespace) -> int:
     nets_path = _artifact(args, proj, "nets")
     # project.yaml is hand-authored (or `blpl init`-generated) config, not a
     # build artifact — so it belongs beside the design markdown where it gets
-    # committed, not in .pipeline/ which is generated and gitignored. Prefer the
-    # durable location; fall back to the legacy one so existing projects keep working.
-    proj_cfg = proj / "project.yaml"
-    if not proj_cfg.exists():
-        proj_cfg = _artifact(args, proj, "project", suffix="yaml")
+    # committed, not in .pipeline/ which is generated and gitignored. On a
+    # multi-board project each board has its own dimensions and stackup, so
+    # the board's own directory is looked in first; the project root is the
+    # shared fallback; the legacy .pipeline/ location keeps old projects working.
+    proj_cfg = _project_config(args, proj)
     coverage = _artifact(args, proj, "coverage_report")
 
     for p, label in [(da_path, "design_artifact"), (bom_path, "bom"), (nets_path, "nets")]:
@@ -538,13 +554,21 @@ def _cmd_stage5(args: argparse.Namespace) -> int:
             output_path=out,
             coverage_path=coverage if coverage.exists() else None,
             project_dir=proj,
+            board=_board(args, proj),
             stock_symbols_root=stage6_compile_kicad._DEFAULT_SYMBOLS,
             stock_footprints_root=stage6_compile_kicad._DEFAULT_FOOTPRINTS,
         )
     except stage5_emit_yaml_hdm.MissingProjectConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    print(f"stage5: emitted HDM with {len(hdm.get('components', {}))} components, {len(hdm.get('nets', {}))} nets")
+    comps_all = hdm.get("components", {})
+    synthesized = [r for r, c in comps_all.items() if isinstance(c, dict) and c.get("synthesized")]
+    tp = (hdm.get("synthesis") or {}).get("test_points") or {}
+    print(
+        f"stage5: emitted HDM with {len(comps_all) - len(synthesized)} components, "
+        f"{len(hdm.get('nets', {}))} nets"
+        + (f", {len(synthesized)} test points (policy: {tp.get('policy', '?')})" if synthesized else "")
+    )
     print(f"        wrote {out}")
 
     # A placeholder that slips by unnoticed is how you fab a board with the wrong
@@ -599,6 +623,7 @@ def _cmd_stage2(args: argparse.Namespace) -> int:
         # shared library holds is re-reported as a gap forever — and worse, the
         # LLM's hint (which coverage exists to outrank) decides instead.
         project_dir=proj,
+            board=_board(args, proj),
         output_path=output_path,
     )
     s = report["summary"]
@@ -638,6 +663,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if start > end:
         print(f"error: --from {args.start_stage} is after --to {args.end_stage}", file=sys.stderr)
         return 2
+
+    # `--board all` on a multi-board project: every board in manifest order,
+    # then the cross-board check, because a project is only built when the
+    # boards have been checked against each other. Each board's failure is
+    # reported and the rest still run — a broken daughterboard should not hide
+    # what the carrier's review has to say.
+    if getattr(args, "board", None) == "all":
+        proj = _project_dir(args)
+        man = project_manifest.discover(proj)
+        if man.implicit:
+            print(f"error: {proj.name} is a single-board project; omit --board.", file=sys.stderr)
+            return 2
+        worst = 0
+        for b in man.boards:
+            print(f"==> board {b.name}", file=sys.stderr)
+            rc = _cmd_run(argparse.Namespace(**{**vars(args), "board": b.name}))
+            worst = max(worst, rc)
+        rc = _cmd_crossboard(argparse.Namespace(project_dir=args.project_dir))
+        return max(worst, rc)
 
     def _attempt(stage: str, fn, note: str = "") -> int:
         print(f"==> {stage}{' ' + note if note else ''}", file=sys.stderr)
@@ -701,12 +745,26 @@ def _cmd_run(args: argparse.Namespace) -> int:
             rc = _attempt("stage6", lambda: _cmd_stage6(base))
             if rc != 0 and not args.continue_on_error:
                 return rc
+            # Routing sits between emission and validation so Stage 7's DRC and
+            # Stage 8's review see the routed board. A missing router is not a
+            # failure of the run — the step records why it did not route, and
+            # Stage 8 reads that record — so only an attempted-and-failed route
+            # is allowed to stop anything.
+            if not getattr(args, "no_autoroute", False):
+                ns = argparse.Namespace(**vars(base), passes=getattr(args, "passes", 10))
+                rc = _attempt("autoroute", lambda: _cmd_autoroute(ns))
+                if rc != 0 and not args.continue_on_error:
+                    return rc
         elif stage == "stage7":
             rc = _attempt("stage7", lambda: _cmd_stage7(base))
             if rc != 0 and not args.continue_on_error:
                 return rc
         elif stage == "stage8":
-            ns = argparse.Namespace(**vars(base), no_emc=False, no_spice=False)
+            ns = argparse.Namespace(
+                **vars(base), no_emc=False, no_spice=False,
+                lifecycle=getattr(args, "lifecycle", False),
+                no_lifecycle=getattr(args, "no_lifecycle", False),
+            )
             rc = _attempt("stage8", lambda: _cmd_stage8(ns))
             if rc != 0 and not args.continue_on_error:
                 return rc
@@ -729,32 +787,35 @@ def _cmd_stage6(args: argparse.Namespace) -> int:
     return 0
 
 
+def _newest_emitted(pipeline_dir: Path, suffix: str, board: str | None) -> Path | None:
+    """The most recent compile of *this* board.
+
+    Without the board filter a multi-board project validates whichever file
+    is newest, so running stage7 on `sensor` right after compiling `base`
+    reports on `base` and calls it `sensor` — a clean report for a board
+    nobody checked. Stage 8 and the autorouter pick their input the same way,
+    for the same reason.
+    """
+    found = sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True)
+    if board is not None:
+        found = [p for p in found if f"_{board}_" in p.name]
+    return found[0] if found else None
+
+
 def _cmd_stage7(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
     pipeline_dir = project_manifest.pipeline_dir(proj)
     board = _board(args, proj)
 
-    def _newest(suffix: str) -> Path | None:
-        """The most recent compile of *this* board.
-
-        Without the board filter a multi-board project validates whichever file
-        is newest, so running stage7 on `sensor` right after compiling `base`
-        reports on `base` and calls it `sensor` — a clean report for a board
-        nobody checked.
-        """
-        found = sorted(pipeline_dir.glob(f"*{suffix}"), reverse=True)
-        if board is not None:
-            found = [p for p in found if f"_{board}_" in p.name]
-        return found[0] if found else None
-
-    pcb = _newest(".kicad_pcb")
-    sch = _newest(".kicad_sch")
+    pcb = _newest_emitted(pipeline_dir, ".kicad_pcb", board)
+    sch = _newest_emitted(pipeline_dir, ".kicad_sch", board)
     report = stage7_validate.run(
         proj,
         pcb_path=pcb,
         sch_path=sch,
         generated_symbols_dir=proj / "generated" / "symbols",
-        coverage_path=pipeline_dir / "coverage_report.json",
+        coverage_path=_artifact(args, proj, "coverage_report"),
+        board=board,
     )
     status = "PASS" if report["ok"] else "FAIL"
 
@@ -771,14 +832,23 @@ def _cmd_stage7(args: argparse.Namespace) -> int:
     cov = report["coverage"]
     cov_label = "skipped" if cov.get("skipped") else f"{cov.get('hit',0)} hit / {cov.get('miss',0)} miss"
     print(f"stage7: {status}  klc={klc_label}  erc={erc_label}  drc={drc_label}  coverage={cov_label}")
-    print(f"        wrote {pipeline_dir / 'validation_report.json'}")
+    print(f"        wrote {_artifact(args, proj, 'validation_report')}")
     return 0 if report["ok"] else 1
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
+    board = _board(args, proj)
+    # A board's project.yaml lives beside that board's markdown: two boards in
+    # one project do not share an outline or a stackup, and writing both to the
+    # project root would let the second silently describe the first.
+    target_dir = None
+    if board is not None:
+        target_dir = project_manifest.board_dir(proj, project_manifest.discover(proj), board)
     try:
-        target, result = _init.write_config(proj, force=args.force, board=_board(args, proj))
+        target, result = _init.write_config(
+            proj, force=args.force, board=board, target_dir=target_dir
+        )
     except FileExistsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -848,12 +918,11 @@ def _cmd_skills(args: argparse.Namespace) -> int:
 
 def _cmd_stage8(args: argparse.Namespace) -> int:
     proj = _project_dir(args)
-    pipeline_dir = proj / ".pipeline"
-    # Same "most recent timestamped compile wins" rule as stage7.
-    pcb_candidates = sorted(pipeline_dir.glob("*.kicad_pcb"), reverse=True)
-    sch_candidates = sorted(pipeline_dir.glob("*.kicad_sch"), reverse=True)
-    pcb = pcb_candidates[0] if pcb_candidates else None
-    sch = sch_candidates[0] if sch_candidates else None
+    pipeline_dir = project_manifest.pipeline_dir(proj)
+    board = _board(args, proj)
+    # Same "most recent timestamped compile of THIS board wins" rule as stage7.
+    pcb = _newest_emitted(pipeline_dir, ".kicad_pcb", board)
+    sch = _newest_emitted(pipeline_dir, ".kicad_sch", board)
     if pcb is None and sch is None:
         print(
             f"error: no emitted KiCad files in {pipeline_dir} — run stage6 first",
@@ -861,12 +930,20 @@ def _cmd_stage8(args: argparse.Namespace) -> int:
         )
         return 2
 
+    lifecycle: bool | None = None
+    if getattr(args, "lifecycle", False):
+        lifecycle = True
+    elif getattr(args, "no_lifecycle", False):
+        lifecycle = False
+
     report = stage8_review.run(
         proj,
         sch_path=sch,
         pcb_path=pcb,
         emc=not args.no_emc,
         spice=not args.no_spice,
+        board=board,
+        lifecycle=lifecycle,
     )
     if report.get("skipped"):
         print(f"stage8: skipped — {report['reason']}")
@@ -885,6 +962,20 @@ def _cmd_stage8(args: argparse.Namespace) -> int:
         print("        [placeholder] DO NOT FABRICATE — parts of this board are stand-ins:")
         for d in report["placeholders"]:
             print(f"        [placeholder] {d['summary']}")
+    routing = report.get("autoroute") or {}
+    if routing.get("attempted") and routing.get("ok"):
+        left = routing.get("unrouted")
+        print(f"        [route] Freerouting ran" + (f", {left} net(s) still open" if left is not None else ""))
+    else:
+        print(f"        [route] not routed — {routing.get('reason', 'autorouting was not attempted')}")
+    lc = report.get("lifecycle") or {}
+    if lc.get("ran"):
+        print("        [lifecycle] distributor audit ran")
+    elif lc.get("reason"):
+        print(f"        [lifecycle] not run — {lc['reason']}")
+    for rid, why in (report.get("expected_reasons") or {}).items():
+        if rid not in ("RT-001", "LC-007"):
+            print(f"        [expected] {rid}: {why}")
     sim = report.get("simulation") or {}
     if sim.get("skipped"):
         print(f"        [spice] not run — {sim.get('reason', 'unknown reason')}")
@@ -896,9 +987,95 @@ def _cmd_stage8(args: argparse.Namespace) -> int:
             f"        [spice] {c.get('total', 0)} simulated on {sim.get('simulator', '?')} — "
             f"{c.get('pass', 0)} pass, {c.get('warn', 0)} warn, {c.get('fail', 0)} fail"
         )
-    print(f"        wrote {pipeline_dir / 'review.md'}")
+    print(f"        wrote {_artifact(args, proj, 'review', suffix='md')}")
     # Emitter defects and placeholders gate; design issues are the user's to triage.
     return 0 if report["ok"] else 1
+
+
+def _cmd_autoroute(args: argparse.Namespace) -> int:
+    """Bulk-route the most recent compile of a board and leave a record either way.
+
+    Never fatal to a pipeline run: a missing router is a reason written into
+    `.pipeline/autoroute_report[.board].json`, which Stage 8 reads to decide
+    whether an unrouted net is a finding about the board or about the tooling.
+    Exit 1 only when routing was attempted and failed — that is worth stopping
+    for; "no jar installed" is not.
+    """
+    from . import autoroute
+
+    proj = _project_dir(args)
+    pipeline_dir = project_manifest.pipeline_dir(proj)
+    board = _board(args, proj)
+    pcb = _newest_emitted(pipeline_dir, ".kicad_pcb", board)
+    if pcb is None:
+        print(f"error: no emitted .kicad_pcb in {pipeline_dir} — run stage6 first", file=sys.stderr)
+        return 2
+    report_path = _artifact(args, proj, "autoroute_report")
+    work = pipeline_dir / ("autoroute" if board is None else f"autoroute.{board}")
+    result = autoroute.run_for(pcb, report_path, passes=args.passes, work_dir=work)
+    if not result.attempted:
+        print(f"autoroute: skipped — {result.reason}")
+        print(f"           wrote {report_path}")
+        return 0
+    if not result.ok:
+        print(f"autoroute: FAILED — {result.reason}", file=sys.stderr)
+        print(f"           wrote {report_path}", file=sys.stderr)
+        return 1
+    left = f", {result.unrouted} net(s) still open" if result.unrouted is not None else ""
+    print(f"autoroute: routed {pcb.name} in {result.passes} passes{left}")
+    print(f"           snapshot {result.snapshot}")
+    print(f"           wrote {report_path}")
+    return 0
+
+
+def _cmd_crossboard(args: argparse.Namespace) -> int:
+    """Check every declared mate in every configuration, across the project.
+
+    Project-level, not per-board: the report is about what happens where two
+    boards meet, which no board's own pipeline can see. Reads each board's
+    Stage 0 artifact, so boards that have not run Stage 0 are reported as
+    unbuilt rather than silently left out of the check.
+    """
+    from . import crossboard
+
+    proj = _project_dir(args)
+    try:
+        man = project_manifest.discover(proj)
+    except project_manifest.ManifestError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if man.implicit:
+        print(f"crossboard: {proj.name} is a single-board project; nothing mates with anything.")
+        return 0
+    for w in man.warnings:
+        print(f"crossboard: project.md: {w}", file=sys.stderr)
+
+    artifacts: dict[str, dict] = {}
+    for b in man.boards:
+        art = project_manifest.artifact_path(proj, "design_artifact.deterministic", board=b.name)
+        if art.is_file():
+            try:
+                artifacts[b.name] = json.loads(art.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+    report = crossboard.check(man, artifacts)
+    out = project_manifest.artifact_path(proj, "crossboard")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
+
+    by_sev: dict[str, int] = {}
+    for f in report.findings:
+        by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
+    status = "BLOCKED" if report.blocked else "PASS"
+    print(
+        f"crossboard: {status}  configurations={', '.join(report.checked)}  "
+        f"errors={by_sev.get('error', 0)}  warnings={by_sev.get('warning', 0)}"
+    )
+    for f in report.findings:
+        where = f" [{f.mate}{' pin ' + f.pin if f.pin else ''}]" if f.mate else ""
+        print(f"        [{f.severity}] {f.configuration}: {f.kind}{where} — {f.message}")
+    print(f"        wrote {out}")
+    return 1 if report.blocked else 0
 
 
 def _cmd_spice(args: argparse.Namespace) -> int:
@@ -1044,6 +1221,23 @@ def _cmd_bom_assembly(args: argparse.Namespace) -> int:
         for w in pkg.warnings:
             print(f"        ! {w}")
     return rc
+
+
+def _add_lifecycle_flags(p: argparse.ArgumentParser) -> None:
+    g = p.add_mutually_exclusive_group()
+    g.add_argument(
+        "--lifecycle",
+        action="store_true",
+        help=(
+            "Force the distributor lifecycle audit in stage8, even with no keys "
+            "(LCSC needs none). Default: run it when distributor credentials are set."
+        ),
+    )
+    g.add_argument(
+        "--no-lifecycle",
+        action="store_true",
+        help="Skip the distributor lifecycle audit in stage8.",
+    )
 
 
 def _add_llm_flags(p: argparse.ArgumentParser) -> None:
@@ -1244,7 +1438,33 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip SPICE simulation of the detected subcircuits.",
     )
+    _add_lifecycle_flags(p)
     p.set_defaults(func=_cmd_stage8)
+
+    p = sub.add_parser(
+        "autoroute",
+        help=(
+            "Bulk-route the latest compiled board with Freerouting (needs java and "
+            "FREEROUTING_JAR); always writes autoroute_report.json saying what happened."
+        ),
+    )
+    p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--board",
+        help=(
+            "Which board, for a project that has more than one. Omit it on a "
+            "single-board project; required when project.md declares several."
+        ),
+    )
+    p.add_argument("--passes", type=int, default=10, help="Freerouting optimisation passes (default 10).")
+    p.set_defaults(func=_cmd_autoroute)
+
+    p = sub.add_parser(
+        "crossboard",
+        help="Check every declared mate in project.md pin by pin; writes .pipeline/crossboard.json.",
+    )
+    p.add_argument("--project-dir", required=True)
+    p.set_defaults(func=_cmd_crossboard)
 
     p = sub.add_parser(
         "spice",
@@ -1327,9 +1547,17 @@ def main(argv: list[str] | None = None) -> int:
         "--board",
         help=(
             "Which board, for a project that has more than one. Omit it on a "
-            "single-board project; required when project.md declares several."
+            "single-board project; required when project.md declares several. "
+            "'all' runs every board in turn and then the cross-board check."
         ),
     )
+    p.add_argument(
+        "--no-autoroute",
+        action="store_true",
+        help="Skip the Freerouting pass that otherwise runs after stage6 when a router is available.",
+    )
+    p.add_argument("--passes", type=int, default=10, help="Freerouting optimisation passes (default 10).")
+    _add_lifecycle_flags(p)
     p.add_argument(
         "--from",
         dest="start_stage",

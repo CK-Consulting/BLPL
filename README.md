@@ -23,6 +23,9 @@ Hardware projects usually live in two disconnected worlds: narrative design docs
 | KiCad plugin (pcbnew Python API) | Working. Requires KiCad 10.x. |
 | Classifier (passives, generic connectors, 3-pin semis) | Working. Auto-resolves most of dev.03. |
 | Connector synthesis (pinout-only → BOM) | Working. |
+| Multi-board projects (`project.md`: boards, cables, mates, configurations) | Working. Per-board stages, cross-board pin check through declared cables. |
+| Autoroute (Freerouting after Stage 6) | Working where java + the jar are present; the backend image ships both. Always leaves a report saying what happened. |
+| Test-point synthesis (`test_points.policy` in `project.yaml`) | Working. |
 | Input doctor / Preflight | Working. 12 checks over your markdown, before any stage runs. |
 | Web UI | Working. Vault-gated, git-backed projects, board viewer, durable runs. |
 | Design chat + agent tools | Working. Proposal-based edits, parts lookup, datasheet extraction. |
@@ -60,8 +63,9 @@ Markdown design docs
 │  Stage 4   nets   │  → nets.json (regex net-class rules, diff-pair detection)
 │  Stage 5   HDM    │  → hdm.yaml (Hardware Description Manifest — SoT)
 │  Stage 6   KiCad  │  → .kicad_sch + .kicad_pcb + .kicad_pro
+│  autoroute        │  → routed .kicad_pcb + autoroute_report.json (or the reason it did not run)
 │  Stage 7   lint   │  → validation_report.json (ERC/DRC/coverage)
-│  Stage 8   review │  → review.md (emitter defects vs design issues vs expected)
+│  Stage 8   review │  → review.md (emitter defects vs design issues vs not-run-this-time)
 └───────────────────┘
         │
         ▼   release  → gerbers, drill, placement, BOM + per-house CPL — if the gate agrees

@@ -31,10 +31,17 @@ The findings, in descending order of how much they should worry you:
     which is why it is reported per configuration and not globally: a pin that
     dangles in `minimal` and connects in `full` is working as designed.
 
-Mirroring is assumed only where the manifest says nothing. Two boards that mate
-through a ribbon cable run pin 1 to pin 1; two that stack through a plug and
-socket may reverse. ``order`` on a mate says which, and the default is straight
-because that is what the overwhelming majority of board-to-board connectors do.
+``missing_cable``
+    The mate says ``(via NAME)`` and no ``## Cables`` entry has that name. The
+    mate cannot be checked, because checking it straight would report every
+    crossed pair as a mismatch and hide the real ones among them.
+
+Straight is assumed only where the manifest says nothing. Two boards that mate
+through a ribbon run pin 1 to pin 1; two receptacles joined by a USB-C cable
+face each other through the cable's crossings; a plug-and-socket pair may
+mate back to front. A mate says ``(via NAME)`` for the second and
+``(reversed)`` for the third, and the default is straight because that is what
+the overwhelming majority of board-to-board connectors do.
 """
 
 from __future__ import annotations
@@ -43,7 +50,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from .project_manifest import Configuration, Mate, ProjectManifest
+from .project_manifest import Cable, Configuration, Mate, ProjectManifest
 
 # Signals that are expected to appear on both sides under different names, or to
 # be absent without meaning anything is wrong.
@@ -71,6 +78,17 @@ _RF_MARKERS = (
 )
 
 
+# Tokens that make a name a *control* of something RF rather than RF itself:
+# RF_ENABLE, ANT_SW_CTRL, MODULE_PRESENT_ANT, TX_ACTIVE. Twenty-nine of those
+# on one project's management cable were reported as RF crossing a connector,
+# which is the kind of noise that gets a real coax crossing dismissed with them.
+_CONTROL_TOKENS = {
+    "EN", "ENABLE", "CTRL", "CTL", "SEL", "SW", "PRESENT", "DET", "DETECT", "PWR",
+    "IRQ", "INT", "GATE", "KILL", "RST", "RESET", "STATUS", "REQ", "REQUEST",
+    "GRANT", "ACTIVE", "MGMT", "SBIO", "ID", "PG", "OK", "FAULT", "ALERT",
+}
+
+
 def is_rf(signal: str) -> bool:
     """Whether a signal name reads as radio-frequency.
 
@@ -78,11 +96,15 @@ def is_rf(signal: str) -> bool:
     positive costs one line in a report that a human dismisses in a second, and
     a false negative costs a board spin. Anything genuinely ambiguous should be
     renamed — a net whose name does not say it is RF is a problem on its own.
+    A name that also carries a control word (RF_ENABLE, SW1_CTRL) is a digital
+    line about RF, not RF, and is not reported.
     """
     up = (signal or "").strip().upper()
     if not up:
         return False
     tokens = [t for t in re.split(r"[^A-Z0-9]+", up) if t]
+    if any(t in _CONTROL_TOKENS for t in tokens):
+        return False
     for m in _RF_MARKERS:
         for t in tokens:
             # Whole token, or the marker with a bare index after it. ANT1 and
@@ -145,6 +167,19 @@ def _norm(signal: str) -> str:
     return (signal or "").strip().upper()
 
 
+def _dont_care(signal: str) -> bool:
+    """A pin with nothing on it faces whatever it faces.
+
+    Stage 4's own no-connect predicate, so the per-pin ``NC_J1_A10`` spelling
+    doctor asks for reads as open here too — otherwise two unassigned lanes,
+    each named after its own board's pin, would be reported as a mismatch
+    between two wires that carry nothing.
+    """
+    from .stage4_synthesize_nets import is_no_connect
+
+    return signal in _DONT_CARE or is_no_connect(signal)
+
+
 def _pins_of(artifact: dict, connector: str) -> list[dict] | None:
     """A connector's pins from a board's design artifact, or None if absent."""
     for conn in artifact.get("connectors", []):
@@ -157,15 +192,25 @@ def _pin_key(pin: dict) -> str:
     return str(pin.get("pin", "")).strip()
 
 
-def _facing(a_pins: list[dict], b_pins: list[dict], order: str) -> list[tuple[dict, dict | None]]:
+def _facing(
+    a_pins: list[dict],
+    b_pins: list[dict],
+    order: str,
+    cable: Cable | None = None,
+) -> list[tuple[dict, dict | None]]:
     """Pair up pins across the mate.
 
-    Straight pairs by pin label where both sides use the same labels, and falls
-    back to position when they do not — a plug numbered 1..6 facing a socket
-    numbered A1..A6 is a real thing, and refusing to check it would be worse
-    than checking it positionally.
+    Through a cable, each a-side pin faces the b-side label the cable names for
+    it (its own label when the cable does not mention it) — always by label,
+    because a cable is defined in terms of labels and nothing else. Without a
+    cable, straight pairs by pin label where both sides use the same labels and
+    falls back to position when they do not — a plug numbered 1..6 facing a
+    socket numbered A1..A6 is a real thing, and refusing to check it would be
+    worse than checking it positionally.
     """
     b_by_label = {_pin_key(p): p for p in b_pins}
+    if cable is not None:
+        return [(a, b_by_label.get(cable.facing(_pin_key(a)))) for a in a_pins]
     labels_align = all(_pin_key(p) in b_by_label for p in a_pins) and len(a_pins) == len(b_pins)
     seq = list(b_pins)
     if order == "reversed":
@@ -187,9 +232,20 @@ def check_mate(
     *,
     order: str = "straight",
     rf_severity: str = "warning",
+    cable: Cable | None = None,
 ) -> list[Finding]:
-    """Compare one pair of mating connectors, pin by pin."""
+    """Compare one pair of mating connectors, pin by pin.
+
+    ``cable`` is the declared permutation for a mate that goes ``(via NAME)``;
+    ``order`` is ``"reversed"`` for a plug-and-socket pair that mates back to
+    front. A mate carrying ``reversed`` in the manifest wins over the keyword
+    argument, so callers can pass the mate alone.
+    """
+    if mate.reversed:
+        order = "reversed"
     label = f"{mate.a_board}.{mate.a_connector} <-> {mate.b_board}.{mate.b_connector}"
+    if cable is not None:
+        label += f" (via {cable.name})"
     a_pins = _pins_of(a_artifact, mate.a_connector)
     b_pins = _pins_of(b_artifact, mate.b_connector)
 
@@ -226,10 +282,16 @@ def check_mate(
             )
         )
 
-    for a, b in _facing(a_pins, b_pins, order):
+    for a, b in _facing(a_pins, b_pins, order, cable):
         a_sig, a_pin = _norm(a.get("signal", "")), _pin_key(a)
         if b is None:
-            if a_sig not in _DONT_CARE:
+            if not _dont_care(a_sig):
+                faces = (
+                    f"pin {cable.facing(a_pin)}, which {mate.b_board}.{mate.b_connector} "
+                    "does not declare"
+                    if cable is not None
+                    else f"nothing on {mate.b_board}.{mate.b_connector}"
+                )
                 out.append(
                     Finding(
                         kind="unmated_signal",
@@ -239,7 +301,7 @@ def check_mate(
                         pin=a_pin,
                         message=(
                             f"{a_sig} on {mate.a_board}.{mate.a_connector} pin {a_pin} faces "
-                            f"nothing on {mate.b_board}.{mate.b_connector}."
+                            f"{faces}."
                         ),
                     )
                 )
@@ -251,7 +313,7 @@ def check_mate(
         # the name, so agreement must not be allowed to excuse it.
         for sig, board, conn in ((a_sig, mate.a_board, mate.a_connector),
                                  (b_sig, mate.b_board, mate.b_connector)):
-            if is_rf(sig):
+            if is_rf(sig) and not _dont_care(sig):
                 forbidden = rf_severity == "error"
                 out.append(
                     Finding(
@@ -277,7 +339,7 @@ def check_mate(
                 )
                 break
 
-        if a_sig in _DONT_CARE or b_sig in _DONT_CARE:
+        if _dont_care(a_sig) or _dont_care(b_sig):
             continue
         if a_sig != b_sig:
             out.append(
@@ -290,7 +352,8 @@ def check_mate(
                     message=(
                         f"pin {a_pin} carries {a_sig} on {mate.a_board} but "
                         f"{_pin_key(b)} carries {b_sig} on {mate.b_board}. These pins face "
-                        "each other when the boards are plugged together."
+                        "each other when the boards are plugged together"
+                        + (f" through {cable.name}." if cable is not None else ".")
                     ),
                 )
             )
@@ -338,8 +401,24 @@ def check(
             a, b = artifacts.get(mate.a_board), artifacts.get(mate.b_board)
             if a is None or b is None:
                 continue  # already reported as board_not_built
+            cable = man.cable(mate.cable)
+            if mate.cable and cable is None:
+                report.findings.append(
+                    Finding(
+                        kind="missing_cable",
+                        severity="error",
+                        configuration=cfg.name,
+                        mate=f"{mate.a_board}.{mate.a_connector} <-> {mate.b_board}.{mate.b_connector}",
+                        message=(
+                            f"the mate goes via {mate.cable!r} but no cable of that name is "
+                            "declared under ## Cables, so it cannot be checked. Checking it "
+                            "straight would report every crossed pair as a mismatch."
+                        ),
+                    )
+                )
+                continue
             report.findings.extend(
-                check_mate(mate, a, b, cfg.name, rf_severity=severity)
+                check_mate(mate, a, b, cfg.name, rf_severity=severity, cable=cable)
             )
 
     return report

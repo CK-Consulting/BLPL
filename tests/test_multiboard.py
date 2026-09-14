@@ -535,3 +535,89 @@ def test_the_artifact_naming_rule_the_frontend_mirrors(tmp_path):
 
     # …and a single-board project keeps the name already on disk and in git.
     assert artifact_path(tmp_path, "bom").name == "bom.json"
+
+
+# -- cables ------------------------------------------------------------------
+
+CABLE_MANIFEST = """
+## Boards
+
+- core
+- sub (optional)
+
+## Cables
+
+- usb-c: A2<->B11, A3<->B10, B10<->A3, B11<->A2 — the crossed pairs; everything else straight
+
+## Mates
+
+- core.J_MGMT <-> sub.J_MGMT (via usb-c)
+
+## Configurations
+
+- full: core, sub
+"""
+
+
+def _cable_artifacts(sub_b11: str = "RESET_N"):
+    return {
+        "core": {"connectors": [_conn("J_MGMT", [("A1", "GND"), ("A2", "RESET_N"), ("A3", "ENABLE"),
+                                                 ("B10", "SPARE"), ("B11", "TX_REQ")])]},
+        "sub": {"connectors": [_conn("J_MGMT", [("A1", "GND"), ("A2", "TX_REQ"), ("A3", "SPARE"),
+                                                ("B10", "ENABLE"), ("B11", sub_b11)])]},
+    }
+
+
+def test_a_cable_is_parsed_as_a_pin_permutation():
+    man = parse(CABLE_MANIFEST, project_id="p")
+    assert man.warnings == []
+    cable = man.cable("usb-c")
+    assert cable is not None
+    assert cable.pairs == {"A2": "B11", "A3": "B10", "B10": "A3", "B11": "A2"}
+    assert cable.facing("A2") == "B11" and cable.facing("A1") == "A1"
+    assert man.mates[0].cable == "usb-c"
+    assert man.to_dict()["cables"][0]["name"] == "usb-c"
+
+
+def test_crossed_pairs_match_through_the_cable_instead_of_mismatching():
+    man = parse(CABLE_MANIFEST, project_id="p")
+    report = crossboard.check(man, _cable_artifacts())
+    assert [f.kind for f in report.findings] == []
+
+
+def test_a_real_swap_is_still_caught_behind_the_cable():
+    man = parse(CABLE_MANIFEST, project_id="p")
+    report = crossboard.check(man, _cable_artifacts(sub_b11="ENABLE"))
+    kinds = [f.kind for f in report.findings]
+    assert kinds == ["signal_mismatch"]
+    f = report.findings[0]
+    assert f.pin == "A2" and "B11" in f.message and "usb-c" in f.message
+
+
+def test_a_mate_via_an_undeclared_cable_is_an_error_not_a_straight_check():
+    text = CABLE_MANIFEST.replace("(via usb-c)", "(via ribbon)")
+    man = parse(text, project_id="p")
+    assert any("ribbon" in w for w in man.warnings)
+    report = crossboard.check(man, _cable_artifacts())
+    assert [f.kind for f in report.findings] == ["missing_cable"]
+    assert report.blocked
+
+
+def test_a_cable_pin_mapped_two_ways_is_reported_not_resolved():
+    man = parse(CABLE_MANIFEST.replace("B11<->A2", "B11<->A2, A2<->B10"), project_id="p")
+    assert any("maps A2 to both" in w for w in man.warnings)
+    assert man.cable("usb-c").pairs["A2"] == "B11"
+
+
+def test_reversed_mates_pair_positionally_back_to_front():
+    man = parse(
+        "## Boards\n\n- a\n- b\n\n## Mates\n\n- a.J1 <-> b.J1 (reversed)\n\n"
+        "## Configurations\n\n- full: a, b\n",
+        project_id="p",
+    )
+    assert man.mates[0].reversed
+    arts = {
+        "a": {"connectors": [_conn("J1", [("1", "SDA"), ("2", "SCL")])]},
+        "b": {"connectors": [_conn("J1", [("1", "SCL"), ("2", "SDA")])]},
+    }
+    assert crossboard.check(man, arts).findings == []

@@ -245,8 +245,10 @@ stage8: PASS  emitter=<n>  design=<n>  expected=<n>  placeholders=<n>
 
 - **emitter** — BLPL lost or mangled something. These are our bugs and they gate.
 - **design** — a real electrical problem in what you wrote. Yours to triage.
-- **expected** — known BLPL limitations. Every net is unrouted because there is no
-  autorouter; reporting that as a failure would train you to ignore the report.
+- **expected** — something did not run this time, and the line says why. With no
+  Freerouting jar installed every net is unrouted; reporting that as a failure
+  would train you to ignore the report, and hiding the reason would let it stay
+  that way forever.
 
 Read `.pipeline/review.md` rather than the JSON. And note the `[spice]` line: on
 this two-part board there is nothing simulatable, which is *not* the same as

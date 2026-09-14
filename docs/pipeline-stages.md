@@ -108,7 +108,8 @@ Collapses every pinout entry into nets, where **signal name = net name**. Implem
 
 - Net-class assignment via regex rules (`^(GND|VCC|V_|…)` → `Power_Bulk`; `^USB3_|SS_[RT]X[+\-]` → `USB3_Diff_90Ohm`; etc.).
 - Differential-pair detection and tagging (`_P/_N`, `_TX/_RX` pairs).
-- Signals beginning with `NC_` or named `Reserved` are dropped (unconnected per-pin, or would collide into one net).
+- Signals that mean "not connected" are dropped and never become nets: the bare spellings (`NC`, `N/C`, `N.C.`, `-`, `DNC`), anything beginning with `NC_` (the per-pin form doctor asks for, so thirty open pins do not collapse into one net), and `Reserved`. Stage 5 uses the same predicate to mark those pins with KiCad no-connect flags.
+- A **GPIO map** (`GPIO | Signal | Destination`) under a heading naming the host (`## U1 GPIO assignment`) binds host pins to nets. When the host also has a full pinout table, the map re-homes the pin: ball `A4` listed as `PB6` in the pinout and as `I2C_SCL` in the map ends up on `I2C_SCL`, and the one-pin `PB6` net disappears rather than shorting to it. Rows whose pin is `TBD` are counted, never guessed.
 - Refdes-aware deduplication (same pin-number can't appear twice).
 
 ## Stage 5 — HDM emission
@@ -120,6 +121,20 @@ Combines the stage outputs with hand-authored board geometry (`project.yaml` car
 
 `hdm.yaml` is the single source of truth for Stage 6. A human can read and edit it directly.
 
+Two things Stage 5 adds that no BOM row asked for:
+
+- **No-connect pins.** Every pin a pinout table declares open lands in that component's `no_connect_pins`, and the schematic emitter puts a KiCad no-connect flag on it. Without this, ERC and the review could not tell a pin the designer left open from one the design forgot.
+- **Test points**, under a policy in `project.yaml`:
+
+  ```yaml
+  test_points:
+    policy: power        # none | power | all   (default: power)
+    symbol: Connector:TestPoint
+    footprint: TestPoint:TestPoint_Pad_D1.0mm
+  ```
+
+  `power` puts one on every power and ground net; `all` on every net with a pad. They are synthesised components (`TP1…`, marked `synthesized: test_point`), never counted as BOM rows, and the choice is recorded under `synthesis:` so Stage 8 can say what the coverage figure means.
+
 ## Stage 6 — KiCad compilation
 
 **Input**: `hdm.yaml`.
@@ -129,6 +144,16 @@ Two implementations, same output shape:
 
 - **`blpl stage6`** — hand-rolled S-expression emitter. Pure Python stdlib; runs without KiCad installed. Good for CI and headless flows.
 - **`blpl stage6-plugin`** — invokes KiCad's bundled Python interpreter to call the native `pcbnew` API. Produces `.kicad_pcb` via KiCad's own writer (reliable v10 format, real `PCB_SHAPE` Edge.Cuts, native net objects). Schematic side still uses the emitter (v10 has no eeschema Python API).
+
+## Autoroute — between Stage 6 and Stage 7
+
+```bash
+blpl autoroute --project-dir <proj> [--board <b>] [--passes 10]
+```
+
+Bulk-routes the latest compiled board with [Freerouting](https://github.com/freerouting/freerouting): Specctra DSN out through KiCad's `pcbnew` Python, the jar, SES back in. `blpl run` does this after Stage 6 unless told `--no-autoroute`, so Stage 7's DRC and Stage 8's review see a routed board. It needs `kicad-cli`, a Python that imports `pcbnew`, `java`, and `FREEROUTING_JAR`; the backend image ships all four.
+
+It **always** writes `.pipeline/autoroute_report[.board].json` — `attempted`, `ok`, `reason`, the snapshot taken before routing, how many nets Freerouting left open. A missing router is a reason in that file, not a failed run: Stage 8 reads it to decide whether an unrouted net is a finding about your board or about the tooling. The result is reviewed, never trusted — an autorouter optimises for completing connections, and DRC afterwards decides whether it stays.
 
 ## Stage 7 — Validation
 
@@ -154,19 +179,29 @@ It shells out to the kicad-happy analyzers — `analyze_schematic.py`, `analyze_
 |---|---|---|
 | `emitter` | The pipeline lost or mangled data it was given | BLPL — fix the emitter, not the board |
 | `design` | A real electrical problem in the design you authored | You — fix the markdown |
-| `expected` | A known consequence of what BLPL does not do yet | Nobody, yet |
+| `expected` | Something did not run *this time*, and the report says why | You, by enabling it — the reason names what is missing |
 
-That classification is the whole point. kicad-happy assumes a human drew the board, so an unclassified review of a *generated* one is ~90% noise — every net is unrouted by construction, there are no test points, and the generator's own limitations swamp the real findings. `_EMITTER_RULES` and `_EXPECTED_RULES` in `stage8_review.py` are where that knowledge lives.
+That classification is the whole point. kicad-happy assumes a human drew the board, so an unclassified review of a *generated* one is ~90% noise, and the generator's own limitations swamp the real findings. `_EMITTER_RULES` in `stage8_review.py` is where the emitter knowledge lives.
 
-Two checks are invisible to the analyzers, because they compare against artifacts the analyzers never see:
+`expected` is deliberately not a static list. Each excuse is conditional on evidence from this run, and the reason is printed next to the count:
+
+| Rule | Excused when | Becomes a design issue when |
+|---|---|---|
+| `RT-001` unrouted net | the autoroute report says routing was not attempted (no jar, no java) | Freerouting ran — an open net is then a fact about the board |
+| `LC-007` lifecycle audit not run | no distributor credentials are configured (the reason names the variables) | credentials exist, or `--lifecycle` is passed; the audit runs and the finding does not appear |
+| `TE-001` test-point coverage | never — it is a design issue whose recommendation names `test_points.policy` | always |
+| `RS-001` undriven rail | the rail carries a PWR_FLAG and the kicad-happy checkout predates the fix that lets its rail audit see one | otherwise it is an emitter defect |
+
+Cross-checks invisible to the analyzers, because they compare against artifacts the analyzers never see:
 
 - **Stage 1 component loss.** Stage 0 is deterministic, so if it parsed 46 components the design has 46. Stage 1 resolves those through an LLM, and an LLM returning a short list produces a quietly smaller board rather than an error. The counts are compared and the difference reported.
+- **Symbol and footprint leakage, by name.** Every placeable BOM row must appear in the emitted schematic and PCB under its own reference. `not_placed` rows (a coin cell in a retainer) are not expected; synthesised test points are not counted against the BOM; a footprint under a reference nobody assigned (`REF**`) is reported as unaccounted.
 - **Placeholder parts.** Stage 5 substitutes generic stand-ins for parts with no real symbol or footprint, so the board opens, renders and routes — while being wrong. These block fabrication at any severity.
 
 `ok` is false when there are emitter defects or placeholders. Design issues never gate: they are yours to triage.
 
 ```bash
-blpl stage8 --project-dir <proj> [--no-emc] [--no-spice]
+blpl stage8 --project-dir <proj> [--board <b>] [--no-emc] [--no-spice] [--lifecycle | --no-lifecycle]
 ```
 
 ### Simulation, inside Stage 8
@@ -187,10 +222,64 @@ Only the last is verification. See [`cli.md`](cli.md#spice) for `blpl spice`, wh
 ## Orchestrator
 
 ```bash
-blpl run --project-dir <proj> --from stage0 --to stage8 [--continue-on-error]
+blpl run --project-dir <proj> --from stage0 --to stage8 [--continue-on-error] [--no-autoroute]
 ```
 
-`--from` / `--to` can be any `stageN` (default `stage0` → `stage8`). With `--continue-on-error`, non-zero exits from a stage don't abort the run — useful when Stage 3 pending prompts or Stage 2 misses shouldn't block Stage 6 emission.
+`--from` / `--to` can be any `stageN` (default `stage0` → `stage8`). With `--continue-on-error`, non-zero exits from a stage don't abort the run — useful when Stage 3 pending prompts or Stage 2 misses shouldn't block Stage 6 emission. The autoroute step runs after Stage 6 whenever a router is available; `--no-autoroute` skips it. On a multi-board project `--board all` runs every board in turn and then the cross-board check.
+
+## Multi-board projects
+
+A project is almost never one board. A `project.md` at the project root declares the boards, and each board's design markdown moves into a subdirectory named after it:
+
+```
+example-handheld/
+    project.md            # boards, cables, mates, configurations, rules
+    core/                 # one directory per board: its *.md and its project.yaml
+    sb-ant/
+    sb-lora/
+    .pipeline/            # ONE pipeline directory; the board is a filename qualifier
+```
+
+```markdown
+## Boards
+
+- core — the carrier, always present
+- sb-lora (optional) — the LoRa radio
+
+## Cables
+
+- usb-c: A2<->B11, A3<->B10, A8<->B8, A10<->B3, A11<->B2, B2<->A11, B3<->A10, B8<->A8, B10<->A3, B11<->A2 — full-featured C-C, non e-marked
+
+## Mates
+
+- core.J_MGMT_LORA <-> sb-lora.J_MGMT (via usb-c)
+- core.J_SBIO_LORA <-> sb-lora.J_SBIO (via usb-c)
+
+## Configurations
+
+- minimal: core
+- full: core, sb-lora
+
+## Rules
+
+- rf across boards: warn
+```
+
+What each section means:
+
+- **Boards** — a name (which becomes a directory), `(optional)` if the board can be absent, a note after a spaced dash.
+- **Cables** — a named pin permutation for connectors joined by a cable rather than plugged straight together. `A2<->B11` means the a-side's A2 faces the b-side's B11; every pin not listed faces its own label. A USB-C cable used as a generic link crosses its SuperSpeed and SBU pairs, and without this every crossed pair would be reported as a mismatch.
+- **Mates** — which connectors physically meet, `(via NAME)` for a cable, `(reversed)` for a plug-and-socket pair that mates back to front, `(when BOARD)` for a mate that exists only when an optional board is fitted (defaults to the optional side).
+- **Configurations** — the combinations meant to be buildable. Each is checked on its own; a pin that dangles in `minimal` and connects in `full` is working as designed.
+- **Rules** — `rf across boards: forbid | warn | allow`.
+
+Every stage takes `--board <name>` and qualifies its artifacts with it (`bom.core.json`, `hdm.sb-lora.yaml`, `review.core.md`, `example-handheld_core_<stamp>.kicad_pcb`). Each board reads only its own directory's markdown and its own `project.yaml` (`blpl init --board core` writes `core/project.yaml`; the project root's `project.yaml` is the fallback). Nets are namespaced by board: `core.U1` and `sb-lora.U1` are different parts, and nothing joins across boards by name — a net between boards exists because two connectors are plugged together, which is what `## Mates` writes down.
+
+```bash
+blpl crossboard --project-dir <proj>
+```
+
+runs after every board has a Stage 0 artifact and lines the mating connectors up pin by pin through their cable: `signal_mismatch` (facing pins carry different signals — the one that puts smoke in the room), `pin_count_mismatch`, `unmated_signal`, `rf_crosses_boards`, `missing_connector`, `missing_cable`, `board_not_built`. It writes `.pipeline/crossboard.json`, the one project-level artifact.
 
 ## Before you start: `blpl doctor`
 

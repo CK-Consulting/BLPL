@@ -166,3 +166,104 @@ def test_a_single_board_project_keeps_its_old_filenames(project):
         hdm, project / ".pipeline", project_dir=project, board=None, stamp="2026-08-19_120000Z"
     )
     assert out["pcb"].name == "Shield_2026-08-19_120000Z.kicad_pcb"
+
+
+def test_init_writes_each_boards_config_beside_its_own_markdown(project, monkeypatch):
+    """Two boards do not share an outline or a stackup; a project.yaml at the
+    root would let the second board silently describe the first."""
+    for board in ("base", "sensor"):
+        rc = cli.main(["init", "--project-dir", str(project), "--board", board])
+        assert rc == 0
+        assert (project / board / "project.yaml").is_file()
+    assert not (project / "project.yaml").exists()
+
+
+def test_autoroute_without_a_router_writes_the_reason_and_does_not_fail(project, monkeypatch):
+    from blpl.core import autoroute
+
+    monkeypatch.setattr(autoroute, "available", lambda: (False, "bulk autorouting needs the Freerouting jar"))
+    (project / ".pipeline").mkdir()
+    (project / ".pipeline" / "demo_base_2026.kicad_pcb").write_text("(kicad_pcb)")
+    rc = cli.main(["autoroute", "--project-dir", str(project), "--board", "base"])
+    assert rc == 0
+    import json
+    report = json.loads((project / ".pipeline" / "autoroute_report.base.json").read_text())
+    assert report["attempted"] is False
+    assert "Freerouting jar" in report["reason"]
+
+
+def test_autoroute_needs_a_compiled_board(project):
+    assert cli.main(["autoroute", "--project-dir", str(project), "--board", "base"]) == 2
+
+
+def test_crossboard_command_checks_the_declared_mates(tmp_path, capsys):
+    (tmp_path / "project.md").write_text(
+        "## Boards\n\n- base\n- sensor (optional)\n\n## Mates\n\n- base.J3 <-> sensor.J1\n"
+    )
+    (tmp_path / "base").mkdir()
+    (tmp_path / "base" / "d.md").write_text(
+        "## J3 pinout\n\n| Pin | Signal |\n|---|---|\n| 1 | SDA |\n| 2 | SCL |\n"
+    )
+    (tmp_path / "sensor").mkdir()
+    (tmp_path / "sensor" / "d.md").write_text(
+        "## J1 pinout\n\n| Pin | Signal |\n|---|---|\n| 1 | SCL |\n| 2 | SDA |\n"
+    )
+    for b in ("base", "sensor"):
+        assert cli.main(["stage0-det", "--project-dir", str(tmp_path), "--board", b]) == 0
+    rc = cli.main(["crossboard", "--project-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "BLOCKED" in out and "signal_mismatch" in out
+    assert (tmp_path / ".pipeline" / "crossboard.json").is_file()
+
+
+def test_crossboard_on_a_single_board_project_has_nothing_to_say(tmp_path, capsys):
+    (tmp_path / "d.md").write_text("# one\n")
+    assert cli.main(["crossboard", "--project-dir", str(tmp_path)]) == 0
+    assert "single-board" in capsys.readouterr().out
+
+
+def test_run_all_boards_runs_each_board_then_the_crossboard_check(project, monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_cmd_stage0_det", lambda ns: seen.append(f"stage0:{ns.board}") or 0)
+    monkeypatch.setattr(cli, "_cmd_crossboard", lambda ns: seen.append("crossboard") or 0)
+    rc = cli.main(["run", "--project-dir", str(project), "--board", "all", "--to", "stage0"])
+    assert rc == 0
+    assert seen == ["stage0:base", "stage0:sensor", "crossboard"]
+
+
+def test_run_all_boards_is_refused_on_a_single_board_project(tmp_path):
+    (tmp_path / "d.md").write_text("# one\n")
+    assert cli.main(["run", "--project-dir", str(tmp_path), "--board", "all", "--to", "stage0"]) == 2
+
+
+def test_run_routes_after_stage6_unless_told_not_to(project, monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_cmd_stage6", lambda ns: seen.append("stage6") or 0)
+    monkeypatch.setattr(cli, "_cmd_autoroute", lambda ns: seen.append(f"autoroute:{ns.passes}") or 0)
+    args = ["run", "--project-dir", str(project), "--board", "base", "--from", "stage6", "--to", "stage6"]
+    assert cli.main([*args, "--passes", "3"]) == 0
+    assert seen == ["stage6", "autoroute:3"]
+    seen.clear()
+    assert cli.main([*args, "--no-autoroute"]) == 0
+    assert seen == ["stage6"]
+
+
+def test_stage8_reviews_the_board_it_was_asked_about(project, monkeypatch):
+    from blpl.core import stage8_review
+
+    pipeline = project / ".pipeline"
+    pipeline.mkdir()
+    (pipeline / "demo_base_2026-01-01.kicad_sch").write_text("(kicad_sch)")
+    (pipeline / "demo_sensor_2026-01-02.kicad_sch").write_text("(kicad_sch)")
+    got = {}
+
+    def _fake(proj, **kw):
+        got.update(kw)
+        return {"skipped": True, "reason": "stubbed"}
+
+    monkeypatch.setattr(stage8_review, "run", _fake)
+    assert cli.main(["stage8", "--project-dir", str(project), "--board", "base", "--no-lifecycle"]) == 0
+    assert got["board"] == "base"
+    assert got["sch_path"].name == "demo_base_2026-01-01.kicad_sch"
+    assert got["lifecycle"] is False

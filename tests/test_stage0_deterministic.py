@@ -253,3 +253,30 @@ def test_a_symbol_column_is_absorbed_as_symbol_hint(tmp_path: Path) -> None:
     comps = {c["local_id"]: c for c in artifact["components"]}
     assert comps["U_BLE"]["symbol_hint"] == "Raytac:AN54LV-U15"
     assert "symbol_hint" not in comps["R1"]
+
+
+def test_any_bom_ref_anchors_a_pinout_heading_not_only_j_and_u(tmp_path) -> None:
+    """A switch, a buzzer or a termination resistor has a pinout too. The J/U
+    shape stays as the fallback for docs without a BOM; a Ref the BOM declares
+    anchors outright — even when the pinout table comes first in the file."""
+    doc = tmp_path / "d.md"
+    doc.write_text(
+        "# board\n\n"
+        "## SW1 — pinout\n\n"
+        "| Pin | Signal |\n|---|---|\n| 1 | RF2 |\n| 5 | RFIN |\n\n"
+        "## BOM\n\n"
+        "| Ref | MPN | Description |\n|---|---|---|\n| SW1 | BGS12P2L6 | RF SPDT |\n| BZ1 | OWMB | buzzer |\n| J1 | X | hdr |\n\n"
+        "## BZ1 pinout\n\n"
+        "| Pin | Signal |\n|---|---|\n| P | BUZZ_P |\n| N | BUZZ_N |\n",
+        encoding="utf-8",
+    )
+    from blpl.core import stage0_deterministic as s0
+
+    art = s0.extract([doc])
+    by_id = {c["local_id"]: c for c in art["connectors"]}
+    assert set(by_id) >= {"SW1", "BZ1"}
+    assert [p["signal"] for p in by_id["SW1"]["pins"]] == ["RF2", "RFIN"]
+    assert [p["signal"] for p in by_id["BZ1"]["pins"]] == ["BUZZ_P", "BUZZ_N"]
+    # A heading with no refdes in it still anchors nothing on its own.
+    assert s0.refdes_in_heading("## Power input pinout", {"SW1"}) is None
+    assert s0.refdes_in_heading("## R_PRES_M (0 Ω strap) pinout", {"R_PRES_M"}) == "R_PRES_M"

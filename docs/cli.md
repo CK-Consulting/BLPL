@@ -121,10 +121,28 @@ blpl stage7 --project-dir <proj>
 ### `stage8`
 Design review via the kicad-happy analyzers → `review_report.json` + `review.md`.
 ```
-blpl stage8 --project-dir <proj>
+blpl stage8 --project-dir <proj> [--board <b>]
     [--no-emc]                     # skip the EMC rule pass (the slowest analyzer)
     [--no-spice]                   # skip SPICE simulation of detected subcircuits
+    [--lifecycle | --no-lifecycle] # distributor lifecycle audit: force, or skip.
+                                   # Default: run it when DIGIKEY_CLIENT_ID+SECRET,
+                                   # MOUSER_SEARCH_API_KEY or ELEMENT14_API_KEY is set.
 ```
+The review reads `autoroute_report.json` and `hdm.yaml` to decide what is excused this run and why; every excuse is printed with its reason.
+
+### `autoroute`
+Bulk-route the latest compiled board with Freerouting; runs inside `run` after stage6.
+```
+blpl autoroute --project-dir <proj> [--board <b>] [--passes 10]
+```
+Needs `kicad-cli`, a Python with `pcbnew`, `java`, and `FREEROUTING_JAR`. Always writes `.pipeline/autoroute_report[.board].json` saying whether it ran and why not; a snapshot of the board before routing lands under `.pipeline/autoroute/`. Exit 0 when skipped for a missing router, 1 only when routing was attempted and failed.
+
+### `crossboard`
+Check every mate `project.md` declares, pin by pin, through its cable, in every configuration.
+```
+blpl crossboard --project-dir <proj>
+```
+Project-level: needs each board's Stage 0 artifact, writes `.pipeline/crossboard.json`, exits 1 when a `signal_mismatch` or other error blocks the project. See [`pipeline-stages.md`](pipeline-stages.md#multi-board-projects).
 
 ### `spice`
 Re-simulate the subcircuits Stage 8 detected, without re-running the analyzers.
@@ -177,10 +195,12 @@ exists for re-running it with `--lcsc` without rebuilding the package.
 Generate `project.yaml` from the identity, stackup and net-class tables already in
 your markdown. Stage 5 halts without it, and `DOC-007` warns about it.
 ```
-blpl init --project-dir <proj> [--force]
+blpl init --project-dir <proj> [--board <b>] [--force]
 ```
 This is the answer to `DOC-001` reporting your net-classes table as discarded:
-Stage 0 does not consume it, but `init` does.
+Stage 0 does not consume it, but `init` does. On a multi-board project `--board`
+writes `<board>/project.yaml` — boards do not share an outline or a stackup. The
+generated file carries the `test_points:` policy Stage 5 synthesises test points under.
 
 ### `skills`
 Install BLPL's Claude Code skills into a project's `.claude/skills/`.
@@ -216,14 +236,17 @@ blpl serve
 ### `run`
 Chain stages 0–8 with bounded range and error handling.
 ```
-blpl run --project-dir <proj>
+blpl run --project-dir <proj> [--board <b> | --board all]
     [--from stage0] [--to stage8]        # defaults
     [--stage0 det|llm|both]        # mode for Stage 0; 'both' also runs stage0-compare
     [--auto-fill-gaps]             # forwarded to stage3
     [--continue-on-error]          # don't abort on non-zero stage exit
+    [--no-autoroute] [--passes N]  # the Freerouting pass after stage6
+    [--lifecycle | --no-lifecycle] # forwarded to stage8
     [--llm-provider ...] [--llm-model ...]
     [--symbols-root ...] [--footprints-root ...]
 ```
+`--board all` runs every board a multi-board project declares, in order, and then `crossboard`.
 
 ## Flag conventions
 

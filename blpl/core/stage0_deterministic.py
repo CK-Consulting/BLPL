@@ -38,8 +38,22 @@ _HEADING_RE = re.compile(r"^#+[^\n]*", re.MULTILINE)
 _REFDES_IN_HEADING_RE = re.compile(r"\b((?:J|U)(?:_[A-Za-z0-9]\w*|\d+\w*))\b")
 
 
-def refdes_in_heading(heading: str) -> str | None:
-    """Return the first refdes-shaped token in a heading line, or None."""
+_HEADING_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.]*")
+
+
+def refdes_in_heading(heading: str, known: set[str] | frozenset[str] | None = None) -> str | None:
+    """Return the refdes a heading names, or None.
+
+    A token that is a Ref in the document's own BOM wins outright — that is
+    what lets ``## SW1 — pinout`` or ``## BZ1 pinout`` anchor a table for a
+    switch, a buzzer or a termination resistor. The J/U shape is the fallback
+    for headings written before the BOM (or without one): it keeps ordinary
+    prose out ("USB", "Connector") without needing to know the parts list.
+    """
+    if known:
+        for tok in _HEADING_TOKEN_RE.findall(heading):
+            if tok in known:
+                return tok
     m = _REFDES_IN_HEADING_RE.search(heading)
     return m.group(1) if m else None
 
@@ -92,12 +106,15 @@ def _heading_text_above(text: str, line_start: int) -> str | None:
     return None
 
 
-def _find_connector_for_table(text: str, table: _md.ParsedTable) -> str:
+def _find_connector_for_table(
+    text: str, table: _md.ParsedTable, known: set[str] | None = None
+) -> str:
     """Return the connector refdes heading that most closely precedes the table,
     or ``_UNANCHORED`` if none is found.
 
     Uses the table's 1-based line_start (which is unambiguous even when multiple
-    tables share identical header rows).
+    tables share identical header rows). ``known`` is the BOM's own Refs, so a
+    heading naming any part in the BOM anchors — not only J*/U*.
     """
     lines = text.splitlines(keepends=True)
     if table.line_start < 1 or table.line_start > len(lines):
@@ -109,10 +126,31 @@ def _find_connector_for_table(text: str, table: _md.ParsedTable) -> str:
             break
         # Headings without a refdes (e.g. "## BOM — Core Subsystem") don't reset the
         # anchor; only a refdes-bearing heading rebinds it.
-        ref = refdes_in_heading(m.group(0))
+        ref = refdes_in_heading(m.group(0), known)
         if ref:
             best_ref = ref
     return best_ref
+
+
+def known_refs(md_files: list[Path]) -> set[str]:
+    """Every Ref the BOM tables across these files declare.
+
+    Read in a pass of its own so a pinout table may precede its BOM table, or
+    sit in a different file, and still anchor on the part's own name.
+    """
+    refs: set[str] = set()
+    for md_path in md_files:
+        md_path = Path(md_path)
+        if not md_path.exists():
+            continue
+        for table in _md.extract_tables_from_file(md_path):
+            if _md.classify(table) != "bom":
+                continue
+            for row in table.rows:
+                ref = _column_lookup(row, ["Ref", "Reference", "Refdes", "Designator"]).strip()
+                if ref:
+                    refs.add(ref)
+    return refs
 
 
 def _make_source_ref(table: _md.ParsedTable) -> dict:
@@ -139,6 +177,7 @@ def extract(md_files: list[Path]) -> dict:
     unanchored_seen = 0
 
     source_files: list[str] = []
+    refs = known_refs(md_files)
     for md_path in md_files:
         md_path = Path(md_path)
         if not md_path.exists():
@@ -162,7 +201,7 @@ def extract(md_files: list[Path]) -> dict:
             if kind == "bom":
                 _absorb_bom_table(table, components)
             elif kind == "pinout":
-                connector_ref = _find_connector_for_table(text, table)
+                connector_ref = _find_connector_for_table(text, table, refs)
                 if connector_ref == _UNANCHORED:
                     # Every unanchored table used to land on the single local_id
                     # "UNKNOWN", so a power header and an audio jack merged into one
@@ -182,8 +221,9 @@ def extract(md_files: list[Path]) -> dict:
                             ),
                             "fix": (
                                 "Put the refdes in the heading, e.g. '## J_USB_C — USB-C "
-                                "receptacle' or '## U_GNSS (LC76G-PA) pinout'. A refdes is J or U "
-                                "followed by a number (J2) or an underscore name (J_USB_C)."
+                                "receptacle' or '## SW1 — pinout'. Any Ref from the BOM table "
+                                "anchors; without a BOM row, J or U followed by a number (J2) or "
+                                "an underscore name (J_USB_C) does."
                             ),
                             "local_id": connector_ref,
                             "source_ref": _make_source_ref(table),
@@ -197,7 +237,7 @@ def extract(md_files: list[Path]) -> dict:
                 # doc the nearest refdes heading was the GNSS chip's pinout, which
                 # would have bound every host GPIO to the wrong part.
                 heading = _heading_text_above(text, table.line_start)
-                host = refdes_in_heading(heading) if heading else None
+                host = refdes_in_heading(heading, refs) if heading else None
                 if host is None:
                     label = heading or "(no heading)"
                     warnings.append(

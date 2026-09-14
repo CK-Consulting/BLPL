@@ -209,27 +209,39 @@ def run(
     sch_path: Path | None = None,
     generated_symbols_dir: Path | None = None,
     coverage_path: Path | None = None,
+    board: str | None = None,
 ) -> dict:
-    """Run all Stage 7 checks and write validation_report.json into .pipeline/."""
+    """Run all Stage 7 checks and write validation_report.json into .pipeline/.
+
+    ``board`` qualifies every file this stage reads or writes, the way the
+    rest of the pipeline does (``validation_report.sensor.json``). Without it
+    a multi-board project's boards overwrote one report and read one
+    another's coverage.
+    """
+    from .project_manifest import artifact_path
+
     project_dir = Path(project_dir)
     pipeline_dir = project_dir / ".pipeline"
     pipeline_dir.mkdir(parents=True, exist_ok=True)
 
+    def _p(name: str) -> Path:
+        return artifact_path(project_dir, name, board=board)
+
     gen_symbols = generated_symbols_dir or (project_dir / "generated" / "symbols")
-    cov = coverage_path or (pipeline_dir / "coverage_report.json")
+    cov = coverage_path or _p("coverage_report")
 
     sym_files = sorted(gen_symbols.glob("*.kicad_sym")) if gen_symbols.exists() else []
     klc_result = _run_klc_symbol_checks(sym_files)
 
     erc_result: dict
     if sch_path is not None and sch_path.exists():
-        erc_result = _run_erc(sch_path, pipeline_dir / "erc_report.json")
+        erc_result = _run_erc(sch_path, _p("erc_report"))
     else:
         erc_result = {"ok": True, "skipped": True, "reason": "no .kicad_sch supplied"}
 
     drc_result: dict
     if pcb_path is not None and pcb_path.exists():
-        drc_result = _run_drc(pcb_path, pipeline_dir / "drc_report.json")
+        drc_result = _run_drc(pcb_path, _p("drc_report"))
     else:
         drc_result = {"ok": True, "skipped": True, "reason": "no .kicad_pcb supplied"}
 
@@ -243,7 +255,5 @@ def run(
         "drc": drc_result,
         "coverage": cov_result,
     }
-    (pipeline_dir / "validation_report.json").write_text(
-        json.dumps(report, indent=2) + "\n", encoding="utf-8"
-    )
+    _p("validation_report").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

@@ -113,7 +113,11 @@ def run(
     # audit reads a net map that excludes PWR_FLAG pins and then asks whether a
     # PWR_FLAG is on the net — so it can never see one, and reports every flagged
     # rail as unsourced. Record the truth here rather than patch the analyzer.
-    (output_dir / "emitter_report.json").write_text(
+    # Board-qualified like every other per-board artifact: two boards compiled
+    # into one .pipeline/ would otherwise overwrite each other's record and
+    # Stage 8 would excuse the wrong board's rails.
+    report_name = "emitter_report.json" if board is None else f"emitter_report.{_sanitize_filename(board)}.json"
+    (output_dir / report_name).write_text(
         json.dumps({"pwr_flag_nets": _sch.flagged_nets(hdm, symbols_root=symbol_roots)},
                    indent=2) + "\n",
         encoding="utf-8",

@@ -43,9 +43,29 @@ The markdown stays the source, as everywhere else in the pipeline::
     - sensing: base, sensor
     - full: base, sensor, radio
 
+    ## Cables
+
+    - usb-c: A2<->B11, A3<->B10, B2<->A11, B3<->A10, A8<->B8, B8<->A8 — crossed pairs
+
+    ## Mates
+
+    - base.J3 <-> sensor.J1 (via usb-c)
+
     ## Rules
 
     - rf across boards: forbid
+
+**A cable is a pin permutation, declared once.** Two connectors that plug
+straight into each other face pin 1 to pin 1, and that is the default. Two
+receptacles joined by a cable face whatever the cable wires them to — and a
+USB-C cable, used here as a generic 24-conductor link, crosses its SuperSpeed
+and SBU pairs end to end. Checking such a mate pin-for-pin by label reports
+every crossed pair as a mismatch, which is exactly backwards: the crossing is
+the thing that makes the pinouts *right*. So a ``## Cables`` entry names the
+pairs that do not face their own label (``A2<->B11`` means the a-side's A2
+faces the b-side's B11), every unlisted pin faces its namesake, and a mate says
+``(via NAME)`` to go through it. Unlisted-means-straight keeps the common case
+short; a pin listed twice on one side is reported, not resolved.
 
 The ``Rules`` section is where a project states a standard it wants held to.
 Nothing there is a default the tool imposes — an engineer who has decided to
@@ -73,7 +93,12 @@ _MATE = re.compile(
     r"(?P<b_board>[\w.-]+)\.(?P<b_conn>[\w-]+)\s*$"
 )
 _WHEN = re.compile(r"\(\s*when\s+(?P<board>[\w.-]+)\s*\)", re.IGNORECASE)
+_VIA = re.compile(r"\(\s*via\s+(?P<cable>[\w.-]+)\s*\)", re.IGNORECASE)
+_REVERSED = re.compile(r"\(\s*reversed\s*\)", re.IGNORECASE)
 _OPTIONAL = re.compile(r"\(\s*optional\s*\)", re.IGNORECASE)
+# One crossed pair inside a cable declaration: "A2<->B11". Pin labels are what
+# a pinout table's Pin column holds — letters and digits, no spaces.
+_CABLE_PAIR = re.compile(r"^(?P<a>[\w.+-]+)\s*(?:<->|<>|↔)\s*(?P<b>[\w.+-]+)$")
 
 # A board name is not just a label — ``board_dir`` turns it into a directory and
 # ``artifact_path`` turns it into part of a filename. So it is held to what a
@@ -125,6 +150,11 @@ class Mate:
     b_connector: str
     when: str | None = None
     note: str = ""
+    # The cable this mate goes through, by name in ``## Cables``. None means the
+    # connectors plug straight into each other and every pin faces its namesake.
+    cable: str | None = None
+    # Positional reversal for a plug-and-socket pair that mates back to front.
+    reversed: bool = False
 
     def boards(self) -> tuple[str, str]:
         return (self.a_board, self.b_board)
@@ -135,7 +165,32 @@ class Mate:
             "b": f"{self.b_board}.{self.b_connector}",
             "when": self.when,
             "note": self.note,
+            "cable": self.cable,
+            "reversed": self.reversed,
         }
+
+
+@dataclass(frozen=True)
+class Cable:
+    """A named pin permutation between the two ends of a mate.
+
+    ``pairs`` maps an a-side pin label to the b-side pin label it faces. A pin
+    absent from the map faces its own label. The map is one-directional on
+    purpose: a USB-C cable's A2 lands on the far B11 *and* its B11 lands on the
+    far A2, and both facts have to be written down, because a cable that
+    crosses one way only is a real thing too.
+    """
+
+    name: str
+    pairs: dict[str, str] = field(default_factory=dict)
+    note: str = ""
+
+    def facing(self, a_pin: str) -> str:
+        """Which b-side pin label the given a-side pin faces."""
+        return self.pairs.get(a_pin, a_pin)
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "pairs": dict(self.pairs), "note": self.note}
 
 
 @dataclass(frozen=True)
@@ -154,6 +209,7 @@ class ProjectManifest:
     project_id: str
     boards: list[Board] = field(default_factory=list)
     mates: list[Mate] = field(default_factory=list)
+    cables: list[Cable] = field(default_factory=list)
     configurations: list[Configuration] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     # True when there is no project.md and the project is the single implicit
@@ -166,6 +222,11 @@ class ProjectManifest:
 
     def board(self, name: str) -> Board | None:
         return next((b for b in self.boards if b.name == name), None)
+
+    def cable(self, name: str | None) -> Cable | None:
+        if name is None:
+            return None
+        return next((c for c in self.cables if c.name == name), None)
 
     def mates_for(self, present: set[str]) -> list[Mate]:
         """The mates that exist when exactly ``present`` boards are fitted."""
@@ -185,6 +246,7 @@ class ProjectManifest:
             "implicit": self.implicit,
             "boards": [b.to_dict() for b in self.boards],
             "mates": [m.to_dict() for m in self.mates],
+            "cables": [c.to_dict() for c in self.cables],
             "configurations": [c.to_dict() for c in self.configurations],
             "rules": {"rf_across_boards": self.rf_severity},
             "warnings": self.warnings,
@@ -249,10 +311,51 @@ def parse(text: str, *, project_id: str) -> ProjectManifest:
             continue
         man.boards.append(Board(name=name, optional=optional, note=note))
 
+    for item in sec.get("cables", []):
+        if ":" not in item:
+            man.warnings.append(f"cables: {item!r} is not 'name: A2<->B11, ...'")
+            continue
+        name, rest = item.split(":", 1)
+        name = name.strip().strip("`*_")
+        rest, note = _split_note(rest.strip())
+        if not name:
+            man.warnings.append(f"cables: could not read a name from {item!r}")
+            continue
+        if man.cable(name):
+            man.warnings.append(f"cables: {name!r} listed more than once; keeping the first")
+            continue
+        pairs: dict[str, str] = {}
+        bad: list[str] = []
+        for chunk in (c.strip() for c in rest.split(",")):
+            if not chunk:
+                continue
+            pm = _CABLE_PAIR.match(chunk)
+            if not pm:
+                bad.append(chunk)
+                continue
+            a_pin, b_pin = pm.group("a"), pm.group("b")
+            if a_pin in pairs and pairs[a_pin] != b_pin:
+                # Two different answers for one pin is a contradiction, and
+                # picking either would hide it. Report and keep the first.
+                man.warnings.append(
+                    f"cables: {name!r} maps {a_pin} to both {pairs[a_pin]} and {b_pin}; "
+                    f"keeping {pairs[a_pin]}"
+                )
+                continue
+            pairs[a_pin] = b_pin
+        if bad:
+            man.warnings.append(
+                f"cables: {name!r} has {len(bad)} pair(s) not shaped like 'A2<->B11': "
+                + ", ".join(repr(b) for b in bad[:6])
+            )
+        man.cables.append(Cable(name=name, pairs=pairs, note=note))
+
     for item in sec.get("mates", []):
         decl, note = _split_note(item)
         when_m = _WHEN.search(decl)
-        decl_clean = _WHEN.sub("", decl).strip()
+        via_m = _VIA.search(decl)
+        is_reversed = bool(_REVERSED.search(decl))
+        decl_clean = _REVERSED.sub("", _VIA.sub("", _WHEN.sub("", decl))).strip()
         m = _MATE.match(decl_clean)
         if not m:
             man.warnings.append(
@@ -275,6 +378,8 @@ def parse(text: str, *, project_id: str) -> ProjectManifest:
                 b_connector=m.group("b_conn"),
                 when=when,
                 note=note,
+                cable=via_m.group("cable") if via_m else None,
+                reversed=is_reversed,
             )
         )
 
@@ -318,6 +423,10 @@ def _check_references(man: ProjectManifest) -> None:
                 man.warnings.append(f"mates: {side!r} is not a board listed under Boards")
         if m.when and m.when not in known:
             man.warnings.append(f"mates: 'when {m.when}' is not a board listed under Boards")
+        if m.cable and man.cable(m.cable) is None:
+            man.warnings.append(
+                f"mates: 'via {m.cable}' names no cable listed under Cables"
+            )
     for c in man.configurations:
         for b in c.boards:
             if b not in known:

@@ -221,6 +221,7 @@ def run(
     output_path: Path,
     *,
     project_dir: Path | None = None,
+    board: str | None = None,
 ) -> dict:
     """Run Stage 2 and write a coverage report. Returns the report dict.
 
@@ -240,7 +241,7 @@ def run(
     # doc plainly said otherwise.
     from . import explicit_pins
 
-    explicit_pins.apply(bom["rows"], project_dir)
+    explicit_pins.apply(bom["rows"], project_dir, board)
 
     if project_dir is not None:
         from .symbol_resolution import footprint_search_path, search_path
@@ -259,7 +260,7 @@ def run(
     from . import explicit_pins
     from .symbol_resolution import is_not_placed
 
-    pins = explicit_pins.load(project_dir) if project_dir is not None else {}
+    pins = explicit_pins.load(project_dir, board) if project_dir is not None else {}
 
     for row in bom["rows"]:
         summary["total"] += 1

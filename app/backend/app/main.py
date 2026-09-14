@@ -1506,12 +1506,27 @@ def _fab_readiness(pipeline_dir: Path) -> dict | None:
     defects — at the project level, so 'this board is not fabricable' is visible
     without opening it. Best-effort: a missing or unparseable report is just None.
     """
-    report = pipeline_dir / "review_report.json"
-    if not report.is_file():
+    # A single-board project writes review_report.json; a multi-board project
+    # writes one per board (review_report.<board>.json). The verdict shown at
+    # the project level is the worst of them — one unfabricable board makes
+    # the project unfabricable — rather than silently None because the
+    # unqualified name does not exist.
+    candidates = [pipeline_dir / "review_report.json"] if (pipeline_dir / "review_report.json").is_file() \
+        else sorted(pipeline_dir.glob("review_report.*.json"))
+    if not candidates:
         return None
-    try:
-        data = json.loads(report.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    data: dict = {"summary": {"placeholders": 0, "emitter": 0}}
+    seen = False
+    for report in candidates:
+        try:
+            one = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        seen = True
+        s1 = one.get("summary") or {}
+        data["summary"]["placeholders"] += int(s1.get("placeholders", 0))
+        data["summary"]["emitter"] += int(s1.get("emitter", 0))
+    if not seen:
         return None
     s = data.get("summary") or {}
     placeholders = int(s.get("placeholders", 0))

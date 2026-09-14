@@ -28,14 +28,28 @@ from typing import Any
 _ARTIFACT = Path(".pipeline") / "design_artifact.deterministic.json"
 
 
-def load(project_dir: Path) -> dict[str, dict[str, Any]]:
+def _artifact(project_dir: Path, board: str | None) -> Path:
+    """The deterministic Stage 0 artifact for this board.
+
+    Board-qualified like every other per-board artifact. Reading the
+    unqualified name on a multi-board project found nothing, so the overlay
+    silently did not apply and every doc-stated pin went unread.
+    """
+    if board is None:
+        return Path(project_dir) / _ARTIFACT
+    from .project_manifest import artifact_path
+
+    return artifact_path(Path(project_dir), "design_artifact.deterministic", board=board)
+
+
+def load(project_dir: Path, board: str | None = None) -> dict[str, dict[str, Any]]:
     """local_id -> the explicit pins the design doc states for it.
 
     Reads the deterministic Stage 0 artifact — the one place the doc's tables
     land without a model in between. Absent or unreadable means no pins: the
     overlay must never be the thing that breaks a run.
     """
-    path = Path(project_dir) / _ARTIFACT
+    path = _artifact(project_dir, board)
     try:
         artifact = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -57,7 +71,7 @@ def load(project_dir: Path) -> dict[str, dict[str, Any]]:
     return pins
 
 
-def pin_maps(project_dir: Path) -> dict[str, dict[str, str]]:
+def pin_maps(project_dir: Path, board: str | None = None) -> dict[str, dict[str, str]]:
     """local_id -> {signal: pin} derived from the doc's pinout tables.
 
     The doc's pinout tables are the durable statement of signal→pin — the
@@ -73,7 +87,7 @@ def pin_maps(project_dir: Path) -> dict[str, dict[str, str]]:
     collapse the CSV path has always performed; Stage 4 wires multi-pin nets
     from the pinout tables themselves, not from this map.
     """
-    path = Path(project_dir) / _ARTIFACT
+    path = _artifact(project_dir, board)
     try:
         artifact = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -91,7 +105,7 @@ def pin_maps(project_dir: Path) -> dict[str, dict[str, str]]:
     return out
 
 
-def apply(rows: list[dict], project_dir: Path | None) -> int:
+def apply(rows: list[dict], project_dir: Path | None, board: str | None = None) -> int:
     """Overlay the doc's explicit pins onto BOM rows, in place.
 
     Returns how many rows changed. Mirrors exactly what Stage 1's pinning
@@ -100,7 +114,7 @@ def apply(rows: list[dict], project_dir: Path | None) -> int:
     """
     if project_dir is None:
         return 0
-    pins = load(Path(project_dir))
+    pins = load(Path(project_dir), board)
     if not pins:
         return 0
     changed = 0

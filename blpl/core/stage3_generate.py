@@ -483,6 +483,7 @@ def run(
     coverage_path: Path,
     bom_path: Path,
     project_dir: Path,
+    board: str | None = None,
     *,
     auto_generate: bool = False,
     symbols_root: Path | None = None,
@@ -566,8 +567,8 @@ def run(
     # an FPGA may have a library-matched symbol but still need a pin_map.
     from . import explicit_pins
 
-    explicit_pins.apply(bom["rows"], project_dir)
-    doc_pin_maps = explicit_pins.pin_maps(project_dir)
+    explicit_pins.apply(bom["rows"], project_dir, board)
+    doc_pin_maps = explicit_pins.pin_maps(project_dir, board)
     bom_mutated = False
     for bom_row in bom["rows"]:
         # A connector hint that names no symbol anywhere is the LLM's

@@ -93,6 +93,14 @@ the **net-classes** table (`Class | Trace width | Clearance | Via dia | Via dril
 and the **stackup** table. Both currently have to be restated in `project.yaml`.
 Reading them from the markdown would remove the last hand-authored file.
 
+### Placement
+
+Stage 6 still grid-places every footprint. With test points and real designs
+the grid overflows the outline, and every placement finding in the review
+(courtyard overlaps, parts off the board edge, no decoupling near the IC) is a
+consequence. Routing is in (Freerouting after Stage 6); placement is the next
+thing between an emitted board and one worth routing.
+
 ### Ideas, not commitments
 
 - **Native packaging** via Tauri — the FastAPI backend stays authoritative,
