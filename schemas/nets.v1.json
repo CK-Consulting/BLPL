@@ -4,32 +4,68 @@
   "title": "Nets v1",
   "description": "Stage 4 output and checked-in source of truth. Logical nets with class assignment and (refdes, pin) membership.",
   "type": "object",
-  "required": ["project_id", "schema_version", "nets"],
+  "required": [
+    "project_id",
+    "schema_version",
+    "nets"
+  ],
   "additionalProperties": false,
   "properties": {
-    "project_id": {"type": "string"},
-    "schema_version": {"const": 1},
+    "project_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
     "warnings": {
       "type": "array",
-      "description": "What Stage 4 could not synthesize cleanly — GPIO-map rows it could not bind, and doc-vs-doc naming disagreements it detected. Same no-silent-drops contract as Stage 0's warnings.",
+      "description": "What Stage 4 could not synthesize cleanly \u2014 GPIO-map rows it could not bind, and doc-vs-doc naming disagreements it detected. Same no-silent-drops contract as Stage 0's warnings.",
       "items": {
         "type": "object",
-        "required": ["code", "summary"],
+        "required": [
+          "code",
+          "summary"
+        ],
         "additionalProperties": false,
         "properties": {
-          "code": {"type": "string"},
-          "summary": {"type": "string"},
-          "fix": {"type": "string"},
-          "net": {"type": "string"},
+          "code": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "fix": {
+            "type": "string"
+          },
+          "net": {
+            "type": "string"
+          },
           "source_ref": {
             "type": "object",
-            "required": ["file"],
+            "required": [
+              "file"
+            ],
             "additionalProperties": false,
             "properties": {
-              "file": {"type": "string"},
-              "line_start": {"type": "integer", "minimum": 1},
-              "line_end": {"type": "integer", "minimum": 1}
+              "file": {
+                "type": "string"
+              },
+              "line_start": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "line_end": {
+                "type": "integer",
+                "minimum": 1
+              }
             }
+          },
+          "unassigned_pins": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "STAGE4-006: host pins named only by their port that no net picked up ('U1 A5')."
           }
         }
       }
@@ -38,21 +74,40 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["name", "class", "members"],
+        "required": [
+          "name",
+          "class",
+          "members"
+        ],
         "additionalProperties": false,
         "properties": {
-          "name": {"type": "string"},
-          "class": {"type": "string", "description": "Net class name; must match a class defined in the project stackup/YAML-HDM."},
-          "diff_pair_of": {"type": "string", "description": "Name of the complementary net if this is half of a differential pair."},
+          "name": {
+            "type": "string"
+          },
+          "class": {
+            "type": "string",
+            "description": "Net class name; must match a class defined in the project stackup/YAML-HDM."
+          },
+          "diff_pair_of": {
+            "type": "string",
+            "description": "Name of the complementary net if this is half of a differential pair."
+          },
           "members": {
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["refdes", "pin"],
+              "required": [
+                "refdes",
+                "pin"
+              ],
               "additionalProperties": false,
               "properties": {
-                "refdes": {"type": "string"},
-                "pin": {"type": "string"}
+                "refdes": {
+                  "type": "string"
+                },
+                "pin": {
+                  "type": "string"
+                }
               }
             }
           },
@@ -60,12 +115,22 @@
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["file"],
+              "required": [
+                "file"
+              ],
               "additionalProperties": false,
               "properties": {
-                "file": {"type": "string"},
-                "line_start": {"type": "integer", "minimum": 1},
-                "line_end": {"type": "integer", "minimum": 1}
+                "file": {
+                  "type": "string"
+                },
+                "line_start": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "line_end": {
+                  "type": "integer",
+                  "minimum": 1
+                }
               }
             }
           }

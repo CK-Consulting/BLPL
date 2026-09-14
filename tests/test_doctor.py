@@ -100,9 +100,12 @@ def test_power_rail_shared_across_connectors_is_not_reported(tmp_path: Path) -> 
     assert "DOC-008" not in _codes(report)
 
 
-def test_reserved_is_flagged_because_stage4_does_not_drop_it(tmp_path: Path) -> None:
-    """The trap: 'Reserved' looks like NC but is treated as a real net name."""
-    assert "RESERVED" not in {s.upper() for s in doctor._NC_SIGNALS}
+def test_reserved_is_still_named_even_though_stage4_now_drops_it(tmp_path: Path) -> None:
+    """'Reserved' no longer shorts thirty pins into one net — Stage 4 drops it —
+    but it is still reported, as a warning: on one datasheet it means "do not
+    connect" and on another "future function", and a pin the design meant to
+    use has just gone quietly open."""
+    assert doctor._stage4.is_no_connect("Reserved")
     _project(
         tmp_path,
         design__md="""
@@ -120,8 +123,9 @@ def test_reserved_is_flagged_because_stage4_does_not_drop_it(tmp_path: Path) -> 
 """,
     )
     report = doctor.run(tmp_path)
-    assert "DOC-004" in _codes(report)
-    assert not report.ok
+    found = [f for f in report.findings if f.code == "DOC-004"]
+    assert found and found[0].severity == "warning"
+    assert "open" in found[0].summary
 
 
 def test_genuine_nc_signals_are_ignored(tmp_path: Path) -> None:

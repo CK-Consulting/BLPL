@@ -5,7 +5,8 @@ Inputs:
   - nets.json (synthesized from Stage 4)
   - design_artifact.json (connector pin_maps, optional)
   - coverage_report.json (optional — prefers confirmed library matches over hints)
-  - project.yaml (hand-authored — project name, stackup, net_classes, boundaries)
+  - project.yaml (hand-authored — project name, stackup, net_classes, boundaries,
+    and the test_points policy)
 
 Output: hdm.yaml matching the schema yaml_to_kicad.py already consumes.
 
@@ -20,6 +21,7 @@ from typing import Any
 import yaml
 
 from . import schema, symbol_resolution
+from . import stage4_synthesize_nets
 
 
 _PROJECT_YAML_TEMPLATE = """\
@@ -165,6 +167,160 @@ def _index_coverage(coverage: dict | None) -> dict[str, dict]:
     return {r["local_id"]: r for r in coverage.get("rows", [])}
 
 
+# --- No-connect pins ---------------------------------------------------------
+
+
+def is_no_connect(signal: str) -> bool:
+    """Whether a pinout row declares its pin deliberately unconnected.
+
+    Stage 4's own predicate — imported, not copied, so a pin Stage 4 refuses
+    to put on a net is exactly a pin this stage marks no-connect and the two
+    can never drift into disagreement.
+    """
+    return stage4_synthesize_nets.is_no_connect(signal)
+
+
+def _no_connect_pins(
+    local_id: str, design_artifact: dict, connected: set[tuple[str, str]], refdes: str
+) -> list[str]:
+    """Physical pins the design declares NC and no net actually claims.
+
+    The second condition is the safety: if some upstream path did put a
+    NC-named pin on a net, a no-connect marker on top of a net label is an
+    ERC error of our own making. A pin is only marked when it is genuinely
+    on nothing.
+    """
+    pins: set[str] = set()
+    for conn in design_artifact.get("connectors", []):
+        if conn["local_id"] != local_id:
+            continue
+        for pin in conn.get("pins", []):
+            number = str(pin.get("pin") or "").strip()
+            signal = str(pin.get("signal") or "")
+            if not number:
+                continue
+            # Declared open, or a host pin named only by its port that no net
+            # picked up (Stage 4 drops those and counts them as unassigned) —
+            # either way the pin is on nothing, and the schematic should say
+            # so with a flag rather than an open pin ERC has to guess about.
+            declared = is_no_connect(signal)
+            unassigned = bool(stage4_synthesize_nets._PORT_NAME_RE.match(
+                stage4_synthesize_nets._normalize_signal(signal)))
+            if not (declared or unassigned):
+                continue
+            if (refdes, number) in connected or (local_id, number) in connected:
+                continue
+            pins.add(number)
+    return sorted(pins, key=lambda v: (len(v), v))
+
+
+# --- Test points -------------------------------------------------------------
+
+TEST_POINT_POLICIES = ("none", "power", "all")
+DEFAULT_TEST_POINT_POLICY = "power"
+DEFAULT_TEST_POINT_SYMBOL = "Connector:TestPoint"
+DEFAULT_TEST_POINT_FOOTPRINT = "TestPoint:TestPoint_Pad_D1.0mm"
+
+
+class TestPointConfigError(ValueError):
+    """project.yaml asks for test points in a way this stage cannot honour."""
+
+
+def test_point_config(project_config: dict) -> dict:
+    """The ``test_points:`` block of project.yaml, defaults filled in.
+
+    ``power`` is the default on purpose. ``all`` on a real board is hundreds of
+    pads nobody placed, and ``none`` leaves a board with no way to probe its
+    rails during bring-up — which is the one set of test points every board
+    wants regardless of how the rest of test is going to be done.
+    """
+    raw = project_config.get("test_points") or {}
+    if not isinstance(raw, dict):
+        raise TestPointConfigError("test_points in project.yaml must be a mapping")
+    policy = str(raw.get("policy") or DEFAULT_TEST_POINT_POLICY).strip().lower()
+    if policy not in TEST_POINT_POLICIES:
+        raise TestPointConfigError(
+            f"test_points.policy {policy!r} is not one of {', '.join(TEST_POINT_POLICIES)}"
+        )
+    return {
+        "policy": policy,
+        "symbol": str(raw.get("symbol") or DEFAULT_TEST_POINT_SYMBOL),
+        "footprint": str(raw.get("footprint") or DEFAULT_TEST_POINT_FOOTPRINT),
+    }
+
+
+def _test_point_nets(nets_out: dict, policy: str) -> list[str]:
+    if policy == "none":
+        return []
+    if policy == "power":
+        return sorted(n for n, d in nets_out.items() if d.get("class") == "Power_Bulk")
+    return sorted(n for n, d in nets_out.items() if d.get("pads"))
+
+
+def _synthesize_test_points(
+    components_out: dict,
+    nets_out: dict,
+    cfg: dict,
+    *,
+    project_dir: Path | None,
+    stock_symbols_root: Path | None,
+    stock_footprints_root: Path | None,
+) -> dict:
+    """Add one TP per selected net. Returns the ``synthesis.test_points`` record.
+
+    A test point is not a BOM row — it is copper the pipeline adds so the board
+    can be probed — so it is marked ``synthesized`` and never counted as a part.
+    The symbol and footprint go through the same resolver as real parts: a
+    project may override them, and a name that resolves to nothing must stop
+    the stage rather than reach the emitter as a dangling lib_id.
+    """
+    record = {"policy": cfg["policy"], "count": 0, "symbol": cfg["symbol"], "footprint": cfg["footprint"]}
+    targets = _test_point_nets(nets_out, cfg["policy"])
+    if not targets:
+        return record
+
+    symbol, footprint = cfg["symbol"], cfg["footprint"]
+    if project_dir is not None and stock_symbols_root is not None:
+        res = symbol_resolution.resolve(
+            symbol, project_dir=project_dir, stock_root=stock_symbols_root, pin_count=1
+        )
+        if res.needs_manual_symbol:
+            raise TestPointConfigError(
+                f"test_points.symbol {symbol!r} {res.reason}; name a symbol that exists "
+                "or set test_points.policy: none"
+            )
+    if project_dir is not None and stock_footprints_root is not None:
+        fres = symbol_resolution.resolve_footprint(
+            footprint, project_dir=project_dir, stock_root=stock_footprints_root, pin_count=1
+        )
+        if fres.needs_manual_symbol:
+            raise TestPointConfigError(
+                f"test_points.footprint {footprint!r} {fres.reason}; name a footprint that "
+                "exists or set test_points.policy: none"
+            )
+
+    taken = {r.upper() for r in components_out}
+    n = 0
+    for net_name in targets:
+        # Skip refdes the design already uses — a hand-placed TP3 keeps its name.
+        n += 1
+        while f"TP{n}" in taken:
+            n += 1
+        refdes = f"TP{n}"
+        taken.add(refdes)
+        components_out[refdes] = {
+            "value": f"TP_{net_name}",
+            "lib_symbol": symbol,
+            "footprint": footprint,
+            "pin_map": {"1": "1"},
+            "synthesized": "test_point",
+            "net": net_name,
+        }
+        nets_out[net_name]["pads"].append([refdes, "1"])
+        record["count"] += 1
+    return record
+
+
 def emit(
     bom: dict,
     nets: dict,
@@ -175,6 +331,7 @@ def emit(
     project_dir: Path | None = None,
     stock_symbols_root: Path | None = None,
     stock_footprints_root: Path | None = None,
+    board: str | None = None,
 ) -> tuple[dict, dict, dict]:
     """Return (HDM dict, symbol resolutions, footprint resolutions).
 
@@ -194,13 +351,19 @@ def emit(
     # changed nothing here until a paid rerun regenerated the file.
     from . import explicit_pins
 
-    explicit_pins.apply(bom["rows"], project_dir)
+    explicit_pins.apply(bom["rows"], project_dir, board)
 
     cov_by_id = _index_coverage(coverage)
     resolutions: dict[str, symbol_resolution.Resolution] = {}
     footprint_resolutions: dict[str, symbol_resolution.Resolution] = {}
 
     board_dim = tuple(project_config.get("project", {}).get("dimensions", [100, 80]))
+    tp_cfg = test_point_config(project_config)
+    # Every (refdes, pin) some net claims — the guard that keeps a no-connect
+    # marker off a pin that is, in fact, connected.
+    connected: set[tuple[str, str]] = {
+        (str(m["refdes"]), str(m["pin"])) for net in nets["nets"] for m in net["members"]
+    }
     components_out: dict[str, Any] = {}
     rows = bom["rows"]
     not_placed: list[str] = []
@@ -276,6 +439,11 @@ def emit(
         pin_map = _pin_map_for(row["local_id"], design_artifact, bom_row=row)
         if pin_map:
             comp["pin_map"] = pin_map
+        nc = _no_connect_pins(row["local_id"], design_artifact, connected, refdes)
+        if nc:
+            # What the design says is deliberately open, so the emitter can mark
+            # it and ERC stops reporting every declared-NC pin as a mistake.
+            comp["no_connect_pins"] = nc
         components_out[refdes] = comp
 
     nets_out: dict[str, Any] = {}
@@ -285,12 +453,25 @@ def emit(
             "pads": [[m["refdes"], m["pin"]] for m in net["members"]],
         }
 
+    tp_record = _synthesize_test_points(
+        components_out,
+        nets_out,
+        tp_cfg,
+        project_dir=project_dir,
+        stock_symbols_root=stock_symbols_root,
+        stock_footprints_root=stock_footprints_root,
+    )
+
     hdm: dict[str, Any] = {}
     for key in ("project", "net_classes", "boundaries"):
         if key in project_config:
             hdm[key] = project_config[key]
     hdm["components"] = components_out
     hdm["nets"] = nets_out
+    # Always written, count 0 included: Stage 8 reads this to tell "no test
+    # points because the policy said so" from "no test points because the
+    # pipeline cannot make them".
+    hdm["synthesis"] = {"test_points": tp_record}
     if not_placed:
         # Recorded rather than dropped: anyone diffing bom.json against the HDM
         # would otherwise find rows that vanished with nothing saying why.
@@ -307,6 +488,7 @@ def run(
     coverage_path: Path | None = None,
     *,
     project_dir: Path | None = None,
+    board: str | None = None,
     stock_symbols_root: Path | None = None,
     stock_footprints_root: Path | None = None,
 ) -> dict:
@@ -323,6 +505,7 @@ def run(
         project_config,
         coverage,
         project_dir=project_dir,
+        board=board,
         stock_symbols_root=stock_symbols_root,
         stock_footprints_root=stock_footprints_root,
     )

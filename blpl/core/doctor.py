@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import markdown_tables as _md
 from . import stage4_synthesize_nets as _stage4
-from .stage0_deterministic import refdes_in_heading
+from .stage0_deterministic import known_refs as _s0_known_refs, refdes_in_heading
 
 # A power rail on twenty connectors is the whole point of a power rail — merging it
 # into one net is correct, not a bug. Rather than keep a second hand-written list
@@ -48,6 +48,8 @@ _SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
 # Q/D (3-pin small-signal parts the classifier resolves), not J (connectors,
 # which synthesis handles), and not R/C/L.
 _IC_REFDES = re.compile(r"^U[\d_]", re.IGNORECASE)
+# Parts with intentions of their own for DOC-008: ICs, transistors, modules.
+_ACTIVE_REFDES = re.compile(r"^(U|Q|IC|A|MOD)[\d_]", re.IGNORECASE)
 
 
 @dataclass
@@ -723,6 +725,10 @@ def run(
     # Kept for the two checks that need the whole row, not just its refdes:
     # whether its footprint exists, and whether the classifier can resolve it.
     bom_rows: list[tuple[str, dict, str, int]] = []
+    # What Stage 0 will accept as a heading anchor: any Ref the BOM declares,
+    # read up front so a pinout table above its BOM row (or in another file)
+    # anchors here exactly as it does there.
+    known = _s0_known_refs(md_files)
 
     for md_path in md_files:
         text = md_path.read_text(encoding="utf-8")
@@ -808,7 +814,7 @@ def run(
 
             elif kind == "gpio":
                 heading, hline = _heading_above(text, table.line_start)
-                ref = refdes_in_heading(heading) if heading else None
+                ref = refdes_in_heading(heading, known) if heading else None
                 if not ref:
                     label = (heading or "").lstrip("# ").strip() or "(no heading)"
                     report.findings.append(
@@ -831,7 +837,7 @@ def run(
 
             elif kind == "pinout":
                 heading, hline = _heading_above(text, table.line_start)
-                ref = refdes_in_heading(heading) if heading else None
+                ref = refdes_in_heading(heading, known) if heading else None
 
                 if not ref:
                     label = (heading or "").lstrip("# ").strip() or "(no heading)"
@@ -878,7 +884,9 @@ def run(
                         )
 
                     up = sig.upper()
-                    if up and up not in _NC_SIGNALS:
+                    # Reserved is kept here on purpose: Stage 4 drops it, but
+                    # DOC-004 below still wants to say so out loud.
+                    if up and (up == "RESERVED" or not _stage4.is_no_connect(sig)):
                         signal_owners.setdefault(sig, []).append((ref, rel))
 
     # Signal name IS net name, so a name on two components becomes ONE net. Whether
@@ -897,6 +905,27 @@ def run(
         # thirty pins shorts them all into one net whether the owners are
         # chips, connectors, or a declared bus, so it is decided first.
         if sig.upper() in _FAKE_NC_PLACEHOLDERS:
+            if _stage4.is_no_connect(sig):
+                # "Reserved" is dropped, so nothing shorts — but on one part it
+                # means "do not connect" and on another "future function", and
+                # a pin the design meant to use has just gone quietly open.
+                report.findings.append(
+                    Finding(
+                        code="DOC-004",
+                        severity="warning",
+                        summary=(
+                            f"'{sig}' is used as a signal name on {len(refs)} components "
+                            f"({', '.join(sorted(refs))}); Stage 4 leaves every one of those "
+                            "pins open."
+                        ),
+                        fix=(
+                            "If that is the intent, name each pin NC_<ref>_<n> so it is "
+                            "unambiguous; if any of them carries a real signal, name it."
+                        ),
+                        file=owners[0][1],
+                    )
+                )
+                continue
             report.findings.append(
                 Finding(
                     code="DOC-004",
@@ -907,9 +936,9 @@ def run(
                         "shorted together into a single net."
                     ),
                     fix=(
-                        f"Stage 4 only drops {sorted(_NC_SIGNALS)} — '{sig}' is not in that "
-                        "list, so it is treated as a real net name. Give each unconnected pin "
-                        "a unique name: NC_J2_17, NC_J3_19."
+                        f"Stage 4 only drops {sorted(_NC_SIGNALS)}, NC_-prefixed names and "
+                        f"'Reserved' — '{sig}' is none of those, so it is treated as a real "
+                        "net name. Give each unconnected pin a unique name: NC_J2_17, NC_J3_19."
                     ),
                     file=owners[0][1],
                 )
@@ -919,9 +948,12 @@ def run(
         # Connectors do not count toward the collision threshold — a net on a
         # chip and a connector is the connector doing its job, carrying that
         # net off the board, and warning would fire on every routed interface
-        # pin. The hazard DOC-008 exists for is two unrelated chips silently
-        # sharing a name.
-        if len({r for r in refs if not r.startswith("J")}) < 2:
+        # pin. Nor do passives and electromechanical parts: a resistor, a
+        # motor, a speaker, an RF switch or a combiner on a net with one chip
+        # is a wire doing what the pinout table said, and counting them made a
+        # fully wired sub-board read as a dozen collisions. The hazard DOC-008
+        # exists for is two unrelated *active* parts silently sharing a name.
+        if len({r for r in refs if _ACTIVE_REFDES.match(r)}) < 2:
             continue
         declared = declared_buses.get(sig)
         if declared is not None:
@@ -991,7 +1023,7 @@ def run(
 
     # Stage 5 halts hard without this. Check both the durable location and the
     # legacy .pipeline/ one, matching how Stage 5 resolves it.
-    has_config = (project_dir / "project.yaml").exists() or (
+    has_config = (md_root / "project.yaml").exists() or (project_dir / "project.yaml").exists() or (
         project_dir / ".pipeline" / "project.yaml"
     ).exists()
     if not has_config:

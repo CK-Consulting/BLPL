@@ -124,3 +124,27 @@ def test_a_partially_parsed_class_row_names_its_defaulted_fields(tmp_path):
     assert result.config["net_classes"]["RF_50Ohm"]["trace_width"] == 0.35
     assert any("RF_50Ohm: via_dia" in d for d in result.defaulted)
     assert any("RF_50Ohm: via_drill" in d for d in result.defaulted)
+
+
+def test_a_board_config_lands_beside_its_markdown_not_at_the_root(tmp_path: Path) -> None:
+    """Multi-board: each board has its own dimensions, so init --board writes
+    <board>/project.yaml. The libraries directory stays at the project root —
+    two boards that mate must resolve a part identically."""
+    board = tmp_path / "sb-ant"
+    board.mkdir()
+    (board / "overview.md").write_text(OVERVIEW, encoding="utf-8")
+    target, _ = init_project.write_config(tmp_path, board="sb-ant", target_dir=board)
+    assert target == board / "project.yaml"
+    assert target.exists()
+    assert not (tmp_path / "project.yaml").exists()
+    assert (tmp_path / "libraries" / "symbols").is_dir()
+
+
+def test_generated_config_carries_the_test_point_policy(tmp_path: Path) -> None:
+    (tmp_path / "overview.md").write_text(OVERVIEW, encoding="utf-8")
+    target, result = init_project.write_config(tmp_path)
+    assert result.config["test_points"]["policy"] == "power"
+    text = target.read_text(encoding="utf-8")
+    assert "test_points:" in text
+    # The choice is explained where the value is, not in a doc nobody opens.
+    assert "power  one per power/ground net" in text

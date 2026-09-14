@@ -96,7 +96,9 @@ def test_emit_produces_yaml_to_kicad_compatible_structure() -> None:
     assert set(j1["placement"]) == {"x", "y", "rot", "side"}
     # Net structure: pads is list of [refdes, pin] pairs.
     assert hdm["nets"]["GND"]["class"] == "Power_Bulk"
-    assert hdm["nets"]["GND"]["pads"] == [["J1", "2"]]
+    # The design's own pad comes first; the default test-point policy appends
+    # a probe point to every power net (see test_stage5_test_points.py).
+    assert hdm["nets"]["GND"]["pads"][0] == ["J1", "2"]
 
 
 def test_coverage_match_overrides_bom_hints() -> None:

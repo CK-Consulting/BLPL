@@ -215,3 +215,87 @@ def test_doctor_counts_an_anchored_gpio_map_as_used(tmp_path) -> None:
     report = doctor.run(tmp_path)
     assert not any(f.code in ("DOC-001", "DOC-009") for f in report.findings)
     assert report.tables_used == report.tables_seen
+
+
+# -- a host that has its own pinout table ------------------------------------
+
+_MCU_DOC = """\
+# Core
+
+## J1 pinout
+
+| Pin | Signal |
+|---|---|
+| 1 | I2C_SCL |
+| 2 | I2C_SDA |
+| 3 | SENSOR_EN |
+
+## U1 pinout
+
+| Pin | Signal | Function |
+|---|---|---|
+| A3 | PB7 | bidirectional |
+| A4 | PB6 | bidirectional |
+| A5 | PG15 | bidirectional |
+| B1 | PC14-OSC32_IN (PC14) | bidirectional |
+| C2 | VBAT | power_in |
+
+## U1 GPIO assignment
+
+| GPIO | Signal | Destination |
+|---|---|---|
+| PB6 | I2C_SCL | J1 pin 1 |
+| A3 | I2C_SDA | J1 pin 2 |
+| PG15 | VBAT | strap |
+| PC14 | SENSOR_EN | J1 pin 3 |
+"""
+
+
+def test_a_mapped_ball_moves_off_its_port_name_net_onto_the_signal(tmp_path) -> None:
+    """Ball A4 is 'PB6' in the pinout and 'I2C_SCL' in the map. The ball must end
+    up on I2C_SCL as its physical pin, and the one-pin PB6 net must be gone —
+    otherwise the emitter resolves both to A4 and KiCad shorts the two nets."""
+    nets = _by_name(_nets_for(tmp_path, _MCU_DOC))
+    assert "PB6" not in nets
+    assert {"refdes": "U1", "pin": "A4"} in nets["I2C_SCL"]["members"]
+    assert {"refdes": "U1", "pin": "PB6"} not in nets["I2C_SCL"]["members"]
+
+
+def test_the_gpio_cell_may_name_the_ball_directly(tmp_path) -> None:
+    nets = _by_name(_nets_for(tmp_path, _MCU_DOC))
+    assert "PB7" not in nets
+    assert {"refdes": "U1", "pin": "A3"} in nets["I2C_SDA"]["members"]
+
+
+def test_a_normalised_pinout_signal_matches_its_bare_port_name(tmp_path) -> None:
+    # "PC14-OSC32_IN (PC14)" normalises to "PC14-OSC32_IN", not "PC14" — the map
+    # row cannot bind by signal, and PC14 is not a ball either, so it is
+    # created as a logical member exactly as before (identity pin).
+    nets = _by_name(_nets_for(tmp_path, _MCU_DOC))
+    assert {"refdes": "U1", "pin": "PC14"} in nets["SENSOR_EN"]["members"]
+
+
+def test_a_pin_the_pinout_already_puts_on_a_real_net_is_not_moved(tmp_path) -> None:
+    """PG15 is mapped to VBAT, but VBAT already exists with U1 C2 on it and PG15's
+    own net is just PG15 — that moves. Now make the conflict real: the pinout
+    puts a ball on a named net and the map disagrees."""
+    doc = _MCU_DOC.replace("| A5 | PG15 | bidirectional |", "| A5 | SPI_CS | bidirectional |") \
+                  .replace("| PG15 | VBAT | strap |", "| A5 | VBAT | strap |")
+    result = _nets_for(tmp_path, doc)
+    nets = _by_name(result)
+    assert {"refdes": "U1", "pin": "A5"} in nets["SPI_CS"]["members"]
+    assert {"refdes": "U1", "pin": "A5"} not in nets["VBAT"]["members"]
+    assert "STAGE4-005" in _codes(result)
+
+
+def test_unassigned_port_pins_are_dropped_and_counted_once(tmp_path) -> None:
+    """PG15 is listed in the pinout and nowhere else. It is an unassigned pin,
+    not a net; it goes, and STAGE4-006 says how many went. Balls the map binds
+    (PB6 -> I2C_SCL) and named signals (VBAT) stay."""
+    doc = _MCU_DOC.replace("| PG15 | VBAT | strap |\n", "")
+    result = _nets_for(tmp_path, doc)
+    nets = _by_name(result)
+    assert "PG15" not in nets
+    assert "VBAT" in nets and "I2C_SCL" in nets
+    w = [w for w in result["warnings"] if w["code"] == "STAGE4-006"]
+    assert len(w) == 1 and w[0]["unassigned_pins"] == ["U1 A5"]

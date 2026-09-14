@@ -82,6 +82,25 @@ _DIFF_PAIR_SUFFIX_ORDER = sorted(_DIFF_PAIR_SUFFIXES, key=len, reverse=True)
 _NC_SIGNALS = {"NC", "N/C", "N.C.", "-", "", "DNC"}
 
 
+def is_no_connect(signal: str) -> bool:
+    """Whether a pinout row declares its pin deliberately unconnected.
+
+    The bare spellings in ``_NC_SIGNALS``, the ``NC_<part>_<n>`` form that
+    doctor tells people to write so two unconnected pins on one part never
+    collapse into a single "NC" net, and the datasheet word "Reserved". The
+    docs have always said all three are dropped; the code only dropped the
+    bare set, so every ``NC_CELL_81`` became a one-pin net — 27 of them on one
+    board — and thirty "Reserved" pins would have shorted into one net. The
+    schematic emitter had no way to tell a pin the designer left open from one
+    the design forgot. Stage 5 imports this predicate to decide which pins get
+    a no-connect marker, so the two stages cannot disagree about what "open"
+    means. Doctor still reports "Reserved" (DOC-004) because on some parts it
+    means "future function", and a name that says which is better.
+    """
+    up = (signal or "").strip().upper()
+    return up in _NC_SIGNALS or up.startswith("NC_") or up == "RESERVED"
+
+
 # --- GPIO-map consumption ----------------------------------------------------
 #
 # A GPIO-assignment map ("GPIO | Signal | Destination | ...") carries the HOST
@@ -93,6 +112,14 @@ _NC_SIGNALS = {"NC", "N/C", "N.C.", "-", "", "DNC"}
 # A pin cell that can actually bind: one token ending in digits (GPIO8, IO42).
 # "GPIO— (TBD)" and "GPIO11-18 (subset)" fail — they are counted, not guessed at.
 _GPIO_PIN_RE = re.compile(r"[A-Za-z_]*\d+\Z")
+
+# What a datasheet calls a pin before the design gives it a job: STM32 ports
+# (PB6), nRF ports (P0.04, P1_15), ESP/generic GPIO numbers (GPIO12, IO42). A
+# pinout table that lists these as the "signal" is stating the silicon's name
+# for the ball, not a net — which is why the GPIO map is allowed to move such a
+# ball onto a real net, and not allowed to move one the pinout already put on
+# SPI_CS.
+_PORT_NAME_RE = re.compile(r"^(P[A-Z]\d{1,2}|P\d+[._]\d+|GPIO\d+|IO\d+)$", re.IGNORECASE)
 
 # A signal cell that names ONE net. Multi-signal shorthand ("CAM_PCLK, CAM_HSYNC",
 # "SOM_SPI_*", "BLE_B_UART_TX/RX", "Boot strap") is reported, never split by guess.
@@ -183,7 +210,7 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
         src_ref = conn.get("source_ref")
         for pin in conn.get("pins", []):
             signal = _normalize_signal(pin["signal"])
-            if signal.upper() in _NC_SIGNALS:
+            if is_no_connect(signal):
                 continue
             net = nets_by_name.setdefault(
                 signal,
@@ -205,6 +232,37 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
     # placeholder for future extension.
 
     warnings = _apply_gpio_assignments(design_artifact, nets_by_name, bom)
+
+    # A host pin the pinout table names after itself (PB0, GPIO12) and nothing
+    # else touches is an unassigned pin, not a one-pin net called PB0. Left
+    # in, a 216-ball MCU contributes a hundred and fifty "single-pin net"
+    # findings that say nothing the GPIO map's TBD count has not already said,
+    # and drown the nets that really do reach only one pin. Dropped here and
+    # counted once; Stage 5 gives each pin a no-connect flag.
+    unassigned: list[str] = []
+    for name in list(nets_by_name):
+        net = nets_by_name[name]
+        if len(net["members"]) == 1 and _PORT_NAME_RE.match(name):
+            m = net["members"][0]
+            unassigned.append(f"{m['refdes']} {m['pin']} ({name})")
+            del nets_by_name[name]
+    if unassigned:
+        warnings.append(
+            {
+                "code": "STAGE4-006",
+                "summary": (
+                    f"{len(unassigned)} host pin(s) named only by their port have no "
+                    f"assignment and are left unconnected: {', '.join(unassigned[:12])}"
+                    + (f", … (+{len(unassigned) - 12} more)" if len(unassigned) > 12 else "")
+                    + "."
+                ),
+                "fix": (
+                    "Nothing, for a pin that is meant to stay free. Give a pin a job by "
+                    "listing it in the host's GPIO map or naming its signal in the pinout."
+                ),
+                "unassigned_pins": [u.split(" (")[0] for u in unassigned],
+            }
+        )
 
     # Diff-pair detection (bidirectional tagging).
     for name in list(nets_by_name.keys()):
@@ -258,9 +316,35 @@ def _apply_gpio_assignments(
         for m in net["members"]:
             member_owner.setdefault((m["refdes"], m["pin"]), net["name"])
 
+    # The host's own pinout, when it has one: normalised signal -> physical pin,
+    # and the set of physical pins. dev.04's host had no pinout table, so the
+    # GPIO map was its only connectivity and the GPIO cell was the pin. An MCU
+    # with a 216-ball pinout table is the other case: ball A4 is already on a
+    # one-pin net called PB6, and the map's "PB6 carries I2C_SCL" has to move
+    # that ball onto I2C_SCL — not add a second, logical member that the
+    # emitter resolves to the same ball and KiCad reads as a short between the
+    # two nets.
+    host_pin_by_signal: dict[str, dict[str, str]] = {}
+    host_signal_by_pin: dict[str, dict[str, str]] = {}
+    for conn in design_artifact.get("connectors", []):
+        ref = _resolve_refdes(conn["local_id"], bom)
+        for pin in conn.get("pins", []):
+            phys = str(pin.get("pin") or "").strip()
+            sig = _normalize_signal(str(pin.get("signal") or ""))
+            if not phys:
+                continue
+            host_signal_by_pin.setdefault(ref, {})[phys] = sig
+            if sig:
+                host_pin_by_signal.setdefault(ref, {}).setdefault(sig, phys)
+
+    def _physical(host: str, gpio: str) -> str:
+        """The host pin a GPIO cell names: by pinout signal, else itself (a ball,
+        or — with no pinout table — the only name the pin has)."""
+        return host_pin_by_signal.get(host, {}).get(gpio, gpio)
+
     for a in assignments:
         signal = _normalize_signal(a["signal"])
-        if not signal or signal.upper() in _NC_SIGNALS:
+        if is_no_connect(signal):
             continue
         src_ref = a.get("source_ref")
         gpio = a["gpio"].strip()
@@ -381,14 +465,44 @@ def _apply_gpio_assignments(
 
         if target is not None:
             net = nets_by_name[target]
-            member = {"refdes": host, "pin": gpio}
+            phys = _physical(host, gpio)
+            current = member_owner.get((host, phys))
+            if current is not None and current != target:
+                own = host_signal_by_pin.get(host, {}).get(phys)
+                names_port = current == own and (current == gpio or _PORT_NAME_RE.match(current))
+                if names_port and len(nets_by_name[current]["members"]) == 1:
+                    # The pinout table named this ball after its own port pin
+                    # (PB6) and nothing else is on that net: the map is the
+                    # more specific statement, so the ball moves.
+                    del nets_by_name[current]
+                    member_owner.pop((host, phys), None)
+                else:
+                    warnings.append(
+                        {
+                            "code": "STAGE4-005",
+                            "summary": (
+                                f"GPIO map puts {host} {gpio} on {signal}, but the pinout "
+                                f"table already places that pin ({phys}) on {current}. "
+                                "One pin, two nets — nothing was joined."
+                            ),
+                            "fix": (
+                                "Make the pinout table and the GPIO map agree: name the pin "
+                                "one thing, or drop it from one of the two tables."
+                            ),
+                            "net": signal,
+                            **({"source_ref": src_ref} if src_ref else {}),
+                        }
+                    )
+                    unbound.append(f"{a['signal']} ({gpio}: conflicts with {current})")
+                    continue
+            member = {"refdes": host, "pin": phys}
             if member not in net["members"]:
                 net["members"].append(member)
             if src_ref:
                 refs = net.setdefault("source_refs", [])
                 if src_ref not in refs:
                     refs.append(src_ref)
-            member_owner.setdefault((host, gpio), target)
+            member_owner[(host, phys)] = target
 
     if unbound:
         warnings.append(
