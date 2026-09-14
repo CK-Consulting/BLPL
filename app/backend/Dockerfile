@@ -18,8 +18,30 @@ USER root
 # being ordered. kicad-happy's datasheet verification already reaches for the
 # same binary and silently degrades without it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3-pip python3-venv git poppler-utils \
+        python3-pip python3-venv git poppler-utils ca-certificates curl gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Java and Freerouting, so `blpl run` can autoroute after stage6. Without a
+# router every net on every emitted board is unrouted by construction, and
+# Stage 8 can only file RT-001 under "known limitation"; once a router has had
+# a go, an unrouted net is a finding about the design. Freerouting 2.4.x needs
+# Java 25, which Debian trixie's own openjdk (21) does not satisfy, so the JRE
+# comes from Adoptium's apt repository. The jar is pinned by version and by
+# sha256: a jar that changed under us would change what routes, silently.
+ARG FREEROUTING_VERSION=2.4.1
+ARG FREEROUTING_SHA256=251101c3eeac22d7e7dfcf6796603279e5d1000283eb82d8f093780f7afc6aa9
+RUN set -eux; \
+    curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public \
+        | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg; \
+    echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb trixie main" \
+        > /etc/apt/sources.list.d/adoptium.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends temurin-25-jre; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /opt/freerouting; \
+    curl -fsSL -o /opt/freerouting/freerouting.jar \
+        "https://github.com/freerouting/freerouting/releases/download/v${FREEROUTING_VERSION}/freerouting-${FREEROUTING_VERSION}.jar"; \
+    echo "${FREEROUTING_SHA256}  /opt/freerouting/freerouting.jar" | sha256sum -c -
 
 WORKDIR /app
 
@@ -58,6 +80,7 @@ RUN chmod +x /app/entrypoint.sh
 
 ENV BLPL_PROJECTS_ROOT=/app/projects \
     BLPL_KICAD_HAPPY=/app/kicad-happy \
+    FREEROUTING_JAR=/opt/freerouting/freerouting.jar \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8000

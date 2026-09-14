@@ -12,9 +12,18 @@
   returns usable measurements: kicad-happy's testbenches carry their `.meas` in
   ngspice `.control` blocks, so LTspice runs the sweep correctly and still
   reports every result as skipped. See [`cli.md`](cli.md#spice).
-- **Freerouting jar (optional).** For `bulk_autoroute`. Point `FREEROUTING_JAR` at
-  it — the path is never guessed, since a wrong guess would leave a board
-  unrouted while reporting a completed run.
+- **Freerouting jar + Java 25 (optional).** For autorouting. `blpl run` routes
+  the board after stage6 when kicad-cli, a Python that can import `pcbnew`,
+  `java`, and the jar are all present; `blpl autoroute` does the same step on
+  its own, and `blpl run --no-autoroute` skips it. When anything is missing the
+  step is skipped and the reason lands in `.pipeline/autoroute_report.json`, so
+  Stage 8 can tell a net the router could not finish (a design finding) from a
+  net nothing ever tried to route (a known limitation). Point `FREEROUTING_JAR`
+  at the jar — the path is never guessed, since a wrong guess would leave a
+  board unrouted while reporting a completed run. The backend image ships both
+  the JRE and Freerouting 2.4.1 at `/opt/freerouting/freerouting.jar`. Every run
+  snapshots the board to `.pipeline/autoroute/<name>.pre-autoroute.kicad_pcb`
+  first; the result is reviewed by DRC, never trusted.
 
 ## Install the Python package
 
