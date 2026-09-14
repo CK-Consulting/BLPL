@@ -11,6 +11,7 @@ they carry the real library geometry so DRC results are meaningful.
 
 from __future__ import annotations
 
+import math
 import uuid as _uuid
 from copy import deepcopy
 from collections.abc import Sequence
@@ -137,6 +138,139 @@ def _override_footprint_layer(footprint_node: sexpr.Node, side: str) -> None:
     layer_node = sexpr.find(footprint_node, "layer")
     if layer_node is not None:
         layer_node[:] = ["layer", target]
+
+
+# Legacy footprint upgrade --------------------------------------------------
+#
+# Footprints reach the emitter from wherever Stage 5 found them, and the
+# vendor/module libraries are whatever a part's maker or SnapEDA/UltraLibrarian
+# exported: KiCad 5 ``(module ...)`` files with ``(tedit ...)``, arcs written as
+# centre + start + sweep angle, ``(width w)`` strokes, and ``(fp_text reference
+# "REF**")`` in place of a Reference property. KiCad itself upgrades those when
+# it *loads a library*; it does not upgrade them when it finds them embedded in
+# a v10 board file. So the emitter copied them in verbatim and produced a board
+# kicad-cli refused outright ("Expecting 'mid'" at the first legacy arc) — and
+# where it did load, seven parts kept the reference ``REF**`` because only
+# ``(property "Reference" ...)`` was ever patched, so the schematic/PCB
+# cross-check reported them missing from the board.
+#
+# The upgrade is done here, in Python, rather than by shelling out to
+# ``kicad-cli fp upgrade``: the emitter's contract is to run without KiCad
+# installed, and rewriting a user's library in place is not the emitter's call.
+
+_LEGACY_SHAPE_TAGS = ("fp_line", "fp_arc", "fp_circle", "fp_rect", "fp_poly")
+
+
+def _num(atom: str) -> float:
+    return float(sexpr.unquote(atom))
+
+
+def _fmt(v: float) -> str:
+    """Render a coordinate the way KiCad writes one: no trailing zeros, no -0."""
+    r = round(v, 6)
+    if r == 0:
+        r = 0.0
+    text = f"{r:.6f}".rstrip("0").rstrip(".")
+    return text if text not in ("", "-0") else "0"
+
+
+def _rotate_std(x: float, y: float, degrees: float) -> tuple[float, float]:
+    """Rotate (x, y) about the origin by ``degrees`` on raw coordinates."""
+    theta = math.radians(degrees)
+    c, s = math.cos(theta), math.sin(theta)
+    return (x * c - y * s, x * s + y * c)
+
+
+def _upgrade_legacy_arc(arc: sexpr.Node) -> None:
+    """Rewrite a centre/start/angle arc as the start/mid/end form, in place.
+
+    KiCad 5 wrote an arc as ``(start CENTRE) (end STARTPOINT) (angle SWEEP)``.
+    Its own parser, on reading that form, computes the end point by rotating
+    the start point about the centre by ``-angle`` with ``RotatePoint`` — whose
+    convention, on raw y-down coordinates, is a standard rotation by ``+angle``
+    — and then, when the angle is negative, swaps start and end so the arc is
+    always stored counter-clockwise. The mid point sits half-way round, and
+    does not care which way the ends were swapped.
+    """
+    start_node = sexpr.find(arc, "start")
+    end_node = sexpr.find(arc, "end")
+    angle_node = sexpr.find(arc, "angle")
+    if start_node is None or end_node is None or angle_node is None:
+        return
+    cx, cy = _num(start_node[1]), _num(start_node[2])
+    sx, sy = _num(end_node[1]), _num(end_node[2])
+    sweep = _num(angle_node[1])
+    rx, ry = sx - cx, sy - cy
+    ex, ey = _rotate_std(rx, ry, sweep)
+    mx, my = _rotate_std(rx, ry, sweep / 2.0)
+    p_start = (sx, sy)
+    p_end = (cx + ex, cy + ey)
+    if sweep < 0:
+        p_start, p_end = p_end, p_start
+    start_node[:] = ["start", _fmt(p_start[0]), _fmt(p_start[1])]
+    end_node[:] = ["end", _fmt(p_end[0]), _fmt(p_end[1])]
+    arc.insert(arc.index(end_node), ["mid", _fmt(cx + mx), _fmt(cy + my)])
+    arc.remove(angle_node)
+
+
+def _upgrade_legacy_stroke(shape: sexpr.Node) -> None:
+    """``(width w)`` → ``(stroke (width w) (type solid))`` when no stroke exists."""
+    if sexpr.find(shape, "stroke") is not None:
+        return
+    width_node = sexpr.find(shape, "width")
+    if width_node is None:
+        return
+    shape[shape.index(width_node)] = ["stroke", ["width", width_node[1]], ["type", "solid"]]
+
+
+def _fp_text_to_property(text_node: sexpr.Node, name: str) -> sexpr.Node:
+    """Turn ``(fp_text reference|value X (at ..) (layer ..) [hide] (effects ..))``
+    into the v10 ``(property "Name" "X" ...)`` field that carries it now."""
+    prop: sexpr.Node = ["property", sexpr.quote(name), text_node[2]]
+    hidden = False
+    for child in text_node[3:]:
+        if child == "hide":
+            hidden = True
+            continue
+        if isinstance(child, list) and sexpr.head(child) == "hide":
+            hidden = True
+            continue
+        if isinstance(child, list) and sexpr.head(child) == "at":
+            # KiCad 6 wrote ``(at x y unlocked)``; unlocked is its own node now.
+            at = [a for a in child if a != "unlocked"]
+            prop.append(at)
+            if "unlocked" in child:
+                prop.append(["unlocked", "yes"])
+            continue
+        prop.append(child)
+    if hidden:
+        prop.append(["hide", "yes"])
+    return prop
+
+
+def _upgrade_legacy_footprint(fp_node: sexpr.Node) -> None:
+    """Bring a pre-v10 footprint up to what a v10 board file may contain.
+
+    Idempotent on a modern footprint: nothing here matches, nothing changes.
+    """
+    if fp_node and fp_node[0] == "module":
+        fp_node[0] = "footprint"
+
+    for tedit in sexpr.find_all(fp_node, "tedit"):
+        fp_node.remove(tedit)
+
+    for text_node in sexpr.find_all(fp_node, "fp_text"):
+        kind = text_node[1] if len(text_node) > 2 else None
+        if kind == "reference":
+            fp_node[fp_node.index(text_node)] = _fp_text_to_property(text_node, "Reference")
+        elif kind == "value":
+            fp_node[fp_node.index(text_node)] = _fp_text_to_property(text_node, "Value")
+
+    for tag in _LEGACY_SHAPE_TAGS:
+        for shape in sexpr.find_all(fp_node, tag):
+            if tag == "fp_arc" and sexpr.find(shape, "mid") is None:
+                _upgrade_legacy_arc(shape)
+            _upgrade_legacy_stroke(shape)
 
 
 def _set_reference_and_value(
@@ -289,6 +423,7 @@ def build(
             )
         fp_node = loaders.load_footprint(fp_ref, footprints_root)
         fp_node = deepcopy(fp_node)  # don't mutate the library copy
+        _upgrade_legacy_footprint(fp_node)
 
         # Library .kicad_mod files identify themselves by bare footprint name; a
         # PCB expects the "Lib:Name" qualified form so KiCad can trace it back

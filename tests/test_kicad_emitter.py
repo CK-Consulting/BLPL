@@ -256,3 +256,112 @@ def test_pro_emit_has_net_classes_and_patterns() -> None:
     patterns = data["net_settings"]["netclass_patterns"]
     assert any(p["pattern"] == "VIN" for p in patterns)
     assert any(p["pattern"] == "GND" for p in patterns)
+
+
+def test_sch_marks_declared_nc_pins_with_no_connect() -> None:
+    """A pin the design says is NC gets KiCad's no-connect X, not a dangling stub."""
+    hdm = _minimal_hdm()
+    # Pin 2 (GND) leaves the net and is declared NC instead.
+    hdm["nets"] = {"VIN": {"class": "Default", "pads": [["J1", "VIN"]]}}
+    hdm["components"]["J1"]["no_connect_pins"] = ["2"]
+    out = sch.emit(hdm, symbols_root=_SYMBOLS_ROOT)
+    node = sexpr.parse(out)
+    ncs = sexpr.find_all(node, "no_connect")
+    assert len(ncs) == 1
+    # Sits exactly on pin 2's connection point, on the 1.27mm grid.
+    pins = {p["number"]: p for p in loaders.load_symbol_pins("Connector:Barrel_Jack", _SYMBOLS_ROOT)}
+    inst = sexpr.find(node, "symbol")
+    cx, cy = float(sexpr.find(inst, "at")[1]), float(sexpr.find(inst, "at")[2])
+    tip = sch._pin_absolute_tip(cx, cy, pins["2"])
+    at = sexpr.find(ncs[0], "at")
+    assert (float(at[1]), float(at[2])) == (sch._snap(tip[0]), sch._snap(tip[1]))
+    # And the NC pin got no label — only VIN is labelled.
+    labels = [sexpr.unquote(l[1]) for l in sexpr.find_all(node, "label")]
+    assert labels == ["VIN"]
+
+
+def test_sch_without_nc_pins_emits_no_markers() -> None:
+    out = sch.emit(_minimal_hdm(), symbols_root=_SYMBOLS_ROOT)
+    assert "(no_connect" not in out
+
+
+def test_sch_load_symbol_pins_gathers_shared_and_unit_one_sub_symbols(tmp_path: Path) -> None:
+    """Pins split across _0_0 and _1_0 (the nRF9151 shape) are all unit 1's pins."""
+    lib = tmp_path / "Vendor.kicad_sym"
+    lib.write_text(
+        """(kicad_symbol_lib (version 20211014) (generator test)
+  (symbol "SiP" (in_bom yes) (on_board yes)
+    (symbol "SiP_0_0"
+      (pin power_in line (at 0 10 270) (length 2.54) (name "GND") (number "1"))
+    )
+    (symbol "SiP_1_0"
+      (pin bidirectional line (at 10 0 180) (length 2.54) (name "P0.20") (number "2"))
+    )
+    (symbol "SiP_1_1"
+      (rectangle (start -5 -5) (end 5 5))
+    )
+    (symbol "SiP_2_1"
+      (pin bidirectional line (at -10 0 0) (length 2.54) (name "P0.21") (number "3"))
+    )
+  )
+)""",
+        encoding="utf-8",
+    )
+    numbers = sorted(p["number"] for p in loaders.load_symbol_pins("Vendor:SiP", tmp_path))
+    # Unit 2's pin is another unit; the graphics-only _1_1 no longer hides the rest.
+    assert numbers == ["1", "2"]
+
+
+_TWO_UNIT_LIB = """(kicad_symbol_lib (version 20211014) (generator test)
+  (symbol "Dual" (in_bom yes) (on_board yes)
+    (property "Reference" "U" (at 0 0 0))
+    (symbol "Dual_1_1"
+      (rectangle (start -5.08 -5.08) (end 5.08 5.08))
+      (pin input line (at -7.62 0 0) (length 2.54) (name "A") (number "1"))
+    )
+    (symbol "Dual_2_1"
+      (rectangle (start -5.08 -5.08) (end 5.08 5.08))
+      (pin power_in line (at 0 7.62 270) (length 2.54) (name "VDD") (number "2"))
+    )
+  )
+)"""
+
+
+def test_load_symbol_units_groups_pins_by_unit(tmp_path: Path) -> None:
+    (tmp_path / "T.kicad_sym").write_text(_TWO_UNIT_LIB, encoding="utf-8")
+    units = loaders.load_symbol_units("T:Dual", tmp_path)
+    assert {u: [p["number"] for p in pins] for u, pins in units.items()} == {1: ["1"], 2: ["2"]}
+    # The unit-1 view is unchanged for callers that only ever wanted one body.
+    assert [p["number"] for p in loaders.load_symbol_pins("T:Dual", tmp_path)] == ["1"]
+
+
+def test_sch_draws_every_unit_of_a_multi_unit_symbol(tmp_path: Path) -> None:
+    """One instance per unit, same refdes, each body in its own cell — so the
+    power pins an MCU vendor parks on unit 4 are drawn, wired and labelled."""
+    (tmp_path / "T.kicad_sym").write_text(_TWO_UNIT_LIB, encoding="utf-8")
+    hdm = _minimal_hdm()
+    hdm["components"] = {
+        "U1": {"value": "Dual", "footprint": "", "lib_symbol": "T:Dual", "pin_map": {"A": "1", "VDD": "2"}}
+    }
+    hdm["nets"] = {
+        "SIG": {"class": "Default", "pads": [["U1", "A"]]},
+        "VDD": {"class": "Power_Bulk", "pads": [["U1", "VDD"]]},
+    }
+    node = sexpr.parse(sch.emit(hdm, symbols_root=[tmp_path, _SYMBOLS_ROOT]))
+    insts = [s for s in sexpr.find_all(node, "symbol") if sexpr.unquote(sexpr.find(s, "lib_id")[1]) == "T:Dual"]
+    units = sorted(int(sexpr.find(s, "unit")[1]) for s in insts)
+    assert units == [1, 2]
+    # Both bodies carry the same reference and their instance path names the unit.
+    for s in insts:
+        ref = next(p for p in sexpr.find_all(s, "property") if sexpr.unquote(p[1]) == "Reference")
+        assert sexpr.unquote(ref[2]) == "U1"
+        path = sexpr.find(sexpr.find(sexpr.find(s, "instances"), "project"), "path")
+        assert sexpr.find(path, "unit")[1] == sexpr.find(s, "unit")[1]
+    # They sit in different cells.
+    ats = {(sexpr.find(s, "at")[1], sexpr.find(s, "at")[2]) for s in insts}
+    assert len(ats) == 2
+    # And unit 2's pin got its label — the whole point.
+    labels = sorted(sexpr.unquote(l[1]) for l in sexpr.find_all(node, "label"))
+    assert labels == ["SIG", "VDD", "VDD"]  # VDD twice: pin stub + PWR_FLAG label
+    # The rail audit saw the power_in pin on unit 2 and flagged the rail.
+    assert sch.flagged_nets(hdm, symbols_root=[tmp_path, _SYMBOLS_ROOT]) == ["VDD"]

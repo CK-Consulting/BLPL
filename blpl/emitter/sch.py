@@ -89,12 +89,13 @@ def _component_instance(
     mpn: str = "",
     manufacturer: str = "",
     datasheet: str = "",
+    unit: int = 1,
 ) -> sexpr.Node:
     return [
         "symbol",
         ["lib_id", sexpr.quote(lib_id)],
         ["at", _mm(x), _mm(y), "0"],
-        ["unit", "1"],
+        ["unit", str(unit)],
         ["body_style", "1"],
         ["exclude_from_sim", "no"],
         ["in_bom", "yes"],
@@ -136,7 +137,7 @@ def _component_instance(
                     "path",
                     sexpr.quote(f"/{sexpr.unquote(schematic_uuid)}"),
                     ["reference", sexpr.quote(refdes)],
-                    ["unit", "1"],
+                    ["unit", str(unit)],
                 ],
             ],
         ],
@@ -305,6 +306,19 @@ def _wire(x1: float, y1: float, x2: float, y2: float) -> sexpr.Node:
     ]
 
 
+def _no_connect(x: float, y: float) -> sexpr.Node:
+    """The X that tells ERC a pin is unconnected on purpose.
+
+    A pin the design declares NC (``NC``, ``N/C``, ``NC_CELL_31``, a bare dash)
+    is dropped by Stage 4 and so gets no wire and no label here — which is
+    exactly what an unconnected pin looks like to ERC and to kicad-happy's
+    NT-001, and the active design carried some fifty of those as findings
+    that no edit to the markdown could ever clear. The marker is how KiCad
+    distinguishes "left open by decision" from "forgot to wire it".
+    """
+    return ["no_connect", ["at", _mm(x), _mm(y)], ["uuid", _new_uuid()]]
+
+
 def _label(net_name: str, x: float, y: float, rot: float = 0) -> sexpr.Node:
     return [
         "label",
@@ -402,12 +416,53 @@ def _component_grid(
     KiCad read the overlapping pins as wired together, shorting unrelated nets.
     """
     layout = []
-    for i, refdes in enumerate(components.keys()):
+    for i, key in enumerate(components):
         col, row = i % cols, i // cols
         layout.append(
-            (refdes, _snap(origin_x + col * cell_w), _snap(origin_y + row * cell_h))
+            (key, _snap(origin_x + col * cell_w), _snap(origin_y + row * cell_h))
         )
     return layout
+
+
+def _placements(components: dict, units_by_lib_id: dict[str, dict[int, list[dict]]]) -> list[tuple[str, int]]:
+    """Every (refdes, unit) that gets its own symbol instance and grid cell.
+
+    A multi-unit symbol is several bodies sharing one reference, and KiCad
+    wants each body placed separately. Counting components rather than units
+    sized the sheet for one body per part and drew exactly that — so a
+    216-pin MCU appeared as its 64-pin unit 1 and nothing else.
+    """
+    out: list[tuple[str, int]] = []
+    for refdes, comp in components.items():
+        lib_id = comp.get("lib_symbol") or ""
+        units = units_by_lib_id.get(lib_id) or {1: []}
+        for unit in sorted(units):
+            out.append((refdes, unit))
+    return out
+
+
+def _load_units(components: dict, symbols_root: Path) -> dict[str, dict[int, list[dict]]]:
+    """Pins per unit for every lib_symbol in use; a missing symbol reads as unit 1, no pins."""
+    out: dict[str, dict[int, list[dict]]] = {}
+    for comp in components.values():
+        lib_id = comp.get("lib_symbol") or ""
+        if ":" not in lib_id or lib_id in out:
+            continue
+        try:
+            out[lib_id] = loaders.load_symbol_units(lib_id, symbols_root)
+        except loaders.LibraryMiss:
+            out[lib_id] = {1: []}
+    return out
+
+
+def _all_unit_pins(units_by_lib_id: dict[str, dict[int, list[dict]]]) -> dict[str, list[dict]]:
+    """The flat per-symbol pin list the rail audit wants: every unit's pins.
+
+    The audit decides whether a rail is driven from the electrical types of the
+    pins on it. Feed it unit 1 alone and every power pin on a separate power
+    unit is invisible — which is precisely where MCU vendors put them.
+    """
+    return {lib_id: [p for unit in sorted(units) for p in units[unit]] for lib_id, units in units_by_lib_id.items()}
 
 
 def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
@@ -423,7 +478,9 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
     # components actually need, and a symbol that runs off the page is a symbol
     # whose pins are unreachable.
     cell_w, cell_h = _cell_size(hdm, symbols_root)
-    n = max(1, len(components))
+    units_by_lib_id = _load_units(components, symbols_root)
+    placements = _placements(components, units_by_lib_id)
+    n = max(1, len(placements))
     cols = max(1, min(6, math.ceil(math.sqrt(n))))
     rows = math.ceil(n / cols)
     sheet_w = _snap(2 * 20 * GRID_MM + cols * cell_w)
@@ -528,19 +585,10 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
 
     # Component instances + per-pin label stubs for declared nets.
     pin_net_map = _build_component_pin_net_map(hdm)
-
-    pins_by_lib_id: dict[str, list[dict]] = {}
-    for comp in components.values():
-        lib_id = comp.get("lib_symbol") or ""
-        if ":" not in lib_id or lib_id in pins_by_lib_id:
-            continue
-        try:
-            pins_by_lib_id[lib_id] = loaders.load_symbol_pins(lib_id, symbols_root)
-        except loaders.LibraryMiss:
-            pins_by_lib_id[lib_id] = []
+    pins_by_lib_id = _all_unit_pins(units_by_lib_id)
 
     stub_len = 2.54  # one grid unit; enough to clear the symbol body.
-    for refdes, x, y in _component_grid(components, cell_w, cell_h, cols):
+    for (refdes, unit), x, y in _component_grid(placements, cell_w, cell_h, cols):
         comp = components[refdes]
         lib_id = comp.get("lib_symbol") or ""
         if ":" not in lib_id:
@@ -568,17 +616,25 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
                 mpn=str(comp.get("mpn", "")),
                 manufacturer=str(comp.get("manufacturer", "")),
                 datasheet=str(comp.get("datasheet", "")),
+                unit=unit,
             )
         )
 
         component_nets = pin_net_map.get(refdes) or {}
-        if not component_nets:
+        # Physical pin numbers the design declares not-connected (Stage 5 writes
+        # them as ``no_connect_pins``). A pin that is both NC and on a net is a
+        # contradiction upstream; the net wins here, because a wire that exists
+        # is the safer thing to show.
+        nc_pins = {str(p) for p in (comp.get("no_connect_pins") or [])}
+        if not component_nets and not nc_pins:
             continue
-        for pin in pins_by_lib_id.get(lib_id, []):
+        for pin in units_by_lib_id.get(lib_id, {}).get(unit, []):
             net_name = component_nets.get(pin["number"])
-            if not net_name:
-                continue
             tip_x, tip_y = _pin_absolute_tip(x, y, pin)
+            if not net_name:
+                if pin["number"] in nc_pins:
+                    node.append(_no_connect(_snap(tip_x), _snap(tip_y)))
+                continue
             end_x, end_y = _pin_stub_endpoint(tip_x, tip_y, pin["rot"], stub_len)
             node.append(_wire(tip_x, tip_y, end_x, end_y))
             node.append(_label(net_name, end_x, end_y, rot=pin["rot"]))
@@ -606,15 +662,7 @@ def flagged_nets(hdm: dict, *, symbols_root: Path) -> list[str]:
     """The nets this emitter puts a PWR_FLAG on. Recorded so Stage 8 can tell an
     unsourced rail apart from one whose source it simply cannot see."""
     pin_net_map = _build_component_pin_net_map(hdm)
-    pins_by_lib_id: dict[str, list[dict]] = {}
-    for comp in (hdm.get("components") or {}).values():
-        lib_id = comp.get("lib_symbol") or ""
-        if ":" not in lib_id or lib_id in pins_by_lib_id:
-            continue
-        try:
-            pins_by_lib_id[lib_id] = loaders.load_symbol_pins(lib_id, symbols_root)
-        except loaders.LibraryMiss:
-            pins_by_lib_id[lib_id] = []
+    pins_by_lib_id = _all_unit_pins(_load_units(hdm.get("components") or {}, symbols_root))
     return _undriven_power_nets(hdm, pin_net_map, pins_by_lib_id)
 
 
