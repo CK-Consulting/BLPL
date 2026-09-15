@@ -48,6 +48,10 @@ type Props = {
 
 export function StageRunner({ projectId, board, onFinished }: Props) {
   const [mode, setMode] = useState<"single" | "pipeline" | "panel">("single");
+  // Pipeline scope on a multi-board project: the board selected above, or every
+  // board in turn followed by the cross-board check. A pipeline run is about
+  // one board unless it says otherwise, and the run's label says which.
+  const [scope, setScope] = useState<"board" | "all">("board");
   const [stage, setStage] = useState("doctor");
   const [from, setFrom] = useState("stage0");
   const [to, setTo] = useState("stage8");
@@ -75,8 +79,10 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
     setExitCode(null);
     setRunning(true);
 
+    const allBoards = mode === "pipeline" && board !== null && scope === "all";
+    const where = allBoards ? " (all boards)" : board ? ` (${board})` : "";
     const label =
-      mode === "single" ? stage : mode === "panel" ? "review panel" : `${from}→${to}`;
+      (mode === "single" ? stage : mode === "panel" ? "review panel" : `${from}→${to}`) + where;
     // The stages this run will announce, so the progress panel knows what it is
     // waiting for before the first header arrives.
     setRanStages(
@@ -90,7 +96,7 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
         : mode === "panel"
           ? `/api/projects/${projectId}/review-panel`
           : `/api/projects/${projectId}/pipeline?from_stage=${from}&to_stage=${to}`,
-      board,
+      allBoards ? "all" : board,
     );
 
     try {
@@ -155,7 +161,38 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
           {running && <button onClick={stop}>Stop</button>}
         </div>
       ) : (
+        <div className="panel">
+          <p className="muted small">
+            {board === null ? (
+              <>Runs the stages in order for this board; each stage's artifacts replace the last run's.</>
+            ) : scope === "all" ? (
+              <>
+                Runs the stages in order for <strong>every board</strong> in <code>project.md</code>,
+                one after another, then the cross-board check that compares the mates pin by
+                pin. One entry in run history, one log.
+              </>
+            ) : (
+              <>
+                Runs the stages in order for <strong>{board}</strong> only. The other boards are
+                separate runs — pick each one above, or choose <em>all boards</em> here. The
+                cross-board check runs only after an all-boards run or <code>blpl crossboard</code>.
+              </>
+            )}
+          </p>
         <div className="row wrap">
+          {board !== null && (
+            <>
+              <label className="muted">board</label>
+              <select
+                value={scope}
+                onChange={(e) => setScope(e.target.value as "board" | "all")}
+                disabled={running}
+              >
+                <option value="board">{board}</option>
+                <option value="all">all boards, then cross-board check</option>
+              </select>
+            </>
+          )}
           <label className="muted">from</label>
           <select value={from} onChange={(e) => setFrom(e.target.value)} disabled={running}>
             {PIPELINE_STAGES.map((s) => (
@@ -170,6 +207,7 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
           </select>
           <button onClick={run} disabled={running}>{running ? "Running…" : "Run pipeline"}</button>
           {running && <button onClick={stop}>Stop</button>}
+        </div>
         </div>
       )}
 

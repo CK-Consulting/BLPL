@@ -112,6 +112,17 @@ def test_running_the_whole_pipeline_needs_a_board_too(unlocked) -> None:
     assert "board" in str(r.json().get("detail", "")).lower()
 
 
+def test_all_boards_is_a_pipeline_scope_only_a_multi_board_project_has(unlocked) -> None:
+    """`board=all` runs every board and then the cross-board check, as the CLI
+    does. A single-board project has no 'all' and says so rather than running
+    its one board under a misleading label."""
+    unlocked.post("/api/projects", json={"id": "single"})
+    unlocked.put("/api/projects/single/files/design.md", json={"content": "# one\n"})
+    r = unlocked.post("/api/projects/single/pipeline?from_stage=stage5&to_stage=stage8&board=all")
+    assert r.status_code == 400
+    assert "single-board" in str(r.json().get("detail", ""))
+
+
 def test_the_review_panel_needs_a_board(unlocked) -> None:
     """The panel reads fixed artifact names out of .pipeline. Unqualified, it
     finds nothing on a multi-board project and reports there is nothing to

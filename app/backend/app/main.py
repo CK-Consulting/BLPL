@@ -4341,7 +4341,26 @@ async def run_pipeline(
     # Without it "run the pipeline" is the one control on a multi-board project
     # that cannot work, while each stage individually can. Asked before the
     # provider lookup, for the same reason as the panel above.
-    resolved = _resolve_board(proj, board)
+    #
+    # `all` is the one name that is not a board: on a multi-board project it
+    # runs the range for every board in manifest order and then the cross-board
+    # check, exactly as `blpl run --board all` does. A pipeline run is otherwise
+    # about ONE board, and the run's label says which.
+    every_board = False
+    if board == "all":
+        try:
+            man = project_manifest.discover(proj)
+        except project_manifest.ManifestError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if man.implicit:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{proj.name} is a single-board project; there is no 'all' to run",
+            )
+        every_board = True
+        resolved = "all"
+    else:
+        resolved = _resolve_board(proj, board)
 
     env = dict(os.environ)
     lo, hi = _PIPELINE_STAGES.index(from_stage), _PIPELINE_STAGES.index(to_stage)
@@ -4360,7 +4379,9 @@ async def run_pipeline(
     if resolved is not None:
         cmd += ["--board", resolved]
     label = f"pipeline {from_stage}→{to_stage}"
-    if resolved is not None:
+    if every_board:
+        label += " (all boards)"
+    elif resolved is not None:
         label += f" ({resolved})"
     return _start_run(session, user, project_id, label, cmd, env)
 

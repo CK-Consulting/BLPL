@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { duration } from "./RunHistory";
+import { duration, splitBoard } from "./RunHistory";
 import { parseTimestamp, stamp } from "../time";
 import { classify } from "../runlog";
 
@@ -97,5 +97,21 @@ describe("one format across every panel", () => {
   it("shows an expiry as a full instant, not a bare day", () => {
     // "8/30/2026" leaves the reader guessing which hour an invitation dies.
     expect(stamp("2026-08-30T23:59:59+00:00")).toBe("2026-08-30_235959Z");
+  });
+});
+
+
+describe("the board a run was about", () => {
+  it("is split off the kind so it reads as scope, not name", () => {
+    expect(splitBoard("stage6 (core)")).toEqual({ kind: "stage6", board: "core" });
+    expect(splitBoard("pipeline stage0→stage8 (all boards)")).toEqual({
+      kind: "pipeline stage0→stage8",
+      board: "all boards",
+    });
+  });
+
+  it("leaves a single-board project's runs alone", () => {
+    expect(splitBoard("stage6")).toEqual({ kind: "stage6", board: null });
+    expect(splitBoard("pipeline stage0→stage8")).toEqual({ kind: "pipeline stage0→stage8", board: null });
   });
 });

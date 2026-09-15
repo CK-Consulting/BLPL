@@ -5,6 +5,18 @@ import { Verbosity, classifyAll } from "../runlog";
 import { RunLog } from "./RunLog";
 
 /**
+ * A run's kind carries the board it was about in a trailing parenthesis —
+ * "stage6 (core)", "pipeline stage0→stage8 (all boards)" — because the record
+ * predates boards and the backend appended rather than adding a column. Split
+ * it here so the board reads as what it is: the scope of the run, not part of
+ * its name. A single-board project's runs carry no parenthesis and get none.
+ */
+export function splitBoard(kind: string): { kind: string; board: string | null } {
+  const m = /^(.*?)\s+\(([^()]+)\)$/.exec(kind);
+  return m ? { kind: m[1], board: m[2] } : { kind, board: null };
+}
+
+/**
  * The durable record behind the stage runner: every run this project has ever
  * made, with its log one click away. A run that is still going can be reopened
  * from here — full replay, then the live tail — which is what makes a browser
@@ -99,7 +111,12 @@ export function RunHistory({ projectId, reloadToken }: Props) {
         {runs.map((r) => (
           <li key={r.id}>
             <button className={`runrow ${open === r.id ? "on" : ""}`} onClick={() => view(r)}>
-              <span className="run-kind">{r.kind}</span>
+              <span className="run-kind">{splitBoard(r.kind).kind}</span>
+              {splitBoard(r.kind).board && (
+                <span className="chip" title="the board this run was about">
+                  {splitBoard(r.kind).board}
+                </span>
+              )}
               <span className="muted">{stamp(r.started_at)}</span>
               <span className="muted">{duration(r)}</span>
               {statusBadge(r)}
