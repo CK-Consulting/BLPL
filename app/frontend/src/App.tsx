@@ -283,7 +283,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                   highlight={highlight}
                 />
               )}
-              {tab === "preflight" && <Preflight projectId={selected} reloadToken={reloadToken} />}
+              {tab === "preflight" && (
+                <Preflight projectId={selected} board={board} reloadToken={reloadToken} />
+              )}
               {tab === "edit" && (
                 <FileView
                   projectId={selected}

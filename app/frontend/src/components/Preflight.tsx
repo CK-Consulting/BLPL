@@ -16,6 +16,13 @@ import { LaunchKicad } from "./LaunchKicad";
  * and twenty copies of the same sentence reads as twenty problems. And the
  * *fix* is shown, not hidden behind a click: knowing a table was discarded is
  * only half an answer, and the other half is what to rename.
+ *
+ * A multi-board project answers two questions instead of one: what each
+ * board's markdown would lose, and what happens where the boards plug together.
+ * The second is the one no per-board check can reach — a pin-for-pin swap
+ * between two receptacles — so it is shown first, and the board selected above
+ * comes next; the others follow, because a swap at the far end of a cable is
+ * a finding about both boards.
  */
 
 type Finding = {
@@ -39,19 +46,50 @@ type Report = {
   findings: Finding[];
 };
 
+type CrossFinding = {
+  kind: string;
+  severity: "error" | "warning" | "info";
+  configuration: string;
+  message: string;
+  mate: string;
+  pin: string;
+};
+
+type CrossReport = {
+  blocked: boolean;
+  checked_configurations: string[];
+  findings: CrossFinding[];
+};
+
+type MultiReport = {
+  multi_board: true;
+  boards: Record<string, Report>;
+  crossboard: CrossReport | null;
+  crossboard_ready: string[];
+  crossboard_missing: string[];
+};
+
+type Payload = Report | MultiReport;
+
+function isMulti(p: Payload): p is MultiReport {
+  return (p as MultiReport).multi_board === true;
+}
+
 export function Preflight({
   projectId,
+  board,
   reloadToken,
 }: {
   projectId: string;
+  board?: string | null;
   reloadToken: number;
 }) {
-  const [report, setReport] = useState<Report | null>(null);
+  const [report, setReport] = useState<Payload | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
     setReport(null);
-    getJSON<Report>(`/api/projects/${projectId}/preflight`)
+    getJSON<Payload>(`/api/projects/${projectId}/preflight`)
       .then((r) => {
         setReport(r);
         setError("");
@@ -62,6 +100,96 @@ export function Preflight({
   if (error) return <div className="pad danger-h">Preflight failed: {error}</div>;
   if (!report) return <div className="muted pad">Reading your markdown…</div>;
 
+  if (isMulti(report)) {
+    // Selected board first; the rest in manifest order.
+    const names = Object.keys(report.boards);
+    const ordered = board && names.includes(board) ? [board, ...names.filter((n) => n !== board)] : names;
+    return (
+      <div className="reports">
+        <CrossBoard report={report} />
+        {ordered.map((name) => (
+          <BoardReport key={name} report={report.boards[name]} title={name} />
+        ))}
+      </div>
+    );
+  }
+
+  if (!report.summary) {
+    // A shape this panel does not know. Say so rather than throwing inside
+    // render, which leaves the whole tab blank with the reason in a console.
+    return (
+      <div className="pad danger-h">
+        Preflight returned a report this panel cannot read (no summary). Run{" "}
+        <code>blpl doctor</code> from the command line for the full output.
+      </div>
+    );
+  }
+
+  return (
+    <div className="reports">
+      <BoardReport report={report} />
+    </div>
+  );
+}
+
+function CrossBoard({ report }: { report: MultiReport }) {
+  const x = report.crossboard;
+  const bySeverity = { error: 0, warning: 0, info: 0 };
+  for (const f of x?.findings ?? []) bySeverity[f.severity] = (bySeverity[f.severity] ?? 0) + 1;
+  const missing = report.crossboard_missing;
+
+  return (
+    <section className="report-block">
+      <h3>Where the boards meet</h3>
+      {!x ? (
+        <p className="muted">
+          No cross-board check yet: run Stage 0 for {missing.length ? missing.join(", ") : "each board"}{" "}
+          and the mates in <code>project.md</code> are compared pin by pin.
+        </p>
+      ) : (
+        <>
+          <div className={`fab-banner ${x.blocked ? "danger" : "ok"}`}>
+            {x.blocked ? (
+              <>
+                <strong>{bySeverity.error} mate error(s).</strong> Facing pins carry different
+                signals — this is the one that puts smoke in the room. Configurations checked:{" "}
+                {x.checked_configurations.join(", ")}.
+              </>
+            ) : (
+              <>
+                <strong>Every declared mate lines up.</strong> Configurations checked:{" "}
+                {x.checked_configurations.join(", ")}.
+                {bySeverity.warning > 0 && ` ${bySeverity.warning} thing(s) worth a look below.`}
+              </>
+            )}
+          </div>
+          {missing.length > 0 && (
+            <p className="muted small">
+              Not yet checked (no Stage 0 artifact): {missing.join(", ")}.
+            </p>
+          )}
+          {x.findings.filter((f) => f.severity !== "info").length > 0 && (
+            <ul className="finding-list">
+              {x.findings
+                .filter((f) => f.severity !== "info")
+                .map((f, i) => (
+                  <li key={i} className={f.severity === "error" ? "danger-h" : undefined}>
+                    <strong>{f.kind}</strong>
+                    {f.mate && <span className="muted small"> — {f.mate}{f.pin ? ` pin ${f.pin}` : ""}</span>}
+                    <span className="muted small"> [{f.configuration}]</span>
+                    <br />
+                    {f.message}
+                  </li>
+                ))}
+            </ul>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function BoardReport({ report, title }: { report: Report; title?: string }) {
   const s = report.summary;
   const groups = new Map<string, Finding[]>();
   for (const f of report.findings) {
@@ -71,7 +199,8 @@ export function Preflight({
   }
 
   return (
-    <div className="reports">
+    <>
+      {title && <h2 className="report-board">{title}</h2>}
       <div className={`fab-banner ${report.ok ? "ok" : "danger"}`}>
         {report.ok ? (
           <>
@@ -149,6 +278,6 @@ export function Preflight({
           <p className="muted small">{findings[0].fix}</p>
         </section>
       ))}
-    </div>
+    </>
   );
 }
