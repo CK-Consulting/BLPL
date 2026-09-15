@@ -1044,3 +1044,31 @@ def test_an_explicit_symbol_on_a_not_placed_row_is_still_checked(tmp_path: Path)
     report = doctor.run(proj, symbols_root=tmp_path / "empty")
     (hit,) = [f for f in report.findings if f.code == "DOC-015"]
     assert "PCM_Elektuur_1:BAT_RTC" in hit.summary
+
+
+def test_a_board_still_sees_the_projects_own_libraries(tmp_path: Path) -> None:
+    """libraries/ is project-scoped. Run for one board of a multi-board project,
+    doctor must look there — rooting it at the board directory instead made
+    every hand-drawn part on every sub-board read as missing."""
+    (tmp_path / "project.md").write_text("## Boards\n\n- core\n- sb\n")
+    lib = tmp_path / "libraries"
+    (lib / "symbols").mkdir(parents=True)
+    (lib / "footprints" / "mine.pretty").mkdir(parents=True)
+    (lib / "symbols" / "mine.kicad_sym").write_text(
+        '(kicad_symbol_lib (version 20211014) (generator x) (symbol "PART" (pin passive line '
+        '(at 0 0 0) (length 2.54) (name "1" (effects (font (size 1 1)))) (number "1" (effects (font (size 1 1)))))))'
+    )
+    (lib / "footprints" / "mine.pretty" / "PART.kicad_mod").write_text('(footprint "PART" (layer "F.Cu"))')
+    (tmp_path / "sb").mkdir()
+    (tmp_path / "sb" / "sb.md").write_text(
+        "## Parts\n\n| Ref | MPN | Package | Symbol |\n|---|---|---|---|\n"
+        "| U9 | X | mine:PART | mine:PART |\n"
+        "## U9 pinout\n\n| Pin | Signal |\n|---|---|\n| 1 | A |\n"
+    )
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "core.md").write_text("# core\n")
+    codes = {f.code for f in doctor.run(tmp_path, board="sb").findings}
+    assert "DOC-010" not in codes and "DOC-015" not in codes
+    # The wrong call, for contrast: the board directory has no libraries/.
+    wrong = {f.code for f in doctor.run(tmp_path / "sb").findings}
+    assert {"DOC-010", "DOC-015"} <= wrong

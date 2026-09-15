@@ -4220,7 +4220,12 @@ def preflight(project_id: str, user: User = Depends(require_onboarded),
         for b in (x.name for x in man.boards):
             bdir = project_manifest.board_dir(proj, man, b)
             if bdir.is_dir():
-                per_board[b] = doctor.run(bdir).to_dict()
+                # The project, qualified by board — not the board directory as
+                # a project. libraries/ and the vendored modules are scoped to
+                # the project, so a doctor rooted at core/ could not find the
+                # project's own symbol library and reported every hand-drawn
+                # part on every sub-board as missing.
+                per_board[b] = doctor.run(proj, board=b).to_dict()
             art = project_manifest.artifact_path(
                 proj, "design_artifact.deterministic", board=b
             )
