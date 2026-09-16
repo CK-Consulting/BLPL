@@ -126,6 +126,12 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
 
   return (
     <div className="panel">
+      {board !== null && (
+        <div className="active-board-line" title="Every run from this panel is about this board">
+          <span className="muted small">Running against</span>{" "}
+          <span className="active-board-name">{board}</span>
+        </div>
+      )}
       <div className="seg">
         <button className={mode === "single" ? "on" : ""} disabled={running} onClick={() => setMode("single")}>
           Single stage

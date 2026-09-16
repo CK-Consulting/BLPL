@@ -826,3 +826,13 @@ header .kicad-launch { margin-left: .4rem; }
 .policy-consent { display: flex; gap: .6rem; align-items: flex-start; font-size: 14px; line-height: 1.5; color: #e6ebf1; background: #10141b; border: 1px solid #414a57; border-radius: 8px; padding: .7rem .8rem; }
 .policy-consent input { margin-top: .25rem; }
 .policy-panel { display: flex; flex-direction: column; gap: .9rem; }
+
+/* The active board: one colour, used for exactly this, everywhere it appears.
+   Bright on purpose — the whole point is that nobody runs a stage without
+   knowing which board it is about. */
+.active-board { display: inline-flex; align-items: center; gap: .5rem; padding: .2rem .35rem .2rem .7rem; border-radius: 8px; background: #ffd400; color: #111; font-weight: 700; }
+.active-board-label { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+.active-board select { background: #111; color: #ffd400; border: 1px solid #111; border-radius: 6px; font-weight: 700; font-family: ui-monospace, monospace; padding: .2rem .4rem; }
+.active-board-line { display: flex; align-items: center; gap: .4rem; margin-bottom: .5rem; }
+.active-board-name { background: #ffd400; color: #111; font-weight: 700; font-family: ui-monospace, monospace; padding: .1rem .5rem; border-radius: 6px; }
+.board-item.on { border-left: 3px solid #ffd400; padding-left: calc(.45rem - 3px); }

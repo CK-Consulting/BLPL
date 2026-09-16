@@ -15,6 +15,7 @@ import { KicadFileView } from "./components/KicadFileView";
 import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
 import { Preflight } from "./components/Preflight";
+import { ActiveBoard } from "./components/ActiveBoard";
 import { ModuleLibrary } from "./components/ModuleLibrary";
 import { ReleasePanel } from "./components/ReleasePanel";
 import { DiffView } from "./components/DiffView";
@@ -124,6 +125,12 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
           ))}
         </select>
         {selected && <ProjectSettings projectId={selected} />}
+        {/* The board every tab below is about, where the eye lands first. On a
+            project with seven boards "which one am I building" is the question
+            behind every stage run, and a highlighted item in the rail did not
+            answer it loudly enough. */}
+        {selected && <ActiveBoard projectId={selected} board={board} onBoard={setBoard} />}
+        <span className="spacer" />
         <LaunchKicad className="link kicad-launch" />
         {(() => {
           const cur = projects.find((p) => p.id === selected);
@@ -142,7 +149,6 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
             refresh().then(() => setSelected(id));
           }}
         />
-        <span className="spacer" />
         <span className="kicad" title="KiCad running server-side, in the container">
           {/* Named, not bare: "10.0.0" alone reads as an app version. */}
           {kicad ? `KiCad ${kicad}` : "KiCad: not found"}

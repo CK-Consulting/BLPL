@@ -4157,7 +4157,14 @@ async def run_stage(
         activity.RAN,
         stage_name if resolved is None else f"{stage_name} ({resolved})",
     )
-    return _start_run(session, user, project_id, stage_name, cmd, env)
+    # The run record carries the board the same way the activity log does:
+    # a single-stage run used to be recorded as bare "stage1", so run history
+    # could not say which of seven boards it had built.
+    return _start_run(
+        session, user, project_id,
+        stage_name if resolved is None else f"{stage_name} ({resolved})",
+        cmd, env,
+    )
 
 
 @app.post("/api/projects/{project_id}/release")
