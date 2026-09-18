@@ -101,7 +101,8 @@ something from earlier — "the pinmap that worked", "before we changed the rail
 — look it up with file_history and read_file_version instead of saying it is no \
 longer in front of you. This conversation may have been summarised; the history \
 has not, and quoting the committed value beats reconstructing it.
-- You cannot write files. To change one, call propose_file_edit; the user sees \
+- You cannot write files. To change one, call propose_file_edit (any design document in \
+the project, including a board's own directory such as core/core.md); the user sees \
 your change as a diff and accepts or rejects it. Propose the complete new file \
 content, not a fragment. Say in the rationale what you changed and why.
 - When the user is deciding something — which part, which pinout, whether a \
@@ -425,8 +426,20 @@ def apply_proposal(
     destroy work nobody agreed to lose, and a three-way merge here would be
     guessing. Refusing sends the assistant back to re-read — cheap, and correct.
     """
-    target = (Path(project_dir) / proposal.path).resolve()
-    if target.parent != Path(project_dir).resolve():
+    root = Path(project_dir).resolve()
+    target = (root / proposal.path).resolve()
+    # Anywhere inside the project, a design document, not in a dot-directory —
+    # the same rule the propose tool applied, checked again here because the
+    # proposal was on disk in between and a file on disk is an input. A
+    # multi-board project's boards live in subdirectories, so "must be in the
+    # root" would refuse every edit to a board.
+    parts = Path(proposal.path).parts
+    if (
+        not target.is_relative_to(root)
+        or target == root
+        or ".." in parts
+        or any(part.startswith(".") for part in parts)
+    ):
         return False, f"invalid proposal path {proposal.path!r}"
 
     try:

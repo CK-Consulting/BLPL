@@ -501,4 +501,11 @@ project-root/
     .pipeline/                            # Pipeline outputs (gitignored)
 ```
 
-Stage 0 reads every `*.md` in the project-dir root. Keep markdown at the project root (not nested in subdirectories), or pass `--md-root` when the pipeline grows that flag.
+Stage 0 reads every `*.md` in one directory, not recursively. On a single-board
+project that is the project root. On a multi-board project (a `project.md` with
+a `## Boards` section) each board's markdown lives in a directory named after
+the board — `core/core.md`, `sb-ble/sb-ble.md` — and every stage takes
+`--board <name>`; the root holds only `project.md` and reference material.
+Edit the board's own document, in its own directory: `propose_file_edit`
+accepts any design document in the project, and an edit to a sub-board
+belongs in that sub-board's file, never in a root file describing it.

@@ -12,7 +12,10 @@ which is the kind of friction that quietly ends projects.
 Every project has a chat panel that can read its design documents and pipeline
 artifacts, look parts up, and walk a BOM line by line. It never writes a file
 directly. An edit arrives as a **proposal** — a diff you accept or reject —
-recorded under `.blpl/proposals/` with the SHA of the file it was based on. If
+recorded under `.blpl/proposals/` with the SHA of the file it was based on. Any
+design document in the project can be proposed, including a board's own
+directory on a multi-board project (`sb-ble/sb-ble.md`); the app's own
+directories (`.pipeline/`, `.blpl/`) and non-design files cannot. If
 that file changed since, accepting is refused rather than merged, because the
 alternative is an assistant quietly overwriting an edit you were in the middle of.
 

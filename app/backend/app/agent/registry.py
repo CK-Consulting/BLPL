@@ -134,12 +134,31 @@ def _read_text(target: Path) -> str:
     return target.read_text(encoding="utf-8", errors="replace")
 
 
+def _rel(ctx: ToolContext, target: Path) -> str:
+    """A resolved project path as the project-relative string every record
+    keys on — the read-hash map, the proposal, the message back to the model.
+    One spelling, so ``core/core.md`` read and ``core/core.md`` proposed meet."""
+    return target.relative_to(ctx.project_dir.resolve()).as_posix()
+
+
 def _project_file(ctx: ToolContext, name: str) -> Path:
-    if not name or "/" in name or "\\" in name or name.startswith("."):
-        raise ToolDenied(f"{name!r} must be a bare filename in the project root")
-    target = (ctx.project_dir / name).resolve()
-    if target.parent != ctx.project_dir.resolve():
-        raise ToolDenied(f"{name!r} must be a bare filename in the project root")
+    """Resolve a path for *writing*: anywhere inside the project, design
+    documents only.
+
+    Writes used to be held to bare filenames in the project root. That was a
+    reasonable boundary when a project was one directory of markdown; a
+    multi-board project keeps each board's design in its own directory, and
+    the rule made every sub-board unwritable to the assistant working on it —
+    which it reported as "restricted by the workbench" and then worked around.
+    The boundary that matters is the project (the sandbox's, checked again at
+    accept time) and the file type (a design document, not a datasheet or a
+    pipeline artifact), so those are what is checked. Dot-directories stay
+    off limits: .pipeline/, .blpl/ and .git/ are the app's, not the design's.
+    """
+    target = _readable_file(ctx, name)
+    rel = _rel(ctx, target)
+    if any(part.startswith(".") for part in Path(rel).parts):
+        raise ToolDenied(f"{name!r} is inside a hidden directory, which is not part of the design")
     if target.suffix.lower() not in EDITABLE_SUFFIXES:
         raise ToolDenied(
             f"{name!r} is not an editable design document ({', '.join(sorted(EDITABLE_SUFFIXES))})"
@@ -266,10 +285,12 @@ async def _read_file(ctx: ToolContext, args: dict) -> str:
     if not target.is_file():
         raise FileNotFoundError(f"no file {args.get('path')!r} in this project")
     text = _read_text(target)
-    # Keyed by the path as given, so a later proposal for the same file finds
-    # the hash of the bytes that were actually read. Root-level documents — the
-    # only ones a proposal can target — key the same way they always did.
-    ctx.read_shas[target.name] = sha_of(text)
+    # Keyed by the project-relative path, so a later proposal for the same file
+    # finds the hash of the bytes that were actually read — and a read of
+    # sb-ble/board.md can never anchor an edit of sb-lora/board.md, which a
+    # bare-filename key would have allowed the moment two boards used the
+    # same document name.
+    ctx.read_shas[_rel(ctx, target)] = sha_of(text)
     return text
 
 
@@ -291,6 +312,7 @@ async def _propose_edit(ctx: ToolContext, args: dict) -> str:
     from ..chat import ProposalStore, sha_of
 
     target = _project_file(ctx, str(args.get("path", "")))
+    rel = _rel(ctx, target)
     new_content = args.get("new_content")
     if not isinstance(new_content, str):
         raise ToolDenied("new_content must be the complete new file content, as a string")
@@ -299,7 +321,7 @@ async def _propose_edit(ctx: ToolContext, args: dict) -> str:
     exists = target.is_file()
     current = target.read_text(encoding="utf-8", errors="replace") if exists else None
     if current is not None and sha_of(current) == sha_of(new_content):
-        raise ToolDenied(f"{target.name} already has exactly this content — nothing to propose")
+        raise ToolDenied(f"{rel} already has exactly this content — nothing to propose")
 
     # The base this edit claims to be built on, and it must come from an actual
     # read in this turn — never from the file itself.
@@ -318,11 +340,11 @@ async def _propose_edit(ctx: ToolContext, args: dict) -> str:
     #
     # No fallback now. If the file exists and was not read in this turn, there is
     # no honest base to anchor to and the proposal is refused.
-    prior = ctx.read_shas.get(target.name)
+    prior = ctx.read_shas.get(rel)
     if current is not None:
         if prior is None:
             raise ToolDenied(
-                f"{target.name} has not been read in this turn, so there is nothing to base an "
+                f"{rel} has not been read in this turn, so there is nothing to base an "
                 "edit on. Read it first and build the edit from what it actually contains — a "
                 "copy from earlier in the conversation may be several edits behind."
             )
@@ -331,7 +353,7 @@ async def _propose_edit(ctx: ToolContext, args: dict) -> str:
             # than at accept time means the model is told while it can still act,
             # and the proposal never exists to be accepted by mistake.
             raise ToolDenied(
-                f"{target.name} changed after you read it, so this edit is built on a version "
+                f"{rel} changed after you read it, so this edit is built on a version "
                 "that no longer exists. Read it again and rebuild the edit from the new content."
             )
         base_sha = prior
@@ -347,25 +369,25 @@ async def _propose_edit(ctx: ToolContext, args: dict) -> str:
         # because nothing conflicted. Deleting a file is a decision; undoing it
         # silently is not this tool's to make.
         raise ToolDenied(
-            f"{target.name} existed when you read it and is not a file any more — it has been "
+            f"{rel} existed when you read it and is not a file any more — it has been "
             "deleted or replaced. Proposing the old content back would undo that silently. "
             "Check what happened before deciding whether it should be recreated."
         )
     elif target.exists():
         # Never read, and something is there that is not a file. Refused rather
         # than left for apply_proposal to fail on mid-write.
-        raise ToolDenied(f"{target.name} exists and is not a file — nothing here can edit it")
+        raise ToolDenied(f"{rel} exists and is not a file — nothing here can edit it")
     else:
         base_sha = None
     proposal = ProposalStore(ctx.project_dir).create(
-        path=target.name,
+        path=rel,
         new_content=new_content,
         rationale=str(args.get("rationale", "")),
         base_sha=base_sha,
         conversation=ctx.conversation,
     )
     return (
-        f"Proposed to {'update' if exists else 'create'} {target.name} (proposal {proposal.id}). "
+        f"Proposed to {'update' if exists else 'create'} {rel} (proposal {proposal.id}). "
         "The user must accept it before anything is written; do not assume it is applied."
     )
 
@@ -1533,7 +1555,13 @@ def project_tools() -> list[ToolSpec]:
             input_schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Filename in the project root (.md/.yaml)."},
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Path relative to the project root, e.g. core/core.md or "
+                            "sb-ble/sb-ble.md (.md/.yaml). Any board's directory is writable."
+                        ),
+                    },
                     "new_content": {"type": "string", "description": "The complete new file content."},
                     "rationale": {"type": "string", "description": "What changed and why, briefly."},
                 },

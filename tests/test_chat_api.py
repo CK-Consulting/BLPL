@@ -280,9 +280,11 @@ def test_a_no_op_edit_is_refused_rather_than_queued(project) -> None:
 
 
 def test_proposals_cannot_target_files_outside_the_project(project) -> None:
-    for bad in ("../escape.md", "sub/x.md", "evil.py"):
+    # A subdirectory is fine now (that is where a board lives); outside the
+    # project and non-design files are not.
+    for bad in ("../escape.md", "evil.py", "sub/notes.txt"):
         res = _call(_ctx(project), "propose_file_edit", path=bad, new_content="x", rationale="r")
-        assert res.is_error
+        assert res.is_error, bad
 
 
 # -- history round-trip -------------------------------------------------------
@@ -996,3 +998,58 @@ def test_a_directory_in_the_way_of_a_new_file_is_refused_too(project) -> None:
     res = _call(ctx, "propose_file_edit", path="notes.md", new_content="# x\n", rationale="r")
 
     assert res.is_error and "is not a file" in res.content
+
+
+# -- proposals on a multi-board project ----------------------------------------
+
+
+def test_a_boards_own_document_can_be_proposed_and_applied(project) -> None:
+    """The restriction that made the assistant say it was 'restricted by the
+    workbench to project root files' and then edit sub-boards by other means.
+    A board's design lives in its own directory; that is where edits go."""
+    (project / "sb-ble").mkdir()
+    (project / "sb-ble" / "sb-ble.md").write_text("# sb-ble\n", encoding="utf-8")
+    ctx = _ctx(project)
+    _call(ctx, "read_project_file", path="sb-ble/sb-ble.md")
+    res = _call(
+        ctx, "propose_file_edit", path="sb-ble/sb-ble.md", new_content="# sb-ble v2\n", rationale="r"
+    )
+    assert not res.is_error, res.content
+    proposal = ProposalStore(project).pending()[0]
+    assert proposal.path == "sb-ble/sb-ble.md"
+    ok, detail = apply_proposal(proposal, project, ctx.sandbox)
+    assert ok, detail
+    assert (project / "sb-ble" / "sb-ble.md").read_text() == "# sb-ble v2\n"
+
+
+def test_a_read_of_one_boards_file_cannot_anchor_an_edit_of_anothers(project) -> None:
+    """Two boards may both keep a board.md. Keyed by bare filename, reading
+    one would have satisfied the read-before-write rule for the other, and a
+    whole-file edit built from the wrong board would have gone through."""
+    for b in ("sb-ble", "sb-lora"):
+        (project / b).mkdir()
+        (project / b / "board.md").write_text(f"# {b}\n", encoding="utf-8")
+    ctx = _ctx(project)
+    _call(ctx, "read_project_file", path="sb-ble/board.md")
+    res = _call(ctx, "propose_file_edit", path="sb-lora/board.md", new_content="# x\n", rationale="r")
+    assert res.is_error and "has not been read" in res.content
+
+
+def test_the_apps_own_directories_stay_unwritable(project) -> None:
+    (project / ".pipeline").mkdir(exist_ok=True)
+    (project / ".pipeline" / "hdm.yaml").write_text("a: 1\n", encoding="utf-8")
+    ctx = _ctx(project)
+    _call(ctx, "read_project_file", path=".pipeline/hdm.yaml")
+    res = _call(ctx, "propose_file_edit", path=".pipeline/hdm.yaml", new_content="a: 2\n", rationale="r")
+    assert res.is_error and "hidden directory" in res.content
+
+
+def test_apply_refuses_a_proposal_that_points_outside_or_into_dotdirs(project) -> None:
+    """The accept path re-checks: the proposal was a file on disk in between."""
+    ctx = _ctx(project)
+    for bad in ("../elsewhere.md", ".blpl/x.md", "."):
+        proposal = ProposalStore(project).create(
+            path=bad, new_content="x", rationale="r", base_sha=None
+        )
+        ok, detail = apply_proposal(proposal, project, ctx.sandbox)
+        assert not ok and "invalid proposal path" in detail, bad
