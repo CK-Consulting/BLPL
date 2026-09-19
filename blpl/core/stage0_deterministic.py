@@ -336,6 +336,15 @@ def _absorb_bom_table(table: _md.ParsedTable, components: dict[str, dict]) -> No
         symbol_hint = _column_lookup(row, ["Symbol"])
         part_hint = _column_lookup(row, ["Part Number", "MPN", "Part"])
         manufacturer_hint = _column_lookup(row, ["Manufacturer"])
+        # Same argument as Symbol above. The designer stated how many pins the
+        # part has; carrying it costs nothing, and dropping it makes Stage 1
+        # re-derive from the MPN alone something the document already said —
+        # for a 216-ball BGA as readily as for an 0402. It usually guesses
+        # right, which is worse than usually wrong: the one that got through
+        # was a fiducial answered as 0 pins, which is physically true, violates
+        # the BOM schema's minimum of 1, and took the whole stage down after
+        # every other row had resolved.
+        pin_count_hint = _column_lookup(row, ["Pin Count", "Pins", "Pin count"])
         comp = components.setdefault(
             ref,
             {"local_id": ref, "description": description or ref, "source_ref": source_ref},
@@ -350,6 +359,13 @@ def _absorb_bom_table(table: _md.ParsedTable, components: dict[str, dict]) -> No
             comp["part_hint"] = part_hint
         if manufacturer_hint:
             comp["manufacturer_hint"] = manufacturer_hint
+        if pin_count_hint and "pin_count_hint" not in comp:
+            try:
+                n = int(str(pin_count_hint).strip())
+            except ValueError:
+                n = 0  # prose where a number was expected; let Stage 1 decide
+            if n >= 1:
+                comp["pin_count_hint"] = n
 
 
 def _absorb_pinout_table(

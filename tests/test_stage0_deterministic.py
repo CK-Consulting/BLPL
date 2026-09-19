@@ -255,6 +255,36 @@ def test_a_symbol_column_is_absorbed_as_symbol_hint(tmp_path: Path) -> None:
     assert "symbol_hint" not in comps["R1"]
 
 
+def test_a_pin_count_column_is_absorbed_as_pin_count_hint(tmp_path: Path) -> None:
+    """The designer stated how many pins the part has. Dropping it made Stage 1
+    re-derive from the MPN alone something the document already said — for a
+    216-ball BGA as readily as for an 0402 — and it usually guessed right,
+    which is worse than usually wrong. The one that got through was a fiducial
+    answered as 0 pins: physically true, below the BOM schema's minimum of 1,
+    and it failed the whole stage after every other row had resolved."""
+    bom_md = _write(
+        tmp_path,
+        "bom.md",
+        "# BOM\n"
+        "\n"
+        "| Ref | Part Number | Package | Pin Count |\n"
+        "|-----|-------------|---------|-----------|\n"
+        "| U1   | STM32U5G9NJH6Q | TFBGA-216 | 216 |\n"
+        "| FID1 | FIDUCIAL-1MM | Fiducial | 1 |\n"
+        "| R1   | RC0402 | 0402 | |\n"
+        "| R2   | RC0402 | 0402 | two |\n",
+    )
+    artifact = s0.extract([bom_md])
+    schema.validate("design_artifact", artifact)
+    comps = {c["local_id"]: c for c in artifact["components"]}
+    assert comps["U1"]["pin_count_hint"] == 216
+    assert comps["FID1"]["pin_count_hint"] == 1
+    # An empty cell and prose where a number belongs both leave it to Stage 1
+    # rather than inventing a count or writing a zero the schema rejects.
+    assert "pin_count_hint" not in comps["R1"]
+    assert "pin_count_hint" not in comps["R2"]
+
+
 def test_any_bom_ref_anchors_a_pinout_heading_not_only_j_and_u(tmp_path) -> None:
     """A switch, a buzzer or a termination resistor has a pinout too. The J/U
     shape stays as the fallback for docs without a BOM; a Ref the BOM declares
