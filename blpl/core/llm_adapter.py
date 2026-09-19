@@ -44,6 +44,11 @@ _DEFAULT_MODELS = {
 # needs ~12k. The old 8192 cap silently truncated those responses.
 _DEFAULT_MAX_TOKENS = 16384
 
+# Three is enough for a provider having a bad moment and few enough that a
+# model which simply cannot answer this prompt fails quickly rather than
+# burning the batch three times over on every batch.
+_JSON_ATTEMPTS = 3
+
 
 class TruncatedResponse(RuntimeError):
     """The model hit its output limit mid-response, so the result is incomplete."""
@@ -58,6 +63,31 @@ class AllProvidersFailed(RuntimeError):
         self.errors = errors
         detail = "; ".join(f"{prov} → {type(e).__name__}: {e}" for prov, e in errors)
         super().__init__(f"all {len(errors)} LLM provider(s) failed — {detail}")
+
+
+def _no_content_reason(resp: object, choice: object) -> str:
+    """Why a response carried no usable content, in words.
+
+    "no content" is the symptom of several different problems and the bare
+    message named none of them. The usual one is a reasoning model that spent
+    the whole budget thinking: the request succeeded, the usage is billed, and
+    the answer was never started.
+    """
+    usage = getattr(resp, "usage", None)
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning = int(getattr(details, "reasoning_tokens", 0) or 0)
+    finish = getattr(choice, "finish_reason", None)
+    why = f"no content (finish_reason={finish!r}"
+    if reasoning:
+        why += f", {reasoning} of {getattr(usage, 'completion_tokens', 0)} completion tokens went to reasoning"
+    why += ")"
+    if finish == "length":
+        why += (
+            " — the budget ran out before the answer began; raise max_tokens, ask for"
+            " fewer items per request, or use a model that does not reason before"
+            " answering, since structured extraction gains little from it"
+        )
+    return why
 
 
 def _build_one(
@@ -282,57 +312,59 @@ class _OpenAIAdapter:
         client = OpenAI(**kwargs)  # falls back to OPENAI_API_KEY
         # OpenAI strict mode requires all properties be in `required` and no open
         # unions. We pass the schema as-is; callers are responsible for strict-compatible shapes.
-        resp = client.chat.completions.create(
-            model=model or self.model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            # Stated rather than left to the provider. A reasoning model spends
-            # this budget on thinking *before* it writes anything, so a default
-            # that is comfortable for a plain completion can be consumed
-            # entirely, and what comes back is a well-formed response whose
-            # content is null. Stage 1 asks for ~250 tokens per component and
-            # batches twelve of them, so the answer alone is ~3k.
-            max_tokens=_DEFAULT_MAX_TOKENS,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "structured_output",
-                    "schema": output_schema,
-                    "strict": True,
+        #
+        # Asked more than once, because a single unusable reply otherwise ends
+        # the whole stage. Stage 1 sends a board in batches of twelve, and a
+        # provider that answers the first five perfectly and returns prose on
+        # the sixth takes the run down with it after minutes of work — the
+        # failure observed here, where batch one came back as 6.6 kB of clean
+        # JSON and a later one did not. These are not the errors the SDK
+        # retries: the HTTP call succeeded, and what is wrong is the body.
+        last: str = ""
+        for attempt in range(1, _JSON_ATTEMPTS + 1):
+            resp = client.chat.completions.create(
+                model=model or self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                # Stated rather than left to the provider. A reasoning model
+                # spends this budget on thinking *before* it writes anything, so
+                # a default that is comfortable for a plain completion can be
+                # consumed entirely, and what comes back is a well-formed
+                # response whose content is null. Stage 1 asks for ~250 tokens
+                # per component and batches twelve, so the answer alone is ~3k.
+                max_tokens=_DEFAULT_MAX_TOKENS,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "structured_output",
+                        "schema": output_schema,
+                        "strict": True,
+                    },
                 },
-            },
-        )
-        choice = resp.choices[0]
-        content = choice.message.content
-        # Empty counts as missing. A reasoning model that runs out of budget
-        # mid-thought returns "" rather than None, which sailed past a `is None`
-        # check and died in json.loads with "Expecting value: line 1 column 1",
-        # an error about JSON that had nothing to do with the JSON.
-        if content is None or not content.strip():
-            # "no content" is the symptom of several different problems and the
-            # bare message named none of them. The usual one is a reasoning
-            # model that spent the whole budget thinking: the request succeeded,
-            # the usage is billed, and the answer was never started.
-            usage = getattr(resp, "usage", None)
-            details = getattr(usage, "completion_tokens_details", None)
-            reasoning = int(getattr(details, "reasoning_tokens", 0) or 0)
-            finish = getattr(choice, "finish_reason", None)
-            why = f"finish_reason={finish!r}"
-            if reasoning:
-                why += f", {reasoning} of {getattr(usage, 'completion_tokens', 0)} completion tokens went to reasoning"
-            hint = ""
-            if finish == "length":
-                hint = (
-                    " The budget ran out before the answer began. Raise max_tokens, "
-                    "ask for fewer items per request, or use a model that does not "
-                    "reason before answering — structured extraction gains little from it."
-                )
-            raise RuntimeError(
-                f"{model or self.model} returned no content ({why})." + hint
             )
-        return json.loads(content)
+            choice = resp.choices[0]
+            content = choice.message.content
+            # Empty counts as missing. A reasoning model that runs out of budget
+            # mid-thought returns "" rather than None, which sailed past an
+            # `is None` check and died in json.loads with "Expecting value: line
+            # 1 column 1" — an error about JSON that had nothing to do with JSON.
+            if content and content.strip():
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError as exc:
+                    # Usually a fenced block or a sentence before the object.
+                    last = (
+                        f"attempt {attempt}: reply was not JSON ({exc}); "
+                        f"it begins {content.strip()[:70]!r}"
+                    )
+                    continue
+            last = f"attempt {attempt}: {_no_content_reason(resp, choice)}"
+
+        raise RuntimeError(
+            f"{model or self.model} gave no usable JSON in {_JSON_ATTEMPTS} attempts. {last}"
+        )
 
 
 # ---------------------------------------------------------------------------
