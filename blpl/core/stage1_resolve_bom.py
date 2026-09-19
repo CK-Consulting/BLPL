@@ -236,6 +236,18 @@ def resolve(
         for c in components
         if ":" in (c.get("symbol_hint") or "")
     }
+    # Pin counts too, and for a reason the other two do not have: the model is
+    # not paraphrasing here, it is disagreeing. A fiducial is bare copper, so
+    # "0 pins" is the physically correct answer and the model gives it even when
+    # the hint in the prompt says 1 — the design counts the pad because Stage 4
+    # needs something to attach a net to, and the BOM schema requires at least
+    # one. Passing the hint through was not enough; the number the designer
+    # wrote has to win.
+    explicit_pins = {
+        c["local_id"]: c["pin_count_hint"]
+        for c in components
+        if isinstance(c.get("pin_count_hint"), int) and c["pin_count_hint"] >= 1
+    }
     # not_placed is pinned for the same reason, and it is easier to lose: it
     # has no colon, so the explicit-reference net above never catches it, and
     # the LLM "helpfully" rewrites it into a real-looking package ("Coin Cell
@@ -253,6 +265,9 @@ def resolve(
         pinned_sym = explicit_sym.get(r.get("local_id"))
         if pinned_sym:
             r["symbol_hint"] = pinned_sym
+        pinned_pins = explicit_pins.get(r.get("local_id"))
+        if pinned_pins:
+            r["pin_count"] = pinned_pins
         if r.get("local_id") in not_placed_ids:
             r["package"] = "not_placed"
             r["footprint_hint"] = None

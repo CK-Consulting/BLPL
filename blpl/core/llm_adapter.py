@@ -65,6 +65,21 @@ class AllProvidersFailed(RuntimeError):
         super().__init__(f"all {len(errors)} LLM provider(s) failed — {detail}")
 
 
+def _unfenced(text: str) -> str:
+    """``text`` with a Markdown code fence stripped, if it is wearing one.
+
+    A fenced object is the single most common near-miss — the content is right
+    and only the wrapper is wrong — and re-asking for it wastes a call and the
+    thinking that went with it.
+    """
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    body = t.split("\n", 1)[1] if "\n" in t else ""
+    end = body.rfind("```")
+    return (body[:end] if end != -1 else body).strip()
+
+
 def _no_content_reason(resp: object, choice: object) -> str:
     """Why a response carried no usable content, in words.
 
@@ -322,12 +337,29 @@ class _OpenAIAdapter:
         # retries: the HTTP call succeeded, and what is wrong is the body.
         last: str = ""
         for attempt in range(1, _JSON_ATTEMPTS + 1):
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+            if attempt > 1:
+                # Say it plainly on the retry. `response_format` is advisory on
+                # several providers — they accept the schema and answer in
+                # whatever shape they think best, and the one that prompted this
+                # replied with a Markdown report ("## Resolved BOM", then tables)
+                # three times running. Asking again identically cannot help; the
+                # model was not having a bad moment, it had decided. An explicit
+                # instruction costs one sentence and addresses the actual error.
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous reply could not be parsed as JSON. Reply with "
+                        "one JSON object and nothing else: no Markdown, no tables, no "
+                        "code fences, no commentary before or after it."
+                    ),
+                })
             resp = client.chat.completions.create(
                 model=model or self.model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
+                messages=messages,
                 # Stated rather than left to the provider. A reasoning model
                 # spends this budget on thinking *before* it writes anything, so
                 # a default that is comfortable for a plain completion can be
@@ -352,7 +384,7 @@ class _OpenAIAdapter:
             # 1 column 1" — an error about JSON that had nothing to do with JSON.
             if content and content.strip():
                 try:
-                    return json.loads(content)
+                    return json.loads(_unfenced(content))
                 except json.JSONDecodeError as exc:
                     # Usually a fenced block or a sentence before the object.
                     last = (
