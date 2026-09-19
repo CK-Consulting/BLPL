@@ -56,6 +56,30 @@ KEEP_RECENT_TURNS = 6
 
 SUMMARY_ROLE = "summary"
 
+# Characters per token, by what the characters are. Four is the usual English
+# approximation and for prose it holds. Tool results are not prose: they are
+# JSON, KiCad S-expressions, netlists, pinout tables and part numbers, none of
+# which a tokenizer packs anything like as well — and in a design conversation
+# they are the overwhelming majority of the bytes.
+#
+# Measured on the transcript that prompted this: 67,796 characters of prose
+# against 1,078,280 of tool traffic. The flat four-character rule called the
+# whole thing 266,000 tokens; the provider billed 476,000. Splitting the two
+# rates puts the estimate at 466,000, which is close enough to decide with.
+#
+# The consequence of the old number was not a slightly-off gauge. It was the
+# only guard against sending a request the provider will refuse for length,
+# reading 44% under on exactly the conversations that are in danger of it.
+_CHARS_PER_TOKEN_PROSE = 4.0
+_CHARS_PER_TOKEN_DATA = 2.4
+
+# Bounds on the correction a conversation's own billing history may apply to
+# the character estimate. Wide enough to fix a genuinely different mix, narrow
+# enough that one odd usage record — a turn that was mostly cache reads, a
+# provider that counts differently — cannot swing the decision on its own.
+_CALIBRATION_FLOOR = 0.75
+_CALIBRATION_CEILING = 2.5
+
 _PROMPT = """\
 You are compacting the earlier part of a hardware design conversation so it \
 fits in a smaller context window. Write a summary that lets the assistant \
@@ -114,15 +138,16 @@ class Plan:
         return self.tokens_after <= self.tokens_target
 
 
-def estimate(events: list[dict]) -> int:
+def estimate(events: list[dict], scale: float = 1.0) -> int:
     """Rough token count for the text of a conversation.
 
-    Four characters per token, which is the usual English approximation and is
-    wrong in both directions on JSON and part numbers. Good enough: this decides
-    whether to compact, and the cost of being slightly off is compacting one
-    turn early or late.
+    Two rates rather than one — see ``_CHARS_PER_TOKEN_DATA`` — because a design
+    conversation is mostly tool output and tool output does not tokenize like
+    English. ``scale`` is the per-conversation correction from ``calibration``,
+    applied by ``plan`` so that the trigger and the search for a cut point are
+    measured against the same ruler.
     """
-    total = 0
+    total = 0.0
     for ev in events:
         blocks = (ev.get("metadata") or {}).get("blocks") or []
         # The blocks are what actually travels, so when there are any, they are
@@ -138,14 +163,46 @@ def estimate(events: list[dict]) -> int:
             for b in blocks:
                 kind = b.get("type")
                 if kind == "text":
-                    total += len(b.get("text") or "")
+                    total += len(b.get("text") or "") / _CHARS_PER_TOKEN_PROSE
                 elif kind == "tool_use":
-                    total += len(str(b.get("input") or ""))
+                    total += len(str(b.get("input") or "")) / _CHARS_PER_TOKEN_DATA
                 elif kind == "tool_result":
-                    total += len(str(b.get("content") or ""))
+                    total += len(str(b.get("content") or "")) / _CHARS_PER_TOKEN_DATA
         else:
-            total += len(ev.get("content") or "")
-    return total // 4
+            total += len(ev.get("content") or "") / _CHARS_PER_TOKEN_PROSE
+    return int(total * scale)
+
+
+def calibration(events: list[dict], reserved: int = 0) -> float:
+    """What to multiply the character estimate by, learned from this conversation.
+
+    Every assistant turn records what the provider billed for the request that
+    produced it, and that request carried exactly the events before it. So the
+    conversation has been measuring itself all along: compare the two and the
+    ratio is this transcript's own characters-per-token, mix and all.
+
+    Nothing to compare against — a fresh conversation, or a provider that
+    reported no usage — leaves the estimate alone rather than guessing.
+    """
+    for i in range(len(events) - 1, -1, -1):
+        if events[i].get("role") != "assistant":
+            continue
+        usage = (events[i].get("metadata") or {}).get("usage") or {}
+        # ``prompt_tokens`` and nothing else. It is the size of the turn's last
+        # request — the whole prompt, cached parts included — whereas the
+        # ``input_tokens`` beside it is the turn's spend summed over every
+        # iteration of the tool loop, which on a ten-iteration turn is about ten
+        # times the size of the conversation. Records written before that field
+        # existed carry only the sum, so they do not calibrate at all rather
+        # than calibrating from the wrong number.
+        billed = int(usage.get("prompt_tokens") or 0)
+        if billed <= 0:
+            continue
+        guess = estimate(events[:i]) + reserved
+        if guess <= 0:
+            continue
+        return min(_CALIBRATION_CEILING, max(_CALIBRATION_FLOOR, billed / guess))
+    return 1.0
 
 
 def existing_summary(events: list[dict]) -> tuple[str, int]:
@@ -175,7 +232,8 @@ def plan(events: list[dict], window: int, reserved: int = 0) -> Plan:
     system prompt, the tool declarations.
     """
     budget = max(8_000, int(window * TEXT_SHARE) - reserved)
-    now = estimate(events)
+    scale = calibration(events, reserved)
+    now = estimate(events, scale)
     if now <= budget:
         return Plan(upto=0, tokens_now=now, tokens_target=budget, tokens_after=now)
 
@@ -208,12 +266,12 @@ def plan(events: list[dict], window: int, reserved: int = 0) -> Plan:
     # can be — summarise as little as will do.
     cut = candidates[0]
     for i in candidates:
-        if estimate(events[i:]) <= budget:
+        if estimate(events[i:], scale) <= budget:
             cut = i
             break
         cut = i
     return Plan(
-        upto=cut, tokens_now=now, tokens_target=budget, tokens_after=estimate(events[cut:])
+        upto=cut, tokens_now=now, tokens_target=budget, tokens_after=estimate(events[cut:], scale)
     )
 
 

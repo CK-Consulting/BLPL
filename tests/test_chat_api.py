@@ -25,6 +25,7 @@ from app.conversations import Conversation
 from app.references import FilesystemSandbox, ReferenceManifest
 from blpl.core.llm_chat import (
     Done,
+    EmptyReply,
     Msg,
     TextBlock,
     TextDelta,
@@ -313,6 +314,23 @@ def test_history_replays_tool_calls_not_just_prose(tmp_path) -> None:
     assert messages[2].content[0].tool_use_id == "t1"
 
 
+def test_stop_reason_is_persisted_with_the_assistant_message(tmp_path) -> None:
+    conv = Conversation.create(tmp_path, title="t")
+    assistant = Msg(role="assistant", content=[TextBlock("cut off mid-")], stop_reason="max_tokens")
+    persist_messages(conv, [assistant], model="m", usage=None)
+    (row,) = conv.read_all()
+    assert row["metadata"]["stop_reason"] == "max_tokens"
+
+
+def test_an_empty_reply_is_retryable_but_does_not_fall_through_the_chain() -> None:
+    """Asking the same endpoint again is the remedy; handing the same oversized
+    history to the next, usually smaller, model in the chain is not."""
+    exc = EmptyReply("openrouter-cheap", "end_turn")
+    assert chat_mod.is_transient(exc)
+    assert not chat_mod.worth_another_endpoint(exc)
+    assert "openrouter-cheap" in chat_mod.explain(exc)
+
+
 def test_a_question_nothing_answered_is_kept_for_humans_and_not_replayed(tmp_path) -> None:
     """Both halves go: the error marker, and the question it was the only reply
     to. This used to keep the question, which is benign until the failure is
@@ -350,7 +368,7 @@ class _ScriptedAdapter:
         self.endpoint = endpoint
         self._n = 0
 
-    async def stream_chat(self, messages, *, system="", tools=(), max_tokens=0):
+    async def stream_chat(self, messages, *, system="", tools=(), max_tokens=0, stable_prefix=0):
         events = _ScriptedAdapter.turns[self._n]
         self._n += 1
         for event in events:
@@ -420,7 +438,7 @@ def test_the_question_survives_a_failing_turn(chat_client, monkeypatch) -> None:
     blowing up costs the answer and never the question."""
 
     class _Exploding(_ScriptedAdapter):
-        async def stream_chat(self, messages, *, system="", tools=(), max_tokens=0):
+        async def stream_chat(self, messages, *, system="", tools=(), max_tokens=0, stable_prefix=0):
             raise RuntimeError("provider exploded")
             yield  # pragma: no cover — makes this an async generator
 

@@ -208,6 +208,10 @@ _TRANSIENT_NAMES = {
     "APITimeoutError",
     "InternalServerError",
     "RateLimitError",
+    # The model returned a well-formed stream with nothing in it. Not a
+    # property of the request: the same question asked again usually gets an
+    # answer, so the one-click retry a 529 gets is the right offer here too.
+    "EmptyReply",
 }
 
 
@@ -264,6 +268,14 @@ def worth_another_endpoint(exc: BaseException) -> bool:
     request we constructed will fail identically everywhere, and retrying those
     across four providers would turn one clear error into four slow ones.
     """
+    if isinstance(exc, llm_chat.EmptyReply):
+        # Transient, but not a reason to move down the chain. An empty reply
+        # is nearly always the request's size or the provider's mood, and the
+        # next endpoints in a chain are usually smaller models — handing them
+        # the same oversized history turns one blank minute into several
+        # slow ones. Asking this endpoint again is the remedy, and the user
+        # gets that as a one-click retry.
+        return False
     if is_transient(exc):
         return True
     text = str(exc).lower()
@@ -877,6 +889,8 @@ def persist_messages(conv: Conversation, messages: Iterable[Msg], *, model: str,
                 meta["raw_content"] = msg.raw_content
             if usage:
                 meta["usage"] = usage
+            if msg.stop_reason:
+                meta["stop_reason"] = msg.stop_reason
             conv.append("assistant", msg.text, meta)
         else:
             conv.append("tool_results", "", {"blocks": blocks})
@@ -1339,4 +1353,11 @@ def _sum_usage(usages: list[Usage]) -> dict:
         "input_tokens": sum(u.input_tokens for u in usages),
         "output_tokens": sum(u.output_tokens for u in usages),
         "cache_read_tokens": sum(u.cache_read_tokens for u in usages),
+        "cache_creation_tokens": sum(u.cache_creation_tokens for u in usages),
+        # The last request of the turn — the one that carried the most history.
+        # The sums above are what the turn *spent*, across every iteration of
+        # the tool loop, and on a ten-iteration turn that is roughly ten times
+        # the size of the conversation. Anything asking how big this
+        # conversation has become wants this number and not those.
+        "prompt_tokens": usages[-1].prompt_tokens if usages else 0,
     }

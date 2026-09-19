@@ -235,6 +235,31 @@ def test_sch_emits_wire_plus_label_per_connected_pin() -> None:
     assert "GND" in label_texts
 
 
+def test_a_derived_symbol_reports_the_pins_of_the_parent_it_extends() -> None:
+    """KiCad draws most specific part numbers as a shell over a generic body:
+    ``2N7002`` carries ``(extends "Q_NMOS_GSD")`` and no pins of its own. Reading
+    the shell alone returned an empty list, and nothing downstream treated that
+    as an error — the part was placed and drawn with no wires, no labels, and no
+    way to say a pin was NC, so every net that reached it silently lost that
+    member. On one real board that took the buzzer FET out of BUZZ_GATE and
+    BUZZ_DRV, and the review reported them as single-pin nets.
+
+    ``sch.py`` already walks the chain when it copies symbols into
+    ``lib_symbols``, which is why the schematic still opened. The two readers
+    have to agree, or the file is valid and wrong."""
+    shell = loaders.load_symbol_def("Transistor_FET:2N7002", _SYMBOLS_ROOT)
+    assert loaders.extends_of(shell) == "Q_NMOS_GSD"   # a shell, by construction
+
+    nums = {p["number"] for p in loaders.load_symbol_pins("Transistor_FET:2N7002", _SYMBOLS_ROOT)}
+    assert nums == {p["number"] for p in loaders.load_symbol_pins("Transistor_FET:Q_NMOS_GSD", _SYMBOLS_ROOT)}
+    assert len(nums) == 3
+
+
+def test_a_symbol_that_extends_nothing_is_unaffected() -> None:
+    pins = loaders.load_symbol_pins("Device:R", _SYMBOLS_ROOT)
+    assert {p["number"] for p in pins} == {"1", "2"}
+
+
 def test_sch_load_symbol_pins_returns_barrel_jack_pins() -> None:
     """Sanity check the pin-position loader used for wire stubs."""
     pins = loaders.load_symbol_pins("Connector:Barrel_Jack", _SYMBOLS_ROOT)

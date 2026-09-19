@@ -288,6 +288,13 @@ class _OpenAIAdapter:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            # Stated rather than left to the provider. A reasoning model spends
+            # this budget on thinking *before* it writes anything, so a default
+            # that is comfortable for a plain completion can be consumed
+            # entirely, and what comes back is a well-formed response whose
+            # content is null. Stage 1 asks for ~250 tokens per component and
+            # batches twelve of them, so the answer alone is ~3k.
+            max_tokens=_DEFAULT_MAX_TOKENS,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -297,9 +304,34 @@ class _OpenAIAdapter:
                 },
             },
         )
-        content = resp.choices[0].message.content
-        if content is None:
-            raise RuntimeError("openai response had no content")
+        choice = resp.choices[0]
+        content = choice.message.content
+        # Empty counts as missing. A reasoning model that runs out of budget
+        # mid-thought returns "" rather than None, which sailed past a `is None`
+        # check and died in json.loads with "Expecting value: line 1 column 1",
+        # an error about JSON that had nothing to do with the JSON.
+        if content is None or not content.strip():
+            # "no content" is the symptom of several different problems and the
+            # bare message named none of them. The usual one is a reasoning
+            # model that spent the whole budget thinking: the request succeeded,
+            # the usage is billed, and the answer was never started.
+            usage = getattr(resp, "usage", None)
+            details = getattr(usage, "completion_tokens_details", None)
+            reasoning = int(getattr(details, "reasoning_tokens", 0) or 0)
+            finish = getattr(choice, "finish_reason", None)
+            why = f"finish_reason={finish!r}"
+            if reasoning:
+                why += f", {reasoning} of {getattr(usage, 'completion_tokens', 0)} completion tokens went to reasoning"
+            hint = ""
+            if finish == "length":
+                hint = (
+                    " The budget ran out before the answer began. Raise max_tokens, "
+                    "ask for fewer items per request, or use a model that does not "
+                    "reason before answering — structured extraction gains little from it."
+                )
+            raise RuntimeError(
+                f"{model or self.model} returned no content ({why})." + hint
+            )
         return json.loads(content)
 
 

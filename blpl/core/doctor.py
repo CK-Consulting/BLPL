@@ -751,8 +751,17 @@ def run(
                 if "net class" in low or "identity" in low or (
                     "project" in low and {h.lower() for h in table.headers} >= {"field", "value"}
                 ):
+                    # Counted as used. Not by Stage 0 — by `blpl init`, which
+                    # reads them to generate project.yaml — but "used" and
+                    # "discarded" are the only two buckets the summary has, and
+                    # of the two this is the true one. Left out of both, they
+                    # fell into `seen - used` and the report told a clean
+                    # project that four of its tables had been dropped.
+                    report.tables_used += 1
                     continue
                 if "shared bus" in low:
+                    # Consumed by DOC-008, a few dozen lines below.
+                    report.tables_used += 1
                     for row in table.rows:
                         lower = {k.lower(): v for k, v in row.items()}
                         sig = (lower.get("signal") or "").strip().strip("`")

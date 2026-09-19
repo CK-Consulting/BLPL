@@ -193,6 +193,36 @@ def test_unrecognized_table_is_reported_as_discarded(tmp_path: Path) -> None:
     assert report.tables_used == 0
 
 
+def test_a_table_doctor_itself_consumes_is_not_counted_as_discarded(tmp_path: Path) -> None:
+    """The summary has two buckets, used and discarded, and these tables belong
+    in the first one. A "Shared buses" table is read a few dozen lines below by
+    DOC-008 and a "Net classes" table is read by `blpl init`; neither reaches
+    Stage 0, so neither was counted at all, so both fell into `seen - used`.
+    On a real seven-board project that put "discarded 4" on an otherwise clean
+    report — a preflight crying wolf about content it had just read."""
+    _project(
+        tmp_path,
+        design__md="""
+## Shared buses
+
+| Signal | Components | Purpose |
+|--------|------------|---------|
+| I2C_SCL | U1, U2 | system I2C |
+
+## Net classes
+
+| Class | Applies to | trace_width | clearance | via_dia | via_drill |
+|-------|-----------|-------------|-----------|---------|-----------|
+| Power | VSYS | 0.5 | 0.2 | 0.6 | 0.3 |
+""",
+    )
+    report = doctor.run(tmp_path)
+    assert "DOC-001" not in _codes(report)
+    assert report.tables_seen == 2
+    assert report.tables_used == 2
+    assert report.to_dict()["summary"]["tables_discarded"] == 0
+
+
 def test_empty_project_is_an_error(tmp_path: Path) -> None:
     report = doctor.run(tmp_path)
     assert "DOC-000" in _codes(report)

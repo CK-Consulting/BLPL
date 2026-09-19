@@ -165,7 +165,7 @@ def test_running_into_the_ceiling_teaches_it_upward(tmp_path, monkeypatch) -> No
     class Adapter:
         endpoint = Ep(name="e")
 
-        async def stream_chat(self, messages, *, system="", tools=(), max_tokens=0,
+        async def stream_chat(self, messages, *, system="", tools=(), max_tokens=0, stable_prefix=0,
                               json_schema=None):
             asked.append(max_tokens)
             # The schema is handed to the provider, not just written into the

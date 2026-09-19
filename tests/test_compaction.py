@@ -231,3 +231,98 @@ def test_the_oldest_turn_can_be_summarised_on_its_own() -> None:
     # The cut lands on the second turn's start, so the first turn is what gets
     # replaced — and the six recent exchanges are untouched.
     assert p.upto == compaction.turn_starts(events)[1]
+
+
+# ---------------------------------------------------------------------------
+# Measuring the conversation
+#
+# The estimate is the only guard against sending a request the provider will
+# refuse for its length, and it was reading 44% under on exactly the
+# conversations in danger of it: a real transcript the provider billed at
+# 476,000 tokens was estimated at 266,000, against a budget of 488,000. It sat
+# quietly under the line and was never compacted.
+# ---------------------------------------------------------------------------
+
+
+def _tool_result(chars: int) -> dict:
+    return {
+        "role": "tool_results",
+        "content": "",
+        "metadata": {"blocks": [{"type": "tool_result", "tool_use_id": "t1", "content": "x" * chars}]},
+    }
+
+
+def _prose(chars: int) -> dict:
+    return {"role": "user", "content": "", "metadata": {"blocks": [{"type": "text", "text": "x" * chars}]}}
+
+
+def test_tool_output_is_not_counted_as_though_it_were_english() -> None:
+    # Same byte count, very different token count: one is prose, the other is
+    # JSON, netlists, pinout tables and part numbers.
+    assert compaction.estimate([_tool_result(24_000)]) > compaction.estimate([_prose(24_000)])
+
+
+def test_a_transcript_that_is_mostly_tool_output_estimates_near_what_it_bills() -> None:
+    # The real proportions from the transcript that prompted this: 67,796
+    # characters of prose against 1,078,280 of tool traffic, billed at 476,000.
+    events = [_prose(67_796), _tool_result(1_078_280)]
+    assert 430_000 <= compaction.estimate(events) <= 500_000
+
+
+def test_a_conversation_calibrates_the_estimate_from_what_it_was_actually_billed() -> None:
+    events = [
+        _prose(40_000),
+        {"role": "assistant", "content": "ok", "metadata": {"usage": {"prompt_tokens": 20_000}}},
+    ]
+    # 40,000 characters of prose estimates at 10,000 tokens; the provider
+    # charged 20,000 for the request that carried them, so everything this
+    # conversation measures is scaled to match.
+    assert compaction.calibration(events) == pytest.approx(2.0)
+    assert compaction.estimate(events, compaction.calibration(events)) == pytest.approx(20_000, rel=0.01)
+
+
+def test_calibration_ignores_the_turn_total_and_only_trusts_a_single_request() -> None:
+    # input_tokens on an assistant event is the turn's spend summed over every
+    # iteration of the tool loop — on a ten-iteration turn, roughly ten times
+    # the size of the conversation. Records written before prompt_tokens
+    # existed carry only that sum, and must not calibrate from it.
+    events = [
+        _prose(40_000),
+        {"role": "assistant", "content": "ok", "metadata": {"usage": {"input_tokens": 6_000_000}}},
+    ]
+    assert compaction.calibration(events) == 1.0
+
+
+def test_calibration_stays_within_bounds_when_a_usage_record_is_odd() -> None:
+    for billed in (1, 10_000_000):
+        events = [
+            _prose(40_000),
+            {"role": "assistant", "content": "ok", "metadata": {"usage": {"prompt_tokens": billed}}},
+        ]
+        assert 0.75 <= compaction.calibration(events) <= 2.5
+
+
+def test_a_fresh_conversation_has_nothing_to_calibrate_from_and_says_so() -> None:
+    assert compaction.calibration([_prose(1_000)]) == 1.0
+    assert compaction.calibration([]) == 1.0
+
+
+def test_the_trigger_and_the_cut_search_are_measured_against_the_same_ruler() -> None:
+    # A plan whose "does the tail fit" test used a different scale from its
+    # "are we over budget" test would cut in the wrong place, or loop.
+    events = []
+    for _ in range(30):
+        events.append(_prose(2_000))
+        events.append(_tool_result(8_000))
+        events.append({"role": "assistant", "content": "ok",
+                       "metadata": {"usage": {"prompt_tokens": 160_000}}})
+    plan = compaction.plan(events, window=200_000, reserved=12_000)
+    scale = compaction.calibration(events, 12_000)
+    assert scale > 1.0                        # the correction is actually in play
+    assert plan.tokens_now > plan.tokens_target
+    assert plan.upto > 0
+    assert plan.tokens_after <= plan.tokens_target
+    # The cut search and the trigger measured the same way. Were they not, the
+    # plan would cut in the wrong place or decide it had not cut far enough.
+    assert plan.tokens_after == compaction.estimate(events[plan.upto:], scale)
+    assert plan.tokens_now == compaction.estimate(events, scale)

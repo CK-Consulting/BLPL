@@ -160,8 +160,20 @@ def _unit_and_style(sub_name: str) -> tuple[int | None, int | None]:
         return (None, None)
 
 
+def extends_of(node: sexpr.Sexp) -> str | None:
+    """The parent name in a derived symbol's ``(extends "Parent")``, if any."""
+    if not isinstance(node, list):
+        return None
+    for child in node:
+        if isinstance(child, list) and len(child) >= 2 and child[0] == "extends":
+            return sexpr.unquote(str(child[1]))
+    return None
+
+
 def load_symbol_units(
-    ref: str, symbols_root: Path | str | Sequence[Path | str]
+    ref: str,
+    symbols_root: Path | str | Sequence[Path | str],
+    _depth: int = 0,
 ) -> dict[int, list[dict]]:
     """Pin records grouped by unit: ``{1: [...], 2: [...], ...}``.
 
@@ -176,6 +188,26 @@ def load_symbol_units(
     as before: the alternate body is the same pins drawn differently.
     """
     _lib, _name, top = _load_symbol_node(ref, symbols_root)
+
+    # A derived symbol — ``(extends "Parent")`` — carries no pins of its own;
+    # the parent supplies them, and in KiCad's libraries that is how most
+    # specific part numbers are drawn (2N7002 extends Q_NMOS_GSD,
+    # BQ27441DRZR-G1A extends BQ27441-G1, PAM8302AAS extends PAM8302AAD).
+    #
+    # Reading the child alone returns no pins at all, and nothing downstream
+    # treats that as an error: the part is placed, drawn, and given no wires and
+    # no labels, so every net that reached it silently loses that member. On one
+    # real board that took the buzzer FET out of BUZZ_GATE and BUZZ_DRV, and the
+    # review reported them as single-pin nets with no hint as to why.
+    #
+    # ``sch.py`` already follows the chain when it copies symbols into
+    # ``lib_symbols``, which is why the schematic still opens. The two must
+    # agree, or the file is valid and wrong.
+    parent = extends_of(top)
+    if parent and _depth < 8:
+        lib, _, _ = ref.partition(":")
+        return load_symbol_units(f"{lib}:{parent}", symbols_root, _depth + 1)
+
     by_unit: dict[int, list[sexpr.Node]] = {}
     shared: list[sexpr.Node] = list(sexpr.find_all(top, "pin"))
     for sub in sexpr.find_all(top, "symbol"):

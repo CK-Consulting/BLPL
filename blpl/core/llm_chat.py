@@ -43,7 +43,7 @@ import json
 import os
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -129,6 +129,12 @@ class Msg:
     content: list[Block]
     raw_provider: str | None = None
     raw_content: Any = None
+    # Why the provider ended this assistant turn, in the normalized vocabulary
+    # (``end_turn``, ``max_tokens``, ``tool_use``, ...). Stamped by the loop,
+    # not the adapter, and persisted with the message: without it an empty
+    # ``stop`` and a ``length`` cutoff are indistinguishable in the transcript
+    # afterwards, which is exactly when someone wants to know which it was.
+    stop_reason: str | None = None
 
     @staticmethod
     def user(text: str) -> Msg:
@@ -210,7 +216,24 @@ class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
+    # Tokens written to cache this request, billed at 1.25x (5-minute TTL) or
+    # 2x (one hour). Recorded because it is the only way to tell a healthy loop
+    # from a broken one: reads without writes means the prefix is stable and
+    # being reused, writes the size of the whole conversation on every request
+    # means something upstream is rewriting it and the cache never lands.
+    cache_creation_tokens: int = 0
     type: str = "usage"
+
+    @property
+    def prompt_tokens(self) -> int:
+        """Everything the model read this request, cached or not.
+
+        ``input_tokens`` alone is the *uncached remainder*, which collapses to a
+        few thousand once caching works — and reading it as the request size is
+        how a conversation gets to half a million tokens while every meter on
+        the wall says it is small.
+        """
+        return self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
 
     def to_dict(self) -> dict:
         return {
@@ -219,6 +242,7 @@ class Usage:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
         }
 
 
@@ -252,6 +276,118 @@ class ToolDecl:
     name: str
     description: str
     input_schema: dict
+
+
+# ---------------------------------------------------------------------------
+# Prompt caching
+# ---------------------------------------------------------------------------
+#
+# A design conversation is the worst possible shape for an uncached provider.
+# The API is stateless, so every request carries the whole history; a turn that
+# calls tools sends that history again on every iteration; and the history here
+# is mostly tool results — file dumps, netlists, pinout tables — which is the
+# bulk of the bytes and the part that never changes again once written.
+#
+# Measured on one real conversation before any of this existed: 88 tool results,
+# 838,000 characters, and a ten-iteration turn that billed 6,063,596 input
+# tokens because the same half-million-token prefix was re-read ten times at
+# full price. The whole hour came to roughly $100.
+#
+# Caching is a prefix match: the key is the exact bytes up to each breakpoint,
+# so a single byte changing anywhere invalidates everything after it. Render
+# order is tools -> system -> messages, which is why the breakpoint on the
+# system block covers the tool declarations too, and why nothing dynamic may be
+# interpolated into either. Three breakpoints, at the three places this
+# conversation actually stops changing:
+#
+#   1. system (+ tools)      one hour   frozen for the life of the process
+#   2. the settled history   one hour   everything that was already there when
+#                                       this turn began — never edited again,
+#                                       and the piece that has to survive the
+#                                       user thinking for twenty minutes
+#   3. the turn's tail       5 minutes  moves with each tool-loop iteration, so
+#                                       it is rewritten constantly and wants the
+#                                       cheaper write
+#
+# Ordering matters: entries with the longer TTL must come first, which the list
+# above satisfies by construction. The fourth slot is deliberately unspent —
+# a breakpoint costs a write, and there is no fourth place here that stops
+# changing.
+_MAX_BREAKPOINTS = 4
+
+# One hour, not five minutes, for the two stable points. The write costs 2x
+# instead of 1.25x and needs three reads to pay for itself; a single tool-loop
+# turn does ten, and the observed gaps between turns in a real session were 18,
+# 21 and 31 minutes — every one of which would have expired a five-minute entry
+# and paid to read the whole conversation cold again.
+_TTL_STABLE = "1h"
+
+# The rolling breakpoint takes the provider's default five minutes, expressed by
+# sending no TTL at all rather than a literal: the default is documented, the
+# spelling of the literal is not, and a rejected request is a worse outcome than
+# a slightly shorter-lived entry.
+_TTL_ROLLING = None
+
+# Where ``cache_control`` may be attached. Reasoning blocks are the reason this
+# is a list rather than "the last block": they come back inside an assistant
+# turn, they must be replayed byte-for-byte, and annotating one is not worth
+# finding out whether the provider tolerates it.
+_CACHEABLE_BLOCKS = frozenset({"text", "image", "document", "tool_use", "tool_result"})
+
+
+def cache_points(count: int, stable_prefix: int) -> dict[int, str | None]:
+    """{message index: TTL} for the messages that should carry a breakpoint.
+
+    ``stable_prefix`` is how many leading messages were already settled when the
+    turn began. Everything below it is a prefix of every request this turn and
+    of every request in every turn after it, because conversations only ever
+    grow at the end — so it is worth the two-hour-TTL write. Everything above it
+    is this turn's own tool traffic, which is appended to on each iteration and
+    re-cached each time.
+
+    On the first iteration the two coincide: nothing has been appended yet, so
+    there is one breakpoint and it is the stable one. That is the request that
+    pays for the entry every later iteration reads.
+    """
+    if count <= 0:
+        return {}
+    tail = count - 1
+    stable = min(stable_prefix, count) - 1
+    if stable < 0:
+        return {tail: _TTL_ROLLING}
+    if stable >= tail:
+        return {tail: _TTL_STABLE}
+    return {stable: _TTL_STABLE, tail: _TTL_ROLLING}
+
+
+def _cache_control(ttl: str | None) -> dict:
+    control: dict[str, str] = {"type": "ephemeral"}
+    if ttl:
+        control["ttl"] = ttl
+    return control
+
+
+def _mark_cached(message: dict, ttl: str | None) -> dict:
+    """A copy of ``message`` with a breakpoint on its last cacheable block.
+
+    A copy, emphatically. An assistant turn's content may be ``raw_content`` —
+    the provider's own bytes, held on the Msg and written to the conversation
+    file so the turn can be replayed verbatim — and annotating that in place
+    would put a ``cache_control`` key into the stored transcript, where it would
+    be replayed on every future request as part of the very prefix it is
+    supposed to be keeping stable.
+    """
+    content = message.get("content")
+    if not isinstance(content, list) or not content:
+        return message
+    for i in range(len(content) - 1, -1, -1):
+        block = content[i]
+        if not isinstance(block, dict) or block.get("type") not in _CACHEABLE_BLOCKS:
+            continue
+        blocks = list(content)
+        blocks[i] = {**block, "cache_control": _cache_control(ttl)}
+        return {**message, "content": blocks}
+    return message
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +443,7 @@ class ChatAdapter(Protocol):
         tools: Sequence[ToolDecl] = (),
         max_tokens: int = DEFAULT_MAX_TOKENS,
         json_schema: dict | None = None,
+        stable_prefix: int = 0,
     ) -> AsyncIterator[ChatEvent]: ...
 
 
@@ -325,6 +462,28 @@ def build_chat_adapter(endpoint: Endpoint) -> ChatAdapter:
 # ---------------------------------------------------------------------------
 
 ToolExecutor = Callable[[ToolUseBlock], Awaitable[ToolResultBlock]]
+
+
+class EmptyReply(RuntimeError):
+    """The model ended its turn with nothing in it: no text and no tool call.
+
+    Providers do this rather than erroring — a request near the model's window,
+    a safety cutoff, a thinking budget spent before the answer started — and the
+    stream is well-formed, so every layer above would otherwise call it a
+    success. To the person waiting it is a minute of nothing followed by
+    nothing, which is a failure, and one that asking again often fixes.
+    """
+
+    def __init__(self, endpoint_name: str, stop_reason: str):
+        self.endpoint_name = endpoint_name
+        self.stop_reason = stop_reason
+        super().__init__(
+            f"{endpoint_name} ended the turn with nothing to show — no text and no "
+            f"tool call (provider stop reason: {stop_reason}). This usually means "
+            "the request was near the model's context limit or the provider cut the "
+            "answer off before it started. Asking again often works; if it keeps "
+            "happening, a new session or fewer attachments shrinks the request."
+        )
 
 
 @dataclass
@@ -369,6 +528,12 @@ async def run_tool_loop(
     (tool results), which is what the app forwards to the browser.
     """
     history = list(messages)
+    # Everything the turn started with. The loop appends to `history` as it
+    # goes, so this index is the seam between what was already settled — and is
+    # therefore worth caching for an hour — and this turn's own tool traffic,
+    # which is rewritten on every iteration. Captured here rather than derived
+    # in the adapter because this is the only place that knows it.
+    stable_prefix = len(history)
     result = LoopResult()
 
     def emit(event: ChatEvent) -> None:
@@ -380,7 +545,11 @@ async def run_tool_loop(
         done: Done | None = None
 
         async for event in adapter.stream_chat(
-            history, system=system, tools=tools, max_tokens=max_tokens
+            history,
+            system=system,
+            tools=tools,
+            max_tokens=max_tokens,
+            stable_prefix=stable_prefix,
         ):
             if isinstance(event, Done):
                 done = event
@@ -396,11 +565,18 @@ async def run_tool_loop(
                 f"{adapter.endpoint.name}: chat stream ended without a done event"
             )
 
-        history.append(done.message)
-        result.new_messages.append(done.message)
+        message = replace(done.message, stop_reason=done.stop_reason)
+        calls = message.tool_calls
+        if not calls and not message.text.strip():
+            # Nothing said and nothing asked for. Raised before the message
+            # reaches history: persisting it would put a blank assistant turn
+            # into the transcript, where it reads as an answer that was given.
+            raise EmptyReply(adapter.endpoint.name, done.stop_reason)
+
+        history.append(message)
+        result.new_messages.append(message)
         emit(done)
 
-        calls = done.message.tool_calls
         if not calls:
             result.stop_reason = done.stop_reason
             return result
@@ -498,15 +674,30 @@ class _AnthropicChat:
         tools: Sequence[ToolDecl] = (),
         max_tokens: int = DEFAULT_MAX_TOKENS,
         json_schema: dict | None = None,
+        stable_prefix: int = 0,
     ) -> AsyncIterator[ChatEvent]:
         client = self._client()
+        wire = [_to_anthropic_message(m) for m in messages]
+        for index, ttl in cache_points(len(wire), stable_prefix).items():
+            wire[index] = _mark_cached(wire[index], ttl)
         payload: dict[str, Any] = {
             "model": self.endpoint.model,
             "max_tokens": max_tokens,
-            "messages": [_to_anthropic_message(m) for m in messages],
+            "messages": wire,
         }
         if system:
-            payload["system"] = system
+            # Sent as a block rather than a string so it can carry a breakpoint.
+            # Tools render ahead of system, so this one marker caches both — and
+            # both are frozen here, which is what makes it worth an hour: the
+            # prompt is a constant plus a packaged skill file, and nothing
+            # per-request is interpolated into either.
+            payload["system"] = [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": _cache_control(_TTL_STABLE),
+                }
+            ]
         if tools:
             payload["tools"] = [
                 {"name": t.name, "description": t.description, "input_schema": t.input_schema}
@@ -540,6 +731,7 @@ class _AnthropicChat:
                 input_tokens=getattr(usage, "input_tokens", 0) or 0,
                 output_tokens=getattr(usage, "output_tokens", 0) or 0,
                 cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+                cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
             )
 
         yield Done(
@@ -615,6 +807,51 @@ class _OpenAIChat:
     def __init__(self, endpoint: Endpoint):
         self.endpoint = endpoint
 
+    def _caches(self) -> bool:
+        """Whether to annotate this endpoint's requests with cache breakpoints.
+
+        Narrow on purpose. ``cache_control`` is an Anthropic field that routers
+        forward for Anthropic models; a local llama.cpp or vLLM server has no
+        use for it and may reject an unrecognised key outright, and the hosted
+        models that cache automatically — Gemini, DeepSeek — need no annotation
+        to do it. So this covers exactly the case that was costing money: an
+        Anthropic model reached through a router, which is how the $100 hour in
+        the ledger was actually billed.
+        """
+        return self.endpoint.model.startswith("anthropic/")
+
+    def _cache(self, wire: list[dict], ends: list[int], system: bool, stable_prefix: int) -> None:
+        """Place the breakpoints from ``cache_points`` onto the rendered wire.
+
+        Two mismatches to absorb. One source message can render as several wire
+        messages — a turn of tool results becomes one ``role: "tool"`` message
+        each — so ``ends`` maps a conversation index to where it finished. And
+        only ``system`` and ``user`` messages are annotated: whether a router
+        accepts ``cache_control`` on a ``role: "tool"`` message is not something
+        worth discovering through a 400 in the middle of someone's turn, so a
+        breakpoint that lands on one walks back to the last message that can
+        carry it. The prefix is still cached up to that point, and the tool
+        results just behind the marker are picked up by the next request, whose
+        marker has moved past them.
+        """
+        floor = 1 if system else 0
+        if system:
+            marked = _mark_openai_cached(wire[0], _TTL_STABLE)
+            if marked is not None:
+                wire[0] = marked
+        used: set[int] = set()
+        for index, ttl in cache_points(len(ends), stable_prefix).items():
+            at = ends[index]
+            while at >= floor:
+                if at in used:
+                    break  # the stabler marker already there is the better one
+                marked = _mark_openai_cached(wire[at], ttl)
+                if marked is not None:
+                    wire[at] = marked
+                    used.add(at)
+                    break
+                at -= 1
+
     def _client(self):
         from openai import AsyncOpenAI  # lazy import; optional dep
 
@@ -638,13 +875,20 @@ class _OpenAIChat:
         tools: Sequence[ToolDecl] = (),
         max_tokens: int = DEFAULT_MAX_TOKENS,
         json_schema: dict | None = None,
+        stable_prefix: int = 0,
     ) -> AsyncIterator[ChatEvent]:
         client = self._client()
         wire: list[dict] = []
+        # Where each source message's last wire message landed, so a breakpoint
+        # chosen against the conversation can be found again on the wire.
+        ends: list[int] = []
         if system:
             wire.append({"role": "system", "content": system})
         for m in messages:
             wire.extend(_to_openai_messages(m))
+            ends.append(len(wire) - 1)
+        if self._caches():
+            self._cache(wire, ends, bool(system), stable_prefix)
 
         payload: dict[str, Any] = {
             "model": self.endpoint.model,
@@ -746,6 +990,33 @@ class _OpenAIChat:
 _OPENAI_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 
 
+def _mark_openai_cached(message: dict, ttl: str | None) -> dict | None:
+    """A copy carrying a breakpoint, or ``None`` when this message cannot take one.
+
+    Plain-string content is widened to a one-part list on the way, which is the
+    ordinary OpenAI content-parts shape and what routers expect to find a
+    ``cache_control`` key inside.
+    """
+    if message.get("role") not in ("system", "user"):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        if not content:
+            return None
+        parts: list = [{"type": "text", "text": content}]
+    elif isinstance(content, list) and content:
+        parts = list(content)
+    else:
+        return None
+    for i in range(len(parts) - 1, -1, -1):
+        part = parts[i]
+        if not isinstance(part, dict) or part.get("type") not in ("text", "image_url", "file"):
+            continue
+        parts[i] = {**part, "cache_control": _cache_control(ttl)}
+        return {**message, "content": parts}
+    return None
+
+
 def _to_openai_messages(msg: Msg) -> list[dict]:
     """One normalized message → one or more OpenAI messages.
 
@@ -833,7 +1104,11 @@ class _OllamaChat:
         tools: Sequence[ToolDecl] = (),
         max_tokens: int = DEFAULT_MAX_TOKENS,
         json_schema: dict | None = None,
+        stable_prefix: int = 0,
     ) -> AsyncIterator[ChatEvent]:
+        # ``stable_prefix`` is accepted and ignored: Ollama runs the model
+        # locally, where re-reading a prompt costs time rather than money and
+        # the server does its own prefix reuse.
         client = self._client()
         wire: list[dict] = []
         if system:
