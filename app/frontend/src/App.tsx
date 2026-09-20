@@ -14,6 +14,7 @@ import { LaunchKicad } from "./components/LaunchKicad";
 import { KicadFileView } from "./components/KicadFileView";
 import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
+import { LifecycleTable } from "./components/LifecycleTable";
 import { Preflight } from "./components/Preflight";
 import { ActiveBoard } from "./components/ActiveBoard";
 import { ModuleLibrary } from "./components/ModuleLibrary";
@@ -49,7 +50,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showSharing, setShowSharing] = useState(false);
-  const [tab, setTab] = useState<"board" | "preflight" | "edit" | "kicad" | "bom" | "modules" | "reports" | "release" | "artifacts" | "changes">("board");
+  const [tab, setTab] = useState<"board" | "preflight" | "edit" | "kicad" | "bom" | "lifecycle" | "modules" | "reports" | "release" | "artifacts" | "changes">("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
   // Which board everything below the board panel is about. Null until the
   // board list loads; a single-board project settles on its one implicit board.
@@ -265,6 +266,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                 <button className={tab === "bom" ? "on" : ""} onClick={() => setTab("bom")}>
                   BOM
                 </button>
+                <button className={tab === "lifecycle" ? "on" : ""} onClick={() => setTab("lifecycle")}>
+                  Lifecycle
+                </button>
                 <button className={tab === "modules" ? "on" : ""} onClick={() => setTab("modules")}>
                   Modules
                 </button>
@@ -307,6 +311,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
               )}
               {tab === "bom" && (
                 <BomTable projectId={selected} board={board} reloadToken={reloadToken} />
+              )}
+              {tab === "lifecycle" && (
+                <LifecycleTable projectId={selected} reloadToken={reloadToken} />
               )}
               {tab === "modules" && <ModuleLibrary projectId={selected} reloadToken={reloadToken} />}
               {tab === "reports" && (

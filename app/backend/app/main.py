@@ -2605,6 +2605,122 @@ def _tree_target(proj: Path, rel: str) -> Path:
     return target
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle table
+# ---------------------------------------------------------------------------
+
+class LifecycleEdit(BaseModel):
+    """One person's findings about one part."""
+
+    mpn: str
+    user_status: str | None = None
+    checked_on: str | None = None
+    reference: str | None = None
+    acknowledged: str | None = None
+    notes: str | None = None
+
+
+def _lifecycle_module():
+    """kicad-happy's table reader, which owns the file's shape.
+
+    Imported rather than reimplemented. The table is written by the audit and
+    read here, and two parsers for one format drift apart the first time a
+    column is added. Located through find_kicad_happy() for the same reason:
+    the repo already has one answer to "where is kicad-happy", and the layout
+    differs between this checkout and the backend image.
+    """
+    import importlib
+    import sys as _sys
+
+    from blpl.agent.kicad_happy import KicadHappyMissing, find_kicad_happy
+
+    base = find_kicad_happy()
+    if base is None:
+        raise HTTPException(503, str(KicadHappyMissing(
+            "kicad-happy not found; cannot read the lifecycle table")))
+    scripts = str(base / "skills" / "kicad" / "scripts")
+    if scripts not in _sys.path:
+        _sys.path.insert(0, scripts)
+    return importlib.import_module("lifecycle_table")
+
+
+def _lifecycle_path(proj: Path) -> Path:
+    return proj / "lifecycle.md"
+
+
+@app.get("/api/projects/{project_id}/lifecycle")
+def get_lifecycle(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """The lifecycle table as rows, for the pane that edits it."""
+    proj = _project_dir(session, user, project_id)
+    path = _lifecycle_path(proj)
+    if not path.is_file():
+        return {"exists": False, "rows": [], "columns": [], "user_columns": []}
+    mod = _lifecycle_module()
+    rows = mod.read_table(str(path))
+    return {
+        "exists": True,
+        "columns": mod.COLUMNS,
+        "user_columns": mod.USER_COLUMNS,
+        # departed is computed here rather than left to the client to sniff
+        # out of the Notes cell: it decides whether a row is work or history,
+        # and one parser for that is enough.
+        "rows": [dict(r, MPN=m, departed=mod.is_departed(r))
+                 for m, r in sorted(rows.items())],
+    }
+
+
+@app.post("/api/projects/{project_id}/lifecycle")
+def post_lifecycle(
+    project_id: str,
+    body: LifecycleEdit,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Write one row's human columns, leaving the script's alone.
+
+    Only the five columns a person owns are writable here, and only for a row
+    that already exists. The audit owns which parts are in the table and what
+    the machine thinks of them; this endpoint exists so that recording what
+    *you* found does not mean hand-editing a monospace markdown table.
+    """
+    proj = _project_dir(session, user, project_id)
+    path = _lifecycle_path(proj)
+    if not path.is_file():
+        raise HTTPException(404, "no lifecycle table — run the audit first")
+
+    mod = _lifecycle_module()
+    rows = mod.read_table(str(path))
+    row = rows.get(body.mpn)
+    if row is None:
+        raise HTTPException(404, f"{body.mpn} is not in the lifecycle table")
+
+    for field, column in (
+        ("user_status", "User Status"),
+        ("checked_on", "Checked On"),
+        ("reference", "Reference"),
+        ("acknowledged", "Acknowledged"),
+        ("notes", "Notes"),
+    ):
+        value = getattr(body, field)
+        if value is not None:
+            row[column] = value.strip()
+
+    # Acknowledging clears the flag immediately, rather than leaving it stale
+    # until the next audit. The column is the work list; it has to be right
+    # the moment someone has done the work.
+    if (row.get("Acknowledged") or "").strip():
+        row["Ack?"] = ""
+
+    path.write_text(mod.render_table(list(rows.values())), encoding="utf-8")
+    return {"ok": True, "mpn": body.mpn, "row": row}
+
+
 @app.get("/api/projects/{project_id}/blob")
 def get_blob(
     project_id: str,

@@ -165,7 +165,8 @@ def test_emitter_defects_gate_but_design_issues_do_not(tmp_path: Path, monkeypat
     fake = tmp_path / "kh"
     monkeypatch.setattr(s8, "_find_kicad_happy", lambda: fake)
 
-    def _fake_run(script: Path, args: list[str], out_path: Path, env=None) -> dict:
+    def _fake_run(script: Path, args: list[str], out_path: Path, env=None,
+                  timeout: float | None = None) -> dict:
         # One real design problem, one known limitation. No emitter defects:
         # the single BOM row was emitted as one symbol, with its MPN intact.
         payload = {
@@ -205,7 +206,8 @@ def test_a_board_qualifies_every_artifact_stage8_touches(tmp_path: Path, monkeyp
     sch.write_text("(kicad_sch)")
     monkeypatch.setattr(s8, "_find_kicad_happy", lambda: tmp_path)
 
-    def _fake_run(script: Path, args: list[str], out_path: Path, env=None) -> dict:
+    def _fake_run(script: Path, args: list[str], out_path: Path, env=None,
+                  timeout: float | None = None) -> dict:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps({"statistics": {"total_components": 0},
                                         "components": [], "findings": []}))
@@ -327,7 +329,8 @@ def test_an_autoroute_record_for_another_compile_does_not_count(tmp_path: Path, 
     pcb.write_text("(kicad_pcb)")
     monkeypatch.setattr(s8, "_find_kicad_happy", lambda: tmp_path)
 
-    def _fake_run(script: Path, args: list[str], out_path: Path, env=None) -> dict:
+    def _fake_run(script: Path, args: list[str], out_path: Path, env=None,
+                  timeout: float | None = None) -> dict:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps({"footprints": [{"reference": "U1"}],
                                         "findings": [_finding("RT-001")]}))

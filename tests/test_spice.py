@@ -227,7 +227,8 @@ def _stage8_with_spice(tmp_path: Path, monkeypatch, spice_report: dict | None, *
     sch.write_text("(kicad_sch)")
     monkeypatch.setattr(s8, "_find_kicad_happy", lambda: tmp_path / "kh")
 
-    def _fake_analyzer(script: Path, args: list[str], out_path: Path, env=None) -> dict:
+    def _fake_analyzer(script: Path, args: list[str], out_path: Path, env=None,
+                  timeout: float | None = None) -> dict:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps({"findings": []}))
         return {"ok": True, "skipped": False, "exit_code": 0, "report_json": str(out_path)}

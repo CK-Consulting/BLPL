@@ -210,6 +210,19 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8e8e; }
 .conf.mid { background: #3a2f14; color: #f0c674; }
 .conf.lo { background: #3a1a1d; color: #ff8e8e; }
 
+/* --- lifecycle pane --- */
+/* The form sits under the table rather than inside a row: the five fields a
+   person fills in do not fit a table cell, and a finding is one statement. */
+.lifecycle-form { border-top: 1px solid #6b6f75; background: #14171c; display: flex; flex-direction: column; gap: .5rem; }
+.lifecycle-form h4 { margin: 0; }
+.lifecycle-form label { display: flex; flex-direction: column; gap: .2rem; font-size: 12px; color: #9ea8b3; }
+.lifecycle-form input, .lifecycle-form select, .lifecycle-form textarea {
+  background: #0f1115; color: #e6e6e6; border: 1px solid #6b6f75; border-radius: 6px;
+  padding: .35rem .55rem; font: inherit; font-size: 13px;
+}
+.lifecycle-form .row { display: flex; gap: .5rem; }
+.pad.error { color: #ffc0c0; background: #2a1418; }
+
 /* --- diff / changes --- */
 .diff { overflow-y: auto; min-height: 0; height: 100%; padding: .8rem; display: flex; flex-direction: column; gap: .6rem; }
 .diff-summary { padding: 0 .2rem; }
