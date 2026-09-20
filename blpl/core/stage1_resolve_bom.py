@@ -126,6 +126,27 @@ def _build_user_prompt(design_artifact: dict, components: list[dict] | None = No
     return "\n".join(lines)
 
 
+def _mpn_extends(candidate: str | None, stated: str) -> bool:
+    """Whether the model's answer is the designer's part, spelled out in full.
+
+    Two things look alike and are opposites. Extending a family reference into
+    an orderable code is the model doing its job — a designer who writes
+    `XAZU1EG` wants `XAZU1EG-1SBVA484I`, and pinning the short form back over
+    it would put something unorderable on the BOM. Substituting a different
+    part is the model overruling a decision, which it does not get to do.
+
+    Prefix is the test that separates them, compared without the separators
+    manufacturers sprinkle through ordering codes so that `FIT-0774` and
+    `FIT0774` are the same part while `SM02B-SRSS-TB(LF)(SN)` is not.
+    """
+    if not candidate:
+        return False
+    def norm(x: str) -> str:
+        return "".join(ch for ch in x.upper() if ch.isalnum())
+    a, b = norm(candidate), norm(stated)
+    return bool(b) and a.startswith(b)
+
+
 def _post_process(raw: dict, project_id: str) -> dict:
     """Strip nulls and assemble a bom.v1 dict."""
     rows: list[dict] = []
@@ -248,6 +269,19 @@ def resolve(
         for c in components
         if isinstance(c.get("pin_count_hint"), int) and c["pin_count_hint"] >= 1
     }
+    # The part number itself, which was the one field left unpinned and is the
+    # most authoritative of them all: a designer who wrote an MPN has chosen
+    # the thing they intend to buy. The model rewrote M_HAPTIC's FIT0774 into
+    # "SM02B-SRSS-TB(LF)(SN)" — the connector named inside its own footprint
+    # string — turning a vibration motor into the two-pin header it plugs
+    # into, and stage 2 then missed on a part that had been resolving for
+    # weeks. A hint the model may overrule is fine for a package guess; it is
+    # not fine for the line someone will order against.
+    explicit_mpn = {
+        c["local_id"]: c["part_hint"].strip()
+        for c in components
+        if isinstance(c.get("part_hint"), str) and c["part_hint"].strip()
+    }
     # not_placed is pinned for the same reason, and it is easier to lose: it
     # has no colon, so the explicit-reference net above never catches it, and
     # the LLM "helpfully" rewrites it into a real-looking package ("Coin Cell
@@ -268,6 +302,9 @@ def resolve(
         pinned_pins = explicit_pins.get(r.get("local_id"))
         if pinned_pins:
             r["pin_count"] = pinned_pins
+        pinned_mpn = explicit_mpn.get(r.get("local_id"))
+        if pinned_mpn and not _mpn_extends(r.get("mpn"), pinned_mpn):
+            r["mpn"] = pinned_mpn
         if r.get("local_id") in not_placed_ids:
             r["package"] = "not_placed"
             r["footprint_hint"] = None

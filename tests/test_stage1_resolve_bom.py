@@ -187,6 +187,59 @@ def test_an_explicit_symbol_reference_survives_the_llm(tmp_path: Path) -> None:
     assert rows["R1"]["symbol_hint"] == "Device:R"
 
 
+def test_an_explicit_mpn_survives_the_llm(tmp_path: Path) -> None:
+    """The Part column is the designer saying what they will order, and it was
+    the one field left unpinned. On a real board the model rewrote M_HAPTIC's
+    `FIT0774` into `SM02B-SRSS-TB(LF)(SN)` — the connector named inside the
+    part's own footprint string — turning a vibration motor into the two-pin
+    header it plugs into. Stage 2 then missed on a part that had resolved
+    cleanly for weeks."""
+    artifact = {
+        "project_id": "proj",
+        "schema_version": 1,
+        "components": [
+            {
+                "local_id": "M_HAPTIC",
+                "description": "10 mm coin vibration motor",
+                "part_hint": "FIT0774",
+                "package_hint": "Connector_JST:JST_SH_SM02B-SRSS-TB_1x02-1MP_P1.00mm_Horizontal",
+            },
+            {
+                "local_id": "R1",
+                "description": "resistor",
+                "package_hint": "0402",
+            },
+        ],
+        "connectors": [],
+        "subsystems": [],
+        "raw_nets": [],
+    }
+    schema.validate("design_artifact", artifact)
+    adapter = _StubAdapter({"rows": [
+        {"local_id": "M_HAPTIC", "mpn": "SM02B-SRSS-TB(LF)(SN)",  # lifted from the footprint
+         "manufacturer": "JST", "package": "JST SH", "pin_count": 2,
+         "datasheet_url": None, "description": "connector", "role": None,
+         "symbol_hint": "Connector:Conn_01x02_Pin",
+         "footprint_hint": "Connector_JST:JST_SH_SM02B-SRSS-TB_1x02-1MP_P1.00mm_Horizontal",
+         "confidence": 0.6, "notes": None, "value": None, "tolerance": None,
+         "voltage_v": None, "power_w": None, "dielectric": None, "safety_class": None},
+        {"local_id": "R1", "mpn": "RC0402FR-0710KL", "manufacturer": "Yageo",
+         "package": "0402", "pin_count": 2, "datasheet_url": None,
+         "description": "resistor", "role": None, "symbol_hint": "Device:R",
+         "footprint_hint": "Resistor_SMD:R_0402_1005Metric",
+         "confidence": 0.9, "notes": None, "value": "10k", "tolerance": None,
+         "voltage_v": None, "power_w": None, "dielectric": None, "safety_class": None},
+    ]})
+
+    bom = s1.resolve(artifact, adapter=adapter, synthesize_connectors=False)
+    rows = {r["local_id"]: r for r in bom["rows"]}
+
+    # What the designer wrote wins over what the model preferred…
+    assert rows["M_HAPTIC"]["mpn"] == "FIT0774"
+    # …and a part with no stated MPN is still the model's to resolve.
+    assert rows["R1"]["mpn"] == "RC0402FR-0710KL"
+
+
 def test_not_placed_survives_the_llm(tmp_path: Path) -> None:
     """not_placed has no colon, so the explicit-reference pinning never caught
     it — and the LLM rewrites it into a real-looking package ("Coin Cell 1220"

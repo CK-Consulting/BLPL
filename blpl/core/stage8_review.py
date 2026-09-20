@@ -113,8 +113,30 @@ def _find_kicad_happy() -> Path | None:
     return None
 
 
+def _lifecycle_deadline(n_parts: int, lifecycle_on: bool) -> int:
+    """How long to allow the schematic analyzer.
+
+    A fixed 600 seconds was the old answer and it failed in both directions:
+    generous enough to hide a serial audit that spent four hundred of those
+    seconds asleep, and too tight the moment the board grew past a hundred
+    parts. The analysis itself takes about a second; everything else is the
+    distributor audit, which is network-bound and scales with the BOM.
+
+    So the deadline scales with the BOM when the audit is on and collapses to
+    something small when it is not, which also means a hang in the analyser
+    proper surfaces in a minute rather than ten.
+    """
+    if not lifecycle_on:
+        return 120
+    # Four sources, concurrent, with the slowest observed around a second per
+    # part; doubled for the anomaly this is guarding against, then floored and
+    # capped so neither a tiny board nor a runaway one gets a silly number.
+    return int(max(180, min(1800, 60 + n_parts * 4)))
+
+
 def _run_analyzer(
-    script: Path, args: list[str], out_path: Path, env: dict[str, str] | None = None
+    script: Path, args: list[str], out_path: Path, env: dict[str, str] | None = None,
+    timeout: int = 600,
 ) -> dict:
     """Run one analyzer script, capturing its JSON output.
 
@@ -129,7 +151,7 @@ def _run_analyzer(
         capture_output=True,
         text=True,
         check=False,
-        timeout=600,
+        timeout=timeout,
         env=env,
     )
     result: dict = {
@@ -810,18 +832,29 @@ def run(
             lifecycle_reason = why
 
     if sch_path is not None and sch_path.exists():
+        # Size the deadline to the work rather than to a constant. The BOM
+        # length is the only thing that moves it, because the analysis is a
+        # second and the distributor audit is the rest.
+        _n_parts = 0
+        try:
+            _n_parts = len(json.loads(Path(sch_path).with_suffix(".json").read_text())
+                           .get("bom", []))
+        except Exception:
+            _n_parts = 120
         analyzers["schematic"] = _run_analyzer(
             kicad_scripts / "analyze_schematic.py",
             [str(sch_path), *lifecycle_args],
             review_dir / "schematic.json",
             env=analyzer_env,
+            timeout=_lifecycle_deadline(_n_parts, bool(lifecycle_args)),
         )
     else:
         analyzers["schematic"] = {"ok": True, "skipped": True, "reason": "no .kicad_sch supplied"}
 
     if pcb_path is not None and pcb_path.exists():
         analyzers["pcb"] = _run_analyzer(
-            kicad_scripts / "analyze_pcb.py", [str(pcb_path), "--full"], review_dir / "pcb.json"
+            kicad_scripts / "analyze_pcb.py", [str(pcb_path), "--full"],
+            review_dir / "pcb.json", timeout=300,
         )
     else:
         analyzers["pcb"] = {"ok": True, "skipped": True, "reason": "no .kicad_pcb supplied"}
