@@ -7,6 +7,7 @@ confidence score per row.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from . import llm_adapter, schema
@@ -317,6 +318,13 @@ def resolve(
                 design_artifact, existing_local_ids=existing_ids
             )
         )
+    floored = _floor_pin_counts(bom)
+    if floored:
+        print(
+            "stage1: raised pin_count to 1 on %d row(s) the schema would have "
+            "rejected: %s" % (len(floored), ", ".join(floored)),
+            file=sys.stderr,
+        )
     schema.validate("bom", bom)
     return bom
 
@@ -332,6 +340,33 @@ def run(
     bom = resolve(artifact, adapter=adapter, synthesize_connectors=synthesize_connectors)
     schema.dump_json(output_path, bom)
     return bom
+
+
+def _floor_pin_counts(bom: dict) -> list[str]:
+    """Raise any pin_count below the schema's minimum to 1, and say which.
+
+    The pinning in resolve() is the real repair: wherever the design states a
+    Pin Count, the designer's number wins over the model's. But it can only pin
+    what the document says, and the model answers 0 for anything it reads as
+    having no electrical pins — a fiducial, most often, which is physically
+    right and schema-invalid. When one got through, an hour of resolved BOM was
+    discarded over a single integer, after every other row had come back
+    correct. No stage should be that brittle about a field it can repair.
+
+    One is the right value rather than a fudge: the design counts a fiducial's
+    pad because Stage 4 needs something to attach a net to. Returned rather
+    than logged here so the caller can be loud about it — a pin count nobody
+    stated and nobody checked deserves a second look even when the run lives.
+    """
+    floored = sorted(
+        r.get("local_id") or "?"
+        for r in bom.get("rows", [])
+        if isinstance(r.get("pin_count"), int) and r["pin_count"] < 1
+    )
+    for r in bom.get("rows", []):
+        if isinstance(r.get("pin_count"), int) and r["pin_count"] < 1:
+            r["pin_count"] = 1
+    return floored
 
 
 def apply_connector_synthesis(

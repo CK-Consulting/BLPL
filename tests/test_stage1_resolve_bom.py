@@ -277,3 +277,34 @@ def test_not_placed_survives_the_llm(tmp_path: Path) -> None:
     from blpl.core.symbol_resolution import is_not_placed
     assert is_not_placed(row["package"])
     assert not row.get("footprint_hint")
+
+
+def test_a_zero_pin_count_does_not_discard_the_whole_pass():
+    """The failure this guards against cost 67 minutes of resolved BOM.
+
+    Stage 1's schema puts a minimum of 1 on pin_count. A fiducial has no
+    electrical pins, so the model answers 0, which is physically true and
+    invalid — and it took the stage down after every other row had resolved.
+    """
+    from blpl.core.stage1_resolve_bom import _floor_pin_counts
+
+    bom = {
+        "rows": [
+            {"local_id": "U1", "pin_count": 216},
+            {"local_id": "FID1", "pin_count": 0},
+            {"local_id": "FID2", "pin_count": -1},
+            {"local_id": "R1"},  # absent is a different error, not ours to mask
+        ]
+    }
+    floored = _floor_pin_counts(bom)
+
+    assert floored == ["FID1", "FID2"], "the caller has to be able to name them"
+    assert [r.get("pin_count") for r in bom["rows"]] == [216, 1, 1, None]
+
+
+def test_flooring_leaves_a_valid_bom_alone():
+    from blpl.core.stage1_resolve_bom import _floor_pin_counts
+
+    bom = {"rows": [{"local_id": "U1", "pin_count": 216}, {"local_id": "C1", "pin_count": 2}]}
+    assert _floor_pin_counts(bom) == []
+    assert [r["pin_count"] for r in bom["rows"]] == [216, 2]
