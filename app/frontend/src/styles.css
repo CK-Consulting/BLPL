@@ -119,7 +119,11 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8e8e; }
    actually available to tabs — padding excluded — which is what the overflow
    measurement compares against. */
 .tabs { padding: .4rem .6rem; border-bottom: 1px solid #6b6f75; background: #15181d; position: relative; }
-.tabs-row { display: flex; gap: .3rem; align-items: center; overflow: hidden; }
+/* No overflow:hidden here. The row only ever contains what fits, so there is
+   nothing to clip — and clipping it also clipped the overflow menu, which is
+   absolutely positioned inside this box and hangs below it. The button worked;
+   the menu simply could not paint. */
+.tabs-row { display: flex; gap: .3rem; align-items: center; min-width: 0; }
 .tabs-row > button { flex: 0 0 auto; white-space: nowrap; }
 /* Every tab at its natural width, off-screen, so a folded tab can be measured
    and brought back when the pane widens again. */
