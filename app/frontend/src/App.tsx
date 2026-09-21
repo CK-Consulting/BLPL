@@ -15,6 +15,13 @@ import { KicadFileView } from "./components/KicadFileView";
 import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
 import { LifecycleTable } from "./components/LifecycleTable";
+import { TabBar } from "./components/TabBar";
+
+// Named so TabBar is typed on the real set of tabs: an id that is not one of
+// these is a compile error rather than a pane that silently renders nothing.
+type TabId =
+  | "board" | "preflight" | "edit" | "kicad" | "bom" | "lifecycle"
+  | "modules" | "reports" | "release" | "artifacts" | "changes";
 import { Preflight } from "./components/Preflight";
 import { ActiveBoard } from "./components/ActiveBoard";
 import { ModuleLibrary } from "./components/ModuleLibrary";
@@ -50,7 +57,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showSharing, setShowSharing] = useState(false);
-  const [tab, setTab] = useState<"board" | "preflight" | "edit" | "kicad" | "bom" | "lifecycle" | "modules" | "reports" | "release" | "artifacts" | "changes">("board");
+  const [tab, setTab] = useState<TabId>("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
   // Which board everything below the board panel is about. Null until the
   // board list loads; a single-board project settles on its one implicit board.
@@ -241,50 +248,29 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
               </>
             )}
             <section className="viewer">
-              <div className="tabs">
-                <button className={tab === "board" ? "on" : ""} onClick={() => setTab("board")}>
-                  Board
-                </button>
-                <button
-                  className={tab === "preflight" ? "on" : ""}
-                  onClick={() => setTab("preflight")}
-                >
-                  Preflight
-                </button>
-                {/* Only while a KiCad file is open. A tab that is empty most
-                    of the time is a tab people learn to skip past, and the
-                    Board tab already answers "show me this project's board" —
-                    this one answers "show me the file I just clicked". */}
-                {openFile && destinationFor(openFile) === "kicad" && (
-                  <button className={tab === "kicad" ? "on" : ""} onClick={() => setTab("kicad")}>
-                    KiCad
-                  </button>
-                )}
-                <button className={tab === "edit" ? "on" : ""} onClick={() => setTab("edit")}>
-                  View/Edit
-                </button>
-                <button className={tab === "bom" ? "on" : ""} onClick={() => setTab("bom")}>
-                  BOM
-                </button>
-                <button className={tab === "lifecycle" ? "on" : ""} onClick={() => setTab("lifecycle")}>
-                  Lifecycle
-                </button>
-                <button className={tab === "modules" ? "on" : ""} onClick={() => setTab("modules")}>
-                  Modules
-                </button>
-                <button className={tab === "reports" ? "on" : ""} onClick={() => setTab("reports")}>
-                  Reports
-                </button>
-                <button className={tab === "release" ? "on" : ""} onClick={() => setTab("release")}>
-                  Release
-                </button>
-                <button className={tab === "artifacts" ? "on" : ""} onClick={() => setTab("artifacts")}>
-                  Artifacts
-                </button>
-                <button className={tab === "changes" ? "on" : ""} onClick={() => setTab("changes")}>
-                  Changes
-                </button>
-              </div>
+              <TabBar
+                items={[
+                  { id: "board", label: "Board" },
+                  { id: "preflight", label: "Preflight" },
+                  // Only while a KiCad file is open. A tab that is empty most
+                  // of the time is a tab people learn to skip past, and the
+                  // Board tab already answers "show me this project's board" —
+                  // this one answers "show me the file I just clicked".
+                  ...(openFile && destinationFor(openFile) === "kicad"
+                    ? [{ id: "kicad" as const, label: "KiCad" }]
+                    : []),
+                  { id: "edit", label: "View/Edit" },
+                  { id: "bom", label: "BOM" },
+                  { id: "lifecycle", label: "Lifecycle" },
+                  { id: "modules", label: "Modules" },
+                  { id: "reports", label: "Reports" },
+                  { id: "release", label: "Release" },
+                  { id: "artifacts", label: "Artifacts" },
+                  { id: "changes", label: "Changes" },
+                ]}
+                active={tab}
+                onSelect={setTab}
+              />
               {tab === "board" && (
                 <DesignView
                   projectId={selected}

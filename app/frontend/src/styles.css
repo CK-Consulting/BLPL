@@ -115,7 +115,19 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8e8e; }
 .seg button.on { background: #2b4a86; border-color: #34507f; }
 
 /* --- board/edit tabs --- */
-.tabs { display: flex; gap: .3rem; padding: .4rem .6rem; border-bottom: 1px solid #6b6f75; background: #15181d; }
+/* The row is the flex container, not .tabs, so its clientWidth is the space
+   actually available to tabs — padding excluded — which is what the overflow
+   measurement compares against. */
+.tabs { padding: .4rem .6rem; border-bottom: 1px solid #6b6f75; background: #15181d; position: relative; }
+.tabs-row { display: flex; gap: .3rem; align-items: center; overflow: hidden; }
+.tabs-row > button { flex: 0 0 auto; white-space: nowrap; }
+/* Every tab at its natural width, off-screen, so a folded tab can be measured
+   and brought back when the pane widens again. */
+.tabs-measure { position: absolute; visibility: hidden; pointer-events: none; top: 0; left: 0; display: flex; gap: .3rem; white-space: nowrap; }
+.tabs-more { position: relative; flex: 0 0 auto; }
+.tabs-menu { position: absolute; right: 0; top: calc(100% + .35rem); z-index: 40; display: flex; flex-direction: column; gap: .15rem; min-width: 9rem; padding: .25rem; background: #1b1f26; border: 1px solid #6b6f75; border-radius: 6px; box-shadow: 0 8px 20px rgba(0,0,0,.45); }
+.tabs-menu button { text-align: left; width: 100%; white-space: nowrap; }
+.tabs-menu button:hover { background: #22262e; color: #e6e6e6; }
 .tabs button { background: transparent; border: 1px solid transparent; padding: .25rem .8rem; border-radius: 6px; color: #9aa4b0; }
 .tabs button.on { background: #22262e; color: #e6e6e6; border-color: #6b6f75; }
 .viewer { display: flex; flex-direction: column; }
