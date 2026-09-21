@@ -157,7 +157,12 @@ export function DesignView({
       cancelled = true;
     };
     // reloadToken lets a finished stage run pull the newly-emitted board in.
-  }, [projectId, reloadToken]);
+    // `board` belongs here too: it is null until the board list loads, and on a
+    // multi-board project /design refuses to guess and answers 400. Without it
+    // in the deps the first render's failure was the last word — the pane stayed
+    // on "has more than one board; say which with ?board=" after the board it
+    // was asking about had arrived.
+  }, [projectId, board, reloadToken]);
 
   if (error) {
     return (
