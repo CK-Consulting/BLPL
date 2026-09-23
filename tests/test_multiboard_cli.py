@@ -232,6 +232,54 @@ def test_run_all_boards_runs_each_board_then_the_crossboard_check(project, monke
     assert seen == ["stage0:base", "stage0:sensor", "crossboard"]
 
 
+def test_one_board_raising_does_not_hide_the_others_or_the_crossboard_check(project, monkeypatch):
+    """The bug: --continue-on-error only guarded a non-zero return.
+
+    A stage that raised — stage1 failing jsonschema validation is the real
+    case — unwound past the per-board loop, so the second board never ran and
+    the cross-board check never happened. The loop's own comment promises the
+    opposite.
+    """
+    seen: list[str] = []
+
+    def stage0(ns):
+        seen.append(f"stage0:{ns.board}")
+        if ns.board == "base":
+            raise ValueError("'package' is a required property")
+        return 0
+
+    monkeypatch.setattr(cli, "_cmd_stage0_det", stage0)
+    monkeypatch.setattr(cli, "_cmd_crossboard", lambda ns: seen.append("crossboard") or 0)
+    rc = cli.main(["run", "--project-dir", str(project), "--board", "all", "--to", "stage0"])
+    assert seen == ["stage0:base", "stage0:sensor", "crossboard"]
+    assert rc != 0, "the run still has to report failure, it just must not stop early"
+
+
+def test_a_raising_stage_honours_continue_on_error_within_a_board(project, monkeypatch):
+    """With the flag, a raise behaves like a non-zero return: report and carry on."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        cli, "_cmd_stage0_det", lambda ns: seen.append("stage0") or (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    monkeypatch.setattr(cli, "_cmd_stage1", lambda ns: seen.append("stage1") or 0)
+    rc = cli.main(
+        ["run", "--project-dir", str(project), "--board", "base", "--to", "stage1", "--continue-on-error"]
+    )
+    assert seen == ["stage0", "stage1"], "stage1 must still run"
+    assert rc != 0
+
+
+def test_a_raising_stage_still_halts_without_continue_on_error(project, monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(
+        cli, "_cmd_stage0_det", lambda ns: seen.append("stage0") or (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    monkeypatch.setattr(cli, "_cmd_stage1", lambda ns: seen.append("stage1") or 0)
+    rc = cli.main(["run", "--project-dir", str(project), "--board", "base", "--to", "stage1"])
+    assert seen == ["stage0"], "stage1 must not run"
+    assert rc != 0
+
+
 def test_run_all_boards_is_refused_on_a_single_board_project(tmp_path):
     (tmp_path / "d.md").write_text("# one\n")
     assert cli.main(["run", "--project-dir", str(tmp_path), "--board", "all", "--to", "stage0"]) == 2

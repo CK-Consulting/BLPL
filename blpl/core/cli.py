@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 from . import (
@@ -678,14 +679,44 @@ def _cmd_run(args: argparse.Namespace) -> int:
         worst = 0
         for b in man.boards:
             print(f"==> board {b.name}", file=sys.stderr)
-            rc = _cmd_run(argparse.Namespace(**{**vars(args), "board": b.name}))
+            try:
+                rc = _cmd_run(argparse.Namespace(**{**vars(args), "board": b.name}))
+            except Exception:
+                # A raised stage is the same event as a stage returning non-zero,
+                # and the loop already isolates the second. Without this it did
+                # not isolate the first: one board's traceback unwound straight
+                # past the remaining boards and the cross-board check, which is
+                # the opposite of what the comment above promises.
+                traceback.print_exc()
+                print(f"==> board {b.name} raised; continuing", file=sys.stderr)
+                rc = 1
             worst = max(worst, rc)
         rc = _cmd_crossboard(argparse.Namespace(project_dir=args.project_dir))
         return max(worst, rc)
 
+    # The worst return code any stage produced. --continue-on-error means carry
+    # on past a failure, not forget it happened: without this the function ended
+    # in an unconditional `return 0`, so a run that continued past a broken
+    # stage exited 0 and reported success. Every rc in this function comes
+    # through _attempt, so recording it here covers all of them.
+    worst_rc = 0
+
     def _attempt(stage: str, fn, note: str = "") -> int:
+        nonlocal worst_rc
         print(f"==> {stage}{' ' + note if note else ''}", file=sys.stderr)
-        rc = fn()
+        try:
+            rc = fn()
+        except Exception:
+            # --continue-on-error only ever guarded a non-zero return, so any
+            # stage that raised instead of returning ignored the flag entirely
+            # and took the whole run with it. A schema validation failure in
+            # stage1 is the case that found this. Turning the exception into a
+            # non-zero rc lets the existing halt-or-continue logic below decide,
+            # which is what the flag is for. KeyboardInterrupt and SystemExit
+            # are not Exception subclasses, so Ctrl-C still stops the run.
+            traceback.print_exc()
+            rc = 1
+        worst_rc = max(worst_rc, rc)
         if rc != 0 and not args.continue_on_error:
             print(f"==> {stage} returned {rc}; halting (use --continue-on-error to proceed)", file=sys.stderr)
         return rc
@@ -768,7 +799,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             rc = _attempt("stage8", lambda: _cmd_stage8(ns))
             if rc != 0 and not args.continue_on_error:
                 return rc
-    return 0
+    return worst_rc
 
 
 def _cmd_stage6(args: argparse.Namespace) -> int:
