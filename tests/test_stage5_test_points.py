@@ -192,3 +192,44 @@ def test_a_test_point_part_that_does_not_exist_stops_the_stage(tmp_path: Path) -
         s5.emit(_bom(), _nets(), _artifact(), _config("power", symbol="Nope:Missing"),
                 project_dir=tmp_path, stock_symbols_root=STOCK_SYMBOLS,
                 stock_footprints_root=STOCK_FOOTPRINTS)
+
+
+def test_a_project_rule_beats_stage4s_guess(tmp_path) -> None:
+    """Stage 4's name rules must work for every board, so they cannot know this
+    project spells its USB class USB2_HS rather than USB2_Diff_90Ohm. Without a
+    project rule the class it declares is used by nothing."""
+    from blpl.core import stage5_emit_yaml_hdm as s5
+
+    cfg = {"net_classes": {"Default": {}, "USB2_HS": {}},
+           "net_class_rules": [{"pattern": r"^MCU_USB_D[PMN]$", "class": "USB2_HS"}]}
+    rules = s5._project_class_rules(cfg)
+    declared = set(cfg["net_classes"])
+    assert s5._reconcile_net_class("MCU_USB_DP", "USB2_Diff_90Ohm", rules, declared) == ("USB2_HS", None)
+    assert s5._reconcile_net_class("MCU_USB_DM", "Default", rules, declared) == ("USB2_HS", None)
+
+
+def test_an_undeclared_class_is_reported_but_not_rewritten(tmp_path) -> None:
+    """Demoting the net here was tried and is worse: a project that merely
+    forgot to declare Power_Bulk would have its rails silently rewritten to a
+    signal trace width by the pipeline. Emit what was asked for, and say so."""
+    from blpl.core import stage5_emit_yaml_hdm as s5
+
+    cls, note = s5._reconcile_net_class("VBAT", "Power_Bulk", [], {"Default"})
+    assert cls == "Power_Bulk"
+    assert "does not declare" in note
+
+
+def test_no_declared_classes_means_no_opinion(tmp_path) -> None:
+    """An absent net_classes block is 'no opinion', not 'nothing permitted'."""
+    from blpl.core import stage5_emit_yaml_hdm as s5
+
+    assert s5._reconcile_net_class("VBAT", "Power_Bulk", [], set()) == ("Power_Bulk", None)
+
+
+def test_a_rule_naming_an_undeclared_class_is_refused(tmp_path) -> None:
+    from blpl.core import stage5_emit_yaml_hdm as s5
+
+    import pytest as _pytest
+    with _pytest.raises(s5.NetClassConfigError, match="not in net_classes"):
+        s5._project_class_rules({"net_classes": {"Default": {}},
+                                 "net_class_rules": [{"pattern": "^X", "class": "Nope"}]})

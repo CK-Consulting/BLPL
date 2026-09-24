@@ -15,6 +15,7 @@ Deterministic; no LLM.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -212,6 +213,80 @@ def _no_connect_pins(
                 continue
             pins.add(number)
     return sorted(pins, key=lambda v: (len(v), v))
+
+
+# --- Net classes -------------------------------------------------------------
+
+
+class NetClassConfigError(ValueError):
+    """project.yaml asks for a net class in a way this stage cannot honour."""
+
+
+def _project_class_rules(project_config: dict) -> list[tuple[re.Pattern[str], str]]:
+    """Optional ``net_class_rules:`` — the project's own pattern → class table.
+
+    Stage 4 guesses a class from the net name using rules that have to work for
+    every board, so they cannot know that this project spells its USB class
+    ``USB2_HS`` rather than ``USB2_Diff_90Ohm``, or that ``DSI_*`` belongs on
+    ``DSI_Diff_100Ohm``. A project that declares a controlled-impedance class
+    and never says which nets belong to it gets a class used by nothing and
+    differential pairs routed as default single-ended traces — which is exactly
+    what happened here to all six MIPI DSI nets.
+
+    Rules are tried in order and the first match wins, ahead of Stage 4's guess.
+    """
+    raw = project_config.get("net_class_rules") or []
+    if not isinstance(raw, list):
+        raise NetClassConfigError("net_class_rules in project.yaml must be a list")
+    declared = set(project_config.get("net_classes") or {})
+    out: list[tuple[re.Pattern[str], str]] = []
+    for i, rule in enumerate(raw):
+        if not isinstance(rule, dict) or "pattern" not in rule or "class" not in rule:
+            raise NetClassConfigError(
+                f"net_class_rules[{i}] needs both 'pattern' and 'class'"
+            )
+        cls = str(rule["class"])
+        if cls not in declared:
+            raise NetClassConfigError(
+                f"net_class_rules[{i}] names class {cls!r}, which is not in net_classes "
+                f"({', '.join(sorted(declared)) or 'none declared'})"
+            )
+        try:
+            out.append((re.compile(str(rule["pattern"])), cls))
+        except re.error as exc:
+            raise NetClassConfigError(
+                f"net_class_rules[{i}] pattern {rule['pattern']!r} is not a regex: {exc}"
+            ) from exc
+    return out
+
+
+def _reconcile_net_class(
+    name: str, guessed: str, rules: list[tuple[re.Pattern[str], str]], declared: set[str]
+) -> tuple[str, str | None]:
+    """The class this net should carry, and a note if it is not declared.
+
+    Two things go wrong without this. A project rule has to be able to beat
+    Stage 4's generic guess. And Stage 4 can assign a class the project never
+    declared — ``USB2_Diff_90Ohm`` on a project that declares ``USB2_HS`` — which
+    reaches ``.kicad_pro`` as a netclass_pattern naming a class that is not in
+    the file, so KiCad falls back to Default without saying so.
+
+    The note is a report, not a correction. Demoting the net here was tried and
+    is worse: a project that simply forgot to declare ``Power_Bulk`` would have
+    its rails silently rewritten to a signal trace width by the pipeline, which
+    is the same silent failure one layer earlier and harder to see. Emit what
+    was asked for, and say plainly that the project does not define it.
+    """
+    for pat, cls in rules:
+        if pat.match(name.upper()) or pat.match(name):
+            return cls, None
+    if declared and guessed not in declared:
+        return guessed, (
+            f"net {name!r} is classed {guessed!r}, which project.yaml does not declare; "
+            f"KiCad will fall back to Default for it. Declare it under net_classes, "
+            f"or map the net with net_class_rules."
+        )
+    return guessed, None
 
 
 # --- Test points -------------------------------------------------------------
@@ -446,10 +521,16 @@ def emit(
             comp["no_connect_pins"] = nc
         components_out[refdes] = comp
 
+    class_rules = _project_class_rules(project_config)
+    declared_classes = set(project_config.get("net_classes") or {})
+    class_notes: list[str] = []
     nets_out: dict[str, Any] = {}
     for net in nets["nets"]:
+        cls, note = _reconcile_net_class(net["name"], net["class"], class_rules, declared_classes)
+        if note:
+            class_notes.append(note)
         nets_out[net["name"]] = {
-            "class": net["class"],
+            "class": cls,
             "pads": [[m["refdes"], m["pin"]] for m in net["members"]],
         }
 
@@ -472,6 +553,8 @@ def emit(
     # points because the policy said so" from "no test points because the
     # pipeline cannot make them".
     hdm["synthesis"] = {"test_points": tp_record}
+    if class_notes:
+        hdm["synthesis"]["net_class_notes"] = class_notes
     if not_placed:
         # Recorded rather than dropped: anyone diffing bom.json against the HDM
         # would otherwise find rows that vanished with nothing saying why.

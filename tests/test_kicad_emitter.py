@@ -390,3 +390,24 @@ def test_sch_draws_every_unit_of_a_multi_unit_symbol(tmp_path: Path) -> None:
     assert labels == ["SIG", "VDD", "VDD"]  # VDD twice: pin stub + PWR_FLAG label
     # The rail audit saw the power_in pin on unit 2 and flagged the rail.
     assert sch.flagged_nets(hdm, symbols_root=[tmp_path, _SYMBOLS_ROOT]) == ["VDD"]
+
+
+def test_diff_pair_halves_spelled_without_a_separator_still_pair() -> None:
+    """DSI_CKP / DSI_CKN is how every MIPI datasheet spells it, and the
+    separator-only match missed all of them — so no DSI pair on the example-handheld
+    board was ever recognised as a pair, and both halves sat on Default."""
+    from blpl.core.stage4_synthesize_nets import _diff_pair_complements as complements
+
+    assert complements("DSI_CKP") == ["DSI_CKN"]
+    assert complements("DSI_D0N") == ["DSI_D0P"]
+    # The separator pass still wins where both readings exist.
+    assert complements("SOM_TX_P") == ["SOM_TX_N"]
+
+
+def test_usb_d_minus_is_classed_with_its_partner() -> None:
+    """The rule matched D[PN]; 'DM' is the ordinary spelling of D-minus, so
+    MCU_USB_DP got a class and MCU_USB_DM stayed Default — the two halves of one
+    pair under different rules, which cannot be routed as a pair."""
+    from blpl.core.stage4_synthesize_nets import _assign_class as klass
+
+    assert klass("MCU_USB_DP") == klass("MCU_USB_DM") == "USB2_Diff_90Ohm"

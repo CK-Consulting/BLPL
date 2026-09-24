@@ -55,7 +55,11 @@ _CLASS_RULES: list[tuple[re.Pattern[str], str]] = [
     # SOM_USB_DP / SOM_USB_DN. The required leading "_" before USB means this does NOT
     # match the bare/anchored USB_DP or dev.02/dev.03's USB_D+/USB2_D+ forms, which stay
     # on the USB3_Diff_90Ohm rule above — so no existing board's nets are reclassified.
-    (re.compile(r".*_USB\d*_D[PN]$"), "USB2_Diff_90Ohm"),
+    # D[PMN], not D[PN]: "DM" is the ordinary spelling of USB D-minus and the
+    # diff-pair table below already lists it as a complement of DP. Leaving it
+    # out classed MCU_USB_DP and left MCU_USB_DM on Default — the two halves of
+    # one pair under different rules, which cannot be routed as a pair.
+    (re.compile(r".*_USB\d*_D[PMN]$"), "USB2_Diff_90Ohm"),
 ]
 
 
@@ -178,6 +182,19 @@ def _diff_pair_complements(name: str) -> list[str]:
             if upper.endswith(sep_suffix):
                 base = name[: -len(sep_suffix)]
                 return [base + "_" + comp for comp in _DIFF_PAIR_SUFFIXES[suffix]]
+    # Second pass: the same suffixes with no separator before them. DSI_CKP /
+    # DSI_CKN, DSI_D0P / DSI_D0N — the spelling every MIPI datasheet uses, and
+    # the one the separator-only pass above missed, so no DSI pair on this
+    # project was ever recognised as a pair. Run as a second pass rather than
+    # relaxing the first, so a name ending "_TX_P" still prefers "_TX_N" over
+    # the bare-P reading. A false positive is harmless: the caller keeps only a
+    # candidate that actually exists among the synthesized nets.
+    for suffix in _DIFF_PAIR_SUFFIX_ORDER:
+        if suffix in ("+", "-"):
+            continue
+        if upper.endswith(suffix):
+            base = name[: -len(suffix)]
+            return [base + comp for comp in _DIFF_PAIR_SUFFIXES[suffix]]
     return []
 
 
