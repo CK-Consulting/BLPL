@@ -83,7 +83,12 @@ _DIFF_PAIR_SUFFIXES: dict[str, tuple[str, ...]] = {
 _DIFF_PAIR_SUFFIX_ORDER = sorted(_DIFF_PAIR_SUFFIXES, key=len, reverse=True)
 
 
-_NC_SIGNALS = {"NC", "N/C", "N.C.", "-", "", "DNC"}
+# An em dash, en dash and minus sign all read as "nothing here" to a person
+# writing a pinout table, and a design document is written by hand. The bare
+# ASCII hyphen was listed and the typographic ones were not, so `U_PWRMUX`
+# pin C3 - deliberately floating, and documented as such - became a net
+# literally named "—" with one member.
+_NC_SIGNALS = {"NC", "N/C", "N.C.", "-", "\u2013", "\u2014", "\u2212", "", "DNC"}
 
 
 def is_no_connect(signal: str) -> bool:

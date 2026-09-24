@@ -315,3 +315,17 @@ def test_stage8_reviews_the_board_it_was_asked_about(project, monkeypatch):
     assert got["board"] == "base"
     assert got["sch_path"].name == "demo_base_2026-01-01.kicad_sch"
     assert got["lifecycle"] is False
+
+
+def test_a_typographic_dash_means_no_connect_too() -> None:
+    """A design document is written by hand, and an em dash reads as "nothing
+    here" to the person writing the pinout table. Only the ASCII hyphen was
+    listed, so U_PWRMUX pin C3 — deliberately floating, and documented as
+    such — became a net literally named "—" with one member."""
+    from blpl.core.stage4_synthesize_nets import is_no_connect
+
+    assert is_no_connect("-")
+    assert is_no_connect("—"), "em dash"
+    assert is_no_connect("–"), "en dash"
+    assert is_no_connect("−"), "minus sign"
+    assert not is_no_connect("VBUS")
