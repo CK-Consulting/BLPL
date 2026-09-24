@@ -1,7 +1,8 @@
 """Stage 6: compile the YAML HDM into KiCad project files (v9/v10 format).
 
-Uses ``pipeline.kicad_emitter`` to produce ``.kicad_sch``, ``.kicad_pcb``, and
-``.kicad_pro`` that kicad-cli 9.x / 10.x can load. Schematic is emitted first
+Uses ``pipeline.kicad_emitter`` to produce ``.kicad_sch``, ``.kicad_pcb``,
+``.kicad_pro`` and the ``sym-lib-table`` / ``fp-lib-table`` pair that tells
+KiCad where the referenced libraries are, all loadable by kicad-cli 9.x / 10.x. Schematic is emitted first
 (primary source of truth in KiCad's workflow), PCB second with pad-net links
 that match the schematic labels, project JSON third to tie the pair together.
 """
@@ -16,7 +17,7 @@ from pathlib import Path
 
 import yaml
 
-from blpl.emitter import pcb as _pcb, pro as _pro, sch as _sch
+from blpl.emitter import lib_tables as _lib_tables, pcb as _pcb, pro as _pro, sch as _sch
 
 from . import symbol_resolution
 
@@ -105,9 +106,26 @@ def run(
     pro_path = output_dir / f"{base_name}.kicad_pro"
 
     symbol_roots = _symbol_roots(symbols_root, project_dir)
+    footprint_roots = _footprint_roots(Path(footprints_root), project_dir)
     _sch.write(hdm, sch_path, symbols_root=symbol_roots)
-    _pcb.write(hdm, pcb_path, footprints_root=_footprint_roots(Path(footprints_root), project_dir))
+    _pcb.write(hdm, pcb_path, footprints_root=footprint_roots)
     _pro.write(hdm, pro_path)
+
+    # Tell KiCad where the libraries the design references actually live.
+    # Without these two tables it loads the project, resolves nothing, and ERC
+    # reports "The current configuration does not include the symbol library
+    # 'Device'" once per reference — 533 of 762 violations across the seven
+    # example-handheld boards, which buried every real finding under bookkeeping.
+    # PWR_FLAG is passed explicitly because the schematic emitter places it
+    # itself; it is in no component's lib_symbol and would otherwise be the one
+    # library still missing from the table.
+    lib_table_report = _lib_tables.write(
+        hdm,
+        output_dir,
+        symbols_root=symbol_roots,
+        footprints_root=footprint_roots,
+        extra_symbol_lib_ids=[_sch.PWR_FLAG_LIB_ID],
+    )
 
     # What the emitter did that the emitted files cannot show. kicad-happy's rail
     # audit reads a net map that excludes PWR_FLAG pins and then asks whether a
@@ -118,7 +136,8 @@ def run(
     # Stage 8 would excuse the wrong board's rails.
     report_name = "emitter_report.json" if board is None else f"emitter_report.{_sanitize_filename(board)}.json"
     (output_dir / report_name).write_text(
-        json.dumps({"pwr_flag_nets": _sch.flagged_nets(hdm, symbols_root=symbol_roots)},
+        json.dumps({"pwr_flag_nets": _sch.flagged_nets(hdm, symbols_root=symbol_roots),
+                    "lib_tables": lib_table_report},
                    indent=2) + "\n",
         encoding="utf-8",
     )
