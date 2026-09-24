@@ -128,27 +128,6 @@ def test_the_power_library_is_listed_even_though_no_component_names_it(tmp_path:
     assert '(name "power")' in (out / "sym-lib-table").read_text()
 
 
-def test_a_library_no_root_provides_is_reported_not_invented(tmp_path: Path) -> None:
-    """Writing an entry for a library that does not exist would point KiCad at
-    a missing path, which is worse than omitting it. It is reported instead.
-
-    Exercised against the emitter module directly: a design referencing a
-    missing symbol library never reaches here, because the schematic emitter
-    raises LibraryMiss first.
-    """
-    from blpl.emitter import lib_tables
-
-    hdm = {"components": {"U1": {"lib_symbol": "Nowhere_Sym:Thing", "footprint": "Nowhere_FP:Thing"}}}
-    out = tmp_path / "out"
-    out.mkdir()
-
-    report = lib_tables.write(hdm, out, symbols_root=tmp_path, footprints_root=tmp_path)
-
-    assert "Nowhere_Sym" not in (out / "sym-lib-table").read_text()
-    assert "Nowhere_FP" not in (out / "fp-lib-table").read_text()
-    assert report["unresolved"] == ["symbol:Nowhere_Sym", "footprint:Nowhere_FP"]
-
-
 def test_a_project_library_shadows_a_stock_one_of_the_same_name(tmp_path: Path) -> None:
     """The table has to agree with what the emitters actually loaded. Roots are
     ordered custom-first, so the first root holding the nickname wins here too."""
@@ -156,10 +135,10 @@ def test_a_project_library_shadows_a_stock_one_of_the_same_name(tmp_path: Path) 
 
     local = tmp_path / "local"
     local.mkdir()
-    (local / "Device.kicad_sym").write_text("(kicad_symbol_lib)")
+    (local / "Device.kicad_sym").write_text('(kicad_symbol_lib (symbol "R"))')
     stock = tmp_path / "stock"
     stock.mkdir()
-    (stock / "Device.kicad_sym").write_text("(kicad_symbol_lib)")
+    (stock / "Device.kicad_sym").write_text('(kicad_symbol_lib (symbol "R"))')
     out = tmp_path / "out"
     out.mkdir()
 
@@ -173,3 +152,78 @@ def test_a_project_library_shadows_a_stock_one_of_the_same_name(tmp_path: Path) 
     table = (out / "sym-lib-table").read_text()
     assert str((local / "Device.kicad_sym").resolve()) in table
     assert str((stock / "Device.kicad_sym").resolve()) not in table
+
+
+def test_a_partially_shadowing_library_does_not_win_the_table(tmp_path: Path) -> None:
+    """The bug this module was rewritten for.
+
+    ``loaders`` resolves per *item*, so it takes LGA-8 from stock even though a
+    vendored library of the same nickname supplies a different part. A lib
+    table maps a nickname to one directory, so picking the first root that
+    merely *has* the nickname pointed KiCad at a library holding none of what
+    the design used — 'LGA-8_8x6mm_P1.27mm not found in library Package_LGA'
+    on a board whose stock library contains it.
+    """
+    from blpl.emitter import lib_tables
+
+    vendor = tmp_path / "vendor"
+    (vendor / "Package_LGA.pretty").mkdir(parents=True)
+    (vendor / "Package_LGA.pretty" / "Nordic_LGA-113.kicad_mod").write_text("(footprint)")
+    stock = tmp_path / "stock"
+    (stock / "Package_LGA.pretty").mkdir(parents=True)
+    (stock / "Package_LGA.pretty" / "LGA-8.kicad_mod").write_text("(footprint)")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    hdm = {"components": {"U1": {"footprint": "Package_LGA:LGA-8"}}}
+    lib_tables.write(hdm, out, symbols_root=[tmp_path], footprints_root=[vendor, stock])
+
+    table = (out / "fp-lib-table").read_text()
+    assert str((stock / "Package_LGA.pretty").resolve()) in table
+    assert str((vendor / "Package_LGA.pretty").resolve()) not in table
+
+
+def test_a_nickname_split_across_roots_is_merged_not_guessed(tmp_path: Path) -> None:
+    """When the design uses one nickname from two roots, no single directory
+    can serve it and a table cannot say so. The referenced items are collected
+    into a merged library instead, which is the only arrangement that agrees
+    with what the emitters actually loaded."""
+    from blpl.emitter import lib_tables
+
+    vendor = tmp_path / "vendor"
+    (vendor / "Package_SON.pretty").mkdir(parents=True)
+    (vendor / "Package_SON.pretty" / "FromVendor.kicad_mod").write_text("(footprint vendor)")
+    stock = tmp_path / "stock"
+    (stock / "Package_SON.pretty").mkdir(parents=True)
+    (stock / "Package_SON.pretty" / "FromStock.kicad_mod").write_text("(footprint stock)")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    hdm = {"components": {
+        "U1": {"footprint": "Package_SON:FromVendor"},
+        "U2": {"footprint": "Package_SON:FromStock"},
+    }}
+    report = lib_tables.write(hdm, out, symbols_root=[tmp_path], footprints_root=[vendor, stock])
+
+    merged = out / lib_tables.MERGE_DIRNAME / "Package_SON.pretty"
+    assert (merged / "FromVendor.kicad_mod").read_text() == "(footprint vendor)"
+    assert (merged / "FromStock.kicad_mod").read_text() == "(footprint stock)"
+    assert str(merged.resolve()) in (out / "fp-lib-table").read_text()
+    assert report["merged"] == [{
+        "kind": "footprint", "lib": "Package_SON", "merged": True,
+        "items": ["FromStock", "FromVendor"],
+        "sources": sorted({str(stock / "Package_SON.pretty"), str(vendor / "Package_SON.pretty")}),
+    }]
+
+
+def test_an_item_no_root_provides_is_named_not_just_its_library(tmp_path: Path) -> None:
+    from blpl.emitter import lib_tables
+
+    out = tmp_path / "out"
+    out.mkdir()
+    hdm = {"components": {"U1": {"lib_symbol": "Nope:Thing", "footprint": "NopeFP:Thing"}}}
+
+    report = lib_tables.write(hdm, out, symbols_root=[tmp_path], footprints_root=[tmp_path])
+
+    assert report["unresolved"] == ["symbol:Nope:Thing", "footprint:NopeFP:Thing"]
+    assert "Nope" not in (out / "sym-lib-table").read_text()
