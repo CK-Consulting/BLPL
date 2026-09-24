@@ -233,3 +233,54 @@ def test_a_rule_naming_an_undeclared_class_is_refused(tmp_path) -> None:
     with _pytest.raises(s5.NetClassConfigError, match="not in net_classes"):
         s5._project_class_rules({"net_classes": {"Default": {}},
                                  "net_class_rules": [{"pattern": "^X", "class": "Nope"}]})
+
+
+def _hdm_nets(**kw):
+    """Minimal HDM-shaped nets for exercising the selection rules."""
+    return {n: dict(pads=[["U1", "1"]], **v) for n, v in kw.items()}
+
+
+def test_include_adds_to_the_policy_rather_than_replacing_it() -> None:
+    """`power` leaves every signal net unprobeable — on the example-handheld core, 92
+    of 174 nets have no pad a probe can reach. A board has to be able to keep
+    the rails and name the handful of signals bring-up actually needs."""
+    from blpl.core import stage5_emit_yaml_hdm as s5
+
+    nets = _hdm_nets(VBAT={"class": "Power_Bulk"}, SPI1_SCK={"class": "Default"},
+                 DSI_CKP={"class": "Default"})
+    cfg = s5.test_point_config({"test_points": {"policy": "power", "include": [r"^SPI1_"]}})
+    assert s5._test_point_nets(nets, cfg) == ["SPI1_SCK", "VBAT"]
+
+
+def test_exclude_beats_both_policy_and_include() -> None:
+    """The nets that must not carry a stub have to be removable even when a
+    broad policy or a broad include pattern caught them."""
+    from blpl.core import stage5_emit_yaml_hdm as s5
+
+    nets = _hdm_nets(OSPI_CLK={"class": "Default"}, OSPI_D0={"class": "Default"},
+                 VBAT={"class": "Power_Bulk"})
+    cfg = s5.test_point_config({"test_points": {"policy": "all", "exclude": [r"^OSPI_"]}})
+    assert s5._test_point_nets(nets, cfg) == ["VBAT"]
+
+
+def test_diff_pairs_are_left_alone_unless_asked_for() -> None:
+    """A test point on one half of a pair breaks the symmetry the pair exists
+    for, so `all` must not quietly stub the DSI lanes. Opting in is deliberate."""
+    from blpl.core import stage5_emit_yaml_hdm as s5
+
+    nets = _hdm_nets(DSI_CKP={"class": "DSI_Diff_100Ohm", "diff_pair_of": "DSI_CKN"},
+                 DSI_CKN={"class": "DSI_Diff_100Ohm", "diff_pair_of": "DSI_CKP"},
+                 VBAT={"class": "Power_Bulk"})
+    cfg = s5.test_point_config({"test_points": {"policy": "all"}})
+    assert s5._test_point_nets(nets, cfg) == ["VBAT"]
+
+    optin = s5.test_point_config({"test_points": {"policy": "all", "include_diff_pairs": True}})
+    assert s5._test_point_nets(nets, optin) == ["DSI_CKN", "DSI_CKP", "VBAT"]
+
+
+def test_a_bad_include_pattern_is_refused_at_load() -> None:
+    from blpl.core import stage5_emit_yaml_hdm as s5
+    import pytest as _pytest
+
+    with _pytest.raises(s5.TestPointConfigError, match="not a regex"):
+        s5.test_point_config({"test_points": {"include": ["^(unclosed"]}})

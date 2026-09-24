@@ -317,19 +317,68 @@ def test_point_config(project_config: dict) -> dict:
         raise TestPointConfigError(
             f"test_points.policy {policy!r} is not one of {', '.join(TEST_POINT_POLICIES)}"
         )
+    def _patterns(key: str) -> list[re.Pattern[str]]:
+        vals = raw.get(key) or []
+        if isinstance(vals, str):
+            vals = [vals]
+        if not isinstance(vals, list):
+            raise TestPointConfigError(f"test_points.{key} must be a list of patterns")
+        out = []
+        for v in vals:
+            try:
+                out.append(re.compile(str(v)))
+            except re.error as exc:
+                raise TestPointConfigError(
+                    f"test_points.{key} pattern {v!r} is not a regex: {exc}"
+                ) from exc
+        return out
+
     return {
         "policy": policy,
         "symbol": str(raw.get("symbol") or DEFAULT_TEST_POINT_SYMBOL),
         "footprint": str(raw.get("footprint") or DEFAULT_TEST_POINT_FOOTPRINT),
+        # Named nets on top of the policy, and named nets taken back off it.
+        # The three policies are a blunt instrument on a real board: `power`
+        # leaves every signal net unprobeable, and `all` is not merely excessive
+        # but harmful — it puts a stub on differential pairs and on memory buses
+        # running at hundreds of MHz, where the test point is an impedance
+        # discontinuity rather than a convenience.
+        "include": _patterns("include"),
+        "exclude": _patterns("exclude"),
+        # Off by default, and this is the safety property. A test point on one
+        # half of a pair breaks the symmetry the pair exists for. Opting in has
+        # to be deliberate.
+        "include_diff_pairs": bool(raw.get("include_diff_pairs", False)),
     }
 
 
-def _test_point_nets(nets_out: dict, policy: str) -> list[str]:
-    if policy == "none":
-        return []
+def _test_point_nets(nets_out: dict, cfg: dict) -> list[str]:
+    """Which nets get a test point: policy, then include, then exclude.
+
+    Order matters. `include` adds to whatever the policy chose, so a board can
+    keep `power` and name the handful of signals bring-up actually needs.
+    `exclude` runs last and beats everything, because the nets that must not
+    have a stub — differential pairs, a 200 MHz memory bus — have to be
+    removable even when a broad policy or a broad include pattern caught them.
+    """
+    policy = cfg["policy"]
     if policy == "power":
-        return sorted(n for n, d in nets_out.items() if d.get("class") == "Power_Bulk")
-    return sorted(n for n, d in nets_out.items() if d.get("pads"))
+        chosen = {n for n, d in nets_out.items() if d.get("class") == "Power_Bulk"}
+    elif policy == "all":
+        chosen = {n for n, d in nets_out.items() if d.get("pads")}
+    else:
+        chosen = set()
+
+    for pat in cfg.get("include") or []:
+        chosen |= {n for n, d in nets_out.items() if d.get("pads") and pat.search(n)}
+
+    if not cfg.get("include_diff_pairs", False):
+        chosen -= {n for n, d in nets_out.items() if d.get("diff_pair_of")}
+
+    for pat in cfg.get("exclude") or []:
+        chosen -= {n for n in chosen if pat.search(n)}
+
+    return sorted(chosen)
 
 
 def _synthesize_test_points(
@@ -350,7 +399,11 @@ def _synthesize_test_points(
     the stage rather than reach the emitter as a dangling lib_id.
     """
     record = {"policy": cfg["policy"], "count": 0, "symbol": cfg["symbol"], "footprint": cfg["footprint"]}
-    targets = _test_point_nets(nets_out, cfg["policy"])
+    if cfg.get("include") or cfg.get("exclude") or cfg.get("include_diff_pairs"):
+        record["include"] = [p.pattern for p in cfg.get("include") or []]
+        record["exclude"] = [p.pattern for p in cfg.get("exclude") or []]
+        record["include_diff_pairs"] = bool(cfg.get("include_diff_pairs", False))
+    targets = _test_point_nets(nets_out, cfg)
     if not targets:
         return record
 
@@ -529,10 +582,16 @@ def emit(
         cls, note = _reconcile_net_class(net["name"], net["class"], class_rules, declared_classes)
         if note:
             class_notes.append(note)
-        nets_out[net["name"]] = {
+        entry = {
             "class": cls,
             "pads": [[m["refdes"], m["pin"]] for m in net["members"]],
         }
+        # Stage 4 works this out and it used to stop here. Carrying it through
+        # is what lets the test-point policy leave differential pairs alone
+        # without every project having to name them.
+        if net.get("diff_pair_of"):
+            entry["diff_pair_of"] = net["diff_pair_of"]
+        nets_out[net["name"]] = entry
 
     tp_record = _synthesize_test_points(
         components_out,
