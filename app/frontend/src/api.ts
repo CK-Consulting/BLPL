@@ -387,6 +387,12 @@ export type GitStatus = {
   behind: number;
   dirty: boolean;
   has_remote: boolean;
+  /** Which remote the Push button acts on. "origin" for a clone, but a
+   *  hand-made repository need not have one. */
+  remote_name: string;
+  /** Where it points. Any credential embedded in the URL is replaced
+   *  server-side, so this is safe to display and to screenshot. */
+  remote_url: string;
 };
 
 export type LibraryPolicyValues = {

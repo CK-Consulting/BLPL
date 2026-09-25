@@ -47,3 +47,56 @@ describe("the active-board control", () => {
     expect(screen.queryByLabelText("Active board")).toBeNull();
   });
 });
+
+describe("fabricability belongs to the board, not the application", () => {
+  // It used to be a chip floating in the navbar beside the account menu,
+  // permanently present and attached to nothing — which reads as a property of
+  // the app, and a warning that is always on is a warning nobody sees.
+  const boards = {
+    implicit: false,
+    boards: [{ name: "core", optional: false }],
+  };
+
+  function stub() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify(boards), { status: 200 })),
+    );
+  }
+
+  it("names what is blocking, under the selector", async () => {
+    stub();
+    render(
+      <ActiveBoard
+        projectId="p"
+        board="core"
+        onBoard={() => {}}
+        fab={{ placeholders: 3, emitter_defects: 1, blocked: true }}
+      />,
+    );
+    expect(await screen.findByText(/not fabricable/)).toHaveTextContent("3 placeholder part(s)");
+    expect(screen.getByText(/not fabricable/)).toHaveTextContent("1 emitter defect(s)");
+  });
+
+  it("says so quietly when the board is ready", async () => {
+    stub();
+    render(
+      <ActiveBoard
+        projectId="p"
+        board="core"
+        onBoard={() => {}}
+        fab={{ placeholders: 0, emitter_defects: 0, blocked: false }}
+      />,
+    );
+    expect(await screen.findByText("fabricable")).toBeInTheDocument();
+  });
+
+  it("shows nothing at all when readiness is unknown", async () => {
+    // A project whose readiness has not been computed must not read as either
+    // verdict.
+    stub();
+    render(<ActiveBoard projectId="p" board="core" onBoard={() => {}} />);
+    await screen.findByLabelText("Active board");
+    expect(screen.queryByText(/fabricable/)).toBeNull();
+  });
+});

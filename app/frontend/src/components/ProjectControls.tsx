@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { GitStatus, ImportResult, getJSON, postForm, postJSON } from "../api";
 import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
+import { WrenchScrewdriver } from "./Icons";
 
 // The git strip: what state the server's working copy is in, and the three
 // buttons that keep it in sync with the remote you roam through — pull, commit,
@@ -88,8 +89,46 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
   );
 }
 
-export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
+/**
+ * "+ Project" as a labelled button, with its dialog.
+ *
+ * The dashboard wants the word, not an icon: it is the primary action on a
+ * screen that may have nothing else on it, and an empty state whose only way
+ * forward is an unlabelled glyph is a dead end. The navbar wants the icon, and
+ * opens the dialog itself.
+ */
+export function NewProjectButton({ onCreated }: { onCreated: (id: string) => void }) {
   const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button className="link" onClick={() => setOpen(true)}>
+        + Project
+      </button>
+      {open && <NewProject onClose={() => setOpen(false)} onCreated={onCreated} />}
+    </>
+  );
+}
+
+
+/**
+ * The new-project dialog, opened by the navbar rather than by itself.
+ *
+ * It used to own both the trigger and the dialog, which is why the bar had a
+ * "+ Project" text link in the middle of it. The trigger now lives in
+ * NavActions with every other action, so this renders only when asked and is
+ * mounted only while open — which also makes the per-project consent reset
+ * unnecessary, because there is no stale instance to carry one over.
+ */
+export function NewProject({
+  onCreated,
+  onClose,
+}: {
+  onCreated: (id: string) => void;
+  onClose: () => void;
+}) {
+  const setOpen = (v: boolean) => {
+    if (!v) onClose();
+  };
   const [mode, setMode] = useState<"init" | "clone" | "import">("init");
   const [name, setName] = useState("");
   const [remote, setRemote] = useState("");
@@ -141,23 +180,6 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
       setBusy(false);
     }
   };
-
-  if (!open)
-    return (
-      <button
-        className="link"
-        onClick={() => {
-          // Fresh declaration per project. The component stays mounted while
-          // closed, and a consent carried over from the last project would be
-          // submitted for this one unread.
-          policy.reset();
-          setSkipped([]);
-          setOpen(true);
-        }}
-      >
-        + Project
-      </button>
-    );
 
   return (
     <div className="modal-backdrop" onClick={() => setOpen(false)}>
@@ -256,21 +278,31 @@ export function NewProject({ onCreated }: { onCreated: (id: string) => void }) {
  * an inline panel because the next per-project setting should have somewhere to
  * live that is not a new button.
  */
+/**
+ * This project's settings — distinct from the account's, and labelled as such.
+ *
+ * It was an unlabelled cog. So was the account's. Two identical glyphs for two
+ * different scopes, told apart only by position in a crowded bar, which is not
+ * telling them apart at all. The cog now means the application and your
+ * account; a project gets the wrench and screwdriver, and both say what they
+ * are.
+ */
 export function ProjectSettings({ projectId }: { projectId: string }) {
   const [open, setOpen] = useState(false);
   if (!open)
     return (
       <button
-        className="link proj-settings"
-        title="Project settings — what this project shares with the component library"
+        className="nav-icon proj-settings"
+        aria-label={`Project settings — ${projectId}`}
+        title={`Project settings — ${projectId}`}
         onClick={() => setOpen(true)}
       >
-        ⚙
+        <WrenchScrewdriver />
       </button>
     );
   return (
     <div className="modal-backdrop" onClick={() => setOpen(false)}>
-      <div className="modal small" onClick={(e) => e.stopPropagation()}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
         <header className="modal-head">
           <h2>Project settings — {projectId}</h2>
           <button className="link" onClick={() => setOpen(false)}>
@@ -278,9 +310,59 @@ export function ProjectSettings({ projectId }: { projectId: string }) {
           </button>
         </header>
         <div className="modal-body">
+          <ProjectGitPanel projectId={projectId} />
           <ProjectPolicyPanel projectId={projectId} />
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * Where this project came from and where its buttons push to.
+ *
+ * The header showed a branch name and offered Pull, Commit and Push, and the
+ * remote those acted on appeared nowhere in the application. Knowing you are
+ * on `main` is not knowing whose `main`, and a push control whose destination
+ * is invisible is one someone will eventually fire at the wrong repository.
+ */
+function ProjectGitPanel({ projectId }: { projectId: string }) {
+  const [st, setSt] = useState<GitStatus | null>(null);
+
+  useEffect(() => {
+    getJSON<GitStatus>(`/api/projects/${projectId}/git/status`)
+      .then(setSt)
+      .catch(() => setSt(null));
+  }, [projectId]);
+
+  return (
+    <section className="proj-git">
+      <h3>Git</h3>
+      {!st ? (
+        <p className="muted small">Reading repository status…</p>
+      ) : (
+        <dl className="kv">
+          <dt>Branch</dt>
+          <dd>
+            <code>{st.branch || "(no commits yet)"}</code>
+          </dd>
+          <dt>Remote</dt>
+          <dd>
+            {st.has_remote ? (
+              <>
+                <code>{st.remote_name || "origin"}</code>{" "}
+                {/* Any credential in the URL is replaced server-side before it
+                    reaches here, so this is safe to show and to screenshot. */}
+                <span className="remote-url">{st.remote_url}</span>
+              </>
+            ) : (
+              <span className="muted">
+                none — this project is local only, and Push has nowhere to go
+              </span>
+            )}
+          </dd>
+        </dl>
+      )}
+    </section>
   );
 }

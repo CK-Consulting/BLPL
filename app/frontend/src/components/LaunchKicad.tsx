@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ExternalLink } from "./Icons";
 
 /**
  * Open the KiCad running in the compose stack, in a new tab.
@@ -53,7 +54,22 @@ export function useKicadDesktop(): string | null {
   return ok ? KICAD_PATH : null;
 }
 
-export function LaunchKicad({ className = "", label = "KiCad" }: { className?: string; label?: string }) {
+/**
+ * The control that opens KiCad, carrying the version it will open.
+ *
+ * The version used to sit beside this as its own static label — "KiCad 10.0.6"
+ * in the middle of the navbar, between two unrelated links, saying nothing
+ * anyone could act on. It is not a fact about the app; it is a fact about
+ * *what this button opens*, so it belongs on the button. That also removes one
+ * item from a bar that had too many.
+ */
+export function LaunchKicad({
+  className = "",
+  version = null,
+}: {
+  className?: string;
+  version?: string | null;
+}) {
   const url = useKicadDesktop();
   if (!url) return null;
   return (
@@ -62,9 +78,15 @@ export function LaunchKicad({ className = "", label = "KiCad" }: { className?: s
       href={url}
       target="_blank"
       rel="noopener noreferrer"
-      title="Open the KiCad desktop in a new tab — for drawing a footprint or a symbol the libraries do not have"
+      title={
+        version
+          ? `KiCad ${version}, running server-side in the container — for drawing a footprint or a symbol the libraries do not have`
+          : "Open the KiCad desktop in a new tab — for drawing a footprint or a symbol the libraries do not have"
+      }
     >
-      {label} ↗
+      <ExternalLink />
+      <span className="kicad-launch-label">Open KiCad in New Tab</span>
+      {version && <span className="kicad-ver">{version}</span>}
     </a>
   );
 }

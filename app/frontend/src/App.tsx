@@ -29,6 +29,8 @@ import { ReleasePanel } from "./components/ReleasePanel";
 import { DiffView } from "./components/DiffView";
 import { Artifacts } from "./components/Artifacts";
 import { ChatPanel } from "./components/ChatPanel";
+import { NavActions } from "./components/NavActions";
+import { Chat as ChatIcon, Cog, PlusSquare, Share as ShareIcon } from "./components/Icons";
 import { BoardPanel } from "./components/BoardPanel";
 import { RailToggle, Section } from "./components/Rail";
 import { FileTree, destinationFor, type TreeNode } from "./components/FileTree";
@@ -56,6 +58,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   const [selected, setSelected] = useState<string | null>(projectId);
   const [kicad, setKicad] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showNewProject, setShowNewProject] = useState(false);
   const [showSharing, setShowSharing] = useState(false);
   const [tab, setTab] = useState<TabId>("board");
   const sidebar = useResizable("blpl.sidebarWidth", 380);
@@ -136,40 +139,53 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
         {/* The board every tab below is about, where the eye lands first. On a
             project with seven boards "which one am I building" is the question
             behind every stage run, and a highlighted item in the rail did not
-            answer it loudly enough. */}
-        {selected && <ActiveBoard projectId={selected} board={board} onBoard={setBoard} />}
+            answer it loudly enough. The board's fabricability now hangs under
+            this selector rather than floating in the bar: it is a fact about
+            one board, and a permanent warning beside the account menu reads as
+            a property of the application. */}
+        {selected && (
+          <ActiveBoard
+            projectId={selected}
+            board={board}
+            onBoard={setBoard}
+            fab={projects.find((p) => p.id === selected)?.fab}
+          />
+        )}
         <span className="spacer" />
-        <LaunchKicad className="link kicad-launch" />
-        {(() => {
-          const cur = projects.find((p) => p.id === selected);
-          if (!cur?.fab?.blocked) return null;
-          const bits: string[] = [];
-          if (cur.fab.placeholders) bits.push(`${cur.fab.placeholders} placeholder part(s)`);
-          if (cur.fab.emitter_defects) bits.push(`${cur.fab.emitter_defects} emitter defect(s)`);
-          return (
-            <span className="fab-chip" title={`${bits.join(", ")} — see the Reports tab`}>
-              ⚠ not fabricable
-            </span>
-          );
-        })()}
-        <NewProject
-          onCreated={(id) => {
-            refresh().then(() => setSelected(id));
-          }}
+        <LaunchKicad className="link kicad-launch" version={kicad} />
+        <NavActions
+          actions={[
+            {
+              id: "new-project",
+              label: "New project",
+              icon: <PlusSquare />,
+              onSelect: () => setShowNewProject(true),
+              title: "Clone a git remote, or start a local project",
+            },
+            {
+              id: "chat",
+              label: "Chat",
+              icon: <ChatIcon />,
+              onSelect: toggleChat,
+              active: showChat,
+            },
+            {
+              id: "share",
+              label: "Share project",
+              icon: <ShareIcon />,
+              onSelect: () => setShowSharing(true),
+              disabled: !selected,
+              title: selected ? `Invite someone to ${selected}` : "Select a project first",
+            },
+            {
+              id: "settings",
+              label: "Account & app settings",
+              icon: <Cog />,
+              onSelect: () => setShowSettings(true),
+              title: "Endpoints, task routing, git credentials, passkeys — your defaults across every project",
+            },
+          ]}
         />
-        <span className="kicad" title="KiCad running server-side, in the container">
-          {/* Named, not bare: "10.0.0" alone reads as an app version. */}
-          {kicad ? `KiCad ${kicad}` : "KiCad: not found"}
-        </span>
-        <button className={showChat ? "link on" : "link"} onClick={toggleChat}>
-          Chat
-        </button>
-        <button className="link" onClick={() => setShowSharing(true)} disabled={!selected}>
-          Share
-        </button>
-        <button className="link" onClick={() => setShowSettings(true)}>
-          Settings
-        </button>
         {/* Clerk owns sign-out, the account menu, and everything under it, so
             there is nothing here for the app to reimplement. */}
         <UserControl />
@@ -342,6 +358,15 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
         </div>
       )}
 
+      {showNewProject && (
+        <NewProject
+          onClose={() => setShowNewProject(false)}
+          onCreated={(id) => {
+            setShowNewProject(false);
+            refresh().then(() => setSelected(id));
+          }}
+        />
+      )}
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
       {showSharing && selected && (
         <div className="modal-backdrop" onClick={() => setShowSharing(false)}>

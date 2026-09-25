@@ -2373,6 +2373,7 @@ def git_status(project_id: str, user: User = Depends(require_onboarded),
     return {
         "branch": st.branch, "ahead": st.ahead, "behind": st.behind,
         "dirty": st.dirty, "has_remote": st.has_remote,
+        "remote_name": st.remote_name, "remote_url": st.remote_url,
     }
 
 

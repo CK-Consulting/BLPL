@@ -220,7 +220,7 @@ function BoardReport({ report, title }: { report: Report; title?: string }) {
           not exist is fixed by drawing one, and this is where you learn it does
           not exist. */}
       <div className="preflight-tools">
-        <LaunchKicad className="btn kicad-launch" label="Launch KiCad in a new tab" />
+        <LaunchKicad className="btn kicad-launch" />
         <span className="muted small">
           For drawing a footprint or symbol the libraries do not have. Save it into this
           project's <code>libraries/footprints/</code> — doctor and Stage 5 both look there.

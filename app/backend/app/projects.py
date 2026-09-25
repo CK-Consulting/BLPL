@@ -24,6 +24,7 @@ ever passes through application code or lands in a log line.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,6 +102,30 @@ class GitStatus:
     behind: int         # remote commits not yet pulled
     dirty: bool         # uncommitted changes to design files
     has_remote: bool
+    #: The remote's name and where it points. Reported because "has_remote:
+    #: true" answers a question nobody asks — the branch label was visible in
+    #: the UI while *which repository it pushed to* appeared nowhere at all,
+    #: which is a poor property for a control that pushes.
+    remote_name: str = ""
+    remote_url: str = ""
+
+
+def _redact_url(url: str) -> str:
+    """A remote URL with any embedded credentials removed.
+
+    ``gitstore`` is careful never to splice a token into a URL, but this one is
+    not ours: it is whatever the user pasted into the clone form, and
+    ``https://user:ghp_xxx@github.com/...`` is a shape people paste. Displaying
+    it would put a live token on screen, in a screenshot, and in any bug report
+    made from one. The userinfo is replaced rather than dropped so the URL still
+    reads as authenticated, which is information worth keeping.
+    """
+    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]+)@(.*)$", url)
+    if not match:
+        return url
+    scheme, userinfo, rest = match.groups()
+    user = userinfo.split(":", 1)[0]
+    return f"{scheme}{user}:***@{rest}" if ":" in userinfo else f"{scheme}{user}@{rest}"
 
 
 class Projects:
@@ -274,7 +299,20 @@ class Projects:
                 parts = counts.split()
                 if len(parts) == 2:
                     behind, ahead = int(parts[0]), int(parts[1])
-        return GitStatus(branch=branch, ahead=ahead, behind=behind, dirty=dirty, has_remote=has_remote)
+        remote_name = ""
+        remote_url = ""
+        if has_remote:
+            # "origin" when it exists, else whatever the first remote is called:
+            # a clone names it origin, but a repository someone set up by hand
+            # need not have one, and reporting nothing in that case would be the
+            # same blind spot in a different place.
+            names = self._git(d, "remote").split()
+            remote_name = "origin" if "origin" in names else names[0]
+            remote_url = _redact_url(
+                self._git_allow_fail(d, "remote", "get-url", remote_name).strip()
+            )
+        return GitStatus(branch=branch, ahead=ahead, behind=behind, dirty=dirty,
+                         has_remote=has_remote, remote_name=remote_name, remote_url=remote_url)
 
     # -- diff ----------------------------------------------------------------
 

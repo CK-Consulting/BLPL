@@ -63,7 +63,7 @@ describe("the component-library declaration", () => {
 
 // -- the dialog forgets between projects --------------------------------------
 
-import { NewProject } from "./ProjectControls";
+import { NewProjectButton } from "./ProjectControls";
 import { afterEach } from "vitest";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -89,13 +89,17 @@ function stubDefaults() {
 
 describe("a fresh declaration per project", () => {
   it("reopening the dialog resets a consent given for the previous project", async () => {
-    // The dialog component stays mounted while closed — closing hides a modal,
-    // it does not unmount state. Without the reset, the declaration made for
-    // one project greeted the next one already filled in, consent tick
-    // included: the next board would have shared under a statement its creator
-    // never read.
+    // The declaration made for one project must never greet the next one
+    // already filled in, consent tick included — that would share the next
+    // board under a statement its creator never read.
+    //
+    // This used to be enforced by an explicit reset, because the dialog stayed
+    // mounted while closed and closing only hid it. The navbar now opens it and
+    // NewProjectButton mounts it only while open, so the stale instance the
+    // reset defended against no longer exists. The guarantee is the same and is
+    // still worth asserting; what changed is that it is now structural.
     stubDefaults();
-    render(<NewProject onCreated={() => {}} />);
+    render(<NewProjectButton onCreated={() => {}} />);
     fireEvent.click(screen.getByText("+ Project"));
     await screen.findByText(/Project permissions/);
 
@@ -113,5 +117,16 @@ describe("a fresh declaration per project", () => {
     ).toBe(true);
     // Nothing shared means no consent statement on screen at all.
     expect(screen.queryByRole("checkbox")).toBeNull();
+  });
+
+  it("the dialog is gone from the document once closed", async () => {
+    // The structural version of the guarantee above: no mounted instance means
+    // no state to carry over, whatever a future edit does to the reset.
+    stubDefaults();
+    render(<NewProjectButton onCreated={() => {}} />);
+    fireEvent.click(screen.getByText("+ Project"));
+    await screen.findByText(/Project permissions/);
+    fireEvent.click(screen.getByText("Close"));
+    expect(screen.queryByText(/Project permissions/)).toBeNull();
   });
 });
