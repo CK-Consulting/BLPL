@@ -21,7 +21,7 @@ from typing import Any
 
 import yaml
 
-from . import schema, symbol_resolution
+from . import placement, schema, symbol_resolution
 from . import stage4_synthesize_nets
 
 
@@ -135,6 +135,60 @@ def _default_placement(index: int, total: int, board_dim: tuple[float, float]) -
         "rot": 0.0,
         "side": "top",
     }
+
+
+def _place_components(
+    components_out: dict,
+    nets_out: dict,
+    project_config: dict,
+    *,
+    project_dir: Path | None,
+    stock_footprints_root: Path | None,
+) -> dict:
+    """Replace the build-time grid with a real placement, and record what happened.
+
+    Returns a record rather than only mutating, because "every part is on the
+    board" and "eleven parts did not fit" are both outcomes a later stage needs
+    to be able to see. The grid's failure was that it could not express the
+    second one: it always succeeded, and the overflow surfaced much later as a
+    board nobody could route.
+
+    A placement that fails leaves the grid coordinates alone. They are wrong,
+    but they are wrong *visibly* — the alternative is components stacked at the
+    origin, which looks like a different bug.
+    """
+    dims = project_config.get("project", {}).get("dimensions") or [100, 80]
+    board = (float(dims[0]), float(dims[1]))
+
+    roots: list[Path] = []
+    if project_dir is not None and stock_footprints_root is not None:
+        roots = [r for r, _ in symbol_resolution.footprint_search_path(
+            Path(project_dir), Path(stock_footprints_root))]
+    elif stock_footprints_root is not None:
+        roots = [Path(stock_footprints_root)]
+
+    hints = (project_config.get("placement") or {}).get("hints") or {}
+    result = placement.place(
+        components_out, nets_out, board, footprint_roots=roots, hints=hints
+    )
+    for ref, p in result.placements.items():
+        if ref in components_out:
+            components_out[ref]["placement"] = p.as_dict()
+
+    record: dict[str, Any] = {
+        "placed": len(result.placements),
+        "unplaced": sorted(result.unplaced),
+        "board_mm": [board[0], board[1]],
+        "hinted": sorted(hints),
+        "connection_length_mm": round(
+            placement.total_connection_length(result.placements, nets_out), 1
+        ),
+    }
+    if result.unplaced:
+        record["reasons"] = dict(sorted(result.unplaced.items()))
+    if result.notes:
+        record["notes"] = result.notes
+    return record
 
 
 def _pin_map_for(
@@ -602,6 +656,16 @@ def emit(
         stock_footprints_root=stock_footprints_root,
     )
 
+    # Real placement, over the grid every component was given while it was being
+    # built. The grid was never placement — it sized every part the same and ran
+    # off the bottom of the board — and a router handed parts that are not on
+    # the board can do nothing with them. Done here, after test points, so that
+    # synthesized parts are placed too.
+    place_record = _place_components(
+        components_out, nets_out, project_config,
+        project_dir=project_dir, stock_footprints_root=stock_footprints_root,
+    )
+
     hdm: dict[str, Any] = {}
     for key in ("project", "net_classes", "boundaries"):
         if key in project_config:
@@ -611,7 +675,7 @@ def emit(
     # Always written, count 0 included: Stage 8 reads this to tell "no test
     # points because the policy said so" from "no test points because the
     # pipeline cannot make them".
-    hdm["synthesis"] = {"test_points": tp_record}
+    hdm["synthesis"] = {"test_points": tp_record, "placement": place_record}
     if class_notes:
         hdm["synthesis"]["net_class_notes"] = class_notes
     if not_placed:
