@@ -2,14 +2,14 @@
 
 Produces a schematic that kicad-cli 9.x / 10.x can load for ERC. Each HDM
 component is placed as a symbol instance with a ``lib_id`` reference. KiCad
-resolves the symbol graphics from the project's symbol-library table at
-open-time, so the ``lib_symbols`` block here only carries empty-shell
-declarations (matching what KiCad itself emits).
+resolves the symbol graphics from the ``lib_symbols`` block, which carries a
+full, self-contained copy of every symbol used — derived symbols flattened
+against their parents, because KiCad cannot resolve ``(extends ...)`` inside a
+schematic cache.
 
-Nets are declared as ``(global_label ...)`` entries laid out on a grid — a
-"net palette" the user can drag onto pins in the editor. No wires are drawn;
-ERC will report unconnected pins, which is the correct signal for a freshly
-synthesized design that hasn't been routed yet.
+Each pin that has a net gets a short stub wire and a label at its far end;
+same-named labels are what join pins into nets. No net palette and no
+pin-to-pin wires.
 
 The schematic-to-PCB linkage uses matching net names. Component Footprint
 properties carry the ``Lib:Name`` footprint ref so that ``Update PCB from
@@ -19,6 +19,7 @@ Schematic`` is a no-op on our generated pair.
 from __future__ import annotations
 
 import math
+import re
 import uuid as _uuid
 from copy import deepcopy
 from pathlib import Path
@@ -245,6 +246,92 @@ def _extends_of(shell: sexpr.Sexp) -> str | None:
         if isinstance(child, list) and len(child) >= 2 and child[0] == "extends":
             return sexpr.unquote(str(child[1]))
     return None
+
+
+def _property_name(node: sexpr.Sexp) -> str | None:
+    """The name of a ``(property "Name" "Value" ...)`` node."""
+    if isinstance(node, list) and len(node) >= 2 and node[0] == "property":
+        return sexpr.unquote(str(node[1]))
+    return None
+
+
+def _sub_symbol_name(node: sexpr.Sexp) -> str | None:
+    """The name of a nested ``(symbol "Parent_0_1" ...)`` body/pin unit."""
+    if isinstance(node, list) and len(node) >= 2 and node[0] == "symbol":
+        return sexpr.unquote(str(node[1]))
+    return None
+
+
+def _flatten_derived(child: sexpr.Sexp, parent: sexpr.Sexp) -> sexpr.Node:
+    """Resolve ``(extends "Parent")`` into a self-contained symbol.
+
+    KiCad's schematic ``lib_symbols`` is a *cache*: entries are keyed by the
+    full ``"Lib:Name"``, but a derived symbol names its parent bare —
+    ``(extends "BQ27441-G1")``, not ``"Battery_Management:BQ27441-G1"``. So the
+    parent is in the file and the child still cannot find it, and the child
+    loads with **no pins at all**.
+
+    That is not a cosmetic problem. A pinless symbol means every wire this
+    emitter drew to one of its pins ends in mid-air, and every net that had one
+    pin on such a symbol collapses to a single-pin net. On example-handheld's
+    core board, two derived symbols — BQ27441DRZR-G1A and PAM8302AAS — produced
+    37 of 53 ERC violations this way: 2 "doesn't match copy in library", 17
+    "unconnected wire endpoint", 18 "label connected to only one pin". The
+    stubs were at the right coordinates the whole time; there was nothing there
+    to meet them.
+
+    So the cache entry is flattened instead: the parent's graphics and pins,
+    under the child's name, carrying the child's own properties. Nothing is
+    left to resolve at load time, which is also what makes KiCad's
+    schematic-versus-library comparison agree.
+    """
+    child_name = sexpr.unquote(str(child[1]))
+    # Top-level cache entries are keyed "Lib:Name", but the nested body/pin
+    # units are named from the *bare* symbol name — "BQ27441-G1_1_1", never
+    # "Battery_Management:BQ27441-G1_1_1". Renaming against the qualified name
+    # produced units called plain "Lib:Name", and KiCad answered the whole file
+    # with "Failed to load schematic".
+    child_bare = child_name.rpartition(":")[2] or child_name
+
+    child_props = [c for c in child[2:] if _property_name(c) is not None]
+    child_prop_names = {_property_name(c) for c in child_props}
+
+    config: list[sexpr.Sexp] = []
+    parent_props: list[sexpr.Sexp] = []
+    units: list[sexpr.Sexp] = []
+    trailing: list[sexpr.Sexp] = []
+
+    for node in parent[2:]:
+        tag = sexpr.head(node)
+        if tag == "extends":
+            continue  # resolved by the recursion that got us here
+        if _property_name(node) is not None:
+            # The child's own value wins; the parent supplies what it omits.
+            if _property_name(node) not in child_prop_names:
+                parent_props.append(deepcopy(node))
+            continue
+        if _sub_symbol_name(node) is not None:
+            unit = deepcopy(node)
+            # "Parent_1_1" -> "Child_1_1". The suffix is read off the unit's own
+            # name rather than sliced against the parent's, which only works
+            # when both are spelled the same way and they are not.
+            sub = _sub_symbol_name(unit) or ""
+            suffix = re.search(r"(_\d+_\d+)$", sub)
+            unit[1] = sexpr.quote(child_bare + (suffix.group(1) if suffix else ""))
+            units.append(unit)
+            continue
+        if tag == "embedded_fonts":
+            trailing.append(deepcopy(node))
+            continue
+        config.append(deepcopy(node))
+
+    flat: sexpr.Node = ["symbol", sexpr.quote(child_name)]
+    flat.extend(config)
+    flat.extend(deepcopy(c) for c in child_props)
+    flat.extend(parent_props)
+    flat.extend(units)
+    flat.extend(trailing)
+    return flat
 
 
 def _warning_text(message: str, x: float, y: float) -> sexpr.Node:
@@ -499,24 +586,32 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
     missing: list[str] = []
     emitted: set[str] = set()
 
-    def _add(ref: str) -> None:
-        """Emit a symbol shell, pulling in any parent it derives from.
+    def _resolve(ref: str, seen: tuple[str, ...] = ()) -> sexpr.Sexp:
+        """Load a symbol and flatten any ``(extends ...)`` chain above it.
 
-        KiCad has derived symbols: a shell can carry (extends "Parent"), and the
-        parent supplies the pins and body. Copying only the child produces a
-        schematic that references a base symbol which isn't in the file, and KiCad
-        rejects the whole thing with a bare "Failed to load schematic". So follow
-        the extends chain and bring the parents along.
+        Bringing the parent along beside the child is not enough — see
+        _flatten_derived for why KiCad cannot match the two up inside a
+        schematic — so the chain is collapsed here and the result is
+        self-contained.
         """
+        if ref in seen:
+            chain = " -> ".join((*seen, ref))
+            raise loaders.LibraryMiss(f"circular symbol inheritance: {chain}")
+        shell = loaders.load_symbol_shell(ref, symbols_root)
+        parent_name = _extends_of(shell)
+        if not parent_name:
+            return shell
+        lib, _, _ = ref.partition(":")
+        parent = _resolve(f"{lib}:{parent_name}", (*seen, ref))
+        return _flatten_derived(shell, parent)
+
+    def _add(ref: str) -> None:
+        """Emit one self-contained symbol into the cache."""
         if ref in emitted:
             return
-        shell = loaders.load_symbol_shell(ref, symbols_root)
-        parent = _extends_of(shell)
-        if parent:
-            lib, _, _ = ref.partition(":")
-            _add(f"{lib}:{parent}")  # parent must appear before the child
+        resolved = _resolve(ref)
         emitted.add(ref)
-        lib_symbols_children.append(deepcopy(shell))
+        lib_symbols_children.append(deepcopy(resolved))
 
     for ref in lib_ids:
         try:

@@ -16,6 +16,8 @@ because the next occurrence will be just as opaque.
 
 from __future__ import annotations
 
+import re
+
 from blpl.emitter import loaders, sexpr
 from blpl.core import stage6_compile_kicad as s6
 
@@ -26,6 +28,21 @@ def _shell(ref: str):
 
 def _properties(shell) -> list[list]:
     return [c for c in shell if isinstance(c, list) and c and c[0] == "property"]
+
+
+def _cached_symbol(text: str, name: str) -> str:
+    """The one ``(symbol "Lib:Name" ...)`` block from an emitted lib_symbols cache."""
+    i = text.find(f'(symbol "{name}"')
+    assert i >= 0, f"{name} not in the emitted cache"
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[i : j + 1]
+    raise AssertionError(f"unterminated symbol block for {name}")
 
 
 def test_private_property_keeps_its_name() -> None:
@@ -55,11 +72,8 @@ def test_derived_symbol_reports_its_parent() -> None:
     assert sch._extends_of(shell) == "TP0610T"
 
 
-def test_emitting_a_derived_symbol_pulls_in_its_parent() -> None:
-    """Without the parent, KiCad rejects the whole schematic."""
-    from blpl.emitter import sch
-
-    hdm = {
+def _derived_hdm() -> dict:
+    return {
         "project": {"name": "T", "dimensions": [100, 80]},
         "components": {
             "Q1": {
@@ -70,10 +84,67 @@ def test_emitting_a_derived_symbol_pulls_in_its_parent() -> None:
         },
         "nets": {},
     }
-    text = sch.emit(hdm, symbols_root=s6._DEFAULT_SYMBOLS)
+
+
+def test_a_derived_symbol_is_flattened_into_the_cache() -> None:
+    """Shipping the parent beside the child is not enough, and looked like it was.
+
+    A schematic's lib_symbols is keyed "Lib:Name", but a derived symbol names
+    its parent bare — (extends "TP0610T"). KiCad cannot match the two, so the
+    child loaded with **no pins**, every wire drawn to one of its pins ended in
+    mid-air, and every net through it collapsed to a single pin. On
+    example-handheld's core board that was 37 of 53 ERC violations.
+
+    So the child is emitted self-contained and the parent is not emitted at all.
+    """
+    from blpl.emitter import sch
+
+    text = sch.emit(_derived_hdm(), symbols_root=s6._DEFAULT_SYMBOLS)
 
     assert '(symbol "Transistor_FET:AO3401A"' in text
-    assert '(symbol "Transistor_FET:TP0610T"' in text, "parent symbol was not emitted"
+    assert "(extends" not in text, "nothing should be left to resolve at load time"
+    assert '(symbol "Transistor_FET:TP0610T"' not in text, (
+        "the parent is no longer referenced by anything and should not be shipped"
+    )
+
+
+def test_a_flattened_symbol_carries_the_parents_pins() -> None:
+    """The pins are the point: without them the stubs connect to nothing."""
+    from blpl.emitter import sch
+
+    text = sch.emit(_derived_hdm(), symbols_root=s6._DEFAULT_SYMBOLS)
+    block = _cached_symbol(text, "Transistor_FET:AO3401A")
+
+    assert block.count("(pin ") == 3, "a MOSFET has three pins; got a shell"
+
+
+def test_a_flattened_symbols_units_are_renamed_to_it() -> None:
+    """Unit names derive from the symbol name, and are spelled bare.
+
+    Renaming them against the qualified name produced units called plain
+    "Lib:Name", and KiCad answered the whole file with "Failed to load
+    schematic" — which is indistinguishable from any other emit bug.
+    """
+    from blpl.emitter import sch
+
+    text = sch.emit(_derived_hdm(), symbols_root=s6._DEFAULT_SYMBOLS)
+    block = _cached_symbol(text, "Transistor_FET:AO3401A")
+    units = re.findall(r'\(symbol "([^"]+)"', block)[1:]
+
+    assert units, "the flattened symbol has no body/pin units"
+    for unit in units:
+        assert re.fullmatch(r"AO3401A_\d+_\d+", unit), f"badly named unit: {unit!r}"
+
+
+def test_a_flattened_symbol_keeps_its_own_value() -> None:
+    """The child's identity must not be replaced by the parent's."""
+    from blpl.emitter import sch
+
+    text = sch.emit(_derived_hdm(), symbols_root=s6._DEFAULT_SYMBOLS)
+    block = _cached_symbol(text, "Transistor_FET:AO3401A")
+
+    assert '(property "Value" "AO3401A"' in block
+    assert '(property "Value" "TP0610T"' not in block
 
 
 def test_multiline_text_escapes_its_newlines() -> None:
