@@ -1052,7 +1052,10 @@ def _cmd_autoroute(args: argparse.Namespace) -> int:
         print(f"autoroute: FAILED — {result.reason}", file=sys.stderr)
         print(f"           wrote {report_path}", file=sys.stderr)
         return 1
-    left = f", {result.unrouted} net(s) still open" if result.unrouted is not None else ""
+    # Connections, not nets: Freerouting's figure counts ratsnest items, so it
+    # is routinely larger than the board's net count and saying "nets" makes a
+    # board read as far worse than it is.
+    left = f", {result.unrouted} connection(s) still open" if result.unrouted is not None else ""
     print(f"autoroute: routed {pcb.name} in {result.passes} passes{left}")
     print(f"           snapshot {result.snapshot}")
     print(f"           wrote {report_path}")

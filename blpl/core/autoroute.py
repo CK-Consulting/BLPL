@@ -64,8 +64,15 @@ PYTHON_ENV = "HDM_KICAD_PYTHON"
 _TIMEOUT = 3600  # a large board genuinely takes this long
 
 # What Freerouting prints when the routing stage ends. The two numbers are the
-# whole verdict: how many nets it gave up on, and how many rule violations it
-# left behind.
+# whole verdict: how much it gave up on, and how many rule violations it left
+# behind.
+#
+# **The first number counts connections, not nets**, despite Freerouting saying
+# "unrouted nets" a few lines earlier in its own log. A net with N pads is N-1
+# connections, so the figure is routinely larger than the board's net count —
+# sb-halow reported 33 against 13 nets — and reading it as nets makes a board
+# look far worse than it is. KiCad's DRC agrees with the connection reading:
+# it counted 32 unconnected items on that same board.
 _ROUTING_SUMMARY = re.compile(
     r"Auto-routing stage completed:.*?\((\d+) unrouted and (\d+) violations\)"
 )
@@ -79,14 +86,16 @@ class RouteResult:
     ses: str = ""
     log: str = ""
     # False when the run never started because a dependency was missing. The
-    # distinction Stage 8 needs: an unrouted net after a real attempt is a
-    # finding about the design; before any attempt it says nothing at all.
+    # distinction Stage 8 needs: an unrouted connection after a real attempt is
+    # a finding about the design; before any attempt it says nothing at all.
     attempted: bool = True
     pcb: str = ""
     snapshot: str = ""
     passes: int = 0
     jar: str = ""
     # Freerouting's own count of what it could not finish, when it said.
+    # Connections, not nets — see _ROUTING_SUMMARY. The field keeps its name
+    # because Stage 8 and the stored reports already use it.
     unrouted: int | None = None
     violations: int | None = None
     finished_at: str = ""
