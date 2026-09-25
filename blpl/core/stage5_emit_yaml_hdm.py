@@ -87,15 +87,52 @@ class MissingProjectConfigError(RuntimeError):
     """Raised when project.yaml is missing. Message is a user-facing interactive prompt."""
 
 
-def ensure_project_config(project_config_path: Path, project_id: str) -> dict:
-    """Load project.yaml, or raise an actionable error if missing.
+class InvalidProjectConfigError(ValueError):
+    """project.yaml exists but does not say what it appears to say."""
 
-    If missing, write a skeleton next to the expected path with `.template` suffix
-    so the user can fill it in and rename.
+
+def _describe(error) -> str:
+    where = ".".join(str(p) for p in error.absolute_path) or "(root)"
+    return f"{where}: {error.message}"
+
+
+def ensure_project_config(project_config_path: Path, project_id: str) -> dict:
+    """Load project.yaml, validate it, or raise an actionable error.
+
+    **Validated on load, not on write**, and that is the whole point. A form can
+    police what it writes; it cannot police a hand-edit, a git merge, a template
+    someone copied from another board, or a file this pipeline has never seen
+    before. Every one of those reaches Stage 5 the same way, so the check
+    belongs where the file is read.
+
+    What it closes: Stage 5 read the board size as
+    ``project_config.get("project", {}).get("dimensions") or [100, 80]``. A
+    misspelled key, a string where a number belongs, a one-element list — none
+    of them errored. They silently produced a 100 x 80 mm board that built,
+    routed and reported success at the wrong size. example-handheld's core
+    board was 100 x 80 for weeks against a 96.85 x 57.14 target, and nothing in
+    the pipeline said so; it surfaced only when a placer started measuring how
+    full the board was.
+
+    A file that fails now stops the run and names the field, because a board of
+    the wrong size is not a warning.
     """
     if project_config_path.exists():
         with project_config_path.open() as f:
-            return yaml.safe_load(f) or {}
+            config = yaml.safe_load(f) or {}
+        errors = sorted(
+            schema.validator("project_config").iter_errors(config),
+            key=lambda e: list(e.absolute_path),
+        )
+        if errors:
+            detail = "\n  ".join(_describe(e) for e in errors[:8])
+            more = f"\n  … and {len(errors) - 8} more" if len(errors) > 8 else ""
+            raise InvalidProjectConfigError(
+                f"{project_config_path} is not a valid project config:\n  {detail}{more}\n"
+                f"Nothing was guessed and nothing was defaulted — fix the file and re-run. "
+                f"See schemas/project_config.v1.json for what each field accepts."
+            )
+        return config
     template_path = project_config_path.with_suffix(project_config_path.suffix + ".template")
     template_path.parent.mkdir(parents=True, exist_ok=True)
     template_path.write_text(_PROJECT_YAML_TEMPLATE.format(name=project_id))
@@ -157,7 +194,10 @@ def _place_components(
     but they are wrong *visibly* — the alternative is components stacked at the
     origin, which looks like a different bug.
     """
-    dims = project_config.get("project", {}).get("dimensions") or [100, 80]
+    # No fallback: ensure_project_config has already guaranteed two positive
+    # numbers, so a default here could only mask a validator that stopped
+    # running.
+    dims = project_config["project"]["dimensions"]
     board = (float(dims[0]), float(dims[1]))
 
     roots: list[Path] = []
@@ -539,7 +579,7 @@ def emit(
     resolutions: dict[str, symbol_resolution.Resolution] = {}
     footprint_resolutions: dict[str, symbol_resolution.Resolution] = {}
 
-    board_dim = tuple(project_config.get("project", {}).get("dimensions", [100, 80]))
+    board_dim = tuple(project_config["project"]["dimensions"])
     tp_cfg = test_point_config(project_config)
     # Every (refdes, pin) some net claims — the guard that keeps a no-connect
     # marker off a pin that is, in fact, connected.

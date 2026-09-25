@@ -17,6 +17,7 @@ _SCHEMA_FILES = {
     "coverage_report": "coverage_report.v1.json",
     "nets": "nets.v1.json",
     "gaps": "gaps.v1.json",
+    "project_config": "project_config.v1.json",
 }
 
 

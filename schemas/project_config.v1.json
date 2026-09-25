@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hdm-pipeline/schemas/project_config.v1.json",
+  "title": "Project config v1",
+  "description": "One board's geometry, stackup, net classes and synthesis policy — the file `blpl init` writes and Stage 5 reads. Hand-authored, so this schema is the only thing standing between a typo and a board of the wrong size: Stage 5 used to read dimensions with `.get(...) or [100, 80]`, which turned a misspelled key into a silent 100x80 board that built and shipped without complaint.",
+  "type": "object",
+  "required": ["project"],
+  "additionalProperties": true,
+  "properties": {
+    "project": {
+      "type": "object",
+      "required": ["name", "dimensions"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "board_id": { "type": "string", "minLength": 1 },
+        "dimensions": {
+          "description": "Board width and height in mm. Exactly two numbers: a one-element list is a typo, not a square board.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 2000,
+            "description": "Millimetres. The upper bound is a fat-finger guard — no fab in this pipeline's reach panelises past 2 m, and a stray zero is the likeliest way to reach one."
+          }
+        },
+        "stackup": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "layers": {
+              "description": "Copper layers. Odd counts are not manufacturable, so the enum is the whole list rather than a range.",
+              "enum": [1, 2, 4, 6, 8, 10, 12]
+            },
+            "thickness": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
+            "finish": { "enum": ["ENIG", "HASL", "LF-HASL", "OSP", "Immersion Silver", "Immersion Tin", "Hard Gold"] }
+          }
+        }
+      }
+    },
+    "net_classes": {
+      "description": "Trace and via geometry per class. Stage 4 assigns every unmatched net to Default, so Default has to exist or the emitted .kicad_pro names a class that does not.",
+      "type": "object",
+      "required": ["Default"],
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "trace_width": { "type": "number", "exclusiveMinimum": 0, "maximum": 20 },
+          "clearance": { "type": "number", "exclusiveMinimum": 0, "maximum": 20 },
+          "via_dia": { "type": "number", "exclusiveMinimum": 0, "maximum": 20 },
+          "via_drill": { "type": "number", "exclusiveMinimum": 0, "maximum": 20 }
+        }
+      }
+    },
+    "net_class_rules": {
+      "description": "Patterns applied over Stage 4's name-based guess. First match wins.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pattern", "class"],
+        "additionalProperties": false,
+        "properties": {
+          "pattern": { "type": "string", "minLength": 1, "format": "regex" },
+          "class": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "boundaries": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "board_outline": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "type": { "enum": ["rect", "polygon"] },
+            "start": { "$ref": "#/$defs/point" },
+            "end": { "$ref": "#/$defs/point" },
+            "layer": { "type": "string", "minLength": 1 },
+            "width": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        },
+        "keepouts": { "type": "array" },
+        "copper_zones": { "type": "array" }
+      }
+    },
+    "test_points": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "policy": {
+          "description": "none — synthesise nothing. power — one per power/ground net. all — one per net with a pad.",
+          "enum": ["none", "power", "all"]
+        },
+        "symbol": { "type": "string", "minLength": 1 },
+        "footprint": { "type": "string", "minLength": 1 },
+        "include": { "type": "array", "items": { "type": "string" } },
+        "exclude": { "type": "array", "items": { "type": "string" } },
+        "include_diff_pairs": { "type": "boolean" }
+      }
+    },
+    "placement": {
+      "description": "What the placer cannot infer. A hint is an instruction: someone wrote it knowing something the netlist does not say.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hints": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "x": { "type": "number" },
+              "y": { "type": "number" },
+              "rot": { "enum": [0, 90, 180, 270, 0.0, 90.0, 180.0, 270.0] },
+              "side": { "enum": ["top", "bottom"] },
+              "near": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Refdes to sit beside. Outranks both the netlist and the naming convention."
+              }
+            },
+            "dependentRequired": { "x": ["y"], "y": ["x"] }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "point": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "type": "number" }
+    }
+  }
+}
