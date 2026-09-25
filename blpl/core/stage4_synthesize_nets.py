@@ -20,6 +20,26 @@ from . import schema
 # Note: signal names that collide across subsystems (e.g. generic "TX+" on both J_ETH and J_USB1)
 # are NOT disambiguated here — that is the LLM/user's responsibility in Stages 0/1. Stage 4 merges
 # by literal signal name.
+# A net named after a rail is not always that rail. A divider midpoint, a
+# regulator's feedback node and a current-sense tap all get named for what they
+# measure — VBUS_SNS, REG3V3_FB, VSYS_MON — and every one of them is a
+# high-impedance analog node carrying microamps. Classing them Power_Bulk is
+# wrong twice: they get a 0.4 mm power trace, which on a divider midpoint is
+# extra coupling area and nothing else, and the schematic emitter puts a
+# PWR_FLAG on them, which ERC then reports as a power output shorted to
+# whatever GPIO reads them. VBUS_SNS on example-handheld's core board was
+# the last ERC violation left on it, and it is two resistors, a filter cap and
+# an ADC pin.
+#
+# Checked before the rail patterns, because the rail patterns are prefix
+# matches and would win. A design that genuinely routes power on a net called
+# *_SNS can say so with a net_class_rules entry in project.yaml, which Stage 5
+# applies over this guess.
+# Kept deliberately tight. _REF and _ADC are omitted because AVDD_REF and
+# VDDA_ADC are supply pins that do want copper, and a rule that demotes
+# those trades one wrong trace width for another.
+_SENSE_NODE = re.compile(r".*_(SNS|SENSE|FB|FEEDBACK|DIV|MON|MONITOR)$")
+
 _CLASS_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(GND|AGND|DGND|PGND|VSS)\b"), "Power_Bulk"),
     (re.compile(r"^(VCC|VDD|V_|VIN|VBUS|PVDD)"), "Power_Bulk"),
@@ -163,6 +183,9 @@ def _normalize_signal(signal: str) -> str:
 
 def _assign_class(name: str) -> str:
     upper = name.upper()
+    if _SENSE_NODE.match(upper):
+        # Named after the rail it measures, but not that rail. See _SENSE_NODE.
+        return "Default"
     for pat, cls in _CLASS_RULES:
         if pat.match(upper):
             return cls

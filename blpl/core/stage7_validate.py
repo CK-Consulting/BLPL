@@ -113,6 +113,14 @@ def _run_drc(pcb_path: Path, output_json: Path) -> dict:
         return {"ok": True, "skipped": True, "reason": "could not parse kicad-cli version"}
 
     output_json.parent.mkdir(parents=True, exist_ok=True)
+    # Clear any previous run's report first. Everything below decides what
+    # happened by asking whether this file exists, and kicad-cli writes nothing
+    # when it cannot load the design at all — so a stale report was read as this
+    # run's result and the *old* violation count was reported as current. That
+    # turned a schematic kicad-cli refused to open ("Failed to load schematic",
+    # exit 3) into a run whose numbers looked merely unchanged, which is the
+    # worst way for an emitter bug to present.
+    output_json.unlink(missing_ok=True)
     cmd = [
         cli,
         "pcb",
@@ -156,6 +164,14 @@ def _run_erc(sch_path: Path, output_json: Path) -> dict:
         return {"ok": True, "skipped": True, "reason": "could not parse kicad-cli version"}
 
     output_json.parent.mkdir(parents=True, exist_ok=True)
+    # Clear any previous run's report first. Everything below decides what
+    # happened by asking whether this file exists, and kicad-cli writes nothing
+    # when it cannot load the design at all — so a stale report was read as this
+    # run's result and the *old* violation count was reported as current. That
+    # turned a schematic kicad-cli refused to open ("Failed to load schematic",
+    # exit 3) into a run whose numbers looked merely unchanged, which is the
+    # worst way for an emitter bug to present.
+    output_json.unlink(missing_ok=True)
     cmd = [
         cli,
         "sch",
