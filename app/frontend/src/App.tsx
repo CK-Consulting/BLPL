@@ -135,7 +135,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
             </option>
           ))}
         </select>
-        {selected && <ProjectSettings projectId={selected} />}
+        {selected && <ProjectSettings projectId={selected} board={board} />}
         {/* The board every tab below is about, where the eye lands first. On a
             project with seven boards "which one am I building" is the question
             behind every stage run, and a highlighted item in the rail did not

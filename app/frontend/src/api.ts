@@ -480,3 +480,23 @@ export type Run = {
   exit_code: number | null;
   running: boolean;
 };
+
+/** One board's project.yaml, plus whether it currently validates. */
+export type BoardConfig = {
+  board: string;
+  exists: boolean;
+  valid: boolean;
+  /** Field-qualified messages from the schema, e.g. "project.dimensions: ...". */
+  errors: string[];
+  config: {
+    project?: {
+      name?: string;
+      board_id?: string;
+      dimensions?: [number, number];
+      stackup?: { layers?: number; thickness?: number; finish?: string };
+    };
+    [k: string]: unknown;
+  };
+  /** The pipeline's own schema, so the form's fields cannot drift from it. */
+  schema: Record<string, unknown>;
+};

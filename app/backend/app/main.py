@@ -43,6 +43,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
 from fastapi import (
     BackgroundTasks,
     Cookie,
@@ -93,6 +94,7 @@ from . import (
     workspace,
     worktrees,
 )
+from blpl.core import schema as hdm_schema
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, ProjectPolicy, Run, User
@@ -2554,6 +2556,124 @@ def get_boards(
             "warnings": [str(exc)],
         }
     return man.to_dict()
+
+
+class BoardConfigBody(BaseModel):
+    """A whole board config, as the schema describes it.
+
+    Whole rather than patched: a partial update would have to merge, and
+    merging into a file someone may have hand-edited between the GET and the
+    PUT is how a field nobody touched changes value. The client sends back what
+    it was given, with its edits.
+    """
+
+    config: dict
+
+
+@app.get("/api/projects/{project_id}/boards/{board}/config")
+def get_board_config(
+    project_id: str,
+    board: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """One board's project.yaml, as structure rather than as text.
+
+    The only way to change a board's outline, stackup or net classes used to be
+    editing YAML — through this app's file editor, or in a shell. Text is
+    exactly what a form cannot validate before it is written, and what nobody
+    can validate at all once it is.
+
+    Returns the config, whether it currently validates, and the schema, so a
+    client builds its fields from what the pipeline accepts rather than from a
+    list that can drift away from it.
+    """
+    proj = _project_dir(session, user, project_id)
+    path = _board_config_path(proj, project_id, board)
+    raw: dict = {}
+    valid = True
+    errors: list[str] = []
+    if path.is_file():
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            # Not valid YAML at all. Report it rather than 500: this endpoint
+            # exists precisely so a broken file can be repaired through a form.
+            return {"board": board, "exists": True, "valid": False,
+                    "errors": [f"not valid YAML: {exc}"], "config": {},
+                    "schema": _project_config_schema()}
+        errors = [
+            ".".join(str(p) for p in e.absolute_path) + ": " + e.message
+            for e in sorted(hdm_schema.validator("project_config").iter_errors(raw),
+                            key=lambda e: list(e.absolute_path))
+        ]
+        valid = not errors
+    return {"board": board, "exists": path.is_file(), "valid": valid,
+            "errors": errors, "config": raw, "schema": _project_config_schema()}
+
+
+@app.put("/api/projects/{project_id}/boards/{board}/config")
+def put_board_config(
+    project_id: str,
+    board: str,
+    body: BoardConfigBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Write one board's config, or refuse and say why.
+
+    Validated here as well as on load, and the duplication is deliberate: this
+    stops a bad value reaching the file, and Stage 5's check stops one that
+    arrived some other way. Neither makes the other redundant — a form cannot
+    police a hand-edit or a git merge, and a load-time check cannot tell you
+    about your typo while you are still looking at the field.
+
+    Written through a temporary file in the same directory and replaced
+    atomically, so an interrupted write cannot leave a half-parsed config where
+    a whole one used to be.
+    """
+    proj = _project_dir(session, user, project_id)
+    path = _board_config_path(proj, project_id, board)
+    errors = [
+        ".".join(str(p) for p in e.absolute_path) + ": " + e.message
+        for e in sorted(hdm_schema.validator("project_config").iter_errors(body.config),
+                        key=lambda e: list(e.absolute_path))
+    ]
+    if errors:
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        "# Written by BLPL's project settings. Safe to hand-edit — Stage 5\n"
+        "# validates this file every time it reads it, against\n"
+        "# schemas/project_config.v1.json.\n\n"
+        + yaml.safe_dump(body.config, sort_keys=False),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+    workspaces.touch(project_id, user.id)
+    return {"ok": True, "board": board}
+
+
+def _board_config_path(proj: Path, project_id: str, board: str) -> Path:
+    """Where this board's project.yaml lives.
+
+    A board's config sits beside that board's markdown: two boards do not share
+    an outline or a stackup, and writing both to the project root would let the
+    second silently describe the first.
+    """
+    try:
+        man = project_manifest.discover(proj, project_id=project_id)
+        return project_manifest.board_dir(proj, man, board) / "project.yaml"
+    except (project_manifest.ManifestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _project_config_schema() -> dict:
+    return hdm_schema._load("project_config")
 
 
 # Directories that are noise in a tree rather than content: history, machinery,

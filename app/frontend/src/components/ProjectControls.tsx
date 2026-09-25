@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { GitStatus, ImportResult, getJSON, postForm, postJSON } from "../api";
 import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
 import { WrenchScrewdriver } from "./Icons";
+import { BoardConfigPanel } from "./BoardConfigPanel";
 
 // The git strip: what state the server's working copy is in, and the three
 // buttons that keep it in sync with the remote you roam through — pull, commit,
@@ -287,7 +288,16 @@ export function NewProject({
  * account; a project gets the wrench and screwdriver, and both say what they
  * are.
  */
-export function ProjectSettings({ projectId }: { projectId: string }) {
+export function ProjectSettings({
+  projectId,
+  board,
+}: {
+  projectId: string;
+  /** The active board, because geometry is per board: two boards do not share
+   *  an outline or a stackup. Absent on a single-board project, where the
+   *  board config panel has nothing to address. */
+  board?: string | null;
+}) {
   const [open, setOpen] = useState(false);
   if (!open)
     return (
@@ -310,6 +320,7 @@ export function ProjectSettings({ projectId }: { projectId: string }) {
           </button>
         </header>
         <div className="modal-body">
+          {board && <BoardConfigPanel projectId={projectId} board={board} />}
           <ProjectGitPanel projectId={projectId} />
           <ProjectPolicyPanel projectId={projectId} />
         </div>

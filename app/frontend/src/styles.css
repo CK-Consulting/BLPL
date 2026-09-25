@@ -919,3 +919,13 @@ header .kicad-launch { margin-left: .4rem; }
 .proj-git .kv dt { color: #7d8590; font-size: 12px; }
 .proj-git .kv dd { margin: 0; }
 .proj-git .remote-url { color: #c8ccd2; word-break: break-all; }
+
+/* ---- board config form ---------------------------------------------------- */
+.board-config .field-row { display: flex; flex-wrap: wrap; gap: .8rem; align-items: flex-end; margin: .6rem 0; }
+.board-config label { display: flex; flex-direction: column; gap: .2rem; }
+.board-config label > span { color: #7d8590; font-size: 12px; }
+.board-config input[type="number"] { width: 7rem; }
+/* Errors in the field-qualified form the schema reports them in, so the message
+   names the thing to fix rather than describing it. */
+.config-errors { margin: .6rem 0; padding: .5rem .8rem; list-style: disc inside;
+  background: #3a1113; border: 1px solid #6e2126; border-radius: 6px; color: #ff9b9b; font-size: 12px; }
