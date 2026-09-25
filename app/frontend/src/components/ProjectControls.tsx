@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { GitStatus, ImportResult, getJSON, postForm, postJSON } from "../api";
 import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
-import { WrenchScrewdriver } from "./Icons";
+import { ProjectIcon } from "./Icons";
 import { BoardConfigPanel } from "./BoardConfigPanel";
+import { ProjectRoutingPanel } from "./ProjectRoutingPanel";
 
 // The git strip: what state the server's working copy is in, and the three
 // buttons that keep it in sync with the remote you roam through — pull, commit,
@@ -307,7 +308,7 @@ export function ProjectSettings({
         title={`Project settings — ${projectId}`}
         onClick={() => setOpen(true)}
       >
-        <WrenchScrewdriver />
+        <ProjectIcon size={18} />
       </button>
     );
   return (
@@ -321,6 +322,7 @@ export function ProjectSettings({
         </header>
         <div className="modal-body">
           {board && <BoardConfigPanel projectId={projectId} board={board} />}
+          <ProjectRoutingPanel projectId={projectId} />
           <ProjectGitPanel projectId={projectId} />
           <ProjectPolicyPanel projectId={projectId} />
         </div>

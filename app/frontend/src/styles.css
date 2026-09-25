@@ -929,3 +929,27 @@ header .kicad-launch { margin-left: .4rem; }
    names the thing to fix rather than describing it. */
 .config-errors { margin: .6rem 0; padding: .5rem .8rem; list-style: disc inside;
   background: #3a1113; border: 1px solid #6e2126; border-radius: 6px; color: #ff9b9b; font-size: 12px; }
+
+/* A Private Use Area codepoint: only a font that defines it can draw it, and
+   this app ships no webfont. Nerd Font patches first, then the platform
+   monospace stacks that are most often patched, then a plain fallback so the
+   box at least sits on the text baseline. The button keeps its aria-label
+   either way — a missing glyph costs recognisability, not the control. */
+.glyph {
+  font-family: "Symbols Nerd Font", "SymbolsNerdFont", "Symbols Nerd Font Mono",
+    "JetBrainsMono Nerd Font", "FiraCode Nerd Font", "Hack Nerd Font",
+    "MesloLGS NF", ui-monospace, SFMono-Regular, Menlo, monospace;
+  display: inline-block;
+  font-style: normal;
+  font-variant: normal;
+  text-rendering: auto;
+}
+
+/* ---- project task routing ------------------------------------------------- */
+.routing-table { width: 100%; border-collapse: collapse; margin: .6rem 0; font-size: 13px; }
+.routing-table th { text-align: left; color: #7d8590; font-weight: 500; font-size: 12px; padding: .3rem .5rem; }
+.routing-table td { padding: .3rem .5rem; border-top: 1px solid #2a2f38; }
+/* An overridden row has to be visible at a glance, or the table reads as a
+   list of defaults with one of them mysteriously different. */
+.routing-table tr.overridden td { background: #1d2a3a; }
+.routing-table tr.overridden code { color: #8ab4f8; }

@@ -500,3 +500,14 @@ export type BoardConfig = {
   /** The pipeline's own schema, so the form's fields cannot drift from it. */
   schema: Record<string, unknown>;
 };
+
+/** One project's task routing: the account default, and what overrides it. */
+export type ProjectRouting = {
+  project_id: string;
+  tasks: string[];
+  endpoints: string[];
+  /** task -> chain, from the account settings. */
+  defaults: Record<string, string[]>;
+  /** task -> chain, for this project only. A task absent here is not overridden. */
+  overrides: Record<string, string[]>;
+};

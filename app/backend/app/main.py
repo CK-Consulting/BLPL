@@ -2558,6 +2558,62 @@ def get_boards(
     return man.to_dict()
 
 
+class ProjectRoutingBody(BaseModel):
+    """Per-task overrides for one project. A task absent here has no override."""
+
+    tasks: dict[str, list[str]]
+
+
+@app.get("/api/projects/{project_id}/routing")
+def get_project_routing(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """This project's task routing: the account default, and what overrides it.
+
+    Both, separately, rather than the merged result. A merged view cannot say
+    which tasks are actually overridden — a chain that happens to match the
+    default is indistinguishable from one that was never set — and that
+    difference is exactly what the "use the account default" control acts on.
+    """
+    project = _project_or_404(session, user, project_id)
+    defaults = llmconfig.load(session, user)
+    return {
+        "project_id": project_id,
+        "tasks": list(appconfig.KNOWN_TASKS),
+        "endpoints": sorted(defaults.endpoints),
+        "defaults": {t: list(c) for t, c in defaults.tasks.items()},
+        "overrides": llmconfig.project_overrides(session, user, project.id),
+    }
+
+
+@app.put("/api/projects/{project_id}/routing")
+def put_project_routing(
+    project_id: str,
+    body: ProjectRoutingBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Replace this project's overrides.
+
+    Whole set rather than one task, for the same reason the settings screen
+    sends the whole registry: a merge makes "remove this override" impossible
+    to express. A task with an empty chain is treated as no override, so
+    clearing one is simply sending it empty or leaving it out.
+
+    Overrides are per user as well as per project. Two members of a project
+    have their own endpoints and their own keys, so a route one of them
+    declares cannot mean anything for the other.
+    """
+    project = _project_or_404(session, user, project_id)
+    try:
+        llmconfig.save_project_overrides(session, user, project.id, body.tasks)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"ok": True}
+
+
 class BoardConfigBody(BaseModel):
     """A whole board config, as the schema describes it.
 
@@ -3611,7 +3667,8 @@ def append_message(
 
 
 def _chat_chain(
-    session: Session, user: User, master_key: bytes, task: str = "chat"
+    session: Session, user: User, master_key: bytes, task: str = "chat",
+    project_row_id: int | None = None,
 ) -> list[chat_mod.Endpoint]:
     """Every endpoint routed to a task, in order, keys decrypted for this request.
 
@@ -3620,7 +3677,7 @@ def _chat_chain(
     tool support, overloaded, model gone — the rest are what make the route
     worth declaring.
     """
-    cfg = llmconfig.load(session, user)
+    cfg = llmconfig.load(session, user, project_row_id)
     with_keys = keystore.endpoints_with_keys(session, user)
     out: list[chat_mod.Endpoint] = []
     for rp in llm_resolver.resolve_chain(cfg, with_keys, task):
@@ -3637,7 +3694,9 @@ def _chat_chain(
     return out
 
 
-def _chat_endpoint(session: Session, user: User, master_key: bytes) -> chat_mod.Endpoint:
+def _chat_endpoint(
+    session: Session, user: User, master_key: bytes, project_row_id: int | None = None
+) -> chat_mod.Endpoint:
     """The endpoint *this user's* chat turn should use, key decrypted for this
     request only.
 
@@ -3646,7 +3705,7 @@ def _chat_endpoint(session: Session, user: User, master_key: bytes) -> chat_mod.
     pure — it is handed the set of endpoints this user can authenticate and
     never learns whose keys they are.
     """
-    cfg = llmconfig.load(session, user)
+    cfg = llmconfig.load(session, user, project_row_id)
     try:
         primary = llm_resolver.resolve_primary(
             cfg, keystore.endpoints_with_keys(session, user), "chat"
@@ -3721,7 +3780,8 @@ def _context_of(session: Session, user: User, master_key: bytes, endpoint_name: 
 
 
 def _task_endpoints(
-    session: Session, user: User, master_key: bytes, task: str
+    session: Session, user: User, master_key: bytes, task: str,
+    project_row_id: int | None = None,
 ) -> list[chat_mod.Endpoint]:
     """Every endpoint routed to a task for this user, best first.
 
@@ -3768,7 +3828,7 @@ def _task_endpoints(
     # route is unset is pedantry, not safety.
     if task in appconfig.VISION_TASKS:
         seeing = []
-        for ep in _chat_chain(session, user, master_key):
+        for ep in _chat_chain(session, user, master_key, project_row_id=project_row_id):
             declared = cfg.endpoint(ep.name)
             if declared is not None and declared.can_see:
                 seeing.append(ep)
@@ -3939,8 +3999,9 @@ async def start_chat_turn(
             },
         )
 
-    chain = _chat_chain(session, user, master_key)
-    endpoint = _chat_endpoint(session, user, master_key)
+    _chat_project = _project_or_404(session, user, project_id).id
+    chain = _chat_chain(session, user, master_key, project_row_id=_chat_project)
+    endpoint = _chat_endpoint(session, user, master_key, _chat_project)
     if payload.endpoint:
         chosen = next((e for e in chain if e.name == payload.endpoint), None)
         if chosen is None:
@@ -4243,7 +4304,13 @@ def decide_proposal(
 # --------------------------------------------------------------------------
 
 
-def _stage_env(session: Session, user: User, master_key: bytes, stage_name: str) -> dict[str, str]:
+def _stage_env(
+    session: Session,
+    user: User,
+    master_key: bytes,
+    stage_name: str,
+    project_row_id: int | None = None,
+) -> dict[str, str]:
     """The subprocess environment for a stage run.
 
     For LLM stages, resolve the *whole* fallback chain the config prefers and has
@@ -4265,7 +4332,7 @@ def _stage_env(session: Session, user: User, master_key: bytes, stage_name: str)
     # route, everything stage1-ish the stage1 route, so a cheap model can do the
     # mechanical re-read while footprint resolution gets the expensive one.
     task = "stage0" if stage_name.startswith("stage0") else "stage1"
-    return _inject_llm_env(env, session, user, master_key, task)
+    return _inject_llm_env(env, session, user, master_key, task, project_row_id)
 
 
 def _inject_llm_env(
@@ -4274,6 +4341,7 @@ def _inject_llm_env(
     user: User,
     master_key: bytes,
     task: str = "default",
+    project_row_id: int | None = None,
 ) -> dict[str, str]:
     """Add the resolved LLM fallback chain and its keys to an environment.
 
@@ -4288,7 +4356,10 @@ def _inject_llm_env(
     NoUsableProvider if nothing routed to the task has one, which the caller
     turns into a clear 400.
     """
-    cfg = llmconfig.load(session, user)
+    # Project scope, so an override reaches the thing that actually spends a
+    # token. A setting that is stored and displayed but never consulted is
+    # worse than no setting: it reads as configured.
+    cfg = llmconfig.load(session, user, project_row_id)
     with_keys = keystore.endpoints_with_keys(session, user)
     chain = llm_resolver.resolve_chain(cfg, with_keys, task)
     if not chain:
@@ -4443,7 +4514,10 @@ async def run_stage(
         raise HTTPException(status_code=400, detail=f"unknown stage {stage_name!r}")
     proj = _project_dir(session, user, project_id)
     try:
-        env = _stage_env(session, user, master_key, stage_name)
+        env = _stage_env(
+            session, user, master_key, stage_name,
+            _project_or_404(session, user, project_id).id,
+        )
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [sys.executable, "-m", "blpl.core.cli", stage_name, "--project-dir", str(proj)]
@@ -4597,7 +4671,10 @@ async def run_review_panel(
     # off configuring keys for a request that would still be rejected.
     resolved = _resolve_board(proj, board)
     try:
-        env = _inject_llm_env(dict(os.environ), session, user, master_key, "review_panel")
+        env = _inject_llm_env(
+            dict(os.environ), session, user, master_key, "review_panel",
+            _project_or_404(session, user, project_id).id,
+        )
     except llm_resolver.NoUsableProvider as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     cmd = [
@@ -4673,7 +4750,10 @@ async def run_pipeline(
     lo, hi = _PIPELINE_STAGES.index(from_stage), _PIPELINE_STAGES.index(to_stage)
     if lo <= _PIPELINE_STAGES.index("stage1") <= hi:
         try:
-            env = _inject_llm_env(env, session, user, master_key)
+            env = _inject_llm_env(
+                env, session, user, master_key, "default",
+                _project_or_404(session, user, project_id).id,
+            )
         except llm_resolver.NoUsableProvider as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 

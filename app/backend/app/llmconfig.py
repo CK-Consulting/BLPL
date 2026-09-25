@@ -16,11 +16,11 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .appconfig import AppConfig, Endpoint
+from .appconfig import KNOWN_TASKS, AppConfig, Endpoint
 from .models import LlmEndpoint, LlmTaskRoute, User
 
 
-def load(session: Session, user: User) -> AppConfig:
+def load(session: Session, user: User, project_id: int | None = None) -> AppConfig:
     """This user's endpoints and task routes.
 
     ``projects`` is left empty: callers that need the project registry read the
@@ -42,14 +42,95 @@ def load(session: Session, user: User) -> AppConfig:
             select(LlmEndpoint).where(LlmEndpoint.user_id == user.id).order_by(LlmEndpoint.id)
         )
     }
-    tasks = {
+    # Defaults first, then this project's overrides on top. Per task, an
+    # override *replaces* the chain rather than extending it: merging two
+    # ordered fallback lists has no answer anyone could predict, and the actual
+    # request — "this project uses the cheap model for stage1" — is a
+    # replacement.
+    tasks: dict[str, list[str]] = {}
+    for row in session.scalars(
+        select(LlmTaskRoute)
+        .where(LlmTaskRoute.user_id == user.id, LlmTaskRoute.project_id.is_(None))
+    ):
+        if row.endpoints:
+            tasks[row.task] = list(row.endpoints)
+    if project_id is not None:
+        for row in session.scalars(
+            select(LlmTaskRoute)
+            .where(LlmTaskRoute.user_id == user.id, LlmTaskRoute.project_id == project_id)
+        ):
+            if row.endpoints:
+                tasks[row.task] = list(row.endpoints)
+    return AppConfig(endpoints=endpoints, tasks=tasks)
+
+
+def project_overrides(session: Session, user: User, project_id: int) -> dict[str, list[str]]:
+    """Only this project's overrides, with no defaults folded in.
+
+    Separate from ``load`` because the settings screen has to show which tasks
+    are actually overridden. A merged view cannot answer that — a chain that
+    matches the default is indistinguishable from one that was never set, and
+    the difference is exactly what the "clear this override" control acts on.
+    """
+    return {
         row.task: list(row.endpoints)
         for row in session.scalars(
-            select(LlmTaskRoute).where(LlmTaskRoute.user_id == user.id)
+            select(LlmTaskRoute)
+            .where(LlmTaskRoute.user_id == user.id, LlmTaskRoute.project_id == project_id)
         )
         if row.endpoints
     }
-    return AppConfig(endpoints=endpoints, tasks=tasks)
+
+
+def save_project_overrides(
+    session: Session, user: User, project_id: int, tasks: dict[str, list[str]]
+) -> None:
+    """Replace this project's overrides with ``tasks``.
+
+    A task absent from ``tasks`` has its override deleted, which is how the UI
+    expresses "go back to the account default". An empty chain would have been
+    ambiguous — "cleared" and "never set" would look the same to ``load``,
+    which skips empty rows.
+
+    Endpoint names are checked against the user's registry, because a typo'd
+    name in a chain does not fail: it shortens the fallback list, and nobody
+    notices until a stage quietly uses a model they did not choose.
+    """
+    known = {
+        row.name
+        for row in session.scalars(select(LlmEndpoint).where(LlmEndpoint.user_id == user.id))
+    }
+    for task, chain in tasks.items():
+        if task not in KNOWN_TASKS:
+            raise ValueError(f"unknown task {task!r}")
+        for name in chain:
+            if name not in known:
+                raise ValueError(
+                    f"task {task!r} routes to {name!r}, which is not one of your endpoints"
+                )
+
+    existing = {
+        row.task: row
+        for row in session.scalars(
+            select(LlmTaskRoute)
+            .where(LlmTaskRoute.user_id == user.id, LlmTaskRoute.project_id == project_id)
+        )
+    }
+    for task, chain in tasks.items():
+        row = existing.pop(task, None)
+        if not chain:
+            continue  # nothing to override; falls through to the account default
+        if row is None:
+            session.add(
+                LlmTaskRoute(
+                    user_id=user.id, project_id=project_id, task=task, endpoints=list(chain)
+                )
+            )
+        else:
+            row.endpoints = list(chain)
+    for row in existing.values():
+        session.delete(row)
+    session.flush()
 
 
 def save(session: Session, user: User, cfg: AppConfig) -> None:
@@ -96,14 +177,21 @@ def save(session: Session, user: User, cfg: AppConfig) -> None:
     for row in existing.values():
         session.delete(row)
 
+    # Account-wide rows only. Without the project_id filter this would delete
+    # every project override the moment anyone saved the settings screen.
     routes = {
         row.task: row
-        for row in session.scalars(select(LlmTaskRoute).where(LlmTaskRoute.user_id == user.id))
+        for row in session.scalars(
+            select(LlmTaskRoute)
+            .where(LlmTaskRoute.user_id == user.id, LlmTaskRoute.project_id.is_(None))
+        )
     }
     for task, chain in cfg.tasks.items():
         row = routes.pop(task, None)
         if row is None:
-            session.add(LlmTaskRoute(user_id=user.id, task=task, endpoints=list(chain)))
+            session.add(
+                LlmTaskRoute(user_id=user.id, project_id=None, task=task, endpoints=list(chain))
+            )
         else:
             row.endpoints = list(chain)
     for row in routes.values():

@@ -402,13 +402,36 @@ class LlmTaskRoute(Base):
     content of this table — index 0 is tried first — and an array keeps that
     order as one atomic value instead of something maintained across rows, where
     a partial write would silently reorder a fallback chain.
+
+    ``project_id`` is NULL for the account-wide default and set for an override
+    that applies to one project. Both live here rather than in a second table
+    because they are the same thing at two scopes: an override is a route, read
+    by the same resolver, and a separate table would have meant two shapes, two
+    validations and two places for a chain to be wrong.
+
+    An override replaces its task's chain outright rather than extending it.
+    Merging two ordered fallback lists has no answer anyone could predict, and
+    "this project uses the cheap model for stage1" is the actual request —
+    which is a replacement.
     """
 
     __tablename__ = "llm_task_route"
-    __table_args__ = (UniqueConstraint("user_id", "task", name="uq_llm_task_user_task"),)
+    __table_args__ = (
+        # NULLs do not collide in a UNIQUE index, so this constrains the
+        # per-project rows; the account-wide default is kept single by the
+        # partial index the migration adds beside it.
+        UniqueConstraint("user_id", "project_id", "task", name="uq_llm_task_user_project_task"),
+        Index("ix_llm_task_route_project", "project_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    #: NULL = this user's default for every project. Set = an override for one.
+    #: Deleted with the project, because a route to a project that is gone is
+    #: not a setting anyone can find or clear.
+    project_id: Mapped[int | None] = mapped_column(
+        ForeignKey("project.id", ondelete="CASCADE"), nullable=True
+    )
     task: Mapped[str] = mapped_column(String(64))
     endpoints: Mapped[list] = mapped_column(JSON, default=list)
     updated_at: Mapped[datetime] = mapped_column(

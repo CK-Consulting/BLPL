@@ -34,23 +34,54 @@ function svg(path: React.ReactNode, { size = 16, className = "" }: IconProps) {
 }
 
 /**
- * Crossed wrench and screwdriver — project settings.
+ * A glyph from the Private Use Area, drawn by whatever font supplies it.
+ *
+ * Separate from the SVG icons because it depends on something this app does
+ * not ship: the codepoint is a Nerd Font one, so it renders on a machine that
+ * has a Nerd Font and shows a replacement box on one that does not. That is an
+ * acceptable trade only because the *label* lives on the control, never on the
+ * drawing — a missing glyph costs recognisability, not the ability to use the
+ * button.
+ */
+export function Glyph({
+  codepoint,
+  size = 16,
+  className = "",
+}: {
+  codepoint: string;
+  size?: number;
+  className?: string;
+}) {
+  return (
+    <span
+      className={`icon glyph ${className}`.trim()}
+      style={{ fontSize: size, lineHeight: 1 }}
+      aria-hidden="true"
+    >
+      {codepoint}
+    </span>
+  );
+}
+
+/** nf-cod-circuit_board. A board is what a project here *is*. */
+export const CIRCUIT_BOARD = "\ueabe";
+
+/**
+ * Circuit board — project settings.
  *
  * Distinct from the cog on purpose. A cog is the universal mark for "the
  * application's own preferences", and using it for both meant the only thing
  * separating *this project's* settings from *your account's* was position in a
  * crowded bar.
+ *
+ * The first attempt at this was a hand-written SVG path meant to read as a
+ * crossed wrench and screwdriver. It was invented rather than taken from an
+ * icon set, and it rendered as a tangle — which is a good argument for using a
+ * glyph somebody else drew.
  */
-export const WrenchScrewdriver = (p: IconProps = {}) =>
-  svg(
-    <>
-      <path d="M14.7 6.3a4 4 0 0 0 5 5L21 12l-9 9-3-3 9-9 1.7-2.7Z" />
-      <path d="M6 3 3 6l4.5 4.5" />
-      <path d="m3 21 7-7" />
-      <path d="M7.5 10.5 10 8" />
-    </>,
-    p,
-  );
+export const ProjectIcon = ({ size = 16, className = "" }: IconProps = {}) => (
+  <Glyph codepoint={CIRCUIT_BOARD} size={size} className={className} />
+);
 
 /** Cog — the account's and the application's own settings. */
 export const Cog = (p: IconProps = {}) =>
