@@ -158,23 +158,52 @@ def claim_one(session: Session, worker_id: str, server_key: bytes) -> Claimed | 
 
 
 def reclaim_stale(session: Session) -> int:
-    """Return runs whose worker stopped checking in to the queue.
+    """Settle runs whose worker stopped checking in to the queue.
 
     A claim is a row edit, not a lock held inside a process, precisely so this is
     possible: a container that dies mid-run leaves work anyone can pick up, where
     a lease only its holder could release would leave it stuck forever.
+
+    **The two states settle differently, and that is the point.** A stale
+    ``running`` row is work nobody finished, so it goes back on the queue for
+    the next worker. A stale ``cancelling`` row is work somebody already asked
+    to *stop* — requeueing it would restart a job that was deliberately killed,
+    so it is recorded as ``cancelled`` and left alone.
+
+    ``cancelling`` was not covered at all until 2026-09-25, and the omission was
+    not cosmetic. ``request_cancel`` sets the flag and returns; only the worker
+    can finish the transition. A worker that dies between those two moments
+    leaves the row in ``cancelling`` **forever** — the UI shows a run in flight
+    days after it stopped, and, worse, ``_seal_workspace`` refuses to seal a
+    project with any run in QUEUED, RUNNING or CANCELLING. So one dead container
+    left a project permanently unable to return to sealed. A real row on
+    example-handheld had been stuck that way for three days and sixteen hours.
     """
     cutoff = _now() - STALE_AFTER
-    stale = session.scalars(
-        select(Run).where(Run.status == RUNNING, Run.heartbeat_at < cutoff)
-    )
     count = 0
-    for run in stale:
+
+    for run in session.scalars(
+        select(Run).where(Run.status == RUNNING, Run.heartbeat_at < cutoff)
+    ):
         run.status = QUEUED
         run.claimed_by = ""
         run.started_at = None
         run.heartbeat_at = None
         count += 1
+
+    for run in session.scalars(
+        select(Run).where(Run.status == CANCELLING, Run.heartbeat_at < cutoff)
+    ):
+        run.status = CANCELLED
+        run.ended_at = _now()
+        if run.exit_code is None:
+            run.exit_code = INTERRUPTED
+        # The environment was sealed for a worker that is gone; nothing will
+        # open it now, and leaving ciphertext behind outlives its purpose.
+        run.env_nonce = None
+        run.env_ciphertext = None
+        count += 1
+
     session.flush()
     return count
 
