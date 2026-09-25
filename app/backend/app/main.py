@@ -79,6 +79,7 @@ from . import (
     llmconfig,
     llm_resolver,
     mailer,
+    openstate,
     projectacl,
     projectkey,
     profile as profile_mod,
@@ -131,11 +132,69 @@ async def _lifespan(_app: FastAPI):
             "Back it up separately from the database; together they are the lock and its key.",
             key_path,
         )
+    # Before the sweeper runs, so its first pass already sees anything the
+    # last process left open.
+    _restore_open_workspaces()
     sweeper = asyncio.create_task(_seal_idle_workspaces())
     try:
         yield
     finally:
         sweeper.cancel()
+
+
+def _server_key() -> bytes:
+    return serverkey.load_or_create(_DATA)
+
+
+def _note_workspace_open(
+    session: Session, name: str, path: Path, project_key: bytes, holder: int | None
+) -> None:
+    """Open a workspace in the registry and write the fact through to the database.
+
+    The registry is what every request reads; the row is what survives a
+    restart. A failure to persist must not fail the open — the user gets their
+    project either way — but it does mean a crash before the next open would
+    leave this one unsealed, so it is logged loudly rather than passed over.
+    """
+    workspaces.note_open(name, path, project_key, holder)
+    try:
+        openstate.record_open(session, name, path, project_key, _server_key(), holder)
+    except Exception:  # noqa: BLE001 — persistence is best-effort for the caller
+        logger.exception(
+            "could not record %s as open; a restart would not know to seal it", name
+        )
+
+
+def _touch_workspace(session: Session, name: str, holder: int | None = None) -> None:
+    workspaces.touch(name, holder)
+    try:
+        openstate.touch(session, name, holder)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not persist activity on %s", name)
+
+
+def _restore_open_workspaces() -> None:
+    """Re-adopt workspaces that were open when this process last stopped.
+
+    Without this the idle sweeper has nothing to sweep after a crash, and a
+    project that was open at the time stays plaintext on disk until somebody
+    happens to open and lock it again.
+    """
+    try:
+        with SessionFactory() as session:
+            restored = openstate.restore(session, _server_key(), PROJECTS_ROOT)
+            for name, path, key, touched, holders in restored:
+                workspaces.adopt(name, path, key, touched, holders)
+            session.commit()
+    except Exception:  # noqa: BLE001 — a failed restore must not stop the app
+        logger.exception("could not restore open workspaces")
+        return
+    if restored:
+        logger.info(
+            "restored %d open workspace(s) from the last run: %s",
+            len(restored),
+            ", ".join(name for name, *_ in restored),
+        )
 
 
 async def _seal_idle_workspaces() -> None:
@@ -835,6 +894,7 @@ def auth_lock(
         # release() is false while a colleague is still in there — one project is
         # one directory tree shared by its members, so sealing on your lock alone
         # would delete the files out from under them mid-edit.
+        openstate.release(session, project.name, user.id)
         if workspaces.release(project.name, user.id) and _seal_workspace(session, project.name):
             sealed.append(project.name)
     return {"unlocked": False, "sealed": sealed}
@@ -1438,7 +1498,7 @@ def _project_dir(session: Session, user: User, project_id: str) -> Path:
             detail=f"{project_id!r} is sealed; open it to decrypt it",
             headers={"X-BLPL-Sealed": project_id},
         )
-    workspaces.touch(project_id, user.id)
+    _touch_workspace(session, project_id, user.id)
     try:
         # Validates the name before it reaches the filesystem — the guard against
         # ../ lives there, and a worktree path is built from the same name.
@@ -1695,8 +1755,8 @@ def clone_project(
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     project = projectacl.create(session, user, body.name, remote=body.remote, branch=body.branch)
-    workspaces.note_open(
-        project.name, PROJECTS_ROOT / project.name,
+    _note_workspace_open(
+        session, project.name, PROJECTS_ROOT / project.name,
         grants.create_project_key(session, project, user, master_key),
         user.id,
     )
@@ -1761,8 +1821,8 @@ def init_project(
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     project = projectacl.create(session, user, body.name)
-    workspaces.note_open(
-        project.name, PROJECTS_ROOT / project.name,
+    _note_workspace_open(
+        session, project.name, PROJECTS_ROOT / project.name,
         grants.create_project_key(session, project, user, master_key),
         user.id,
     )
@@ -1794,7 +1854,7 @@ def open_project(
     """
     project = _project_or_404(session, user, project_id)
     if not workspace.is_sealed(PROJECTS_ROOT, project_id):
-        workspaces.touch(project_id, user.id)
+        _touch_workspace(session, project_id, user.id)
         return {"ok": True, "already_open": True}
 
     try:
@@ -1811,7 +1871,7 @@ def open_project(
     except workspace.WorkspaceError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    workspaces.note_open(project_id, PROJECTS_ROOT / project_id, project_key, user.id)
+    _note_workspace_open(session, project_id, PROJECTS_ROOT / project_id, project_key, user.id)
     activity.record(session, project, user, activity.OPENED, "")
     return {"ok": True, "already_open": False}
 
@@ -1853,6 +1913,9 @@ def _seal_workspace(session: Session, project_id: str) -> bool:
         logger.warning("could not seal %s: %s", project_id, exc)
         return False
     workspaces.forget(project_id)
+    # The row and the wrapped key it carries exist only while the project is
+    # unsealed. It is sealed now, so both go.
+    openstate.forget(session, project_id)
     logger.info("sealed %s (%d bytes)", project_id, size)
     return True
 
@@ -2278,8 +2341,8 @@ async def import_project(
         raise
 
     project = projectacl.create(session, user, name)
-    workspaces.note_open(
-        project.name, PROJECTS_ROOT / project.name,
+    _note_workspace_open(
+        session, project.name, PROJECTS_ROOT / project.name,
         grants.create_project_key(session, project, user, master_key),
         user.id,
     )

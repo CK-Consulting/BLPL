@@ -114,6 +114,26 @@ class Registry:
         if holder is not None:
             entry.holders.add(holder)
 
+    def adopt(
+        self,
+        workspace: str,
+        path: Path,
+        key: bytes,
+        last_touched: datetime,
+        holders: set[int],
+    ) -> None:
+        """Put back an entry that outlived the process that made it.
+
+        Separate from ``note_open`` because the timestamp must be the one the
+        workspace actually had, not now: a project left open by a crash three
+        hours ago is already overdue for sealing, and restoring it as freshly
+        touched would grant it another full idle window on every restart — a
+        crash loop would keep it plaintext forever.
+        """
+        entry = OpenWorkspace(workspace, path, key, last_touched)
+        entry.holders = set(holders)
+        self._open[workspace] = entry
+
     def touch(self, workspace: str, holder: int | None = None) -> None:
         """Note activity. Reaching a project's files counts as being in it —
         which is how someone who never called open still holds it open, and how

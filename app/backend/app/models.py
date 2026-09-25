@@ -231,6 +231,55 @@ class GitEndpoint(Base):
     )
 
 
+class OpenWorkspaceRow(Base):
+    """An unsealed project, recorded so a restart does not lose track of it.
+
+    The registry in app/workspace.py is a process-local dict, which was fine for
+    every path that ends in a user saying they are done. It is not fine for the
+    one that matters most: if the server dies while a project is open, the dict
+    dies with it, the idle sweeper has nothing to sweep, and the project stays
+    **plaintext on disk indefinitely** — until somebody happens to open and lock
+    it again. The encryption's whole claim is that data at rest is sealed, and a
+    crash quietly suspended it.
+
+    Recording the workspace alone would not be enough, because sealing needs the
+    project key and that key is normally reachable only through a *user's* master
+    key, which exists while they have a session and nowhere else. After a restart
+    there is no such user. So the project key is wrapped under the server key
+    (app/serverkey.py) and stored here, which is what lets the sweeper seal a
+    workspace whose owner never came back.
+
+    Be exact about what that costs, because it reads worse than it is. This row
+    exists **only while the project is already plaintext on disk**, and it is
+    deleted the moment the workspace is sealed. For its whole lifetime, anyone
+    who could use it — the operator, someone holding the database and the server
+    key — could equally just read the unsealed directory sitting next to it. The
+    row adds no window; it closes one.
+    """
+
+    __tablename__ = "open_workspace"
+
+    #: The project directory's name, and the AES-GCM associated data for the
+    #: wrapped key — so a row cannot be replayed into another project.
+    workspace: Mapped[str] = mapped_column(String(128), primary_key=True)
+    #: Where it was unsealed to. Stored rather than recomputed because the
+    #: projects root is deployment configuration and may move.
+    path: Mapped[str] = mapped_column(String(1024))
+    nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
+    #: The project key, sealed under the server key. Never the plaintext.
+    wrapped_key: Mapped[bytes] = mapped_column(LargeBinary)
+    #: User ids currently in it. A JSON array rather than a child table: it is
+    #: read and written whole, always with its row, and never queried across.
+    holders: Mapped[list] = mapped_column(JSON, default=list)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    #: Drives idle sealing. Written through from the in-memory registry, but
+    #: throttled — every file access touches the registry, and a write per
+    #: access would put the sealing deadline on the hot path.
+    last_touched: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=_now
+    )
+
+
 class UserMasterKey(Base):
     """One user's master key, wrapped under their passphrase.
 
