@@ -125,6 +125,12 @@ def run(
         symbols_root=symbol_roots,
         footprints_root=footprint_roots,
         extra_symbol_lib_ids=[_sch.PWR_FLAG_LIB_ID],
+        # Board-qualified, because every board of a multi-board project
+        # compiles into this same directory and each one's table used to
+        # overwrite the last. ERC never saw it — ERC runs right after the stage
+        # 6 that wrote the table — but anyone opening an older board in KiCad
+        # got another board's libraries.
+        board=_sanitize_filename(board) if board else None,
     )
 
     # What the emitter did that the emitted files cannot show. kicad-happy's rail
