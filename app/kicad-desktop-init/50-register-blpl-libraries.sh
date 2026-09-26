@@ -59,17 +59,15 @@ add_entry() {
     echo "kicad-init: registered $nick -> $uri"
 }
 
-# --- one writable library per project ---------------------------------------
-for proj in "$PROJECTS_DIR"/*/; do
-    [ -d "$proj" ] || continue
-    proj="${proj%/}"
-    name="$(basename "$proj")"
-    symdir="$proj/libraries/symbols"
-    fpdir="$proj/libraries/footprints"
-    # Only projects that have the libraries/ layout (blpl init creates it).
-    [ -d "$proj/libraries" ] || continue
+# register_project <project-dir> <name>
+# One writable symbol library and one writable .pretty, named after the
+# project, in the layout every pipeline stage already indexes.
+register_project() {
+    local proj="$1" name="$2"
+    local symdir="$proj/libraries/symbols"
+    local fpdir="$proj/libraries/footprints"
     mkdir -p "$symdir" "$fpdir"
-    symfile="$symdir/$name.kicad_sym"
+    local symfile="$symdir/$name.kicad_sym"
     if [ ! -s "$symfile" ]; then
         # A minimal valid, empty library: a file KiCad will open and save
         # into, and the flat layout every pipeline stage already indexes.
@@ -78,7 +76,48 @@ for proj in "$PROJECTS_DIR"/*/; do
     mkdir -p "$fpdir/$name.pretty"
     add_entry "$SYM_TABLE" "$name" "$symfile" "BLPL project library (writable) — searched FIRST by the pipeline"
     add_entry "$FP_TABLE" "$name" "$fpdir/$name.pretty" "BLPL project library (writable) — searched FIRST by the pipeline"
-done
+}
+
+# --- one writable library per project ---------------------------------------
+#
+# Two mount shapes, because the compose file has two deployment modes:
+#
+#   KICAD_DESKTOP_PROJECT unset -> ./data/projects      is /config/projects,
+#                                  so each CHILD is a project.
+#   KICAD_DESKTOP_PROJECT=name  -> ./data/projects/name is /config/projects,
+#                                  so the ROOT is the project.
+#
+# Only the first was handled, and the second is the mode a deployment with
+# accounts is told to use. There the loop walked `core/`, `sb-ble/`,
+# `design-notes/` as though each were a project, found no `libraries/` in any
+# of them, and registered nothing at all — while the project's real
+# `libraries/` sat unregistered one level up. The desktop then offered only
+# the read-only stock mount and PCM installs: precisely the "draw the missing
+# symbol and lose it" failure this script exists to prevent, in the one mode
+# where it was never noticed because the single-operator default works.
+#
+# The root layout is detected rather than inferred from the variable, because
+# the variable lives in the backend's environment and this container should
+# not have to agree with it to be correct.
+if [ -d "$PROJECTS_DIR/libraries" ]; then
+    name="${KICAD_DESKTOP_PROJECT:-}"
+    case "$name" in
+        ""|none) name="$(basename "$(readlink -f "$PROJECTS_DIR")")" ;;
+    esac
+    # A bind mount's own basename is "projects" when the source is anonymous;
+    # anything is better than registering a library called that.
+    [ "$name" = "projects" ] && name="project"
+    echo "kicad-init: single-project mount detected, registering root as '$name'"
+    register_project "$PROJECTS_DIR" "$name"
+else
+    for proj in "$PROJECTS_DIR"/*/; do
+        [ -d "$proj" ] || continue
+        proj="${proj%/}"
+        # Only projects that have the libraries/ layout (blpl init creates it).
+        [ -d "$proj/libraries" ] || continue
+        register_project "$proj" "$(basename "$proj")"
+    done
+fi
 
 # --- stock symbols: repair the registration the mount breaks ----------------
 # The image's template sym-lib-table lists the flat <Lib>.kicad_sym files the

@@ -232,7 +232,9 @@ def extract(
 ) -> dict:
     """Run LLM extraction over md_files and return a design_artifact.v1 dict."""
     if adapter is None:
-        adapter = llm_adapter.get_adapter()
+        # Name the task: a pipeline range runs several stages in one process,
+        # and this project may route stage0 somewhere other than the default.
+        adapter = llm_adapter.get_adapter(task="stage0")
     artifact: dict = {
         "project_id": _infer_project_id(md_files),
         "schema_version": 1,

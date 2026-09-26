@@ -103,3 +103,58 @@ describe("the board's geometry, as fields", () => {
     expect(await screen.findByText(/has no/)).toBeInTheDocument();
   });
 });
+
+describe("a single-board project", () => {
+  /**
+   * Its one board is implicit, so the selected board is null — and the panel
+   * used to be withheld entirely on that basis. But such a project still has a
+   * `project.yaml` at its root holding exactly the dimensions and stackup this
+   * form edits, so the effect was that the simplest project, the one most
+   * likely to be somebody's first, was the only one that could not use it.
+   */
+  function stubImplicit(calls: string[]) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push(`${init?.method ?? "GET"} ${url}`);
+        if (String(url).endsWith("/boards")) {
+          return new Response(
+            JSON.stringify({ implicit: true, boards: [{ name: "solo" }] }),
+            { status: 200 },
+          );
+        }
+        if (init?.method === "PUT") {
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ...CONFIG, board: "solo" }), { status: 200 });
+      }),
+    );
+  }
+
+  it("still edits its geometry, by resolving its own implicit board", async () => {
+    const calls: string[] = [];
+    stubImplicit(calls);
+    render(<BoardConfigPanel projectId="p" board={null} />);
+
+    expect(await screen.findByLabelText("Width (mm)")).toHaveValue(100);
+    // Resolved by name, not by relying on the server mapping anything onto the
+    // project root.
+    expect(calls).toContain("GET /api/projects/p/boards");
+    expect(calls).toContain("GET /api/projects/p/boards/solo/config");
+    expect(calls.some((c) => c.includes("/boards/null/"))).toBe(false);
+  });
+
+  it("saves to the resolved board, never to a literal null", async () => {
+    const calls: string[] = [];
+    stubImplicit(calls);
+    render(<BoardConfigPanel projectId="p" board={null} />);
+
+    const width = await screen.findByLabelText("Width (mm)");
+    fireEvent.change(width, { target: { value: "55" } });
+    fireEvent.click(screen.getByText("Save board config"));
+
+    await waitFor(() =>
+      expect(calls).toContain("PUT /api/projects/p/boards/solo/config"),
+    );
+  });
+});

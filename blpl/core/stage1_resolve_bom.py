@@ -183,7 +183,9 @@ def resolve(
     """
     schema.validate("design_artifact", design_artifact)
     if adapter is None:
-        adapter = llm_adapter.get_adapter()
+        # Name the task: a pipeline range runs several stages in one process,
+        # and this project may route stage1 somewhere other than the default.
+        adapter = llm_adapter.get_adapter(task="stage1")
 
     components = design_artifact.get("components", [])
     rows: list[dict] = []

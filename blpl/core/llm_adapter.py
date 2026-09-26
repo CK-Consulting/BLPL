@@ -149,21 +149,61 @@ def build_adapter(
     return _build_one(kind, model, api_key=api_key, base_url=base_url)
 
 
-def get_adapter(provider: str | None = None, model: str | None = None) -> LLMAdapter:
+def _adapter_for_chain(chain) -> "LLMAdapter | None":
+    """A fallback adapter for one chain, or None if it names nothing usable."""
+    if not isinstance(chain, list):
+        return None
+    members = [
+        _build_one(
+            c.get("provider") or c.get("kind"),
+            c.get("model"),
+            # The key rides in its own env var, named by the chain entry.
+            # Absent (a legacy chain) means "let the SDK read its own".
+            api_key=os.environ.get(c["key_env"]) if c.get("key_env") else None,
+            base_url=c.get("base_url") or None,
+        )
+        for c in chain
+        if isinstance(c, dict) and (c.get("provider") or c.get("kind"))
+    ]
+    return _FallbackAdapter(members) if members else None
+
+
+def get_adapter(provider: str | None = None, model: str | None = None,
+                task: str | None = None) -> LLMAdapter:
     """Return an LLMAdapter, honouring a configured fallback chain.
 
     Resolution order:
       1. explicit ``provider`` arg — always a single adapter, no fallback
-      2. ``HDM_LLM_CHAIN`` env var — a JSON list ``[{"provider","model"}, …]`` in
+      2. ``HDM_LLM_CHAINS`` env var — a JSON object ``{task: chain}``, used when
+         the caller names its ``task`` and that task has an entry
+      3. ``HDM_LLM_CHAIN`` env var — a JSON list ``[{"provider","model"}, …]`` in
          fallback order, injected by the app from your priority list + stored
          keys. Returns a fallback adapter that tries each in turn.
-      3. ``HDM_LLM_PROVIDER`` / ``HDM_LLM_MODEL`` — a single adapter (CLI path)
-      4. "anthropic" default
+      4. ``HDM_LLM_PROVIDER`` / ``HDM_LLM_MODEL`` — a single adapter (CLI path)
+      5. "anthropic" default
 
     Keys are never in the chain JSON — each provider's SDK reads its own env var
     (ANTHROPIC_API_KEY, OPENAI_API_KEY). The chain only says which to try and in
     what order.
+
+    ``task`` exists because one process can run several stages. ``blpl run``
+    executes stage0 and stage1 in a single child, and a project may route them
+    to different models on purpose — the cheap one for the mechanical re-read,
+    the expensive one for footprint resolution. A single ``HDM_LLM_CHAIN``
+    cannot express that, so the whole range used to take one chain and a
+    per-stage route was silently ignored: configured, displayed, and never
+    consulted.
     """
+    if provider is None and task:
+        chains_json = os.environ.get("HDM_LLM_CHAINS")
+        if chains_json:
+            try:
+                by_task = json.loads(chains_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"HDM_LLM_CHAINS is not valid JSON: {exc}") from exc
+            adapter = _adapter_for_chain(by_task.get(task))
+            if adapter is not None:
+                return adapter
     if provider is None:
         chain_json = os.environ.get("HDM_LLM_CHAIN")
         if chain_json:
@@ -171,20 +211,9 @@ def get_adapter(provider: str | None = None, model: str | None = None) -> LLMAda
                 chain = json.loads(chain_json)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"HDM_LLM_CHAIN is not valid JSON: {exc}") from exc
-            members = [
-                _build_one(
-                    c.get("provider") or c.get("kind"),
-                    c.get("model"),
-                    # The key rides in its own env var, named by the chain entry.
-                    # Absent (a legacy chain) means "let the SDK read its own".
-                    api_key=os.environ.get(c["key_env"]) if c.get("key_env") else None,
-                    base_url=c.get("base_url") or None,
-                )
-                for c in chain
-                if c.get("provider") or c.get("kind")
-            ]
-            if members:
-                return _FallbackAdapter(members)
+            adapter = _adapter_for_chain(chain)
+            if adapter is not None:
+                return adapter
 
     provider = (provider or os.environ.get("HDM_LLM_PROVIDER") or "anthropic").lower()
     model = model or os.environ.get("HDM_LLM_MODEL") or _DEFAULT_MODELS.get(provider)

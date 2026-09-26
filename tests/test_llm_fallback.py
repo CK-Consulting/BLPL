@@ -106,3 +106,37 @@ def test_the_chain_env_falls_back_to_single_provider_when_empty(monkeypatch) -> 
     monkeypatch.setenv("HDM_LLM_PROVIDER", "ollama")
     adapter = la.get_adapter()
     assert adapter.provider == "ollama"
+
+
+def test_a_task_takes_its_own_chain_when_one_is_declared(monkeypatch) -> None:
+    """One process can run several stages, and they can be routed apart.
+
+    ``blpl run --from stage0 --to stage8`` executes stage0 and stage1 in a
+    single child. A project routing stage0 to a cheap local model and stage1 to
+    an expensive one cannot express that in a single ``HDM_LLM_CHAIN``, so the
+    range used to resolve ``default`` and the per-stage route was stored,
+    displayed and never consulted.
+    """
+    monkeypatch.setenv("HDM_LLM_CHAIN", json.dumps([{"provider": "anthropic", "model": "fallback"}]))
+    monkeypatch.setenv("HDM_LLM_CHAINS", json.dumps({
+        "stage0": [{"provider": "ollama", "model": "cheap"}],
+        "stage1": [{"provider": "anthropic", "model": "dear"}],
+    }))
+
+    assert [m.model for m in la.get_adapter(task="stage0")._members] == ["cheap"]
+    assert [m.model for m in la.get_adapter(task="stage1")._members] == ["dear"]
+    # A task with no entry, and a caller that names none, both fall through to
+    # the single chain — that is what keeps the agent dispatcher working.
+    assert [m.model for m in la.get_adapter(task="vision")._members] == ["fallback"]
+    assert [m.model for m in la.get_adapter()._members] == ["fallback"]
+
+
+def test_an_explicit_provider_still_beats_a_task_chain(monkeypatch) -> None:
+    monkeypatch.setenv("HDM_LLM_CHAINS", json.dumps({"stage1": [{"provider": "openai", "model": "m"}]}))
+    assert la.get_adapter(provider="anthropic", task="stage1").provider == "anthropic"
+
+
+def test_a_malformed_task_chain_env_is_a_clear_error(monkeypatch) -> None:
+    monkeypatch.setenv("HDM_LLM_CHAINS", "not json{")
+    with pytest.raises(ValueError, match="HDM_LLM_CHAINS"):
+        la.get_adapter(task="stage1")

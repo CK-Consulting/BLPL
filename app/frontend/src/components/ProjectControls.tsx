@@ -295,8 +295,9 @@ export function ProjectSettings({
 }: {
   projectId: string;
   /** The active board, because geometry is per board: two boards do not share
-   *  an outline or a stackup. Absent on a single-board project, where the
-   *  board config panel has nothing to address. */
+   *  an outline or a stackup. Null on a single-board project, whose one board
+   *  is implicit — the panel resolves that itself rather than being withheld,
+   *  because such a project still has a root project.yaml to edit. */
   board?: string | null;
 }) {
   const [open, setOpen] = useState(false);
@@ -321,7 +322,7 @@ export function ProjectSettings({
           </button>
         </header>
         <div className="modal-body">
-          {board && <BoardConfigPanel projectId={projectId} board={board} />}
+          <BoardConfigPanel projectId={projectId} board={board ?? null} />
           <ProjectRoutingPanel projectId={projectId} />
           <ProjectGitPanel projectId={projectId} />
           <ProjectPolicyPanel projectId={projectId} />

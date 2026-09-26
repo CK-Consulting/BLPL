@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import logging
+from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -4396,6 +4397,70 @@ def _inject_llm_env(
     return env
 
 
+def _inject_llm_env_for_tasks(
+    env: dict[str, str],
+    session: Session,
+    user: User,
+    master_key: bytes,
+    tasks: Sequence[str],
+    project_row_id: int | None = None,
+) -> dict[str, str]:
+    """Inject a chain per task, for a child that will run several stages.
+
+    ``blpl run --from stage0 --to stage8`` is one process running stages that
+    may be routed differently on purpose — a cheap model for stage0's
+    mechanical re-read, an expensive one for stage1's footprint resolution.
+    Resolving a single ``default`` chain for the whole range made that routing
+    a setting that is stored, displayed, and never consulted, which is worse
+    than not offering it.
+
+    It also failed outright in a case that should work: a project that routes
+    only ``stage1`` and has nothing usable on ``default`` got a 400 for a run
+    whose stage1 was perfectly well configured.
+
+    The first task still populates ``HDM_LLM_CHAIN`` and the provider-wide
+    variables, so anything that reads the chain without naming a task — the
+    agent dispatcher, the review panel, an older stage — keeps working.
+    """
+    chains: dict[str, list[dict]] = {}
+    failures: list[Exception] = []
+    primary_done = False
+    for task in tasks:
+        try:
+            scratch = _inject_llm_env(dict(env), session, user, master_key,
+                                      task, project_row_id)
+        except llm_resolver.NoUsableProvider as exc:
+            failures.append(exc)
+            continue
+        # Per-endpoint key variables are named after the endpoint, so two tasks
+        # sharing one write the same name and the same value — assigned, not
+        # set-defaulted, so a stale key in the server's own environment cannot
+        # win over the user's.
+        for k, v in scratch.items():
+            if k.startswith("BLPL_LLM_KEY__"):
+                env[k] = v
+        chains[task] = json.loads(scratch["HDM_LLM_CHAIN"])
+        if not primary_done:
+            # The first routable task owns the un-suffixed variables, including
+            # the provider-wide SDK ones: two tasks on different providers must
+            # not fight over one global.
+            primary_done = True
+            env["HDM_LLM_CHAIN"] = scratch["HDM_LLM_CHAIN"]
+            env["HDM_LLM_PROVIDER"] = scratch["HDM_LLM_PROVIDER"]
+            env.pop("HDM_LLM_MODEL", None)
+            if "HDM_LLM_MODEL" in scratch:
+                env["HDM_LLM_MODEL"] = scratch["HDM_LLM_MODEL"]
+            for var in _PROVIDER_ENV.values():
+                if var in scratch:
+                    env[var] = scratch[var]
+    if not chains:
+        # Every task in the range is unroutable — report the first, which is
+        # the one the user hits first.
+        raise failures[0]
+    env["HDM_LLM_CHAINS"] = json.dumps(chains)
+    return env
+
+
 async def _stream_run(run_id: str, logs_dir: Path):
     """Replay a run's log from the top, then follow it live.
 
@@ -4748,10 +4813,15 @@ async def run_pipeline(
 
     env = dict(os.environ)
     lo, hi = _PIPELINE_STAGES.index(from_stage), _PIPELINE_STAGES.index(to_stage)
-    if lo <= _PIPELINE_STAGES.index("stage1") <= hi:
+    # One chain per LLM task the range will actually reach, not one `default`
+    # chain for all of them: stage0 and stage1 are routable separately and a
+    # range spanning both has to carry both routes.
+    tasks = [t for t, stage in (("stage0", "stage0"), ("stage1", "stage1"))
+             if lo <= _PIPELINE_STAGES.index(stage) <= hi]
+    if tasks:
         try:
-            env = _inject_llm_env(
-                env, session, user, master_key, "default",
+            env = _inject_llm_env_for_tasks(
+                env, session, user, master_key, tasks,
                 _project_or_404(session, user, project_id).id,
             )
         except llm_resolver.NoUsableProvider as exc:

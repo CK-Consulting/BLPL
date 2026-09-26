@@ -1079,3 +1079,85 @@ def test_the_skill_table_matches_the_palette(tmp_path) -> None:
         assert hue == spec["hue"], f"{name}: skill says {hue!r}, palette says {spec['hue']!r}"
     for name in rows:
         assert name in theme["classes"], f"{name} is in the skill's table but not the palette"
+
+
+def test_a_pipeline_range_carries_a_chain_for_each_stage_it_will_run(client):
+    """A per-stage route has to reach the process that spends the token.
+
+    The range resolved a single `default` chain, so a project deliberately
+    routing stage0 to a cheap model and stage1 to an expensive one got the
+    default for both — while running either stage on its own honoured the
+    route. A setting that is stored and displayed but never consulted reads as
+    configured, which is worse than not offering it.
+    """
+    import json as _json
+
+    sign_in(client)
+    client.put(
+        "/api/settings/llm",
+        json={
+            "endpoints": [
+                {"name": "cheap", "kind": "openai"},
+                {"name": "dear", "kind": "anthropic"},
+            ],
+            "tasks": {
+                "default": ["dear"],
+                "stage0": ["cheap"],
+                "stage1": ["dear"],
+            },
+        },
+    )
+    client.put("/api/settings/secrets/cheap", json={"value": "sk-cheap"})
+    client.put("/api/settings/secrets/dear", json={"value": "sk-dear"})
+    client.post("/api/projects/init", json={"name": "routed"})
+
+    enqueue_only(client, "/api/projects/routed/pipeline?from_stage=stage0&to_stage=stage8")
+    env = queued_env("routed")
+
+    chains = _json.loads(env["HDM_LLM_CHAINS"])
+    assert [c["endpoint"] for c in chains["stage0"]] == ["cheap"]
+    assert [c["endpoint"] for c in chains["stage1"]] == ["dear"]
+    # Both stages' keys travel, because both stages run in this one child.
+    assert env["BLPL_LLM_KEY__CHEAP"] == "sk-cheap"
+    assert env["BLPL_LLM_KEY__DEAR"] == "sk-dear"
+
+
+def test_a_range_that_stops_before_stage1_carries_only_stage0s_route(client):
+    import json as _json
+
+    sign_in(client)
+    client.put(
+        "/api/settings/llm",
+        json={
+            "endpoints": [{"name": "cheap", "kind": "openai"}, {"name": "dear", "kind": "anthropic"}],
+            "tasks": {"default": ["dear"], "stage0": ["cheap"], "stage1": ["dear"]},
+        },
+    )
+    client.put("/api/settings/secrets/cheap", json={"value": "sk-cheap"})
+    client.put("/api/settings/secrets/dear", json={"value": "sk-dear"})
+    client.post("/api/projects/init", json={"name": "shortrange"})
+
+    enqueue_only(client, "/api/projects/shortrange/pipeline?from_stage=stage0&to_stage=stage0")
+    chains = _json.loads(queued_env("shortrange")["HDM_LLM_CHAINS"])
+    assert list(chains) == ["stage0"]
+
+
+def test_a_range_runs_when_only_the_stage_it_reaches_is_routable(client):
+    """Previously a 400: the range asked for `default`, found nothing usable
+    there, and refused a run whose stage1 was perfectly well configured."""
+    import json as _json
+
+    sign_in(client)
+    client.put(
+        "/api/settings/llm",
+        json={
+            "endpoints": [{"name": "dear", "kind": "anthropic"}],
+            "tasks": {"default": [], "stage1": ["dear"]},
+        },
+    )
+    client.put("/api/settings/secrets/dear", json={"value": "sk-dear"})
+    client.post("/api/projects/init", json={"name": "onlystage1"})
+
+    enqueue_only(client, "/api/projects/onlystage1/pipeline?from_stage=stage1&to_stage=stage8")
+    chains = _json.loads(queued_env("onlystage1")["HDM_LLM_CHAINS"])
+    assert [c["endpoint"] for c in chains["stage1"]] == ["dear"]

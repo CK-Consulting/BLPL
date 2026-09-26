@@ -385,6 +385,17 @@ def place(
         else:
             ext = (box[0], box[1])
             offsets[ref] = (box[2], box[3])
+        # Apply the rotation here, once, rather than at each of the four sites
+        # that place something. ``rot`` can only come from a hint, so it is
+        # known before anything is placed, and rotating the geometry up front
+        # means every later use of it -- the fit test, the reservation, the
+        # largest-first ordering, occupied_box -- is about the part KiCad will
+        # actually draw.
+        rot = float((hints.get(ref) or {}).get("rot", 0.0))
+        if rot:
+            rw, rh, rdx, rdy = rotated_geometry(ext[0], ext[1], *offsets[ref], rot)
+            ext = (rw, rh)
+            offsets[ref] = (rdx, rdy)
         result.extents[ref] = ext
     result.offsets = offsets
 
@@ -550,6 +561,43 @@ def _ranked_spots(canvas: "_Canvas", edge: bool, tx: float, ty: float):
 
 def _area(extent: tuple[float, float]) -> float:
     return extent[0] * extent[1]
+
+
+def rotated_geometry(w: float, h: float, dx: float, dy: float,
+                     rot: float) -> tuple[float, float, float, float]:
+    """A footprint's extents and origin offset as they are after ``rot``.
+
+    KiCad rotates a footprint's own geometry about its origin, so the library's
+    ``(w, h, dx, dy)`` describes the part only at rot=0. Reserving that
+    rectangle for a rotated part is the off-centre-courtyard bug one step on:
+    right for rot=0, and silently wrong for the only case anybody writes a rot
+    hint *for* — an asymmetric connector turned to face the board edge.
+
+    The mapping is measured, not derived: with pcbnew, a footprint orientation
+    of +90 deg sends a local offset ``(dx, dy)`` to ``(dy, -dx)``, and the
+    extents swap. (Board coordinates are y-down, which is why the sign lands
+    where it does; reasoning about it from "counter-clockwise" gets it wrong.)
+    Angles that are not multiples of 90 deg take the axis-aligned bounding box
+    of the rotated rectangle, which is conservative — never smaller than the
+    truth, so it cannot certify an overlap as clear.
+    """
+    rot = float(rot) % 360.0
+    if rot == 0.0:
+        return (w, h, dx, dy)
+    if rot == 90.0:
+        return (h, w, dy, -dx)
+    if rot == 180.0:
+        return (w, h, -dx, -dy)
+    if rot == 270.0:
+        return (h, w, -dy, dx)
+    a = math.radians(rot)
+    cos_a, sin_a = abs(math.cos(a)), abs(math.sin(a))
+    return (
+        w * cos_a + h * sin_a,
+        w * sin_a + h * cos_a,
+        dx * math.cos(a) + dy * math.sin(a),
+        -dx * math.sin(a) + dy * math.cos(a),
+    )
 
 
 def occupied_box(result: "Result", ref: str) -> tuple[float, float, float, float]:

@@ -21,19 +21,58 @@ import { getJSON, putJSON, type BoardConfig } from "../api";
 const FINISHES = ["ENIG", "HASL", "LF-HASL", "OSP", "Immersion Silver", "Immersion Tin", "Hard Gold"];
 const LAYERS = [1, 2, 4, 6, 8, 10, 12];
 
-export function BoardConfigPanel({ projectId, board }: { projectId: string; board: string }) {
+export function BoardConfigPanel({
+  projectId,
+  board,
+}: {
+  projectId: string;
+  /** The selected board, or null on a single-board project.
+   *
+   *  Null is the truthful value there — the one board is implicit and its
+   *  artifacts carry no board qualifier on disk — but it is not a reason to
+   *  withhold this form. A single-board project has a `project.yaml` at its
+   *  root with exactly the dimensions and stackup this panel edits, and
+   *  gating on `board` made the form reachable only from multi-board
+   *  projects: unreachable for the simplest case, which is the one most
+   *  likely to be somebody's first board. */
+  board: string | null;
+}) {
   const [data, setData] = useState<BoardConfig | null>(null);
   const [draft, setDraft] = useState<BoardConfig["config"] | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
+  // What the config routes are actually addressed with. For an implicit
+  // project the server maps any board name onto the project root, but relying
+  // on that would be relying on an accident — so ask which board it thinks it
+  // has, and name it.
+  const [target, setTarget] = useState<string | null>(board);
+
+  useEffect(() => {
+    if (board) {
+      setTarget(board);
+      return;
+    }
+    let cancelled = false;
+    getJSON<{ boards: { name: string }[] }>(`/api/projects/${projectId}/boards`)
+      .then((d) => {
+        if (!cancelled) setTarget(d.boards[0]?.name ?? null);
+      })
+      .catch((e) => {
+        if (!cancelled) setNote((e as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, board]);
 
   useEffect(() => {
     setData(null);
     setDraft(null);
     setNote(null);
     setErrors([]);
-    getJSON<BoardConfig>(`/api/projects/${projectId}/boards/${board}/config`)
+    if (!target) return;
+    getJSON<BoardConfig>(`/api/projects/${projectId}/boards/${target}/config`)
       .then((d) => {
         setData(d);
         setDraft(structuredClone(d.config));
@@ -42,7 +81,7 @@ export function BoardConfigPanel({ projectId, board }: { projectId: string; boar
         setErrors(d.errors);
       })
       .catch((e) => setNote((e as Error).message));
-  }, [projectId, board]);
+  }, [projectId, target]);
 
   if (!data || !draft) return <p className="muted small">Reading board config…</p>;
 
@@ -71,9 +110,9 @@ export function BoardConfigPanel({ projectId, board }: { projectId: string; boar
     setNote(null);
     setErrors([]);
     try {
-      await putJSON(`/api/projects/${projectId}/boards/${board}/config`, { config: draft });
+      await putJSON(`/api/projects/${projectId}/boards/${target}/config`, { config: draft });
       setNote("Saved. Re-run stage 5 to rebuild the board with it.");
-      const fresh = await getJSON<BoardConfig>(`/api/projects/${projectId}/boards/${board}/config`);
+      const fresh = await getJSON<BoardConfig>(`/api/projects/${projectId}/boards/${target}/config`);
       setData(fresh);
       setDraft(structuredClone(fresh.config));
     } catch (e) {
@@ -87,7 +126,7 @@ export function BoardConfigPanel({ projectId, board }: { projectId: string; boar
 
   return (
     <section className="board-config">
-      <h3>Board — {board}</h3>
+      <h3>Board — {board ?? target ?? "this project"}</h3>
       {!data.exists && (
         <p className="muted small">
           This board has no <code>project.yaml</code> yet. Saving creates one.

@@ -319,3 +319,88 @@ def test_a_polygon_courtyard_is_read_not_skipped():
     )
     assert box is not None
     assert box[1] >= 5.0, "the polygon courtyard is 5 mm tall; the pads alone are 3.5"
+
+
+def test_a_rotated_footprint_is_collided_in_its_rotated_geometry():
+    """A ``rot`` hint rotates the emitted footprint; the placer has to reserve
+    the rectangle KiCad will actually draw, not the library's unrotated one.
+
+    This is the same failure as the off-centre courtyard above, one step on:
+    the box was right in size and place for rot=0 and silently wrong for the
+    only case anybody writes a rot hint *for* — an asymmetric edge connector
+    turned to face the board edge. Verified against pcbnew: a footprint
+    orientation of +90 deg maps a local offset ``(dx, dy)`` to ``(dy, -dx)``.
+    """
+    import blpl.core.placement as mod
+
+    def wide_box(fp, roots):
+        # 12 x 3 mm, origin at the left end — a connector, near enough.
+        return (12.0, 3.0, 6.0, 0.0)
+
+    original = mod.footprint_box
+    mod.footprint_box = wide_box
+    try:
+        r = mod.place({"J1": _comp("X")}, {}, (40, 40),
+                      hints={"J1": {"x": 20.0, "y": 20.0, "rot": 90}})
+    finally:
+        mod.footprint_box = original
+
+    x0, y0, x1, y1 = mod.occupied_box(r, "J1")
+    # Rotated 90 deg, the 12 mm span is vertical and the 3 mm span horizontal.
+    assert abs((x1 - x0) - 3.0) < 1e-6, f"width {x1 - x0} — extents not swapped"
+    assert abs((y1 - y0) - 12.0) < 1e-6, f"height {y1 - y0} — extents not swapped"
+    # (6, 0) rotates to (0, -6): the body runs *up* from the hinted origin.
+    assert abs(((x0 + x1) / 2) - 20.0) < 1e-6
+    assert abs(((y0 + y1) / 2) - 14.0) < 1e-6
+
+
+def test_nothing_is_placed_into_the_space_a_rotated_part_occupies():
+    """The consequence that matters.
+
+    A hinted position is taken as given, overlap or not — that is deliberate,
+    and two overlapping hints are the human's decision. The bug is the other
+    direction: the *reservation* was the unrotated rectangle, so the placer
+    left the space the rotated connector really fills marked free and put
+    ordinary parts inside it.
+
+    The box for J1 here is computed **by hand** rather than from
+    ``occupied_box``. That is the whole point: before the fix the reservation
+    and the read-back were wrong in the same direction, so asking the module
+    where J1 was would have agreed with the module's own mistake and this test
+    would have passed on the broken code. It is only a check if the oracle is
+    independent — the same lesson as the placement metric that could not see
+    the rails it excluded.
+    """
+    import blpl.core.placement as mod
+
+    def box_for(fp, roots):
+        # The connector is long and asymmetric; everything else is a passive.
+        return (12.0, 3.0, 6.0, 0.0) if fp == "CONN" else (2.0, 1.0, 0.0, 0.0)
+
+    original = mod.footprint_box
+    mod.footprint_box = box_for
+    try:
+        comps = {"J1": _comp("CONN")}
+        comps.update({f"R{i}": _comp("P") for i in range(60)})
+        r = mod.place(comps, {}, (24, 24),
+                      hints={"J1": {"x": 12.0, "y": 18.0, "rot": 90}})
+    finally:
+        mod.footprint_box = original
+
+    # Rotated 90 deg: a 12 x 3 body with its origin at one end becomes a 3 x 12
+    # body running up from the origin. Derived from the measured pcbnew
+    # mapping (dx, dy) -> (dy, -dx), not from anything under test.
+    jx0, jy0, jx1, jy1 = 12.0 - 1.5, 18.0 - 12.0, 12.0 + 1.5, 18.0
+
+    intruders = []
+    for ref, p in r.placements.items():
+        if ref == "J1":
+            continue
+        x0, y0, x1, y1 = p.x - 1.0, p.y - 0.5, p.x + 1.0, p.y + 0.5
+        if x0 < jx1 - 1e-9 and jx0 < x1 - 1e-9 and y0 < jy1 - 1e-9 and jy0 < y1 - 1e-9:
+            intruders.append(ref)
+
+    assert not intruders, (
+        f"{len(intruders)} part(s) placed inside the rotated connector's real "
+        f"courtyard ({jx0},{jy0})-({jx1},{jy1}): {sorted(intruders)[:6]}"
+    )
