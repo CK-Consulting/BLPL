@@ -2387,9 +2387,9 @@ class CommitBody(BaseModel):
 @app.post("/api/projects/{project_id}/git/commit")
 def git_commit(project_id: str, body: CommitBody, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
-    _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id)
     try:
-        out = projects.commit_all(project_id, body.message)
+        out = projects.commit_checkout(checkout, body.message)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "committed": out is not None}
@@ -3064,7 +3064,10 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     # and refusing the save that landed would be a lie about what happened.
     committed = False
     try:
-        committed = projects.commit_all(project_id, f"edit: {name}") is not None
+        # In the checkout the file was written to, which for a member is their
+        # own worktree rather than the repository directory the name resolves to.
+        checkout = _project_dir(session, user, project_id)
+        committed = projects.commit_checkout(checkout, f"edit: {name}") is not None
     except ProjectError:
         committed = False
     return {
@@ -4292,7 +4295,7 @@ def decide_proposal(
     store.set_status(proposal, "accepted")
     committed = False
     try:
-        committed = projects.commit_all(project_id, f"chat: {proposal.rationale or proposal.path}") is not None
+        committed = projects.commit_checkout(proj, f"chat: {proposal.rationale or proposal.path}") is not None
     except ProjectError:
         # A project without git history still gets its file. Losing the commit is
         # worth reporting, not worth refusing the edit that already landed.

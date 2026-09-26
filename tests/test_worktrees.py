@@ -148,3 +148,50 @@ def test_a_new_project_has_a_commit_to_branch_from(unlocked):
         text=True,
     )
     assert head.returncode == 0 and head.stdout.strip()
+
+
+def _git(cwd, *args):
+    import subprocess
+
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True).stdout
+
+
+def test_a_members_save_is_committed_on_their_branch_not_the_owners(unlocked, second_user):
+    """The edit lands in the member's worktree, so that is where it is committed.
+
+    It used to be committed in the owner's checkout instead: the member's file
+    stayed uncommitted, and whatever the owner had uncommitted was swept into a
+    commit named after somebody else's edit.
+    """
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json={"name": "mine"})
+    _share(unlocked, second_user)
+    owner_dir = main.PROJECTS_ROOT / "mine"
+    (owner_dir / "owner-draft.md").write_text("not ready\n")
+
+    r = second_user.put("/api/projects/mine/files/theirs.md", json={"content": "work\n"})
+    assert r.json()["committed"] is True
+
+    theirs = main.PROJECTS_ROOT / worktrees.WORKTREES_DIR / "mine" / "u2"
+    assert _git(theirs, "status", "--porcelain").strip() == ""
+    assert "edit: theirs.md" in _git(theirs, "log", "-1", "--format=%s")
+    # The owner's draft is still the owner's, uncommitted, and on no one's branch.
+    assert "owner-draft.md" in _git(owner_dir, "status", "--porcelain")
+    assert "theirs.md" not in _git(owner_dir, "ls-files")
+
+
+def test_the_commit_button_commits_the_callers_own_checkout(unlocked, second_user):
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json={"name": "mine"})
+    _share(unlocked, second_user)
+    second_user.get("/api/projects/mine/files")
+    theirs = main.PROJECTS_ROOT / worktrees.WORKTREES_DIR / "mine" / "u2"
+    (theirs / "loose.md").write_text("x\n")
+    (main.PROJECTS_ROOT / "mine" / "owner-draft.md").write_text("not ready\n")
+
+    r = second_user.post("/api/projects/mine/git/commit", json={"message": "mine"})
+    assert r.json()["committed"] is True
+    assert "loose.md" in _git(theirs, "show", "--name-only", "--format=", "HEAD")
+    assert "owner-draft.md" in _git(main.PROJECTS_ROOT / "mine", "status", "--porcelain")

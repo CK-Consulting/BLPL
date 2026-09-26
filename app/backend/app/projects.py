@@ -268,7 +268,27 @@ class Projects:
     def commit_all(self, name: str, message: str) -> str | None:
         """Stage everything and commit. Returns the commit output, or None if the
         tree was clean (nothing to commit is not an error)."""
-        d = self._require(name)
+        return self._commit(self._require(name), message)
+
+    def commit_checkout(self, checkout: Path, message: str) -> str | None:
+        """``commit_all`` for a checkout the caller already resolved.
+
+        A member's edits land in their own worktree, not in the repository
+        directory ``commit_all`` names, so a route that wrote through
+        ``_project_dir`` has to commit in the directory it wrote to. Committing
+        by project name instead left the member's file uncommitted and swept
+        whatever the owner had uncommitted into a commit named after somebody
+        else's edit.
+
+        A worktree's ``.git`` is a file pointing back at the repository, not a
+        directory, which is why this cannot go through ``_require``.
+        """
+        d = Path(checkout)
+        if not (d / ".git").exists():
+            raise ProjectError(f"{d.name!r} is not a git checkout")
+        return self._commit(d, message)
+
+    def _commit(self, d: Path, message: str) -> str | None:
         self._git(d, "add", "-A")
         if not self._is_dirty(d):
             return None
