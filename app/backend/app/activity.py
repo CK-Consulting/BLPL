@@ -28,6 +28,7 @@ RAN = "ran"
 IMPORTED = "imported"
 SHARED = "shared"
 JOINED = "joined"
+UPLOADED = "uploaded"
 
 # What each kind reads as in a feed. Kept here rather than in the frontend so a
 # new kind cannot appear in the UI as a raw enum nobody recognises.
@@ -38,6 +39,7 @@ PHRASING = {
     IMPORTED: "imported",
     SHARED: "shared",
     JOINED: "joined",
+    UPLOADED: "uploaded",
 }
 
 

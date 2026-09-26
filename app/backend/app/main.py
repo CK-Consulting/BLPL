@@ -77,6 +77,7 @@ from . import (
     grants,
     importer,
     keystore,
+    llm_ignore,
     passkeys,
     llmconfig,
     llm_resolver,
@@ -2755,6 +2756,8 @@ def _tree_role(rel: Path) -> str:
         return "artifact"
     if parts and parts[0] == "datasheets":
         return "datasheet"
+    if parts and parts[0] == quarantine.REFERENCES_DIRNAME:
+        return "reference"
     # vis/ is where a project's diagrams and renders live. It is design work —
     # the architecture drawing is usually the first thing anybody makes and the
     # thing they come back to — so it belongs in the group that opens by
@@ -2828,7 +2831,14 @@ def get_tree(
     pipeline output, and the tree is the only view that says so.
     """
     proj = _project_dir(session, user, project_id)
-    return {"project_id": project_id, "nodes": _walk_tree(proj, proj)}
+    nodes = _walk_tree(proj, proj)
+    # Marked on the node so the tree can say which files the assistant has been
+    # told to leave alone, rather than that living only in a JSON file.
+    ignored = llm_ignore.paths(proj)
+    for node in nodes:
+        if not node["dir"] and node["path"] in ignored:
+            node["llm_ignore"] = True
+    return {"project_id": project_id, "nodes": nodes}
 
 
 def _tree_target(proj: Path, rel: str) -> Path:
@@ -3078,6 +3088,168 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
         "bytes": target.stat().st_size,
         "committed": committed,
     }
+
+
+# Per file, not per request: a reference design is often a zip of tens of
+# megabytes, and a datasheet a few. Everything that lands is committed to the
+# project and sealed with it, so this is a cost on every clone and every seal,
+# not only on disk. Overridable for a deployment that knows its files.
+UPLOAD_MAX_BYTES = int(os.environ.get("BLPL_UPLOAD_MAX_MB", "100")) * 1024 * 1024
+UPLOAD_MAX_FILES = 20
+
+
+async def _read_capped(upload: UploadFile, cap: int) -> bytes | None:
+    """The upload's bytes, or None as soon as it passes ``cap``.
+
+    Read in chunks so an oversized file is refused after ``cap`` bytes rather
+    than after the whole thing has been buffered.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await upload.read(1024 * 1024):
+        total += len(chunk)
+        if total > cap:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@app.post("/api/projects/{project_id}/uploads")
+async def upload_files(
+    project_id: str,
+    files: list[UploadFile] = File(...),
+    meta: str = Form("[]"),
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Put files into a project, through quarantine.
+
+    ``meta`` is a JSON list aligned with ``files``: ``{"kind": "datasheet" |
+    "reference", "mpn": str, "llm_ignore": bool}`` per file. The uploader picks
+    the kind because only they know whether a PDF is a datasheet or a layout
+    guide, and the directory it lands in should say which.
+
+    Each file gets its own verdict. A held file is a result, not an error: it
+    stays in ``retrieved/`` as evidence and the response says why. Only a
+    malformed request fails the batch.
+    """
+    proj = _project_dir(session, user, project_id)
+    if len(files) > UPLOAD_MAX_FILES:
+        raise HTTPException(status_code=400, detail=f"{len(files)} files; at most {UPLOAD_MAX_FILES} per upload")
+    try:
+        specs = json.loads(meta or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"meta is not JSON: {exc}")
+    if not isinstance(specs, list) or len(specs) != len(files):
+        raise HTTPException(status_code=400, detail="meta must be a list with one entry per file")
+    for spec in specs:
+        if not isinstance(spec, dict) or spec.get("kind") not in quarantine.UPLOAD_KINDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"each file needs a kind: one of {sorted(quarantine.UPLOAD_KINDS)}",
+            )
+
+    who = user.email or f"user {user.id}"
+    results: list[dict] = []
+    for upload, spec in zip(files, specs):
+        name = upload.filename or "upload"
+        data = await _read_capped(upload, UPLOAD_MAX_BYTES)
+        if data is None:
+            results.append({
+                "name": name, "state": "rejected", "path": None,
+                "reasons": [f"larger than the {UPLOAD_MAX_BYTES // (1024 * 1024)} MB upload limit"],
+            })
+            continue
+        rec = quarantine.accept_upload(
+            data,
+            proj,
+            original_name=name,
+            kind=spec["kind"],
+            uploaded_by=who,
+            mpn=str(spec.get("mpn") or "").strip(),
+            llm_ignore=bool(spec.get("llm_ignore")),
+        )
+        path = f"{rec.released_to}/{rec.released_as}" if rec.state == quarantine.RELEASED else None
+        if path and rec.llm_ignore:
+            llm_ignore.set_ignored(proj, path, True, by=who)
+        results.append({
+            "name": name,
+            "state": rec.state,
+            "kind": rec.kind,
+            "path": path,
+            "reasons": rec.reasons,
+            "inspection": (rec.inspection or {}).get("state", ""),
+            "scan": (rec.scan or {}).get("state", ""),
+            "llm_ignore": rec.llm_ignore,
+        })
+
+    landed = [r for r in results if r["state"] != "rejected"]
+    if landed:
+        activity.record(
+            session, _project_or_404(session, user, project_id), user, activity.UPLOADED,
+            ", ".join(r["name"] for r in landed),
+        )
+    committed = False
+    try:
+        # Released files and the ledger; retrieved/ itself is gitignored, so a
+        # held file never enters history.
+        committed = projects.commit_checkout(proj, f"upload: {len(landed)} file(s)") is not None
+    except ProjectError:
+        committed = False
+    return {"results": results, "committed": committed}
+
+
+@app.get("/api/projects/{project_id}/quarantine")
+def get_quarantine(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Everything that has come in from outside, newest first, and what was decided."""
+    proj = _project_dir(session, user, project_id)
+    return {"summary": quarantine.summary(proj), "entries": list(reversed(quarantine.ledger(proj)))[:500]}
+
+
+class LlmIgnoreBody(BaseModel):
+    path: str
+    ignored: bool
+
+
+@app.get("/api/projects/{project_id}/llm-ignore")
+def get_llm_ignore(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    return {"files": llm_ignore.entries(_project_dir(session, user, project_id))}
+
+
+@app.put("/api/projects/{project_id}/llm-ignore")
+def set_llm_ignore(
+    project_id: str,
+    body: LlmIgnoreBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Put one file on the LLM-ignore list, or take it off."""
+    proj = _project_dir(session, user, project_id)
+    target = _tree_target(proj, body.path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"no file {body.path!r} in this project")
+    rel = target.relative_to(proj.resolve()).as_posix()
+    changed = llm_ignore.set_ignored(proj, rel, body.ignored, by=user.email or f"user {user.id}")
+    committed = False
+    if changed:
+        verb = "ignore" if body.ignored else "unignore"
+        try:
+            committed = projects.commit_checkout(proj, f"llm-{verb}: {rel}") is not None
+        except ProjectError:
+            committed = False
+    return {"path": rel, "ignored": body.ignored, "changed": changed, "committed": committed}
 
 
 class FolderBody(BaseModel):
