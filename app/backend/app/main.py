@@ -2368,9 +2368,9 @@ async def import_project(
 @app.get("/api/projects/{project_id}/git/status")
 def git_status(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
-    _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id)
     try:
-        st = projects.status(project_id)
+        st = projects.status(project_id, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {
@@ -2400,9 +2400,9 @@ def git_diff(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     """What changed in the working copy since the last commit — the 'what did that
     run do' view. Diffs are size-capped server-side."""
-    _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id)
     try:
-        return projects.diff(project_id)
+        return projects.diff(project_id, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -2411,10 +2411,10 @@ def git_diff(project_id: str, user: User = Depends(require_onboarded),
 def git_pull(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key)) -> dict:
-    _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id)
     try:
         with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
-            out = projects.pull(project_id, env=env)
+            out = projects.pull(project_id, env=env, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}
@@ -2424,10 +2424,12 @@ def git_pull(project_id: str, user: User = Depends(require_onboarded),
 def git_push(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key)) -> dict:
-    _project_dir(session, user, project_id)
+    # The checkout /git/commit just committed in, so "Commit + Push" pushes
+    # the commit it made rather than the owner's branch.
+    checkout = _project_dir(session, user, project_id)
     try:
         with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
-            out = projects.push(project_id, env=env)
+            out = projects.push(project_id, env=env, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}

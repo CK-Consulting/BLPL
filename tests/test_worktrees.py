@@ -195,3 +195,50 @@ def test_the_commit_button_commits_the_callers_own_checkout(unlocked, second_use
     assert r.json()["committed"] is True
     assert "loose.md" in _git(theirs, "show", "--name-only", "--format=", "HEAD")
     assert "owner-draft.md" in _git(main.PROJECTS_ROOT / "mine", "status", "--porcelain")
+
+
+def test_commit_and_push_publishes_the_members_commit_not_the_owners_branch(unlocked, second_user, tmp_path):
+    """"Commit + Push" is two requests. Both have to act on the member's checkout,
+    or the push reports success having published nothing of theirs."""
+    import subprocess
+
+    import app.main as main
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    unlocked.post("/api/projects/init", json={"name": "mine"})
+    owner_dir = main.PROJECTS_ROOT / "mine"
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=owner_dir, check=True)
+    assert unlocked.post("/api/projects/mine/git/push").status_code == 200
+    owner_branch = _git(owner_dir, "branch", "--show-current").strip()
+    owner_head = _git(remote, "rev-parse", owner_branch).strip()
+
+    _share(unlocked, second_user)
+    second_user.get("/api/projects/mine/files")
+    theirs = main.PROJECTS_ROOT / worktrees.WORKTREES_DIR / "mine" / "u2"
+    (theirs / "theirs.md").write_text("work\n")
+    assert second_user.post("/api/projects/mine/git/commit", json={"message": "m"}).json()["committed"]
+    r = second_user.post("/api/projects/mine/git/push")
+    assert r.status_code == 200, r.text
+
+    member_branch = worktrees.branch_for(2)
+    assert "theirs.md" in _git(remote, "ls-tree", "-r", "--name-only", member_branch)
+    assert _git(remote, "rev-parse", owner_branch).strip() == owner_head
+
+    status = second_user.get("/api/projects/mine/git/status").json()
+    assert status["branch"] == member_branch
+    assert status["ahead"] == 0 and status["has_remote"]
+
+
+def test_pulling_a_branch_that_was_never_pushed_says_so(unlocked, second_user, tmp_path):
+    import subprocess
+
+    import app.main as main
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    unlocked.post("/api/projects/init", json={"name": "mine"})
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=main.PROJECTS_ROOT / "mine", check=True)
+    _share(unlocked, second_user)
+    r = second_user.post("/api/projects/mine/git/pull")
+    assert r.status_code == 400 and "push it first" in r.json()["detail"]

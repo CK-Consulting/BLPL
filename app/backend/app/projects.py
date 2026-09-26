@@ -255,20 +255,51 @@ class Projects:
         error: no remote means no credential could apply."""
         return self._git_allow_fail(self.project_dir(name), "remote", "get-url", "origin")
 
-    def pull(self, name: str, *, env: dict[str, str] | None = None) -> str:
+    def pull(
+        self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None
+    ) -> str:
         """Fast-forward the working copy from its remote. Returns git's output.
 
         Deliberately not a merge or rebase of divergent history: if the server
         copy has diverged, that is a conflict a human resolves, not something the
         app papers over. --ff-only turns divergence into a clear error.
         """
-        d = self._require(name)
+        d = self._checkout(name, checkout)
+        if self._has_remote(d) and not self._upstream(d):
+            branch = self._git(d, "branch", "--show-current").strip()
+            raise ProjectError(
+                f"branch {branch!r} has no upstream to pull from yet; push it first"
+            )
         return self._git(d, "pull", "--ff-only", env=env)
 
     def commit_all(self, name: str, message: str) -> str | None:
         """Stage everything and commit. Returns the commit output, or None if the
         tree was clean (nothing to commit is not an error)."""
         return self._commit(self._require(name), message)
+
+    def _checkout(self, name: str, checkout: Path | None) -> Path:
+        """The directory a git operation runs in: the caller's own checkout when
+        given (a member's worktree), else the repository directory itself.
+
+        Every operation a member triggers has to run in the same checkout. The
+        first version of this fix moved commit and left push behind, so "Commit
+        + Push" committed the member's worktree and then pushed the owner's
+        unchanged branch, and reported success.
+        """
+        if checkout is None:
+            return self._require(name)
+        d = Path(checkout)
+        if not (d / ".git").exists():
+            raise ProjectError(f"{d.name!r} is not a git checkout")
+        return d
+
+    def _has_remote(self, d: Path) -> bool:
+        return bool(self._git(d, "remote").strip())
+
+    def _upstream(self, d: Path) -> str:
+        return self._git_allow_fail(
+            d, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"
+        ).strip()
 
     def commit_checkout(self, checkout: Path, message: str) -> str | None:
         """``commit_all`` for a checkout the caller already resolved.
@@ -283,10 +314,7 @@ class Projects:
         A worktree's ``.git`` is a file pointing back at the repository, not a
         directory, which is why this cannot go through ``_require``.
         """
-        d = Path(checkout)
-        if not (d / ".git").exists():
-            raise ProjectError(f"{d.name!r} is not a git checkout")
-        return self._commit(d, message)
+        return self._commit(self._checkout("", checkout), message)
 
     def _commit(self, d: Path, message: str) -> str | None:
         self._git(d, "add", "-A")
@@ -294,14 +322,23 @@ class Projects:
             return None
         return self._git(d, "commit", "-m", message)
 
-    def push(self, name: str, *, env: dict[str, str] | None = None) -> str:
-        d = self._require(name)
+    def push(
+        self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None
+    ) -> str:
+        d = self._checkout(name, checkout)
+        if self._has_remote(d) and not self._upstream(d):
+            # A member's worktree branch starts with no upstream, and a plain
+            # push then refuses. Publish it under its own name, and track it so
+            # status can count ahead and behind from then on.
+            names = self._git(d, "remote").split()
+            remote = "origin" if "origin" in names else names[0]
+            return self._git(d, "push", "--set-upstream", remote, "HEAD", env=env)
         return self._git(d, "push", env=env)
 
     # -- inspection ----------------------------------------------------------
 
-    def status(self, name: str) -> GitStatus:
-        d = self._require(name)
+    def status(self, name: str, *, checkout: Path | None = None) -> GitStatus:
+        d = self._checkout(name, checkout)
         # --show-current works before the first commit (an "unborn" branch), where
         # rev-parse HEAD would fail. A just-initialized local project has a branch
         # name but no commit yet, and that is a valid state to report on.
@@ -337,7 +374,12 @@ class Projects:
     # -- diff ----------------------------------------------------------------
 
     def diff(
-        self, name: str, *, max_file_bytes: int = 60_000, max_total_bytes: int = 500_000
+        self,
+        name: str,
+        *,
+        max_file_bytes: int = 60_000,
+        max_total_bytes: int = 500_000,
+        checkout: Path | None = None,
     ) -> dict:
         """What has changed in the working copy since the last commit.
 
@@ -352,7 +394,7 @@ class Projects:
         the running total is blown, comes back with ``diff: null`` and a truncated
         flag — the file still appears with its +/- counts, just not its body.
         """
-        d = self._require(name)
+        d = self._checkout(name, checkout)
         has_head = bool(self._git_allow_fail(d, "rev-parse", "--verify", "HEAD"))
         porcelain = self._git(d, "status", "--porcelain=v1", "-uall")
 
