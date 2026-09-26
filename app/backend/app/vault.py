@@ -9,13 +9,19 @@ secret, there is nothing to derive a per-user key from, so what is left is the
 part that was never about authentication: authenticated encryption under a
 server-held key.
 
-    provider key ──AES-GCM(server key, aad=endpoint)──▶ ciphertext in Postgres
+    secret ──AES-GCM(key, aad=name)──▶ ciphertext in Postgres
 
-Be exact about what that buys. A stolen database dump is inert on its own. A dump
-*plus* the server key is every user's keys, and the operator has both. This is
-the ordinary posture for a hosted tool, and it is why app/serverkey.py insists the
-key lives outside the database it opens — but a user typing a key into Settings is
-trusting the operator, not merely the software, and the docs say so plainly.
+**Which key is the caller's business, not this module's**, and that separation
+is load-bearing. Provider keys and git credentials are sealed under the *user's*
+master key (app/userkey.py), so the operator holds the database but not the key
+that opens those rows. Run environments and the project key of an open workspace
+are sealed under the *server* key (app/serverkey.py), because those have to be
+openable when nobody is present.
+
+This docstring used to say provider keys were sealed under the server key. That
+was true once and stopped being true when per-user master keys arrived; the
+reason it is called out rather than quietly corrected is that a security
+docstring describing the wrong key is worse than none.
 
 AES-GCM's rule — never reuse a (key, nonce) pair — is the sharp edge. Every
 encrypt draws a fresh random 12-byte nonce and stores it beside the ciphertext.

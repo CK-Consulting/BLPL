@@ -243,16 +243,16 @@ rather than as files that passed.
 
 ### Running the scanner
 
-ClamAV ships as a compose profile, off by default:
+ClamAV is a plain service and comes up with the stack. It used to be behind a
+`scanning` profile, on the reasoning that clamd holding a ~1.5–2 GB signature
+database in memory is a silly price for a laptop running tests. That reasoning
+still holds for a laptop — and this is not one. A deployment that fetches
+datasheets from the internet is exactly the case the scanner exists for, so
+here it is part of the deployment rather than a decision.
 
-```
-docker compose --profile scanning up -d
-```
-
-It is a profile rather than a plain service because clamd holds its signature
-database in memory (~1.5–2 GB) and refreshes it on a schedule. That is a fair
-price for a deployment that fetches from the internet and a silly one for a
-laptop running tests, so it is a decision rather than a default.
+`BLPL_QUARANTINE_REQUIRE_SCAN=1` is set on `backend` and `worker`, which holds
+anything the scanner did not see. It was previously set on the `clamav`
+service, where nothing reads it — so the setting was, in effect, off.
 
 Once it is running, set `BLPL_QUARANTINE_REQUIRE_SCAN=1` on `backend` and
 `worker` to hold anything the scanner did not see. Leave it off until then, or

@@ -2,8 +2,24 @@
 #
 # The point of hosting: KiCad lives here, not on your laptop. Sit down at any
 # workstation, open a browser, sign in with Clerk, and the toolchain is
-# byte-identical — no local KiCad to update, no mac-vs-linux path mismatches, and
+# byte-identical — no local KiCad to update, no per-machine path differences, and
 # your projects are already here because they are git-backed on the server.
+#
+# What is integral and what is optional:
+#
+#   db, backend, worker, frontend   the app
+#   kicad-desktop                   integral — drawing a footprint or a symbol
+#                                   the libraries do not have is part of the
+#                                   design process, not an extra
+#   clamav                          integral — this deployment fetches
+#                                   datasheets from the internet
+#   ollama                          OPTIONAL, `local-models` profile. Off by
+#                                   default: it is the heaviest service here and
+#                                   the smallest contributor, and most
+#                                   deployments point BLPL at a model server
+#                                   somewhere else.
+#
+# With local models:  docker compose --profile local-models up -d
 #
 # Bring up:   docker compose -f app/docker-compose.yml up -d --build
 # First run:  open http://<host>:1800 and sign in. Provider API keys are
@@ -41,11 +57,10 @@ services:
 
   backend:
     # Upstream publishes kicad/kicad:10.0.0 for linux/amd64 only — there is no
-    # arm64 manifest. Without this pin the build dies with "no match for platform
-    # in manifest" on any Apple Silicon dev machine. On an amd64 server this is a
-    # no-op (already native); on arm64 it runs under Rosetta/QEMU emulation, which
-    # is slower but correct. Pin it rather than swap in a fork: see the Dockerfile
-    # header for why the official image is load-bearing.
+    # arm64 manifest. This deployment is amd64 Linux, so the pin is a no-op that
+    # earns its place by failing loudly rather than silently emulating if the
+    # image is ever built somewhere else. Pin rather than swap in a fork: see the
+    # Dockerfile header for why the official image is load-bearing.
     platform: linux/amd64
     build:
       # Context is the repo root so the image can pull in blpl/ and
@@ -106,6 +121,10 @@ services:
       # rather than treating as clean.
       - BLPL_CLAMD_HOST=${BLPL_CLAMD_HOST:-clamav}
       - BLPL_CLAMD_PORT=${BLPL_CLAMD_PORT:-3310}
+      # Hold anything the scanner did not see. Safe to have on because
+      # clamav is always up; if it is ever taken down, every fetched
+      # datasheet is held rather than quietly accepted unscanned.
+      - BLPL_QUARANTINE_REQUIRE_SCAN=${BLPL_QUARANTINE_REQUIRE_SCAN:-1}
       # No provider API keys here, deliberately. Keys belong to a signed-in user
       # and live in Postgres sealed under BLPL_SERVER_KEY; a shared one in this
       # file would mean every user of the deployment spending the operator's
@@ -220,9 +239,14 @@ services:
   # the reason the mix is small specialised models rather than one large one —
   # the large one lives on the Thor.
   ollama:
-    image: ollama/ollama:latest
+    # Pinned. `latest` on a model server means the runtime under your models can
+    # change on a `docker compose pull`, and "the same prompt answers differently
+    # this week" is not a thing worth debugging twice.
+    image: ollama/ollama:0.12.3
     container_name: blpl-ollama
-#    profiles: ["local-models"]
+    # The one genuinely optional service here, and the only profile in the file.
+    # Off unless asked for: `docker compose --profile local-models up -d`.
+    profiles: ["local-models"]
     restart: unless-stopped
     networks:
       - blpl
@@ -265,8 +289,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    # No container_name: `docker compose up --scale worker=4` needs to be able
-    # to make more than one.
+    # A container_name IS set above, which rules out `--scale worker=N` — compose
+    # cannot give four containers one name. That is the deliberate trade: this
+    # deployment runs a single worker, and being able to say `docker exec
+    # blpl-worker ...` is worth more here than a scale flag nobody has used. To
+    # scale, drop the container_name and address workers by service instead.
     command: ["python", "-m", "app.worker"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -291,6 +318,10 @@ services:
       # rather than treating as clean.
       - BLPL_CLAMD_HOST=${BLPL_CLAMD_HOST:-clamav}
       - BLPL_CLAMD_PORT=${BLPL_CLAMD_PORT:-3310}
+      # Hold anything the scanner did not see. Safe to have on because
+      # clamav is always up; if it is ever taken down, every fetched
+      # datasheet is held rather than quietly accepted unscanned.
+      - BLPL_QUARANTINE_REQUIRE_SCAN=${BLPL_QUARANTINE_REQUIRE_SCAN:-1}
       # Needed to open the environment sealed into each job. A worker without it
       # refuses to start rather than failing one job at a time.
       - BLPL_SERVER_KEY=${BLPL_SERVER_KEY:-}
@@ -357,7 +388,10 @@ services:
   # A GPU would help here and only here — the 3D viewer's OpenGL, for a human
   # spinning a board. It is not usable on this host; see the environment block.
   kicad-desktop:
- #   profiles: ["desktop"]
+    # No profile. Drawing a footprint or a symbol the libraries do not have is
+    # part of the design process rather than an extra — it has been the answer
+    # to a blocked board often enough that making it opt-in would only mean
+    # turning it on every time.
     # Built on the published image rather than pulled from it: the one layer
     # added installs the KiKit backend (and CopperFiller's psutil) into the
     # python KiCad's plugins run in — the piece PCM cannot deliver, and the
@@ -547,16 +581,16 @@ services:
   # inspection in blpl.core.pdf_inspect — which is the check that actually stops
   # a datasheet phoning home — runs either way.
   #
-  # Once it is running, consider also setting BLPL_QUARANTINE_REQUIRE_SCAN=1 on
-  # backend and worker, which holds anything the scanner did not see. Leave it
-  # off until then, or every datasheet is held.
+  # BLPL_QUARANTINE_REQUIRE_SCAN is set on backend and worker rather than here,
+  # because those are the processes that read it. It was on this service, where
+  # nothing has ever looked at it — so the setting that holds an unscanned file
+  # was, in effect, off.
   clamav:
     image: clamav/clamav:stable
     container_name: blpl-clamav
-#    profiles: ["scanning"]
+    # No profile: this deployment fetches datasheets from the internet, so the
+    # scanner is part of the deployment rather than a decision.
     restart: unless-stopped
-    environment:
-      - BLPL_QUARANTINE_REQUIRE_SCAN=1
     networks:
       - blpl
     volumes:
@@ -577,7 +611,10 @@ networks:
 volumes:
   ollama-models:
   clamav-db:
-  # A named volume, not a bind mount under ./data like the rest of the app's
-  # state. Postgres owns its data directory's permissions and ownership, and a
-  # bind mount onto a macOS filesystem is exactly where that goes wrong.
-  blpl-db:
+  # No blpl-db here. One was declared for a long time and never used: the db
+  # service binds ./blpl-db instead, so the named volume was dead config that
+  # read as the live arrangement. The bind mount is deliberate — the same
+  # reasoning as ./data, which is that being able to look at the bytes from the
+  # host has been worth more during development than the isolation a named
+  # volume buys. The original comment warned about bind-mounting Postgres onto
+  # a macOS filesystem; this deployment is Linux, where that does not apply.

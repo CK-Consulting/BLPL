@@ -1,14 +1,20 @@
-"""The key that seals every stored provider key.
+"""The key for the secrets that must be openable when nobody is present.
 
-Clerk establishes who a user is and holds nothing that could decrypt their data,
-and since a user never hands us a secret there is nothing to derive a per-user
-key from. So provider keys in Postgres are sealed under one key the server holds:
-these 32 bytes.
+Not provider keys — those moved to per-user master keys (app/userkey.py) so that
+the operator holds the database but not the key that opens them. What is left
+here is everything that has to work with no session attached:
 
-That is a real limit, stated plainly because it is easy to forget once it works:
-the database plus this key is every user's keys, and the operator has both. What
-it does buy is that a dump, a snapshot, or a stolen backup is inert on its own.
-So:
+* **a queued run's environment**, which the worker opens in another container,
+  possibly minutes after the person who started it closed the tab;
+* **the project key of an open workspace** (app/openstate.py), so a project left
+  open by a crash can be re-sealed without waiting for its owner to come back.
+
+Both are cases where a user-held key would simply mean the job never runs and
+the workspace never re-seals.
+
+State the limit plainly, because it is easy to forget once it works: the
+database plus this key opens those things, and the operator has both. What it
+does buy is that a dump, a snapshot, or a stolen backup is inert on its own. So:
 
 * The key lives *outside* the database it opens. In one file they would be lock
   and key together, and the encryption would be decoration.

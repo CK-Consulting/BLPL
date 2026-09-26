@@ -92,10 +92,20 @@ blpl stage4 --project-dir <proj> [--source det|llm]
 ```
 
 ### `stage5`
-HDM YAML emission → `hdm.yaml`. Requires hand-authored `project.yaml`.
+HDM YAML emission → `hdm.yaml`. Requires a `project.yaml` — write it by hand, generate
+it with [`init`](#init), or edit it in the web UI's Board tab.
 ```
 blpl stage5 --project-dir <proj>
 ```
+It is validated against `schemas/project_config.v1.json` on load, and an invalid
+file raises rather than being partly used: the fallback it replaced quietly
+substituted a 100 × 80 mm board wherever dimensions were unreadable, which
+produced a complete and entirely wrong board.
+
+This is also where **placement** happens — real courtyard extents, net-adjacency
+clustering, connectors to the edge, and a named refusal for anything that does
+not fit. Results land in `synthesis.placement` in `hdm.yaml`. See
+[`pipeline-stages.md`](pipeline-stages.md#stage-5--hdm-emission).
 
 ### `stage6`
 S-expression emitter → timestamped `.kicad_{sch,pcb,pro}`.

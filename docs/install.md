@@ -108,14 +108,14 @@ Stage 0 (LLM mode) and Stage 1 make LLM calls. Pick one provider and set its cre
 Override provider/model per invocation:
 
 ```bash
-blpl stage1 --project-dir <proj> --llm-provider anthropic --llm-model claude-opus-4-7
+blpl stage1 --project-dir <proj> --llm-provider anthropic --llm-model claude-opus-5
 ```
 
 Or via env:
 
 ```bash
 export BLPL_LLM_PROVIDER=anthropic
-export BLPL_LLM_MODEL=claude-opus-4-7
+export BLPL_LLM_MODEL=claude-opus-5
 ```
 
 The table above is for the **CLI**, which is single-user and reads its keys from
@@ -161,18 +161,31 @@ the operator's quota on the operator's account. If you would rather not bring a
 key, route the task to something keyless — ollama, or an OpenAI-compatible
 endpoint declaring `auth = "none"`.
 
-Keys are stored in Postgres sealed with AES-GCM under a server-held key
-(`BLPL_SERVER_KEY`, or generated at `$BLPL_DATA_ROOT/server.key` on first boot).
-Be clear about what that protects:
+Keys are stored in Postgres sealed with AES-GCM under the **user's own master
+key** — derived with Argon2id from their passphrase and never stored (see
+`app/backend/app/userkey.py` and `keystore.py`). The endpoint name is the
+associated data, so a ciphertext is bound to the row it belongs to and cannot be
+replayed into another endpoint or another user.
 
-* A stolen database dump on its own is **inert**.
-* A dump **plus the server key** is every user's keys.
-* The operator has both, always.
+That is not the same key as `BLPL_SERVER_KEY`, and the difference is the whole
+point of the arrangement:
 
-So keep the server key out of the same backup as the database — together they
-are the lock and its key — and understand that a user typing a key into Settings
-is trusting the operator, not only the software. Losing the server key is not
-recoverable: every stored key becomes ciphertext nobody can open.
+| | Sealed under the **user master key** | Sealed under the **server key** |
+|---|---|---|
+| what | provider API keys, git credentials | stage-run environments, open-workspace project keys |
+| derived from | the user's passphrase (Argon2id) | `BLPL_SERVER_KEY`, or `$BLPL_DATA_ROOT/server.key` on first boot |
+| readable by the operator | no | yes |
+| readable without a live session | no | yes — that is what lets a queued run survive a restart |
+
+So: a stolen database dump is inert. A dump plus the server key still does **not**
+yield anyone's provider keys, because those need a passphrase nobody stored —
+which is what makes the onboarding promise true, and which also means a
+background job cannot quietly reach into someone's credentials.
+
+The cost of that is real. A forgotten passphrase is a forgotten passphrase: the
+keys sealed under it become ciphertext nobody can open, and the user re-enters
+them. Losing the **server key** is separately unrecoverable for the things it
+seals, so keep it out of the same backup as the database.
 
 For an additional layer, encrypt the volume the deployment sits on (LUKS or your
 host's equivalent). That is outside this stack and worth doing on any server you
@@ -199,8 +212,8 @@ cd blpl-repo-root/
 .venv/bin/python -m pytest tests/
 ```
 
-Expect 579 passing. A few auto-skip when the optional tool they exercise is
-absent, which is the intended behaviour rather than a gap:
+Expect **1296 passing and 172 skipped**. The skips are tests whose optional tool
+is absent, which is the intended behaviour rather than a gap:
 
 | Test | Skips without |
 |---|---|
@@ -211,3 +224,24 @@ absent, which is the intended behaviour rather than a gap:
 
 A skipped test is reported as skipped, never as passed — the same rule the
 pipeline applies to its own analyzers.
+
+Three files need dependencies that exist only inside the container image
+(`test_kicad_desktop_gate.py`, `test_onboarding.py`, `test_worker_cancel.py`);
+`--ignore` them to run the rest on a bare host.
+
+Two environment variables have to be **out** of the way:
+
+```bash
+env -u BLPL_SERVER_KEY -u BLPL_MODULES_ROOT python -m pytest tests/
+```
+
+`BLPL_SERVER_KEY` makes one `test_app_api.py` case fail. `BLPL_MODULES_ROOT` is
+worse, because it fails five tests that are *about* symbol search order — the
+variable overrides exactly what they assert, so the suite reports a real-looking
+resolution bug that is only the shell it ran in.
+
+The frontend suite is separate:
+
+```bash
+cd app/frontend && npx vitest run     # 122 passing
+```

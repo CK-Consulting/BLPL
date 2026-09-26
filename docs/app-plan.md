@@ -1,6 +1,25 @@
 # BLPL as an application — architecture plan
 
-Status: proposal. Nothing here is built yet.
+> **Status: superseded, kept as the design record.** This was written as a
+> proposal when none of it existed. Phases A–F are now built and Phase G
+> (packaging) is the one still open — see [`roadmap.md`](roadmap.md) for what
+> shipped. It is left unedited below because the *reasoning* is still the best
+> account of why the app is shaped the way it is, and rewriting it would
+> destroy that while adding nothing.
+>
+> Where it disagrees with the code, the code is right. The differences that
+> matter most:
+>
+> | This document says | What was actually built |
+> |---|---|
+> | A passphrase is the login | **Clerk** is the only door. A passphrase still derives the *vault* master key, but it is not how anyone signs in — see [`security.md`](security.md) |
+> | SQLite (`vault.db`, `runs.db`) | **Postgres**, with Alembic migrations run from the container entrypoint |
+> | The frontend is SolidJS | **React + Vite**; the SolidJS prototype was deleted |
+> | Single user | Multi-user: per-project membership, invitations, and a git worktree per member |
+> | Served on :8080 | **:1800** for the container stack, :7878 for `blpl serve` |
+>
+> For how it works today, read [`architecture.md`](architecture.md),
+> [`security.md`](security.md) and [`../app/README.md`](../app/README.md).
 
 ## What "app-ified" means, concretely
 

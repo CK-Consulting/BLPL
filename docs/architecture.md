@@ -126,8 +126,13 @@ blpl/                           # the library + CLI. No FastAPI import anywhere.
 app/                            # the web application. Imports blpl, never the reverse.
 ├── backend/app/                # FastAPI (`app.main`)
 │   ├── main.py                 # routes: projects, stages, artifacts, chat, release
-│   ├── identity.py, vault.py   # passphrase → session; Argon2id + AES-GCM key store
-│   ├── store.py                # SQLite
+│   ├── clerk_auth.py           # Clerk is the door; no local password
+│   ├── vault.py, serverkey.py  # AES-GCM sealing under a server-held key
+│   ├── keystore.py, gitstore.py# per-user provider keys and git credentials
+│   ├── projectkey.py, grants.py# X25519 sealed boxes, so access can be granted offline
+│   ├── workspace.py            # a project is sealed when nobody is in it
+│   ├── openstate.py            # which workspaces are open, across a restart
+│   ├── models.py, db.py        # Postgres (identity, ownership, runs)
 │   ├── projects.py             # git-backed project lifecycle
 │   ├── runs.py                 # durable runs — a run outlives the tab that started it
 │   ├── references.py           # reference manifest + FilesystemSandbox

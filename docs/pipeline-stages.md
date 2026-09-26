@@ -119,9 +119,48 @@ Collapses every pinout entry into nets, where **signal name = net name**. Implem
 
 Combines the stage outputs with hand-authored board geometry (`project.yaml` carries dimensions, stackup, net_classes, boundaries, keepouts, copper_zones). If `project.yaml` is missing, Stage 5 writes a `.template` next to the expected path and halts with an actionable error.
 
+`project.yaml` is **validated on load** against `schemas/project_config.v1.json`,
+and a file that does not satisfy it raises rather than being partly used. That
+matters more than it sounds: the previous code fell back to `[100, 80]` mm
+wherever dimensions were unreadable, so a typo in the board size produced a
+complete, plausible board of the wrong size. The web UI's Board tab writes the
+same file through the same validator.
+
 `hdm.yaml` is the single source of truth for Stage 6. A human can read and edit it directly.
 
-Two things Stage 5 adds that no BOM row asked for:
+Three things Stage 5 adds that no BOM row asked for:
+
+- **Placement.** Every component is given a position, rotation and side. This is
+  `blpl/core/placement.py`, and it is the stage's most consequential step —
+  Stage 6 writes exactly what it decides. It reads each footprint's real
+  courtyard from the library rather than assuming a size, clusters by net
+  adjacency with the global rails excluded (a net on nearly every part says
+  nothing about who should sit together), places large parts before small ones,
+  and pulls connectors to the board edge.
+
+  A part it cannot fit is **left unplaced and named**, not squeezed in. That
+  refusal is the point: the grid it replaced always succeeded, so a board whose
+  parts did not fit produced coordinates outside the outline and only failed
+  much later, at routing. The outcome is recorded under
+  `synthesis.placement` in `hdm.yaml` — how many placed, which did not and why,
+  the board size used, and the total connection length — so a later stage can
+  tell "placed" from "placed badly".
+
+  Where the automatic result is wrong, `project.yaml` takes hints:
+
+  ```yaml
+  placement:
+    hints:
+      C12: {near: U1}                  # decouples U1, whatever the netlist implies
+      J3:  {x: 4.0, y: 22.5, rot: 90}  # x and y are required together
+      U7:  {side: bottom}
+  ```
+
+  Those five keys — `x`, `y`, `rot`, `side`, `near` — are the whole vocabulary,
+  and the schema rejects anything else rather than ignoring it. A hint is a
+  constraint: `x`/`y` are honoured before anything else is placed, and `near`
+  outranks both the netlist and the naming convention.
+
 
 - **No-connect pins.** Every pin a pinout table declares open lands in that component's `no_connect_pins`, and the schematic emitter puts a KiCad no-connect flag on it. Without this, ERC and the review could not tell a pin the designer left open from one the design forgot.
 - **Test points**, under a policy in `project.yaml`:

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 
 import { getJSON, setLockedHandler, setTokenGetter, setUnlockNeededHandler } from "./api";
 
@@ -13,8 +13,12 @@ import { getJSON, setLockedHandler, setTokenGetter, setUnlockNeededHandler } fro
  * first time somebody reworded it.
  */
 
-let needsUnlock: ReturnType<typeof vi.fn>;
-let locked: ReturnType<typeof vi.fn>;
+// Typed by the handler they stand in for rather than by ReturnType<typeof
+// vi.fn>. Vitest 5 widened that to `Procedure | Constructable`, which no longer
+// satisfies the `() => void` these setters take — and the wide version never
+// said anything useful about the call signature being mocked anyway.
+let needsUnlock: Mock<() => void>;
+let locked: Mock<() => void>;
 
 beforeEach(() => {
   setTokenGetter(async () => "t");

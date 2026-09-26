@@ -1,8 +1,10 @@
 # Roadmap
 
-The pipeline (Stages 0–8) and the web application are both working. What remains
-is packaging, a few CLI surfaces the web UI already has, and the long-tail
-accuracy work that never really ends.
+The pipeline (Stages 0–8) and the web application are both working, and as of
+September 2026 the pipeline reaches a board that routes rather than one that
+merely emits. What remains is packaging, a few CLI surfaces the web UI already
+has, the collaboration work, and the long-tail accuracy work that never really
+ends.
 
 For the app's own design record — the reasoning behind the vault, the config
 cascade and the tool policy — see [`app-plan.md`](app-plan.md). This file is the
@@ -93,13 +95,18 @@ the **net-classes** table (`Class | Trace width | Clearance | Via dia | Via dril
 and the **stackup** table. Both currently have to be restated in `project.yaml`.
 Reading them from the markdown would remove the last hand-authored file.
 
-### Placement
+### Placement ✅ — moved to Shipped
 
-Stage 6 still grid-places every footprint. With test points and real designs
-the grid overflows the outline, and every placement finding in the review
-(courtyard overlaps, parts off the board edge, no decoupling near the IC) is a
-consequence. Routing is in (Freerouting after Stage 6); placement is the next
-thing between an emitted board and one worth routing.
+`blpl/core/placement.py` replaced the grid. It reads real courtyard extents,
+clusters by net adjacency with the global rails excluded, places the big parts
+before the passives scatter the space, pulls connectors to the edge, and
+**refuses** rather than putting a part it cannot fit at coordinates off the
+board. On example-handheld it took every board from parts outside the
+outline to every part placed, connection length down 72–96%, and one board
+routed end to end with nothing unconnected.
+
+What is left there is smaller: pad-to-pad clearance violations survive on three
+boards, which is a spacing parameter rather than a structural problem.
 
 ### Ideas, not commitments
 
@@ -107,9 +114,17 @@ thing between an emitted board and one worth routing.
   Tauri is only a shell.
 - **Schematic-side pcbnew bindings** — if KiCad ever exposes a Python API for
   eeschema, the hand-rolled `.kicad_sch` emitter can go.
-- **Multi-user collaboration** — the passphrase design already supports it; see
-  the open questions in [`app-plan.md`](app-plan.md#open-questions) for whether
-  it is wanted at all.
+- **Concurrent editing** — multi-user itself is shipped (Clerk identity,
+  per-project membership, per-member git worktrees, invitations). What is not
+  solved is two people, or a person and the agent, editing the same markdown:
+  there is no merge story beyond git. A database coordination layer over the
+  text — presence, locks, edit intents — is the likely shape, with the text
+  staying the source of truth so diffing does not break.
+- **A terminal in the central panel** — adding a footprint or a symbol as text
+  has repeatedly been the thing that unblocked a board, and the only routes
+  today are the file editor or launching the KiCad desktop. Runs into the same
+  container-ownership question as everything else that writes to the bind
+  mount.
 
 ## Ongoing
 
@@ -120,4 +135,5 @@ thing between an emitted board and one worth routing.
 - Grow the doctor. Every failure mode that costs somebody a full pipeline run to
   discover should become a `DOC-*` check that costs them a second.
 - Keep the "Known pitfalls" section of the hardware-design skill current.
-- Keep tests green. 579 now; grows with every resolved issue.
+- Keep tests green. 1296 backend and 122 frontend now; grows with every
+  resolved issue.
