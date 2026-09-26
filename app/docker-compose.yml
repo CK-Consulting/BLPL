@@ -69,6 +69,16 @@ services:
       dockerfile: app/backend/Dockerfile
       platforms:
         - linux/amd64
+      # The image carries a passwd entry and home for exactly this uid; see
+      # the Dockerfile. Changing BLPL_UID means a rebuild, not a restart.
+      args:
+        - BLPL_UID=${BLPL_UID:?set BLPL_UID in app/.env to the owner of app/data (id -u)}
+        - BLPL_GID=${BLPL_GID:?set BLPL_GID in app/.env to the owner of app/data (id -g)}
+    # As the host user who owns app/data, so what a run writes is editable and
+    # committable from the host without sudo, and git never sees a repository
+    # owned by someone else. Required, not defaulted: a default of 0 would
+    # quietly restore the root-owned drift this exists to end.
+    user: "${BLPL_UID}:${BLPL_GID}"
     container_name: blpl-backend
     networks:
       - blpl
@@ -210,7 +220,7 @@ services:
       # An SSH deploy key for git, if your project remotes need one. The git CLI
       # in the container reads ~/.ssh; mount a read-only key here. Optional —
       # local-only projects and https remotes with a token helper don't need it.
-      - ./data/ssh:/root/.ssh:ro
+      - ./data/ssh:/home/blpl/.ssh:ro
 
   # The container with KiCad in it, and the only thing that executes a stage.
   #
@@ -283,6 +293,16 @@ services:
       dockerfile: app/backend/Dockerfile
       platforms:
         - linux/amd64
+      # The image carries a passwd entry and home for exactly this uid; see
+      # the Dockerfile. Changing BLPL_UID means a rebuild, not a restart.
+      args:
+        - BLPL_UID=${BLPL_UID:?set BLPL_UID in app/.env to the owner of app/data (id -u)}
+        - BLPL_GID=${BLPL_GID:?set BLPL_GID in app/.env to the owner of app/data (id -g)}
+    # As the host user who owns app/data, so what a run writes is editable and
+    # committable from the host without sudo, and git never sees a repository
+    # owned by someone else. Required, not defaulted: a default of 0 would
+    # quietly restore the root-owned drift this exists to end.
+    user: "${BLPL_UID}:${BLPL_GID}"
     restart: unless-stopped
     networks:
       - blpl
@@ -342,7 +362,7 @@ services:
       - ../kicad-packages:/app/kicad-packages
       - ../kicad-templates:/app/kicad-templates:ro
       - ../KiCAD-Prism:/app/kicad-prism:ro
-      - ./data/ssh:/root/.ssh:ro
+      - ./data/ssh:/home/blpl/.ssh:ro
 
   frontend:
     build:
@@ -404,28 +424,13 @@ services:
     networks:
       - blpl
     environment:
-      # Root, and not by carelessness — by matching the uid that already owns
-      # the files. The backend and the worker run as root, so every project
-      # directory, every .git, and every file the pipeline writes under
-      # data/projects is root:root 755. A desktop running as 1000 can read all
-      # of it and write none of it, which makes "open KiCad and add the missing
-      # footprint" a desktop that opens the board and cannot save it.
-      #
-      # The obvious repair — chown -R 1000:1000 data/projects — breaks the
-      # pipeline. Each project working copy is a git repository, git refuses a
-      # repository owned by someone other than the user running it ("detected
-      # dubious ownership"), and nothing in this codebase sets safe.directory.
-      # Root would stop being able to commit. Matching uids the other way costs
-      # nothing and leaves the ownership on disk untouched.
-      #
-      # This does mean KiCad runs as root inside the container. That is a
-      # smaller step than it sounds: it is already a container whose entire
-      # purpose is handing someone an interactive desktop, it holds no
-      # capabilities beyond the default set, and it can only reach what is
-      # mounted below. Set PUID/PGID to a real user on a deployment whose
-      # pipeline does not run as root.
-      - PUID=${PUID:-0}
-      - PGID=${PGID:-0}
+      # The same uid as the backend and the worker, and for the same reason:
+      # everything under data/projects and data/modules is owned by the host
+      # user those containers now run as, so a desktop running as anyone else
+      # opens a board it cannot save. This used to be 0, back when the pipeline
+      # ran as root and root owned the files; matching moved with the owner.
+      - PUID=${BLPL_UID}
+      - PGID=${BLPL_GID}
       - TZ=${TZ:-Etc/UTC}
       - PIXELFLUX_WAYLAND=true
       # Software rendering, on purpose, on this host. The three lines below are

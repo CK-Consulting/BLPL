@@ -96,15 +96,11 @@ in it — they are per user, in Postgres, sealed.
 
 ### Git remotes that need SSH
 
-If your project remotes are SSH URLs needing a deploy key, mount one:
-
-```sh
-BLPL_SSH_DIR=/path/to/deploy-key-dir docker compose -f app/docker-compose.yml up -d
-```
-
-The directory should contain an SSH private key (and `known_hosts`); it is
-mounted read-only at `/root/.ssh`. Local-only projects and token-helper https
-remotes need none of this.
+If your project remotes are SSH URLs needing a deploy key, put it in
+`app/data/ssh/`. The directory should contain an SSH private key (and
+`known_hosts`), owned by the user the containers run as (`BLPL_UID`, see
+`.env.example`); it is mounted read-only at `/home/blpl/.ssh`. Local-only
+projects and token-helper https remotes need none of this.
 
 ## The security model, briefly
 

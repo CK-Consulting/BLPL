@@ -15,6 +15,15 @@
 # spinning quietly.
 set -e
 
+# The image was built with a passwd entry for one uid (BLPL_UID build arg) and
+# compose runs it as whatever `user:` says. If those differ, ssh remotes fail
+# much later with "No user exists for uid", far from the cause. Say it here.
+if ! id -un >/dev/null 2>&1; then
+    echo "entrypoint: uid $(id -u) has no passwd entry in this image;" \
+         "rebuild with the same BLPL_UID/BLPL_GID compose runs it as" >&2
+    exit 1
+fi
+
 echo "entrypoint: applying migrations"
 alembic upgrade head
 

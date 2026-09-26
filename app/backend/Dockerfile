@@ -83,6 +83,36 @@ ENV BLPL_PROJECTS_ROOT=/app/projects \
     FREEROUTING_JAR=/opt/freerouting/freerouting.jar \
     PYTHONUNBUFFERED=1
 
+# Run as the host user who owns app/data, not as root.
+#
+# Everything these containers write lands in the app/data bind mount, and as
+# root it landed root:root: host-side git and edits needed sudo, and a chown
+# back to the host user drifted again with the next file a run wrote. Worse,
+# git refuses a repository owned by someone other than the caller, so after
+# such a chown a root worker could no longer commit to the projects at all.
+# Matching the uid removes both.
+#
+# The uid needs a passwd entry, not just a number in compose's `user:`: ssh
+# (SSH git remotes) exits with "No user exists for uid" without one, and finds
+# ~/.ssh through the entry's home directory rather than $HOME. The KiCad image
+# may already own that uid (its own `kicad` user is 1000), so an existing
+# entry is re-homed rather than duplicated. Compose passes the same numbers as
+# build args and as `user:`; entrypoint.sh refuses to start if they disagree.
+ARG BLPL_UID=1000
+ARG BLPL_GID=1000
+RUN set -eux; \
+    getent group "${BLPL_GID}" >/dev/null || groupadd -g "${BLPL_GID}" blpl; \
+    if getent passwd "${BLPL_UID}" >/dev/null; then \
+        usermod -d /home/blpl "$(getent passwd "${BLPL_UID}" | cut -d: -f1)"; \
+    else \
+        useradd -u "${BLPL_UID}" -g "${BLPL_GID}" -d /home/blpl -s /bin/sh blpl; \
+    fi; \
+    mkdir -p /home/blpl/.ssh; \
+    chown -R "${BLPL_UID}:${BLPL_GID}" /home/blpl
+ENV HOME=/home/blpl \
+    PYTHONDONTWRITEBYTECODE=1
+USER ${BLPL_UID}:${BLPL_GID}
+
 EXPOSE 8000
 
 # Migrations run before the server does — see entrypoint.sh for why that is a
