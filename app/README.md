@@ -22,8 +22,15 @@ The toolchain lives on the server, so the machine you sit at doesn't matter:
 On any VM with Docker:
 
 ```sh
+# first, in app/.env: BLPL_UID=<id -u> and BLPL_GID=<id -g> (see .env.example)
+app/fix-data-ownership.sh        # before the first up; see below
 docker compose -f app/docker-compose.yml up -d --build
 ```
+
+The backend and worker run as `BLPL_UID`, not root. `fix-data-ownership.sh`
+creates `app/data` and every bind source under it owned by that user before
+anything starts: left to itself, Docker creates a missing bind source as root,
+and a non-root backend cannot write its own `server.key` into it.
 
 Then open `http://<host>:1800` and sign in. Sign-in is [Clerk][clerk]; provider
 API keys are per user and added under Settings after you are in.

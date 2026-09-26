@@ -77,7 +77,9 @@ services:
     # As the host user who owns app/data, so what a run writes is editable and
     # committable from the host without sudo, and git never sees a repository
     # owned by someone else. Required, not defaulted: a default of 0 would
-    # quietly restore the root-owned drift this exists to end.
+    # quietly restore the root-owned drift this exists to end. Run
+    # app/fix-data-ownership.sh before the first `up`: Docker creates a missing
+    # ./data as root, and this uid could not then write server.key into it.
     user: "${BLPL_UID}:${BLPL_GID}"
     container_name: blpl-backend
     networks:
@@ -301,7 +303,9 @@ services:
     # As the host user who owns app/data, so what a run writes is editable and
     # committable from the host without sudo, and git never sees a repository
     # owned by someone else. Required, not defaulted: a default of 0 would
-    # quietly restore the root-owned drift this exists to end.
+    # quietly restore the root-owned drift this exists to end. Run
+    # app/fix-data-ownership.sh before the first `up`: Docker creates a missing
+    # ./data as root, and this uid could not then write server.key into it.
     user: "${BLPL_UID}:${BLPL_GID}"
     restart: unless-stopped
     networks:
