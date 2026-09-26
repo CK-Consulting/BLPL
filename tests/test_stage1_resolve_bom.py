@@ -308,3 +308,128 @@ def test_flooring_leaves_a_valid_bom_alone():
     bom = {"rows": [{"local_id": "U1", "pin_count": 216}, {"local_id": "C1", "pin_count": 2}]}
     assert _floor_pin_counts(bom) == []
     assert [r["pin_count"] for r in bom["rows"]] == [216, 2]
+
+
+# --- incremental resolution -------------------------------------------------
+#
+# Stage 1 used to re-resolve every component on every run. On a 134-component
+# board that is an LLM call per batch over the whole design to learn what three
+# new parts are, and it is not only slow: each pass is another chance for the
+# model to rewrite a part somebody chose deliberately. One did exactly that,
+# quietly appending a "=P2" packaging suffix to an inductor MPN on a run where
+# nothing about that inductor had changed.
+
+
+class _CountingAdapter(_StubAdapter):
+    """A stub that records which components it was actually asked about."""
+
+    def __init__(self, response: dict):
+        super().__init__(response)
+        self.calls = 0
+        self.asked: list[str] = []
+
+    def complete_json(self, system: str, user: str, output_schema: dict, model=None):
+        self.calls += 1
+        for line in user.splitlines():
+            if "local_id=" in line:
+                self.asked.append(line.split("local_id=")[1].split()[0])
+        return self._response
+
+
+def _two_part_artifact() -> dict:
+    a = _artifact()
+    a["components"].append(
+        {"local_id": "R1", "description": "resistor", "package_hint": "0402"}
+    )
+    schema.validate("design_artifact", a)
+    return a
+
+
+def _row(local_id: str, mpn: str) -> dict:
+    return {
+        "local_id": local_id,
+        "mpn": mpn,
+        "manufacturer": "ACME",
+        "package": "0402",
+        "pin_count": 2,
+        "description": "part",
+        "footprint_hint": "Capacitor_SMD:C_0402_1005Metric",
+        "confidence": 0.9,
+    }
+
+
+def test_an_unchanged_component_is_not_asked_about_again() -> None:
+    art = _two_part_artifact()
+    first = _CountingAdapter({"rows": [_row("U1", "A"), _row("R1", "B")]})
+    bom = s1.resolve(art, adapter=first, synthesize_connectors=False)
+    assert sorted(first.asked) == ["R1", "U1"]
+
+    # Same design, second run: nothing has changed, so nothing is asked.
+    second = _CountingAdapter({"rows": []})
+    again = s1.resolve(art, adapter=second, synthesize_connectors=False, previous=bom)
+    assert second.calls == 0, "re-resolved components whose inputs never moved"
+    assert {r["local_id"] for r in again["rows"]} == {"U1", "R1"}
+
+
+def test_only_the_changed_component_is_re_resolved() -> None:
+    art = _two_part_artifact()
+    first = _CountingAdapter({"rows": [_row("U1", "A"), _row("R1", "B")]})
+    bom = s1.resolve(art, adapter=first, synthesize_connectors=False)
+
+    # Edit one component's design inputs; the other is untouched.
+    art["components"][1]["package_hint"] = "0603"
+    second = _CountingAdapter({"rows": [_row("R1", "B-new")]})
+    again = s1.resolve(art, adapter=second, synthesize_connectors=False, previous=bom)
+
+    assert second.asked == ["R1"], f"asked about {second.asked}, expected only R1"
+    by = {r["local_id"]: r for r in again["rows"]}
+    was = {r["local_id"]: r for r in bom["rows"]}
+    assert by["R1"]["mpn"] == "B-new"
+    # Compared against what the first run produced rather than what the stub
+    # returned: U1 carries a part_hint, so the explicit-MPN pinning already
+    # overrode the stub on that first pass. The property under test is that the
+    # reused row is unchanged, not what its value happens to be.
+    assert by["U1"] == was["U1"], "an untouched row was re-resolved"
+
+
+def test_a_hand_corrected_row_survives_a_re_run() -> None:
+    """The other half of why this stage should not run when it has nothing to
+    do: re-resolving overwrites corrections a person made on purpose."""
+    art = _two_part_artifact()
+    first = _CountingAdapter({"rows": [_row("U1", "A"), _row("R1", "WRONG")]})
+    bom = s1.resolve(art, adapter=first, synthesize_connectors=False)
+
+    for r in bom["rows"]:
+        if r["local_id"] == "R1":
+            r["mpn"] = "CORRECTED-BY-HAND"
+
+    second = _CountingAdapter({"rows": []})
+    again = s1.resolve(art, adapter=second, synthesize_connectors=False, previous=bom)
+    by = {r["local_id"]: r for r in again["rows"]}
+    assert by["R1"]["mpn"] == "CORRECTED-BY-HAND"
+    assert second.calls == 0
+
+
+def test_rows_without_a_fingerprint_are_never_reused() -> None:
+    """A BOM written before this mechanism existed has no fingerprints, so it
+    cannot be trusted as a cache — it must resolve from scratch rather than be
+    assumed current."""
+    art = _two_part_artifact()
+    legacy = {"project_id": "proj", "schema_version": 1,
+              "rows": [_row("U1", "A"), _row("R1", "B")]}
+    adapter = _CountingAdapter({"rows": [_row("U1", "A2"), _row("R1", "B2")]})
+    s1.resolve(art, adapter=adapter, synthesize_connectors=False, previous=legacy)
+    assert sorted(adapter.asked) == ["R1", "U1"]
+
+
+def test_row_order_follows_the_design_not_what_was_stale() -> None:
+    """Otherwise every incremental run reshuffles the file and looks like a
+    large diff, which defeats tracking it."""
+    art = _two_part_artifact()
+    first = _CountingAdapter({"rows": [_row("U1", "A"), _row("R1", "B")]})
+    bom = s1.resolve(art, adapter=first, synthesize_connectors=False)
+
+    art["components"][0]["package_hint"] = "BGA-676"     # U1 is the stale one
+    second = _CountingAdapter({"rows": [_row("U1", "A2")]})
+    again = s1.resolve(art, adapter=second, synthesize_connectors=False, previous=bom)
+    assert [r["local_id"] for r in again["rows"]] == ["U1", "R1"]

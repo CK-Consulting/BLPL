@@ -1,199 +1,203 @@
 {
- "$schema": "https://json-schema.org/draft/2020-12/schema",
- "$id": "https://hdm-pipeline/schemas/bom.v1.json",
- "title": "BOM v1",
- "description": "Stage 1 output and checked-in source of truth. Resolved components with MPN, manufacturer, package, and library hints.",
- "type": "object",
- "required": [
-  "project_id",
-  "schema_version",
-  "rows"
- ],
- "additionalProperties": false,
- "properties": {
-  "project_id": {
-   "type": "string"
-  },
-  "schema_version": {
-   "const": 1
-  },
-  "rows": {
-   "type": "array",
-   "items": {
-    "$ref": "#/$defs/bom_row"
-   }
-  }
- },
- "$defs": {
-  "bom_row": {
-   "type": "object",
-   "required": [
-    "local_id",
-    "mpn",
-    "package"
-   ],
-   "additionalProperties": false,
-   "properties": {
-    "local_id": {
-     "type": "string",
-     "description": "Stable ID matching design_artifact component local_id."
-    },
-    "refdes": {
-     "type": "string",
-     "description": "KiCad-style reference designator (U1, J2, etc.). Assigned deterministically in Stage 4 if absent."
-    },
-    "mpn": {
-     "type": "string"
-    },
-    "manufacturer": {
-     "type": "string"
-    },
-    "lcsc": {
-     "type": "string",
-     "description": "LCSC part number for JLCPCB assembly, if known."
-    },
-    "package": {
-     "type": "string",
-     "description": "Canonical package descriptor, e.g., 'BGA-484_19x19mm_P0.8mm', 'QFN-48-1EP_7x7mm_P0.5mm'."
-    },
-    "pin_count": {
-     "type": "integer",
-     "minimum": 1
-    },
-    "datasheet_url": {
-     "type": "string",
-     "format": "uri"
-    },
-    "description": {
-     "type": "string"
-    },
-    "role": {
-     "type": "string"
-    },
-    "symbol_hint": {
-     "type": "string",
-     "description": "Suggested KiCad library symbol, 'LibName:SymbolName' form."
-    },
-    "footprint_hint": {
-     "type": "string",
-     "description": "Suggested KiCad footprint, 'LibName:FootprintName' form."
-    },
-    "model_3d_hint": {
-     "type": "string"
-    },
-    "pin_map": {
-     "type": "object",
-     "description": "Resolved mapping of logical signal name to physical pin number, written by Stage 3's classifier or provided by hand. Logical keys are the names used in nets.json (e.g. 'VBUS', 'GND', 'TX1+/RX1-'); values are physical pin numbers as they appear in the KiCad symbol/footprint (e.g. 'A4', '1').",
-     "additionalProperties": {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hdm-pipeline/schemas/bom.v1.json",
+  "title": "BOM v1",
+  "description": "Stage 1 output and checked-in source of truth. Resolved components with MPN, manufacturer, package, and library hints.",
+  "type": "object",
+  "required": [
+    "project_id",
+    "schema_version",
+    "rows"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {
       "type": "string"
-     }
     },
-    "pin_map_source": {
-     "type": "string",
-     "enum": [
-      "passive_identity",
-      "connector_lookup",
-      "small_signal_3pin",
-      "user_provided",
-      "design_artifact",
-      "pinned_symbol"
-     ],
-     "description": "Audit trail: where the pin_map came from. passive_identity = auto-generated from 2-pin passive classification. connector_lookup = Stage 3 matched a generic connector and derived the map from the library symbol's pin names. user_provided = filled in by the user via the interactive prompt."
+    "schema_version": {
+      "const": 1
     },
-    "alternates": {
-     "type": "array",
-     "items": {
+    "rows": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/bom_row"
+      }
+    }
+  },
+  "$defs": {
+    "bom_row": {
       "type": "object",
       "required": [
-       "mpn"
+        "local_id",
+        "mpn",
+        "package"
       ],
       "additionalProperties": false,
       "properties": {
-       "mpn": {
-        "type": "string"
-       },
-       "manufacturer": {
-        "type": "string"
-       },
-       "lcsc": {
-        "type": "string"
-       }
+        "local_id": {
+          "type": "string",
+          "description": "Stable ID matching design_artifact component local_id."
+        },
+        "refdes": {
+          "type": "string",
+          "description": "KiCad-style reference designator (U1, J2, etc.). Assigned deterministically in Stage 4 if absent."
+        },
+        "mpn": {
+          "type": "string"
+        },
+        "manufacturer": {
+          "type": "string"
+        },
+        "lcsc": {
+          "type": "string",
+          "description": "LCSC part number for JLCPCB assembly, if known."
+        },
+        "package": {
+          "type": "string",
+          "description": "Canonical package descriptor, e.g., 'BGA-484_19x19mm_P0.8mm', 'QFN-48-1EP_7x7mm_P0.5mm'."
+        },
+        "pin_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "datasheet_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "description": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "symbol_hint": {
+          "type": "string",
+          "description": "Suggested KiCad library symbol, 'LibName:SymbolName' form."
+        },
+        "footprint_hint": {
+          "type": "string",
+          "description": "Suggested KiCad footprint, 'LibName:FootprintName' form."
+        },
+        "model_3d_hint": {
+          "type": "string"
+        },
+        "pin_map": {
+          "type": "object",
+          "description": "Resolved mapping of logical signal name to physical pin number, written by Stage 3's classifier or provided by hand. Logical keys are the names used in nets.json (e.g. 'VBUS', 'GND', 'TX1+/RX1-'); values are physical pin numbers as they appear in the KiCad symbol/footprint (e.g. 'A4', '1').",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "pin_map_source": {
+          "type": "string",
+          "enum": [
+            "passive_identity",
+            "connector_lookup",
+            "small_signal_3pin",
+            "user_provided",
+            "design_artifact",
+            "pinned_symbol"
+          ],
+          "description": "Audit trail: where the pin_map came from. passive_identity = auto-generated from 2-pin passive classification. connector_lookup = Stage 3 matched a generic connector and derived the map from the library symbol's pin names. user_provided = filled in by the user via the interactive prompt."
+        },
+        "alternates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "mpn"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "mpn": {
+                "type": "string"
+              },
+              "manufacturer": {
+                "type": "string"
+              },
+              "lcsc": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Stage 1 resolution confidence. Rows <0.9 flagged for human review."
+        },
+        "notes": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string",
+          "description": "Electrical value as written — '10k', '4k7', '100nF', '2.2uH'. Declared here it is authoritative; left out it is guessed from the description, and a guess is never allowed to drive an order on its own."
+        },
+        "tolerance": {
+          "type": "number",
+          "description": "Percent, e.g. 1 for +/-1%."
+        },
+        "voltage_v": {
+          "type": "number",
+          "description": "Rated working voltage in volts."
+        },
+        "power_w": {
+          "type": "number",
+          "description": "Rated power in watts; 0.25 for 1/4W."
+        },
+        "dielectric": {
+          "type": "string",
+          "description": "Ceramic dielectric — C0G/NP0, X7R, X5R. Decides drift and DC bias behaviour, so two capacitors with different dielectrics are not the same part."
+        },
+        "safety_class": {
+          "type": "string",
+          "enum": [
+            "",
+            "X1",
+            "X2",
+            "Y1",
+            "Y2"
+          ],
+          "description": "Mains-suppression class. A rated part may sit across mains isolation and an unrated one of the same value may not, so this never merges with a blank."
+        },
+        "special": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Deliberate requirements that make this not the ordinary part: fusible, flameproof, anti-surge, AEC-Q200, non-inductive."
+        },
+        "no_substitutions": {
+          "type": "boolean",
+          "description": "This exact part, with no alternate accepted, unless engineering and design agree otherwise. Set it and the line is never grouped with an equivalent part from another vendor, because 'you can order either' is precisely what it forbids."
+        },
+        "no_substitutions_reason": {
+          "type": "string",
+          "description": "Why substitution is barred — safety approval, qualification, sole-source, a footprint that only this vendor honours. A flag without a reason gets overridden by whoever is under deadline; a reason is what makes the conversation possible instead."
+        },
+        "attribute_provenance": {
+          "type": "string",
+          "enum": [
+            "",
+            "manual",
+            "design_document",
+            "vendor"
+          ],
+          "description": "Where the electrical attributes came from. 'design_document' means a stage read them out of the design markdown, 'vendor' means a distributor confirmed them, 'manual' means a person entered them. Absent means unknown, which is treated as the weakest. Grouping parts for an order rests on these attributes, so how much they can be trusted has to travel with them."
+        },
+        "attribute_conflicts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Attributes where the design document and a distributor disagree, or two distributors disagree with each other. The row keeps its designed values — writing the vendor's over them would settle by fiat the question a person needs to answer — and is held out of equivalence grouping, because a part whose rating is in dispute cannot be shown equivalent to anything."
+        },
+        "source_fingerprint": {
+          "type": "string",
+          "description": "Digest of the design-artifact fields this row was resolved from, written by Stage 1 so a later run can tell which components actually changed and resolve only those. Optional: a row without one is treated as unknown and re-resolved, which is what makes this safe to add to an existing BOM. Not a design attribute - nothing downstream should read it."
+        }
       }
-     }
-    },
-    "confidence": {
-     "type": "number",
-     "minimum": 0,
-     "maximum": 1,
-     "description": "Stage 1 resolution confidence. Rows <0.9 flagged for human review."
-    },
-    "notes": {
-     "type": "string"
-    },
-    "value": {
-     "type": "string",
-     "description": "Electrical value as written \u2014 '10k', '4k7', '100nF', '2.2uH'. Declared here it is authoritative; left out it is guessed from the description, and a guess is never allowed to drive an order on its own."
-    },
-    "tolerance": {
-     "type": "number",
-     "description": "Percent, e.g. 1 for +/-1%."
-    },
-    "voltage_v": {
-     "type": "number",
-     "description": "Rated working voltage in volts."
-    },
-    "power_w": {
-     "type": "number",
-     "description": "Rated power in watts; 0.25 for 1/4W."
-    },
-    "dielectric": {
-     "type": "string",
-     "description": "Ceramic dielectric \u2014 C0G/NP0, X7R, X5R. Decides drift and DC bias behaviour, so two capacitors with different dielectrics are not the same part."
-    },
-    "safety_class": {
-     "type": "string",
-     "enum": [
-      "",
-      "X1",
-      "X2",
-      "Y1",
-      "Y2"
-     ],
-     "description": "Mains-suppression class. A rated part may sit across mains isolation and an unrated one of the same value may not, so this never merges with a blank."
-    },
-    "special": {
-     "type": "array",
-     "items": {
-      "type": "string"
-     },
-     "description": "Deliberate requirements that make this not the ordinary part: fusible, flameproof, anti-surge, AEC-Q200, non-inductive."
-    },
-    "no_substitutions": {
-     "type": "boolean",
-     "description": "This exact part, with no alternate accepted, unless engineering and design agree otherwise. Set it and the line is never grouped with an equivalent part from another vendor, because 'you can order either' is precisely what it forbids."
-    },
-    "no_substitutions_reason": {
-     "type": "string",
-     "description": "Why substitution is barred \u2014 safety approval, qualification, sole-source, a footprint that only this vendor honours. A flag without a reason gets overridden by whoever is under deadline; a reason is what makes the conversation possible instead."
-    },
-    "attribute_provenance": {
-     "type": "string",
-     "enum": [
-      "",
-      "manual",
-      "design_document",
-      "vendor"
-     ],
-     "description": "Where the electrical attributes came from. 'design_document' means a stage read them out of the design markdown, 'vendor' means a distributor confirmed them, 'manual' means a person entered them. Absent means unknown, which is treated as the weakest. Grouping parts for an order rests on these attributes, so how much they can be trusted has to travel with them."
-    },
-    "attribute_conflicts": {
-     "type": "array",
-     "items": {
-      "type": "string"
-     },
-     "description": "Attributes where the design document and a distributor disagree, or two distributors disagree with each other. The row keeps its designed values \u2014 writing the vendor's over them would settle by fiat the question a person needs to answer \u2014 and is held out of equivalence grouping, because a part whose rating is in dispute cannot be shown equivalent to anything."
     }
-   }
   }
- }
 }

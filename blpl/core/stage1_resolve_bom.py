@@ -7,6 +7,8 @@ confidence score per row.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -105,6 +107,55 @@ _SYSTEM_PROMPT = (
 _PASSIVE_ATTRS = ("value", "tolerance", "voltage_v", "power_w", "dielectric", "safety_class")
 
 
+#: The component fields Stage 1 actually reads. Everything in the prompt
+#: (`_build_user_prompt`) plus everything pinned back over the model's answer
+#: afterwards — package, symbol, pin count and MPN. If none of these moved,
+#: this stage cannot produce a different row, so there is nothing to ask.
+_STAGE1_INPUTS = (
+    "local_id", "description", "part_hint", "package_hint",
+    "manufacturer_hint", "role", "pin_count_hint", "symbol_hint",
+)
+
+#: Where a reusable row records what it was resolved from. It lives on the row
+#: rather than in a sidecar or a top-level key: the BOM schema forbids extra
+#: top-level properties, and a sidecar can drift out of step with the file it
+#: describes, whereas a fingerprint carried by the row it belongs to cannot.
+FINGERPRINT_KEY = "source_fingerprint"
+
+
+def component_fingerprint(component: dict) -> str:
+    """A stable digest of the inputs this stage resolves a component from."""
+    payload = {k: component.get(k) for k in _STAGE1_INPUTS}
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def reusable_rows(design_artifact: dict, previous: dict | None) -> dict[str, dict]:
+    """Rows from a previous BOM whose inputs have not changed.
+
+    Keyed by local_id. A row qualifies only if it carries a fingerprint and
+    that fingerprint still matches the component as the artifact now describes
+    it — so a row written before this mechanism existed is never reused, and
+    neither is one whose design inputs moved.
+
+    Hand edits survive deliberately. If someone corrects an MPN in the BOM and
+    the design document has not changed, the fingerprint still matches and the
+    correction is kept. Re-resolving would silently overwrite it, which is the
+    other half of why this stage should not run when it has nothing to do.
+    """
+    if not previous:
+        return {}
+    want = {c["local_id"]: component_fingerprint(c)
+            for c in design_artifact.get("components", [])}
+    out = {}
+    for row in previous.get("rows", []):
+        rid = row.get("local_id")
+        fp = row.get(FINGERPRINT_KEY)
+        if rid in want and fp and fp == want[rid]:
+            out[rid] = row
+    return out
+
+
 class ComponentsDropped(RuntimeError):
     """The LLM returned fewer components than it was given."""
 
@@ -172,6 +223,7 @@ def resolve(
     adapter: llm_adapter.LLMAdapter | None = None,
     *,
     synthesize_connectors: bool = True,
+    previous: dict | None = None,
 ) -> dict:
     """Run the Stage 1 LLM pass and return a bom.v1 dict.
 
@@ -182,12 +234,33 @@ def resolve(
     see ``connector_synthesis.infer_connector_metadata``.
     """
     schema.validate("design_artifact", design_artifact)
-    if adapter is None:
-        # Name the task: a pipeline range runs several stages in one process,
-        # and this project may route stage1 somewhere other than the default.
-        adapter = llm_adapter.get_adapter(task="stage1")
+    _adapter = adapter
 
     components = design_artifact.get("components", [])
+
+    # Only resolve what changed. Every row carries the fingerprint of the
+    # component inputs it came from, so a re-run can tell the three parts
+    # somebody just added from the hundred and thirty that have not moved
+    # since the last run — and ask about three.
+    #
+    # This is not only about time and tokens. Re-resolving a settled component
+    # gives a model another chance to rewrite a part somebody chose
+    # deliberately, and it has taken those chances: an MPN quietly gained a
+    # "=P2" packaging suffix on a run where nothing about that inductor had
+    # changed at all.
+    reused = reusable_rows(design_artifact, previous)
+    stale = [c for c in components if c["local_id"] not in reused]
+    if reused:
+        print(
+            f"stage1: reusing {len(reused)} unchanged row(s), "
+            f"resolving {len(stale)}",
+            file=sys.stderr,
+        )
+    if not stale:
+        # Nothing to ask. Take the adapter lookup off the path entirely so a
+        # no-op run does not need a provider, a key, or a network.
+        adapter = None
+
     rows: list[dict] = []
 
     # Batch, rather than asking for all 46 components in one response. This is
@@ -195,9 +268,15 @@ def resolve(
     # mid-tool-call, and a truncated structured output deserialises to an empty
     # row list. That is exactly how a 46-component design silently became a
     # 0-component BOM.
-    for start in range(0, len(components), _BATCH_SIZE):
-        batch = components[start : start + _BATCH_SIZE]
-        raw = adapter.complete_json(
+    for start in range(0, len(stale), _BATCH_SIZE):
+        batch = stale[start : start + _BATCH_SIZE]
+        if _adapter is None:
+            # Name the task: a pipeline range runs several stages in one
+            # process, and this project may route stage1 somewhere other than
+            # the default. Resolved here rather than up front so a run with
+            # nothing to do never needs a provider at all.
+            _adapter = llm_adapter.get_adapter(task="stage1")
+        raw = _adapter.complete_json(
             system=_SYSTEM_PROMPT,
             user=_build_user_prompt(design_artifact, batch),
             output_schema=_LLM_OUTPUT_SCHEMA,
@@ -209,13 +288,13 @@ def resolve(
     # never by the design. Give the stragglers one focused retry, then refuse to
     # continue — a board quietly missing a third of its parts is far worse than a
     # pipeline that stops and says so.
-    expected = {c["local_id"] for c in components}
+    expected = {c["local_id"] for c in stale}
     got = {r.get("local_id") for r in rows}
     missing = expected - got
 
     if missing:
-        retry = [c for c in components if c["local_id"] in missing]
-        raw = adapter.complete_json(
+        retry = [c for c in stale if c["local_id"] in missing]
+        raw = _adapter.complete_json(
             system=_SYSTEM_PROMPT,
             user=_build_user_prompt(design_artifact, retry),
             output_schema=_LLM_OUTPUT_SCHEMA,
@@ -313,6 +392,24 @@ def resolve(
             r["footprint_hint"] = None
 
     bom = _post_process({"rows": rows}, project_id=design_artifact["project_id"])
+
+    # Stamp what each freshly-resolved row was resolved from, then fold the
+    # reused rows back in. Order follows the design artifact rather than the
+    # order things happened to be resolved in, so a BOM does not reshuffle
+    # itself just because a different subset was stale — that would make every
+    # incremental run look like a large diff and defeat the point of tracking
+    # the file.
+    fp = {c["local_id"]: component_fingerprint(c)
+          for c in design_artifact.get("components", [])}
+    for r in bom["rows"]:
+        if r.get("local_id") in fp:
+            r[FINGERPRINT_KEY] = fp[r["local_id"]]
+    merged = {r["local_id"]: r for r in bom["rows"]}
+    merged.update(reused)
+    order = {c["local_id"]: i for i, c in enumerate(design_artifact.get("components", []))}
+    bom["rows"] = sorted(merged.values(),
+                         key=lambda r: order.get(r.get("local_id"), len(order)))
+
     if synthesize_connectors:
         existing_ids = {r["local_id"] for r in bom["rows"]}
         bom["rows"].extend(
@@ -337,9 +434,27 @@ def run(
     adapter: llm_adapter.LLMAdapter | None = None,
     *,
     synthesize_connectors: bool = True,
+    full: bool = False,
 ) -> dict:
+    """Resolve the BOM, reusing rows whose design inputs have not changed.
+
+    ``full=True`` re-resolves everything, which is what you want after changing
+    the prompt or the model — the fingerprint covers the design inputs, not the
+    thing doing the resolving, so a better model will not invalidate a cache by
+    itself.
+    """
     artifact = schema.load_json(design_artifact_path)
-    bom = resolve(artifact, adapter=adapter, synthesize_connectors=synthesize_connectors)
+    previous = None
+    if not full and output_path.exists():
+        try:
+            previous = schema.load_json(output_path)
+        except (ValueError, OSError) as exc:
+            # A corrupt or unreadable previous BOM is a reason to resolve from
+            # scratch, not to fail: the cache is an optimisation and must never
+            # be the thing that stops a run.
+            print(f"stage1: ignoring unusable {output_path.name} ({exc})", file=sys.stderr)
+    bom = resolve(artifact, adapter=adapter,
+                  synthesize_connectors=synthesize_connectors, previous=previous)
     schema.dump_json(output_path, bom)
     return bom
 

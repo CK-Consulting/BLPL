@@ -213,7 +213,7 @@ def _cmd_stage1(args: argparse.Namespace) -> int:
     out = _artifact(args, proj, "bom")
     adapter = _make_adapter(args)
     print(f"stage1: resolving BOM from {src_path.name} via {adapter.provider}/{adapter.model}…", file=sys.stderr)
-    bom = stage1_resolve_bom.run(src_path, out, adapter=adapter)
+    bom = stage1_resolve_bom.run(src_path, out, adapter=adapter, full=args.full)
     low = stage1_resolve_bom.low_confidence_rows(bom)
     print(f"stage1: {len(bom['rows'])} rows ({len(low)} low-confidence, need review)")
     print(f"        wrote {out}")
@@ -1319,6 +1319,16 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("stage1", help="LLM design_artifact -> bom.json.")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Re-resolve every component instead of only those whose design "
+            "inputs changed. Wanted after changing the prompt or the model, "
+            "since the reuse fingerprint covers the design, not the resolver. "
+            "Note this also discards hand corrections made to the BOM."
+        ),
+    )
     p.add_argument(
         "--board",
         help=(
