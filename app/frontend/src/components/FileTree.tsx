@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getJSON, postJSON, putJSON } from "../api";
+import { UploadDialog } from "./UploadDialog";
 
 /**
  * Everything in the project, grouped by what it is for.
@@ -27,9 +28,20 @@ export type TreeNode = {
   path: string;
   name: string;
   dir: boolean;
-  role: "design" | "diagram" | "artifact" | "datasheet" | "note" | "kicad" | "other";
+  role:
+    | "design"
+    | "diagram"
+    | "artifact"
+    | "datasheet"
+    | "reference"
+    | "quarantined"
+    | "note"
+    | "kicad"
+    | "other";
   bytes?: number;
   modified?: string;
+  /** On the LLM-ignore list: the assistant leaves it alone unless asked by name. */
+  llm_ignore?: boolean;
 };
 
 // Order matters: this is the order the groups appear, which is roughly the
@@ -39,9 +51,14 @@ const GROUPS: { role: TreeNode["role"]; label: string }[] = [
   { role: "diagram", label: "Diagrams" },
   { role: "kicad", label: "KiCad" },
   { role: "datasheet", label: "Datasheets" },
+  { role: "reference", label: "References" },
   { role: "artifact", label: "Pipeline" },
   { role: "note", label: "Notes" },
   { role: "other", label: "Other" },
+  // Last, and present. The backend has always tagged retrieved/ as
+  // quarantined so that it would be shown, but no group here matched the
+  // role and every held file silently disappeared from the tree.
+  { role: "quarantined", label: "Quarantine" },
 ];
 
 type Dir = {
@@ -122,6 +139,7 @@ export function FileTree({
   // documents, which is a lot of noise in front of the four files anybody came
   // to look at.
   const [showHidden, setShowHidden] = useState(false);
+  const [uploading, setUploading] = useState(false);
 
   useEffect(() => {
     getJSON<{ nodes: TreeNode[] }>(`/api/projects/${projectId}/tree`)
@@ -200,7 +218,20 @@ export function FileTree({
         <button className="link" onClick={() => void create("folder")}>
           + Folder
         </button>
+        <button className="link" onClick={() => setUploading(true)}>
+          + Upload
+        </button>
       </div>
+      {uploading && (
+        <UploadDialog
+          projectId={projectId}
+          onClose={() => setUploading(false)}
+          onUploaded={() => {
+            setBump((n) => n + 1);
+            onChanged?.();
+          }}
+        />
+      )}
       {error && <div className="gate-error small">{error}</div>}
       <input
         className="tree-filter"
@@ -325,6 +356,11 @@ function Branch({
             title={`${n.path}${n.bytes !== undefined ? ` · ${size(n.bytes)}` : ""}`}
           >
             <span className="tree-name mono">{n.name}</span>
+            {n.llm_ignore && (
+              <span className="tree-badge muted small" title="On the LLM-ignore list">
+                LLM ignore
+              </span>
+            )}
             <span className="spacer" />
             <span className="muted tree-size">{size(n.bytes)}</span>
           </button>

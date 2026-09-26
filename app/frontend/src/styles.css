@@ -953,3 +953,16 @@ header .kicad-launch { margin-left: .4rem; }
    list of defaults with one of them mysteriously different. */
 .routing-table tr.overridden td { background: #1d2a3a; }
 .routing-table tr.overridden code { color: #8ab4f8; }
+
+/* Upload dialog. The drop zone is the file input's label, so a click opens the
+   picker and a drop lands in the same handler. */
+.upload-drop { display: flex; flex-direction: column; gap: .5rem; padding: 1rem; border: 1px dashed #6b6f75; border-radius: 8px; cursor: pointer; }
+.upload-drop.dragging { border-color: #9ab8ff; background: #1d2330; }
+.upload-rows { width: 100%; border-collapse: collapse; font-size: 14px; }
+.upload-rows th, .upload-rows td { text-align: left; padding: .35rem .4rem; border-bottom: 1px solid #2c3038; vertical-align: middle; }
+.upload-rows td.mono { max-width: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-rows input:not([type="checkbox"]) { width: 8rem; }
+.upload-footnote { margin: 0; }
+.upload-results { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: .35rem; font-size: 14px; }
+.upload-result.held, .upload-result.rejected { color: #ffc0c0; }
+.tree-badge { margin-left: .4rem; padding: 0 .3rem; border: 1px solid #6b6f75; border-radius: 4px; font-size: 11px; white-space: nowrap; }

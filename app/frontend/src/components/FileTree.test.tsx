@@ -147,3 +147,31 @@ describe("where a click lands", () => {
     expect(destinationFor(node("blob", { bytes: 9_000_000 }))).toBe("browser");
   });
 });
+
+
+describe("outside files", () => {
+  it("groups references and quarantined files, and marks LLM-ignored ones", async () => {
+    const user = userEvent.setup();
+    mockTree([
+      node("overview.md", { role: "design" }),
+      node("references/guide.pdf", { role: "reference", llm_ignore: true }),
+      node("retrieved/abc-evil.pdf", { role: "quarantined" }),
+    ]);
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("overview.md");
+    // Held files used to vanish: no group matched their role.
+    expect(screen.getByRole("button", { name: /Quarantine/ })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /References/ }));
+    expect(screen.getByText("guide.pdf")).toBeInTheDocument();
+    expect(screen.getByText("LLM ignore")).toBeInTheDocument();
+  });
+
+  it("opens the upload dialog", async () => {
+    const user = userEvent.setup();
+    mockTree();
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("overview.md");
+    await user.click(screen.getByRole("button", { name: "+ Upload" }));
+    expect(screen.getByRole("dialog", { name: "Upload files" })).toBeInTheDocument();
+  });
+});
