@@ -19,7 +19,7 @@ import yaml
 
 from blpl.emitter import lib_tables as _lib_tables, pcb as _pcb, pro as _pro, sch as _sch
 
-from . import symbol_resolution
+from . import provenance, symbol_resolution
 
 
 # This file is blpl/core/stage6_compile_kicad.py, so the repo root is three
@@ -140,10 +140,14 @@ def run(
     # Board-qualified like every other per-board artifact: two boards compiled
     # into one .pipeline/ would otherwise overwrite each other's record and
     # Stage 8 would excuse the wrong board's rails.
+    #
+    # The library commits ride along for the same reason: the emitted files
+    # name a lib_id, not the version of it that was read. See provenance.py.
     report_name = "emitter_report.json" if board is None else f"emitter_report.{_sanitize_filename(board)}.json"
     (output_dir / report_name).write_text(
         json.dumps({"pwr_flag_nets": _sch.flagged_nets(hdm, symbols_root=symbol_roots),
-                    "lib_tables": lib_table_report},
+                    "lib_tables": lib_table_report,
+                    "library_provenance": provenance.library_provenance(symbol_roots, footprint_roots)},
                    indent=2) + "\n",
         encoding="utf-8",
     )

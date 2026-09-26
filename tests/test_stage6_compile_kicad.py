@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -227,3 +228,20 @@ def test_an_item_no_root_provides_is_named_not_just_its_library(tmp_path: Path) 
 
     assert report["unresolved"] == ["symbol:Nope:Thing", "footprint:NopeFP:Thing"]
     assert "Nope" not in (out / "sym-lib-table").read_text()
+
+
+def test_the_emitter_report_records_which_library_commits_built_the_board(tmp_path: Path) -> None:
+    """A vendor-symbol fix changes the board; the report has to say which side of it this is."""
+    hdm_path = tmp_path / "hdm.yaml"
+    hdm_path.write_text(yaml.safe_dump(_minimal_hdm()))
+    out = tmp_path / "out"
+
+    s6.run(hdm_path, out, stamp="2026-04-20_120000Z", board="core")
+
+    report = json.loads((out / "emitter_report.core.json").read_text())
+    entries = report["library_provenance"]
+    assert {Path(e["root"]).name for e in entries} >= {"kicad-symbols", "kicad-footprints"}
+    for entry in entries:
+        assert entry["used_for"]
+        # Either a commit, or a stated reason there is none; never silence.
+        assert entry["git"] is not None or entry["reason"]
