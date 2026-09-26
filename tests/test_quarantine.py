@@ -332,3 +332,91 @@ def test_the_staging_file_never_appears_under_datasheets(tmp_path, resolver):
     proj = tmp_path / "proj"
     fetch_datasheet("EVIL", proj / "datasheets")
     assert list((proj / "datasheets").iterdir()) == []
+
+
+# -- uploads -----------------------------------------------------------------
+
+
+def test_an_uploaded_datasheet_is_named_for_its_part(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    rec = quarantine.accept_upload(
+        BENIGN, tmp_path, original_name="scan 01.pdf", kind="datasheet",
+        uploaded_by="a@example.com", mpn="TPS62840",
+    )
+    assert rec.state == quarantine.RELEASED
+    assert (tmp_path / "datasheets" / "TPS62840.pdf").is_file()
+    assert rec.origin == quarantine.UPLOAD
+    assert rec.uploaded_by == "a@example.com"
+    assert rec.original_name == "scan 01.pdf"
+
+
+def test_a_reference_keeps_its_name_in_references(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    rec = quarantine.accept_upload(
+        BENIGN, tmp_path, original_name="AN-123 layout guide.pdf", kind="reference",
+        uploaded_by="a@example.com",
+    )
+    assert rec.released_to == "references"
+    assert (tmp_path / "references" / rec.released_as).is_file()
+    assert rec.released_as == "AN-123_layout_guide.pdf"
+    assert not (tmp_path / "datasheets").exists()
+
+
+def test_an_uploaded_pdf_that_acts_on_open_is_held_like_a_fetched_one(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    rec = quarantine.accept_upload(
+        PHONES_HOME, tmp_path, original_name="ref.pdf", kind="reference", uploaded_by="a@example.com"
+    )
+    assert rec.state == quarantine.HELD
+    assert not (tmp_path / "references").exists()
+
+
+def test_pdf_bytes_are_inspected_whatever_the_name_says(tmp_path, monkeypatch):
+    """Renaming a hostile PDF to .bin must not route it around the inspector."""
+    _no_scanner(monkeypatch)
+    rec = quarantine.accept_upload(
+        PHONES_HOME, tmp_path, original_name="harmless.bin", kind="reference", uploaded_by="a@x"
+    )
+    assert rec.state == quarantine.HELD
+
+
+def test_an_uninspectable_upload_is_released_and_says_it_was_not_inspected(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    rec = quarantine.accept_upload(
+        b"ISO-10303-21;\n", tmp_path, original_name="enclosure.STEP", kind="reference", uploaded_by="a@x"
+    )
+    assert rec.state == quarantine.RELEASED
+    assert rec.inspection["state"] == quarantine.NOT_INSPECTED
+    assert (tmp_path / "references" / "enclosure.step").is_file()
+
+
+def test_a_distributor_fetch_of_a_non_pdf_is_still_held(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    rec = quarantine.accept(b"not a pdf", tmp_path, mpn="X", suffix=".zip")
+    assert rec.reasons
+
+
+def test_an_upload_the_scanner_matches_is_held(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        quarantine.av, "scan_bytes",
+        lambda data: av.ScanResult(state="infected", signature="Eicar-Test-Signature"),
+    )
+    rec = quarantine.accept_upload(
+        EICAR, tmp_path, original_name="x.txt", kind="reference", uploaded_by="a@x"
+    )
+    assert rec.state == quarantine.HELD
+    assert any("Eicar" in r for r in rec.reasons)
+
+
+def test_a_second_file_with_the_same_name_does_not_replace_the_first(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    a = quarantine.accept_upload(b"one\n", tmp_path, original_name="notes.txt", kind="reference", uploaded_by="a@x")
+    b = quarantine.accept_upload(b"two\n", tmp_path, original_name="notes.txt", kind="reference", uploaded_by="a@x")
+    assert a.released_as != b.released_as
+    assert (tmp_path / "references" / a.released_as).read_bytes() == b"one\n"
+    assert (tmp_path / "references" / b.released_as).read_bytes() == b"two\n"
+
+
+def test_an_unknown_kind_is_refused(tmp_path):
+    with pytest.raises(ValueError):
+        quarantine.accept_upload(b"x", tmp_path, original_name="x", kind="junk", uploaded_by="a@x")

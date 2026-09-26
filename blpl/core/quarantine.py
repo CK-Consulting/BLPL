@@ -1,8 +1,9 @@
 """Where retrieved files land, and what has to be true before they leave.
 
-A datasheet fetched from a distributor is the only thing in a BLPL project that
-arrives from outside it. Everything else is written by the people working on the
-board or generated from what they wrote. That makes retrieved files a category
+Two things in a BLPL project arrive from outside it: a datasheet fetched from a
+distributor, and a file a member uploads (a vendor reference design, an
+application note, a datasheet that was never fetched). Everything else is
+written by the people working on the board or generated from what they wrote. That makes retrieved files a category
 of their own, and the point of this module is to keep them in that category
 rather than letting them quietly become project files.
 
@@ -11,6 +12,7 @@ rather than letting them quietly become project files.
         quarantine.json          ← the ledger: what came in, from where, and what was found
         <sha256[:12]>-<mpn>.pdf
       datasheets/                ← only files that have passed live here
+      references/                ← uploads that are not datasheets, once passed
 
 The two-directory shape does the work. Code that reads ``datasheets/`` is
 reading files that were inspected and — where a scanner exists — scanned. Code
@@ -32,6 +34,14 @@ distributor, what was in it. Deleting it would destroy the only record of an
 event worth knowing about, and would make the same download happen again
 tomorrow with nobody the wiser.
 
+**An upload may be any type, and the ledger says which were not inspected.**
+``pdf_inspect`` answers a PDF-shaped question. A ``.step``, a ``.zip`` or a
+vendor ``.xlsx`` has no inspector here, so for an upload it is released with
+its inspection recorded as ``not_inspected`` rather than held forever or
+described as checked. The scanner still gates it, and anything whose bytes are
+a PDF is inspected as one whatever its name says. A distributor fetch keeps the
+stricter rule: it only ever expects a PDF, so anything else is held.
+
 **The ledger is append-mostly and never lies by omission.** Every retrieval gets
 an entry whatever the outcome, so "no entry" means "never fetched" rather than
 "fetched and fine".
@@ -52,7 +62,22 @@ from . import av, pdf_inspect
 
 QUARANTINE_DIRNAME = "retrieved"
 TRUSTED_DIRNAME = "datasheets"
+REFERENCES_DIRNAME = "references"
 LEDGER_NAME = "quarantine.json"
+
+# Where an upload of each kind lands once it passes. The uploader picks the
+# kind, so the directory name keeps saying what is in it: a datasheet goes where
+# the extraction tools already look, and anything else goes beside it.
+UPLOAD_KINDS = {"datasheet": TRUSTED_DIRNAME, "reference": REFERENCES_DIRNAME}
+
+# How a file arrived. Recorded on every entry, because "who put this here" is
+# the first question anyone asks about an untrusted file.
+DISTRIBUTOR = "distributor"
+UPLOAD = "upload"
+
+# Inspection state for a file no inspector here understands. Distinct from
+# `cannot_inspect`, which means an inspector tried and failed.
+NOT_INSPECTED = "not_inspected"
 
 # Held, released, or rejected. A file is *held* by default and only moves on a
 # decision that was recorded.
@@ -91,10 +116,18 @@ class Record:
     source_url: str = ""
     retrieved_at: str = field(default_factory=_now)
     state: str = HELD
-    released_as: str = ""
+    released_as: str = ""            # filename inside released_to
+    released_to: str = TRUSTED_DIRNAME
     inspection: dict = field(default_factory=dict)
     scan: dict = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
+    # Provenance for uploads. Defaults describe a distributor fetch, so ledger
+    # rows written before these fields existed still read correctly.
+    origin: str = DISTRIBUTOR
+    uploaded_by: str = ""
+    original_name: str = ""
+    kind: str = "datasheet"
+    llm_ignore: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -175,6 +208,11 @@ def _decide(inspection: pdf_inspect.Inspection, scan: av.ScanResult) -> list[str
     return reasons
 
 
+def _looks_like_pdf(data: bytes) -> bool:
+    # The spec allows junk before the header; readers look within the first 1 KB.
+    return b"%PDF-" in data[:1024]
+
+
 def accept(
     data: bytes,
     project_dir: str | Path,
@@ -183,12 +221,20 @@ def accept(
     distributor: str = "",
     source_url: str = "",
     suffix: str = ".pdf",
+    origin: str = DISTRIBUTOR,
+    uploaded_by: str = "",
+    original_name: str = "",
+    kind: str = "datasheet",
+    llm_ignore: bool = False,
 ) -> Record:
     """Take delivery of a retrieved file: store, inspect, scan, decide.
 
     Returns the record with its verdict. The bytes are written into
     ``retrieved/`` before anything else happens, so a file that crashes the
     inspector is still on disk to look at afterwards.
+
+    An ``UPLOAD`` of a type no inspector here understands is recorded as
+    ``not_inspected`` and may be released; a distributor fetch of one is held.
     """
     project_dir = Path(project_dir)
     qdir = quarantine_dir(project_dir)
@@ -198,22 +244,28 @@ def accept(
     # Content-addressed, with the part number kept for a human reading the
     # directory. The hash leads so two files for one MPN cannot collide and so
     # nothing here can be mistaken for a finished, trusted artifact.
-    name = f"{digest[:12]}-{_safe(mpn, 'retrieved')}{suffix}"
+    label = mpn or Path(original_name).stem
+    name = f"{digest[:12]}-{_safe(label, 'retrieved')}{suffix}"
     blob = qdir / name
     if not blob.exists():
         tmp = blob.with_name(blob.name + ".part")
         tmp.write_bytes(data)
         tmp.replace(blob)
 
-    inspection = (
-        pdf_inspect.inspect(blob)
-        if suffix.lower() == ".pdf"
-        else pdf_inspect.Inspection(
+    if suffix.lower() == ".pdf" or _looks_like_pdf(data):
+        inspection = pdf_inspect.inspect(blob)
+    elif origin == UPLOAD:
+        inspection = pdf_inspect.Inspection(
+            state=NOT_INSPECTED,
+            findings=[],
+            reason=f"no inspector for {suffix or 'extensionless'} files; stored as uploaded",
+        )
+    else:
+        inspection = pdf_inspect.Inspection(
             state="cannot_inspect",
             findings=[],
             reason=f"no inspector for {suffix} files",
         )
-    )
     scan = av.scan_bytes(data)
     reasons = _decide(inspection, scan)
 
@@ -228,13 +280,24 @@ def accept(
         inspection=inspection.to_dict(),
         scan=scan.to_dict(),
         reasons=reasons,
+        origin=origin,
+        uploaded_by=uploaded_by,
+        original_name=original_name,
+        kind=kind,
+        llm_ignore=llm_ignore,
     )
     _upsert(project_dir, rec)
     return rec
 
 
-def release(project_dir: str | Path, rec: Record, *, as_name: str = "") -> Record:
-    """Copy a passed file into ``datasheets/`` and record that it moved.
+def release(
+    project_dir: str | Path, rec: Record, *, as_name: str = "", dest_dirname: str = TRUSTED_DIRNAME
+) -> Record:
+    """Copy a passed file into ``datasheets/`` (or ``dest_dirname``) and record that it moved.
+
+    A different file already holding the destination name is not overwritten:
+    the new one takes a hash suffix instead. Two vendors' ``app-note.pdf`` are
+    two files, and silently replacing one with the other would lose it.
 
     Refuses on a held file rather than trusting the caller to have checked. The
     check is cheap and the failure it prevents — a file with an ``/OpenAction``
@@ -245,13 +308,16 @@ def release(project_dir: str | Path, rec: Record, *, as_name: str = "") -> Recor
             f"{rec.filename} is held and cannot be released: " + "; ".join(rec.reasons)
         )
     project_dir = Path(project_dir)
-    dest_dir = trusted_dir(project_dir)
+    dest_dir = project_dir / dest_dirname
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / (as_name or f"{_safe(rec.mpn, 'datasheet')}.pdf")
+    if dest.exists() and hashlib.sha256(dest.read_bytes()).hexdigest() != rec.sha256:
+        dest = dest.with_name(f"{dest.stem}-{rec.sha256[:8]}{dest.suffix}")
     shutil.copy2(quarantine_dir(project_dir) / rec.filename, dest)
 
     rec.state = RELEASED
     rec.released_as = dest.name
+    rec.released_to = dest_dirname
     _upsert(project_dir, rec)
     return rec
 
@@ -272,6 +338,56 @@ def accept_and_release(
     if not rec.reasons:
         rec = release(project_dir, rec, as_name=as_name)
     return rec
+
+
+def _upload_suffix(original_name: str) -> str:
+    """The extension the uploader's filename claims, made safe to put on disk."""
+    suffix = Path(original_name or "").suffix.lower()
+    return suffix if re.fullmatch(r"\.[a-z0-9_]{1,15}", suffix) else ""
+
+
+def accept_upload(
+    data: bytes,
+    project_dir: str | Path,
+    *,
+    original_name: str,
+    kind: str,
+    uploaded_by: str,
+    mpn: str = "",
+    llm_ignore: bool = False,
+) -> Record:
+    """The whole path for a file a member uploads, in the order it has to happen.
+
+    Released into the directory for its ``kind``: a datasheet with an MPN is
+    named after the part, the way a fetched one is, so the resolver finds it;
+    anything else keeps the uploader's filename, made safe.
+    """
+    if kind not in UPLOAD_KINDS:
+        raise ValueError(f"kind must be one of {sorted(UPLOAD_KINDS)}, not {kind!r}")
+    suffix = _upload_suffix(original_name)
+    rec = accept(
+        data,
+        project_dir,
+        mpn=mpn,
+        suffix=suffix,
+        origin=UPLOAD,
+        uploaded_by=uploaded_by,
+        original_name=original_name,
+        kind=kind,
+        llm_ignore=llm_ignore,
+    )
+    if rec.reasons:
+        return rec
+    if kind == "datasheet" and mpn:
+        as_name = f"{_safe(mpn, 'datasheet')}{suffix}"
+    else:
+        as_name = f"{_safe(Path(original_name).stem, 'upload')}{suffix}"
+    return release(project_dir, rec, as_name=as_name, dest_dirname=UPLOAD_KINDS[kind])
+
+
+def ledger(project_dir: str | Path) -> list[dict]:
+    """Every entry, oldest first, for anyone who wants the whole record."""
+    return _load(quarantine_dir(project_dir) / LEDGER_NAME)
 
 
 def held(project_dir: str | Path) -> list[dict]:
