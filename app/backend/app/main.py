@@ -3006,7 +3006,50 @@ def get_blob(
                 "X-BLPL-Quarantined": "1",
             },
         )
-    return FileResponse(target)
+    media_type, inline = _blob_disposition(target)
+    headers = {
+        # Always: without it the browser may sniff a text file into HTML.
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{target.name}"',
+    }
+    return FileResponse(target, media_type=media_type, headers=headers)
+
+
+# Types a browser displays without running anything. PDFs go to the browser's
+# own viewer, images to an <img>-equivalent renderer.
+_INLINE_BINARY = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+# Text the workbench reads. Served as text/plain whatever it is, so a browser
+# shows the characters instead of interpreting them.
+_INLINE_TEXT = {
+    ".md", ".markdown", ".txt", ".yaml", ".yml", ".json", ".csv", ".mmd", ".mermaid",
+    ".kicad_sch", ".kicad_pcb", ".kicad_pro", ".kicad_sym", ".kicad_mod", ".net", ".log",
+}
+
+
+def _blob_disposition(target: Path) -> tuple[str, bool]:
+    """The media type to serve a project file as, and whether inline.
+
+    Project files include uploads released as ``not_inspected`` and anything an
+    import or the KiCad desktop wrote, so the name decides nothing about safety.
+    Serving an uploaded ``.html`` or ``.svg`` inline on this origin would run
+    its scripts with the viewer's session and every same-origin API behind it.
+    So only an allowlist of passive types is inline, text of any kind is
+    ``text/plain``, and everything else is an opaque download.
+    """
+    suffix = target.suffix.lower()
+    if suffix in _INLINE_BINARY:
+        return _INLINE_BINARY[suffix], True
+    if suffix in _INLINE_TEXT:
+        return "text/plain; charset=utf-8", True
+    return "application/octet-stream", False
 
 
 

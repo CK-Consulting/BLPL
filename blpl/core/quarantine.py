@@ -364,7 +364,9 @@ def accept_upload(
     """
     if kind not in UPLOAD_KINDS:
         raise ValueError(f"kind must be one of {sorted(UPLOAD_KINDS)}, not {kind!r}")
-    suffix = _upload_suffix(original_name)
+    # Bytes that are a PDF are stored and released as one, whatever the name
+    # claimed: the datasheet resolver looks for <MPN>.pdf and nothing else.
+    suffix = ".pdf" if _looks_like_pdf(data) else _upload_suffix(original_name)
     rec = accept(
         data,
         project_dir,

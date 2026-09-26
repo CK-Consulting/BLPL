@@ -162,3 +162,35 @@ def test_an_uploaded_filename_cannot_escape_or_hide(unlocked):
     paths = [x["path"] for x in r.json()["results"]]
     assert paths == ["references/escape.md", "references/hidden.md"]
     assert not (main.PROJECTS_ROOT / "escape.md").exists()
+
+
+@pytest.mark.parametrize("name,data", [
+    ("page.html", b"<script>fetch('/api/projects')</script>"),
+    ("logo.svg", b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"),
+    ("thing.xml", b"<x/>"),
+    ("tool.bin", b"\x00\x01"),
+])
+def test_an_uploaded_active_file_is_served_as_an_opaque_download(unlocked, name, data):
+    """Inline on this origin, an uploaded HTML or SVG would run with the viewer's session."""
+    unlocked.post("/api/projects/init", json={"name": "mine"})
+    path = _upload(unlocked, [(name, data, {"kind": "reference"})]).json()["results"][0]["path"]
+    r = unlocked.get("/api/projects/mine/blob", params={"path": path})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/octet-stream"
+    assert r.headers["content-disposition"].startswith("attachment")
+    assert r.headers["x-content-type-options"] == "nosniff"
+
+
+def test_passive_files_still_display_inline(unlocked):
+    unlocked.post("/api/projects/init", json={"name": "mine"})
+    results = _upload(unlocked, [
+        ("guide.pdf", BENIGN, {"kind": "reference"}),
+        ("notes.md", b"# hi\n", {"kind": "reference"}),
+    ]).json()["results"]
+    pdf = unlocked.get("/api/projects/mine/blob", params={"path": results[0]["path"]})
+    assert pdf.headers["content-type"] == "application/pdf"
+    assert pdf.headers["content-disposition"].startswith("inline")
+    md = unlocked.get("/api/projects/mine/blob", params={"path": results[1]["path"]})
+    assert md.headers["content-type"].startswith("text/plain")
+    assert md.text == "# hi\n"
+    assert md.headers["x-content-type-options"] == "nosniff"

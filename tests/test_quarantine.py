@@ -420,3 +420,17 @@ def test_a_second_file_with_the_same_name_does_not_replace_the_first(tmp_path, m
 def test_an_unknown_kind_is_refused(tmp_path):
     with pytest.raises(ValueError):
         quarantine.accept_upload(b"x", tmp_path, original_name="x", kind="junk", uploaded_by="a@x")
+
+
+def test_pdf_bytes_under_another_name_are_released_as_a_pdf(tmp_path, monkeypatch):
+    """The resolver looks for <MPN>.pdf; a datasheet saved as .txt is invisible to it."""
+    _no_scanner(monkeypatch)
+    rec = quarantine.accept_upload(
+        BENIGN, tmp_path, original_name="TPS62840 datasheet", kind="datasheet",
+        uploaded_by="a@x", mpn="TPS62840",
+    )
+    assert rec.released_as == "TPS62840.pdf"
+    rec = quarantine.accept_upload(
+        BENIGN + b"%2\n", tmp_path, original_name="guide.txt", kind="reference", uploaded_by="a@x"
+    )
+    assert rec.released_as == "guide.pdf"
