@@ -748,7 +748,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 if rc != 0 and not args.continue_on_error:
                     return rc
         elif stage == "stage1":
-            ns = argparse.Namespace(**vars(base), source="llm" if args.stage0_mode in ("llm", "both") else "det")
+            ns = argparse.Namespace(
+                **vars(base),
+                source="llm" if args.stage0_mode in ("llm", "both") else "det",
+                # _cmd_stage1 reads it unconditionally; without it every run that
+                # reached stage 1 raised AttributeError and halted there.
+                full=getattr(args, "full", False),
+            )
             rc = _attempt("stage1", lambda: _cmd_stage1(ns))
             if rc != 0 and not args.continue_on_error:
                 return rc
@@ -1587,6 +1593,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("run", help="Run the full pipeline end-to-end (stages 0–8).")
     p.add_argument("--project-dir", required=True)
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Stage 1 re-resolves every component, as `stage1 --full` does. "
+            "Also discards hand corrections made to the BOM."
+        ),
+    )
     p.add_argument(
         "--board",
         help=(

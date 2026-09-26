@@ -329,3 +329,30 @@ def test_a_typographic_dash_means_no_connect_too() -> None:
     assert is_no_connect("–"), "en dash"
     assert is_no_connect("−"), "minus sign"
     assert not is_no_connect("VBUS")
+
+
+def test_run_reaches_the_real_stage1_and_passes_full_through(project, monkeypatch):
+    """The other run tests replace _cmd_stage1 whole, which is how a missing
+    `full` on run's namespace slipped past them: the real command read
+    args.full and every end-to-end run died at stage 1."""
+    from blpl.core import stage1_resolve_bom
+
+    seen: list[bool] = []
+
+    class _Adapter:
+        provider, model = "stub", "stub"
+
+    monkeypatch.setattr(cli, "_make_adapter", lambda ns: _Adapter())
+    monkeypatch.setattr(
+        stage1_resolve_bom, "run", lambda src, out, adapter, full: seen.append(full) or {"rows": []}
+    )
+    monkeypatch.setattr(stage1_resolve_bom, "low_confidence_rows", lambda bom: [])
+    ns = cli.argparse.Namespace(project_dir=str(project), board="base")
+    src = cli._artifact(ns, cli._project_dir(ns), "design_artifact.deterministic")
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("{}")
+
+    args = ["run", "--project-dir", str(project), "--board", "base", "--from", "stage1", "--to", "stage1"]
+    assert cli.main(args) == 0
+    assert cli.main([*args, "--full"]) == 0
+    assert seen == [False, True]
