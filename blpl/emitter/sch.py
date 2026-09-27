@@ -528,6 +528,58 @@ def _placements(components: dict, units_by_lib_id: dict[str, dict[int, list[dict
     return out
 
 
+def _reading_order(
+    placements: list[tuple[str, int]], components: dict, bands: int | None = None
+) -> list[tuple[str, int]]:
+    """Order symbols so parts that belong together land together on the sheet.
+
+    The grid used to follow BOM order, which is the order parts happen to
+    appear in the design document. A decoupling capacitor could sit a dozen
+    cells from the pin it decouples, and reviewing the sheet meant chasing
+    labels across it — every connection here is a net label, so there is no
+    wire to follow with your eye. "A grid of symbols" was a fair description.
+
+    Stage 5 has already solved the grouping problem for the board:
+    ``placement.py`` clusters by net adjacency with the global rails excluded,
+    and anchors each bypass capacitor to the IC it is named for. Reusing those
+    coordinates costs nothing and means the schematic and the board agree about
+    what is near what, which is its own help when reading one beside the other.
+
+    Ordering is a horizontal sweep through bands of the board — reading order —
+    rather than raw ``(y, x)``, so a part a millimetre lower than its
+    neighbour does not get pushed to a different row of the sheet.
+
+    Components with no placement keep their original relative order and go
+    last, so an unplaced part is never silently dropped or reshuffled.
+    """
+    pos: dict[str, tuple[float, float]] = {}
+    for refdes, comp in components.items():
+        p = comp.get("placement") or {}
+        x, y = p.get("x"), p.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            pos[refdes] = (float(x), float(y))
+    if not pos:
+        return list(placements)
+
+    ys = [y for _, y in pos.values()]
+    lo, hi = min(ys), max(ys)
+    span = (hi - lo) or 1.0
+    n = bands or max(1, round(len(pos) ** 0.5))
+    original = {item: i for i, item in enumerate(placements)}
+
+    def key(item: tuple[str, int]) -> tuple:
+        refdes, unit = item
+        if refdes not in pos:
+            return (1, 0, 0.0, original[item])
+        x, y = pos[refdes]
+        # Clamped so the part at exactly `hi` lands in the last band rather
+        # than one past it.
+        band = min(n - 1, int((y - lo) / span * n))
+        return (0, band, x, original[item])
+
+    return sorted(placements, key=key)
+
+
 def _load_units(components: dict, symbols_root: Path) -> dict[str, dict[int, list[dict]]]:
     """Pins per unit for every lib_symbol in use; a missing symbol reads as unit 1, no pins."""
     out: dict[str, dict[int, list[dict]]] = {}
@@ -683,7 +735,8 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
     pins_by_lib_id = _all_unit_pins(units_by_lib_id)
 
     stub_len = 2.54  # one grid unit; enough to clear the symbol body.
-    for (refdes, unit), x, y in _component_grid(placements, cell_w, cell_h, cols):
+    ordered = _reading_order(placements, hdm.get("components", {}) or {})
+    for (refdes, unit), x, y in _component_grid(ordered, cell_w, cell_h, cols):
         comp = components[refdes]
         lib_id = comp.get("lib_symbol") or ""
         if ":" not in lib_id:
