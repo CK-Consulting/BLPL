@@ -529,7 +529,10 @@ def _placements(components: dict, units_by_lib_id: dict[str, dict[int, list[dict
 
 
 def _reading_order(
-    placements: list[tuple[str, int]], components: dict, bands: int | None = None
+    placements: list[tuple[str, int]],
+    components: dict,
+    bands: int | None = None,
+    unplaced: "set[str] | frozenset[str]" = frozenset(),
 ) -> list[tuple[str, int]]:
     """Order symbols so parts that belong together land together on the sheet.
 
@@ -551,9 +554,21 @@ def _reading_order(
 
     Components with no placement keep their original relative order and go
     last, so an unplaced part is never silently dropped or reshuffled.
+
+    ``unplaced`` matters more than it looks. Stage 5 does not clear the
+    coordinates of a component it could not place — it leaves the build-time
+    grid values alone deliberately, so the part lands somewhere visibly wrong
+    rather than stacked at the origin, and records the failure only in
+    ``synthesis.placement.unplaced``. Read without that set, a failed placement
+    looks like a real one; worse, the grid it fell back to can run far off the
+    board (rows reaching y=455 on a 35 mm board is the case that motivated the
+    placer), which stretches the band range enough to collapse every genuine
+    placement into a single band and undo the grouping entirely.
     """
     pos: dict[str, tuple[float, float]] = {}
     for refdes, comp in components.items():
+        if refdes in unplaced:
+            continue
         p = comp.get("placement") or {}
         x, y = p.get("x"), p.get("y")
         if isinstance(x, (int, float)) and isinstance(y, (int, float)):
@@ -735,7 +750,13 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
     pins_by_lib_id = _all_unit_pins(units_by_lib_id)
 
     stub_len = 2.54  # one grid unit; enough to clear the symbol body.
-    ordered = _reading_order(placements, hdm.get("components", {}) or {})
+    ordered = _reading_order(
+        placements,
+        hdm.get("components", {}) or {},
+        unplaced=set(
+            ((hdm.get("synthesis") or {}).get("placement") or {}).get("unplaced") or []
+        ),
+    )
     for (refdes, unit), x, y in _component_grid(ordered, cell_w, cell_h, cols):
         comp = components[refdes]
         lib_id = comp.get("lib_symbol") or ""

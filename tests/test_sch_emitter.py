@@ -72,3 +72,41 @@ def test_no_placements_at_all_leaves_the_order_alone() -> None:
     components = {"A": _comp(), "B": _comp()}
     placements = [("A", 1), ("B", 1)]
     assert sch._reading_order(placements, components) == placements
+
+
+def test_a_failed_placement_is_not_mistaken_for_a_real_one() -> None:
+    """Stage 5 leaves the build-time grid coordinates on a component it could
+    not place, recording the failure only in `synthesis.placement.unplaced`.
+    Read without that set it looks placed, and its fallback position is not
+    where the part belongs."""
+    from blpl.emitter import sch
+
+    components = {"U1": _comp(5, 5), "C_U1_VDD": _comp(6, 5), "X_FAIL": _comp(50, 400)}
+    placements = [(r, 1) for r in components]
+    ordered = [r for r, _ in sch._reading_order(
+        placements, components, unplaced={"X_FAIL"})]
+
+    assert ordered[-1] == "X_FAIL", "a failed placement was ordered as if real"
+    assert ordered.index("C_U1_VDD") - ordered.index("U1") == 1
+
+
+def test_an_off_board_fallback_cannot_collapse_the_bands() -> None:
+    """The grid a failed placement falls back to can run far off the board —
+    rows reaching y=455 on a 35 mm board is what motivated the placer. Counted
+    as real, that stretches the band range until every genuine placement lands
+    in one band and the grouping is lost."""
+    from blpl.emitter import sch
+
+    components = {
+        "A1": _comp(5, 5),   "A2": _comp(6, 5),      # cluster near the top
+        "B1": _comp(5, 30),  "B2": _comp(6, 30),     # cluster lower down
+        "X_FAIL": _comp(50, 4000),                   # absurd fallback
+    }
+    placements = [(r, 1) for r in components]
+    ordered = [r for r, _ in sch._reading_order(
+        placements, components, bands=2, unplaced={"X_FAIL"})]
+
+    # Each cluster stays contiguous rather than being flattened together.
+    assert abs(ordered.index("A1") - ordered.index("A2")) == 1
+    assert abs(ordered.index("B1") - ordered.index("B2")) == 1
+    assert ordered[-1] == "X_FAIL"
