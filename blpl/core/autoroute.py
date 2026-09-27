@@ -93,11 +93,18 @@ class RouteResult:
     snapshot: str = ""
     passes: int = 0
     jar: str = ""
-    # Freerouting's own count of what it could not finish, when it said.
-    # Connections, not nets — see _ROUTING_SUMMARY. The field keeps its name
-    # because Stage 8 and the stored reports already use it.
+    # What the finished board actually contains, measured from the board after
+    # the session file was imported. ``unrouted`` keeps its name because Stage 8
+    # and every stored report already read it — what changed is that it is now
+    # the board's number rather than the router's claim about its own copy.
     unrouted: int | None = None
     violations: int | None = None
+    #: Track segments in the saved board. Zero after a "successful" route means
+    #: the session never landed, which is the case this field exists to expose.
+    segments: int | None = None
+    #: What Freerouting said about its own copy, kept for diagnosis. When this
+    #: disagrees with ``unrouted`` the import is the thing to look at.
+    router_reported_unrouted: int | None = None
     finished_at: str = ""
     extra: dict = field(default_factory=dict)
 
@@ -114,6 +121,8 @@ class RouteResult:
             "jar": self.jar,
             "unrouted": self.unrouted,
             "violations": self.violations,
+            "segments": self.segments,
+            "router_reported_unrouted": self.router_reported_unrouted,
             "finished_at": self.finished_at,
             "log": self.log,
             **self.extra,
@@ -223,6 +232,56 @@ def _import_ses(python: str, pcb: Path, ses: Path) -> subprocess.CompletedProces
     return _pcbnew(python, code)
 
 
+#: Track segments in a saved board, counted from the file.
+#:
+#: Read from the text rather than through ``pcbnew.BOARD.GetTracks()`` because
+#: that binding is broken on current Python — it calls ``it.next()`` on its SWIG
+#: iterator, which is the Python 2 spelling, and raises ``AttributeError``. The
+#: file is the artifact anyway: what a board contains is what was written to it.
+_SEGMENT = re.compile(r"^\s*\(segment\b", re.M)
+
+
+def count_segments(pcb: Path) -> int:
+    try:
+        return len(_SEGMENT.findall(pcb.read_text(encoding="utf-8", errors="replace")))
+    except OSError:
+        return 0
+
+
+def _measure_board(python: str, pcb: Path) -> dict:
+    """What the saved board actually contains, asked of the board.
+
+    This exists because the router's own summary was being believed. Freerouting
+    reports what it achieved on *its* copy, and that number was stored as the
+    run's result — so a board whose session file never imported, or which was
+    re-emitted unrouted afterwards, still carried a report saying every
+    connection was routed. Every board in one project read ``unrouted: 0`` while
+    carrying zero track segments.
+
+    ``GetUnconnectedCount`` is the honest question: it is computed from the
+    board's own connectivity, so it cannot agree with a router that never
+    touched this file.
+    """
+    code = (
+        "import pcbnew, json\n"
+        f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
+        "b.BuildConnectivity()\n"
+        "print('BLPL_MEASURE ' + json.dumps({\n"
+        "    'unconnected': int(b.GetConnectivity().GetUnconnectedCount(True)),\n"
+        "    'nets': int(b.GetNetCount()),\n"
+        "}))\n"
+    )
+    proc = _pcbnew(python, code)
+    out = {"segments": count_segments(pcb)}
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("BLPL_MEASURE "):
+            try:
+                out.update(json.loads(line[len("BLPL_MEASURE "):]))
+            except ValueError:
+                pass
+    return out
+
+
 def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> RouteResult:
     """Route a board in bulk. The PCB is modified in place on success.
 
@@ -263,7 +322,7 @@ def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> Route
     base.log = _msg(routed)[-4000:]
     m = _ROUTING_SUMMARY.search(routed.stdout or "") or _ROUTING_SUMMARY.search(routed.stderr or "")
     if m:
-        base.unrouted, base.violations = int(m.group(1)), int(m.group(2))
+        base.router_reported_unrouted, base.violations = int(m.group(1)), int(m.group(2))
     if not ses.is_file():
         base.reason = f"Freerouting produced no session file: {_msg(routed)[-2000:]}"
         return base
@@ -273,6 +332,24 @@ def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> Route
     if imported.returncode != 0:
         base.reason = (
             f"the board was routed but the result could not be imported: {_msg(imported)}"
+        )
+        return base
+
+    # Ask the board, not the router. Freerouting reports what it achieved on its
+    # own copy; until this point that claim was stored as the result, so a board
+    # whose session never landed still read "0 unrouted".
+    measured = _measure_board(python, pcb)
+    base.segments = measured.get("segments")
+    base.unrouted = measured.get("unconnected")
+
+    if not base.segments:
+        # ImportSpecctraSES returned success and the board has no tracks. That
+        # combination is exactly what this check exists for: report the failure
+        # rather than a number copied from a log.
+        base.reason = (
+            "the session file imported without error but the board has no track "
+            f"segments — Freerouting reported {base.router_reported_unrouted} "
+            "unrouted on its own copy, so the result did not reach this file"
         )
         return base
 
