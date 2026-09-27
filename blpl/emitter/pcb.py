@@ -289,6 +289,16 @@ def _drop_degenerate_lines(fp_node: sexpr.Node) -> int:
     segments, both ``F.SilkS``, whose removal bought nothing and cost a
     warning. Six footprints have it on ``F.CrtYd``; those are the ones here.
 
+    The check that cannot be fooled, and the one to reach for when changing
+    any of this, is to ask pcbnew directly rather than to count s-expressions::
+
+        fp.GetCourtyard(pcbnew.F_CrtYd).OutlineCount()   # 0 means no keep-out
+
+    On core before this ran, exactly one of 161 footprints answered 0 —
+    ``Q_BAT_REV``. After, none do. A grep cannot see that and neither can
+    ``kicad-cli fp export svg``, which happily plots a footprint whose
+    courtyard will not close.
+
     Done in the emitter rather than only in libraries because most of the six
     live in stock kicad-footprints — SOT-723, Telit_xL865 and nRF24L01_Breakout
     among them — which is an upstream submodule this project does not own.
