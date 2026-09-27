@@ -551,3 +551,65 @@ def test_a_reference_already_on_the_fab_layer_is_left_alone() -> None:
     node = _fp((1.0, 0.5), ref_layer="F.Fab")
     pcb._set_reference_and_value(node, "C_TINY", "1uF")
     assert _ref_hidden(node) is False
+
+
+# --- zero-length courtyard segments ----------------------------------------
+#
+# A zero-length line has no geometry, so removing one cannot change a shape.
+# KiCad disagrees about the consequences: it reports each as
+# `malformed_courtyard`, and — far worse — exports **no outline at all** for
+# such a footprint into Specctra. The autorouter then has no keep-out for the
+# part and routes through the space it occupies. On sb-halow that was the
+# largest part on the board, and the "0 unrouted" it reached was achieved by
+# routing under a module.
+
+
+def _fp_with_lines(*segments):
+    from blpl.emitter import sexpr
+
+    node = ["footprint", '"t"']
+    for (x1, y1), (x2, y2) in segments:
+        node.append(["fp_line",
+                     ["start", str(x1), str(y1)],
+                     ["end", str(x2), str(y2)],
+                     ["layer", sexpr.quote("F.CrtYd")]])
+    return node
+
+
+def test_a_zero_length_courtyard_segment_is_dropped() -> None:
+    from blpl.emitter import pcb, sexpr
+
+    node = _fp_with_lines(((0, 0), (1, 0)), ((1, 0), (1, 0)), ((1, 0), (1, 1)))
+    assert pcb._drop_degenerate_lines(node) == 1
+    assert len(list(sexpr.find_all(node, "fp_line"))) == 2
+
+
+def test_real_segments_are_left_alone() -> None:
+    """The check is start == end, not "looks small". A 1 µm segment is
+    geometry and removing it would change a shape."""
+    from blpl.emitter import pcb, sexpr
+
+    node = _fp_with_lines(((0, 0), (0.001, 0)), ((0, 0), (0, 5)))
+    assert pcb._drop_degenerate_lines(node) == 0
+    assert len(list(sexpr.find_all(node, "fp_line"))) == 2
+
+
+def test_the_strip_runs_on_every_footprint_not_just_legacy_ones() -> None:
+    """The defect is not confined to pre-v10 files: stock kicad-footprints
+    carries it in SOT-723, Telit_xL865, nRF24L01_Breakout and three pressure
+    sensors, all current. A v10 footprint has to be cleaned too."""
+    from blpl.emitter import pcb, sexpr
+
+    node = _fp_with_lines(((2, 2), (2, 2)))
+    node.insert(1, ["version", "20240108"])      # unmistakably modern
+    pcb._upgrade_legacy_footprint(node)
+    assert list(sexpr.find_all(node, "fp_line")) == []
+
+
+def test_a_malformed_line_without_coordinates_is_not_dropped() -> None:
+    """Refusing to parse is not evidence of being degenerate."""
+    from blpl.emitter import pcb, sexpr
+
+    node = ["footprint", '"t"', ["fp_line", ["start", "0"], ["end", "0"]]]
+    assert pcb._drop_degenerate_lines(node) == 0
+    assert len(list(sexpr.find_all(node, "fp_line"))) == 1

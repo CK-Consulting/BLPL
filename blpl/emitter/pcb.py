@@ -248,6 +248,38 @@ def _fp_text_to_property(text_node: sexpr.Node, name: str) -> sexpr.Node:
     return prop
 
 
+def _drop_degenerate_lines(fp_node: sexpr.Node) -> int:
+    """Remove ``fp_line`` segments whose start and end are the same point.
+
+    A zero-length line has no geometry, so dropping one cannot change a shape —
+    but KiCad reports each as ``malformed_courtyard``, and a courtyard it calls
+    malformed is worse than noisy. KiCad exports **no outline at all** for such
+    a footprint into Specctra, so the autorouter gets no keep-out for the part
+    and routes through the space it occupies. On sb-halow that was the largest
+    part on the board, and the resulting "0 unrouted" was reached by routing
+    under a module.
+
+    Done here rather than by editing libraries because the same defect is in
+    stock kicad-footprints — SOT-723, Telit_xL865, nRF24L01_Breakout and three
+    pressure sensors all carry one — and those are an upstream submodule this
+    project does not own. Cleaning them on the way into the board fixes every
+    footprint, whoever wrote it.
+    """
+    dropped = 0
+    for line in list(sexpr.find_all(fp_node, "fp_line")):
+        start, end = sexpr.find(line, "start"), sexpr.find(line, "end")
+        if start is None or end is None:
+            continue
+        try:
+            same = (float(start[1]), float(start[2])) == (float(end[1]), float(end[2]))
+        except (IndexError, TypeError, ValueError):
+            continue
+        if same:
+            fp_node.remove(line)
+            dropped += 1
+    return dropped
+
+
 def _upgrade_legacy_footprint(fp_node: sexpr.Node) -> None:
     """Bring a pre-v10 footprint up to what a v10 board file may contain.
 
@@ -265,6 +297,8 @@ def _upgrade_legacy_footprint(fp_node: sexpr.Node) -> None:
             fp_node[fp_node.index(text_node)] = _fp_text_to_property(text_node, "Reference")
         elif kind == "value":
             fp_node[fp_node.index(text_node)] = _fp_text_to_property(text_node, "Value")
+
+    _drop_degenerate_lines(fp_node)
 
     for tag in _LEGACY_SHAPE_TAGS:
         for shape in sexpr.find_all(fp_node, tag):
