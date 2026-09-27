@@ -248,25 +248,47 @@ def _fp_text_to_property(text_node: sexpr.Node, name: str) -> sexpr.Node:
     return prop
 
 
+# The courtyard layers, and only those. A zero-length segment is meaningless on
+# any layer, but it is only *consequential* on a courtyard — see below.
+_COURTYARD_LAYERS = frozenset({"F.CrtYd", "B.CrtYd"})
+
+
 def _drop_degenerate_lines(fp_node: sexpr.Node) -> int:
-    """Remove ``fp_line`` segments whose start and end are the same point.
+    """Remove zero-length ``fp_line`` segments from a footprint's courtyard.
 
-    A zero-length line has no geometry, so dropping one cannot change a shape —
-    but KiCad reports each as ``malformed_courtyard``, and a courtyard it calls
-    malformed is worse than noisy. KiCad exports **no outline at all** for such
-    a footprint into Specctra, so the autorouter gets no keep-out for the part
-    and routes through the space it occupies. On sb-halow that was the largest
-    part on the board, and the resulting "0 unrouted" was reached by routing
-    under a module.
+    A zero-length line has no geometry, so dropping one cannot change a shape.
+    KiCad disagrees about the consequences, but only on the courtyard: it
+    reports each as ``malformed_courtyard``, and — the part that matters —
+    exports **no outline at all** for such a footprint into Specctra. The
+    autorouter then has no keep-out for the part and routes through the space
+    it occupies. On sb-halow that was the largest part on the board, and the
+    "0 unrouted" it reached was achieved by routing under a module.
 
-    Done here rather than by editing libraries because the same defect is in
-    stock kicad-footprints — SOT-723, Telit_xL865, nRF24L01_Breakout and three
-    pressure sensors all carry one — and those are an upstream submodule this
-    project does not own. Cleaning them on the way into the board fixes every
-    footprint, whoever wrote it.
+    Restricted to the courtyard layers because that is where the harm is, and
+    because touching the others costs something. Across stock kicad-footprints
+    plus this project's libraries, 143 footprints carry a zero-length segment
+    somewhere — but 137 of those are on silkscreen or fab, where the segment is
+    cosmetic and invisible. Stripping those would rewrite 137 footprints to no
+    effect and earn a ``lib_footprint_mismatch`` for each, because the board
+    copy would no longer match the library copy. ``ICM42670P`` is the worked
+    example: two zero-length segments, both on ``F.SilkS``, and removing them
+    bought nothing and cost a warning.
+
+    Six footprints have it on ``F.CrtYd``, and those are the ones this fixes.
+
+    Done here rather than by editing libraries because most of the six are in
+    stock kicad-footprints — SOT-723, Telit_xL865 and nRF24L01_Breakout among
+    them — which is an upstream submodule this project does not own. Cleaning
+    them on the way into the board fixes every footprint, whoever wrote it, and
+    keeps it fixed after the next upstream bump.
     """
     dropped = 0
     for line in list(sexpr.find_all(fp_node, "fp_line")):
+        layer = sexpr.find(line, "layer")
+        if layer is None or len(layer) < 2:
+            continue
+        if str(layer[1]).strip('"') not in _COURTYARD_LAYERS:
+            continue
         start, end = sexpr.find(line, "start"), sexpr.find(line, "end")
         if start is None or end is None:
             continue

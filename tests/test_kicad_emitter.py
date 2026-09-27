@@ -556,23 +556,25 @@ def test_a_reference_already_on_the_fab_layer_is_left_alone() -> None:
 # --- zero-length courtyard segments ----------------------------------------
 #
 # A zero-length line has no geometry, so removing one cannot change a shape.
-# KiCad disagrees about the consequences: it reports each as
-# `malformed_courtyard`, and — far worse — exports **no outline at all** for
-# such a footprint into Specctra. The autorouter then has no keep-out for the
-# part and routes through the space it occupies. On sb-halow that was the
+# KiCad disagrees about the consequences, but only on the courtyard: it reports
+# each as `malformed_courtyard`, and — far worse — exports **no outline at all**
+# for such a footprint into Specctra. The autorouter then has no keep-out for
+# the part and routes through the space it occupies. On sb-halow that was the
 # largest part on the board, and the "0 unrouted" it reached was achieved by
 # routing under a module.
 
 
-def _fp_with_lines(*segments):
+def _fp_with_lines(*segments, layer="F.CrtYd"):
     from blpl.emitter import sexpr
 
     node = ["footprint", '"t"']
-    for (x1, y1), (x2, y2) in segments:
+    for seg in segments:
+        (x1, y1), (x2, y2) = seg[:2]
+        lay = seg[2] if len(seg) > 2 else layer
         node.append(["fp_line",
                      ["start", str(x1), str(y1)],
                      ["end", str(x2), str(y2)],
-                     ["layer", sexpr.quote("F.CrtYd")]])
+                     ["layer", sexpr.quote(lay)]])
     return node
 
 
@@ -584,8 +586,15 @@ def test_a_zero_length_courtyard_segment_is_dropped() -> None:
     assert len(list(sexpr.find_all(node, "fp_line"))) == 2
 
 
+def test_the_back_courtyard_counts_too() -> None:
+    from blpl.emitter import pcb
+
+    node = _fp_with_lines(((2, 2), (2, 2)), layer="B.CrtYd")
+    assert pcb._drop_degenerate_lines(node) == 1
+
+
 def test_real_segments_are_left_alone() -> None:
-    """The check is start == end, not "looks small". A 1 µm segment is
+    """The check is start == end, not "looks small". A 1 um segment is
     geometry and removing it would change a shape."""
     from blpl.emitter import pcb, sexpr
 
@@ -594,10 +603,29 @@ def test_real_segments_are_left_alone() -> None:
     assert len(list(sexpr.find_all(node, "fp_line"))) == 2
 
 
+def test_silkscreen_and_fab_are_not_touched() -> None:
+    """Scoped deliberately. 143 footprints across stock kicad-footprints and
+    this project carry a zero-length segment, but 137 are on silkscreen or fab
+    where it is cosmetic. Stripping those rewrites a footprint to no effect and
+    earns a `lib_footprint_mismatch`, because the board copy then differs from
+    the library copy. ICM42670P is the worked example: two such segments, both
+    F.SilkS, and removing them bought nothing and cost a warning."""
+    from blpl.emitter import pcb, sexpr
+
+    node = _fp_with_lines(
+        ((-1.9, -0.8), (-1.9, -0.8), "F.SilkS"),
+        ((-1.9, -0.7), (-1.9, -0.7), "F.SilkS"),
+        ((0, 0), (0, 0), "F.Fab"),
+        ((0, 0), (0, 0), "B.SilkS"),
+    )
+    assert pcb._drop_degenerate_lines(node) == 0
+    assert len(list(sexpr.find_all(node, "fp_line"))) == 4
+
+
 def test_the_strip_runs_on_every_footprint_not_just_legacy_ones() -> None:
     """The defect is not confined to pre-v10 files: stock kicad-footprints
-    carries it in SOT-723, Telit_xL865, nRF24L01_Breakout and three pressure
-    sensors, all current. A v10 footprint has to be cleaned too."""
+    carries it in SOT-723, Telit_xL865 and nRF24L01_Breakout, all current. A
+    v10 footprint has to be cleaned too."""
     from blpl.emitter import pcb, sexpr
 
     node = _fp_with_lines(((2, 2), (2, 2)))
@@ -610,6 +638,17 @@ def test_a_malformed_line_without_coordinates_is_not_dropped() -> None:
     """Refusing to parse is not evidence of being degenerate."""
     from blpl.emitter import pcb, sexpr
 
-    node = ["footprint", '"t"', ["fp_line", ["start", "0"], ["end", "0"]]]
+    node = ["footprint", '"t"',
+            ["fp_line", ["start", "0"], ["end", "0"], ["layer", '"F.CrtYd"']]]
+    assert pcb._drop_degenerate_lines(node) == 0
+    assert len(list(sexpr.find_all(node, "fp_line"))) == 1
+
+
+def test_a_line_with_no_layer_is_not_dropped() -> None:
+    """Unknown layer is not the courtyard."""
+    from blpl.emitter import pcb, sexpr
+
+    node = ["footprint", '"t"',
+            ["fp_line", ["start", "0", "0"], ["end", "0", "0"]]]
     assert pcb._drop_degenerate_lines(node) == 0
     assert len(list(sexpr.find_all(node, "fp_line"))) == 1
