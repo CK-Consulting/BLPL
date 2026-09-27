@@ -284,32 +284,83 @@ _MIN_SILK_TEXT_MM = 0.8
 
 
 def _courtyard_extent(footprint_node: sexpr.Node) -> tuple[float, float] | None:
-    """(width, height) of the courtyard, or None when there is none to read."""
+    """(width, height) of the courtyard, or None when there is none to read.
+
+    A circle gives a centre and a point on the circumference, not two opposite
+    corners, so it is expanded to centre +/- radius. Read as corners it collapses
+    the box to a line — a round courtyard measures as having no height — which
+    is the same mistake `placement.py` documents having made, and repeating it
+    here would hide the silkscreen of every circular footprint on the board.
+    """
     xs: list[float] = []
     ys: list[float] = []
-    for tag in ("fp_line", "fp_rect", "fp_poly", "fp_circle"):
+    for tag in ("fp_line", "fp_rect", "fp_poly", "fp_circle", "fp_arc"):
         for shape in sexpr.find_all(footprint_node, tag):
             layer = sexpr.find(shape, "layer")
             if layer is None or "CrtYd" not in sexpr.unquote(str(layer[1])):
                 continue
+            pts: list[tuple[float, float]] = []
             for key in ("start", "end", "center", "mid"):
                 for node in sexpr.find_all(shape, key):
                     try:
-                        xs.append(float(node[1])); ys.append(float(node[2]))
+                        pts.append((float(node[1]), float(node[2])))
                     except (IndexError, TypeError, ValueError):
                         pass
-            for pts in sexpr.find_all(shape, "pts"):
-                for xy in sexpr.find_all(pts, "xy"):
+            for group in sexpr.find_all(shape, "pts"):
+                for xy in sexpr.find_all(group, "xy"):
                     try:
-                        xs.append(float(xy[1])); ys.append(float(xy[2]))
+                        pts.append((float(xy[1]), float(xy[2])))
                     except (IndexError, TypeError, ValueError):
                         pass
+            if tag == "fp_circle" and len(pts) >= 2:
+                (cx, cy), (ex, ey) = pts[0], pts[1]
+                r = math.hypot(ex - cx, ey - cy)
+                pts = [(cx - r, cy - r), (cx + r, cy + r)]
+            for x, y in pts:
+                xs.append(x); ys.append(y)
     if not xs or not ys:
         return None
     return (max(xs) - min(xs), max(ys) - min(ys))
 
 
-def _silk_reference_fits(footprint_node: sexpr.Node, refdes: str) -> bool:
+def _reference_font_mm(prop: sexpr.Node) -> float:
+    """The height the reference will actually be emitted at.
+
+    Not the board minimum. Vendor footprints in this project carry 1.0 mm and
+    1.27 mm reference fonts, and estimating a 0.8 mm label for text that will
+    be emitted at 1.27 mm accepts a reference half again as wide as the space
+    measured for it.
+    """
+    for effects in sexpr.find_all(prop, "effects"):
+        for font in sexpr.find_all(effects, "font"):
+            for size in sexpr.find_all(font, "size"):
+                try:
+                    return max(float(size[2]), float(size[1]))
+                except (IndexError, TypeError, ValueError):
+                    pass
+    return _MIN_SILK_TEXT_MM
+
+
+def _reference_is_rotated(prop: sexpr.Node) -> bool:
+    """Whether the reference text runs across the footprint rather than along it.
+
+    Rotating a footprint turns its courtyard and its reference together, so the
+    two keep the same relative orientation and "try both ways round" is not a
+    test of anything. What decides which courtyard axis the text has to fit in
+    is the angle on the property itself.
+    """
+    at = sexpr.find(prop, "at")
+    if at is None or len(at) < 4:
+        return False
+    try:
+        return round(float(at[3]) / 90.0) % 2 == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _silk_reference_fits(
+    footprint_node: sexpr.Node, refdes: str, prop: sexpr.Node
+) -> bool:
     """Whether this part is big enough to carry its own reference in silk.
 
     A 0402 is 1.0 x 0.5 mm and `C_U1_VDD1` at the 0.8 mm silkscreen minimum is
@@ -329,12 +380,12 @@ def _silk_reference_fits(footprint_node: sexpr.Node, refdes: str) -> bool:
     extent = _courtyard_extent(footprint_node)
     if extent is None:
         return True
-    width_needed = len(refdes) * _CHAR_ADVANCE * _MIN_SILK_TEXT_MM
-    # Either orientation: KiCad rotates reference text with the footprint, so a
-    # tall narrow part can carry a reference down its length.
-    return (width_needed <= extent[0] and _MIN_SILK_TEXT_MM <= extent[1]) or (
-        width_needed <= extent[1] and _MIN_SILK_TEXT_MM <= extent[0]
-    )
+    height = _reference_font_mm(prop)
+    width_needed = len(refdes) * _CHAR_ADVANCE * height
+    along, across = extent
+    if _reference_is_rotated(prop):
+        along, across = across, along
+    return width_needed <= along and height <= across
 
 
 def _hide(prop: sexpr.Node) -> None:
@@ -348,7 +399,6 @@ def _hide(prop: sexpr.Node) -> None:
 def _set_reference_and_value(
     footprint_node: sexpr.Node, refdes: str, value: str
 ) -> None:
-    hide_silk = not _silk_reference_fits(footprint_node, refdes)
     for prop in sexpr.find_all(footprint_node, "property"):
         # property structure: ["property", '"Reference"', '"OLD"', ...]
         if len(prop) >= 3 and isinstance(prop[1], str):
@@ -357,7 +407,10 @@ def _set_reference_and_value(
                 prop[2] = sexpr.quote(refdes)
                 layer = sexpr.find(prop, "layer")
                 on_silk = layer is not None and "SilkS" in sexpr.unquote(str(layer[1]))
-                if hide_silk and on_silk:
+                # Decided per property, because the answer depends on that
+                # property's own font size and angle — not on the footprint
+                # alone.
+                if on_silk and not _silk_reference_fits(footprint_node, refdes, prop):
                     _hide(prop)
             elif pname == "Value":
                 prop[2] = sexpr.quote(value)

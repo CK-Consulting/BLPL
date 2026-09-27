@@ -421,18 +421,31 @@ def test_usb_d_minus_is_classed_with_its_partner() -> None:
 # reported 21 silk_overlap and 10 silk_over_copper across eleven parts.
 
 
-def _fp(courtyard, ref_layer="F.SilkS"):
-    """A footprint node with a courtyard rectangle and a Reference property."""
+def _fp(courtyard, ref_layer="F.SilkS", angle=0, font=0.8, circle=None):
+    """A footprint node with a courtyard and a Reference property.
+
+    `circle` gives (radius) for a round courtyard, written the way KiCad does —
+    a centre and a point on the circumference, which is the shape that has
+    bitten this codebase before.
+    """
     from blpl.emitter import sexpr
 
     node = ["footprint", '"test"']
-    if courtyard is not None:
+    if circle is not None:
+        node.append(["fp_circle",
+                     ["center", "0", "0"],
+                     ["end", str(circle), "0"],
+                     ["layer", sexpr.quote("F.CrtYd")]])
+    elif courtyard is not None:
         w, h = courtyard
         node.append(["fp_rect",
                      ["start", str(-w / 2), str(-h / 2)],
                      ["end", str(w / 2), str(h / 2)],
                      ["layer", sexpr.quote("F.CrtYd")]])
-    node.append(["property", '"Reference"', '"REF**"', ["layer", sexpr.quote(ref_layer)]])
+    node.append(["property", '"Reference"', '"REF**"',
+                 ["at", "0", "0", str(angle)],
+                 ["layer", sexpr.quote(ref_layer)],
+                 ["effects", ["font", ["size", str(font), str(font)]]]])
     node.append(["property", '"Value"', '"old"', ["layer", sexpr.quote("F.Fab")]])
     return node
 
@@ -462,14 +475,48 @@ def test_a_part_big_enough_keeps_its_reference() -> None:
     assert _ref_hidden(node) is False
 
 
-def test_a_long_narrow_part_may_carry_the_reference_down_its_length() -> None:
-    """KiCad rotates reference text with the footprint, so the fit test has to
-    try both orientations or a tall connector loses silk it could have kept."""
+def test_a_long_narrow_part_is_judged_on_the_axis_the_text_runs_along() -> None:
+    """Rotating a footprint turns its courtyard and its reference together, so
+    the two keep the same relative orientation and "try it both ways round" is
+    not a test of anything. A horizontal reference on a 1.2 mm-wide part has
+    1.2 mm to fit in, however long the part is."""
     from blpl.emitter import pcb
 
-    node = _fp((1.2, 16.0))
-    pcb._set_reference_and_value(node, "J_LINK", "FH69")
+    horizontal = _fp((1.2, 16.0), angle=0)
+    pcb._set_reference_and_value(horizontal, "J_LINK", "FH69")
+    assert _ref_hidden(horizontal) is True
+
+    rotated = _fp((1.2, 16.0), angle=90)
+    pcb._set_reference_and_value(rotated, "J_LINK", "FH69")
+    assert _ref_hidden(rotated) is False, "a reference running down the part was hidden"
+
+
+def test_a_circular_courtyard_is_measured_as_a_circle() -> None:
+    """`fp_circle` gives a centre and a point on the circumference, not two
+    opposite corners. Read as corners the box collapses to a line and every
+    round footprint loses its silkscreen — the same mistake placement.py
+    records having made about collision boxes."""
+    from blpl.emitter import pcb
+
+    node = _fp(None, circle=4.0)          # 8 mm across
+    assert pcb._courtyard_extent(node) == (8.0, 8.0)
+    pcb._set_reference_and_value(node, "U_BIG", "part")
     assert _ref_hidden(node) is False
+
+
+def test_the_reference_is_measured_at_the_size_it_will_be_emitted() -> None:
+    """Vendor footprints here carry 1.0 mm and 1.27 mm reference fonts.
+    Estimating a 0.8 mm label for text that emits at 1.27 mm accepts a
+    reference half again as wide as the space measured for it."""
+    from blpl.emitter import pcb
+
+    small_font = _fp((4.0, 2.0), font=0.8)
+    pcb._set_reference_and_value(small_font, "R_PRES", "0R")
+    assert _ref_hidden(small_font) is False
+
+    big_font = _fp((4.0, 2.0), font=1.27)
+    pcb._set_reference_and_value(big_font, "R_PRES", "0R")
+    assert _ref_hidden(big_font) is True
 
 
 def test_a_footprint_with_no_courtyard_keeps_its_silk() -> None:
