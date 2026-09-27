@@ -411,3 +411,96 @@ def test_usb_d_minus_is_classed_with_its_partner() -> None:
     from blpl.core.stage4_synthesize_nets import _assign_class as klass
 
     assert klass("MCU_USB_DP") == klass("MCU_USB_DM") == "USB2_Diff_90Ohm"
+
+
+# --- silkscreen references that cannot fit --------------------------------
+#
+# A 0402 is 1.0 x 0.5 mm and `C_U1_VDD1` at the 0.8 mm silkscreen minimum is
+# about 6 mm wide. The text cannot shrink — 0.8 mm is KiCad's default and the
+# board's floor — so it lands on its neighbours and on copper. sb-halow
+# reported 21 silk_overlap and 10 silk_over_copper across eleven parts.
+
+
+def _fp(courtyard, ref_layer="F.SilkS"):
+    """A footprint node with a courtyard rectangle and a Reference property."""
+    from blpl.emitter import sexpr
+
+    node = ["footprint", '"test"']
+    if courtyard is not None:
+        w, h = courtyard
+        node.append(["fp_rect",
+                     ["start", str(-w / 2), str(-h / 2)],
+                     ["end", str(w / 2), str(h / 2)],
+                     ["layer", sexpr.quote("F.CrtYd")]])
+    node.append(["property", '"Reference"', '"REF**"', ["layer", sexpr.quote(ref_layer)]])
+    node.append(["property", '"Value"', '"old"', ["layer", sexpr.quote("F.Fab")]])
+    return node
+
+
+def _ref_hidden(node) -> bool:
+    from blpl.emitter import sexpr
+
+    for prop in sexpr.find_all(node, "property"):
+        if sexpr.unquote(prop[1]) == "Reference":
+            return any(n[1] == "yes" for n in sexpr.find_all(prop, "hide"))
+    raise AssertionError("no Reference property")
+
+
+def test_a_passive_too_small_for_its_reference_loses_the_silk() -> None:
+    from blpl.emitter import pcb
+
+    node = _fp((1.0, 0.5))          # 0402
+    pcb._set_reference_and_value(node, "C_U1_VDD1", "100nF")
+    assert _ref_hidden(node) is True
+
+
+def test_a_part_big_enough_keeps_its_reference() -> None:
+    from blpl.emitter import pcb
+
+    node = _fp((11.5, 10.5))        # a module
+    pcb._set_reference_and_value(node, "U_HALOW", "MM8108")
+    assert _ref_hidden(node) is False
+
+
+def test_a_long_narrow_part_may_carry_the_reference_down_its_length() -> None:
+    """KiCad rotates reference text with the footprint, so the fit test has to
+    try both orientations or a tall connector loses silk it could have kept."""
+    from blpl.emitter import pcb
+
+    node = _fp((1.2, 16.0))
+    pcb._set_reference_and_value(node, "J_LINK", "FH69")
+    assert _ref_hidden(node) is False
+
+
+def test_a_footprint_with_no_courtyard_keeps_its_silk() -> None:
+    """Measured, not guessed. With nothing to measure the reference stays —
+    hiding it would be a decision made on absent evidence."""
+    from blpl.emitter import pcb
+
+    node = _fp(None)
+    pcb._set_reference_and_value(node, "C_TINY", "1uF")
+    assert _ref_hidden(node) is False
+
+
+def test_hiding_silk_does_not_touch_the_value_or_the_refdes_itself() -> None:
+    """The reference is not lost, only its silk copy: stock footprints carry a
+    ${REFERENCE} on F.Fab, which is the assembly drawing a placement operator
+    reads from."""
+    from blpl.emitter import pcb, sexpr
+
+    node = _fp((1.0, 0.5))
+    pcb._set_reference_and_value(node, "R_PRES_M", "0R")
+    props = {sexpr.unquote(p[1]): sexpr.unquote(p[2]) for p in sexpr.find_all(node, "property")}
+    assert props["Reference"] == "R_PRES_M"
+    assert props["Value"] == "0R"
+
+
+def test_a_reference_already_on_the_fab_layer_is_left_alone() -> None:
+    """Only the silkscreen copy is at issue. A footprint whose reference is
+    already on F.Fab has nothing to hide and hiding it would remove the refdes
+    from the assembly drawing."""
+    from blpl.emitter import pcb
+
+    node = _fp((1.0, 0.5), ref_layer="F.Fab")
+    pcb._set_reference_and_value(node, "C_TINY", "1uF")
+    assert _ref_hidden(node) is False

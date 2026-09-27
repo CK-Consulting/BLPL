@@ -273,15 +273,92 @@ def _upgrade_legacy_footprint(fp_node: sexpr.Node) -> None:
             _upgrade_legacy_stroke(shape)
 
 
+#: KiCad's stroke font advances roughly 0.78 of the glyph height per character
+#: at default thickness. Used to ask whether a reference will physically fit on
+#: the part it names, rather than guessing from the package name.
+_CHAR_ADVANCE = 0.78
+
+#: The board's silkscreen minimum, which is KiCad's own default and the floor
+#: any reference has to clear. Text cannot simply be shrunk to fit a 0402.
+_MIN_SILK_TEXT_MM = 0.8
+
+
+def _courtyard_extent(footprint_node: sexpr.Node) -> tuple[float, float] | None:
+    """(width, height) of the courtyard, or None when there is none to read."""
+    xs: list[float] = []
+    ys: list[float] = []
+    for tag in ("fp_line", "fp_rect", "fp_poly", "fp_circle"):
+        for shape in sexpr.find_all(footprint_node, tag):
+            layer = sexpr.find(shape, "layer")
+            if layer is None or "CrtYd" not in sexpr.unquote(str(layer[1])):
+                continue
+            for key in ("start", "end", "center", "mid"):
+                for node in sexpr.find_all(shape, key):
+                    try:
+                        xs.append(float(node[1])); ys.append(float(node[2]))
+                    except (IndexError, TypeError, ValueError):
+                        pass
+            for pts in sexpr.find_all(shape, "pts"):
+                for xy in sexpr.find_all(pts, "xy"):
+                    try:
+                        xs.append(float(xy[1])); ys.append(float(xy[2]))
+                    except (IndexError, TypeError, ValueError):
+                        pass
+    if not xs or not ys:
+        return None
+    return (max(xs) - min(xs), max(ys) - min(ys))
+
+
+def _silk_reference_fits(footprint_node: sexpr.Node, refdes: str) -> bool:
+    """Whether this part is big enough to carry its own reference in silk.
+
+    A 0402 is 1.0 x 0.5 mm and `C_U1_VDD1` at the 0.8 mm silkscreen minimum is
+    about 6 mm wide. The text cannot shrink — 0.8 mm is the board's floor and
+    KiCad's default — so it lands on its neighbours and on copper instead. That
+    is most of what makes a dense board look unreadable: sb-halow reported 21
+    silk_overlap and 10 silk_over_copper across eleven parts.
+
+    The reference is not lost by hiding it. Stock footprints carry a
+    ``${REFERENCE}`` on F.Fab, which is the assembly drawing — where a
+    placement operator reads it from anyway.
+
+    Measured against the courtyard rather than decided from the refdes prefix:
+    "R" says nothing about size, and a part with no courtyard to measure keeps
+    its silk rather than being hidden on a guess.
+    """
+    extent = _courtyard_extent(footprint_node)
+    if extent is None:
+        return True
+    width_needed = len(refdes) * _CHAR_ADVANCE * _MIN_SILK_TEXT_MM
+    # Either orientation: KiCad rotates reference text with the footprint, so a
+    # tall narrow part can carry a reference down its length.
+    return (width_needed <= extent[0] and _MIN_SILK_TEXT_MM <= extent[1]) or (
+        width_needed <= extent[1] and _MIN_SILK_TEXT_MM <= extent[0]
+    )
+
+
+def _hide(prop: sexpr.Node) -> None:
+    """Mark a property hidden, whether or not it already says otherwise."""
+    for node in sexpr.find_all(prop, "hide"):
+        node[:] = ["hide", "yes"]
+        return
+    prop.append(["hide", "yes"])
+
+
 def _set_reference_and_value(
     footprint_node: sexpr.Node, refdes: str, value: str
 ) -> None:
+    hide_silk = not _silk_reference_fits(footprint_node, refdes)
     for prop in sexpr.find_all(footprint_node, "property"):
         # property structure: ["property", '"Reference"', '"OLD"', ...]
         if len(prop) >= 3 and isinstance(prop[1], str):
             pname = sexpr.unquote(prop[1])
             if pname == "Reference":
                 prop[2] = sexpr.quote(refdes)
+                layer = sexpr.find(prop, "layer")
+                on_silk = layer is not None and "SilkS" in sexpr.unquote(str(layer[1]))
+                if hide_silk and on_silk:
+                    _hide(prop)
             elif pname == "Value":
                 prop[2] = sexpr.quote(value)
 
