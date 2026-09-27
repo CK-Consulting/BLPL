@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..emitter import sexpr
 from .release import find_kicad_cli
 
 # Freerouting is a jar, not a package. Its location is a deploy decision, so it
@@ -248,7 +249,7 @@ def count_segments(pcb: Path) -> int:
         return 0
 
 
-def _measure_board(python: str, pcb: Path) -> dict:
+def _measure_board(python: str, pcb: Path) -> dict | None:
     """What the saved board actually contains, asked of the board.
 
     This exists because the router's own summary was being believed. Freerouting
@@ -272,36 +273,58 @@ def _measure_board(python: str, pcb: Path) -> dict:
         "}))\n"
     )
     proc = _pcbnew(python, code)
-    out = {"segments": count_segments(pcb)}
     for line in (proc.stdout or "").splitlines():
         if line.startswith("BLPL_MEASURE "):
             try:
-                out.update(json.loads(line[len("BLPL_MEASURE "):]))
+                out = json.loads(line[len("BLPL_MEASURE "):])
             except ValueError:
-                pass
-    return out
+                continue
+            out["segments"] = count_segments(pcb)
+            return out
+    # No usable record. Returning a partial dict here would be the original bug
+    # wearing a new hat: `unrouted` would be None, nothing would notice, and the
+    # run would be accepted without ever obtaining the board-derived number this
+    # whole change exists to get.
+    return None
 
 
-def _dsn_body(text: str) -> tuple[str, ...]:
-    """A DSN reduced to something two exports of the same board agree on.
+def _canonical(node: "sexpr.Sexp") -> tuple:
+    """A node reduced to a form two exports of the same board agree on.
 
-    Two things have to be normalised away, and neither is cosmetic.
+    Atoms keep their order — ``(path F.Cu 2000 x1 y1 x2 y2)`` is a coordinate
+    list and reordering it would change the geometry. Child *nodes* are sorted,
+    because that is where the instability is.
 
-    The first line names the file the export came from, which is a new
-    timestamped path on every emission, so it always differs.
-
-    The rest is **order**. pcbnew emits footprints in memory order, which is not
-    stable across loads: exporting the same board twice produced 580 differing
-    lines that were the same components at identical coordinates, listed in a
-    different sequence. Comparing sorted lines ignores that while still catching
-    everything that matters — a part that moved carries different coordinates in
-    its own line, a part added or removed changes the multiset, and a net class
-    rule change rewrites its own block.
+    Crucially this sorts children **within their parent**, so a ``(pins ...)``
+    block stays attached to the ``(net ...)`` it belongs to. An earlier version
+    sorted the file's lines instead, which threw that association away: two
+    boards with the pin lists of GND and VCC exchanged produced the same sorted
+    multiset and compared equal, so a session could be carried onto a board
+    whose connectivity had changed underneath it.
     """
-    lines = text.splitlines()
-    if lines and lines[0].lstrip().startswith("(pcb"):
-        lines = lines[1:]
-    return tuple(sorted(s for s in (line.strip() for line in lines) if s))
+    if isinstance(node, str):
+        return (node,)
+    atoms = tuple(c for c in node if isinstance(c, str))
+    children = sorted((_canonical(c) for c in node if not isinstance(c, str)), key=repr)
+    return (atoms, tuple(children))
+
+
+def _dsn_body(text: str) -> tuple:
+    """A DSN reduced to what should be identical between two exports of a board.
+
+    The top node is ``(pcb "<path>" ...)`` and that path is a new timestamped
+    filename on every emission, so the name atom is dropped. Everything else is
+    canonicalised structurally — see ``_canonical`` for why the structure has to
+    survive the normalisation.
+    """
+    try:
+        node = sexpr.parse(text)
+    except Exception:
+        # Unparseable: compare it to nothing but itself rather than guessing.
+        return ("unparsed", text)
+    if isinstance(node, list) and len(node) > 1 and isinstance(node[1], str):
+        node = [node[0]] + node[2:]
+    return _canonical(node)
 
 
 def _previous_run(work: Path) -> tuple[Path, Path] | None:
@@ -363,7 +386,9 @@ def carry_forward(pcb: Path, work: Path, python: str) -> RouteResult | None:
     if imported.returncode != 0:
         return None
     measured = _measure_board(python, pcb)
-    if not measured.get("segments"):
+    if measured is None:
+        return None
+    if not measured.get("segments") and measured.get("unconnected"):
         return None
     return RouteResult(
         True, "", pcb=str(pcb), ses=str(ses),
@@ -430,17 +455,26 @@ def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> Route
     # own copy; until this point that claim was stored as the result, so a board
     # whose session never landed still read "0 unrouted".
     measured = _measure_board(python, pcb)
+    if measured is None:
+        base.reason = (
+            "the session imported but the board could not be measured, so there "
+            "is no evidence the routing landed — refusing to report success on "
+            "the router's own account, which is the thing this checks"
+        )
+        return base
     base.segments = measured.get("segments")
     base.unrouted = measured.get("unconnected")
 
-    if not base.segments:
-        # ImportSpecctraSES returned success and the board has no tracks. That
-        # combination is exactly what this check exists for: report the failure
-        # rather than a number copied from a log.
+    # Zero segments is only a failure when something still needs connecting. A
+    # mechanical board, or one whose nets are all single-pad, legitimately needs
+    # no track at all — and an unconditional check would fail those runs while
+    # the board is, correctly, complete.
+    if not base.segments and base.unrouted:
         base.reason = (
             "the session file imported without error but the board has no track "
-            f"segments — Freerouting reported {base.router_reported_unrouted} "
-            "unrouted on its own copy, so the result did not reach this file"
+            f"segments and {base.unrouted} connection(s) still open — "
+            f"Freerouting reported {base.router_reported_unrouted} unrouted on "
+            "its own copy, so the result did not reach this file"
         )
         return base
 

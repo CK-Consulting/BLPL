@@ -86,7 +86,7 @@ def _fake_runs(monkeypatch, *, dsn_ok=True, ses_ok=True, import_ok=True,
         if "ExportSpecctraDSN" in (cmd[2] if len(cmd) > 2 else ""):
             if dsn_ok:
                 dsn = Path(cmd[2].split("ExportSpecctraDSN(b, '")[1].split("'")[0])
-                dsn.write_text("(pcb)")
+                dsn.write_text('(pcb "d" (board))')
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             return subprocess.CompletedProcess(cmd, 1, "", "no board")
         if cmd[0] == "java":
@@ -229,7 +229,10 @@ def test_to_dict_keeps_the_fields_the_agent_tool_reads() -> None:
 def test_a_route_that_does_not_reach_the_board_is_a_failure(monkeypatch, tmp_path) -> None:
     """ImportSpecctraSES returning success is not evidence that anything landed."""
     _make_available(monkeypatch, tmp_path)
-    _fake_runs(monkeypatch, lands=False, summary="(0 unrouted and 0 violations)")
+    # Connections still open: zero segments here means the session was lost,
+    # not that the board had nothing to route.
+    _fake_runs(monkeypatch, lands=False, summary="(0 unrouted and 0 violations)",
+               measured_unconnected=3)
     pcb = _board(tmp_path)
     report_path = tmp_path / "autoroute_report.json"
 
@@ -237,7 +240,7 @@ def test_a_route_that_does_not_reach_the_board_is_a_failure(monkeypatch, tmp_pat
 
     assert result.ok is False, "reported success for a board with no tracks"
     rep = _report(report_path)
-    assert rep["segments"] == 0
+    assert rep["segments"] == 0 and rep["unrouted"] == 3
     # The router's own claim is kept, and it is the thing that disagrees.
     assert rep["router_reported_unrouted"] == 0
     assert "no track segments" in rep["reason"]
@@ -307,7 +310,7 @@ def _carry_stub(monkeypatch, *, import_ok=True, segments=42):
             calls.append("export")
             src = Path(code.split("LoadBoard(")[1].split("'")[1])
             dst = Path(code.split("ExportSpecctraDSN(b, '")[1].split("'")[0])
-            dst.write_text(f'(pcb "{dst}")\n{src.read_text()}')
+            dst.write_text(f'(pcb "{dst}" {src.read_text()})')
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if "ImportSpecctraSES" in code:
             calls.append("import")
@@ -418,3 +421,73 @@ def test_the_snapshot_carries_its_project_file(monkeypatch, tmp_path) -> None:
     carried = work / "board.pre-autoroute.kicad_pro"
     assert carried.is_file(), "snapshot left its net classes behind"
     assert carried.read_text() == pro.read_text()
+
+
+# --- the comparison has to keep the structure -------------------------------
+
+
+def test_swapping_pins_between_nets_is_not_equal() -> None:
+    """Sorting the DSN's lines threw away which net each pin list belonged to.
+
+    Two boards with the pin lists of GND and VCC exchanged produced the same
+    sorted multiset and compared equal, so carry_forward would have imported a
+    session onto a board whose connectivity had changed underneath it.
+    """
+    a = '(pcb "a" (network (net GND (pins U1-1 U1-2)) (net VCC (pins U2-1 U2-2))))'
+    b = '(pcb "b" (network (net GND (pins U2-1 U2-2)) (net VCC (pins U1-1 U1-2))))'
+    assert autoroute._dsn_body(a) != autoroute._dsn_body(b)
+
+
+def test_the_filename_and_child_order_are_still_normalised_away() -> None:
+    """The two things that legitimately differ between exports of one board:
+    the timestamped path it was written from, and the order pcbnew happened to
+    emit its children in."""
+    a = '(pcb "one.dsn" (placement (component A (place R1 1 2)) (component B (place R2 3 4))))'
+    b = '(pcb "two.dsn" (placement (component B (place R2 3 4)) (component A (place R1 1 2))))'
+    assert autoroute._dsn_body(a) == autoroute._dsn_body(b)
+
+
+def test_coordinate_order_inside_a_path_is_preserved() -> None:
+    """Atoms are a geometry list — reordering them would change the track."""
+    a = '(pcb "x" (wire (path F.Cu 200 0 0 10 10)))'
+    b = '(pcb "x" (wire (path F.Cu 200 10 10 0 0)))'
+    assert autoroute._dsn_body(a) != autoroute._dsn_body(b)
+
+
+# --- a board with nothing to route is not a failure -------------------------
+
+
+def test_a_board_with_nothing_to_route_succeeds_with_no_tracks(monkeypatch, tmp_path) -> None:
+    """A mechanical board, or one whose nets are all single-pad, legitimately
+    needs no track at all. An unconditional "no segments means failure" check
+    made `blpl autoroute` exit 1 on a board that was already complete."""
+    _make_available(monkeypatch, tmp_path)
+    _fake_runs(monkeypatch, lands=False, measured_unconnected=0)
+    pcb = _board(tmp_path)
+
+    result = autoroute.run_for(pcb, tmp_path / "r.json")
+
+    assert result.ok is True
+    rep = _report(tmp_path / "r.json")
+    assert rep["segments"] == 0 and rep["unrouted"] == 0 and rep["reason"] == ""
+
+
+def test_a_route_is_refused_when_the_board_cannot_be_measured(monkeypatch, tmp_path) -> None:
+    """Without a board-derived number there is no evidence the routing landed,
+    and accepting the run would be the original bug in a new hat: `unrouted`
+    would be None and nothing would notice."""
+    _make_available(monkeypatch, tmp_path)
+    calls = _fake_runs(monkeypatch)
+
+    real_run = autoroute._run
+
+    def no_measure(cmd, timeout=300):
+        if len(cmd) > 2 and "BuildConnectivity" in cmd[2]:
+            return subprocess.CompletedProcess(cmd, 1, "", "pcbnew exploded")
+        return real_run(cmd, timeout)
+
+    monkeypatch.setattr(autoroute, "_run", no_measure)
+    result = autoroute.run_for(_board(tmp_path), tmp_path / "r.json")
+
+    assert result.ok is False
+    assert "could not be measured" in _report(tmp_path / "r.json")["reason"]
