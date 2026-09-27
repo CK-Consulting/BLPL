@@ -282,6 +282,97 @@ def _measure_board(python: str, pcb: Path) -> dict:
     return out
 
 
+def _dsn_body(text: str) -> tuple[str, ...]:
+    """A DSN reduced to something two exports of the same board agree on.
+
+    Two things have to be normalised away, and neither is cosmetic.
+
+    The first line names the file the export came from, which is a new
+    timestamped path on every emission, so it always differs.
+
+    The rest is **order**. pcbnew emits footprints in memory order, which is not
+    stable across loads: exporting the same board twice produced 580 differing
+    lines that were the same components at identical coordinates, listed in a
+    different sequence. Comparing sorted lines ignores that while still catching
+    everything that matters — a part that moved carries different coordinates in
+    its own line, a part added or removed changes the multiset, and a net class
+    rule change rewrites its own block.
+    """
+    lines = text.splitlines()
+    if lines and lines[0].lstrip().startswith("(pcb"):
+        lines = lines[1:]
+    return tuple(sorted(s for s in (line.strip() for line in lines) if s))
+
+
+def _previous_run(work: Path) -> tuple[Path, Path] | None:
+    """The newest (pre-route snapshot, session file) pair in a work directory."""
+    best: tuple[str, Path, Path] | None = None
+    for snap in work.glob("*.pre-autoroute.kicad_pcb"):
+        base = snap.name[: -len(".pre-autoroute.kicad_pcb")]
+        ses = work / f"{base}.ses"
+        if ses.is_file() and (best is None or base > best[0]):
+            best = (base, snap, ses)
+    return (best[1], best[2]) if best else None
+
+
+def carry_forward(pcb: Path, work: Path, python: str) -> RouteResult | None:
+    """Re-apply the last routing when the board has not actually changed.
+
+    Stage 6 writes a new timestamped board on every run, and routing lives in
+    that file — so re-emitting after editing a comment in the design document
+    throws away a completed route, and the only sign is a board that opens full
+    of ratsnest. On this project that is why every board looked unrouted: not a
+    failing router, a route nothing carried across.
+
+    Safe because of what is compared. Both sides are exported to Specctra from
+    an *unrouted* board — the new emission, and the snapshot taken before the
+    previous route — so the comparison covers placement, pads, nets and board
+    outline, everything the session file's coordinates depend on. If those
+    agree the old session is still valid for this board; if anything moved the
+    export differs and nothing is carried.
+
+    The previous run's own ``.dsn`` is deliberately not used for this: it is
+    exported from whatever the board was at the time, so re-running the router
+    on an already-routed board leaves a DSN with the wiring in it, which would
+    never compare equal to a fresh emission.
+
+    Returns None when there is nothing to carry or the board moved.
+    """
+    prior = _previous_run(work)
+    if prior is None:
+        return None
+    snapshot, ses = prior
+
+    fresh, old = work / "_carry-new.dsn", work / "_carry-prev.dsn"
+    try:
+        if _export_dsn(python, pcb, fresh).returncode != 0:
+            return None
+        if _export_dsn(python, snapshot, old).returncode != 0:
+            return None
+        same = _dsn_body(fresh.read_text(encoding="utf-8", errors="replace")) == _dsn_body(
+            old.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+    finally:
+        for f in (fresh, old):
+            f.unlink(missing_ok=True)
+    if not same:
+        return None
+
+    imported = _import_ses(python, pcb, ses)
+    if imported.returncode != 0:
+        return None
+    measured = _measure_board(python, pcb)
+    if not measured.get("segments"):
+        return None
+    return RouteResult(
+        True, "", pcb=str(pcb), ses=str(ses),
+        segments=measured.get("segments"),
+        unrouted=measured.get("unconnected"),
+        extra={"carried_from": str(ses)},
+    )
+
+
 def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> RouteResult:
     """Route a board in bulk. The PCB is modified in place on success.
 
@@ -363,6 +454,7 @@ def run_for(
     *,
     passes: int = 10,
     work_dir: Path | None = None,
+    carry: bool = True,
 ) -> RouteResult:
     """The pipeline step: snapshot, route, and always leave a report.
 
@@ -384,8 +476,37 @@ def run_for(
                              pcb=str(pcb), passes=passes)
     else:
         snapshot = work / f"{pcb.stem}.pre-autoroute.kicad_pcb"
-        shutil.copyfile(pcb, snapshot)
-        result = route(pcb, work_dir=work, passes=passes)
+        # Never overwrite an existing snapshot. Routing this board a second
+        # time would otherwise copy the *routed* board over the record of what
+        # it looked like before, and "put it back as it was" would restore a
+        # routed board — the one thing the snapshot exists to undo. It happened:
+        # one board's pre-autoroute snapshot held 219 track segments.
+        #
+        # It also poisons carry_forward, which compares against this file to
+        # decide whether an old session still fits.
+        if not snapshot.exists():
+            shutil.copyfile(pcb, snapshot)
+            # The project file travels with it. Net classes live in
+            # `.kicad_pro`, not in the board, and pcbnew loads the one beside
+            # the board it is given — so a snapshot on its own is not the same
+            # board: it loses every class and silently falls back to defaults.
+            # A restored snapshot would come back with its rules gone, and the
+            # Specctra export carry_forward compares would differ from the
+            # emission it was copied from for no reason but a missing file.
+            pro = pcb.with_suffix(".kicad_pro")
+            if pro.is_file():
+                shutil.copyfile(pro, snapshot.with_suffix(".kicad_pro"))
+        # A re-emitted board is a new file with no routing in it. If nothing
+        # about the board actually moved, the previous session still applies,
+        # and re-running the router to reach the same answer wastes minutes and
+        # risks a different one. Only taken when the Specctra export of this
+        # board matches the export of the last pre-route snapshot.
+        carried = carry_forward(pcb, work, find_pcbnew_python()) if carry else None
+        if carried is not None:
+            result = carried
+            result.passes = 0
+        else:
+            result = route(pcb, work_dir=work, passes=passes)
         result.snapshot = str(snapshot)
 
     result.finished_at = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")

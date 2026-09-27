@@ -277,3 +277,144 @@ def test_count_segments_reads_the_file_not_the_broken_binding(tmp_path) -> None:
     )
     assert autoroute.count_segments(pcb) == 2
     assert autoroute.count_segments(tmp_path / "absent.kicad_pcb") == 0
+
+
+# --- routing that survives a re-emit ----------------------------------------
+#
+# Stage 6 writes a new timestamped board every run and routing lives in that
+# file, so re-emitting after editing a comment threw away a finished route. The
+# only symptom was a board that opened full of ratsnest, which reads as "the
+# autorouter does not work" rather than "nothing carried the route across".
+
+
+def _carry_stub(monkeypatch, *, import_ok=True, segments=42):
+    """Export a DSN that mirrors the board it came from.
+
+    That is what makes the comparison meaningful here: two exports are equal
+    exactly when the two boards are, which is the property carry_forward relies
+    on to decide the old session still fits.
+    """
+    calls: list[str] = []
+
+    def fake_run(cmd, timeout=300):
+        code = cmd[2] if len(cmd) > 2 else ""
+        if cmd[0] == "java":
+            calls.append("java")
+            Path(cmd[cmd.index("-do") + 1]).write_text("(session)")
+            return subprocess.CompletedProcess(
+                cmd, 0, "INFO Auto-routing stage completed: (0 unrouted and 0 violations)", "")
+        if "ExportSpecctraDSN" in code:
+            calls.append("export")
+            src = Path(code.split("LoadBoard(")[1].split("'")[1])
+            dst = Path(code.split("ExportSpecctraDSN(b, '")[1].split("'")[0])
+            dst.write_text(f'(pcb "{dst}")\n{src.read_text()}')
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if "ImportSpecctraSES" in code:
+            calls.append("import")
+            if import_ok:
+                board = Path(code.split("LoadBoard(")[1].split("'")[1])
+                board.write_text(board.read_text() + "\n" + "\n".join(
+                    "  (segment (start 0 0) (end 1 0) (width 0.2) (layer \"F.Cu\") (net 1))"
+                    for _ in range(segments)))
+            return subprocess.CompletedProcess(cmd, 0 if import_ok else 1, "", "")
+        if "BuildConnectivity" in code:
+            calls.append("measure")
+            return subprocess.CompletedProcess(cmd, 0, 'BLPL_MEASURE {"unconnected": 0}', "")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    monkeypatch.setattr(autoroute, "_run", fake_run)
+    return calls
+
+
+def _prior_run(work: Path, board_text: str, base: str = "brd_2026-01-01_000000Z") -> None:
+    work.mkdir(parents=True, exist_ok=True)
+    (work / f"{base}.pre-autoroute.kicad_pcb").write_text(board_text)
+    (work / f"{base}.ses").write_text("(session)")
+
+
+def test_an_unchanged_board_reuses_the_last_route_without_running_the_router(
+    monkeypatch, tmp_path
+) -> None:
+    _make_available(monkeypatch, tmp_path)
+    calls = _carry_stub(monkeypatch)
+    work = tmp_path / ".pipeline" / "autoroute"
+    text = "(kicad_pcb (version 20260206) (footprint A) (footprint B))"
+    _prior_run(work, text)
+
+    pcb = tmp_path / "board.kicad_pcb"          # re-emitted, same content
+    pcb.write_text(text)
+    result = autoroute.run_for(pcb, tmp_path / "r.json", work_dir=work)
+
+    assert result.ok and result.segments == 42
+    assert "java" not in calls, "re-ran the router for a board that had not changed"
+    rep = _report(tmp_path / "r.json")
+    assert rep["carried_from"].endswith(".ses")
+    assert rep["passes"] == 0
+
+
+def test_a_board_that_moved_is_routed_again_rather_than_carried(monkeypatch, tmp_path) -> None:
+    """The safety half: an old session's coordinates are only valid for the
+    placement they were produced from."""
+    _make_available(monkeypatch, tmp_path)
+    calls = _carry_stub(monkeypatch)
+    work = tmp_path / ".pipeline" / "autoroute"
+    _prior_run(work, "(kicad_pcb (footprint A) (footprint B))")
+
+    pcb = tmp_path / "board.kicad_pcb"
+    pcb.write_text("(kicad_pcb (footprint A) (footprint B) (footprint C))")   # a part moved in
+    result = autoroute.run_for(pcb, tmp_path / "r.json", work_dir=work)
+
+    assert "java" in calls, "carried a session onto a board whose placement changed"
+    assert result.ok
+    assert "carried_from" not in _report(tmp_path / "r.json")
+
+
+def test_carry_is_skipped_when_there_is_nothing_to_carry(monkeypatch, tmp_path) -> None:
+    _make_available(monkeypatch, tmp_path)
+    calls = _carry_stub(monkeypatch)
+    pcb = _board(tmp_path)
+    autoroute.run_for(pcb, tmp_path / "r.json", work_dir=tmp_path / "w")
+    assert "java" in calls
+
+
+def test_the_pre_route_snapshot_is_never_overwritten(monkeypatch, tmp_path) -> None:
+    """Routing a board twice must not replace the record of what it looked
+    like before the first run. Otherwise "undo the autoroute" restores a routed
+    board, and carry_forward compares against something that already has
+    routing in it — both of which happened on a real board whose pre-autoroute
+    snapshot held 219 track segments."""
+    _make_available(monkeypatch, tmp_path)
+    _carry_stub(monkeypatch)
+    work = tmp_path / "w"
+    pcb = tmp_path / "board.kicad_pcb"
+    pcb.write_text("(kicad_pcb (footprint A))")
+    original = pcb.read_text()
+
+    autoroute.run_for(pcb, tmp_path / "r.json", work_dir=work)
+    snap = work / "board.pre-autoroute.kicad_pcb"
+    assert snap.read_text() == original
+
+    # Second run: the board now carries routing. The snapshot must not follow.
+    autoroute.run_for(pcb, tmp_path / "r2.json", work_dir=work)
+    assert snap.read_text() == original, "snapshot was overwritten with the routed board"
+    assert autoroute.count_segments(snap) == 0
+
+
+def test_the_snapshot_carries_its_project_file(monkeypatch, tmp_path) -> None:
+    """Net classes live in `.kicad_pro`, and pcbnew reads the one beside the
+    board. A snapshot without it is a different board: every class falls back
+    to defaults. That made two exports of the same design differ by nine lines
+    of net-class rules and stopped carry_forward from ever matching."""
+    _make_available(monkeypatch, tmp_path)
+    _carry_stub(monkeypatch)
+    pcb = tmp_path / "board.kicad_pcb"
+    pcb.write_text("(kicad_pcb (footprint A))")
+    pro = tmp_path / "board.kicad_pro"
+    pro.write_text('{"net_settings": {"classes": ["Power_Bulk"]}}')
+    work = tmp_path / "w"
+
+    autoroute.run_for(pcb, tmp_path / "r.json", work_dir=work)
+
+    carried = work / "board.pre-autoroute.kicad_pro"
+    assert carried.is_file(), "snapshot left its net classes behind"
+    assert carried.read_text() == pro.read_text()
