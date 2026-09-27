@@ -1242,3 +1242,70 @@ def test_a_project_the_desktop_has_not_mounted_is_refused(client, monkeypatch):
 
     body = client.post("/api/projects/elsewhere/kicad/open").json()
     assert body["opened"] is False and "not the one mounted" in body["reason"]
+
+
+def test_the_board_is_matched_as_a_delimited_name_not_a_substring(client, monkeypatch):
+    """`_latest_with_origin` does a plain `in` test on the filename, so a bare
+    board name also matches a *different* board whose filename happens to
+    contain it — a project called `core-board` matches "core" in every one of
+    its files — and the reverse sort then hands back the wrong board."""
+    import app.main as main
+
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "core-board"})
+    # Board resolution is the manifest's job and is tested elsewhere; what is
+    # under test here is the pattern this route hands to the artifact lookup.
+    monkeypatch.setattr(main, "_resolve_board", lambda *a, **k: "core")
+    pipeline = main.PROJECTS_ROOT / "core-board" / ".pipeline"
+    pipeline.mkdir(parents=True, exist_ok=True)
+    for stem in ("core-board_core_2026-01-01_000000Z", "core-board_sb-ant_2026-01-01_000000Z"):
+        (pipeline / f"{stem}.kicad_pro").write_text("{}", encoding="utf-8")
+
+    r = client.post("/api/projects/core-board/kicad/open?board=core")
+    assert r.status_code == 200, f"{r.status_code}: {r.text}"
+    body = r.json()
+    assert body["opened"] is True
+    assert body["path"].endswith("core-board_core_2026-01-01_000000Z.kicad_pro"), body["path"]
+
+
+def test_a_collaborators_worktree_says_why_a_named_mount_cannot_show_it(client, monkeypatch):
+    """A member who is not the owner works in a worktree beside the project.
+    With the whole root mounted that is still inside the mount; with one project
+    named, only the owner's checkout is there. Opening the owner's copy instead
+    would show somebody else's tree and omit their edits, so it says so — and
+    the reason has to be specific enough to act on."""
+    import app.main as main
+    from app import worktrees
+
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "shared"})
+
+    # A board that exists only in a member's worktree.
+    wt = main.PROJECTS_ROOT / worktrees.WORKTREES_DIR / "shared" / "u99" / ".pipeline"
+    wt.mkdir(parents=True, exist_ok=True)
+    (wt / "shared_2026-01-01_000000Z.kicad_pro").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("KICAD_DESKTOP_PROJECT", "shared")
+    monkeypatch.setattr(main, "_project_dir", lambda *a, **k: wt.parent)
+
+    body = client.post("/api/projects/shared/kicad/open").json()
+    assert body["opened"] is False
+    assert "worktree" in body["reason"], body["reason"]
+
+
+def test_a_worktree_is_reachable_when_the_whole_root_is_mounted(client, monkeypatch):
+    """The default shape mounts the projects root, and worktrees live inside
+    it — so a collaborator's board translates fine and must not be refused."""
+    import app.main as main
+    from app import worktrees
+
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "shared2"})
+    wt = main.PROJECTS_ROOT / worktrees.WORKTREES_DIR / "shared2" / "u99" / ".pipeline"
+    wt.mkdir(parents=True, exist_ok=True)
+    (wt / "shared2_2026-01-01_000000Z.kicad_pro").write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("KICAD_DESKTOP_PROJECT", raising=False)
+    monkeypatch.setattr(main, "_project_dir", lambda *a, **k: wt.parent)
+
+    body = client.post("/api/projects/shared2/kicad/open").json()
+    assert body["opened"] is True
+    assert "/.worktrees/shared2/u99/" in body["path"], body["path"]

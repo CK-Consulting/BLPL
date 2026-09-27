@@ -4146,15 +4146,42 @@ def open_in_kicad_desktop(
     proj = _project_dir(session, user, project_id)
     pipeline_dir = proj / ".pipeline"
     resolved = _resolve_board(proj, board)
-    pro, _ = _latest_with_origin(pipeline_dir, ".kicad_pro", resolved)
+    # Delimited, not a bare substring. `_latest_with_origin` does a plain `in`
+    # test on the filename, so "core" also matches `core-board_sb-ant_….kicad_pro`
+    # — the project name carries the board name — and the reverse sort then
+    # hands back a different board's project. `_core_` cannot. The /design route
+    # already does it this way.
+    pro, _ = _latest_with_origin(
+        pipeline_dir, ".kicad_pro", None if resolved is None else f"_{resolved}_"
+    )
     if pro is None:
         return {"opened": False, "reason": "no KiCad project has been emitted yet"}
 
     desktop_path = _kicad_desktop_path(pro)
     if desktop_path is None:
-        # The board exists but is outside what the desktop has mounted, which
-        # happens when KICAD_DESKTOP_PROJECT names a different project. Saying
-        # so beats writing a request the watcher will reject.
+        # Two ways to land here, and they need different words because only one
+        # of them is something the reader can act on.
+        #
+        # A member who is not the owner works in a git worktree beside the
+        # project rather than in it. With the whole root mounted that is still
+        # inside the mount and translates fine; with KICAD_DESKTOP_PROJECT
+        # naming one project, only the owner's checkout is mounted and the
+        # worktree genuinely is not there. Opening the owner's copy instead
+        # would be worse than saying so — it would show somebody else's tree
+        # and quietly omit their own edits.
+        try:
+            in_worktree = worktrees.WORKTREES_DIR in pro.resolve().parts
+        except OSError:
+            in_worktree = False
+        if in_worktree:
+            return {
+                "opened": False,
+                "reason": (
+                    "the desktop has a single project mounted, which is the "
+                    "owner's checkout — your own worktree is not on it, so the "
+                    "board you are looking at cannot be opened there"
+                ),
+            }
         return {
             "opened": False,
             "reason": "this project is not the one mounted in the KiCad desktop",

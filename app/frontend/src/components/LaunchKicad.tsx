@@ -76,6 +76,11 @@ export function LaunchKicad({
   board?: string | null;
 }) {
   const url = useKicadDesktop();
+  // Why the desktop could not be pointed at this board, when it could not be.
+  // Swallowing that left a member of a shared project staring at an empty
+  // KiCad with nothing anywhere saying why — which is the exact complaint this
+  // whole change exists to answer, reintroduced one level down.
+  const [note, setNote] = useState<string | null>(null);
   if (!url) return null;
 
   // Ask the desktop to open this board as the tab is opening. The desktop
@@ -90,13 +95,22 @@ export function LaunchKicad({
   // link.
   const ask = () => {
     if (!projectId) return;
+    setNote(null);
     const q = board ? `?board=${encodeURIComponent(board)}` : "";
-    postJSON(`/api/projects/${encodeURIComponent(projectId)}/kicad/open${q}`, {}).catch(
-      () => {},
-    );
+    postJSON<{ opened: boolean; reason?: string }>(
+      `/api/projects/${encodeURIComponent(projectId)}/kicad/open${q}`,
+      {},
+    )
+      .then((r) => {
+        if (!r.opened && r.reason) setNote(r.reason);
+      })
+      .catch(() => {
+        /* the desktop still opens; the project can be opened by hand */
+      });
   };
 
   return (
+    <>
     <a
       className={className || "link"}
       href={url}
@@ -113,5 +127,11 @@ export function LaunchKicad({
       <span className="kicad-launch-label">Open KiCad in New Tab</span>
       {version && <span className="kicad-ver">{version}</span>}
     </a>
+    {note && (
+      <span className="muted small kicad-open-note" role="status">
+        Opened the desktop, but not this board: {note}
+      </span>
+    )}
+    </>
   );
 }
