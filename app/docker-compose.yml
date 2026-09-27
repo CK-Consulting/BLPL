@@ -486,6 +486,11 @@ services:
       # symbol", the task this desktop exists for, either fails on a
       # read-only filesystem or saves into a file no pipeline stage searches.
       - ./kicad-desktop-init:/custom-cont-init.d:ro
+      # A long-running service, not a one-shot init: it watches for the app
+      # asking to open a project. The desktop autostarts bare `kicad`, so
+      # without this it comes up with nothing loaded and the workbench's
+      # "Open KiCad" link lands on what looks like an empty install.
+      - ./kicad-desktop-services:/custom-services.d:ro
       # One variable, two shapes, and the empty default is the useful one.
       #
       # Unset, this expands to `./data/projects/` — the whole root, so every

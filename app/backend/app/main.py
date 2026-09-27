@@ -4063,6 +4063,48 @@ def _task_endpoint(session: Session, user: User, master_key: bytes, task: str):
     return chain[0] if chain else None
 
 
+#: Where the desktop's watcher looks for a project to open. The path is inside
+#: the desktop's mount, which is the whole projects root by default and a single
+#: project's *contents* when KICAD_DESKTOP_PROJECT names one.
+_KICAD_DESKTOP_ROOT = "/config/projects"
+
+
+def _kicad_desktop_mount() -> tuple[Path, str]:
+    """(host directory mounted into the desktop, path it appears at there).
+
+    Two shapes, because compose mounts two different things:
+    ``./data/projects/${KICAD_DESKTOP_PROJECT:-}`` is the whole root when the
+    variable is unset and one project's contents when it names one. A path
+    translated with the wrong assumption points at nothing, and the watcher
+    would report a project that does not exist — so this is read from the same
+    variable the mount is written from rather than guessed.
+    """
+    named = (os.environ.get("KICAD_DESKTOP_PROJECT") or "").strip()
+    if named and named != "none":
+        return (PROJECTS_ROOT / named, _KICAD_DESKTOP_ROOT)
+    return (PROJECTS_ROOT, _KICAD_DESKTOP_ROOT)
+
+
+def _kicad_desktop_path(host_path: Path) -> str | None:
+    """A path as the desktop container sees it, or None if it is not mounted."""
+    base, mounted_at = _kicad_desktop_mount()
+    try:
+        rel = host_path.resolve().relative_to(base.resolve())
+    except (ValueError, OSError):
+        return None
+    return f"{mounted_at}/{rel.as_posix()}" if rel.parts else mounted_at
+
+
+def _kicad_open_request_file() -> Path:
+    """The host-side file the desktop watcher polls.
+
+    It lives at the top of whatever is mounted, so it lands at
+    ``/config/projects/.blpl-kicad-open`` in the container under either shape.
+    """
+    base, _ = _kicad_desktop_mount()
+    return base / ".blpl-kicad-open"
+
+
 def _kicad_bridge_url() -> str | None:
     """Where the KiCad MCP server is, if one is configured.
 
@@ -4074,6 +4116,57 @@ def _kicad_bridge_url() -> str | None:
         return from_env
     server = _load_config().mcp.get("kcaa")
     return server.url if server else None
+
+
+@app.post("/api/projects/{project_id}/kicad/open")
+def open_in_kicad_desktop(
+    project_id: str,
+    board: str | None = None,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Ask the KiCad desktop to open this project's current board.
+
+    The desktop autostarts a bare ``kicad``, so opening it from the workbench
+    landed on an empty install — every file mounted and readable, none of them
+    opened. That reads as "the desktop is broken" and is the most common thing
+    to conclude about it.
+
+    The app cannot start a process in that container and KasmVNC takes no file
+    argument, so the two sides meet on a file: this writes the project path as
+    the *desktop* sees it, and a watcher there opens it. Writing the path from
+    here rather than having the watcher guess is what makes it follow the board
+    somebody is actually looking at.
+
+    Answering 200 with ``opened: false`` rather than raising when there is no
+    board yet: a project whose pipeline has not reached stage 6 has nothing to
+    open, which is a fact about the project and not an error the caller did
+    anything to cause.
+    """
+    proj = _project_dir(session, user, project_id)
+    pipeline_dir = proj / ".pipeline"
+    resolved = _resolve_board(proj, board)
+    pro, _ = _latest_with_origin(pipeline_dir, ".kicad_pro", resolved)
+    if pro is None:
+        return {"opened": False, "reason": "no KiCad project has been emitted yet"}
+
+    desktop_path = _kicad_desktop_path(pro)
+    if desktop_path is None:
+        # The board exists but is outside what the desktop has mounted, which
+        # happens when KICAD_DESKTOP_PROJECT names a different project. Saying
+        # so beats writing a request the watcher will reject.
+        return {
+            "opened": False,
+            "reason": "this project is not the one mounted in the KiCad desktop",
+        }
+
+    request = _kicad_open_request_file()
+    try:
+        request.parent.mkdir(parents=True, exist_ok=True)
+        request.write_text(desktop_path + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not ask KiCad to open: {exc}")
+    return {"opened": True, "path": desktop_path, "board": resolved}
 
 
 @app.post("/api/projects/{project_id}/conversations/{filename}/attachments")

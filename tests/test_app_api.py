@@ -1161,3 +1161,84 @@ def test_a_range_runs_when_only_the_stage_it_reaches_is_routable(client):
     enqueue_only(client, "/api/projects/onlystage1/pipeline?from_stage=stage1&to_stage=stage8")
     chains = _json.loads(queued_env("onlystage1")["HDM_LLM_CHAINS"])
     assert [c["endpoint"] for c in chains["stage1"]] == ["dear"]
+
+
+# --- opening a project in the KiCad desktop ---------------------------------
+#
+# The desktop autostarts a bare `kicad`, so opening it from the workbench
+# landed on an empty install: every file mounted and readable, none of them
+# opened. That reads as "the desktop is broken" and is the most common thing
+# to conclude about it.
+
+
+def _emit_board(client, name: str, board: str | None = None) -> None:
+    """Put a .kicad_pro where stage 6 would have left one."""
+    import app.main as main
+
+    proj = main.PROJECTS_ROOT / name
+    pipeline = proj / ".pipeline"
+    pipeline.mkdir(parents=True, exist_ok=True)
+    stem = f"{name}_{board}_2026-01-02_030405Z" if board else f"{name}_2026-01-02_030405Z"
+    (pipeline / f"{stem}.kicad_pro").write_text("{}", encoding="utf-8")
+
+
+def test_opening_a_project_writes_the_path_the_desktop_will_see(client, monkeypatch):
+    import app.main as main
+
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "openme"})
+    _emit_board(client, "openme")
+
+    r = client.post("/api/projects/openme/kicad/open")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["opened"] is True
+    # The path is the *container's*, not this process's — the watcher runs on
+    # the other side of a bind mount and a host path would name nothing there.
+    assert body["path"].startswith("/config/projects/openme/.pipeline/")
+    assert body["path"].endswith(".kicad_pro")
+
+    request = main.PROJECTS_ROOT / ".blpl-kicad-open"
+    assert request.read_text(encoding="utf-8").strip() == body["path"]
+
+
+def test_a_project_with_no_board_yet_is_not_an_error(client):
+    """A pipeline that has not reached stage 6 has nothing to open. That is a
+    fact about the project, not something the caller did wrong."""
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "unbuilt"})
+
+    r = client.post("/api/projects/unbuilt/kicad/open")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["opened"] is False and "emitted" in body["reason"]
+
+
+def test_a_single_project_mount_translates_to_the_root(client, monkeypatch):
+    """With KICAD_DESKTOP_PROJECT naming a project, compose mounts that
+    project's *contents* at /config/projects — so the same board has a
+    different path in the container, and translating it with the other
+    assumption would name a file that does not exist there."""
+    import app.main as main
+
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "solo"})
+    _emit_board(client, "solo")
+    monkeypatch.setenv("KICAD_DESKTOP_PROJECT", "solo")
+
+    body = client.post("/api/projects/solo/kicad/open").json()
+    assert body["opened"] is True
+    assert body["path"].startswith("/config/projects/.pipeline/"), body["path"]
+    # The request file has to land at the top of what is mounted, too.
+    assert (main.PROJECTS_ROOT / "solo" / ".blpl-kicad-open").is_file()
+
+
+def test_a_project_the_desktop_has_not_mounted_is_refused(client, monkeypatch):
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "mounted"})
+    client.post("/api/projects/init", json={"name": "elsewhere"})
+    _emit_board(client, "elsewhere")
+    monkeypatch.setenv("KICAD_DESKTOP_PROJECT", "mounted")
+
+    body = client.post("/api/projects/elsewhere/kicad/open").json()
+    assert body["opened"] is False and "not the one mounted" in body["reason"]

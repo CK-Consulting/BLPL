@@ -152,7 +152,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
           />
         )}
         <span className="spacer" />
-        <LaunchKicad className="link kicad-launch" version={kicad} />
+        <LaunchKicad className="link kicad-launch" version={kicad} projectId={selected} board={board} />
         <NavActions
           actions={[
             {

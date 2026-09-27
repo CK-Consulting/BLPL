@@ -108,7 +108,7 @@ export function Preflight({
       <div className="reports">
         <CrossBoard report={report} />
         {ordered.map((name) => (
-          <BoardReport key={name} report={report.boards[name]} title={name} />
+          <BoardReport key={name} report={report.boards[name]} title={name} projectId={projectId} board={name} />
         ))}
       </div>
     );
@@ -127,7 +127,7 @@ export function Preflight({
 
   return (
     <div className="reports">
-      <BoardReport report={report} />
+      <BoardReport report={report} projectId={projectId} board={board} />
     </div>
   );
 }
@@ -189,7 +189,19 @@ function CrossBoard({ report }: { report: MultiReport }) {
   );
 }
 
-function BoardReport({ report, title }: { report: Report; title?: string }) {
+function BoardReport({
+  report,
+  title,
+  projectId,
+  board,
+}: {
+  report: Report;
+  title?: string;
+  projectId: string;
+  // Which board this report is for, so the KiCad button below opens that one
+  // rather than whichever the workbench happens to have selected.
+  board?: string | null;
+}) {
   const s = report.summary;
   const groups = new Map<string, Finding[]>();
   for (const f of report.findings) {
@@ -220,7 +232,7 @@ function BoardReport({ report, title }: { report: Report; title?: string }) {
           not exist is fixed by drawing one, and this is where you learn it does
           not exist. */}
       <div className="preflight-tools">
-        <LaunchKicad className="btn kicad-launch" />
+        <LaunchKicad className="btn kicad-launch" projectId={projectId} board={board} />
         <span className="muted small">
           For drawing a footprint or symbol the libraries do not have. Save it into this
           project's <code>libraries/footprints/</code> — doctor and Stage 5 both look there.

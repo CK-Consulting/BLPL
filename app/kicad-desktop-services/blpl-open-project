@@ -1,0 +1,46 @@
+#!/usr/bin/with-contenv bash
+# Open the project the app asks for, in the KiCad that is already running.
+#
+# The desktop autostarts bare `kicad` (see /defaults/autostart), so it comes up
+# with no project loaded and its panes empty. Opening the workbench's "Open
+# KiCad" link therefore landed people in what looks like an empty install —
+# the files were always there, mounted and readable, just not opened.
+#
+# The app cannot launch a process in this container, and KasmVNC takes no file
+# argument, so the two sides meet on a file: the backend writes the absolute
+# in-container path of a .kicad_pro into a request file, and this watches for it.
+#
+# Polling rather than inotify: this runs in a stock linuxserver image where
+# inotify-tools is not installed, the request arrives at human speed, and two
+# seconds of latency on a click nobody is timing is not worth a dependency.
+
+REQUEST="${BLPL_KICAD_OPEN_REQUEST:-/config/projects/.blpl-kicad-open}"
+STATE=/config/.blpl-kicad-open.handled
+
+log() { echo "[blpl-open-project] $*"; }
+
+log "watching $REQUEST"
+while true; do
+    if [ -s "$REQUEST" ]; then
+        want="$(head -c 4096 "$REQUEST" | tr -d '\r\n')"
+        seen=""
+        [ -f "$STATE" ] && seen="$(cat "$STATE")"
+        # Compared by content, not mtime: asking for the same project twice is
+        # a no-op rather than a second window, and re-requesting a different
+        # one always fires even if the clock did not move.
+        if [ -n "$want" ] && [ "$want" != "$seen" ]; then
+            if [ -f "$want" ]; then
+                log "opening $want"
+                printf '%s' "$want" > "$STATE"
+                # setsid so KiCad outlives this supervised shell: s6 restarts
+                # `run` scripts, and a child in this process group would be
+                # killed along with it.
+                setsid s6-setuidgid abc kicad "$want" >/dev/null 2>&1 &
+            else
+                log "requested project does not exist: $want"
+                printf '%s' "$want" > "$STATE"
+            fi
+        fi
+    fi
+    sleep 2
+done

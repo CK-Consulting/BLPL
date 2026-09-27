@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { postJSON } from "../api";
 import { ExternalLink } from "./Icons";
 
 /**
@@ -66,18 +67,42 @@ export function useKicadDesktop(): string | null {
 export function LaunchKicad({
   className = "",
   version = null,
+  projectId = null,
+  board = null,
 }: {
   className?: string;
   version?: string | null;
+  projectId?: string | null;
+  board?: string | null;
 }) {
   const url = useKicadDesktop();
   if (!url) return null;
+
+  // Ask the desktop to open this board as the tab is opening. The desktop
+  // autostarts a bare `kicad`, so without this it comes up with nothing loaded
+  // and every file mounted but unopened — which reads as an empty install.
+  //
+  // Fired alongside the navigation rather than before it: the browser only
+  // allows a new tab from a real click, so awaiting a round trip first would
+  // get the tab blocked. The watcher polls, so arriving a moment later is
+  // fine, and a failure here must not stop the desktop opening — the person
+  // can still open the project by hand, which is strictly better than a dead
+  // link.
+  const ask = () => {
+    if (!projectId) return;
+    const q = board ? `?board=${encodeURIComponent(board)}` : "";
+    postJSON(`/api/projects/${encodeURIComponent(projectId)}/kicad/open${q}`, {}).catch(
+      () => {},
+    );
+  };
+
   return (
     <a
       className={className || "link"}
       href={url}
       target="_blank"
       rel="noopener noreferrer"
+      onClick={ask}
       title={
         version
           ? `KiCad ${version}, running server-side in the container — for drawing a footprint or a symbol the libraries do not have`
