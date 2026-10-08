@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Proposal } from "../api";
+import { nextCommitWarning } from "./ChatPanel";
 import { FileView } from "./FileView";
 import { ProposalCard } from "./ProposalCard";
 
@@ -66,5 +67,19 @@ describe("a save after a failed commit", () => {
     await user.type(area, "y");
     await user.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(screen.queryByText(/not committed to git/)).not.toBeInTheDocument());
+  });
+});
+
+describe("the panel's commit warning", () => {
+  it("is set by a failed commit and cleared by a later accept that commits", () => {
+    const failed = nextCommitWarning(null, "accepted", "a.md: accepted — not committed");
+    expect(failed).toBe("a.md: accepted — not committed");
+    expect(nextCommitWarning(failed, "accepted")).toBeNull();
+  });
+
+  it("is left alone by a rejection", () => {
+    expect(nextCommitWarning("a.md: accepted — not committed", "rejected")).toBe(
+      "a.md: accepted — not committed",
+    );
   });
 });

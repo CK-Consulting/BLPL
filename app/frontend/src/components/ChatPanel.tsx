@@ -111,6 +111,24 @@ function turnInFlightId(e: unknown): string | null {
   return detail?.error === "turn_in_flight" && detail.turn_id ? detail.turn_id : null;
 }
 
+/**
+ * The panel's commit warning after a proposal is decided.
+ *
+ * A failed commit sets it. A later accept that commits clears it: the commit
+ * stages the whole checkout, so it also commits whatever the failed one left,
+ * and a warning still claiming that edit is uncommitted would be wrong.
+ * A rejection says nothing about git, so it leaves the warning alone.
+ */
+export function nextCommitWarning(
+  prev: string | null,
+  status: string,
+  warning?: string,
+): string | null {
+  if (warning) return warning;
+  if (status === "accepted") return null;
+  return prev;
+}
+
 export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [filename, setFilename] = useState<string | null>(null);
@@ -812,7 +830,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
 
   const onDecided = (id: string, status: string, warning?: string) => {
     setDecided((d) => ({ ...d, [id]: status }));
-    if (warning) setCommitWarning(warning);
+    setCommitWarning((prev) => nextCommitWarning(prev, status, warning));
     refreshProposals();
     if (status === "accepted") onApplied();
   };
