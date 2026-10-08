@@ -434,3 +434,95 @@ def test_pdf_bytes_under_another_name_are_released_as_a_pdf(tmp_path, monkeypatc
         BENIGN + b"%2\n", tmp_path, original_name="guide.txt", kind="reference", uploaded_by="a@x"
     )
     assert rec.released_as == "guide.pdf"
+
+
+# -- a datasheet filed under its part ----------------------------------------
+#
+# The agent's fetch_datasheet tool downloads into datasheets/<MPN>/. The fetcher
+# used to infer the project as the parent of that directory — datasheets/ — so
+# the quarantine was created at datasheets/retrieved/ (outside the ignore rule,
+# and visible to every datasheet lookup), passed files landed in
+# datasheets/datasheets/, and "already downloaded" never found them.
+
+
+def test_a_datasheet_filed_under_its_part_is_quarantined_at_the_project_root(tmp_path, resolver):
+    from blpl.agent.tools.parts import fetch_datasheet
+
+    resolver.write_bytes(BENIGN)
+    proj = tmp_path / "proj"
+    part = proj / "datasheets" / "TPS62840"
+    got = fetch_datasheet("TPS62840", part, project_dir=proj)
+
+    assert got.ok
+    assert Path(got.path) == part / "TPS62840.pdf"
+    assert (proj / "retrieved" / quarantine.LEDGER_NAME).is_file()
+    assert not (proj / "datasheets" / "retrieved").exists()
+    assert not (proj / "datasheets" / "datasheets").exists()
+    # …and the next lookup finds it rather than downloading it again.
+    again = fetch_datasheet("TPS62840", part, project_dir=proj)
+    assert again.ok and again.distributor == "cache"
+
+
+def test_a_held_datasheet_filed_under_its_part_stays_out_of_datasheets(tmp_path, resolver):
+    from blpl.agent.tools.parts import fetch_datasheet
+
+    resolver.write_bytes(PHONES_HOME)
+    proj = tmp_path / "proj"
+    got = fetch_datasheet("EVIL", proj / "datasheets" / "EVIL", project_dir=proj)
+
+    assert not got.ok and got.held
+    assert list((proj / "retrieved").glob("*.pdf"))
+    assert not [p for p in (proj / "datasheets").rglob("*.pdf")]
+
+
+# -- a held file is never a datasheet ---------------------------------------
+
+
+def _misplaced_quarantine(proj: Path) -> Path:
+    """The layout the bug produced: a held file inside datasheets/retrieved/."""
+    held = proj / "datasheets" / "retrieved" / "327429e564bc-LBAA0XV2DT-158.pdf"
+    held.parent.mkdir(parents=True)
+    held.write_bytes(PHONES_HOME)
+    return held
+
+
+def test_the_resolver_never_offers_a_quarantined_file(tmp_path):
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "proj"
+    _misplaced_quarantine(proj)
+    r = datasheet_files.resolve(proj, "LBAA0XV2DT-158")
+    assert r.path is None
+
+
+def test_a_map_row_pointing_into_quarantine_is_refused(tmp_path):
+    # What verdacor-ear-tag's datasheets.md actually held.
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "proj"
+    _misplaced_quarantine(proj)
+    datasheet_files.record(proj, "LBAA0XV2DT-158", "retrieved/327429e564bc-LBAA0XV2DT-158.pdf")
+    r = datasheet_files.resolve(proj, "LBAA0XV2DT-158")
+    assert r.path is None
+    assert "quarantine" in r.detail
+
+
+def test_naming_a_quarantined_file_explicitly_is_refused(tmp_path):
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "proj"
+    _misplaced_quarantine(proj)
+    r = datasheet_files.resolve(
+        proj, "LBAA0XV2DT-158", file="retrieved/327429e564bc-LBAA0XV2DT-158.pdf"
+    )
+    assert r.path is None
+
+
+# -- the same decision for bytes that arrive another way ---------------------
+
+
+def test_assess_decides_as_accept_does_without_storing(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    assert quarantine.assess(BENIGN, is_pdf=True).reasons == []
+    held = quarantine.assess(PHONES_HOME, is_pdf=True)
+    assert held.reasons == quarantine.accept(PHONES_HOME, tmp_path, mpn="X").reasons
