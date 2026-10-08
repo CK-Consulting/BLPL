@@ -33,9 +33,10 @@ jobs:
           persist-credentials: false
 
       # The emitter and library tests resolve against KiCad's stock symbols and
-      # footprints. The other submodules are large and not needed here.
+      # footprints, and stage 7's KLC check lives in kicad-library-utils. The
+      # other submodules are large and not needed here.
       - name: Stock KiCad libraries
-        run: git submodule update --init --depth 1 -- kicad-symbols kicad-footprints
+        run: git submodule update --init --depth 1 -- kicad-symbols kicad-footprints kicad-library-utils
 
       - uses: actions/setup-python@v5
         with:
@@ -47,14 +48,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]' -r app/backend/requirements.txt
 
-      # The three ignored files need what only exists in the backend image
-      # (kicad-cli, a running KiCad desktop, the worker's process model).
       - name: Test
-        run: >
-          python -m pytest tests/ -q
-          --ignore=tests/test_kicad_desktop_gate.py
-          --ignore=tests/test_onboarding.py
-          --ignore=tests/test_worker_cancel.py
+        run: python -m pytest tests/ -q
 
   frontend:
     runs-on: ubuntu-latest
