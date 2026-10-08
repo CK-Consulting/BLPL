@@ -531,13 +531,20 @@ def authz_gate(
 
 @app.get("/api/health")
 def health() -> dict:
-    kicad = subprocess.run(
-        ["kicad-cli", "--version"], capture_output=True, text=True, check=False
-    )
+    # Reported, never raised: `kicad_cli: null` is the answer when KiCad is
+    # missing, and subprocess raises FileNotFoundError for a binary that is
+    # not on PATH — which made the health check a 500 exactly when it had
+    # something to say.
+    try:
+        kicad = subprocess.run(
+            ["kicad-cli", "--version"], capture_output=True, text=True, check=False, timeout=10
+        ).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        kicad = None
     return {
         "status": "ok",
         "projects_root": str(PROJECTS_ROOT),
-        "kicad_cli": kicad.stdout.strip() or None,
+        "kicad_cli": kicad,
     }
 
 

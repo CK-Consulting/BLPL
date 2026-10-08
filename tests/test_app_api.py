@@ -35,6 +35,15 @@ def test_health_is_reachable_without_a_session(client) -> None:
     assert client.get("/api/health").status_code == 200
 
 
+def test_health_reports_a_missing_kicad_cli_instead_of_failing(client, monkeypatch, tmp_path) -> None:
+    # Found by the first CI run: a runner has no KiCad, and the health check
+    # answered 500 instead of saying so.
+    monkeypatch.setenv("PATH", str(tmp_path))
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["kicad_cli"] is None
+
+
 def test_the_config_probe_is_reachable_without_a_session(client) -> None:
     """The UI must be able to tell "you are signed out" from "this server has no
     Clerk issuer set" — they look identical in a browser and have completely

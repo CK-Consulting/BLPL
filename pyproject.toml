@@ -29,7 +29,7 @@ all-llm = ["anthropic>=0.39", "openai>=1.0", "ollama>=0.3"]
 # three DoS variants, parameter smuggling). Keep the two in step with
 # app/backend/requirements.txt, which pins the container's exact version.
 webapp = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "watchfiles>=0.22", "python-multipart>=0.0.31"]
-dev = ["pytest>=7.4", "rich>=13.0"]
+dev = ["pytest>=7.4", "rich>=13.0", "httpx>=0.27"]  # httpx: starlette TestClient
 
 [project.scripts]
 blpl = "blpl.core.cli:main"
