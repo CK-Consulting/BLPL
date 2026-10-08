@@ -123,3 +123,38 @@ def test_a_member_who_is_not_the_owner_cannot_set_it(unlocked, second_user):
 
     r = second_user.put("/api/projects/mine/git/remote", json={"url": "https://github.com/o/p.git"})
     assert r.status_code == 403
+
+
+def test_a_malformed_url_is_a_validation_error_not_a_crash(deployment_protocols):
+    # Codex P2 on #10: urlsplit raises ValueError on an unclosed IPv6 bracket,
+    # which the routes (expecting ProjectError) turned into a 500.
+    with pytest.raises(ProjectError):
+        check_remote_url("https://[bad/repo")
+
+
+def test_changing_the_remote_changes_the_one_the_branch_tracks(tmp_path):
+    # Codex P1 on #10: with only a non-origin remote, tracked by the branch,
+    # set_remote added a new origin. The panel then showed it while pull and
+    # push kept using the old upstream, and credentials were leased for origin.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    bare = tmp_path / "upstream.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(work), str(bare)], check=True)
+    subprocess.run(["git", "remote", "add", "upstream", f"file://{bare}"], cwd=work, check=True)
+    subprocess.run(["git", "fetch", "-q", "upstream"], cwd=work, check=True)
+    subprocess.run(["git", "branch", "-q", "--set-upstream-to=upstream/main"], cwd=work, check=True)
+
+    store.set_remote(work, "https://github.com/o/new.git")
+
+    remotes = subprocess.run(["git", "remote"], cwd=work, capture_output=True, text=True).stdout.split()
+    assert remotes == ["upstream"]
+    st = store.status("p", checkout=work)
+    assert (st.remote_name, st.remote_url) == ("upstream", "https://github.com/o/new.git")
+    assert store.remote_of("p") == "https://github.com/o/new.git"
+
+
+def test_with_no_remote_at_all_origin_is_added(tmp_path):
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    store.set_remote(work, "git@github.com:o/p.git")
+    assert subprocess.run(["git", "remote"], cwd=work, capture_output=True, text=True).stdout.split() == ["origin"]
