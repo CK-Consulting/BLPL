@@ -1,5 +1,3 @@
-import { existsSync } from "node:fs";
-
 import { describe, expect, it } from "vitest";
 
 /**
@@ -26,10 +24,13 @@ describe("the KaTeX mermaid is given", () => {
     });
   }
 
-  it("is the only KaTeX installed — mermaid has no private copy", () => {
+  it("is the only KaTeX installed — mermaid has no private copy", async () => {
     // What the override exists to guarantee. Without it, npm nests mermaid's
     // own katex@0.16 here, and the tests above pass against ours regardless.
-    expect(existsSync("node_modules/mermaid/node_modules/katex")).toBe(false);
+    // node:fs by a computed name: the build type-checks tests with no Node
+    // types, and this is the one test that needs the filesystem.
+    const fs: { existsSync(path: string): boolean } = await import(/* @vite-ignore */ "node:" + "fs");
+    expect(fs.existsSync("node_modules/mermaid/node_modules/katex")).toBe(false);
   });
 
   it("still throws on bad TeX, which mermaid relies on", async () => {
