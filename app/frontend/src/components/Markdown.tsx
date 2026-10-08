@@ -1,8 +1,10 @@
 import { useMemo } from "react";
 import DOMPurify from "dompurify";
-import { marked } from "marked";
+import { Marked } from "marked";
+import "katex/dist/katex.min.css";
 
 import { Diagram } from "./Diagram";
+import { mathExtension } from "./math";
 
 /**
  * Assistant prose, rendered.
@@ -38,6 +40,14 @@ export function splitDiagrams(text: string): { kind: "prose" | "diagram"; body: 
   return out.filter((p) => p.body.trim());
 }
 
+const md = new Marked({ async: false, breaks: true, gfm: true }, mathExtension());
+
+/** Prose to sanitized HTML. KaTeX draws some glyphs (roots, stretchy arrows) as SVG. */
+export function renderProse(text: string): string {
+  const raw = md.parse(text ?? "") as string;
+  return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true, svg: true } });
+}
+
 export function Markdown({ text }: { text: string }) {
   const parts = useMemo(() => splitDiagrams(text ?? ""), [text]);
   return (
@@ -54,10 +64,7 @@ export function Markdown({ text }: { text: string }) {
 }
 
 function Prose({ text }: { text: string }) {
-  const html = useMemo(() => {
-    const raw = marked.parse(text ?? "", { async: false, breaks: true, gfm: true }) as string;
-    return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
-  }, [text]);
+  const html = useMemo(() => renderProse(text), [text]);
 
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }

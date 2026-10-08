@@ -78,6 +78,27 @@ describe("a 423 that names a sealed project", () => {
     // a passphrase prompt for something the client just fixed itself.
     expect(needsUnlock).not.toHaveBeenCalled();
   });
+
+  it("sends one open however many requests find it sealed", async () => {
+    let open = false;
+    let opens = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (path: string) => {
+        if (path === "/api/projects/proj/open") {
+          opens++;
+          await new Promise((r) => setTimeout(r, 10));
+          open = true;
+          return res(200);
+        }
+        return open ? res(200, {}, '{"ok":true}') : res(423, { "X-BLPL-Sealed": "proj" });
+      }),
+    );
+
+    const all = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => getJSON(`/api/x${i}`)));
+    expect(all).toHaveLength(6);
+    expect(opens).toBe(1);
+  });
 });
 
 describe("a 401", () => {

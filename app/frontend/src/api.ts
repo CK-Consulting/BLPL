@@ -71,6 +71,25 @@ async function send(path: string, init?: RequestInit): Promise<Response> {
   });
 }
 
+// One open per sealed project, however many requests discover it is sealed.
+// A page load asks a project for several things at once, every one of them got
+// its own 423, and every one of them sent its own open: six in 75 ms on the day
+// that raced the server's unseal into restoring a repository without its HEAD.
+// The server now serialises opens, and this stops the storm at the source.
+const opening = new Map<string, Promise<boolean>>();
+
+function openOnce(project: string): Promise<boolean> {
+  let p = opening.get(project);
+  if (!p) {
+    p = send(`/api/projects/${project}/open`, { method: "POST" })
+      .then((r) => r.ok)
+      .catch(() => false)
+      .finally(() => opening.delete(project));
+    opening.set(project, p);
+  }
+  return p;
+}
+
 async function request(path: string, init?: RequestInit): Promise<Response> {
   let res = await send(path, init);
 
@@ -91,8 +110,7 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
   if (sealed) {
     // Once. A second 423 means opening did not work, and retrying in a loop
     // would turn one bad state into a request storm.
-    const opened = await send(`/api/projects/${sealed}/open`, { method: "POST" });
-    if (opened.ok) res = await send(path, init);
+    if (await openOnce(sealed)) res = await send(path, init);
   } else if (res.status === 423) {
     // The other 423: the session has no key. Nothing to retry — a passphrase
     // has to be typed — so ask for it instead of letting the status reach a

@@ -42,10 +42,13 @@ window is better than losing an afternoon.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import io
 import os
 import shutil
 import tarfile
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -200,7 +203,40 @@ def parts_of(projects_root: Path, project: str) -> list[tuple[str, Path]]:
     return parts
 
 
+@contextlib.contextmanager
+def _project_lock(projects_root: Path, project: str):
+    """Hold one project's seal/unseal lock.
+
+    Opening a project was not serialised, and the frontend can ask for it
+    several times at once — six `POST /open` in 75 ms, on one occasion. Every
+    one of them unsealed into the same staging directory: the later ones
+    `rmtree`d it while the first was mid-extract, four crashed on "Directory not
+    empty", and a survivor moved the half-deleted tree into place and removed
+    the blob. The project came back with its design files and without `HEAD`,
+    `config` or its branch ref, so git no longer recognised it as a repository
+    and every commit after that failed.
+
+    `flock` on a file beside the blobs, so the lock holds across the request
+    threads of one process and across the containers that share the bind
+    mount. Every call opens its own descriptor, which is what makes two
+    threads of the same process exclude each other.
+    """
+    lock_dir = Path(projects_root) / SEALED_DIR
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with open(lock_dir / f".{project}.lock", "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def seal(projects_root: Path, project: str, key: bytes) -> int:
+    with _project_lock(projects_root, project):
+        return _seal(projects_root, project, key)
+
+
+def _seal(projects_root: Path, project: str, key: bytes) -> int:
     """Archive the project and its worktrees, encrypt, and remove the plaintext.
 
     Written to a temporary file and moved into place, so an interrupted seal
@@ -245,8 +281,20 @@ def unseal(projects_root: Path, project: str, key: bytes) -> Path:
     between the two leaves both copies, and the next open finds the directory
     already there and uses it; doing it in the other order and dying leaves
     neither, which loses the project.
+
+    Serialised per project (see `_project_lock`). A caller that waited on the
+    lock behind another unseal of the same project finds the directory restored
+    and the blob gone, and returns the directory rather than failing.
     """
+    with _project_lock(projects_root, project):
+        return _unseal(projects_root, project, key)
+
+
+def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
     root = Path(projects_root)
+    repo = root / project
+    if repo.exists() and not sealed_path(root, project).exists():
+        return repo
     blob_path = sealed_path(root, project)
     if not blob_path.exists():
         raise WorkspaceError(f"nothing sealed at {blob_path}")
@@ -260,16 +308,16 @@ def unseal(projects_root: Path, project: str, key: bytes) -> Path:
             f"could not open {project!r} — this is not the key it was sealed with"
         ) from exc
 
-    repo = root / project
     if repo.exists():
         # Already open. Extracting over it would replace what is there with an
         # older copy, which is the shape of an accidental data loss.
         return repo
 
-    staging = root / SEALED_DIR / f".{project}.restore"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
+    # A directory of this call's own. The lock already keeps two restores of
+    # one project apart; a private staging directory means that even without
+    # it, no call can delete files another is extracting. A leftover from a
+    # restore that died is ignored rather than cleaned up here.
+    staging = Path(tempfile.mkdtemp(prefix=f".{project}.restore-", dir=root / SEALED_DIR))
     with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r") as tar:
         # filter="data" refuses absolute paths, links escaping the destination
         # and device nodes. The archive is one we wrote, but it arrives from
