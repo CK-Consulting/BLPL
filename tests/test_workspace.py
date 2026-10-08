@@ -324,3 +324,39 @@ def test_a_locked_session_is_not_mistaken_for_a_sealed_project(unlocked):
     r = unlocked.post("/api/projects/mine/stages/doctor")
     assert r.status_code == 423
     assert "X-BLPL-Sealed" not in r.headers
+
+
+def _git_repo_with_history(path: Path) -> None:
+    path.mkdir(parents=True)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+    for i in range(40):
+        (path / f"doc{i}.md").write_text(f"# doc {i}\n" * 200)
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "x"], cwd=path, check=True, env=env)
+
+
+def test_concurrent_opens_restore_one_whole_repository(tmp_path):
+    # Six opens of one sealed project, all at once — what the frontend sent on
+    # the day this broke. Each used to unseal into the same staging directory,
+    # rmtree another's half-finished extract, and one of them moved the
+    # remainder into place: a repository with its design files and no HEAD.
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    key = os.urandom(32)
+    workspace.seal(root, "p", key)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda _: workspace.unseal(root, "p", key), range(6)))
+
+    assert all(r == root / "p" for r in results)
+    assert not workspace.is_sealed(root, "p")
+    head = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root / "p",
+                          capture_output=True, text=True)
+    assert head.returncode == 0, head.stderr
+    assert head.stdout.strip() == "main"
+    assert len(list((root / "p").glob("doc*.md"))) == 40
+    assert not list((root / workspace.SEALED_DIR).glob(".p.restore*"))

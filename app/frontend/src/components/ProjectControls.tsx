@@ -342,17 +342,25 @@ export function ProjectSettings({
  */
 function ProjectGitPanel({ projectId }: { projectId: string }) {
   const [st, setSt] = useState<GitStatus | null>(null);
+  // A failure is its own state. It used to be caught into `null`, which is
+  // also what "still loading" looks like, so a repository git could not read
+  // sat at "Reading repository status…" forever and said nothing about why.
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    setSt(null);
+    setError(null);
     getJSON<GitStatus>(`/api/projects/${projectId}/git/status`)
       .then(setSt)
-      .catch(() => setSt(null));
+      .catch((e: Error) => setError(e.message || "could not read the repository"));
   }, [projectId]);
 
   return (
     <section className="proj-git">
       <h3>Git</h3>
-      {!st ? (
+      {error ? (
+        <p className="gate-error small">Could not read this project's repository: {error}</p>
+      ) : !st ? (
         <p className="muted small">Reading repository status…</p>
       ) : (
         <dl className="kv">
