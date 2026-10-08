@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import mermaid from "mermaid";
 
-import { houseStyle, isDiagramFile, looksLikeDiagram, withHouseStyle } from "./Diagram";
+import {
+  houseStyle,
+  isDiagramFile,
+  looksLikeDiagram,
+  repairLeftArrows,
+  withHouseStyle,
+} from "./Diagram";
 import { splitDiagrams } from "./Markdown";
 
 describe("spotting a diagram", () => {
@@ -116,5 +122,34 @@ describe("a diagram that will not parse", () => {
     );
     expect(stray).toHaveLength(0);
     expect(document.body.querySelectorAll("body > div[id^='dd']").length).toBe(before);
+  });
+});
+
+describe("left-pointing edges", () => {
+  it("are rejected by mermaid as written", async () => {
+    await expect(mermaid.parse("flowchart TB\n  U1 <--|IRQ| U4")).rejects.toThrow();
+  });
+
+  it("are turned around into something it parses", async () => {
+    const src = [
+      "flowchart TB",
+      "  U1 <--|BUSY / DIO9 / IRQ| U4",
+      "  U1 <-- U6",
+      "  U1 <-.-|x| U3",
+      "  U3 <-->|SUP| C_STORE",
+      "  A <-- text --> B",
+    ].join("\n");
+    const out = repairLeftArrows(src).split("\n");
+    expect(out[1]).toBe("  U4 -->|BUSY / DIO9 / IRQ| U1");
+    expect(out[2]).toBe("  U6 --> U1");
+    expect(out[3]).toBe("  U3 -.->|x| U1");
+    expect(out[4]).toBe("  U3 <-->|SUP| C_STORE");
+    expect(out[5]).toBe("  A <-- text --> B");
+    await expect(mermaid.parse(repairLeftArrows(src))).resolves.toBeTruthy();
+  });
+
+  it("leaves other diagram kinds alone", () => {
+    const seq = "sequenceDiagram\n  A <-- B";
+    expect(repairLeftArrows(seq)).toBe(seq);
   });
 });

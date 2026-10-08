@@ -163,6 +163,33 @@ export function withHouseStyle(source: string): string {
   return [...lines.slice(0, at + 1), ...style, ...lines.slice(at + 1)].join("\n") + "\n";
 }
 
+/**
+ * Turn left-pointing flowchart edges around: `A <--|x| B` becomes `B -->|x| A`.
+ *
+ * Mermaid has `-->` and `<-->` but no `<--`, and models write one anyway — it
+ * is the natural way to say "U4 interrupts U1" on a line about U1 — so one
+ * edge sank a whole 60-line block diagram. Reversing the edge draws exactly
+ * what was meant. Only bare node ids on both sides are rewritten; a line with a
+ * second arrow on it (`A <-- text --> B`, which is valid) is left alone, and so
+ * is anything that is not a flowchart. The file itself is not changed.
+ */
+const LEFT_EDGE = /^(\s*)([\w.-]+)\s*<(-{2,}|-\.+-|={2,})\s*(\|[^|]*\|)?\s*([\w.-]+)\s*(;?)\s*$/;
+
+export function repairLeftArrows(source: string): string {
+  const lines = source.split("\n");
+  const at = headerIndex(lines);
+  if (at < 0 || !STYLEABLE.test(lines[at])) return source;
+  return lines
+    .map((line, i) => {
+      if (i <= at) return line;
+      const m = LEFT_EDGE.exec(line);
+      if (!m) return line;
+      const [, indent, to, body, label = "", from, semi] = m;
+      return `${indent}${from} ${body}>${label} ${to}${semi}`;
+    })
+    .join("\n");
+}
+
 /** Diagram kinds Mermaid understands, used to spot one by its content. */
 const KINDS =
   /^\s*(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram(-v2)?|erDiagram|journey|gantt|pie|quadrantChart|requirementDiagram|gitGraph|mindmap|timeline|C4Context|block-beta|architecture-beta)\b/;
@@ -205,7 +232,7 @@ export function Diagram({ source }: { source: string }) {
     (async () => {
       try {
         const mermaid = await mermaidOnce();
-        const { svg: out } = await mermaid.render(id, withHouseStyle(source));
+        const { svg: out } = await mermaid.render(id, withHouseStyle(repairLeftArrows(source)));
         if (!cancelled) setSvg(out);
       } catch (e) {
         // A diagram that will not parse is shown as its source rather than as

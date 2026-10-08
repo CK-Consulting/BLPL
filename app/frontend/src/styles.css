@@ -966,3 +966,9 @@ header .kicad-launch { margin-left: .4rem; }
 .upload-results { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: .35rem; font-size: 14px; }
 .upload-result.held, .upload-result.rejected { color: #ffc0c0; }
 .tree-badge { margin-left: .4rem; padding: 0 .3rem; border: 1px solid #6b6f75; border-radius: 4px; font-size: 11px; white-space: nowrap; }
+
+/* Display math from KaTeX: a wide formula scrolls rather than widening the chat. */
+.md .math-block {
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
