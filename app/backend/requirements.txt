@@ -40,7 +40,7 @@ alembic==1.14.0
 #     time, and `kid` comes from the unverified header.
 # Also closed: unvalidated `crit` headers, non-HTTP JWKS URI schemes, a public
 # JWK accepted as an HMAC secret, and a b64=false decode amplifier.
-pyjwt[crypto]==2.13.0
+pyjwt[crypto]==2.15.0
 # WebAuthn ceremonies for the passkey unlock slot (app/passkeys.py). Signature
 # verification and CBOR attestation parsing are exactly the kind of
 # security-critical parsing not to hand-roll. Note the library does not model the
