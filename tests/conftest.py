@@ -40,6 +40,11 @@ os.environ["BLPL_DATA_ROOT"] = str(_SESSION_DATA / "data")
 os.environ["BLPL_PROJECTS_ROOT"] = str(_SESSION_DATA / "data" / "projects")
 atexit.register(shutil.rmtree, _SESSION_DATA, True)
 
+# The suite's git fixtures are local bare repositories, reached over file://.
+# Deployments allow only https and ssh; tests that check that refusal set the
+# default back explicitly.
+os.environ.setdefault("BLPL_GIT_ALLOWED_PROTOCOLS", "https:ssh:file")
+
 _PCBNEW_LEGACY_TESTS = [
     "test_copper*.py",
     "test_empty.py",

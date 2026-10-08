@@ -28,6 +28,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class ProjectError(RuntimeError):
@@ -128,6 +129,64 @@ def _redact_url(url: str) -> str:
     return f"{scheme}{user}:***@{rest}" if ":" in userinfo else f"{scheme}{user}@{rest}"
 
 
+# Remote transports git may use for anything a user names. Read by both the URL
+# check below and git itself (GIT_ALLOW_PROTOCOL), so the two cannot disagree.
+# `file` is for the test suite's local bare repositories and nothing else: a
+# deployment that allowed it would let any signed-in user clone another
+# project's repository off the server's own disk into a project they own.
+_DEFAULT_PROTOCOLS = "https:ssh"
+
+
+def allowed_protocols() -> list[str]:
+    raw = os.environ.get("BLPL_GIT_ALLOWED_PROTOCOLS", _DEFAULT_PROTOCOLS)
+    return [p.strip().lower() for p in raw.split(":") if p.strip()]
+
+
+def _net_env(env: dict[str, str] | None) -> dict[str, str]:
+    """Environment for a git command that talks to a remote."""
+    return {**(env or {}), "GIT_ALLOW_PROTOCOL": ":".join(allowed_protocols())}
+
+
+_SCP_LIKE = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9.-]+):(?P<path>[^:].*)$")
+
+
+def check_remote_url(url: str) -> str:
+    """The remote URL, if it is one a user may point a project at. Else raise.
+
+    Accepted: https://host/..., ssh://host/..., and git's user@host:path. Not:
+    local paths and file:// (another repository on this server's disk — the
+    clone route copied them for any signed-in user), transport helpers such as
+    ext::, and anything git could read as an option. `file` is accepted only
+    when BLPL_GIT_ALLOWED_PROTOCOLS includes it, which the test suite does.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        raise ProjectError("a remote URL is required")
+    if raw.startswith("-") or any(c.isspace() or ord(c) < 32 for c in raw):
+        raise ProjectError(f"{raw[:60]!r} is not a remote URL")
+    allowed = allowed_protocols()
+    if "://" in raw:
+        scheme = raw.split("://", 1)[0].lower()
+        if scheme not in allowed:
+            raise ProjectError(
+                f"{scheme}:// remotes are not allowed here; use an https:// or ssh:// URL"
+            )
+        if scheme != "file" and not urlsplit(raw).hostname:
+            raise ProjectError(f"{raw[:60]!r} names no host")
+        return raw
+    if "::" in raw:
+        raise ProjectError("git transport helpers (such as ext::) are not allowed")
+    m = _SCP_LIKE.match(raw)
+    if m and "ssh" in allowed:
+        return raw
+    if raw.startswith("/") and "file" in allowed:
+        return raw
+    raise ProjectError(
+        f"{raw[:60]!r} is not a remote URL — use https://host/owner/repo.git "
+        "or git@host:owner/repo.git (local paths are not allowed)"
+    )
+
+
 class Projects:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
@@ -171,7 +230,13 @@ class Projects:
         dest = self.project_dir(name)
         if dest.exists():
             raise ProjectError(f"project {name!r} already exists at {dest}")
-        self._git(self.root, "clone", "--branch", branch, remote, dest.name, env=env)
+        remote = check_remote_url(remote)
+        if branch.startswith("-"):
+            raise ProjectError(f"{branch!r} is not a branch name")
+        # `--` so nothing user-supplied can be read as an option to clone.
+        self._git(
+            self.root, "clone", "--branch", branch, "--", remote, dest.name, env=_net_env(env)
+        )
         self._ensure_identity(dest)
         return dest
 
@@ -249,6 +314,20 @@ class Projects:
 
     # -- sync ----------------------------------------------------------------
 
+    def set_remote(self, checkout: Path, url: str, *, remote: str = "origin") -> str:
+        """Point a project at a remote, adding it or changing its URL.
+
+        Set in the repository's config, so every member's worktree — which
+        shares that config — sees the same remote.
+        """
+        url = check_remote_url(url)
+        d = self._checkout("", checkout)
+        if remote in self._git(d, "remote").split():
+            self._git(d, "remote", "set-url", remote, url)
+        else:
+            self._git(d, "remote", "add", remote, url)
+        return url
+
     def remote_of(self, name: str) -> str:
         """The origin URL, or "" for a local-only project. For credential
         matching — which is why a missing remote is an empty answer, not an
@@ -270,7 +349,7 @@ class Projects:
             raise ProjectError(
                 f"branch {branch!r} has no upstream to pull from yet; push it first"
             )
-        return self._git(d, "pull", "--ff-only", env=env)
+        return self._git(d, "pull", "--ff-only", env=_net_env(env))
 
     def commit_all(self, name: str, message: str) -> str | None:
         """Stage everything and commit. Returns the commit output, or None if the
@@ -332,8 +411,8 @@ class Projects:
             # status can count ahead and behind from then on.
             names = self._git(d, "remote").split()
             remote = "origin" if "origin" in names else names[0]
-            return self._git(d, "push", "--set-upstream", remote, "HEAD", env=env)
-        return self._git(d, "push", env=env)
+            return self._git(d, "push", "--set-upstream", remote, "HEAD", env=_net_env(env))
+        return self._git(d, "push", env=_net_env(env))
 
     # -- inspection ----------------------------------------------------------
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { GitStatus, ImportResult, getJSON, postForm, postJSON } from "../api";
+import { GitStatus, ImportResult, getJSON, postForm, postJSON, putJSON } from "../api";
 import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
 import { ProjectIcon } from "./Icons";
 import { BoardConfigPanel } from "./BoardConfigPanel";
@@ -385,6 +385,92 @@ function ProjectGitPanel({ projectId }: { projectId: string }) {
           </dd>
         </dl>
       )}
+      {st && (
+        <RemoteForm
+          projectId={projectId}
+          hasRemote={st.has_remote}
+          onSet={(remote_name, remote_url) =>
+            setSt({ ...st, has_remote: true, remote_name, remote_url })
+          }
+        />
+      )}
     </section>
+  );
+}
+
+/**
+ * Add or change where Push goes.
+ *
+ * There was no way to do this in the app: the panel showed the remote and that
+ * was all, so a project created here stayed local-only unless someone edited
+ * its git config on the server. Owner only — the server decides that, and a
+ * member who tries is told why — and the URL is checked server-side the same
+ * way cloning is: https://, ssh:// or user@host:path, never a local path.
+ */
+export function RemoteForm({
+  projectId,
+  hasRemote,
+  onSet,
+}: {
+  projectId: string;
+  hasRemote: boolean;
+  onSet: (remoteName: string, remoteUrl: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!open) {
+    return (
+      <button className="link" onClick={() => setOpen(true)}>
+        {hasRemote ? "Change remote…" : "Add a remote…"}
+      </button>
+    );
+  }
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const out = await putJSON<{ remote_name: string; remote_url: string }>(
+        `/api/projects/${projectId}/git/remote`,
+        { url: url.trim() },
+      );
+      onSet(out.remote_name, out.remote_url);
+      setOpen(false);
+      setUrl("");
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form className="remote-form" onSubmit={submit}>
+      <label className="small">
+        Remote URL
+        <input
+          type="text"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="https://github.com/owner/repo.git or git@github.com:owner/repo.git"
+          aria-label="Remote URL"
+          autoFocus
+        />
+      </label>
+      <p className="muted small">
+        Credentials for a private remote go in Account &amp; app settings → Git endpoints/accounts, per user — not in this URL.
+      </p>
+      {error && <p className="gate-error small">{error}</p>}
+      <button type="submit" disabled={busy || !url.trim()}>
+        {busy ? "Saving…" : "Save remote"}
+      </button>{" "}
+      <button type="button" className="link" onClick={() => setOpen(false)}>
+        Cancel
+      </button>
+    </form>
   );
 }

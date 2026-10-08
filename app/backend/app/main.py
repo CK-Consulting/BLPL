@@ -2388,6 +2388,38 @@ def git_status(project_id: str, user: User = Depends(require_onboarded),
     }
 
 
+class RemoteBody(BaseModel):
+    url: str
+
+
+@app.put("/api/projects/{project_id}/git/remote")
+def set_git_remote(
+    project_id: str,
+    body: RemoteBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Point a project at a remote. Owner only.
+
+    Where Push sends every member's work is the owner's decision, the same as
+    who may see the project. The URL passes the same check as cloning —
+    https://, ssh:// or user@host:path, never a path on this server.
+    """
+    try:
+        projectacl.require_owner(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    except projectacl.NotTheOwner:
+        raise HTTPException(status_code=403, detail="only the owner can set this project's remote")
+    checkout = _project_dir(session, user, project_id)
+    try:
+        projects.set_remote(checkout, body.url)
+        st = projects.status(project_id, checkout=checkout)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "remote_name": st.remote_name, "remote_url": st.remote_url}
+
+
 class CommitBody(BaseModel):
     message: str
 
