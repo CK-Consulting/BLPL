@@ -139,9 +139,15 @@ export function FileView({
   const save = async () => {
     if (!path || !savable) return;
     try {
-      await putJSON(`/api/projects/${projectId}/files/${path}`, { content: draft });
+      const out = await putJSON<{ commit_error?: string }>(
+        `/api/projects/${projectId}/files/${path}`,
+        { content: draft },
+      );
       setContent(draft);
+      // A save can land and still fail to commit. Saying only "Saved" then is
+      // how a broken repository went unnoticed for two days.
       setStatus("Saved");
+      if (out?.commit_error) setError(`Saved — ${out.commit_error}`);
       onSaved();
     } catch (e) {
       setError((e as Error).message);

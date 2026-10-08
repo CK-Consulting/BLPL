@@ -117,8 +117,14 @@ export function ProposalCard({ projectId, proposal, onDecided }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await postJSON(`/api/projects/${projectId}/proposals/${proposal.id}`, { action });
+      const out = await postJSON<{ commit_error?: string }>(
+        `/api/projects/${projectId}/proposals/${proposal.id}`,
+        { action },
+      );
       setStatus(action === "accept" ? "accepted" : "rejected");
+      // Accepted and on disk, but git refused it: say so on the card, rather
+      // than letting "accepted" imply it is in the history.
+      if (out?.commit_error) setError(`Accepted — ${out.commit_error}`);
       onDecided(proposal.id, action === "accept" ? "accepted" : "rejected");
     } catch (e) {
       // The common one is a stale proposal — the file changed under it. That is

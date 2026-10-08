@@ -74,9 +74,13 @@ export function UploadDialog({
     setBusy(true);
     setError(null);
     try {
-      const out = await postForm<{ results: UploadResult[] }>(`/api/projects/${projectId}/uploads`, form);
+      const out = await postForm<{ results: UploadResult[]; commit_error?: string }>(
+        `/api/projects/${projectId}/uploads`,
+        form,
+      );
       setResults(out.results);
       setRows([]);
+      if (out.commit_error) setError(`Uploaded — ${out.commit_error}`);
       if (out.results.some((r) => r.state === "released")) onUploaded?.();
     } catch (e) {
       setError((e as Error).message);

@@ -3103,6 +3103,27 @@ def read_file(project_id: str, name: str, user: User = Depends(require_onboarded
     return {"name": name, "content": target.read_text(encoding="utf-8", errors="replace")}
 
 
+
+def _commit_landed_write(checkout: Path, message: str) -> dict:
+    """Commit a write that has already landed, and say plainly if that failed.
+
+    Four routes write a file and then commit it, and all four used to catch the
+    failure and answer `committed: false` — the same answer as "there was
+    nothing to commit". So when a project's repository lost its HEAD to a
+    restore race, every accepted proposal, save and upload for two days went
+    uncommitted with nothing anywhere saying so. Not fatal, still: the bytes
+    are on disk and refusing the write that landed would be a lie. But the
+    failure travels back as a sentence, and into the log.
+    """
+    try:
+        return {"committed": projects.commit_checkout(checkout, message) is not None}
+    except ProjectError as exc:
+        logger.warning("commit failed in %s (%s): %s", checkout, message, exc)
+        return {
+            "committed": False,
+            "commit_error": f"saved, but not committed to git: {exc}",
+        }
+
 @app.put("/api/projects/{project_id}/files/{name:path}")
 def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
@@ -3124,19 +3145,14 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     #
     # Failure to commit is reported, never fatal. The bytes are already on disk
     # and refusing the save that landed would be a lie about what happened.
-    committed = False
-    try:
-        # In the checkout the file was written to, which for a member is their
-        # own worktree rather than the repository directory the name resolves to.
-        checkout = _project_dir(session, user, project_id)
-        committed = projects.commit_checkout(checkout, f"edit: {name}") is not None
-    except ProjectError:
-        committed = False
+    # In the checkout the file was written to, which for a member is their own
+    # worktree rather than the repository directory the name resolves to.
+    commit = _commit_landed_write(_project_dir(session, user, project_id), f"edit: {name}")
     return {
         "ok": True,
         "name": name,
         "bytes": target.stat().st_size,
-        "committed": committed,
+        **commit,
     }
 
 
@@ -3240,14 +3256,10 @@ async def upload_files(
             session, _project_or_404(session, user, project_id), user, activity.UPLOADED,
             ", ".join(r["name"] for r in landed),
         )
-    committed = False
-    try:
-        # Released files and the ledger; retrieved/ itself is gitignored, so a
-        # held file never enters history.
-        committed = projects.commit_checkout(proj, f"upload: {len(landed)} file(s)") is not None
-    except ProjectError:
-        committed = False
-    return {"results": results, "committed": committed}
+    # Released files and the ledger; retrieved/ itself is gitignored, so a
+    # held file never enters history.
+    commit = _commit_landed_write(proj, f"upload: {len(landed)} file(s)")
+    return {"results": results, **commit}
 
 
 @app.get("/api/projects/{project_id}/quarantine")
@@ -3292,14 +3304,11 @@ def set_llm_ignore(
         raise HTTPException(status_code=404, detail=f"no file {body.path!r} in this project")
     rel = target.relative_to(proj.resolve()).as_posix()
     changed = llm_ignore.set_ignored(proj, rel, body.ignored, by=user.email or f"user {user.id}")
-    committed = False
+    commit: dict = {"committed": False}
     if changed:
         verb = "ignore" if body.ignored else "unignore"
-        try:
-            committed = projects.commit_checkout(proj, f"llm-{verb}: {rel}") is not None
-        except ProjectError:
-            committed = False
-    return {"path": rel, "ignored": body.ignored, "changed": changed, "committed": committed}
+        commit = _commit_landed_write(proj, f"llm-{verb}: {rel}")
+    return {"path": rel, "ignored": body.ignored, "changed": changed, **commit}
 
 
 class FolderBody(BaseModel):
@@ -4637,14 +4646,10 @@ def decide_proposal(
         raise HTTPException(status_code=409, detail=detail)
 
     store.set_status(proposal, "accepted")
-    committed = False
-    try:
-        committed = projects.commit_checkout(proj, f"chat: {proposal.rationale or proposal.path}") is not None
-    except ProjectError:
-        # A project without git history still gets its file. Losing the commit is
-        # worth reporting, not worth refusing the edit that already landed.
-        committed = False
-    return {"ok": True, "status": "accepted", "detail": detail, "committed": committed}
+    # A project without working git history still gets its file. Losing the
+    # commit is worth reporting, not worth refusing the edit that already landed.
+    commit = _commit_landed_write(proj, f"chat: {proposal.rationale or proposal.path}")
+    return {"ok": True, "status": "accepted", "detail": detail, **commit}
 
 
 # --------------------------------------------------------------------------
