@@ -46,7 +46,9 @@ import contextlib
 import fcntl
 import io
 import os
+import re
 import shutil
+import sys
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
@@ -231,9 +233,101 @@ def _project_lock(projects_root: Path, project: str):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+def _restore_dir(projects_root: Path, project: str) -> Path:
+    """Where this project's restores extract: a directory of its own.
+
+    One per project rather than a name prefix in a shared directory, because
+    project names may contain dots, and reaping by `.{name}.restore*` would let
+    one project's cleanup match another's in-flight restore.
+    """
+    return Path(projects_root) / SEALED_DIR / ".restore" / project
+
+
+def _remove_plaintext(path: Path) -> None:
+    """Delete a tree of decrypted files, or raise.
+
+    `rmtree(ignore_errors=True)` was the wrong tool for plaintext: a directory
+    the backend user cannot write into — a read-only folder inside a project,
+    say — made it give up quietly, and the caller went on to report a seal
+    that had left the files on disk. A permission failure is retried once with
+    the owner's write bit restored, since everything here is ours; anything
+    still standing afterwards is an error, not a success.
+    """
+    if not os.path.lexists(path):
+        return
+
+    def make_writable_and_retry(func, target, _exc):
+        # Only real directories inside the tree are made writable: the
+        # containing directory, which is what unlinking or rmdir-ing an entry
+        # needs, and the target itself when it is a directory being listed.
+        # Never a symlink — os.chmod follows links, so chmod-ing one would
+        # change the permissions of whatever it points at, anywhere the
+        # backend user owns something.
+        for d in (os.path.dirname(target), target):
+            if os.path.islink(d) or not os.path.isdir(d):
+                continue
+            try:
+                os.chmod(d, os.stat(d).st_mode | 0o700)
+            except OSError:
+                pass
+        func(target)
+
+    # `onexc` from 3.12; 3.11 (still supported) only has `onerror`. Both call
+    # the handler as (function, path, error).
+    hook = "onexc" if sys.version_info >= (3, 12) else "onerror"
+    try:
+        shutil.rmtree(path, **{hook: make_writable_and_retry})
+    except OSError as exc:
+        raise WorkspaceError(f"could not remove decrypted files at {path}: {exc}") from exc
+    if os.path.lexists(path):
+        raise WorkspaceError(f"could not remove decrypted files at {path}")
+
+
+def _reap_restores(projects_root: Path, project: str) -> None:
+    """Delete plaintext left by restores of this project that did not finish.
+
+    A restore holds decrypted files until it moves them into place. One that
+    died part way — an extract error, a killed process — leaves them behind,
+    and with nothing to reap them they would sit beside the blob indefinitely,
+    which is exactly what sealing exists to prevent. Called only under the
+    project lock, so anything found here belongs to no live restore.
+    """
+    sealed = Path(projects_root) / SEALED_DIR
+    _remove_plaintext(_restore_dir(projects_root, project))
+    # The fixed name restores used before #45.
+    _remove_plaintext(sealed / f".{project}.restore")
+    # #45's layout: `mkdtemp(prefix=".{project}.restore-")`, which appends
+    # exactly eight characters from [a-z0-9_]. Matched exactly, not as a prefix:
+    # another project's directory could only match by having a name of the
+    # same length, which makes it this project's name.
+    own = re.compile(re.escape(f".{project}.restore-") + r"[a-z0-9_]{8}")
+    if sealed.is_dir():
+        for entry in sealed.iterdir():
+            if own.fullmatch(entry.name) and entry.is_dir() and not entry.is_symlink():
+                _remove_plaintext(entry)
+
+
 def seal(projects_root: Path, project: str, key: bytes) -> int:
     with _project_lock(projects_root, project):
-        return _seal(projects_root, project, key)
+        try:
+            root = Path(projects_root)
+            if not (root / project).exists() and is_sealed(root, project):
+                # An earlier seal wrote the blob and then stopped part way
+                # through removing the plaintext. The blob was complete before
+                # anything moved, so finish the removal. Archiving what is left
+                # would overwrite that blob with the worktrees alone and lose
+                # the repository.
+                _reap_restores(root, project)
+                for _name, path in parts_of(root, project):
+                    if path.is_dir():
+                        _remove_plaintext(path)
+                return sealed_path(root, project).stat().st_size
+            _reap_restores(root, project)
+            return _seal(root, project, key)
+        except OSError as exc:
+            # As a WorkspaceError, so the caller keeps the workspace registered
+            # and retries, rather than one project's failure ending the sweep.
+            raise WorkspaceError(f"could not seal {project!r}: {exc}") from exc
 
 
 def _seal(projects_root: Path, project: str, key: bytes) -> int:
@@ -269,8 +363,19 @@ def _seal(projects_root: Path, project: str, key: bytes) -> int:
     tmp.write_bytes(blob)
     os.replace(tmp, target)
 
-    for _name, path in parts:
-        shutil.rmtree(path)
+    # The blob is complete, so the plaintext can go — repository first, and by
+    # an atomic rename rather than an rmtree. Unsealing treats "the repository
+    # directory exists" as "this project is open and whole"; an rmtree killed
+    # part way leaves half a repository there, which is exactly how one came
+    # back once without its HEAD. Renamed aside first, whatever is left behind
+    # by a kill is reaped as staging, and a worktree directory with no
+    # repository beside it is recognised as a leftover the blob already holds.
+    trash_parent = _restore_dir(root, project)
+    trash_parent.mkdir(parents=True, exist_ok=True)
+    trash = Path(tempfile.mkdtemp(dir=trash_parent))
+    for name, path in sorted(parts, key=lambda p: p[0] != "repo"):
+        os.replace(path, trash / name)
+    _remove_plaintext(trash)
     return len(blob)
 
 
@@ -287,7 +392,11 @@ def unseal(projects_root: Path, project: str, key: bytes) -> Path:
     and the blob gone, and returns the directory rather than failing.
     """
     with _project_lock(projects_root, project):
-        return _unseal(projects_root, project, key)
+        try:
+            _reap_restores(projects_root, project)
+            return _unseal(projects_root, project, key)
+        except OSError as exc:
+            raise WorkspaceError(f"could not open {project!r}: {exc}") from exc
 
 
 def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
@@ -315,23 +424,39 @@ def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
 
     # A directory of this call's own. The lock already keeps two restores of
     # one project apart; a private staging directory means that even without
-    # it, no call can delete files another is extracting. A leftover from a
-    # restore that died is ignored rather than cleaned up here.
-    staging = Path(tempfile.mkdtemp(prefix=f".{project}.restore-", dir=root / SEALED_DIR))
-    with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r") as tar:
-        # filter="data" refuses absolute paths, links escaping the destination
-        # and device nodes. The archive is one we wrote, but it arrives from
-        # disk and is decrypted with a key several people hold, so it is treated
-        # as input rather than trusted.
-        tar.extractall(staging, filter="data")
+    # it, no call can delete files another is extracting. It holds plaintext,
+    # so it goes on every exit, and `_reap_restores` catches the exits that
+    # never reach this `finally` (a killed process).
+    parent = _restore_dir(root, project)
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=parent))
+    try:
+        with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r") as tar:
+            # filter="data" refuses absolute paths, links escaping the
+            # destination and device nodes. The archive is one we wrote, but it
+            # arrives from disk and is decrypted with a key several people hold,
+            # so it is treated as input rather than trusted.
+            tar.extractall(staging, filter="data")
 
-    # Into place only once everything has extracted. A half-restored project
-    # would look real to every listing and to git.
-    (root / ".worktrees").mkdir(parents=True, exist_ok=True)
-    os.replace(staging / "repo", repo)
-    if (staging / "worktrees").is_dir():
-        os.replace(staging / "worktrees", root / ".worktrees" / project)
-    shutil.rmtree(staging, ignore_errors=True)
+        # Into place only once everything has extracted, and the repository
+        # last: its directory appearing is what marks the restore complete, so
+        # a kill before it leaves nothing that looks open. A worktree directory
+        # already there with no repository beside it is the remainder of an
+        # interrupted restore or seal — the blob, which is removed only after
+        # everything is in place, holds the same files — so it is replaced
+        # rather than kept or merged. Moving the repository first instead lost
+        # every member's worktree to a kill between the two renames: the next
+        # restore saw the repository, returned, and the next seal archived the
+        # project without them.
+        if (staging / "worktrees").is_dir():
+            dest = root / ".worktrees" / project
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                _remove_plaintext(dest)
+            os.replace(staging / "worktrees", dest)
+        os.replace(staging / "repo", repo)
+    finally:
+        _remove_plaintext(staging)
 
     blob_path.unlink()
     return repo

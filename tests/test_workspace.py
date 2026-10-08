@@ -283,7 +283,9 @@ def test_an_interrupted_seal_never_loses_the_project(unlocked):
 
     os.replace = die_before_swapping_it_in
     try:
-        with __import__("pytest").raises(OSError):
+        # Raised as a WorkspaceError since #46, so callers keep the workspace
+        # registered; the guarantee is the files below, not the type.
+        with __import__("pytest").raises((OSError, workspace.WorkspaceError)):
             workspace.seal(main.PROJECTS_ROOT, "mine", key)
     finally:
         os.replace = real_replace
@@ -359,4 +361,281 @@ def test_concurrent_opens_restore_one_whole_repository(tmp_path):
     assert head.returncode == 0, head.stderr
     assert head.stdout.strip() == "main"
     assert len(list((root / "p").glob("doc*.md"))) == 40
-    assert not list((root / workspace.SEALED_DIR).glob(".p.restore*"))
+    staging = root / workspace.SEALED_DIR / ".restore" / "p"
+    assert not staging.exists() or not any(staging.iterdir())
+
+
+def test_a_failed_restore_leaves_no_plaintext_behind(tmp_path, monkeypatch):
+    # Codex P1 on #45: staging was removed only on success, and each restore
+    # used a fresh name that later restores ignored — so an extract that died
+    # part way left decrypted files beside the blob for good.
+    import tarfile
+
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    key = os.urandom(32)
+    workspace.seal(root, "p", key)
+
+    real = tarfile.TarFile.extractall
+
+    def die_part_way(self, path, *a, **kw):
+        real(self, path, *a, **kw)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tarfile.TarFile, "extractall", die_part_way)
+    try:
+        workspace.unseal(root, "p", key)
+    except (OSError, workspace.WorkspaceError):
+        pass
+    monkeypatch.undo()
+
+    # The blob and its lock file, and no decrypted file anywhere beside them.
+    left = {f.name for f in (root / workspace.SEALED_DIR).rglob("*") if f.is_file()}
+    assert left == {"p.blob", ".p.lock"}, left
+    assert not (root / "p").exists()
+    assert workspace.unseal(root, "p", key) == root / "p"
+
+
+def _plant_leftovers(root: Path, project: str) -> list[Path]:
+    # What a killed process leaves: a restore that never reached its finally,
+    # in today's layout and in the fixed name restores used before it.
+    current = root / workspace.SEALED_DIR / ".restore" / project / "tmpdead" / "repo"
+    legacy = root / workspace.SEALED_DIR / f".{project}.restore" / "repo"
+    # #45's layout: mkdtemp(prefix=".{project}.restore-") — eight random chars.
+    randomized = root / workspace.SEALED_DIR / f".{project}.restore-k3x_9q0z" / "repo"
+    for d in (current, legacy, randomized):
+        d.mkdir(parents=True)
+        (d / "secret.md").write_text("plaintext")
+    return [current, legacy, randomized]
+
+
+def test_leftover_plaintext_is_reaped_by_the_next_unseal(tmp_path):
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    key = os.urandom(32)
+    workspace.seal(root, "p", key)
+    planted = _plant_leftovers(root, "p")
+
+    workspace.unseal(root, "p", key)
+    assert not any(p.exists() for p in planted)
+
+
+def test_leftover_plaintext_is_reaped_by_the_next_seal(tmp_path):
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    planted = _plant_leftovers(root, "p")
+
+    workspace.seal(root, "p", os.urandom(32))
+    assert not any(p.exists() for p in planted)
+
+
+def test_reaping_one_project_never_touches_another(tmp_path):
+    # Names may contain dots, so a prefix match on ".p.restore" would also
+    # have matched a project called "p.restore-x".
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    others = _plant_leftovers(root, "p.restore-x")
+    # The nearest miss for #45's pattern: a project whose own name supplies
+    # eight characters after ".p.restore-".
+    others += _plant_leftovers(root, "p.restore-abcdefgh")
+
+    workspace.seal(root, "p", os.urandom(32))
+    assert all(o.exists() for o in others)
+
+
+def _project_with_worktree(root: Path) -> Path:
+    _git_repo_with_history(root / "p")
+    wt = root / ".worktrees" / "p" / "alice"
+    wt.mkdir(parents=True)
+    (wt / "alice.md").write_text("alice's uncommitted work")
+    return wt / "alice.md"
+
+
+def _kill_at_second_promotion(monkeypatch, root: Path) -> None:
+    # Fail whichever of the two promoting renames comes second, so the test
+    # lands in the window between them under any ordering — not only the one
+    # the code happens to use today.
+    real = workspace.os.replace
+    targets = {root / "p", root / ".worktrees" / "p"}
+    seen = []
+
+    def replace(src, dst):
+        if Path(dst) in targets:
+            seen.append(dst)
+            if len(seen) == 2:
+                raise OSError("killed")
+        return real(src, dst)
+
+    monkeypatch.setattr(workspace.os, "replace", replace)
+
+
+def test_a_restore_killed_before_the_repository_lands_keeps_the_worktrees(tmp_path, monkeypatch):
+    # Codex P1 on #46: the repository used to land first. Killed before the
+    # worktrees followed, the next open saw a repository, returned it, and the
+    # next seal archived the project without anyone's worktree.
+    root = tmp_path / "projects"
+    note = _project_with_worktree(root)
+    key = os.urandom(32)
+    workspace.seal(root, "p", key)
+
+    _kill_at_second_promotion(monkeypatch, root)
+    try:
+        workspace.unseal(root, "p", key)
+    except (OSError, workspace.WorkspaceError):
+        pass
+    monkeypatch.undo()
+
+    workspace.unseal(root, "p", key)
+    assert note.read_text() == "alice's uncommitted work"
+    workspace.seal(root, "p", key)
+    workspace.unseal(root, "p", key)
+    assert note.read_text() == "alice's uncommitted work"
+
+
+def test_a_seal_killed_part_way_never_leaves_half_a_repository(tmp_path, monkeypatch):
+    # The original corruption, from the other side: a seal that dies while
+    # deleting the repository leaves a partial one beside a valid blob, and the
+    # next open would use it. The repository is now renamed aside in one step.
+    root = tmp_path / "projects"
+    note = _project_with_worktree(root)
+    key = os.urandom(32)
+    note.write_text("latest")
+
+    # Killed at the second step of removing the plaintext, whatever it is: a
+    # rename aside (today), or an rmtree that has deleted part of the tree.
+    real_replace, real_rmtree = workspace.os.replace, workspace.shutil.rmtree
+    steps = []
+
+    def replace(src, dst):
+        if Path(src) in {root / "p", root / ".worktrees" / "p"}:
+            steps.append(src)
+            if len(steps) == 2:
+                raise OSError("killed")
+        return real_replace(src, dst)
+
+    def rmtree(path, *a, **kw):
+        if Path(path) == root / "p":
+            (root / "p" / ".git" / "HEAD").unlink()
+            raise OSError("killed")
+        return real_rmtree(path, *a, **kw)
+
+    monkeypatch.setattr(workspace.os, "replace", replace)
+    monkeypatch.setattr(workspace.shutil, "rmtree", rmtree)
+    try:
+        workspace.seal(root, "p", key)
+    except (OSError, workspace.WorkspaceError):
+        pass
+    monkeypatch.undo()
+    assert workspace.is_sealed(root, "p")
+    if (root / "p").exists():
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root / "p", capture_output=True)
+        assert head.returncode == 0, "a partial repository was left looking open"
+
+    workspace.unseal(root, "p", key)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root / "p", capture_output=True)
+    assert head.returncode == 0
+    assert note.read_text() == "latest"
+    leftovers = [f for f in (root / workspace.SEALED_DIR).rglob("*") if f.is_file()]
+    assert {f.name for f in leftovers} <= {".p.lock"}, leftovers
+
+
+def test_a_partial_seal_that_is_retried_keeps_the_repository(tmp_path, monkeypatch):
+    # Codex P1 on #46: the repository renamed aside, the worktree rename
+    # failed, and the idle sweep — still holding the key — retried. The retry
+    # reaped the renamed repository as staging and archived the worktrees
+    # alone over the complete blob.
+    root = tmp_path / "projects"
+    note = _project_with_worktree(root)
+    key = os.urandom(32)
+    real = workspace.os.replace
+
+    def replace(src, dst):
+        if Path(src) == root / ".worktrees" / "p":
+            raise OSError("worktree rename failed")
+        return real(src, dst)
+
+    monkeypatch.setattr(workspace.os, "replace", replace)
+    try:
+        workspace.seal(root, "p", key)
+    except (OSError, workspace.WorkspaceError):
+        pass
+    monkeypatch.undo()
+
+    workspace.seal(root, "p", key)  # the sweep's retry
+    workspace.unseal(root, "p", key)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root / "p", capture_output=True)
+    assert head.returncode == 0, "the retry lost the repository"
+    assert note.read_text() == "alice's uncommitted work"
+
+
+def test_a_read_only_folder_is_still_sealed_away(tmp_path):
+    # Codex P1 on #46: rmtree(ignore_errors=True) gave up on a directory the
+    # backend user could not write into, and seal reported success over the
+    # plaintext it left.
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    ro = root / "p" / "vendor"
+    ro.mkdir()
+    (ro / "notes.md").write_text("plaintext")
+    ro.chmod(0o555)
+    key = os.urandom(32)
+
+    workspace.seal(root, "p", key)
+    left = [f for f in root.rglob("*") if f.is_file() and f.suffix not in {".blob", ".lock"}]
+    assert left == [], left
+
+    workspace.unseal(root, "p", key)
+    assert (ro / "notes.md").read_text() == "plaintext"
+    ro.chmod(0o755)
+
+
+def test_plaintext_that_cannot_be_removed_fails_the_seal(tmp_path, monkeypatch):
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    monkeypatch.setattr(workspace.shutil, "rmtree", lambda *a, **kw: None)
+    try:
+        workspace.seal(root, "p", os.urandom(32))
+    except workspace.WorkspaceError:
+        return
+    raise AssertionError("seal reported success while decrypted files remained")
+
+
+def test_cleanup_never_changes_permissions_through_a_symlink(tmp_path):
+    # Codex P1 on #46: the permission retry chmod-ed the failing path, and
+    # os.chmod follows links — so a symlink in a read-only project folder made
+    # its target, anywhere the backend owns a file, world-writable.
+    outside = tmp_path / "outside-secret"
+    outside.write_text("not part of any project")
+    outside.chmod(0o600)
+
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    ro = root / "p" / "vendor"
+    ro.mkdir()
+    (ro / "link").symlink_to(outside)
+    ro.chmod(0o555)
+
+    workspace.seal(root, "p", os.urandom(32))
+    assert (outside.stat().st_mode & 0o777) == 0o600
+    assert outside.read_text() == "not part of any project"
+    assert not (root / "p").exists()
+
+
+def test_a_leftover_worktree_with_a_read_only_folder_does_not_block_opening(tmp_path):
+    # Codex P1 on #46: recovery replaced a leftover worktree with a bare
+    # rmtree, so one read-only folder in it failed every later open and left
+    # the plaintext where it was.
+    root = tmp_path / "projects"
+    note = _project_with_worktree(root)
+    key = os.urandom(32)
+    workspace.seal(root, "p", key)
+
+    # What an interrupted seal or restore leaves: a worktree, no repository.
+    stale = root / ".worktrees" / "p" / "alice" / "locked"
+    stale.mkdir(parents=True)
+    (stale / "old.md").write_text("stale plaintext")
+    stale.chmod(0o555)
+
+    workspace.unseal(root, "p", key)
+    assert note.read_text() == "alice's uncommitted work"
+    assert not stale.exists()
