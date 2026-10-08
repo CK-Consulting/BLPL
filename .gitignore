@@ -92,3 +92,9 @@ mermaid/customization-inspirations/electronics-symbols/
 mermaid/customization-inspirations/Electrical_symbols_library.svg
 
 app/certs/*
+
+# Personal and machine-specific agent configuration. AGENTS.md and
+# CLAUDE.md at the root are the shared, committed orientation.
+.claude/
+CLAUDE.local.md
+AGENTS.local.md

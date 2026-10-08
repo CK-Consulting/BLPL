@@ -1,0 +1,42 @@
+Board Layer Pipe Line (BLPL)
+Copyright 2026 CK Services LLC d/b/a CK Consulting
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes third-party software, distributed under its own
+license. The full license texts are in licenses/.
+
+app/frontend/public/ecad-viewer.js, glyph-full.js, 3d-viewer.js
+  Prebuilt bundles of ecad-viewer
+  https://github.com/Huaqiu-Electronics/ecad-viewer
+  Copyright (c) 2024 Shenzhen Huaqiu Electronics Co., Ltd. (深圳华秋电子有限公司)
+  MIT License — licenses/ecad-viewer.md
+  ecad-viewer derives from KiCanvas, https://github.com/theacodes/kicanvas
+  Copyright (c) Thea Flowers and contributors
+  MIT License — licenses/kicanvas.md
+
+app/frontend/public/three/
+  three.js, https://github.com/mrdoob/three.js
+  Copyright (c) 2010-2026 three.js authors
+  MIT License — licenses/three.js.txt
+
+mermaid/customization-inspirations/tailwind-colors.css
+  The Tailwind CSS default colour palette, https://github.com/tailwindlabs/tailwindcss
+  Copyright (c) Tailwind Labs, Inc.
+  MIT License — licenses/tailwindcss.txt
+
+app/frontend/src/components/Visualizer.tsx, app/frontend/src/types/ecad-viewer.d.ts
+  Adapted from KiCAD-Prism, https://github.com/krishna-swaroop/KiCAD-Prism
+  Copyright Krishna Swaroop and contributors
+  Apache License 2.0 — see LICENSE. Changes are described in ACKNOWLEDGMENTS.md.
+
+Submodules (not part of this distribution; each carries its own license):
+  kicad-happy          MIT           https://github.com/CK-Consulting/kicad-happy
+                                     (derived from https://github.com/aklofas/kicad-happy)
+  KiCAD-Prism          Apache-2.0    https://github.com/krishna-swaroop/KiCAD-Prism
+  ecad-viewer          MIT           https://github.com/Huaqiu-Electronics/ecad-viewer
+  kicad-ai-assistant                 https://github.com/shaunchokshi/KiCad-AI-Assistant
+  kicad-symbols, kicad-footprints, kicad-packages3D, kicad-templates,
+  kicad-library-utils, kicad-footprint-generator
+                       CC-BY-SA 4.0 with exception / GPL
+                                     https://gitlab.com/kicad/libraries

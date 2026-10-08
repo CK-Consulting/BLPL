@@ -112,6 +112,27 @@ blpl-repo-root/
 - [Thor runbook](docs/thor-runbook.md) — running the model on a Jetson AGX Thor, and why BLPL stays on amd64
 - [Roadmap](docs/roadmap.md) — what is shipped, and what is next
 
+## Acknowledgments
+
+BLPL builds on other people's work. What it ships or links is listed, with
+licences, in [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) and [NOTICE](NOTICE).
+
+These projects were used as references while building it — read, measured
+against, or learned from — and are not included here:
+
+- [Mermaid](https://github.com/mermaid-js/mermaid) (MIT) — block diagrams in
+  the app are Mermaid; its source was the reference for the renderer
+  integration.
+- [SchematicSymbolsSVG](https://github.com/sjgallagher2/SchematicSymbolsSVG)
+  (MIT) and
+  [Inkscape_electric_Symbols](https://github.com/upb-lea/Inkscape_electric_Symbols)
+  (CC0) — the diagram shape language was checked against their symbol sets so
+  that no block shape reads as a schematic symbol.
+- [three-gltf-viewer](https://github.com/donmccurdy/three-gltf-viewer) (MIT) —
+  the 3D view in the bundled ecad-viewer builds on it.
+- [kicad-cli-python](https://github.com/Huaqiu-Electronics/kicad-cli-python) —
+  a reference for driving `kicad-cli` from Python.
+
 ## License
 
-MIT.
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

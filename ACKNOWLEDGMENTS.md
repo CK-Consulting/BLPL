@@ -42,6 +42,19 @@ ecad-viewer itself builds on:
 - **three-gltf-viewer** — MIT — <https://github.com/donmccurdy/three-gltf-viewer> —
   Don McCurdy. Backs the 3D view.
 
+## three.js — MIT
+
+<https://github.com/mrdoob/three.js> — the three.js authors. Vendored in
+`app/frontend/public/three/` for the 3D viewer. License text in
+`licenses/three.js.txt`.
+
+## Tailwind CSS colour palette — MIT
+
+<https://github.com/tailwindlabs/tailwindcss> — Tailwind Labs, Inc.
+`mermaid/customization-inspirations/tailwind-colors.css` is Tailwind's default
+palette, read by `mermaid/tools/palette.py`. License text in
+`licenses/tailwindcss.txt`.
+
 ## kicad-happy — MIT
 
 <https://github.com/aklofas/kicad-happy> — Andrew Klofas.

@@ -1,0 +1,31 @@
+name: Bug report
+description: Something BLPL did wrong
+labels: ["bug", "triage"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The smallest design document or steps that show it. Do not attach datasheets or vendor files.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Error messages, stage reports, ERC/DRC excerpts.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit SHA, and how you run it (CLI, docker compose, …)
+    validations:
+      required: true
