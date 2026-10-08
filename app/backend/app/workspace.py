@@ -452,7 +452,7 @@ def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
             dest = root / ".worktrees" / project
             dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.exists():
-                shutil.rmtree(dest)
+                _remove_plaintext(dest)
             os.replace(staging / "worktrees", dest)
         os.replace(staging / "repo", repo)
     finally:

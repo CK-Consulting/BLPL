@@ -619,3 +619,23 @@ def test_cleanup_never_changes_permissions_through_a_symlink(tmp_path):
     assert (outside.stat().st_mode & 0o777) == 0o600
     assert outside.read_text() == "not part of any project"
     assert not (root / "p").exists()
+
+
+def test_a_leftover_worktree_with_a_read_only_folder_does_not_block_opening(tmp_path):
+    # Codex P1 on #46: recovery replaced a leftover worktree with a bare
+    # rmtree, so one read-only folder in it failed every later open and left
+    # the plaintext where it was.
+    root = tmp_path / "projects"
+    note = _project_with_worktree(root)
+    key = os.urandom(32)
+    workspace.seal(root, "p", key)
+
+    # What an interrupted seal or restore leaves: a worktree, no repository.
+    stale = root / ".worktrees" / "p" / "alice" / "locked"
+    stale.mkdir(parents=True)
+    (stale / "old.md").write_text("stale plaintext")
+    stale.chmod(0o555)
+
+    workspace.unseal(root, "p", key)
+    assert note.read_text() == "alice's uncommitted work"
+    assert not stale.exists()
