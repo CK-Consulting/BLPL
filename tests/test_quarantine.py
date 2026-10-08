@@ -526,3 +526,19 @@ def test_assess_decides_as_accept_does_without_storing(tmp_path, monkeypatch):
     assert quarantine.assess(BENIGN, is_pdf=True).reasons == []
     held = quarantine.assess(PHONES_HOME, is_pdf=True)
     assert held.reasons == quarantine.accept(PHONES_HOME, tmp_path, mpn="X").reasons
+
+
+def test_a_symlink_into_quarantine_is_not_a_datasheet(tmp_path):
+    # Codex P2 on #8: a link under datasheets/ pointing at ../retrieved/<held>
+    # resolved outside datasheets/, and that was taken to mean "not quarantined".
+    from blpl.agent.tools import datasheet_files
+
+    proj = tmp_path / "proj"
+    held = proj / "retrieved" / "327429e564bc-LBAA0XV2DT-158.pdf"
+    held.parent.mkdir(parents=True)
+    held.write_bytes(PHONES_HOME)
+    (proj / "datasheets").mkdir()
+    (proj / "datasheets" / "LBAA0XV2DT-158.pdf").symlink_to(held)
+
+    assert datasheet_files.resolve(proj, "LBAA0XV2DT-158").path is None
+    assert datasheet_files.resolve(proj, "LBAA0XV2DT-158", file="LBAA0XV2DT-158.pdf").path is None
