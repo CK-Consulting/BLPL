@@ -439,3 +439,99 @@ def test_reaping_one_project_never_touches_another(tmp_path):
 
     workspace.seal(root, "p", os.urandom(32))
     assert all(o.exists() for o in others)
+
+
+def _project_with_worktree(root: Path) -> Path:
+    _git_repo_with_history(root / "p")
+    wt = root / ".worktrees" / "p" / "alice"
+    wt.mkdir(parents=True)
+    (wt / "alice.md").write_text("alice's uncommitted work")
+    return wt / "alice.md"
+
+
+def _kill_at_second_promotion(monkeypatch, root: Path) -> None:
+    # Fail whichever of the two promoting renames comes second, so the test
+    # lands in the window between them under any ordering — not only the one
+    # the code happens to use today.
+    real = workspace.os.replace
+    targets = {root / "p", root / ".worktrees" / "p"}
+    seen = []
+
+    def replace(src, dst):
+        if Path(dst) in targets:
+            seen.append(dst)
+            if len(seen) == 2:
+                raise OSError("killed")
+        return real(src, dst)
+
+    monkeypatch.setattr(workspace.os, "replace", replace)
+
+
+def test_a_restore_killed_before_the_repository_lands_keeps_the_worktrees(tmp_path, monkeypatch):
+    # Codex P1 on #46: the repository used to land first. Killed before the
+    # worktrees followed, the next open saw a repository, returned it, and the
+    # next seal archived the project without anyone's worktree.
+    root = tmp_path / "projects"
+    note = _project_with_worktree(root)
+    key = os.urandom(32)
+    workspace.seal(root, "p", key)
+
+    _kill_at_second_promotion(monkeypatch, root)
+    try:
+        workspace.unseal(root, "p", key)
+    except OSError:
+        pass
+    monkeypatch.undo()
+
+    workspace.unseal(root, "p", key)
+    assert note.read_text() == "alice's uncommitted work"
+    workspace.seal(root, "p", key)
+    workspace.unseal(root, "p", key)
+    assert note.read_text() == "alice's uncommitted work"
+
+
+def test_a_seal_killed_part_way_never_leaves_half_a_repository(tmp_path, monkeypatch):
+    # The original corruption, from the other side: a seal that dies while
+    # deleting the repository leaves a partial one beside a valid blob, and the
+    # next open would use it. The repository is now renamed aside in one step.
+    root = tmp_path / "projects"
+    note = _project_with_worktree(root)
+    key = os.urandom(32)
+    note.write_text("latest")
+
+    # Killed at the second step of removing the plaintext, whatever it is: a
+    # rename aside (today), or an rmtree that has deleted part of the tree.
+    real_replace, real_rmtree = workspace.os.replace, workspace.shutil.rmtree
+    steps = []
+
+    def replace(src, dst):
+        if Path(src) in {root / "p", root / ".worktrees" / "p"}:
+            steps.append(src)
+            if len(steps) == 2:
+                raise OSError("killed")
+        return real_replace(src, dst)
+
+    def rmtree(path, *a, **kw):
+        if Path(path) == root / "p":
+            (root / "p" / ".git" / "HEAD").unlink()
+            raise OSError("killed")
+        return real_rmtree(path, *a, **kw)
+
+    monkeypatch.setattr(workspace.os, "replace", replace)
+    monkeypatch.setattr(workspace.shutil, "rmtree", rmtree)
+    try:
+        workspace.seal(root, "p", key)
+    except OSError:
+        pass
+    monkeypatch.undo()
+    assert workspace.is_sealed(root, "p")
+    if (root / "p").exists():
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root / "p", capture_output=True)
+        assert head.returncode == 0, "a partial repository was left looking open"
+
+    workspace.unseal(root, "p", key)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root / "p", capture_output=True)
+    assert head.returncode == 0
+    assert note.read_text() == "latest"
+    leftovers = [f for f in (root / workspace.SEALED_DIR).rglob("*") if f.is_file()]
+    assert {f.name for f in leftovers} <= {".p.lock"}, leftovers

@@ -305,8 +305,19 @@ def _seal(projects_root: Path, project: str, key: bytes) -> int:
     tmp.write_bytes(blob)
     os.replace(tmp, target)
 
-    for _name, path in parts:
-        shutil.rmtree(path)
+    # The blob is complete, so the plaintext can go — repository first, and by
+    # an atomic rename rather than an rmtree. Unsealing treats "the repository
+    # directory exists" as "this project is open and whole"; an rmtree killed
+    # part way leaves half a repository there, which is exactly how one came
+    # back once without its HEAD. Renamed aside first, whatever is left behind
+    # by a kill is reaped as staging, and a worktree directory with no
+    # repository beside it is recognised as a leftover the blob already holds.
+    trash_parent = _restore_dir(root, project)
+    trash_parent.mkdir(parents=True, exist_ok=True)
+    trash = Path(tempfile.mkdtemp(dir=trash_parent))
+    for name, path in sorted(parts, key=lambda p: p[0] != "repo"):
+        os.replace(path, trash / name)
+    shutil.rmtree(trash, ignore_errors=True)
     return len(blob)
 
 
@@ -366,12 +377,23 @@ def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
             # so it is treated as input rather than trusted.
             tar.extractall(staging, filter="data")
 
-        # Into place only once everything has extracted. A half-restored
-        # project would look real to every listing and to git.
-        (root / ".worktrees").mkdir(parents=True, exist_ok=True)
-        os.replace(staging / "repo", repo)
+        # Into place only once everything has extracted, and the repository
+        # last: its directory appearing is what marks the restore complete, so
+        # a kill before it leaves nothing that looks open. A worktree directory
+        # already there with no repository beside it is the remainder of an
+        # interrupted restore or seal — the blob, which is removed only after
+        # everything is in place, holds the same files — so it is replaced
+        # rather than kept or merged. Moving the repository first instead lost
+        # every member's worktree to a kill between the two renames: the next
+        # restore saw the repository, returned, and the next seal archived the
+        # project without them.
         if (staging / "worktrees").is_dir():
-            os.replace(staging / "worktrees", root / ".worktrees" / project)
+            dest = root / ".worktrees" / project
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                shutil.rmtree(dest)
+            os.replace(staging / "worktrees", dest)
+        os.replace(staging / "repo", repo)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
