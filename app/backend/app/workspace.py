@@ -257,10 +257,17 @@ def _remove_plaintext(path: Path) -> None:
         return
 
     def make_writable_and_retry(func, target, _exc):
-        parent = os.path.dirname(target)
-        for d in (parent, target):
+        # Only real directories inside the tree are made writable: the
+        # containing directory, which is what unlinking or rmdir-ing an entry
+        # needs, and the target itself when it is a directory being listed.
+        # Never a symlink — os.chmod follows links, so chmod-ing one would
+        # change the permissions of whatever it points at, anywhere the
+        # backend user owns something.
+        for d in (os.path.dirname(target), target):
+            if os.path.islink(d) or not os.path.isdir(d):
+                continue
             try:
-                os.chmod(d, os.stat(d, follow_symlinks=False).st_mode | 0o700)
+                os.chmod(d, os.stat(d).st_mode | 0o700)
             except OSError:
                 pass
         func(target)

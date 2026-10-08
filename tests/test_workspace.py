@@ -598,3 +598,24 @@ def test_plaintext_that_cannot_be_removed_fails_the_seal(tmp_path, monkeypatch):
     except workspace.WorkspaceError:
         return
     raise AssertionError("seal reported success while decrypted files remained")
+
+
+def test_cleanup_never_changes_permissions_through_a_symlink(tmp_path):
+    # Codex P1 on #46: the permission retry chmod-ed the failing path, and
+    # os.chmod follows links — so a symlink in a read-only project folder made
+    # its target, anywhere the backend owns a file, world-writable.
+    outside = tmp_path / "outside-secret"
+    outside.write_text("not part of any project")
+    outside.chmod(0o600)
+
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    ro = root / "p" / "vendor"
+    ro.mkdir()
+    (ro / "link").symlink_to(outside)
+    ro.chmod(0o555)
+
+    workspace.seal(root, "p", os.urandom(32))
+    assert (outside.stat().st_mode & 0o777) == 0o600
+    assert outside.read_text() == "not part of any project"
+    assert not (root / "p").exists()
