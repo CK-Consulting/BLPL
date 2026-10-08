@@ -359,4 +359,78 @@ def test_concurrent_opens_restore_one_whole_repository(tmp_path):
     assert head.returncode == 0, head.stderr
     assert head.stdout.strip() == "main"
     assert len(list((root / "p").glob("doc*.md"))) == 40
-    assert not list((root / workspace.SEALED_DIR).glob(".p.restore*"))
+    staging = root / workspace.SEALED_DIR / ".restore" / "p"
+    assert not staging.exists() or not any(staging.iterdir())
+
+
+def test_a_failed_restore_leaves_no_plaintext_behind(tmp_path, monkeypatch):
+    # Codex P1 on #45: staging was removed only on success, and each restore
+    # used a fresh name that later restores ignored — so an extract that died
+    # part way left decrypted files beside the blob for good.
+    import tarfile
+
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    key = os.urandom(32)
+    workspace.seal(root, "p", key)
+
+    real = tarfile.TarFile.extractall
+
+    def die_part_way(self, path, *a, **kw):
+        real(self, path, *a, **kw)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tarfile.TarFile, "extractall", die_part_way)
+    try:
+        workspace.unseal(root, "p", key)
+    except OSError:
+        pass
+    monkeypatch.undo()
+
+    # The blob and its lock file, and no decrypted file anywhere beside them.
+    left = {f.name for f in (root / workspace.SEALED_DIR).rglob("*") if f.is_file()}
+    assert left == {"p.blob", ".p.lock"}, left
+    assert not (root / "p").exists()
+    assert workspace.unseal(root, "p", key) == root / "p"
+
+
+def _plant_leftovers(root: Path, project: str) -> list[Path]:
+    # What a killed process leaves: a restore that never reached its finally,
+    # in today's layout and in the fixed name restores used before it.
+    current = root / workspace.SEALED_DIR / ".restore" / project / "tmpdead" / "repo"
+    legacy = root / workspace.SEALED_DIR / f".{project}.restore" / "repo"
+    for d in (current, legacy):
+        d.mkdir(parents=True)
+        (d / "secret.md").write_text("plaintext")
+    return [current, legacy]
+
+
+def test_leftover_plaintext_is_reaped_by_the_next_unseal(tmp_path):
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    key = os.urandom(32)
+    workspace.seal(root, "p", key)
+    planted = _plant_leftovers(root, "p")
+
+    workspace.unseal(root, "p", key)
+    assert not any(p.exists() for p in planted)
+
+
+def test_leftover_plaintext_is_reaped_by_the_next_seal(tmp_path):
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    planted = _plant_leftovers(root, "p")
+
+    workspace.seal(root, "p", os.urandom(32))
+    assert not any(p.exists() for p in planted)
+
+
+def test_reaping_one_project_never_touches_another(tmp_path):
+    # Names may contain dots, so a prefix match on ".p.restore" would also
+    # have matched a project called "p.restore-x".
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    other = _plant_leftovers(root, "p.restore-x")[0]
+
+    workspace.seal(root, "p", os.urandom(32))
+    assert other.exists()

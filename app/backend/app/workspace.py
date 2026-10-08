@@ -231,8 +231,33 @@ def _project_lock(projects_root: Path, project: str):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+def _restore_dir(projects_root: Path, project: str) -> Path:
+    """Where this project's restores extract: a directory of its own.
+
+    One per project rather than a name prefix in a shared directory, because
+    project names may contain dots, and reaping by `.{name}.restore*` would let
+    one project's cleanup match another's in-flight restore.
+    """
+    return Path(projects_root) / SEALED_DIR / ".restore" / project
+
+
+def _reap_restores(projects_root: Path, project: str) -> None:
+    """Delete plaintext left by restores of this project that did not finish.
+
+    A restore holds decrypted files until it moves them into place. One that
+    died part way — an extract error, a killed process — leaves them behind,
+    and with nothing to reap them they would sit beside the blob indefinitely,
+    which is exactly what sealing exists to prevent. Called only under the
+    project lock, so anything found here belongs to no live restore.
+    """
+    shutil.rmtree(_restore_dir(projects_root, project), ignore_errors=True)
+    # The fixed name restores used before they had a directory of their own.
+    shutil.rmtree(Path(projects_root) / SEALED_DIR / f".{project}.restore", ignore_errors=True)
+
+
 def seal(projects_root: Path, project: str, key: bytes) -> int:
     with _project_lock(projects_root, project):
+        _reap_restores(projects_root, project)
         return _seal(projects_root, project, key)
 
 
@@ -287,6 +312,7 @@ def unseal(projects_root: Path, project: str, key: bytes) -> Path:
     and the blob gone, and returns the directory rather than failing.
     """
     with _project_lock(projects_root, project):
+        _reap_restores(projects_root, project)
         return _unseal(projects_root, project, key)
 
 
@@ -315,23 +341,28 @@ def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
 
     # A directory of this call's own. The lock already keeps two restores of
     # one project apart; a private staging directory means that even without
-    # it, no call can delete files another is extracting. A leftover from a
-    # restore that died is ignored rather than cleaned up here.
-    staging = Path(tempfile.mkdtemp(prefix=f".{project}.restore-", dir=root / SEALED_DIR))
-    with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r") as tar:
-        # filter="data" refuses absolute paths, links escaping the destination
-        # and device nodes. The archive is one we wrote, but it arrives from
-        # disk and is decrypted with a key several people hold, so it is treated
-        # as input rather than trusted.
-        tar.extractall(staging, filter="data")
+    # it, no call can delete files another is extracting. It holds plaintext,
+    # so it goes on every exit, and `_reap_restores` catches the exits that
+    # never reach this `finally` (a killed process).
+    parent = _restore_dir(root, project)
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=parent))
+    try:
+        with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r") as tar:
+            # filter="data" refuses absolute paths, links escaping the
+            # destination and device nodes. The archive is one we wrote, but it
+            # arrives from disk and is decrypted with a key several people hold,
+            # so it is treated as input rather than trusted.
+            tar.extractall(staging, filter="data")
 
-    # Into place only once everything has extracted. A half-restored project
-    # would look real to every listing and to git.
-    (root / ".worktrees").mkdir(parents=True, exist_ok=True)
-    os.replace(staging / "repo", repo)
-    if (staging / "worktrees").is_dir():
-        os.replace(staging / "worktrees", root / ".worktrees" / project)
-    shutil.rmtree(staging, ignore_errors=True)
+        # Into place only once everything has extracted. A half-restored
+        # project would look real to every listing and to git.
+        (root / ".worktrees").mkdir(parents=True, exist_ok=True)
+        os.replace(staging / "repo", repo)
+        if (staging / "worktrees").is_dir():
+            os.replace(staging / "worktrees", root / ".worktrees" / project)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
     blob_path.unlink()
     return repo
