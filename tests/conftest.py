@@ -10,10 +10,14 @@ backend under ``app/backend`` is the single backend, so its fixture is shared
 setup, not one file's private helper.
 """
 
+import atexit
 import contextlib
 import importlib
 import importlib.util
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -23,6 +27,18 @@ import pytest
 BACKEND = Path(__file__).resolve().parents[1] / "app" / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+
+# Importing app.main creates its data directories, defaulting to the
+# deployment's /app/data. A test that calls a helper from app.main without the
+# app fixture imported it under whatever environment the test before it left:
+# on a plain host that meant writing to /app, which fails — so the same test
+# passed or failed depending on order — and inside the backend container it
+# meant the live data directory. Every import now points at a scratch
+# directory for the session; the app fixture still sets its own per test.
+_SESSION_DATA = Path(tempfile.mkdtemp(prefix="blpl-tests-"))
+os.environ["BLPL_DATA_ROOT"] = str(_SESSION_DATA / "data")
+os.environ["BLPL_PROJECTS_ROOT"] = str(_SESSION_DATA / "data" / "projects")
+atexit.register(shutil.rmtree, _SESSION_DATA, True)
 
 _PCBNEW_LEGACY_TESTS = [
     "test_copper*.py",

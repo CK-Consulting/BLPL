@@ -21,16 +21,22 @@ on:
       - .gitmodules
       - .github/workflows/kcaa-upstream-check.yml
 
+# Read-only by default. Only the scheduled/manual bump job writes, and it never
+# runs on a pull request: a pull request runs the read-only job below, so code
+# from a branch is never executed holding a token that can push or file issues.
 permissions:
-  contents: write   # push the bump branch
-  issues: write     # say the bump is ready, or that a check broke
+  contents: read
 
 env:
   SUBMODULE_PATH: kicad-ai-assistant
 
 jobs:
   check:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the bump branch
+      issues: write     # say the bump is ready, or that a check broke
     steps:
       - uses: actions/checkout@v4
         # The repo carries many large submodules (KiCad libraries); init only kcaa.
@@ -40,9 +46,8 @@ jobs:
       - name: Init kcaa submodule
         run: git submodule update --init --depth 1 -- "$SUBMODULE_PATH"
 
-      - name: Advance submodule to fork main (scheduled/manual runs only)
+      - name: Advance submodule to fork main
         id: advance
-        if: github.event_name != 'pull_request'
         run: |
           cd "$SUBMODULE_PATH"
           old=$(git rev-parse HEAD)
@@ -55,27 +60,27 @@ jobs:
           echo "Submodule: $old -> $new"
 
       - name: Install uv
-        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        if: steps.advance.outputs.changed == 'true'
         uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
 
       # kcaa's own CI tests on 3.13 with node/jsdom available; mirror that.
       - name: Set up Python 3.13
-        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        if: steps.advance.outputs.changed == 'true'
         working-directory: kicad-ai-assistant
         run: |
           uv python install 3.13
           uv python pin 3.13
 
       - name: Install Node.js
-        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        if: steps.advance.outputs.changed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install kcaa deps
-        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        if: steps.advance.outputs.changed == 'true'
         working-directory: kicad-ai-assistant
         run: |
           uv sync --group dev
@@ -83,7 +88,7 @@ jobs:
 
       - name: Run kcaa test suite
         id: kcaa_tests
-        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        if: steps.advance.outputs.changed == 'true'
         working-directory: kicad-ai-assistant
         env:
           KICAD_VERSION: "10"
@@ -91,7 +96,7 @@ jobs:
 
       - name: Run BLPL contract check
         id: contract
-        if: github.event_name == 'pull_request' || steps.advance.outputs.changed == 'true'
+        if: steps.advance.outputs.changed == 'true'
         working-directory: kicad-ai-assistant
         env:
           KICAD_VERSION: "10"
@@ -167,3 +172,51 @@ jobs:
               --label kcaa-upstream \
               --body "The weekly upstream check failed — either kcaa's test suite or BLPL's contract check (\`tests/kcaa_contract_check.py\`) broke against the fork's latest main. See $run_url. The submodule pointer was NOT bumped."
           fi
+
+  # Pull requests that touch the submodule or the contract check: the same tests
+  # against the pinned SHA, with a read-only token and nothing to write.
+  pull-request:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Init kcaa submodule
+        run: git submodule update --init --depth 1 -- "$SUBMODULE_PATH"
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.13
+        working-directory: kicad-ai-assistant
+        run: |
+          uv python install 3.13
+          uv python pin 3.13
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install kcaa deps
+        working-directory: kicad-ai-assistant
+        run: |
+          uv sync --group dev
+          npm install jsdom
+
+      - name: Run kcaa test suite
+        working-directory: kicad-ai-assistant
+        env:
+          KICAD_VERSION: "10"
+        run: uv run python -m pytest tests/ --tb=short -o "addopts="
+
+      - name: Run BLPL contract check
+        working-directory: kicad-ai-assistant
+        env:
+          KICAD_VERSION: "10"
+        run: uv run python ../tests/kcaa_contract_check.py
