@@ -138,6 +138,8 @@ export function FileView({
 
   const save = async () => {
     if (!path || !savable) return;
+    // A save that commits must not leave the last one's warning standing.
+    setError(null);
     try {
       const out = await putJSON<{ commit_error?: string }>(
         `/api/projects/${projectId}/files/${path}`,

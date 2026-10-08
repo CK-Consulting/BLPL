@@ -126,6 +126,9 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [decided, setDecided] = useState<Record<string, string>>({});
+  // An accepted edit whose commit failed. Kept here, not on the card, because
+  // the card is gone the moment the proposal is decided.
+  const [commitWarning, setCommitWarning] = useState<string | null>(null);
 
   const [input, setInput] = useState("");
   // Uploaded and waiting to ride along with the next message. Upload happens on
@@ -807,8 +810,9 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     await postJSON(`/api/projects/${projectId}/chat/${turnId}/cancel`).catch(() => {});
   };
 
-  const onDecided = (id: string, status: string) => {
+  const onDecided = (id: string, status: string, warning?: string) => {
     setDecided((d) => ({ ...d, [id]: status }));
+    if (warning) setCommitWarning(warning);
     refreshProposals();
     if (status === "accepted") onApplied();
   };
@@ -927,6 +931,14 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       {pending.map((p) => (
         <ProposalCard key={p.id} projectId={projectId} proposal={p} onDecided={onDecided} />
       ))}
+      {commitWarning && (
+        <div className="gate-error" role="alert">
+          {commitWarning}{" "}
+          <button className="link" onClick={() => setCommitWarning(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {lost && (
         <div className="turn-lost">

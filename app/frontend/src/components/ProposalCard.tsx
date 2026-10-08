@@ -83,7 +83,9 @@ function collapse(lines: Line[]): (Line | { kind: "gap"; count: number })[] {
 type Props = {
   projectId: string;
   proposal: Proposal;
-  onDecided: (id: string, status: string) => void;
+  /** `warning` is set when the edit was accepted but git refused the commit.
+   *  The card unmounts once decided, so the parent is what shows it. */
+  onDecided: (id: string, status: string, warning?: string) => void;
 };
 
 export function ProposalCard({ projectId, proposal, onDecided }: Props) {
@@ -122,10 +124,14 @@ export function ProposalCard({ projectId, proposal, onDecided }: Props) {
         { action },
       );
       setStatus(action === "accept" ? "accepted" : "rejected");
-      // Accepted and on disk, but git refused it: say so on the card, rather
-      // than letting "accepted" imply it is in the history.
-      if (out?.commit_error) setError(`Accepted — ${out.commit_error}`);
-      onDecided(proposal.id, action === "accept" ? "accepted" : "rejected");
+      // Accepted and on disk, but git refused it. Not shown on this card: a
+      // decided card is unmounted at once, which is how the first version of
+      // this warning was never seen. The panel shows it instead.
+      onDecided(
+        proposal.id,
+        action === "accept" ? "accepted" : "rejected",
+        out?.commit_error ? `${proposal.path}: accepted — ${out.commit_error}` : undefined,
+      );
     } catch (e) {
       // The common one is a stale proposal — the file changed under it. That is
       // the safety rule working, so the message says what to do next.
