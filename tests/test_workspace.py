@@ -283,7 +283,9 @@ def test_an_interrupted_seal_never_loses_the_project(unlocked):
 
     os.replace = die_before_swapping_it_in
     try:
-        with __import__("pytest").raises(OSError):
+        # Raised as a WorkspaceError since #46, so callers keep the workspace
+        # registered; the guarantee is the files below, not the type.
+        with __import__("pytest").raises((OSError, workspace.WorkspaceError)):
             workspace.seal(main.PROJECTS_ROOT, "mine", key)
     finally:
         os.replace = real_replace
@@ -383,7 +385,7 @@ def test_a_failed_restore_leaves_no_plaintext_behind(tmp_path, monkeypatch):
     monkeypatch.setattr(tarfile.TarFile, "extractall", die_part_way)
     try:
         workspace.unseal(root, "p", key)
-    except OSError:
+    except (OSError, workspace.WorkspaceError):
         pass
     monkeypatch.undo()
 
@@ -479,7 +481,7 @@ def test_a_restore_killed_before_the_repository_lands_keeps_the_worktrees(tmp_pa
     _kill_at_second_promotion(monkeypatch, root)
     try:
         workspace.unseal(root, "p", key)
-    except OSError:
+    except (OSError, workspace.WorkspaceError):
         pass
     monkeypatch.undo()
 
@@ -521,7 +523,7 @@ def test_a_seal_killed_part_way_never_leaves_half_a_repository(tmp_path, monkeyp
     monkeypatch.setattr(workspace.shutil, "rmtree", rmtree)
     try:
         workspace.seal(root, "p", key)
-    except OSError:
+    except (OSError, workspace.WorkspaceError):
         pass
     monkeypatch.undo()
     assert workspace.is_sealed(root, "p")
@@ -535,3 +537,64 @@ def test_a_seal_killed_part_way_never_leaves_half_a_repository(tmp_path, monkeyp
     assert note.read_text() == "latest"
     leftovers = [f for f in (root / workspace.SEALED_DIR).rglob("*") if f.is_file()]
     assert {f.name for f in leftovers} <= {".p.lock"}, leftovers
+
+
+def test_a_partial_seal_that_is_retried_keeps_the_repository(tmp_path, monkeypatch):
+    # Codex P1 on #46: the repository renamed aside, the worktree rename
+    # failed, and the idle sweep — still holding the key — retried. The retry
+    # reaped the renamed repository as staging and archived the worktrees
+    # alone over the complete blob.
+    root = tmp_path / "projects"
+    note = _project_with_worktree(root)
+    key = os.urandom(32)
+    real = workspace.os.replace
+
+    def replace(src, dst):
+        if Path(src) == root / ".worktrees" / "p":
+            raise OSError("worktree rename failed")
+        return real(src, dst)
+
+    monkeypatch.setattr(workspace.os, "replace", replace)
+    try:
+        workspace.seal(root, "p", key)
+    except (OSError, workspace.WorkspaceError):
+        pass
+    monkeypatch.undo()
+
+    workspace.seal(root, "p", key)  # the sweep's retry
+    workspace.unseal(root, "p", key)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root / "p", capture_output=True)
+    assert head.returncode == 0, "the retry lost the repository"
+    assert note.read_text() == "alice's uncommitted work"
+
+
+def test_a_read_only_folder_is_still_sealed_away(tmp_path):
+    # Codex P1 on #46: rmtree(ignore_errors=True) gave up on a directory the
+    # backend user could not write into, and seal reported success over the
+    # plaintext it left.
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    ro = root / "p" / "vendor"
+    ro.mkdir()
+    (ro / "notes.md").write_text("plaintext")
+    ro.chmod(0o555)
+    key = os.urandom(32)
+
+    workspace.seal(root, "p", key)
+    left = [f for f in root.rglob("*") if f.is_file() and f.suffix not in {".blob", ".lock"}]
+    assert left == [], left
+
+    workspace.unseal(root, "p", key)
+    assert (ro / "notes.md").read_text() == "plaintext"
+    ro.chmod(0o755)
+
+
+def test_plaintext_that_cannot_be_removed_fails_the_seal(tmp_path, monkeypatch):
+    root = tmp_path / "projects"
+    _git_repo_with_history(root / "p")
+    monkeypatch.setattr(workspace.shutil, "rmtree", lambda *a, **kw: None)
+    try:
+        workspace.seal(root, "p", os.urandom(32))
+    except workspace.WorkspaceError:
+        return
+    raise AssertionError("seal reported success while decrypted files remained")

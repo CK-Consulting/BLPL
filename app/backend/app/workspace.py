@@ -48,6 +48,7 @@ import io
 import os
 import re
 import shutil
+import sys
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
@@ -242,6 +243,39 @@ def _restore_dir(projects_root: Path, project: str) -> Path:
     return Path(projects_root) / SEALED_DIR / ".restore" / project
 
 
+def _remove_plaintext(path: Path) -> None:
+    """Delete a tree of decrypted files, or raise.
+
+    `rmtree(ignore_errors=True)` was the wrong tool for plaintext: a directory
+    the backend user cannot write into — a read-only folder inside a project,
+    say — made it give up quietly, and the caller went on to report a seal
+    that had left the files on disk. A permission failure is retried once with
+    the owner's write bit restored, since everything here is ours; anything
+    still standing afterwards is an error, not a success.
+    """
+    if not os.path.lexists(path):
+        return
+
+    def make_writable_and_retry(func, target, _exc):
+        parent = os.path.dirname(target)
+        for d in (parent, target):
+            try:
+                os.chmod(d, os.stat(d, follow_symlinks=False).st_mode | 0o700)
+            except OSError:
+                pass
+        func(target)
+
+    # `onexc` from 3.12; 3.11 (still supported) only has `onerror`. Both call
+    # the handler as (function, path, error).
+    hook = "onexc" if sys.version_info >= (3, 12) else "onerror"
+    try:
+        shutil.rmtree(path, **{hook: make_writable_and_retry})
+    except OSError as exc:
+        raise WorkspaceError(f"could not remove decrypted files at {path}: {exc}") from exc
+    if os.path.lexists(path):
+        raise WorkspaceError(f"could not remove decrypted files at {path}")
+
+
 def _reap_restores(projects_root: Path, project: str) -> None:
     """Delete plaintext left by restores of this project that did not finish.
 
@@ -252,9 +286,9 @@ def _reap_restores(projects_root: Path, project: str) -> None:
     project lock, so anything found here belongs to no live restore.
     """
     sealed = Path(projects_root) / SEALED_DIR
-    shutil.rmtree(_restore_dir(projects_root, project), ignore_errors=True)
+    _remove_plaintext(_restore_dir(projects_root, project))
     # The fixed name restores used before #45.
-    shutil.rmtree(sealed / f".{project}.restore", ignore_errors=True)
+    _remove_plaintext(sealed / f".{project}.restore")
     # #45's layout: `mkdtemp(prefix=".{project}.restore-")`, which appends
     # exactly eight characters from [a-z0-9_]. Matched exactly, not as a prefix:
     # another project's directory could only match by having a name of the
@@ -263,13 +297,30 @@ def _reap_restores(projects_root: Path, project: str) -> None:
     if sealed.is_dir():
         for entry in sealed.iterdir():
             if own.fullmatch(entry.name) and entry.is_dir() and not entry.is_symlink():
-                shutil.rmtree(entry, ignore_errors=True)
+                _remove_plaintext(entry)
 
 
 def seal(projects_root: Path, project: str, key: bytes) -> int:
     with _project_lock(projects_root, project):
-        _reap_restores(projects_root, project)
-        return _seal(projects_root, project, key)
+        try:
+            root = Path(projects_root)
+            if not (root / project).exists() and is_sealed(root, project):
+                # An earlier seal wrote the blob and then stopped part way
+                # through removing the plaintext. The blob was complete before
+                # anything moved, so finish the removal. Archiving what is left
+                # would overwrite that blob with the worktrees alone and lose
+                # the repository.
+                _reap_restores(root, project)
+                for _name, path in parts_of(root, project):
+                    if path.is_dir():
+                        _remove_plaintext(path)
+                return sealed_path(root, project).stat().st_size
+            _reap_restores(root, project)
+            return _seal(root, project, key)
+        except OSError as exc:
+            # As a WorkspaceError, so the caller keeps the workspace registered
+            # and retries, rather than one project's failure ending the sweep.
+            raise WorkspaceError(f"could not seal {project!r}: {exc}") from exc
 
 
 def _seal(projects_root: Path, project: str, key: bytes) -> int:
@@ -317,7 +368,7 @@ def _seal(projects_root: Path, project: str, key: bytes) -> int:
     trash = Path(tempfile.mkdtemp(dir=trash_parent))
     for name, path in sorted(parts, key=lambda p: p[0] != "repo"):
         os.replace(path, trash / name)
-    shutil.rmtree(trash, ignore_errors=True)
+    _remove_plaintext(trash)
     return len(blob)
 
 
@@ -334,8 +385,11 @@ def unseal(projects_root: Path, project: str, key: bytes) -> Path:
     and the blob gone, and returns the directory rather than failing.
     """
     with _project_lock(projects_root, project):
-        _reap_restores(projects_root, project)
-        return _unseal(projects_root, project, key)
+        try:
+            _reap_restores(projects_root, project)
+            return _unseal(projects_root, project, key)
+        except OSError as exc:
+            raise WorkspaceError(f"could not open {project!r}: {exc}") from exc
 
 
 def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
@@ -395,7 +449,7 @@ def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
             os.replace(staging / "worktrees", dest)
         os.replace(staging / "repo", repo)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        _remove_plaintext(staging)
 
     blob_path.unlink()
     return repo
