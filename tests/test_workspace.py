@@ -399,10 +399,12 @@ def _plant_leftovers(root: Path, project: str) -> list[Path]:
     # in today's layout and in the fixed name restores used before it.
     current = root / workspace.SEALED_DIR / ".restore" / project / "tmpdead" / "repo"
     legacy = root / workspace.SEALED_DIR / f".{project}.restore" / "repo"
-    for d in (current, legacy):
+    # #45's layout: mkdtemp(prefix=".{project}.restore-") — eight random chars.
+    randomized = root / workspace.SEALED_DIR / f".{project}.restore-k3x_9q0z" / "repo"
+    for d in (current, legacy, randomized):
         d.mkdir(parents=True)
         (d / "secret.md").write_text("plaintext")
-    return [current, legacy]
+    return [current, legacy, randomized]
 
 
 def test_leftover_plaintext_is_reaped_by_the_next_unseal(tmp_path):
@@ -430,7 +432,10 @@ def test_reaping_one_project_never_touches_another(tmp_path):
     # have matched a project called "p.restore-x".
     root = tmp_path / "projects"
     _git_repo_with_history(root / "p")
-    other = _plant_leftovers(root, "p.restore-x")[0]
+    others = _plant_leftovers(root, "p.restore-x")
+    # The nearest miss for #45's pattern: a project whose own name supplies
+    # eight characters after ".p.restore-".
+    others += _plant_leftovers(root, "p.restore-abcdefgh")
 
     workspace.seal(root, "p", os.urandom(32))
-    assert other.exists()
+    assert all(o.exists() for o in others)

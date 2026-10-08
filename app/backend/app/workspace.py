@@ -46,6 +46,7 @@ import contextlib
 import fcntl
 import io
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -250,9 +251,19 @@ def _reap_restores(projects_root: Path, project: str) -> None:
     which is exactly what sealing exists to prevent. Called only under the
     project lock, so anything found here belongs to no live restore.
     """
+    sealed = Path(projects_root) / SEALED_DIR
     shutil.rmtree(_restore_dir(projects_root, project), ignore_errors=True)
-    # The fixed name restores used before they had a directory of their own.
-    shutil.rmtree(Path(projects_root) / SEALED_DIR / f".{project}.restore", ignore_errors=True)
+    # The fixed name restores used before #45.
+    shutil.rmtree(sealed / f".{project}.restore", ignore_errors=True)
+    # #45's layout: `mkdtemp(prefix=".{project}.restore-")`, which appends
+    # exactly eight characters from [a-z0-9_]. Matched exactly, not as a prefix:
+    # another project's directory could only match by having a name of the
+    # same length, which makes it this project's name.
+    own = re.compile(re.escape(f".{project}.restore-") + r"[a-z0-9_]{8}")
+    if sealed.is_dir():
+        for entry in sealed.iterdir():
+            if own.fullmatch(entry.name) and entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
 
 
 def seal(projects_root: Path, project: str, key: bytes) -> int:
