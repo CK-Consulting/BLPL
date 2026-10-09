@@ -103,7 +103,7 @@ from .models import Project, ProjectInvitation, ProjectPolicy, Run, User
 from blpl.core import limits, project_manifest, quarantine
 from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
-from .projects import ProjectError, Projects
+from .projects import ProjectError, Projects, check_remote_url
 from .vault import VaultError
 from .references import (
     FilesystemSandbox,
@@ -1761,6 +1761,10 @@ def clone_project(
     """Clone a remote into a new working copy, owned by whoever cloned it."""
     _refuse_taken_name(session, body.name)
     try:
+        # Validated before any credential is looked up for it: the lookup parses
+        # the URL itself, and a credential should never be chosen for a remote
+        # that is about to be refused.
+        check_remote_url(body.remote)
         with _git_credentials(session, master_key, user, body.remote) as env:
             projects.clone(body.name, body.remote, body.branch, env=env)
     except ProjectError as exc:
@@ -2453,7 +2457,7 @@ def git_pull(project_id: str, user: User = Depends(require_onboarded),
     master_key: bytes = Depends(require_master_key)) -> dict:
     checkout = _project_dir(session, user, project_id)
     try:
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
+        with _git_credentials(session, master_key, user, projects.remote_of(project_id, checkout=checkout)) as env:
             out = projects.pull(project_id, env=env, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2468,7 +2472,7 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
     # the commit it made rather than the owner's branch.
     checkout = _project_dir(session, user, project_id)
     try:
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
+        with _git_credentials(session, master_key, user, projects.remote_of(project_id, checkout=checkout)) as env:
             out = projects.push(project_id, env=env, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

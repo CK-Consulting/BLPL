@@ -180,6 +180,14 @@ def check_remote_url(url: str) -> str:
             raise ProjectError(f"{raw[:60]!r} is not a valid URL: {exc}") from exc
         if scheme != "file" and not host:
             raise ProjectError(f"{raw[:60]!r} names no host")
+        if urlsplit(raw).password is not None:
+            # A token in the URL would be written to .git/config in plaintext
+            # and kept there; display-time redaction does nothing about that.
+            # Credentials belong in the per-user git store, leased per command.
+            raise ProjectError(
+                "this URL carries a password or token — remove it, and add the "
+                "credential under Account & app settings → Git endpoints/accounts"
+            )
         return raw
     if "::" in raw:
         raise ProjectError("git transport helpers (such as ext::) are not allowed")
@@ -353,17 +361,29 @@ class Projects:
         remote = self._primary_remote(d)
         if remote is not None:
             self._git(d, "remote", "set-url", remote, url)
+            # A separate pushurl would keep pushes going to the old place while
+            # the panel showed the new one. Dropped, so pushes use `url`.
+            self._git_allow_fail(d, "config", "--unset-all", f"remote.{remote}.pushurl")
         else:
             self._git(d, "remote", "add", "origin", url)
         return url
 
-    def remote_of(self, name: str) -> str:
-        """The origin URL, or "" for a local-only project. For credential
-        matching — which is why a missing remote is an empty answer, not an
-        error: no remote means no credential could apply."""
-        d = self.project_dir(name)
+    def remote_of(self, name: str, *, checkout: Path | None = None) -> str:
+        """The URL the checkout's remote pushes to, or "" for a local-only
+        project. For credential matching — which is why a missing remote is an
+        empty answer, not an error: no remote means no credential could apply.
+
+        Pass the checkout the operation runs in. A member's worktree branch can
+        resolve a different remote from the owner's, and a credential chosen
+        for the owner's remote would be offered to the member's host.
+        """
+        d = checkout if checkout is not None else self.project_dir(name)
         remote = self._primary_remote(d) if (d / ".git").exists() else None
-        return self._git_allow_fail(d, "remote", "get-url", remote) if remote else ""
+        if not remote:
+            return ""
+        # The URL a push to that remote goes to, which is what the credential
+        # must match: pushurl when one is set, else url.
+        return self._git_allow_fail(d, "remote", "get-url", "--push", remote)
 
     def pull(
         self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None

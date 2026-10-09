@@ -158,3 +158,50 @@ def test_with_no_remote_at_all_origin_is_added(tmp_path):
     work = _repo(tmp_path / "projects" / "p")
     store.set_remote(work, "git@github.com:o/p.git")
     assert subprocess.run(["git", "remote"], cwd=work, capture_output=True, text=True).stdout.split() == ["origin"]
+
+
+def test_a_token_in_the_url_is_refused_not_stored(deployment_protocols):
+    # Codex P1 on #10: accepted as-is, the token was written to .git/config in
+    # plaintext; the panel only hid it when displaying.
+    with pytest.raises(ProjectError) as exc:
+        check_remote_url("https://user:ghp_secret@github.com/o/p.git")
+    assert "token" in str(exc.value)
+    assert check_remote_url("https://user@github.com/o/p.git")  # a username alone is fine
+
+
+def test_changing_a_remote_drops_its_separate_push_url(tmp_path):
+    # Codex P1 on #10: a pushurl kept pushes going to the old destination while
+    # the panel reported the new one.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    subprocess.run(["git", "remote", "add", "origin", "https://old.example/o/p.git"], cwd=work, check=True)
+    subprocess.run(["git", "remote", "set-url", "--push", "origin", "https://old-push.example/o/p.git"], cwd=work, check=True)
+
+    store.set_remote(work, "https://github.com/o/new.git")
+    push = subprocess.run(["git", "remote", "get-url", "--push", "origin"], cwd=work, capture_output=True, text=True).stdout.strip()
+    assert push == "https://github.com/o/new.git"
+
+
+def test_credentials_are_chosen_from_the_checkout_that_pushes(tmp_path):
+    # Codex P1 on #10: the route leased credentials for the owner's remote while
+    # pushing from a member's worktree, whose branch can resolve another one.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    bare = tmp_path / "up.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(work), str(bare)], check=True)
+    subprocess.run(["git", "remote", "add", "upstream", f"file://{bare}"], cwd=work, check=True)
+    subprocess.run(["git", "remote", "add", "origin", "https://origin.example/o/p.git"], cwd=work, check=True)
+    subprocess.run(["git", "fetch", "-q", "upstream"], cwd=work, check=True)
+    subprocess.run(["git", "branch", "-q", "--set-upstream-to=upstream/main"], cwd=work, check=True)
+    member = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "user/2", str(member)], cwd=work, check=True)
+
+    assert store.remote_of("p") == f"file://{bare}"                      # owner: tracked upstream
+    assert store.remote_of("p", checkout=member) == "https://origin.example/o/p.git"  # member: origin
+
+
+def test_cloning_a_malformed_url_is_a_400(unlocked):
+    # Codex P2 on #10: credentials were looked up (parsing the URL) before it
+    # was validated, so this was still a 500.
+    r = unlocked.post("/api/projects/clone", json={"name": "x", "remote": "https://[bad/repo", "branch": "main"})
+    assert r.status_code == 400, r.text
