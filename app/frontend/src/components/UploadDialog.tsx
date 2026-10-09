@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { postForm } from "../api";
+import { announceCommitted } from "../commitEvents";
 
 /**
  * Put files into a project, through quarantine.
@@ -74,13 +75,14 @@ export function UploadDialog({
     setBusy(true);
     setError(null);
     try {
-      const out = await postForm<{ results: UploadResult[]; commit_error?: string }>(
+      const out = await postForm<{ results: UploadResult[]; committed?: boolean; commit_error?: string }>(
         `/api/projects/${projectId}/uploads`,
         form,
       );
       setResults(out.results);
       setRows([]);
       if (out.commit_error) setError(`Uploaded — ${out.commit_error}`);
+      else if (out.committed) announceCommitted(projectId);
       if (out.results.some((r) => r.state === "released")) onUploaded?.();
     } catch (e) {
       setError((e as Error).message);

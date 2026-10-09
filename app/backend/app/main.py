@@ -3258,7 +3258,14 @@ async def upload_files(
         )
     # Released files and the ledger; retrieved/ itself is gitignored, so a
     # held file never enters history.
-    commit = _commit_landed_write(proj, f"upload: {len(landed)} file(s)")
+    # Nothing to commit when every file was refused before quarantine; trying
+    # anyway produced "saved, but not committed" beside a list saying nothing
+    # was uploaded.
+    commit = (
+        _commit_landed_write(proj, f"upload: {len(landed)} file(s)")
+        if landed
+        else {"committed": False}
+    )
     return {"results": results, **commit}
 
 

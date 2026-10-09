@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getJSON, putJSON } from "../api";
+import { announceCommitted } from "../commitEvents";
 import { Code, langOf } from "./Code";
 import { Diagram, isDiagramFile } from "./Diagram";
 import { LineGutter, NumberedSource } from "./LineGutter";
@@ -141,7 +142,7 @@ export function FileView({
     // A save that commits must not leave the last one's warning standing.
     setError(null);
     try {
-      const out = await putJSON<{ commit_error?: string }>(
+      const out = await putJSON<{ committed?: boolean; commit_error?: string }>(
         `/api/projects/${projectId}/files/${path}`,
         { content: draft },
       );
@@ -150,6 +151,7 @@ export function FileView({
       // how a broken repository went unnoticed for two days.
       setStatus("Saved");
       if (out?.commit_error) setError(`Saved — ${out.commit_error}`);
+      else if (out?.committed) announceCommitted(projectId);
       onSaved();
     } catch (e) {
       setError((e as Error).message);

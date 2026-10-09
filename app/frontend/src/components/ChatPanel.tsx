@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError, ChatMessage, ConversationMeta, Proposal, del, getJSON, postJSON, readSSE } from "../api";
+import { onCommitted } from "../commitEvents";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
 import { SlashCommand, SlashPopover, useSlashCommands } from "./SlashCommands";
@@ -147,6 +148,13 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   // An accepted edit whose commit failed. Kept here, not on the card, because
   // the card is gone the moment the proposal is decided.
   const [commitWarning, setCommitWarning] = useState<string | null>(null);
+  // A warning about project A must not survive into project B (the panel is
+  // reused across projects), and any successful commit here — a save, an
+  // upload — also commits what the failed one left, so it clears it too.
+  useEffect(() => {
+    setCommitWarning(null);
+    return onCommitted(projectId, () => setCommitWarning(null));
+  }, [projectId]);
 
   const [input, setInput] = useState("");
   // Uploaded and waiting to ride along with the next message. Upload happens on

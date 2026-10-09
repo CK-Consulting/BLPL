@@ -38,3 +38,25 @@ def test_a_save_into_a_broken_repository_lands_and_says_it_was_not_committed(pro
     assert body["committed"] is False
     assert "not committed to git" in body["commit_error"]
     assert (repo / "design.md").read_text() == "# board\n"
+
+
+def test_an_upload_where_nothing_landed_does_not_claim_a_commit_failure(project, monkeypatch):
+    # Codex P2 on #9: every file refused before quarantine still attempted the
+    # commit, so a broken repository produced "saved, but not committed" beside
+    # a result list saying nothing was uploaded.
+    import json
+
+    import app.main as main
+
+    client, repo = project
+    (repo / ".git" / "HEAD").unlink()
+    monkeypatch.setattr(main, "UPLOAD_MAX_BYTES", 8)
+
+    r = client.post(
+        "/api/projects/p/uploads",
+        files=[("files", ("big.pdf", b"%PDF-1.4 too big", "application/pdf"))],
+        data={"meta": json.dumps([{"kind": "reference", "mpn": "", "llm_ignore": False}])},
+    )
+    assert r.status_code == 200, r.text
+    assert [x["state"] for x in r.json()["results"]] == ["rejected"]
+    assert "commit_error" not in r.json()

@@ -83,3 +83,40 @@ describe("the panel's commit warning", () => {
     );
   });
 });
+
+describe("a successful commit elsewhere", () => {
+  it("is announced only to listeners for the same project", async () => {
+    const { announceCommitted, onCommitted } = await import("../commitEvents");
+    const mine = vi.fn();
+    const other = vi.fn();
+    const off1 = onCommitted("p", mine);
+    const off2 = onCommitted("q", other);
+    announceCommitted("p");
+    off1();
+    off2();
+    announceCommitted("p");
+    expect(mine).toHaveBeenCalledTimes(1);
+    expect(other).not.toHaveBeenCalled();
+  });
+
+  it("is announced by a file save that commits", async () => {
+    const user = userEvent.setup();
+    const { onCommitted } = await import("../commitEvents");
+    const heard = vi.fn();
+    const off = onCommitted("p", heard);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) =>
+        init?.method === "PUT"
+          ? json({ ok: true, committed: true })
+          : ({ ok: true, status: 200, statusText: "OK", text: async () => "body\n" } as unknown as Response),
+      ),
+    );
+    render(<FileView projectId="p" path="a.md" onSaved={() => {}} reloadToken={0} />);
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    await user.type(screen.getByRole("textbox"), "x");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(heard).toHaveBeenCalled());
+    off();
+  });
+});
