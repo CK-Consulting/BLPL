@@ -79,7 +79,11 @@ def host_of(remote: str) -> str | None:
     if not raw or raw.startswith(("/", "./", "../", "file://")):
         return None
     if "://" in raw:
-        return (urlsplit(raw).hostname or "").lower() or None
+        try:
+            return (urlsplit(raw).hostname or "").lower() or None
+        except ValueError:
+            # Malformed (e.g. an unclosed IPv6 bracket): no host to match.
+            return None
     m = _SCP_LIKE.match(raw)
     if m and "@" in raw.split(":", 1)[0] + ":":
         # user@host:path — but a bare "name:path" on Windows-ish inputs is not
