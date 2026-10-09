@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError, ChatMessage, ConversationMeta, Proposal, del, getJSON, postJSON, readSSE } from "../api";
+import { onCommitted } from "../commitEvents";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
 import { SlashCommand, SlashPopover, useSlashCommands } from "./SlashCommands";
@@ -111,6 +112,24 @@ function turnInFlightId(e: unknown): string | null {
   return detail?.error === "turn_in_flight" && detail.turn_id ? detail.turn_id : null;
 }
 
+/**
+ * The panel's commit warning after a proposal is decided.
+ *
+ * A failed commit sets it. A later accept that commits clears it: the commit
+ * stages the whole checkout, so it also commits whatever the failed one left,
+ * and a warning still claiming that edit is uncommitted would be wrong.
+ * A rejection says nothing about git, so it leaves the warning alone.
+ */
+export function nextCommitWarning(
+  prev: string | null,
+  status: string,
+  warning?: string,
+): string | null {
+  if (warning) return warning;
+  if (status === "accepted") return null;
+  return prev;
+}
+
 export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [filename, setFilename] = useState<string | null>(null);
@@ -126,6 +145,16 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [decided, setDecided] = useState<Record<string, string>>({});
+  // An accepted edit whose commit failed. Kept here, not on the card, because
+  // the card is gone the moment the proposal is decided.
+  const [commitWarning, setCommitWarning] = useState<string | null>(null);
+  // A warning about project A must not survive into project B (the panel is
+  // reused across projects), and any successful commit here — a save, an
+  // upload — also commits what the failed one left, so it clears it too.
+  useEffect(() => {
+    setCommitWarning(null);
+    return onCommitted(projectId, () => setCommitWarning(null));
+  }, [projectId]);
 
   const [input, setInput] = useState("");
   // Uploaded and waiting to ride along with the next message. Upload happens on
@@ -807,8 +836,9 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     await postJSON(`/api/projects/${projectId}/chat/${turnId}/cancel`).catch(() => {});
   };
 
-  const onDecided = (id: string, status: string) => {
+  const onDecided = (id: string, status: string, warning?: string) => {
     setDecided((d) => ({ ...d, [id]: status }));
+    setCommitWarning((prev) => nextCommitWarning(prev, status, warning));
     refreshProposals();
     if (status === "accepted") onApplied();
   };
@@ -927,6 +957,14 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       {pending.map((p) => (
         <ProposalCard key={p.id} projectId={projectId} proposal={p} onDecided={onDecided} />
       ))}
+      {commitWarning && (
+        <div className="gate-error" role="alert">
+          {commitWarning}{" "}
+          <button className="link" onClick={() => setCommitWarning(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {lost && (
         <div className="turn-lost">
