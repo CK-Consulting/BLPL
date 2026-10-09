@@ -329,43 +329,34 @@ class Projects:
 
     # -- sync ----------------------------------------------------------------
 
-    def _primary_remote(self, d: Path) -> str | None:
-        """The remote this checkout's pushes and pulls actually go to.
+    # The project's remote is `origin`, always, and every command that talks
+    # to it names it. Resolving "the" remote the way git does — the branch's
+    # upstream, then branch.<b>.pushRemote, remote.pushDefault, push URLs, and
+    # each member worktree's own branch — took three review rounds and still
+    # left ways for the remote shown, the host a credential was leased for and
+    # the place a push actually went to disagree. Naming origin explicitly
+    # makes them one thing, for the owner and every member alike.
+    REMOTE = "origin"
 
-        The one the current branch tracks, when it tracks one; else `origin`;
-        else the first remote; None when there is none. status, push, the
-        credential lookup and set_remote all ask here. They used to choose
-        separately — status and push "origin, else first", the credential
-        lookup "origin" only, git itself the tracked remote — so a branch
-        tracking a remote not called origin was shown one destination, pushed
-        to another, and offered credentials for a third.
-        """
-        names = self._git(d, "remote").split()
-        if not names:
-            return None
-        branch = self._git_allow_fail(d, "branch", "--show-current").strip()
-        if branch:
-            tracked = self._git_allow_fail(d, "config", f"branch.{branch}.remote").strip()
-            if tracked in names:
-                return tracked
-        return "origin" if "origin" in names else names[0]
+    def _primary_remote(self, d: Path) -> str | None:
+        """`origin` if the checkout has it, else None (local-only)."""
+        return self.REMOTE if self.REMOTE in self._git(d, "remote").split() else None
 
     def set_remote(self, checkout: Path, url: str) -> str:
-        """Point a project at a remote: change the one it uses, or add origin.
+        """Point a project's `origin` at a URL, adding origin if there is none.
 
         Set in the repository's config, so every member's worktree — which
         shares that config — sees the same remote.
         """
         url = check_remote_url(url)
         d = self._checkout("", checkout)
-        remote = self._primary_remote(d)
-        if remote is not None:
-            self._git(d, "remote", "set-url", remote, url)
+        if self._primary_remote(d):
+            self._git(d, "remote", "set-url", self.REMOTE, url)
             # A separate pushurl would keep pushes going to the old place while
             # the panel showed the new one. Dropped, so pushes use `url`.
-            self._git_allow_fail(d, "config", "--unset-all", f"remote.{remote}.pushurl")
+            self._git_allow_fail(d, "config", "--unset-all", f"remote.{self.REMOTE}.pushurl")
         else:
-            self._git(d, "remote", "add", "origin", url)
+            self._git(d, "remote", "add", self.REMOTE, url)
         return url
 
     def remote_of(self, name: str, *, checkout: Path | None = None) -> str:
@@ -395,12 +386,15 @@ class Projects:
         app papers over. --ff-only turns divergence into a clear error.
         """
         d = self._checkout(name, checkout)
-        if self._has_remote(d) and not self._upstream(d):
-            branch = self._git(d, "branch", "--show-current").strip()
+        if not self._primary_remote(d):
+            raise ProjectError("this project has no remote to pull from; add one in project settings")
+        branch = self._git(d, "branch", "--show-current").strip()
+        if not self._upstream(d):
             raise ProjectError(
                 f"branch {branch!r} has no upstream to pull from yet; push it first"
             )
-        return self._git(d, "pull", "--ff-only", env=_net_env(env))
+        # From origin by name (see REMOTE), into the branch of the same name.
+        return self._git(d, "pull", "--ff-only", self.REMOTE, branch, env=_net_env(env))
 
     def commit_all(self, name: str, message: str) -> str | None:
         """Stage everything and commit. Returns the commit output, or None if the
@@ -422,9 +416,6 @@ class Projects:
         if not (d / ".git").exists():
             raise ProjectError(f"{d.name!r} is not a git checkout")
         return d
-
-    def _has_remote(self, d: Path) -> bool:
-        return bool(self._git(d, "remote").strip())
 
     def _upstream(self, d: Path) -> str:
         return self._git_allow_fail(
@@ -456,13 +447,13 @@ class Projects:
         self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None
     ) -> str:
         d = self._checkout(name, checkout)
-        if self._has_remote(d) and not self._upstream(d):
-            # A member's worktree branch starts with no upstream, and a plain
-            # push then refuses. Publish it under its own name, and track it so
-            # status can count ahead and behind from then on.
-            remote = self._primary_remote(d)
-            return self._git(d, "push", "--set-upstream", remote, "HEAD", env=_net_env(env))
-        return self._git(d, "push", env=_net_env(env))
+        if not self._primary_remote(d):
+            raise ProjectError("this project has no remote to push to; add one in project settings")
+        # To origin by name, as the branch of the same name — never an
+        # argument-less push, whose destination pushRemote, pushDefault and a
+        # branch's upstream can all redirect (see REMOTE). --set-upstream so a
+        # member's new branch is tracked and status can count ahead/behind.
+        return self._git(d, "push", "--set-upstream", self.REMOTE, "HEAD", env=_net_env(env))
 
     # -- inspection ----------------------------------------------------------
 
@@ -473,7 +464,7 @@ class Projects:
         # name but no commit yet, and that is a valid state to report on.
         branch = self._git(d, "branch", "--show-current").strip()
         dirty = self._has_design_changes(d)
-        has_remote = bool(self._git(d, "remote").strip())
+        has_remote = self._primary_remote(d) is not None
         ahead = behind = 0
         if has_remote:
             # Counts against the upstream, when one is configured. No upstream
@@ -488,13 +479,11 @@ class Projects:
         remote_name = ""
         remote_url = ""
         if has_remote:
-            # The remote pushes actually go to (see _primary_remote): a clone
-            # names it origin, but a repository set up by hand need not, and a
-            # branch may track another — reporting a different one than git
-            # uses is the blind spot this panel exists to remove.
-            remote_name = self._primary_remote(d) or ""
+            # origin, which every pull and push names (see REMOTE), and its
+            # push URL — where a push actually goes, if a separate one is set.
+            remote_name = self.REMOTE
             remote_url = _redact_url(
-                self._git_allow_fail(d, "remote", "get-url", remote_name).strip()
+                self._git_allow_fail(d, "remote", "get-url", "--push", remote_name).strip()
             )
         return GitStatus(branch=branch, ahead=ahead, behind=behind, dirty=dirty,
                          has_remote=has_remote, remote_name=remote_name, remote_url=remote_url)
