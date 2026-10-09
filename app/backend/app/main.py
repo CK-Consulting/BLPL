@@ -4248,8 +4248,15 @@ async def upload_attachments(
     for upload in files:
         data = await upload.read()
         try:
+            # In a worker thread: saving now inspects the PDF (inflating every
+            # stream) and asks the scanner, which may take its full timeout.
+            # On the event loop, ten such files blocked every other request.
             saved.append(
-                attachments.save(conv_dir, upload.filename or "attachment", data).to_dict()
+                (
+                    await asyncio.to_thread(
+                        attachments.save, conv_dir, upload.filename or "attachment", data
+                    )
+                ).to_dict()
             )
         except attachments.AttachmentRejected as exc:
             # One bad file fails the batch rather than half-attaching. The user

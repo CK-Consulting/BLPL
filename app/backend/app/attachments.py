@@ -139,6 +139,20 @@ def save(conversations_dir: Path, name: str, data: bytes) -> Attachment:
             f"{cap // (1024 * 1024)} MB limit for {media_type}"
         )
 
+    # The same checks as the upload quarantine, before the model can see it.
+    # This store used to take anything that sniffed as a PDF or an image, so a
+    # file the quarantine held — an encrypted PDF, one carrying JavaScript —
+    # could be dropped into the chat instead and read by the assistant.
+    from blpl.core import quarantine
+
+    verdict = quarantine.assess(data, is_pdf=media_type in _DOC_TYPES)
+    if verdict.reasons:
+        raise AttachmentRejected(
+            f"{name}: not attached — the same checks that hold uploaded files "
+            f"held this one: {'; '.join(verdict.reasons)}. Upload it to the "
+            "project instead to keep it, held, as evidence."
+        )
+
     digest = hashlib.sha256(data).hexdigest()
     target = store_dir(conversations_dir) / f"{digest}{SUPPORTED_TYPES[media_type]}"
     _remember_name(target, Path(name).name)

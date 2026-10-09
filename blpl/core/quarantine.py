@@ -208,6 +208,34 @@ def _decide(inspection: pdf_inspect.Inspection, scan: av.ScanResult) -> list[str
     return reasons
 
 
+@dataclass
+class Assessment:
+    """What quarantine would decide about some bytes, without filing them."""
+
+    inspection: pdf_inspect.Inspection
+    scan: av.ScanResult
+    reasons: list[str]
+
+
+def assess(data: bytes, *, is_pdf: bool) -> Assessment:
+    """Inspect, scan and decide, exactly as `accept` does, without storing.
+
+    For files that arrive by another door than this module — a chat attachment
+    goes into the conversation store, not ``retrieved/`` — so that the same
+    rules decide whether a model may read them. One policy, two front doors:
+    the alternative was an attachment path that took an encrypted PDF the
+    upload quarantine had already held, and handed it to the model.
+    """
+    if is_pdf or _looks_like_pdf(data):
+        inspection = pdf_inspect.inspect_bytes(data)
+    else:
+        inspection = pdf_inspect.Inspection(
+            state=NOT_INSPECTED, findings=[], reason="no inspector for this type"
+        )
+    scan = av.scan_bytes(data)
+    return Assessment(inspection=inspection, scan=scan, reasons=_decide(inspection, scan))
+
+
 def _looks_like_pdf(data: bytes) -> bool:
     # The spec allows junk before the header; readers look within the first 1 KB.
     return b"%PDF-" in data[:1024]
@@ -330,13 +358,14 @@ def accept_and_release(
     distributor: str = "",
     source_url: str = "",
     as_name: str = "",
+    dest_dirname: str = TRUSTED_DIRNAME,
 ) -> Record:
     """The whole path for a fetched datasheet, in the order it has to happen."""
     rec = accept(
         data, project_dir, mpn=mpn, distributor=distributor, source_url=source_url
     )
     if not rec.reasons:
-        rec = release(project_dir, rec, as_name=as_name)
+        rec = release(project_dir, rec, as_name=as_name, dest_dirname=dest_dirname)
     return rec
 
 

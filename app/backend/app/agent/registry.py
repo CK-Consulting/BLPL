@@ -518,7 +518,9 @@ async def _fetch_datasheet(ctx: ToolContext, args: dict) -> str:
     ctx.sandbox.check_write(dest)
     dest.mkdir(parents=True, exist_ok=True)
     ctx.note(f"downloading datasheet for {mpn}")
-    result = await _to_thread(fetch_datasheet, mpn, dest, creds=ctx.creds)
+    result = await _to_thread(
+        fetch_datasheet, mpn, dest, creds=ctx.creds, project_dir=ctx.project_dir
+    )
     return json.dumps(result.to_dict(), indent=2)
 
 
