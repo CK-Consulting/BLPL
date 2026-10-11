@@ -651,6 +651,64 @@ describe("what a move reports", () => {
   });
 });
 
+/** Serves the tree, and answers every other request with `reply`. */
+function mockReply(reply: Record<string, unknown>) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const body = url.endsWith("/tree") ? { nodes: NODES } : reply;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }),
+  );
+}
+
+describe("what a delete reports", () => {
+  it("says when the ignore list still names the deleted file", async () => {
+    // Codex, PR #17: the list is rewritten after the unlink, and a failed
+    // rewrite used to fail the whole request with the bytes already gone.
+    // Now the delete stands and the stale entry is said so.
+    mockReply({ ok: true, path: "overview.md", kind: "file", committed: true, ignore_list_updated: false });
+    const user = userEvent.setup();
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("overview.md");
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("overview.md") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete file" });
+    await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+    expect(await screen.findByText(/LLM-ignore list still names overview\.md/)).toBeInTheDocument();
+  });
+});
+
+describe("the path a new file opens at", () => {
+  async function create(typed: string) {
+    const user = userEvent.setup();
+    const opened = vi.fn();
+    render(<FileTree projectId="p" reloadToken={0} onOpen={opened} />);
+    await screen.findByText("overview.md");
+    await user.click(screen.getByRole("button", { name: "+ File" }));
+    await user.type(screen.getByLabelText("Path in the project"), `${typed}{Enter}`);
+    await vi.waitFor(() => expect(opened).toHaveBeenCalled());
+    return opened;
+  }
+
+  it("is the one the backend says the file landed at", async () => {
+    // Codex, PR #17: `dir//a.md` is written as `dir/a.md`, but the editor kept
+    // the typed spelling, which no tree row has and no guard matches.
+    mockReply({ ok: true, name: "dir//a.md", path: "dir/a.md", committed: true });
+    const opened = await create("dir//a.md");
+    expect(opened).toHaveBeenCalledWith(expect.objectContaining({ path: "dir/a.md", name: "a.md" }));
+  });
+
+  it("drops empty segments itself when the backend does not say", async () => {
+    mockReply({ ok: true, committed: true });
+    const opened = await create("dir//a.md");
+    expect(opened).toHaveBeenCalledWith(expect.objectContaining({ path: "dir/a.md", name: "a.md" }));
+  });
+});
+
 describe("a tree from a project no longer selected", () => {
   it("never shows the old project's rows after a switch", async () => {
     // Codex, PR #17: a slow /tree for the previous project resolved last and

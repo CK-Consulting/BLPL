@@ -3174,12 +3174,17 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
     target = _editable_file(session, user, project_id, name)
+    # The spelling the file actually landed at, as the tree lists it: empty
+    # segments are dropped, so ``dir//a.md`` is written as ``dir/a.md``. The
+    # client opens this rather than what it typed, or the editor holds a path
+    # no tree row has and every string-compared guard misses it (Codex, PR #17).
+    rel = "/".join(seg for seg in name.split("/") if seg)
     # A new board's directory may not exist yet; writing its first design
     # document is how a board comes into being.
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body.content, encoding="utf-8")
     activity.record(
-        session, _project_or_404(session, user, project_id), user, activity.EDITED, name
+        session, _project_or_404(session, user, project_id), user, activity.EDITED, rel
     )
     # Committed, the way an accepted proposal is. This was the one edit path
     # that wrote over the previous version and kept no record of it: an edit
@@ -3194,12 +3199,13 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
         # In the checkout the file was written to, which for a member is their
         # own worktree rather than the repository directory the name resolves to.
         checkout = _project_dir(session, user, project_id)
-        committed = projects.commit_checkout(checkout, f"edit: {name}") is not None
+        committed = projects.commit_checkout(checkout, f"edit: {rel}") is not None
     except ProjectError:
         committed = False
     return {
         "ok": True,
         "name": name,
+        "path": rel,
         "bytes": target.stat().st_size,
         "committed": committed,
     }
@@ -3533,10 +3539,20 @@ def delete_path(
     # After the delete, unlike a move's list update, and safely so: should this
     # write fail, the file is already gone and the entry left behind can only
     # over-ignore a later file of the same name. Nothing becomes readable.
-    llm_ignore.drop_entries(checkout, rel)
+    # Caught, as a move's post-rename cleanup is (Codex, PR #17): let through,
+    # the error skipped the commit and the dialog reported a failed delete of
+    # bytes that were already gone. The stale entry is reported instead.
+    ignore_list_updated = True
+    try:
+        llm_ignore.drop_entries(checkout, rel)
+    except OSError:
+        ignore_list_updated = False
     activity.record(session, project, user, activity.DELETED, rel)
     committed = _commit_quietly(checkout, f"delete: {rel}")
-    return {"ok": True, "path": rel, "kind": kind, "committed": committed}
+    return {
+        "ok": True, "path": rel, "kind": kind, "committed": committed,
+        "ignore_list_updated": ignore_list_updated,
+    }
 
 
 class MoveBody(BaseModel):

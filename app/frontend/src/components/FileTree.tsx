@@ -640,10 +640,20 @@ export function FileTree({
               );
             }
             stillHere(live.project, "nothing was created");
-            await putJSON(`/api/projects/${live.project}/files/${encodePath(name)}`, { content: "" });
+            const r = await putJSON<{ path?: string }>(
+              `/api/projects/${live.project}/files/${encodePath(name)}`,
+              { content: "" },
+            );
             if (!stillOn(live.project)) return;
             changed();
-            onOpen({ path: name, name: name.split("/").pop() ?? name, dir: false, role: "design" });
+            // The backend's spelling, as with a move: `dir//a.md` is written as
+            // `dir/a.md`, and an editor left holding the typed spelling has a
+            // path no tree row has, so onMoved and the unsaved-edit guards,
+            // which compare strings, miss it (Codex, PR #17). Dropping empty
+            // segments here is the backend's own rule, for an older backend
+            // that does not send the path back.
+            const path = r?.path ?? name.split("/").filter(Boolean).join("/");
+            onOpen({ path, name: path.split("/").pop() ?? path, dir: false, role: "design" });
           }}
         />
       )}
@@ -688,16 +698,23 @@ export function FileTree({
             stillHere(live.project, "nothing was deleted");
             const refusal = canDelete?.(path);
             if (refusal) throw new Error(refusal);
-            const r = await delJSON<{ committed?: boolean }>(
+            const r = await delJSON<{ committed?: boolean; ignore_list_updated?: boolean }>(
               `/api/projects/${live.project}/files/${encodePath(path)}`,
             );
             if (!stillOn(live.project)) return;
             onDeleted?.(path);
             changed();
             // The bytes are gone either way; say so when no commit records it.
+            const notes: string[] = [];
             if (r && r.committed === false) {
-              setError(`${path} was deleted, but the delete was not committed to the project's history.`);
+              notes.push(`${path} was deleted, but the delete was not committed to the project's history.`);
             }
+            // The list could not be rewritten after the delete, so its entry
+            // would cover a new file made at that name (Codex, PR #17).
+            if (r && r.ignore_list_updated === false) {
+              notes.push(`The LLM-ignore list still names ${path}; remove it there if a new file at that name should be readable.`);
+            }
+            if (notes.length) setError(notes.join(" "));
           }}
         />
       )}

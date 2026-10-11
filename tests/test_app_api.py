@@ -378,6 +378,20 @@ def _scratch_with_files(client) -> None:
         assert client.put(f"/api/projects/scratch/files/{rel}", json={"content": f"# {rel}\n"}).status_code == 200
 
 
+def test_a_write_reports_the_path_the_file_landed_at(client) -> None:
+    """Codex, PR #17. ``dir//a.md`` is written as ``dir/a.md``; the editor
+    opened the typed spelling, which no tree row has, so every guard that
+    compares paths as strings missed it. The response says where it landed."""
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "scratch"})
+    r = client.put("/api/projects/scratch/files/dir//a.md", json={"content": "# a\n"})
+    assert r.status_code == 200, r.text
+    assert r.json()["path"] == "dir/a.md"
+    names = {f["name"] for f in client.get("/api/projects/scratch/files").json()}
+    assert "dir/a.md" in names
+    assert "edit: dir/a.md" in _git_log("scratch")
+
+
 def test_a_file_can_be_deleted_and_the_delete_is_committed(client) -> None:
     """Committed so a delete is one revert from undone — the reason it is safe
     to offer behind a single confirmation."""
@@ -786,6 +800,31 @@ def test_an_ignored_file_is_never_left_at_an_unignored_path(client, monkeypatch)
     assert r.json()["ignore_list_updated"] is True
     assert "supply/notes.yaml" in llm_ignore.paths(proj)
     assert not any(p.startswith("psu/") for p in llm_ignore.paths(proj))
+
+
+def test_a_delete_succeeds_even_when_the_ignore_list_cannot_be_rewritten(client, monkeypatch) -> None:
+    """Codex, PR #17. The ignore-list cleanup runs after the unlink, and its
+    error escaped: the delete went uncommitted and the dialog reported a
+    failure for a file that was already gone. Now it is the move's rule — the
+    delete is real, so it is committed and reported, with the stale entry
+    said so."""
+    from app import llm_ignore
+
+    _scratch_with_files(client)
+    import app.main as main
+    proj = main.projects.project_dir("scratch")
+    llm_ignore.set_ignored(proj, "overview.md", True)
+
+    def unwritable(project_dir, rel):
+        raise PermissionError(".blpl is read-only")
+    monkeypatch.setattr(llm_ignore, "drop_entries", unwritable)
+
+    r = client.delete("/api/projects/scratch/files/overview.md")
+    assert r.status_code == 200, r.text
+    assert r.json()["committed"] is True
+    assert r.json()["ignore_list_updated"] is False
+    assert not (proj / "overview.md").exists()
+    assert "delete: overview.md" in _git_log("scratch")
 
 
 # -- cookie Secure flag: the footgun that dropped sessions over HTTP ----------
