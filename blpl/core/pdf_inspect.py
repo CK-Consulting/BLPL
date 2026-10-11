@@ -378,14 +378,23 @@ def _decode(body: bytes, filters: list[str]) -> bytes | None:
                 return None
             if not d.eof:
                 return None
+        # Like Flate's EOF, the ASCII filters must reach their end-of-data
+        # marker (`>`, `~>`). A body cut short at a stray `endstream`, when no
+        # direct /Length could correct the cut, decodes to a clean-looking
+        # prefix otherwise, and the objects after the cut go unread.
         elif f in ("ASCIIHexDecode", "AHx"):
+            if b">" not in body:
+                return None
             digits = re.sub(rb"[^0-9A-Fa-f]", b"", body.split(b">", 1)[0])
             if len(digits) % 2:
                 digits += b"0"
             body = bytes.fromhex(digits.decode())
         elif f in ("ASCII85Decode", "A85"):
+            if b"~>" not in body:
+                return None
             try:
-                body = base64.a85decode(body.split(b"~>", 1)[0], adobe=False, ignorechars=b" \t\r\n")
+                # All six PDF whitespace bytes, NUL and form feed included.
+                body = base64.a85decode(body.split(b"~>", 1)[0], adobe=False, ignorechars=_WS)
             except ValueError:
                 return None
         else:

@@ -372,6 +372,31 @@ def test_ordinary_streams_cannot_push_an_object_stream_past_the_cap(tmp_path, mo
     assert r.state == "cannot_inspect"
 
 
+def test_an_ascii85_body_cut_short_is_unknown(tmp_path):
+    """Codex, PR #15: with an indirect /Length nothing corrects a cut at an
+    `endstream` inside the ASCII85 bytes, and a85decode accepted the aligned
+    prefix without its `~>`. The decoder must reach end-of-data."""
+    import base64
+
+    encoded = base64.a85encode(b"padding!" * 4 + _HIDDEN)
+    cut = 40  # a multiple of 5, so the prefix decodes cleanly on its own
+    body = encoded[:cut] + b"endstream" + encoded[cut:] + b"~>"
+    data = _objstm(b"/Filter/ASCII85Decode/Length 99 0 R", body)
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert not r.is_inert
+
+
+def test_ascii85_honours_every_pdf_whitespace_byte(tmp_path):
+    """Codex, PR #15: NUL and form feed are PDF whitespace; a85decode refused
+    them and a benign object stream was held as undecodable."""
+    import base64
+
+    enc = base64.a85encode(b"1 0 <</Type/Catalog>>")
+    body = enc[:5] + b"\x00\x0c" + enc[5:] + b"~>"
+    data = _objstm(b"/Filter/ASCII85Decode", body)
+    assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
+
+
 def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
     data = (
         b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"
