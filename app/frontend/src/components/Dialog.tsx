@@ -236,3 +236,93 @@ export function ConfirmDialog({
     </Modal>
   );
 }
+
+/**
+ * Unsaved edits, and something about to close them: Save, Discard or Cancel.
+ *
+ * Three ways out rather than ConfirmDialog's two, because "leave" alone makes
+ * the reader choose between their edits and where they meant to go, when what
+ * they usually want is both. Focus starts on Cancel, for the same reason as
+ * ConfirmDialog: Enter pressed out of habit should lose nothing.
+ */
+export function UnsavedChangesDialog({
+  what,
+  saving,
+  onSave,
+  onDiscard,
+  onClose,
+}: {
+  /** Where the reader was going, finishing "before …". */
+  what: string;
+  /** A save is already on its way: offering another would race it. */
+  saving: boolean;
+  /** Throw to keep the dialog open with the error shown. */
+  onSave: () => Promise<void>;
+  onDiscard: () => void;
+  onClose: () => void;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const cancel = useRef<HTMLButtonElement>(null);
+  useEffect(() => cancel.current?.focus(), []);
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await onSave();
+      onClose();
+    } catch (err) {
+      setError((err as Error).message || "That did not work.");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal onClose={onClose} busy={busy}>
+      {(titleId) => (
+        <>
+          <div className="modal-head">
+            <h2 id={titleId}>Unsaved changes</h2>
+            <button type="button" className="link" aria-label="Close" onClick={onClose} disabled={busy}>
+              ✕
+            </button>
+          </div>
+          {error && (
+            <div className="modal-notice error" role="alert">
+              {error}
+            </div>
+          )}
+          <div className="modal-body">
+            <div>
+              {saving
+                ? `A save of the open file has not come back yet. Cancel to wait for it; ${what} now, you will not see whether it worked.`
+                : `The open file has edits that are not saved. Save them before ${what}?`}
+            </div>
+            <div className="dialog-actions">
+              <button ref={cancel} type="button" onClick={onClose} disabled={busy}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => {
+                  onDiscard();
+                  onClose();
+                }}
+                disabled={busy}
+              >
+                {saving ? "Leave anyway" : "Discard"}
+              </button>
+              {!saving && (
+                <button type="button" className="primary" onClick={() => void save()} disabled={busy}>
+                  Save
+                </button>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}

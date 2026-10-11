@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { type MutableRefObject, type ReactNode, useEffect, useRef, useState } from "react";
 import { encodePath, getJSON, putJSON } from "../api";
 import { Code, langOf } from "./Code";
+import { UnsavedChangesDialog } from "./Dialog";
 import { Diagram, isDiagramFile } from "./Diagram";
 import { LineGutter, NumberedSource } from "./LineGutter";
 import { Markdown } from "./Markdown";
@@ -29,6 +30,68 @@ export function isSavable(path: string): boolean {
   return SAVABLE.test(path);
 }
 
+/** Saves the open draft; resolves whether it was written. */
+export type SaveHandle = () => Promise<boolean>;
+
+/**
+ * Asks before anything that would close the editor on unsaved work.
+ *
+ * Codex, PR #17: switching project in the header while the editor was dirty
+ * cleared the draft. That clearing is right, since the draft belongs to the
+ * old project and saving it into the new one is the bug it replaced, but
+ * nothing asked first, so the edits were gone without a word. Every navigation
+ * that changes the project goes through `guard`, which runs it straight away
+ * when there is nothing to lose and otherwise holds it behind a dialog offering
+ * Save, Discard or Cancel. Closing the tab gets the browser's own prompt, the
+ * only one it allows there.
+ */
+export function useUnsavedGuard({
+  dirty,
+  saving,
+  saveHandle,
+}: {
+  dirty: boolean;
+  /** The path whose save is in flight, as FileView reports it. */
+  saving: string | null;
+  saveHandle: MutableRefObject<SaveHandle | null>;
+}): { guard: (go: () => void, what: string) => void; dialog: ReactNode } {
+  const [held, setHeld] = useState<{ go: () => void; what: string } | null>(null);
+  const atRisk = dirty || saving !== null;
+
+  useEffect(() => {
+    if (!atRisk) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      // Older browsers show the prompt only when returnValue is set.
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [atRisk]);
+
+  const guard = (go: () => void, what: string) => {
+    if (atRisk) setHeld({ go, what });
+    else go();
+  };
+
+  const dialog = held && (
+    <UnsavedChangesDialog
+      what={held.what}
+      saving={saving !== null}
+      onSave={async () => {
+        const ok = (await saveHandle.current?.()) ?? false;
+        // Thrown, the dialog stays open with this shown and the project does
+        // not change: leaving after a failed save is the loss this guards.
+        if (!ok) throw new Error("The file was not saved, so nothing has changed. Your edits are still open.");
+        held.go();
+      }}
+      onDiscard={() => held.go()}
+      onClose={() => setHeld(null)}
+    />
+  );
+  return { guard, dialog };
+}
+
 export function FileView({
   projectId,
   path,
@@ -37,6 +100,7 @@ export function FileView({
   renamedFrom = null,
   onDirtyChange,
   onSavingChange,
+  saveHandle,
 }: {
   projectId: string;
   /** Project-relative path chosen in the file tree. */
@@ -49,6 +113,9 @@ export function FileView({
   /** Told the path a save was sent for, and null once it has come back, so a
    *  rename or delete can wait for it rather than race it. */
   onSavingChange?: (path: string | null) => void;
+  /** Filled with this pane's save, so the unsaved-changes dialog can offer Save
+   *  before a project switch closes the draft. */
+  saveHandle?: MutableRefObject<SaveHandle | null>;
   onSaved: () => void;
   /** Bumped when something outside this pane changes the project — a proposal
    *  applied from the chat, a sync, a run that rewrote a document. */
@@ -206,10 +273,12 @@ export function FileView({
     }
   }, [dirty]);
 
-  const save = async () => {
+  // Resolves whether the draft was written, which is what the unsaved-changes
+  // dialog needs before it lets a project switch go ahead.
+  const save = async (): Promise<boolean> => {
     // Never write what was not read from this path: an empty or foreign
     // buffer saved here replaces the file with it.
-    if (!path || !savable || !loaded || savingRef.current) return;
+    if (!path || !savable || !loaded || savingRef.current) return false;
     const key = `${projectId}\u0000${path}`;
     const sent = draft;
     savingRef.current = true;
@@ -223,11 +292,13 @@ export function FileView({
       // content this draft is not, and clearing its unsaved badge reported
       // saved what had been written somewhere else. Only the document the save
       // was for takes its result.
-      if (currentKey.current !== key) return;
+      if (currentKey.current !== key) return true;
       setContent(sent);
       setStatus("Saved");
+      return true;
     } catch (e) {
       if (currentKey.current === key) setError((e as Error).message);
+      return false;
     } finally {
       // Always, mounted or not: a pane closed mid-save that never said the
       // save was over would hold every later rename of that file refused.
@@ -236,6 +307,16 @@ export function FileView({
       onSavingChange?.(null);
     }
   };
+
+  // Reassigned every render so the handle saves the draft as it is now, not
+  // as it was when the handle was first handed out.
+  if (saveHandle) saveHandle.current = save;
+  useEffect(
+    () => () => {
+      if (saveHandle) saveHandle.current = null;
+    },
+    [saveHandle],
+  );
 
   if (!path) {
     return (
@@ -306,7 +387,7 @@ export function FileView({
           </button>
         </div>
         {editing && (
-          <button onClick={save} disabled={!dirty || !loaded || saving}>
+          <button onClick={() => void save()} disabled={!dirty || !loaded || saving}>
             Save
           </button>
         )}

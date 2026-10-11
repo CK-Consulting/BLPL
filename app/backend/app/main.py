@@ -3626,7 +3626,7 @@ def move_path(
     ignore_list_updated = True
     if before is not None:
         try:
-            llm_ignore.finish_move(checkout, before, src_rel, dst_rel)
+            llm_ignore.finish_move(checkout, before)
         except OSError:
             # The move happened, and failing the request would misstate that,
             # as with a commit that fails. The superset still covers the file at

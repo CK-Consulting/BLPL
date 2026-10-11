@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AuthGate, UserControl } from "./components/AuthGate";
 import { DesignView, type Highlight } from "./components/Visualizer";
 import { StageRunner } from "./components/StageRunner";
@@ -9,7 +9,7 @@ import { Dashboard } from "./components/Dashboard";
 import { Invitations } from "./components/Invitations";
 import { Logo } from "./components/Logo";
 import { NewProject, ProjectSettings, ProjectSync } from "./components/ProjectControls";
-import { FileView } from "./components/FileView";
+import { FileView, type SaveHandle, useUnsavedGuard } from "./components/FileView";
 import { LaunchKicad } from "./components/LaunchKicad";
 import { KicadFileView } from "./components/KicadFileView";
 import { Reports } from "./components/Reports";
@@ -84,6 +84,11 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   // enough: it stays true until the PUT returns, and a rename in that window
   // raced the save (Codex, PR #17).
   const [editorSaving, setEditorSaving] = useState<string | null>(null);
+  // Everything that takes the editor's project away from it asks first when
+  // there is unsaved work (Codex, PR #17): the header selector, a new project
+  // that would open itself, the way back to the dashboard, closing the tab.
+  const editorSave = useRef<SaveHandle | null>(null);
+  const unsaved = useUnsavedGuard({ dirty: editorDirty, saving: editorSaving, saveHandle: editorSave });
   const [railCollapsed, setRailCollapsed] = useState(
     () => localStorage.getItem("blpl.railCollapsed") === "1",
   );
@@ -135,13 +140,22 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
     <div className="app">
       <Invitations onChanged={refresh} />
       <header>
-        <button className="link dash-back" onClick={onLeave} title="All projects">
+        <button
+          className="link dash-back"
+          onClick={() => unsaved.guard(onLeave, "going back to all projects")}
+          title="All projects"
+        >
           ← <Logo size={30} />
         </button>
         <span className="sep">/</span>
         <select
           value={selected ?? ""}
-          onChange={(e) => setSelected(e.target.value)}
+          onChange={(e) => {
+            // Controlled, so the select shows the old project until the
+            // switch actually happens: Cancel leaves it where it was.
+            const next = e.target.value;
+            if (next !== selected) unsaved.guard(() => setSelected(next), `switching to ${next}`);
+          }}
           disabled={projects.length === 0}
         >
           {projects.map((p) => (
@@ -351,6 +365,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                   renamedFrom={renamedFrom}
                   onDirtyChange={setEditorDirty}
                   onSavingChange={setEditorSaving}
+                  saveHandle={editorSave}
                 />
               )}
               {tab === "kicad" && openFile && (
@@ -408,10 +423,12 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
           onClose={() => setShowNewProject(false)}
           onCreated={(id) => {
             setShowNewProject(false);
-            refresh().then(() => setSelected(id));
+            // Created either way; only opening it waits on the unsaved edits.
+            refresh().then(() => unsaved.guard(() => setSelected(id), `opening ${id}`));
           }}
         />
       )}
+      {unsaved.dialog}
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
       {showSharing && selected && (
         <div className="modal-backdrop" onClick={() => setShowSharing(false)}>

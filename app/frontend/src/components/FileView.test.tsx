@@ -1,8 +1,9 @@
 import userEvent from "@testing-library/user-event";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import { useRef, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { FileView } from "./FileView";
+import { FileView, type SaveHandle, useUnsavedGuard } from "./FileView";
 
 /** The blob endpoint, one body per call. */
 function serve(...bodies: string[]) {
@@ -279,5 +280,124 @@ describe("a save that comes back after the pane moved on", () => {
     expect(screen.queryByText(/DRAFT FOR A/)).toBeNull();
     expect(screen.queryByText("Saved")).toBeNull();
     expect(screen.getByText("b body")).toBeTruthy();
+  });
+});
+
+describe("switching project asks before closing unsaved edits", () => {
+  // Codex, PR #17: the header selector switched project with no question asked,
+  // and FileView, rightly, dropped the old project's draft on the switch, so
+  // the edits were lost without a word. This harness is wired as App wires it:
+  // the selector's change goes through the guard, and FileView reports dirty,
+  // saving and its save handle back up.
+  function Harness() {
+    const [project, setProject] = useState("one");
+    const [dirty, setDirty] = useState(false);
+    const [saving, setSaving] = useState<string | null>(null);
+    const handle = useRef<SaveHandle | null>(null);
+    const unsaved = useUnsavedGuard({ dirty, saving, saveHandle: handle });
+    return (
+      <>
+        <select
+          aria-label="Project"
+          value={project}
+          onChange={(e) => {
+            const next = e.target.value;
+            unsaved.guard(() => setProject(next), `switching to ${next}`);
+          }}
+        >
+          <option value="one">one</option>
+          <option value="two">two</option>
+        </select>
+        <FileView
+          projectId={project}
+          path="design.md"
+          onSaved={() => {}}
+          reloadToken={0}
+          onDirtyChange={setDirty}
+          onSavingChange={setSaving}
+          saveHandle={handle}
+        />
+        {unsaved.dialog}
+      </>
+    );
+  }
+
+  const puts: { url: string; body: string }[] = [];
+  beforeEach(() => {
+    puts.length = 0;
+    globalThis.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        puts.push({ url: String(url), body: String(init.body) });
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(String(url).includes("/projects/one/") ? "project one body" : "project two body");
+    }) as unknown as typeof fetch;
+  });
+
+  async function dirtyEditorInProjectOne() {
+    const user = userEvent.setup();
+    render(<Harness />);
+    await screen.findByText("project one body");
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    await user.type(screen.getByRole("textbox"), " UNSAVED EDIT");
+    await user.selectOptions(screen.getByLabelText("Project"), "two");
+    return { user, dialog: await screen.findByRole("dialog") };
+  }
+
+  it("Cancel keeps the project and the draft", async () => {
+    const { user, dialog } = await dirtyEditorInProjectOne();
+    expect(dialog.textContent).toMatch(/switching to two/);
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect((screen.getByLabelText("Project") as HTMLSelectElement).value).toBe("one");
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toMatch(/UNSAVED EDIT/);
+    expect(puts).toEqual([]);
+  });
+
+  it("Discard switches and drops the draft", async () => {
+    const { user, dialog } = await dirtyEditorInProjectOne();
+    await user.click(within(dialog).getByRole("button", { name: "Discard" }));
+    await screen.findByText("project two body");
+    expect((screen.getByLabelText("Project") as HTMLSelectElement).value).toBe("two");
+    expect(screen.queryByText(/UNSAVED EDIT/)).toBeNull();
+    expect(puts).toEqual([]);
+  });
+
+  it("Save writes the draft to the old project, then switches", async () => {
+    const { user, dialog } = await dirtyEditorInProjectOne();
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    await screen.findByText("project two body");
+    expect(puts).toHaveLength(1);
+    expect(puts[0].url).toContain("/api/projects/one/files/design.md");
+    expect(puts[0].body).toContain("UNSAVED EDIT");
+    expect((screen.getByLabelText("Project") as HTMLSelectElement).value).toBe("two");
+  });
+
+  it("a failed save keeps the dialog, the project and the draft", async () => {
+    const { user, dialog } = await dirtyEditorInProjectOne();
+    globalThis.fetch = vi.fn(
+      async () => new Response("no", { status: 500, statusText: "boom" }),
+    ) as unknown as typeof fetch;
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    await within(dialog).findByRole("alert");
+    expect((screen.getByLabelText("Project") as HTMLSelectElement).value).toBe("one");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toMatch(/UNSAVED EDIT/);
+  });
+
+  it("switches without asking when nothing is unsaved", async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+    await screen.findByText("project one body");
+    await user.selectOptions(screen.getByLabelText("Project"), "two");
+    await screen.findByText("project two body");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("asks the browser before the tab closes on unsaved edits", async () => {
+    await dirtyEditorInProjectOne();
+    const e = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(e);
+    expect(e.defaultPrevented).toBe(true);
   });
 });

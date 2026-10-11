@@ -118,3 +118,91 @@ def test_a_whole_project_diff_leaves_ignored_and_outside_files_out(project):
     out = _run(project, "diff_file", since="HEAD").content
     assert "Board v2" in out
     assert "SHOULD NOT APPEAR" not in out
+
+
+# -- overlapping writers: Codex, PR #17 ---------------------------------------
+#
+# Each move used to snapshot the whole list in cover_move and rewrite the file
+# from that snapshot in finish_move, so of two overlapping moves the last write
+# dropped the other's destination, and that file became readable.
+
+MOVE_ORDERS = [
+    ("cover A", "cover B", "finish A", "finish B"),
+    ("cover A", "cover B", "finish B", "finish A"),
+    ("cover B", "cover A", "finish A", "finish B"),
+    ("cover A", "finish A", "cover B", "finish B"),
+]
+
+
+@pytest.mark.parametrize("order", MOVE_ORDERS, ids=[" / ".join(o) for o in MOVE_ORDERS])
+def test_two_overlapping_moves_both_keep_their_destination_ignored(project, order):
+    llm_ignore.set_ignored(project, "power/a.yaml", True)
+    llm_ignore.set_ignored(project, "radio/b.yaml", True)
+    moves = {"A": ("power", "psu"), "B": ("radio", "rf")}
+    covers = {}
+    for step in order:
+        verb, which = step.split()
+        if verb == "cover":
+            covers[which] = llm_ignore.cover_move(project, *moves[which])
+        else:
+            llm_ignore.finish_move(project, covers[which])
+    assert llm_ignore.paths(project) == {"psu/a.yaml", "rf/b.yaml"}
+
+
+def test_undoing_one_move_leaves_the_other_moves_entries(project):
+    llm_ignore.set_ignored(project, "power/a.yaml", True)
+    llm_ignore.set_ignored(project, "radio/b.yaml", True)
+    a = llm_ignore.cover_move(project, "power", "psu")
+    b = llm_ignore.cover_move(project, "radio", "rf")
+    llm_ignore.finish_move(project, b)
+    # A's rename failed: only A's own addition comes off.
+    llm_ignore.restore(project, a)
+    assert llm_ignore.paths(project) == {"power/a.yaml", "rf/b.yaml"}
+
+
+def test_undoing_a_move_keeps_a_destination_that_was_already_listed(project):
+    llm_ignore.set_ignored(project, "power/a.yaml", True)
+    llm_ignore.set_ignored(project, "psu/a.yaml", True)
+    cover = llm_ignore.cover_move(project, "power", "psu")
+    llm_ignore.restore(project, cover)
+    assert llm_ignore.paths(project) == {"power/a.yaml", "psu/a.yaml"}
+
+
+def test_an_edit_between_cover_and_finish_survives_the_finish(project):
+    llm_ignore.set_ignored(project, "power/a.yaml", True)
+    cover = llm_ignore.cover_move(project, "power", "psu")
+    llm_ignore.set_ignored(project, "overview.md", True)
+    llm_ignore.finish_move(project, cover)
+    assert llm_ignore.paths(project) == {"psu/a.yaml", "overview.md"}
+
+
+def test_concurrent_writers_lose_no_entries(project):
+    import threading
+
+    names = [f"notes/{i:02d}.md" for i in range(24)]
+    start = threading.Barrier(len(names))
+    errors = []
+
+    def add(rel):
+        try:
+            start.wait()
+            llm_ignore.set_ignored(project, rel, True)
+        except Exception as e:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(e)
+
+    threads = [threading.Thread(target=add, args=(n,)) for n in names]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert llm_ignore.paths(project) == set(names)
+
+
+def test_the_lock_file_never_lands_in_a_commit(project):
+    git = lambda *a: subprocess.run(["git", *a], cwd=project, check=True, capture_output=True, text=True)
+    git("init", "-q")
+    llm_ignore.set_ignored(project, "overview.md", True)
+    untracked = git("status", "--porcelain", "--untracked-files=all").stdout
+    assert ".blpl/llm-ignore.json" in untracked
+    assert "lock" not in untracked
