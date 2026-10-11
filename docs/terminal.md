@@ -123,8 +123,9 @@ This is a new compose service, `terminal`, with these properties:
   separate, single-purpose service, `quota`, does only that: it runs with that
   one capability, has no network and no secrets, mounts only `data/projects`,
   and listens on a Unix socket shared with the backend and `terminal`. It
-  accepts a (project, member) pair and one of four operations (assign an ID,
-  measure usage, set the limit, clear), derives the path itself with
+  accepts a (project, member) pair and one of five operations (assign an ID,
+  reassign and verify it over the whole tree, measure usage, set the limit,
+  clear), derives the path itself with
   `worktrees.path_for`, and never takes a path from its caller. The backend
   calls it too, because the backend is what settles the ceiling after its own
   writes (see "Limits").
@@ -306,6 +307,54 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
       recompute it. A shell that filled its allowance and reconnects finds no
       more room. The ID, the limit and the row go away only when the worktree
       does (`worktrees.remove`, including on member removal).
+    - **The project ID lives in the inodes, and sealing replaces every inode.**
+      The kernel keeps the limit against the ID number in its quota files, so
+      the limit itself survives anything that happens to the tree. What does
+      not survive is the tagging: the ID and the `PROJINHERIT` flag are inode
+      metadata (`fsxattr`, set by ioctl, not an extended attribute). `_seal` in
+      `workspace.py` tars the repository and the worktrees, renames the
+      plaintext aside and removes it; `_unseal` extracts the archive into a
+      fresh `mkdtemp` staging directory under the restore directory and
+      `os.replace`s it into place. Neither tar nor the staging directory carries
+      an ID, so after one idle seal and unseal every restored file is in
+      project 0, outside the ceiling, while the `terminal_quota` row still
+      says the ceiling is enforced. Anything else that recreates a tree does
+      the same: a clone, an import, `worktrees.ensure` re-creating a worktree
+      after removal or after a leftover was reaped, `git worktree add` of a
+      fresh checkout, a restore from backup. So the row is treated as a claim
+      that has to be checked against the kernel, never as a fact:
+      - **On unseal,** once `_unseal` has put the tree in place and before the
+        workspace is handed to anyone, the backend asks `quota` to reassign
+        every worktree of that project that has a `terminal_quota` row: a walk
+        that sets the row's project ID on every inode and `PROJINHERIT` on
+        every directory, and the owner's `.git` its own unlimited ID again. It
+        is one ioctl per inode, the same order of work as the extract that
+        just ran.
+      - **On every session admission,** inside the POST's admission lock and
+        before a ticket exists, `quota` runs the same reassignment and then
+        verifies: it reads back the root's project ID and `PROJINHERIT`, reads
+        the kernel's usage and limit for the ID, and compares them with the
+        bytes and inodes its own walk counted (allocated blocks and distinct
+        inodes, as the kernel counts them, with the owner's `.git` subtree
+        excluded) and with the row's ceiling. The usage must equal the walk,
+        the limit must equal the ceiling, and the usage must not exceed it.
+        If any of that fails, the POST refuses with a message and no session
+        starts. The admission is what makes every path above safe, including
+        ones nobody has listed yet: whatever recreated the tree, a shell only
+        ever starts in one the kernel has just been seen to bound.
+      - **A full walk, not a sample.** A sample of paths can miss exactly the
+        subtree that was recreated, and the usage comparison needs the totals
+        of every inode anyway, so a sample saves nothing on the comparison
+        that matters. A full walk costs one `stat` and one ioctl per inode,
+        about what `git status` already spends on the same tree, and it runs
+        once per session admission (which a person starts, and which is
+        limited to one per member per project) and once per unseal. A project
+        large enough for that to show is large enough that its `git status`
+        shows first.
+      - The POST also takes a workspace holder for the pending session
+        (`term-pending:<session id>`), replaced by the socket's holder when it
+        opens and dropped when the reservation expires, so the tree cannot be
+        sealed and recreated between the verification and the shell starting.
     - **Raising it is a person's decision.** The project owner, or a server
       admin, can raise the allowance from project settings; the change is
       recorded in the activity feed. Nothing raises it automatically on the
@@ -334,10 +383,30 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
       widens the kernel limit by the write's bound (the upload cap times the
       file count, the size of an editor buffer, `BLPL_RUN_QUOTA_MB` for a
       run); on exit it sets the ceiling to the old ceiling plus the measured
-      net change, never below baseline plus allowance, and puts the kernel
-      limit back to it. The widening is safe because, for its duration,
-      nothing untrusted is writing: the shell is frozen, and runs cannot
-      overlap a session at all.
+      net change, capped at that bound and never below baseline plus
+      allowance, and puts the kernel limit back to it. The widening is safe
+      because, for its duration, nothing untrusted is writing: the shell is
+      frozen, and runs cannot overlap a session at all.
+    - **The rule that makes the arithmetic true: a write that settles the
+      ceiling by measured delta never runs beside a live shell.** The usage is
+      counted per project ID, not per directory, so a delta measured while the
+      shell runs includes whatever the shell wrote anywhere in the worktree in
+      the meantime, and the ceiling would grow by it. An earlier draft let
+      writers confined to `.blpl/` and `retrieved/` skip the freeze, on the
+      reasoning that the shell cannot write there. It cannot, but it can write
+      everywhere else under the same ID while such a write runs, and every
+      chat message appends to a transcript under `.blpl/`. A shell writing in a
+      loop beside a busy conversation would have been credited with its own
+      bytes on every message, regaining allowance for as long as it liked. So
+      there is no unfrozen settling write: if a session is open, the wrapper
+      freezes it, whatever the write touches. The alternative was to let such
+      writers stay unfrozen and settle by the byte count they themselves
+      wrote instead of a measured delta. That works for an append, but a
+      rewrite by `os.replace` needs the old size too, a `git pull` does not
+      know its count until it has run, and two settling rules are twice the
+      surface for the guard to check. The cap at the write's bound stays as a
+      second line: whatever the measurement says, one write never credits more
+      than it could have written.
 
     The trade-offs are honest ones. A run that writes more than
     `BLPL_RUN_QUOTA_MB` in a worktree that has ever had a terminal now fails
@@ -464,12 +533,18 @@ need a person.
      and a run cannot start during the write;
   2. if a session is open, freezes it (below) and fails the write if the
      freeze does not take;
-  3. widens and then settles the quota ceiling (see "Limits");
+  3. widens the quota ceiling by the write's bound, and after the write
+     settles it by the measured delta, capped at that bound (see "Limits");
   4. thaws, in a `finally`, whatever happened.
 
-  A writer that touches only paths the shell cannot write (`.blpl/`,
-  `retrieved/`, both bound read-only) may pass `freeze=False`, since it cannot
-  race the shell, but still takes the lock and settles the quota.
+  There is no `freeze=False`. A writer that touches only paths the shell
+  cannot write (`.blpl/`, `retrieved/`, both bound read-only) cannot race the
+  shell over those files, but its settlement measures the whole project ID,
+  and the shell can be writing elsewhere under it; only a frozen shell keeps
+  the delta the app's own ("Limits" gives the case). A freeze takes tens of
+  milliseconds when nothing is in uninterruptible sleep, so the cost is a
+  brief stall in the shell per app write, most noticeably one per chat
+  message. That is the price of the ceiling meaning what it says.
 
   **Every current writer, as of `main` at f277796** (all in
   `app/backend/app/main.py` unless named):
@@ -653,9 +728,39 @@ by the same change.
   code that writes the ledger. A migration seeds it once from each project's
   current ledger, which accepts what is on disk today as this backend's own
   record. That is a one-time trust decision, and it should be stated as one.
-- **`get_blob` hashes every PDF it is asked for,** wherever it sits, and looks
-  the hash up. The hash is cached on (path, inode, size, mtime), so a file is
-  hashed again only after it changes.
+- **`get_blob` hashes the bytes it is about to send, and sends only those.**
+  An earlier draft hashed the file, cached the hash on (path, inode, size,
+  mtime), and then handed the path to `FileResponse`. Both halves fail the
+  same way. The cache key is metadata the writer controls: a shell running as
+  the same uid can overwrite a released PDF in place with different bytes of
+  the same length and put the mtime back with `touch -d`, and the inode never
+  changes, so the key matches and the new bytes are served inline under the
+  old verdict. And without any cache, `FileResponse` opens the path again
+  after the hash, so a file swapped in between is served under the verdict
+  of the bytes it replaced. So:
+  - The route opens the file once (`O_NOFOLLOW`), checks with `fstat` on that
+    descriptor that it is a regular file within the size limit, reads it into
+    memory from the same descriptor, hashes that buffer, looks the hash up,
+    and answers with a `Response` whose body is that buffer. Nothing reopens
+    the path, so what was judged is exactly what is sent.
+  - The limit is `BLPL_UPLOAD_MAX_MB` (default 100), the cap uploads and
+    first-view inspection already use. A PDF over it is never inline: it is
+    streamed from the path as `application/octet-stream`, attachment,
+    `nosniff`, with no hash, because an attachment is safe whatever the bytes
+    turn out to be. Copying each file to a private snapshot (a backend-only
+    temporary directory, outside every bind the terminal has) would lift the
+    limit, at the cost of a disk copy per view. Datasheets fit the upload cap,
+    so it is not proposed.
+  - A cache may only speed up the lookup of a verdict by its hash. It never
+    stands in for hashing the bytes being sent, and no key made of path or
+    metadata decides trust. Hashing a few-megabyte datasheet per view costs
+    milliseconds.
+  - Making released files immutable was considered instead. fs-verity has to
+    be enabled per file by a filesystem that supports it, `chattr +i` needs
+    `CAP_LINUX_IMMUTABLE`, which nothing in this design holds, and either
+    would also stop the member's own editor and pulls from changing the file.
+    Neither removes the need to check what is sent, because a same-uid shell
+    can still rename the file away and put another at its path.
   - `released`: served inline as `application/pdf`, as today.
   - `released_active`: never inline (see below).
   - `held`, or **no verdict at all**: `application/octet-stream`,
@@ -663,9 +768,11 @@ by the same change.
     served today, and the tree marks the file as uninspected.
 - **First view runs the inspection.** A PDF with no verdict is not held for
   ever. The first request for it runs the same `pdf_inspect` and scanner
-  checks `accept_upload` runs, without moving the file, records the verdict,
-  and serves by that verdict. Files over the upload size cap skip this and
-  stay attachment-only. The file stays where it is. What changes is only how
+  checks `accept_upload` runs, on the buffer already read (or a copy of it in
+  a backend-only temporary file, for a scanner that wants a path), never on
+  the path again. It records the verdict against the buffer's hash and
+  serves that buffer by that verdict. Files over the upload size cap skip
+  this and stay attachment-only. The file stays where it is. What changes is only how
   the browser is allowed to receive it. Directory placement stops mattering
   for safety, so a PDF a shell wrote at the root, a PDF from a pulled
   branch and one staged from the library are all treated alike.
@@ -707,8 +814,8 @@ The proposal is a third ledger state, `released_active`, beside `held` and
   never by handing the browser a URL to the raw file. Download is still allowed,
   behind a notice naming what the file contains.
 - **Enforced at the server, not only in the viewer.** The blob route looks the
-  file's content hash up in `pdf_verdict` ([above](#which-pdfs-the-browser-may-open)),
-  so neither a rename nor a copy to another directory sheds the state. For
+  content hash of the bytes it is about to send up in `pdf_verdict`
+  ([above](#which-pdfs-the-browser-may-open)), so neither a rename nor a copy to another directory sheds the state. For
   `released_active`, it never answers inline: it serves
   `application/octet-stream` with `Content-Disposition: attachment` and
   `nosniff`, exactly as it serves `retrieved/`. A raw link, an old tree link
@@ -728,7 +835,8 @@ The proposal is a third ledger state, `released_active`, beside `held` and
   `<iframe>`, `<embed>` or form) cannot set a custom header, and a
   cross-origin `fetch` that sets one triggers a CORS preflight the backend
   never grants, so only the app's own pdf.js can use it. The headers alone
-  already keep the file out of the native viewer. The custom header keeps
+  already keep the file out of the native viewer. Like the blob route, it
+  reads the file once and sends the buffer it hashed. The custom header keeps
   the route from becoming a second download link that skips the notice the
   app shows before downloading an active PDF. `Sec-Fetch-Mode: navigate` is
   refused as well, as a second signal where the browser sends it.
@@ -764,7 +872,8 @@ documentation, and anything still on the left with no right-hand side is a bug.
 0. **PDF trust by content hash.** This closes a gap that exists today
    (import, clone, pull, library staging), so it lands first and does not
    wait for the terminal. The `pdf_verdict` table and its seeding migration,
-   hash lookup in `get_blob`, inspection on first view. Tests that matter:
+   read-once hashing in `get_blob` (the bytes hashed are the bytes sent),
+   inspection on first view. Tests that matter:
    - A PDF written at the project root, in a board directory and in
      `datasheets/` with no verdict is served as an attachment with `nosniff`,
      never inline.
@@ -777,7 +886,14 @@ documentation, and anything still on the left with no right-hand side is a bug.
      ever served inline.
    - First view of a clean PDF records `released` and serves it inline; of
      one with an OpenAction records `released_active` and does not.
-   - Editing a file in place invalidates the cached hash.
+   - Overwriting a released PDF in place with different bytes of the same
+     length, and restoring its mtime with `touch -d`, gets the new bytes
+     served as an attachment, never inline.
+   - A file swapped for another between the hash and the response (a test
+     hook between the two) does not change what is sent: the body is
+     byte-identical to the buffer that was hashed.
+   - A PDF over `BLPL_UPLOAD_MAX_MB` is served as an attachment with
+     `nosniff`, without being read into memory or inspected.
 1. **Service and sandbox.** Build the `terminal` container, the seccomp
    profile, the delegated cgroup subtree, the `quota` service, the bwrap
    launcher and ticket verification. Test it from the host with `websocat`
@@ -818,7 +934,8 @@ documentation, and anything still on the left with no right-hand side is a bug.
 2. **Backend routes.** The session preflight with its 423 flow, the one-time
    ticket, per-session holders, relay, activity and limits, the
    `worktree_write` wrapper on every writer in the table under "Other
-   writers", the quota ceiling and its owner-only raise, plus the
+   writers", the quota ceiling and its owner-only raise, project-ID
+   reassignment on unseal and verification at admission, plus the
    `core.hooksPath` / `core.fsmonitor` overrides on the backend's own git
    commands. Tests that matter:
    - The route-walking test: every mutating route under
@@ -827,14 +944,30 @@ documentation, and anything still on the left with no right-hand side is a bug.
      fails it.
    - Calling `commit_checkout`, `commit_all` or `pull`, or writing through
      `FilesystemSandbox.check_write`, outside a `worktree_write` scope raises.
-   - An upload, an LLM-ignore change and a pull each freeze a session that
-     has a background job writing, and fail cleanly if the freeze times out.
+   - An upload, an LLM-ignore change, a transcript append and a pull each
+     freeze a session that has a background job writing, and fail cleanly if
+     the freeze times out. No writer can opt out of the freeze.
+   - While the shell writes continuously in the board directories, a burst of
+     chat messages grows the ceiling by exactly the transcripts' own bytes,
+     not by anything the shell wrote.
+   - A write whose measured delta exceeds its declared bound (forced by a
+     test hook) credits the ceiling with the bound, no more.
    - An upload while the shell has uncommitted edits commits only the
      uploaded files and the ledger; the shell's edits stay uncommitted.
    - After an upload during a session, the ceiling has grown by exactly the
      upload's bytes, and the shell's remaining room is what it was.
    - A run in a worktree with a quota can write up to `BLPL_RUN_QUOTA_MB`, and
      the ceiling afterwards reflects what it wrote.
+   - Seal and unseal a project whose worktree has a `terminal_quota` row:
+     afterwards every inode carries the row's project ID, every directory has
+     `PROJINHERIT`, and a shell writing past the allowance gets `EDQUOT`.
+   - With the reassignment on unseal disabled (a test hook), session
+     admission repairs the tree, verifies it and opens. Where verification is
+     made to fail (the root's ID cannot be set, or the kernel's usage
+     disagrees with the walk), the POST refuses with a message and no ticket
+     is issued.
+   - A worktree recreated by `worktrees.ensure`, by an import or by a clone is
+     verified at admission like an unsealed one.
    - Only the owner or an admin can raise the allowance, and the raise is in
      the activity feed.
    - The pdf.js byte route answers `application/octet-stream`, attachment,
