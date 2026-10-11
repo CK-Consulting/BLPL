@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "blpl"
 version = "0.2.0"
 description = "Board Layer Pipe Line — markdown-to-KiCad hardware design pipeline."
+# The headless pipeline: future repository "blpl-core". The LLM agent layer
+# (blpl.agent) ships here too, behind the llm-* extras, for now.
 requires-python = ">=3.11"
 dependencies = [
     "pyyaml>=6.0",
@@ -24,12 +26,11 @@ llm-anthropic = ["anthropic>=0.39"]
 llm-openai = ["openai>=1.0"]
 llm-ollama = ["ollama>=0.3"]
 all-llm = ["anthropic>=0.39", "openai>=1.0", "ollama>=0.3"]
-# python-multipart's floor is a security floor, not a feature one: every release
-# below 0.0.31 carries at least one of the parser CVEs (arbitrary file write,
-# three DoS variants, parameter smuggling). Keep the two in step with
-# app/backend/requirements.txt, which pins the container's exact version.
-webapp = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "watchfiles>=0.22", "python-multipart>=0.0.31"]
-dev = ["pytest>=7.4", "rich>=13.0", "httpx>=0.27"]  # httpx: starlette TestClient
+# The web app's dependencies (FastAPI, uvicorn, python-multipart, ...) are not
+# an extra of this package any more: the app is its own tree (app/, the future
+# "blpl-app" repository) and pins them in app/backend/requirements.txt. `blpl
+# serve` launches that backend and says so when they are missing.
+dev = ["pytest>=7.4", "rich>=13.0"]
 
 [project.scripts]
 blpl = "blpl.core.cli:main"
@@ -38,7 +39,7 @@ hdm-pipeline = "blpl.core.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["blpl*"]
-exclude = ["tests*", "kicad-*", "schemas*", "docs*", "ui*"]
+exclude = ["tests*", "kicad-*", "schemas*", "mermaid*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
