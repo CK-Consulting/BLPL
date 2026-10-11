@@ -273,7 +273,9 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
   the same gap seen from the other side.
 - **Limits.** The container gets memory and CPU limits in compose. Each session
   gets an idle timeout (30 min without input closes it), **one session per
-  member per project**, and 8 per host. Within that:
+  member per project**, and 8 per host (`BLPL_TERMINAL_MAX_SESSIONS`), held
+  as slots in the database so that no burst of requests can pass it (see
+  "The host cap is a set of slots" under the backend's part). Within that:
   - **Processes, memory and CPU are per session cgroup:** `pids.max`,
     `memory.max` and `cpu.max` on `session-<id>/`. `RLIMIT_NPROC` from
     `prlimit` is the wrong tool here. It counts processes per real uid, and
@@ -447,10 +449,12 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
       right person, but it is the app's arithmetic with nothing under it. A
       path that writes objects and forgets to charge is unbounded again (the
       snapshot above was nearly missed in this draft), and so is a pull.
-      Measuring growth with `git count-objects -v` before and after does not
-      rescue it: the count includes other members' commits landing at the
-      same time, and a pack or gc in between can shrink the store by more than
-      the commit grew it.
+      Measuring growth with `git count-objects -v` before and after, with
+      nothing serializing the store's writers, does not rescue it: the count
+      includes other members' commits landing at the same time, and a pack or
+      gc in between can shrink the store by more than the commit grew it.
+      (Serializing them changes that answer; see "settles by what the store
+      actually grew" below.)
     - *`.git` under its own limited project ID, alone.* The kernel then bounds
       every writer of the store, whatever it is: commits, snapshots, pulls and
       `git gc`'s temporary packs. But it is one budget per project, so one
@@ -464,7 +468,9 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
     - **The repository's `.git` gets a limited project ID** when the first
       `terminal_quota` row in the project is created. Its ceiling is its size
       then (measured the same way as a worktree baseline) plus
-      `BLPL_HISTORY_QUOTA_MB`, kept in a `history_quota` row keyed on the
+      `BLPL_HISTORY_QUOTA_MB`, with an inode limit beside it (its inode
+      count then, plus one per block of that allowance), kept in a
+      `history_quota` row keyed on the
       project, reassigned on unseal and verified at admission like a
       worktree's ceiling. Nothing untrusted can write `.git`: it is read-only
       to every shell, by both paths. So the backend may widen this limit for
@@ -472,30 +478,95 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
       operation is `git gc`, which writes the new pack before deleting the old
       ones and so needs transient room up to the size of what it repacks. The
       backend passes `-c gc.auto=0` on its own git commands, so a gc never
-      starts inside a commit near the limit. It runs gc itself, under a
-      per-project lock that every store-writing operation also takes, with
+      starts inside a commit near the limit. It runs gc itself, under the
+      per-project store lock that every store-writing operation also takes, with
       the limit widened by the store's size, and puts the limit back to the
       ceiling afterwards. Packing really does shrink the store, and the kernel
       counts the result, so a gc gives the project's limit room back.
-    - **Each Git-panel commit and each snapshot charges the member** for the
-      blobs it adds, before it writes any. Under the freeze, the backend lists
-      what it will stage (`git status --porcelain -z --untracked-files=all`,
-      or the whole tree for a snapshot) and hashes each file without writing
-      it (`git hash-object --stdin-paths`). It asks the store which of those
-      object IDs it lacks (`git cat-file --batch-check`) and sums those files'
-      sizes. That is the uncompressed size, which is what incompressible data
-      costs on disk, give or take zlib's few bytes of framing per object.
-      Compressible data costs less on disk and is charged the same, which
-      errs the right way. Charges are never refunded when a later gc packs the
-      blobs smaller; the kernel's count is where packing shows. If the charge
-      would take the member past `BLPL_TERMINAL_HISTORY_MB` (kept beside the
-      allowance in the `terminal_quota` row, as `history_used`), the commit is
-      refused with a message naming the allowance, and nothing has been
-      written. Otherwise it proceeds and `history_used` grows by the charge.
-      Deleting the files and committing the deletion charges nothing and
-      refunds nothing, because the blobs are still in history. The charge
-      applies to worktrees with a `terminal_quota` row; a member who has
-      never had a shell is bounded by the project's limit alone.
+    - **Each Git-panel commit and each snapshot is charged to the member, and
+      the charge is what the store actually grew.** An earlier draft charged
+      only the blobs a commit would add. Renaming or copying content the
+      store already has adds no blob, but every such commit still writes new
+      tree objects and a commit object, each a loose file of at least one
+      block and one inode; a loop of renames committed from the Git panel
+      spent the shared `.git` ceiling at no charge to anyone. Two fixes were
+      weighed:
+      - *Add the prospective trees and commit to the estimate,* by building
+        the tree against a temporary index and object directory
+        (`git write-tree` with `GIT_OBJECT_DIRECTORY` pointed at a scratch
+        directory and the real store as an alternate) and summing what lands
+        there. That counts objects, but still not what they cost on disk
+        (block rounding, inodes), nor the index and reflog the commit
+        rewrites under `.git`, and it is a second computation that has to
+        stay in step with what `git commit` really does.
+      - **Settle by measured growth (chosen).** The objection to measuring
+        was that other writers move the store at the same time. That no
+        longer holds here: every operation that writes `.git` (Git-panel
+        commits, landed-write commits, snapshots and restores, pulls, gc)
+        takes the per-project store lock, the shell and the run namespace
+        see `.git` read-only, the backend's git commands pass `-c gc.auto=0
+        -c maintenance.auto=false` so no pack starts inside another
+        operation, and its read-only commands (`status`, `diff`, `log`) pass
+        `--no-optional-locks` so they never rewrite an index outside the
+        lock. Under the lock, then, the `.git` project ID's usage changes
+        only by what the one operation wrote. The writable KiCad desktop
+        mount is the exception, and is already a writer outside the
+        accounting ("Decisions wanted").
+
+      How it runs, under the freeze and the store lock:
+      1. **An estimate refuses early,** so that a refused commit normally
+         leaves nothing behind. The backend lists what it will stage
+         (`git status --porcelain -z --untracked-files=all`, or the whole
+         tree for a snapshot), computes each entry's blob ID without git
+         opening the path (below), asks the store which it lacks
+         (`git cat-file --batch-check`), and sums those sizes plus one block
+         per new object it can foresee (each blob, each directory on a
+         changed path, the commit). If that would take the member past
+         `BLPL_TERMINAL_HISTORY_MB` (kept beside the allowance in the
+         `terminal_quota` row, as `history_used`), the commit is refused
+         with a message naming the allowance, and nothing has been written.
+      2. **The kernel holds the hard line.** For the length of the
+         operation, `quota` narrows the `.git` ID's limit to its current
+         usage plus the smaller of the member's remaining allowance and the
+         project's remaining room, so whatever the estimate missed (a clean
+         filter, an eol conversion, a bigger index) cannot carry the
+         operation past either. A commit stopped there fails with `EDQUOT`
+         and updates no ref.
+      3. **The charge is the measured growth.** `quota` measures the ID's
+         usage before and after, in allocated bytes as the kernel counts
+         them; `history_used` grows by the difference, never by less than
+         zero, and the limit goes back to the project ceiling in a
+         `finally`. Debris from a stopped commit is charged too, because it
+         was written; the next gc removes it from the kernel's count.
+
+      Every loose object costs at least a block, so a flood of small objects
+      is charged a block each, and the per-member byte allowance bounds the
+      inodes it can create as well. Compressible data costs less on disk and
+      is charged what it costs. Charges are never refunded when a later gc
+      packs the objects smaller; the kernel's count is where packing shows.
+      Deleting files and committing the deletion is charged for its trees
+      and commit and refunds nothing, because the blobs are still in history. The
+      charge applies to worktrees with a `terminal_quota` row; a member who
+      has never had a shell is bounded by the project's limit alone.
+    - **Hashing for the estimate never opens a path through a link.**
+      `git hash-object --stdin-paths` reads each path as a file and follows
+      symlinks: a link to `/dev/zero` would have the backend reading for
+      ever, under the freeze and the store lock, and a link to a directory
+      makes it fail. That is not even the right answer, because git stores a
+      symlink as a blob holding its target's text. So the backend computes
+      blob IDs itself, in the repository's object format
+      (`git rev-parse --show-object-format`):
+      - It `lstat`s each path. A **symlink** is hashed as git stores it:
+        `os.readlink` bytes as the blob's content, `blob <len>\0<target>`
+        under the format's hash. The link's target is never opened.
+      - A **regular file** is opened with `O_NOFOLLOW | O_NONBLOCK`,
+        checked with `fstat` on that descriptor to be a regular file no
+        larger than the worktree's ceiling (nothing larger can lawfully be
+        in a bounded checkout), and hashed from that descriptor, reading at
+        most the size `fstat` gave. The session is frozen, so the size
+        cannot move.
+      - **Anything else** (a FIFO, a socket, a device node) is refused, and
+        the commit with it, naming the path. git would not store one either.
     - **The guard is structural here too.** `projects._commit` and
       `kicad_bridge.snapshot` take the charge themselves, so a new route that
       commits or snapshots cannot skip it, in the same way they assert the
@@ -557,13 +628,19 @@ need a person.
   This route:
   - opens the workspace;
   - ensures the member's worktree (`worktrees.ensure`);
-  - checks the session caps;
+  - checks membership, the run exclusion and the per-pair cap, and claims a
+    host slot, all under the admission locks (below);
   - returns a **one-time ticket**: random, valid for 30 seconds, bound to
     (member, workspace, session id).
 - **`GET /api/projects/{id}/terminal?ticket=…`** upgrades to the WebSocket and
   spends the ticket. The ticket replaces any need to carry the Clerk token on
   the socket. It is single-use and short-lived, so its appearance in an nginx
-  access log is harmless, unlike a bearer token's.
+  access log is harmless, unlike a bearer token's. Spending it is not a
+  formality: under the same admission locks as the POST, the backend checks
+  again that the member still has access and that the row is still
+  `pending`, marks it `active`, and asks the terminal service to spawn the
+  shell before it commits and lets the locks go ("Revocation" says why the
+  spawn sits inside the lock).
 - **Holding the workspace open, per socket, not per member.** The registry's
   `holders` is a `set[int]` of user ids. A member's session can have several
   attached tabs, and the member may also hold the project open through the
@@ -600,6 +677,48 @@ need a person.
     process state, so the run path can see it under the same lock. A partial
     unique index on active sessions per (member, project) backs the
     one-session rule up in the database.
+  - **The host cap is a set of slots, not a count.** An earlier draft checked
+    the 8-per-host cap by counting live rows and then inserting one. The
+    pair lock and the partial unique index are both keyed on (member,
+    project), so two requests for different pairs hold different locks, each
+    counts 7, and both insert: a burst across many pairs passes the cap by as
+    many as arrive together. Two fixes were weighed:
+    - *A host-wide advisory lock around the count and the insert.* Correct,
+      but it is one more lock every admission must remember to take, and the
+      cap is then still the app's arithmetic: a path that inserts a row
+      without the lock passes it again.
+    - **A slot table (chosen).** `terminal_slot` holds exactly
+      `BLPL_TERMINAL_MAX_SESSIONS` rows, numbered, each with a nullable
+      `session_id`; the backend adds or removes rows on start to match the
+      setting. Admission claims one in a single statement:
+      `UPDATE terminal_slot SET session_id = :sid WHERE slot = (SELECT slot
+      FROM terminal_slot WHERE <free> ORDER BY slot LIMIT 1 FOR UPDATE SKIP
+      LOCKED) RETURNING slot`, where `<free>` is "`session_id` is null, or
+      names a row that no longer counts" (a `pending` row past its expiry, an
+      `active` row past its heartbeat). No row returned means the host is
+      full, and the POST answers 503 saying so. Two transactions cannot claim
+      the same row, so the cap holds however many requests arrive, without a
+      lock every admission must remember: there are only that many rows to
+      hold.
+    - **It gives crash cleanup one shape.** A slot is released in the same
+      transaction that closes its session row, for whatever reason it closes.
+      A claim that reclaims a slot from a row that no longer counts closes
+      that row in the same statement's transaction, and the terminal
+      service, finding its row closed on the next heartbeat, kills whatever
+      is left of that session. A crash on either side therefore leaves slots
+      that the next claim reclaims, never a host that stays full.
+    - A second tab attaching to an existing session claims no slot; the slot
+      belongs to the session, not to its sockets. The terminal service
+      refuses to spawn more PTYs than there are slots, as a second line.
+  - **Lock order.** Admission and ticket redemption take three advisory
+    locks, always in this order: the member's account key and the project
+    key, both **shared** (`pg_advisory_xact_lock_shared`), then the
+    (member, project) pair key, exclusive. A run enqueue and
+    `worktree_write` take the pair key only. The revocations under
+    "Revocation" take whichever key covers what they change, exclusive. One
+    order everywhere means no two paths can wait on each other; shared modes
+    mean admissions for different members or projects never queue behind
+    each other.
   - **Reservations expire, and the table is reconciled with reality.** The row
     is created in the POST transaction, so that no run can start between the
     preflight and the socket opening. It starts `pending`, with the ticket's
@@ -809,17 +928,52 @@ need a person.
     commits only those (`git add -- <paths>`, `git commit -- <paths>`).
     Only the Git panel's own commit stages the whole checkout, because that is
     what the member asked for after looking at the diff.
-- **Revocation ends the session.** A ticket checks membership once, when the
-  socket opens, and a live shell would otherwise outlast its member's access.
-  Its bind mount keeps the checkout reachable even after `worktrees.remove`.
-  So removing a member, deleting a project or revoking an invitation first
-  terminates every session for that member and project: the socket is closed,
-  every process in the session's cgroup is killed through `cgroup.kill`
-  (killing one process group would miss the shell's other jobs, for the reason
-  given under "Other writers"), the cgroup is removed once empty, and the row
-  is closed. Only then does
-  revocation complete. The once-a-minute touch also re-checks membership, as a
-  backstop for any path that changes access without going through those
+- **Revocation ends the session, and no session can start behind it.** A
+  live shell would otherwise outlast its member's access, and its bind mount
+  keeps the checkout reachable even after `worktrees.remove`. An earlier
+  draft terminated the member's known sessions first and removed the
+  membership afterwards. A terminal POST racing that order sees the
+  membership still valid, creates a fresh row after the termination pass has
+  looked, and gets a shell that nothing kills until the once-a-minute
+  re-check finds it. So revocation follows the admission path's own rules:
+  1. **It takes the admission lock that covers what it changes,**
+     exclusive: the pair key for removing a member, revoking an invitation
+     or a role change that takes away write access; the project key for
+     deleting a project; the account key for disabling an account. The
+     shared modes in "Lock order" mean an exclusive project or account key
+     waits for every admission in flight under it and holds off every new
+     one, without naming each member.
+  2. **In that transaction it changes the access first,** then closes every
+     `pending` or `active` row the change covers and releases their slots,
+     and commits. From that commit on, any admission or ticket redemption
+     that takes the lock sees the access gone and refuses, and any row that
+     was already pending is closed, so its ticket cannot be spent.
+  3. **It then terminates what was running,** before the route returns: the
+     socket is closed, every process in each session's cgroup is killed
+     through `cgroup.kill` (killing one process group would miss the shell's
+     other jobs, for the reason given under "Other writers"), the cgroup is
+     removed once empty. Those rows are already closed, so a terminal
+     service that misses the request kills the session at its next
+     heartbeat.
+
+  The gap that ordering alone leaves is between a redemption marking its row
+  `active` and the shell existing: a revocation landing in between would
+  close a row whose PTY did not exist yet, and the spawn would follow it.
+  That is why the redemption asks the terminal service to spawn **while it
+  still holds the locks**, and commits only once the spawn has answered. A
+  revocation waiting on the lock therefore finds either no row or a row
+  whose shell exists and can be killed. If the commit fails after a spawn,
+  the backend kills the session it just started. As a second line, the
+  terminal service remembers the session ids it was told to kill for as long
+  as a ticket could be valid, and refuses to spawn one of them.
+
+  The same holds for **deleting a project**, which is a revocation of every
+  member at once, and for **sealing**: idle sealing cannot fire under a live
+  session, because the session holds the workspace, but a seal requested
+  while sessions exist (an owner's explicit lock, where a route offers one)
+  takes the project key exclusive, closes the rows, terminates the sessions
+  and only then seals. The once-a-minute touch still re-checks membership, as
+  a backstop for any path that changes access without going through these
   routes.
 
 ### 4. nginx
@@ -1254,7 +1408,8 @@ documentation, and anything still on the left with no right-hand side is a bug.
    - The service starts with no database reachable.
    - Stage 5 resolves a stock footprint.
 2. **Backend routes.** The session preflight with its 423 flow, the one-time
-   ticket, per-session holders, relay, activity and limits, the
+   ticket, per-session holders, relay, activity and limits (the host cap as
+   slot rows), the admission locks and revocation under them, the
    `worktree_write` wrapper on every writer in the table under "Other
    writers", the quota ceiling and its owner-only raise, project-ID
    reassignment on unseal and verification at admission, plus the
@@ -1308,7 +1463,24 @@ documentation, and anything still on the left with no right-hand side is a bug.
      panel, delete it, commit the deletion, refill and commit: once
      `history_used` would pass `BLPL_TERMINAL_HISTORY_MB`, the commit is
      refused, nothing is written to the store, and the store has grown by no
-     more than the allowance plus trees and commits.
+     more than the allowance.
+   - Rename a directory of existing content and commit it from the Git
+     panel, over and over: each commit is charged the store's measured
+     growth (its trees, its commit, the index), `history_used` rises with
+     every round, and once the allowance is spent the commit is refused. The
+     store's growth over the whole loop equals the sum of the charges.
+   - With the estimate disabled (a test hook), a commit that would pass the
+     member's remaining allowance stops at the narrowed kernel limit with
+     `EDQUOT`, no ref moves, the debris is charged, and the limit is back at
+     the project ceiling afterwards.
+   - A backend `git status` in a member's worktree writes nothing under
+     `.git` (`--no-optional-locks`), and two members' commits in parallel
+     are serialized by the store lock, each charged only its own growth.
+   - A Git-panel commit whose working tree holds a symlink to `/dev/zero`,
+     one to a directory and one dangling returns promptly, charges each
+     link as the blob of its target's text, and the IDs the estimate
+     computed equal the ones `git add` stores. A FIFO in the tree refuses
+     the commit, naming it, without blocking.
    - An undo snapshot of a tree holding large untracked shell files is charged
      like a commit, and refused past the allowance.
    - An upload's commit is charged to the project's history limit, not to the
@@ -1329,6 +1501,23 @@ documentation, and anything still on the left with no right-hand side is a bug.
    - The blob route serves a `released_active` PDF as an attachment, never
      inline.
    - Removing a member kills their live shell before the removal returns.
+   - A member removal fired concurrently with that member's terminal POST,
+     and separately with their ticket redemption, repeated many times with
+     the interleaving varied by test hooks, never leaves a live session or a
+     spawned shell for the removed member: the POST refuses, or its ticket
+     cannot be spent, or the shell it spawned is killed before the removal
+     returns. The same race against project deletion, a role change that
+     removes write access, and account disable gives the same result.
+   - A kill request for a session id the terminal service has not spawned
+     yet makes a later spawn of that id refuse.
+   - A burst of concurrent session POSTs from many different (member,
+     project) pairs never leaves more than `BLPL_TERMINAL_MAX_SESSIONS`
+     slots held or PTYs running, and the rest are refused with the host-full
+     message.
+   - A slot held by a pending row past its expiry, or by an active row past
+     its heartbeat, is reclaimed by the next claim, which closes that row;
+     the terminal service then kills that session at its next heartbeat.
+     Killing the backend mid-POST leaves no slot that stays held.
    - A Git-panel commit while a background shell job is writing sees no file
      change between `git add -A` and the commit.
    - A commit whose freeze times out fails, and the tree is not committed.
@@ -1361,7 +1550,8 @@ documentation, and anything still on the left with no right-hand side is a bug.
 7. PDFs with no verdict: inspected on first view (proposed), or served as
    attachments until someone asks for an inspection explicitly. First view is
    friendlier; the explicit step keeps a GET from running a scanner.
-8. The terminal allowance defaults (`BLPL_TERMINAL_QUOTA_MB`,
+8. The host cap (`BLPL_TERMINAL_MAX_SESSIONS`, 8 proposed, enforced as that
+   many slot rows), the terminal allowance defaults (`BLPL_TERMINAL_QUOTA_MB`,
    `BLPL_TERMINAL_QUOTA_INODES`), the run widening (`BLPL_RUN_QUOTA_MB`), the
    history allowances (`BLPL_TERMINAL_HISTORY_MB` per member,
    `BLPL_HISTORY_QUOTA_MB` per project), and whether a server admin as well as
