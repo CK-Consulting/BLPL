@@ -153,6 +153,70 @@ def test_an_object_stream_that_hides_its_type_is_still_read(tmp_path):
     assert {"OpenAction", "JS"} <= {f.name for f in r.active}
 
 
+def test_an_unfiltered_object_stream_is_read_as_structure(tmp_path):
+    """Codex, PR #15. With no /Filter the body is already the objects, but it
+    was only offered to zlib, failed to inflate and was skipped — and stream
+    bodies are blanked from the raw scan, so the /OpenAction went unseen."""
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4>>stream\n"
+        b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+        b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_comment_reading_obj_does_not_cut_the_dictionary_short(tmp_path):
+    """Codex, PR #15. The dictionary was found by searching back for `obj`, so a
+    `% obj` comment after its keys hid /Type/ObjStm and the stream was skipped."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode\n% obj\n>>stream\n"
+        + zlib.compress(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_string_containing_obj_does_not_cut_the_dictionary_short(tmp_path):
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Note(an obj)>>stream\n"
+        + zlib.compress(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_object_stream_through_a_filter_chain_is_decoded(tmp_path):
+    import base64
+
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    body = base64.a85encode(zlib.compress(inner)) + b"~>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter[/ASCII85Decode/FlateDecode]>>stream\n"
+        + body
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_object_stream_this_cannot_decode_is_unknown_not_clean(tmp_path):
+    """Its objects are real to a reader that can decode them and invisible
+    here. Skipping it would release whatever is inside."""
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/LZWDecode>>stream\n"
+        b"\x80\x0b\x60\x50\x22\x0c\x0c\x85\x01"
+        b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+    assert "LZWDecode" in r.reason
+
+
 def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
     data = (
         b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"

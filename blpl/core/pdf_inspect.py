@@ -46,6 +46,7 @@ codebase, absence of information is never evidence of absence.
 
 from __future__ import annotations
 
+import base64
 import re
 import zlib
 from dataclasses import dataclass
@@ -82,7 +83,6 @@ CONSTRUCTS: dict[str, tuple[str, str]] = {
 # fire on `/JSName`. A PDF name ends at whitespace or a delimiter.
 _NAME = re.compile(rb"/([A-Za-z0-9#]+)")
 _HEX_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
-_STREAM = re.compile(rb"stream\r?\n", re.DOTALL)
 
 # A stream that decompresses to more than this is not a datasheet's structure —
 # it is an image, and images carry no actions. Bounded so a zip bomb costs a
@@ -153,29 +153,64 @@ def _unescape(name: bytes) -> str:
 _NOT_STRUCTURE = re.compile(rb"[(%]|(?<!<)<(?!<)|(?<![A-Za-z0-9#/])stream\r?\n")
 _ENDSTREAM = b"endstream"
 _EOL = re.compile(rb"[\r\n]")
+_DICT_DELIM = re.compile(rb"<<|>>")
 
 
-def _structure(data: bytes) -> bytes:
-    """`data` with every stream body, string and comment blanked out.
+@dataclass
+class _Stream:
+    """One stream as a reader meets it: its dictionary and where its body is."""
+
+    dictionary: bytes   # the dictionary's structure, strings and comments blanked
+    start: int          # body offsets into the file
+    end: int
+
+
+def _parse(data: bytes) -> tuple[bytes, list[_Stream]]:
+    """`data` with every stream body, string and comment blanked out, and each
+    stream paired with the dictionary that introduces it.
 
     What is left is what a PDF reader parses as objects, and the only place a
     name means anything. A blanked span becomes one space so tokens either side
     of it stay apart.
 
+    The dictionary is found in the same pass, from the structure, rather than
+    by searching backwards through the raw bytes for `obj`. That search was
+    defeated by a comment reading `% obj`, or a string containing `obj`, between
+    the dictionary's keys and the `stream` keyword: it cut the dictionary short,
+    the object stream's `/Type /ObjStm` fell outside the cut, and the stream was
+    never decompressed. Here comments and strings are already gone, and the
+    dictionary is whichever one closed last before the keyword.
+
     Errs towards keeping bytes: a stream with no `endstream`, or a string that
     never closes, leaves the rest of the file in place to be scanned. A file
     built to confuse this gets more scrutiny, not less.
     """
-    out: list[bytes] = []
+    out = bytearray()
+    streams: list[_Stream] = []
+    opens: list[int] = []               # offsets in `out` of unclosed `<<`
+    last_dict: tuple[int, int] | None = None
+
+    def keep(chunk: bytes) -> None:
+        nonlocal last_dict
+        base = len(out)
+        out.extend(chunk)
+        for m in _DICT_DELIM.finditer(chunk):
+            if m.group() == b"<<":
+                opens.append(base + m.start())
+            elif opens:
+                begin = opens.pop()
+                if not opens:
+                    last_dict = (begin, base + m.end())
+
     pos = 0
     n = len(data)
     while True:
         m = _NOT_STRUCTURE.search(data, pos)
         if m is None:
-            out.append(data[pos:])
+            keep(data[pos:])
             break
         start = m.start()
-        out.append(data[pos:start])
+        keep(data[pos:start])
         lead = data[start : start + 1]
         if lead == b"(":
             # Literal strings nest on balanced parens; `\(` and `\)` do not count.
@@ -193,33 +228,47 @@ def _structure(data: bytes) -> bytes:
                         break
                 i += 1
             if i >= n:
-                out.append(data[start:])
+                keep(data[start:])
                 break
             end = i + 1
         elif lead == b"<":
             close = data.find(b">", start + 1)
             if close < 0:
-                out.append(data[start:])
+                keep(data[start:])
                 break
             end = close + 1
         elif lead == b"%":
             nl = _EOL.search(data, start)
             end = n if nl is None else nl.end()
         else:                            # a stream body, up to its endstream
+            # Its dictionary is the one that closed last, provided nothing but
+            # whitespace (and blanked strings or comments) came after it.
+            dictionary = b""
+            if last_dict is not None and not bytes(out[last_dict[1] :]).strip():
+                dictionary = bytes(out[last_dict[0] : last_dict[1]])
             close = data.find(_ENDSTREAM, m.end())
+            streams.append(_Stream(dictionary, m.end(), n if close < 0 else close))
             if close < 0:
-                out.append(data[start:])
+                keep(data[start:])
                 break
-            out.append(b"stream ")
+            keep(b"stream ")
             end = close
-        out.append(b" ")
+        out.extend(b" ")
         pos = end
-    return b"".join(out)
+    return bytes(out), streams
+
+
+def _names_in(structure: bytes) -> set[str]:
+    return {_unescape(m.group(1)) for m in _NAME.finditer(structure)}
 
 
 def _scan(data: bytes, where: str) -> dict[str, Finding]:
+    return _findings(_parse(data)[0], where)
+
+
+def _findings(structure: bytes, where: str) -> dict[str, Finding]:
     found: dict[str, Finding] = {}
-    for match in _NAME.finditer(_structure(data)):
+    for match in _NAME.finditer(structure):
         name = _unescape(match.group(1))
         entry = CONSTRUCTS.get(name)
         if entry is None or name in found:
@@ -229,13 +278,45 @@ def _scan(data: bytes, where: str) -> dict[str, Finding]:
     return found
 
 
-def _names(data: bytes) -> set[str]:
-    """Every name in the structure of `data`, normalised."""
-    return {_unescape(m.group(1)) for m in _NAME.finditer(_structure(data))}
+_FILTER = re.compile(rb"/Filter\s*(\[[^\]]*\]|/[A-Za-z0-9#]+)")
 
 
-def _inflate_object_streams(data: bytes) -> tuple[list[bytes], int]:
-    """Every object stream in the file, decompressed.
+def _filters(dictionary: bytes) -> list[str]:
+    """The stream's filter chain, in the order a reader applies it."""
+    m = _FILTER.search(dictionary)
+    if m is None:
+        return []
+    return [_unescape(n) for n in _NAME.findall(m.group(1))]
+
+
+def _decode(body: bytes, filters: list[str]) -> bytes | None:
+    """The body as a reader would see it, or None when a filter cannot be
+    undone here. Covers the filters an object stream realistically uses."""
+    for f in filters:
+        if f in ("FlateDecode", "Fl"):
+            try:
+                body = zlib.decompressobj().decompress(body, _MAX_INFLATE)
+            except zlib.error:
+                return None
+        elif f in ("ASCIIHexDecode", "AHx"):
+            digits = re.sub(rb"[^0-9A-Fa-f]", b"", body.split(b">", 1)[0])
+            if len(digits) % 2:
+                digits += b"0"
+            body = bytes.fromhex(digits.decode())
+        elif f in ("ASCII85Decode", "A85"):
+            try:
+                body = base64.a85decode(body.split(b"~>", 1)[0], adobe=False, ignorechars=b" \t\r\n")
+            except ValueError:
+                return None
+        else:
+            return None
+    return body
+
+
+def _object_streams(
+    data: bytes, streams: list[_Stream]
+) -> tuple[list[bytes], list[str], int]:
+    """Every object stream in the file decoded, and the ones that could not be.
 
     Only object streams, because only they hold objects: an image, a page's
     drawing operators or an XMP packet is data, and reading names out of data
@@ -244,29 +325,38 @@ def _inflate_object_streams(data: bytes) -> tuple[list[bytes], int]:
     — no reader can locate the objects inside without `/First`, so a file that
     omits the type to hide its objects still has to declare it.
 
-    The filter is not parsed: every candidate is offered to zlib and whatever
-    inflates is kept. A declared filter that disagrees with the bytes is
-    exactly what an attacker writes.
+    Decoded by the filter the dictionary declares, which is what a reader does.
+    An unfiltered object stream is already structure and is read as it stands:
+    offering it only to zlib, as this used to, let an `/OpenAction` stored there
+    go unseen. The body is also offered to zlib whatever is declared, because a
+    declared filter that disagrees with the bytes is exactly what an attacker
+    writes.
+
+    An object stream that cannot be decoded is reported rather than skipped.
+    Its objects are real to whichever reader can decode it and unknown to us,
+    and unknown is never clean, so the caller makes the file `cannot_inspect`.
+    That holds a file using LZW or a crypt filter on its object streams, which
+    is rare in datasheets and preferable to releasing objects nobody read.
     """
     out: list[bytes] = []
-    count = 0
-    for match in _STREAM.finditer(data):
-        if count >= _MAX_STREAMS:
-            break
-        count += 1
-        # The stream's dictionary is what precedes the keyword, back to its
-        # `obj`. Bounded, because a dictionary is short and a file is not.
-        head = data[max(0, match.start() - 4096) : match.start()]
-        obj = head.rfind(b"obj")
-        names = _names(head[obj + 3 :] if obj >= 0 else head)
-        if "ObjStm" not in names and "First" not in names:
+    undecodable: list[str] = []
+    limited = streams[:_MAX_STREAMS]
+    for st in limited:
+        if not ({"ObjStm", "First"} & _names_in(st.dictionary)):
             continue
-        chunk = data[match.end() : match.end() + _MAX_INFLATE]
-        try:
-            out.append(zlib.decompressobj().decompress(chunk, _MAX_INFLATE))
-        except zlib.error:
-            continue        # not Flate — nothing this module can read
-    return out, count
+        body = data[st.start : min(st.end, st.start + _MAX_INFLATE)]
+        filters = _filters(st.dictionary)
+        decoded = _decode(body, filters)
+        if decoded is None:
+            undecodable.append("/".join(filters))
+        else:
+            out.append(decoded)
+        if filters != ["FlateDecode"]:
+            try:
+                out.append(zlib.decompressobj().decompress(body, _MAX_INFLATE))
+            except zlib.error:
+                pass
+    return out, undecodable, len(limited)
 
 
 def inspect(path: str | Path) -> Inspection:
@@ -290,9 +380,10 @@ def inspect_bytes(data: bytes) -> Inspection:
             reason="no %PDF- header; the file is not what its name claims",
         )
 
-    found = _scan(data, "raw")
-    inflated, count = _inflate_object_streams(data)
-    for chunk in inflated:
+    structure, streams = _parse(data)
+    found = _findings(structure, "raw")
+    decoded, undecodable, count = _object_streams(data, streams)
+    for chunk in decoded:
         for name, finding in _scan(chunk, "stream").items():
             found.setdefault(name, finding)
 
@@ -300,13 +391,26 @@ def inspect_bytes(data: bytes) -> Inspection:
     # visible in its unencrypted structure. `/Encrypt` in the trailer means the
     # strings and streams are enciphered and their contents cannot be read.
     # Structural like everything else: the word in a thumbnail is not a key.
-    if "Encrypt" in _names(data):
+    if "Encrypt" in _names_in(structure):
         return Inspection(
             state="cannot_inspect",
             findings=sorted(found.values(), key=lambda f: f.name),
             reason=(
                 "the PDF is encrypted, so its streams cannot be read. Whatever is "
                 "inside them is unknown — which is not the same as harmless"
+            ),
+            streams_scanned=count,
+        )
+
+    if undecodable:
+        return Inspection(
+            state="cannot_inspect",
+            findings=sorted(found.values(), key=lambda f: f.name),
+            reason=(
+                "an object stream uses a filter this check cannot decode ("
+                + ", ".join(sorted(set(undecodable)))
+                + "), so the objects inside it are unknown — which is not the same "
+                "as harmless"
             ),
             streams_scanned=count,
         )
