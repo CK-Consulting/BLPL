@@ -57,9 +57,16 @@ This is a new compose service, `terminal`, with these properties:
   Python are all there and match what the pipeline uses. It gets a different
   command, and **none of the backend's secrets**: no database URL, no provider
   keys, no `server.key`, no ssh mount.
-- **Mounts only `./data/projects`**, at the same path the backend uses. It does
-  not mount `./data` as a whole, so `modules`, `kicad-desktop`, `ssh` and
-  `runs.db` are not there to be reached.
+- **Mounts `./data/projects`**, at the same path the backend uses, and **the
+  stock libraries read-only**, at the same paths too: `kicad-symbols`,
+  `kicad-footprints`, `kicad-templates`, the 3D model trees, and
+  `data/modules` (`BLPL_MODULES_ROOT`). The backend image deliberately does not
+  contain the libraries. The backend gets them through compose mounts, so a
+  terminal without the same mounts would run Stage 5 and 6 against nothing,
+  getting placeholders for ordinary parts. The rule is to mirror the
+  worker's library mounts exactly, all `:ro`. It does not mount the rest of
+  `./data`, so `kicad-desktop`, `ssh`, `server.key` and `runs.db` are not
+  there to be reached.
 - **Runs as `${BLPL_UID}:${BLPL_GID}`**, like backend and worker. bwrap without
   setuid maps the caller's uid into the sandbox, so every file a shell creates
   is owned by the host user. This avoids repeating the root-owned-files problem.
@@ -92,7 +99,12 @@ bwrap --unshare-all --die-with-parent --new-session \
       --ro-bind /usr /usr  --ro-bind /etc /etc  --symlink usr/bin /bin  (etc.)
       --ro-bind /opt/blpl-venv /opt/blpl-venv    # blpl + python deps
       --bind  <worktree>            /home/project
-      --bind  <project>/.git        <project>/.git   # see "git" below
+      --ro-bind <project>/.git      <project>/.git   # see "git" below: read-only,
+      --bind  <project>/.git/objects  …               #   with only these writable
+      --bind  <project>/.git/worktrees/<member>  …
+      --bind  <project>/.git/refs/heads/user/<id>  …
+      --bind  <project>/.git/logs/refs/heads/user/<id>  …
+      --ro-bind <stock libraries> <same paths>  # as the worker mounts them
       --tmpfs /tmp  --dev /dev  --proc /proc
       --clearenv --setenv HOME /home/project --setenv TERM xterm-256color
       --setenv GIT_AUTHOR_NAME … --setenv GIT_AUTHOR_EMAIL …
@@ -106,14 +118,32 @@ bwrap --unshare-all --die-with-parent --new-session \
   panel**, which leases a credential for the one command that needs it
   (PR #10).
 - **Git.** A member's worktree is a linked worktree. Its `.git` is a file
-  pointing into the project's shared object store, so git inside the sandbox
-  needs that store bound at its real path. That exposes the objects of other
-  members' branches. They are already readable to every member, so nothing new
-  is disclosed, but the store is also *writable*, as it must be for `git commit`
-  to work. A member who is hostile to the store can corrupt it. Members can
-  already push garbage to it through the app, so this matches today's trust
-  level rather than lowering it. It is recorded here so that it is a decision,
-  not a discovery.
+  pointing into the project's shared repository, so git inside the sandbox
+  needs that repository at its real path. **It is bound read-only, with only
+  what a commit on the member's own branch writes made writable on top:**
+  - `objects/`;
+  - the member's own `worktrees/<name>/` (HEAD, index, logs);
+  - `refs/heads/user/<id>` and its reflog, created loose if the ref is packed.
+
+  Everything else stays read-only, above all **`config`, `hooks/` and
+  `info/`**. A writable `config` or `hooks/` would be code execution in the
+  backend. The backend runs `git commit`, `pull` and `push` in this same
+  repository from the Git panel, so a hook or a `core.fsmonitor` /
+  `core.sshCommand` planted from a shell would run there, with every secret
+  the backend holds. The backend also defends itself regardless: every git
+  command it runs passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false`.
+  A worktree-local `config.worktree` in the member's admin directory is inert,
+  because `extensions.worktreeConfig` would have to be set in the read-only
+  `config`.
+
+  Two things remain:
+  - The objects of other members' branches are readable. They already are to
+    every member, so nothing new is disclosed.
+  - A hostile member can write garbage objects. That is no worse than pushing
+    garbage through the app today.
+
+  Other members' refs are not writable, so one member cannot move another's
+  branch.
 - **Commit author** comes from the member's account, not from the image's git
   config. Commits made in projects today show `BLPL <blpl@localhost>`, which is
   the same gap seen from the other side.
@@ -123,21 +153,37 @@ bwrap --unshare-all --die-with-parent --new-session \
 
 ### 3. The backend's part
 
-There is one new route, `GET /api/projects/{id}/terminal`, which upgrades to a
-WebSocket.
+There are two routes. The first is plain HTTP, because it is the step that can
+need a person.
 
-- **Authentication.** A browser cannot set an `Authorization` header on a
-  WebSocket, so the Clerk token travels in the `Sec-WebSocket-Protocol` header
-  (a subprotocol). It is checked exactly as the HTTP routes check it, and never
-  goes in the URL, where nginx would log it.
-- **Workspace.** The route opens the workspace if it is sealed, prompting for
-  the passphrase through the same 423 flow the file pane uses. It ensures the
-  member's worktree (`worktrees.ensure`) and calls `registry.touch(workspace,
-  holder=user_id)`. While the socket is open it touches the registry on every
-  frame from the client, rate-limited to once a minute. That stops idle sealing
-  from removing the files from under a live shell, which `workspace.py` would
-  otherwise do after `IDLE_AFTER`. On close it calls `release`, and seals if the
-  member was the last holder, exactly as locking does today.
+- **`POST /api/projects/{id}/terminal/session`** is an ordinary authenticated
+  request, so the existing **423 unlock flow works unchanged**. A browser's
+  WebSocket API never exposes a failed upgrade's status or body, so a 423 on
+  the upgrade itself would reach the frontend as a bare "connection failed",
+  with no way to ask for the passphrase.
+
+  This route:
+  - opens the workspace;
+  - ensures the member's worktree (`worktrees.ensure`);
+  - checks the session caps;
+  - returns a **one-time ticket**: random, valid for 30 seconds, bound to
+    (member, workspace, session id).
+- **`GET /api/projects/{id}/terminal?ticket=…`** upgrades to the WebSocket and
+  spends the ticket. The ticket replaces any need to carry the Clerk token on
+  the socket. It is single-use and short-lived, so its appearance in an nginx
+  access log is harmless, unlike a bearer token's.
+- **Holding the workspace open, per session, not per member.** The registry's
+  `holders` is a `set[int]` of user ids. With two sessions per member allowed,
+  `release(workspace, user_id)` on closing either socket would report nobody
+  left and seal the checkout under the other live shell. So holders become
+  **per-session tokens**: an opaque string such as `term:<session id>` beside
+  the plain user ids that locking uses, or a count per user. The workspace is
+  released only when the last holder of any kind is gone.
+
+  While a socket is open, the backend touches the registry with that holder,
+  rate-limited to once a minute. That keeps idle sealing (`IDLE_AFTER`) from
+  firing under a live shell. On close it releases that one holder, and seals
+  only if nothing else holds the workspace.
 - **Relay only.** The backend relays bytes and resize messages. It does not
   parse the stream.
 - **Activity.** The activity feed records session start and end, with member
@@ -248,9 +294,17 @@ documentation, and anything still on the left with no right-hand side is a bug.
    - `curl` fails.
    - A file created in the sandbox is owned by `BLPL_UID` on the host.
    - Killing the socket kills the shell.
-2. **Backend route.** Authentication by subprotocol, workspace hold and touch,
-   relay, activity, limits. Test that idle sealing does not fire while a session
-   is open, and does fire after it closes.
+   - Writing `.git/config`, `.git/hooks/*` or another member's ref fails.
+   - `git commit` on the member's own branch works.
+   - Stage 5 resolves a stock footprint.
+2. **Backend routes.** The session preflight with its 423 flow, the one-time
+   ticket, per-session holders, relay, activity and limits, plus the
+   `core.hooksPath` / `core.fsmonitor` overrides on the backend's own git
+   commands. Tests that matter:
+   - Idle sealing does not fire while a session is open, and does fire after
+     it closes.
+   - Closing one of a member's two sessions does not seal under the other.
+   - A planted hook does not run when the Git panel commits.
 3. **Frontend tab.** xterm.js, mounted while hidden, resize, the run-in-flight
    banner.
 4. **Reattach after reload** (tmux), and **`released_active`** for PDFs using
