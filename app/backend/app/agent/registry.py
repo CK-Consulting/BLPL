@@ -1607,7 +1607,13 @@ def project_tools() -> list[ToolSpec]:
                 "context that it has. Because this tool takes the whole file, an edit written "
                 "from a stale copy does not fail loudly; it silently reverts every change made "
                 "in between while appearing to succeed.\n\n"
-                "Creating a file that does not exist yet is the one case with nothing to read."
+                "Creating a file that does not exist yet is the one case with nothing to read. "
+                "Its folder is created when the proposal is accepted.\n\n"
+                "new_content is the file exactly as it should be written: never include diff "
+                "markers (+, -, @@). The app draws the diff itself.\n\n"
+                "Splitting a project into boards, or adding a board: follow the ordered "
+                "procedure in your instructions. project.md comes first, and nothing in a "
+                "board folder is built until project.md lists that board."
             ),
             input_schema={
                 "type": "object",
