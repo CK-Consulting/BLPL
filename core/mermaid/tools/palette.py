@@ -25,6 +25,7 @@ block, held to the 3:1 that 1.4.11 asks of a control boundary.
 from __future__ import annotations
 
 import math
+import os
 import re
 from pathlib import Path
 
@@ -205,8 +206,14 @@ def build() -> dict:
 
 # The frontend is built from app/frontend alone, so anything it needs at build
 # time has to live inside that directory. These are copies, written by this
-# script and not by hand — `mermaid/` stays the source.
-VENDORED = HERE.parent.parent / "app" / "frontend" / "src" / "generated"
+# script and not by hand — `mermaid/` stays the source. The palette lives with
+# the pipeline (core/), because the hardware-design skill's class table is held
+# to it; the frontend is a consumer in another tree, found beside core/ in the
+# umbrella checkout or wherever BLPL_FRONTEND_DIR points once they are split.
+_FRONTEND = Path(
+    os.environ.get("BLPL_FRONTEND_DIR") or HERE.parent.parent.parent / "app" / "frontend"
+)
+VENDORED = _FRONTEND / "src" / "generated"
 
 
 def vendor(data: dict) -> list[Path]:
@@ -233,7 +240,7 @@ if __name__ == "__main__":
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     for f in vendor(data):
-        print(f"  vendored {f.relative_to(HERE.parent.parent)}")
+        print(f"  vendored {f}")
     worst_label = min(c["label"] for c in data["checks"] if "label" in c)
     worst_border = min(c["border"] for c in data["checks"] if "border" in c)
     worst_link = min(c["contrast"] for c in data["checks"] if "contrast" in c)
