@@ -56,6 +56,10 @@ export type TreeNode = {
   /** Not in git as it is now — untracked, ignored, or with uncommitted
    *  changes: deleted here, git cannot bring these bytes back. */
   untracked?: boolean;
+  /** A folder whose listing left something out — skipped tooling such as
+   *  node_modules, or contents below the depth limit. Deleting it removes
+   *  files the tree never showed, so nothing can be promised about them. */
+  incomplete?: boolean;
 };
 
 // Order matters: this is the order the groups appear, which is roughly the
@@ -366,9 +370,20 @@ export function FileTree({
       return;
     }
     try {
-      await postJSON(`/api/projects/${projectId}/files/move`, { path: from, to });
-      onMoved?.(from, to);
+      const r = await postJSON<{ from?: string; to?: string; committed?: boolean }>(
+        `/api/projects/${projectId}/files/move`,
+        { path: from, to },
+      );
+      // The backend's spelling, not ours: `dir//b.md` lands as `dir/b.md`,
+      // and an open file followed to the spelling we sent would point at a
+      // path no tree row has (Codex, PR #17).
+      const landed = r?.to ?? to;
+      onMoved?.(r?.from ?? from, landed);
       changed();
+      // As with a delete: the move happened, so say when no commit records it.
+      if (r && r.committed === false) {
+        setError(`${landed} was moved, but the move was not committed to the project's history.`);
+      }
     } catch (e) {
       setError((e as Error).message);
     }
@@ -387,13 +402,7 @@ export function FileTree({
     setDialog({ kind: "delete", item });
   };
 
-  // Whether git can bring back what a delete removes. Unknown when git could
-  // not answer, and unknown is not "yes".
-  const recoverable = (item: Item) =>
-    loaded.git &&
-    !nodes.some(
-      (n) => !n.dir && n.untracked && (n.path === item.id || n.path.startsWith(`${item.id}/`)),
-    );
+  const recoverable = (item: Item) => deleteIsRecoverable(nodes, item.id, loaded.git);
 
   const menuItems = (item: Item): MenuItem[] => {
     const out: MenuItem[] = [];
@@ -822,6 +831,33 @@ export function deleteRefusalForDraft(
   if (!dirty || !openPath) return null;
   if (openPath !== path && !openPath.startsWith(`${path}/`)) return null;
   return `${openPath} has unsaved edits that deleting it would lose. Save or discard your edits first.`;
+}
+
+/**
+ * Whether git can bring back everything a delete of `path` removes. Unknown
+ * when git could not answer, and unknown is not "yes".
+ *
+ * For a folder this is a claim about every file in it, and the tree knows
+ * only the files it listed. "No untracked file among them" promised recovery
+ * for an empty folder — git records no folders, so it cannot come back — and
+ * for one whose listing was partial, where the rmtree also takes whatever was
+ * skipped or lay below the depth limit (Codex, PR #17). So a folder counts as
+ * recoverable only with at least one listed file, none of them untracked, and
+ * no incomplete folder in it, itself included.
+ */
+export function deleteIsRecoverable(nodes: TreeNode[], path: string, git: boolean): boolean {
+  if (!git) return false;
+  let files = 0;
+  for (const n of nodes) {
+    if (n.path !== path && !n.path.startsWith(`${path}/`)) continue;
+    if (n.dir) {
+      if (n.incomplete) return false;
+      continue;
+    }
+    if (n.untracked) return false;
+    files++;
+  }
+  return files > 0;
 }
 
 /** Kept for callers that only ask the older question. */

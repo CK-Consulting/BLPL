@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   FileTree,
+  deleteIsRecoverable,
   deleteRefusalForDraft,
   destinationFor,
   isHidden,
@@ -410,6 +411,121 @@ describe("deletes that would lose something", () => {
     expect(screen.getByRole("dialog", { name: "Delete file" })).toHaveTextContent(
       "recovered from the project's history",
     );
+  });
+});
+
+describe("what a folder delete can promise", () => {
+  // Codex, PR #17: "no untracked file listed under it" was taken to mean
+  // "recoverable", but the delete is an rmtree and the tree is not the disk.
+  const tracked = [
+    node("base", { dir: true }),
+    node("base/board.md"),
+    node("base/sub", { dir: true }),
+    node("base/sub/notes.md"),
+  ];
+
+  it("promises recovery for a fully listed folder of tracked files", () => {
+    expect(deleteIsRecoverable(tracked, "base", true)).toBe(true);
+    expect(deleteIsRecoverable(tracked, "base/board.md", true)).toBe(true);
+  });
+
+  it("promises nothing when git could not answer", () => {
+    expect(deleteIsRecoverable(tracked, "base", false)).toBe(false);
+  });
+
+  it("does not promise an empty folder back — git records no folders", () => {
+    const nodes = [...tracked, node("empty", { dir: true })];
+    expect(deleteIsRecoverable(nodes, "empty", true)).toBe(false);
+    // Nor a folder whose only contents are empty folders.
+    const nested = [node("outer", { dir: true }), node("outer/inner", { dir: true })];
+    expect(deleteIsRecoverable(nested, "outer", true)).toBe(false);
+  });
+
+  it("does not promise a folder whose listing was partial, at any depth", () => {
+    const self = tracked.map((n) => (n.path === "base" ? { ...n, incomplete: true } : n));
+    expect(deleteIsRecoverable(self, "base", true)).toBe(false);
+    const below = tracked.map((n) => (n.path === "base/sub" ? { ...n, incomplete: true } : n));
+    expect(deleteIsRecoverable(below, "base", true)).toBe(false);
+    // A sibling's partial listing says nothing about this folder.
+    const sibling = [...tracked, node("other", { dir: true, incomplete: true }), node("other/x.md")];
+    expect(deleteIsRecoverable(sibling, "base", true)).toBe(true);
+  });
+
+  it("does not promise a folder holding an untracked file", () => {
+    const nodes = [...tracked, node("base/sub/scratch.md", { untracked: true })];
+    expect(deleteIsRecoverable(nodes, "base", true)).toBe(false);
+  });
+
+  it("does not match a sibling that merely shares a prefix", () => {
+    const nodes = [...tracked, node("base2", { dir: true }), node("base2/x.md", { untracked: true })];
+    expect(deleteIsRecoverable(nodes, "base", true)).toBe(true);
+  });
+
+  it("says an empty folder's delete cannot be undone", async () => {
+    const user = userEvent.setup();
+    mockApi([...NODES, node("empty", { dir: true, role: "design" })]);
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("empty/");
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("empty/") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    expect(screen.getByRole("dialog", { name: "Delete folder" })).toHaveTextContent(
+      "this cannot be undone",
+    );
+  });
+});
+
+describe("what a move reports", () => {
+  /** Serves the tree, and answers the move with `reply`. */
+  function mockMove(reply: Record<string, unknown>) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        const body = url.endsWith("/tree") ? { nodes: NODES } : reply;
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+  }
+
+  async function renameBoard(onMoved = vi.fn()) {
+    const user = userEvent.setup();
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} onMoved={onMoved} />);
+    await screen.findByText("overview.md");
+    await user.click(screen.getByRole("treeitem", { name: /base\// }));
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("board.md") });
+    await user.click(screen.getByRole("menuitem", { name: "Rename" }));
+    const input = await screen.findByLabelText("New name for board.md");
+    await user.clear(input);
+    await user.type(input, "main.md{Enter}");
+    return onMoved;
+  }
+
+  it("follows the path the backend says the file landed at", async () => {
+    // Codex, PR #17: an open file was followed to the spelling submitted
+    // (`dir//b.md`), not to where the backend put it (`dir/b.md`).
+    mockMove({ ok: true, from: "base/board.md", to: "base/landed.md", committed: true });
+    const moved = await renameBoard();
+    await vi.waitFor(() => expect(moved).toHaveBeenCalledWith("base/board.md", "base/landed.md"));
+    expect(moved).not.toHaveBeenCalledWith("base/board.md", "base/main.md");
+  });
+
+  it("says when the move was not committed", async () => {
+    mockMove({ ok: true, from: "base/board.md", to: "base/main.md", committed: false });
+    await renameBoard();
+    expect(
+      await screen.findByText(
+        "base/main.md was moved, but the move was not committed to the project's history.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says nothing more when it was", async () => {
+    mockMove({ ok: true, from: "base/board.md", to: "base/main.md", committed: true });
+    const moved = await renameBoard();
+    await vi.waitFor(() => expect(moved).toHaveBeenCalled());
+    expect(screen.queryByText(/not committed/)).toBeNull();
   });
 });
 

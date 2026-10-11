@@ -2784,6 +2784,9 @@ def _tree_role(rel: Path) -> str:
     return "other"
 
 
+_TREE_MAX_DEPTH = 6
+
+
 def _walk_tree(root: Path, base: Path, depth: int = 0) -> list[dict]:
     """Everything in a project, as a flat list of nodes with relative paths.
 
@@ -2791,24 +2794,52 @@ def _walk_tree(root: Path, base: Path, depth: int = 0) -> list[dict]:
     to filter, sort and diff than a tree of dicts. Depth-limited because a
     runaway directory should cost a truncated listing rather than a hung request.
     """
-    if depth > 6:
-        return []
+    return _walk_dir(root, base, depth)[0]
+
+
+def _walk_dir(root: Path, base: Path, depth: int) -> tuple[list[dict], bool]:
+    """The nodes under ``root``, and whether they are *all* of what is there.
+
+    A folder whose listing left something out is marked ``incomplete``, because
+    the tree is also what decides whether deleting the folder can be undone
+    (Codex, PR #17). The delete is an rmtree: it removes what the listing
+    skipped — a ``node_modules`` or a nested ``.git`` — and what lay below the
+    depth limit, and the client, seeing no untracked file among what was
+    listed, promised all of it back from history. Unlisted is not tracked.
+    """
+    if depth > _TREE_MAX_DEPTH:
+        # Past the limit nothing is listed. Complete only if nothing is there.
+        try:
+            return [], next(root.iterdir(), None) is None
+        except OSError:
+            return [], False
     out: list[dict] = []
+    complete = True
     try:
         entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
     except OSError:
-        return out
+        return out, False
     for p in entries:
         if p.name in _TREE_SKIP:
+            # Never a delete target itself — the delete route refuses any
+            # dot-segment, and the rest are tooling, not content — but a
+            # folder holding one loses it to the rmtree all the same.
+            complete = False
             continue
         rel = p.relative_to(base)
         if p.is_dir():
-            out.append({"path": str(rel), "name": p.name, "dir": True, "role": _tree_role(rel)})
-            out.extend(_walk_tree(p, base, depth + 1))
+            node = {"path": str(rel), "name": p.name, "dir": True, "role": _tree_role(rel)}
+            out.append(node)
+            below, whole = _walk_dir(p, base, depth + 1)
+            if not whole:
+                node["incomplete"] = True
+                complete = False
+            out.extend(below)
             continue
         try:
             st = p.stat()
         except OSError:
+            complete = False
             continue
         out.append(
             {
@@ -2820,7 +2851,7 @@ def _walk_tree(root: Path, base: Path, depth: int = 0) -> list[dict]:
                 "modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
             }
         )
-    return out
+    return out, complete
 
 
 @app.get("/api/projects/{project_id}/tree")

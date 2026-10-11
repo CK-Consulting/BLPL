@@ -597,6 +597,37 @@ def test_a_tracked_file_with_uncommitted_changes_is_not_called_recoverable(clien
     assert not by_path["power/power.md"].get("untracked")
 
 
+def test_the_tree_marks_a_folder_whose_listing_left_something_out(client) -> None:
+    """Codex, PR #17: a folder delete is an rmtree, so it removes what the tree
+    skipped (node_modules, a nested .git) and what lay below its depth limit.
+    The client called such a folder recoverable because none of the files it
+    *was shown* were untracked; the folder now says its listing is partial."""
+    _scratch_with_files(client)
+    import app.main as main
+    proj = main.projects.project_dir("scratch")
+    (proj / "power" / "node_modules" / "pkg").mkdir(parents=True)
+    (proj / "power" / "node_modules" / "pkg" / "index.js").write_text("x\n")
+    deep = proj / "deep" / "a" / "b" / "c" / "d" / "e" / "f"
+    deep.mkdir(parents=True)
+    (deep / "lost.txt").write_text("below the depth limit\n")
+    (proj / "deep" / "a" / "b" / "c" / "d" / "e" / "also-empty").mkdir()
+    (proj / "empty").mkdir()
+    by_path = {n["path"]: n for n in client.get("/api/projects/scratch/tree").json()["nodes"]}
+    # The node_modules folder itself is never shown, and the folder holding it
+    # is the one that must not promise recovery.
+    assert "power/node_modules" not in by_path
+    assert by_path["power"].get("incomplete") is True
+    # Truncated by depth: the cut-off folder and every folder above it.
+    assert "deep/a/b/c/d/e/f/lost.txt" not in by_path
+    for rel in ("deep/a/b/c/d/e/f", "deep/a/b/c/d/e", "deep"):
+        assert by_path[rel].get("incomplete") is True, rel
+    # A folder past the limit with nothing in it lost nothing.
+    assert not by_path["deep/a/b/c/d/e/also-empty"].get("incomplete")
+    # An empty folder was listed completely; the client decides what an empty
+    # folder's delete can promise.
+    assert not by_path["empty"].get("incomplete")
+
+
 def test_delete_and_move_refuse_a_path_through_a_symlinked_folder(client) -> None:
     """Codex, PR #17: the retrieved/ guard, the untrusted-folder rule and the
     ledger all read the lexical path, so a folder link inside the project made
