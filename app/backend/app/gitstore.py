@@ -227,10 +227,21 @@ def lease(master_key: bytes, row: GitEndpoint):
     """
     secret = vault.decrypt_secret(master_key, _aad(row.name), row.nonce, row.ciphertext)
     if row.method == "https_token":
-        helper = "!f() { echo \"username=${GIT_HTTP_USER}\"; echo \"password=${GIT_HTTP_TOKEN}\"; }; f"
+        # Answers only `get`, and only for the host the credential was stored
+        # for. The helper used to answer every request, so whichever host git
+        # ended up talking to (a second push URL, a remote changed mid-request)
+        # was handed this token. Git passes host=... on stdin, port included.
+        helper = (
+            "!f() { test \"$1\" = get || exit 0; h=; "
+            "while IFS= read -r l; do case \"$l\" in host=*) h=\"${l#host=}\";; esac; done; "
+            "h=$(printf %s \"${h%%:*}\" | tr A-Z a-z); "
+            "test -n \"$GIT_HTTP_HOST\" && test \"$h\" = \"$GIT_HTTP_HOST\" || exit 0; "
+            "echo \"username=${GIT_HTTP_USER}\"; echo \"password=${GIT_HTTP_TOKEN}\"; }; f"
+        )
         yield Credential(env={
             "GIT_HTTP_USER": row.username or "git",
             "GIT_HTTP_TOKEN": secret,
+            "GIT_HTTP_HOST": (getattr(row, "host", "") or "").lower(),
             # Clear any configured helpers first (the empty helper resets the
             # list), then install ours. Without the reset, a system helper could
             # answer first with the wrong identity.

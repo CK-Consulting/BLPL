@@ -414,8 +414,12 @@ class Projects:
             u.strip() for u in self._git_allow_fail(d, *args, self.REMOTE).splitlines() if u.strip()
         ))
         if len(urls) > 1:
+            # Redacted: the setter refuses a URL with a token in it, but a
+            # repository configured before that, or edited by hand, can still
+            # hold one, and this sentence goes to any member who presses Pull.
             raise ProjectError(
-                f"origin has {len(urls)} {operation} URLs ({', '.join(urls)}), and a "
+                f"origin has {len(urls)} {operation} URLs "
+                f"({', '.join(_redact_url(u) for u in urls)}), and a "
                 f"{operation} would go to all of them with a credential meant for one. "
                 "Set a single URL in Project settings → Git."
             )
@@ -450,8 +454,30 @@ class Projects:
         # when there is more than one, before any credential is leased.
         return self._single_destination(d, operation)
 
+    def _destination(self, d: Path, operation: str, url: str | None) -> str:
+        """The URL to run ``operation`` against: the one the caller leased a
+        credential for, provided origin still says the same.
+
+        The route resolves the URL, leases a credential for its host, then calls
+        pull or push. Naming `origin` to git at that point re-read the config,
+        so an owner changing the remote in between sent the member's token for
+        host A to host B. Git is now handed this exact URL, and a URL that no
+        longer matches origin is refused rather than used.
+        """
+        dest = self._single_destination(d, operation)
+        if url is not None and url != dest:
+            raise ProjectError(
+                "the project's remote changed while this was starting; try again"
+            )
+        return dest
+
     def pull(
-        self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None
+        self,
+        name: str,
+        *,
+        env: dict[str, str] | None = None,
+        checkout: Path | None = None,
+        url: str | None = None,
     ) -> str:
         """Fast-forward the working copy from its remote. Returns git's output.
 
@@ -462,14 +488,19 @@ class Projects:
         d = self._checkout(name, checkout)
         if not self._primary_remote(d):
             raise ProjectError("this project has no remote to pull from; add one in project settings")
-        self._single_destination(d, "fetch")
-        branch =self._git(d, "branch", "--show-current").strip()
+        dest = self._destination(d, "fetch", url)
+        branch = self._git(d, "branch", "--show-current").strip()
         if not self._upstream(d):
             raise ProjectError(
                 f"branch {branch!r} has no upstream to pull from yet; push it first"
             )
-        # From origin by name (see REMOTE), into the branch of the same name.
-        return self._git(d, "pull", "--ff-only", self.REMOTE, branch, env=_net_env(env))
+        # From the resolved URL, into origin's tracking ref and then the branch
+        # of the same name. The URL, not the name: see _destination.
+        tracking = f"refs/remotes/{self.REMOTE}/{branch}"
+        out = self._git(
+            d, "fetch", "--", dest, f"+refs/heads/{branch}:{tracking}", env=_net_env(env)
+        )
+        return out + self._git(d, "merge", "--ff-only", tracking)
 
     def commit_all(self, name: str, message: str) -> str | None:
         """Stage everything and commit. Returns the commit output, or None if the
@@ -519,17 +550,33 @@ class Projects:
         return self._git(d, "commit", "-m", message)
 
     def push(
-        self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None
+        self,
+        name: str,
+        *,
+        env: dict[str, str] | None = None,
+        checkout: Path | None = None,
+        url: str | None = None,
     ) -> str:
         d = self._checkout(name, checkout)
         if not self._primary_remote(d):
             raise ProjectError("this project has no remote to push to; add one in project settings")
-        self._single_destination(d, "push")
-        # To origin by name, as the branch of the same name — never an
+        dest = self._destination(d, "push", url)
+        branch = self._git(d, "branch", "--show-current").strip()
+        if not branch:
+            raise ProjectError("the checkout is not on a branch; there is nothing to push")
+        sha = self._git(d, "rev-parse", "HEAD").strip()
+        # To the resolved URL, as the branch of the same name — never an
         # argument-less push, whose destination pushRemote, pushDefault and a
-        # branch's upstream can all redirect (see REMOTE). --set-upstream so a
-        # member's new branch is tracked and status can count ahead/behind.
-        return self._git(d, "push", "--set-upstream", self.REMOTE, "HEAD", env=_net_env(env))
+        # branch's upstream can all redirect (see REMOTE), and not origin by
+        # name either, which git would re-read (see _destination).
+        out = self._git(d, "push", "--", dest, f"{sha}:refs/heads/{branch}", env=_net_env(env))
+        # What --set-upstream origin would have recorded, done by hand because
+        # the push named a URL: origin's tracking ref, which status measures
+        # publication against, and the branch's upstream.
+        self._git(d, "update-ref", f"refs/remotes/{self.REMOTE}/{branch}", sha)
+        self._git(d, "config", f"branch.{branch}.remote", self.REMOTE)
+        self._git(d, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+        return out
 
     # -- inspection ----------------------------------------------------------
 

@@ -356,6 +356,63 @@ def test_setting_the_remote_leaves_exactly_one_url(tmp_path):
     assert store.remote_of("p", operation="push") == "https://github.com/o/new.git"
 
 
+def test_a_remote_changed_after_leasing_is_refused_not_used(tmp_path):
+    # Codex P1 on #10: the route leased a credential for origin's URL, then
+    # push named origin and git re-read the config, so an owner changing the
+    # remote in between sent the member's token for host A to host B. Git is
+    # handed the resolved URL, and a URL origin no longer has is refused.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    a = tmp_path / "a.git"
+    b = tmp_path / "b.git"
+    for bare in (a, b):
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    store.set_remote(work, f"file://{a}")
+
+    leased_for = store.remote_of("p", operation="push")
+    store.set_remote(work, f"file://{b}")          # the owner, mid-request
+    with pytest.raises(ProjectError, match="remote changed"):
+        store.push("p", url=leased_for)
+    assert _heads(a) == set() and _heads(b) == set()
+
+    # Resolved and used together, it goes where the credential was chosen for,
+    # and the bookkeeping --set-upstream used to do is still done.
+    store.push("p", url=store.remote_of("p", operation="push"))
+    assert "main" in _heads(b)
+    st = store.status("p", checkout=work)
+    assert not st.unpublished and st.ahead == 0
+
+
+def test_pull_uses_the_url_it_was_given(tmp_path):
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    a = tmp_path / "a.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(a)], check=True)
+    store.set_remote(work, f"file://{a}")
+    store.push("p")
+    leased_for = store.remote_of("p", operation="fetch")
+    store.pull("p", url=leased_for)
+    store.set_remote(work, "https://elsewhere.example/o/p.git")
+    with pytest.raises(ProjectError, match="remote changed"):
+        store.pull("p", url=leased_for)
+
+
+def test_the_several_urls_refusal_never_shows_a_token(tmp_path):
+    # Codex P1 on #10: a hand-edited config can still hold a token in a URL,
+    # and the refusal listed every URL to any member who pressed Pull.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://me:ghp_secret123@host-a.example/o/p.git"],
+        cwd=work, check=True,
+    )
+    _config(work, "--add", "remote.origin.url", "https://host-b.example/o/p.git")
+    with pytest.raises(ProjectError) as exc:
+        store.pull("p")
+    assert "ghp_secret123" not in str(exc.value)
+    assert "host-a.example" in str(exc.value)
+
+
 def test_cloning_a_malformed_url_is_a_400(unlocked):
     # Codex P2 on #10: credentials were looked up (parsing the URL) before it
     # was validated, so this was still a 500.

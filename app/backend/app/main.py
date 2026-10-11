@@ -2460,8 +2460,11 @@ def git_pull(project_id: str, user: User = Depends(require_onboarded),
     try:
         # A pull fetches, so the credential is the fetch URL's — which need not
         # be the host a push goes to.
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id, operation="fetch", checkout=checkout)) as env:
-            out = projects.pull(project_id, env=env, checkout=checkout)
+        # Resolved once: the credential is leased for this URL and git is
+        # handed this URL, so the two cannot diverge if origin changes between.
+        dest = projects.remote_of(project_id, operation="fetch", checkout=checkout)
+        with _git_credentials(session, master_key, user, dest) as env:
+            out = projects.pull(project_id, env=env, checkout=checkout, url=dest)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}
@@ -2475,8 +2478,9 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
     # the commit it made rather than the owner's branch.
     checkout = _project_dir(session, user, project_id)
     try:
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id, operation="push", checkout=checkout)) as env:
-            out = projects.push(project_id, env=env, checkout=checkout)
+        dest = projects.remote_of(project_id, operation="push", checkout=checkout)
+        with _git_credentials(session, master_key, user, dest) as env:
+            out = projects.push(project_id, env=env, checkout=checkout, url=dest)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}

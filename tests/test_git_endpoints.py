@@ -152,6 +152,37 @@ def test_an_https_lease_reads_back_the_token_it_sealed() -> None:
         assert cred.env["GIT_CONFIG_VALUE_0"] == ""
 
 
+
+def test_the_https_helper_answers_only_for_its_own_host(tmp_path) -> None:
+    """Codex P1 on #10: the helper answered every request, so whichever host
+    git ended up talking to was handed this token. It now answers `get` for
+    the host the credential was stored for and nothing else."""
+    import os
+    import subprocess
+    from types import SimpleNamespace
+    from app import vault
+
+    key = b"h" * 32
+    nonce, ct = vault.encrypt_secret(key, "git-endpoint:gh", "ghp_scoped")
+    row = SimpleNamespace(
+        name="gh", method="https_token", username="me", host="github.com",
+        nonce=nonce, ciphertext=ct,
+    )
+
+    def fill(host: str, env: dict) -> str:
+        r = subprocess.run(
+            ["git", "credential", "fill"],
+            input=f"protocol=https\nhost={host}\n\n", capture_output=True, text=True,
+            env={**os.environ, **env, "HOME": str(tmp_path)}, cwd=tmp_path,
+        )
+        return r.stdout
+
+    with gitstore.lease(key, row) as cred:
+        assert "password=ghp_scoped" in fill("github.com", cred.env)
+        assert "password=ghp_scoped" in fill("GitHub.com:443", cred.env)
+        assert "ghp_scoped" not in fill("evil.example", cred.env)
+
+
 # -- one credential per host --------------------------------------------------
 
 
