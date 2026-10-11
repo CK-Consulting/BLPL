@@ -204,8 +204,8 @@ services:
       - ./data:/app/data
       # 3D model libraries, so `kicad-cli pcb export glb --subst-models` can
       # substitute real component models off the official KiCad image.
-      - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
-      - ../kicad-packages3D-source:/usr/share/kicad/3dmodels-source:ro
+      - ./kicad-packages3D:/usr/share/kicad/3dmodels:ro
+      - ./kicad-packages3D-source:/usr/share/kicad/3dmodels-source:ro
       # Stock symbol/footprint libraries. The image copies blpl/schemas/kicad-happy
       # but NOT these (they are large and versioned as submodules), and inside the
       # container the CLI resolves its default library roots to /app/kicad-symbols
@@ -216,8 +216,8 @@ services:
       - ../kicad-symbols:/app/kicad-symbols:ro
       - ../kicad-footprints:/app/kicad-footprints:ro
       - ../kicad-happy:/app/kicad-happy
-      - ../kicad-templates:/app/kicad-templates:ro
-      - ../KiCAD-Prism:/app/kicad-prism:ro
+      - ./kicad-templates:/app/kicad-templates:ro
+      - ./KiCAD-Prism:/app/kicad-prism:ro
       # An SSH deploy key for git, if your project remotes need one. The git CLI
       # in the container reads ~/.ssh; mount a read-only key here. Optional —
       # local-only projects and https remotes with a token helper don't need it.
@@ -357,13 +357,13 @@ services:
       # what lets an SSE reader in the API tail a log a worker is writing,
       # without a broker between them.
       - ./data:/app/data
-      - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
-      - ../kicad-packages3D-source:/usr/share/kicad/3dmodels-source:ro
+      - ./kicad-packages3D:/usr/share/kicad/3dmodels:ro
+      - ./kicad-packages3D-source:/usr/share/kicad/3dmodels-source:ro
       - ../kicad-symbols:/app/kicad-symbols:ro
       - ../kicad-footprints:/app/kicad-footprints:ro
       - ../kicad-happy:/app/kicad-happy
-      - ../kicad-templates:/app/kicad-templates:ro
-      - ../KiCAD-Prism:/app/kicad-prism:ro
+      - ./kicad-templates:/app/kicad-templates:ro
+      - ./KiCAD-Prism:/app/kicad-prism:ro
       - ./data/ssh:/home/blpl/.ssh:ro
 
   frontend:
@@ -551,7 +551,7 @@ services:
       - ./data/modules:/config/shared-libraries:${KICAD_SHARED_LIBRARIES:-ro}
       - ../kicad-symbols:/usr/share/kicad/symbols:ro
       - ../kicad-footprints:/usr/share/kicad/footprints:ro
-      - ../kicad-packages3D:/usr/share/kicad/3dmodels:ro
+      - ./kicad-packages3D:/usr/share/kicad/3dmodels:ro
     # Loopback only, and no websocket port. Both halves matter.
     #
     # The stream does not need a second published port. Selkies' client builds

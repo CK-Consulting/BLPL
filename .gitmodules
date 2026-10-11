@@ -5,7 +5,7 @@
 	path = core/kicad-footprints
 	url = https://gitlab.com/kicad/libraries/kicad-footprints
 [submodule "kicad-templates"]
-	path = kicad-templates
+	path = app/kicad-templates
 	url = https://gitlab.com/kicad/libraries/kicad-templates
 [submodule "kicad-library-utils"]
 	path = core/kicad-library-utils
@@ -14,21 +14,21 @@
 	path = kicad-footprint-generator
 	url = https://gitlab.com/kicad/libraries/kicad-footprint-generator
 [submodule "kicad-packages3D"]
-	path = kicad-packages3D
+	path = app/kicad-packages3D
 	url = https://gitlab.com/kicad/libraries/kicad-packages3D
 [submodule "kicad-packages3D-source"]
-	path = kicad-packages3D-source
+	path = app/kicad-packages3D-source
 	url = https://gitlab.com/kicad/libraries/kicad-packages3D-source
 [submodule "kicad-happy"]
 	path = core/kicad-happy
 	url = https://github.com/CK-Consulting/kicad-happy.git
 [submodule "kicad-ai-assistant"]
-	path = kicad-ai-assistant
+	path = app/kicad-ai-assistant
 	url = https://github.com/shaunchokshi/KiCad-AI-Assistant
 	branch = main
 [submodule "KiCAD-Prism"]
-	path = KiCAD-Prism
+	path = app/KiCAD-Prism
 	url = https://github.com/krishna-swaroop/KiCAD-Prism.git
 [submodule "ecad-viewer"]
-	path = ecad-viewer
+	path = app/ecad-viewer
 	url = https://github.com/Huaqiu-Electronics/ecad-viewer
