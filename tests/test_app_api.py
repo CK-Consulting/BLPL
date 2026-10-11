@@ -290,6 +290,39 @@ def test_a_board_keeps_its_design_document_in_its_own_directory(client) -> None:
     assert r.status_code == 200 and r.json()["content"] == "# base\n"
 
 
+def test_a_name_with_url_metacharacters_round_trips_percent_encoded(client) -> None:
+    """Codex, PR #17: a file renamed to ``victim.md#draft.md`` was saved by
+    interpolating its path into the URL raw, the fragment never left the
+    browser, and the PUT overwrote ``victim.md``. The client now encodes each
+    segment; this pins that the server decodes ``%23`` and ``%3F`` in
+    ``{name:path}`` back to the name, so the encoded form reaches that file and
+    no other, through every route that takes one.
+
+    ``%25`` is left out on purpose, not forgotten: Starlette's TestClient
+    unquotes a path httpx has already unquoted, so ``%25af`` arrives here as
+    the byte 0xAF. Uvicorn decodes once — ``%25aft`` served for real comes
+    back as ``%aft`` — and nginx passes the URI through untouched, so the
+    double decode belongs to this harness, not to the app."""
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "scratch"})
+    assert client.put("/api/projects/scratch/files/power/victim.md", json={"content": "keep\n"}).status_code == 200
+
+    name = "power/victim.md#d?raft.md"
+    url = "/api/projects/scratch/files/power/victim.md%23d%3Fraft.md"
+    w = client.put(url, json={"content": "draft\n"})
+    assert w.status_code == 200, w.text
+    assert client.get("/api/projects/scratch/files/power/victim.md").json()["content"] == "keep\n"
+    assert name in [f["name"] for f in client.get("/api/projects/scratch/files").json()]
+    assert client.get(url).json()["content"] == "draft\n"
+
+    m = client.post("/api/projects/scratch/files/move", json={"path": name, "to": "power/b#1.md"})
+    assert m.status_code == 200, m.text
+    assert client.get("/api/projects/scratch/files/power/b%231.md").json()["content"] == "draft\n"
+    assert client.delete("/api/projects/scratch/files/power/b%231.md").status_code == 200
+    assert client.get("/api/projects/scratch/files/power/b%231.md").status_code == 404
+    assert client.get("/api/projects/scratch/files/power/victim.md").json()["content"] == "keep\n"
+
+
 def test_everything_the_listing_offers_can_actually_be_opened(client) -> None:
     """The listing and the reader must agree on what a name means, or the
     workbench shows files it cannot open."""

@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { type NodeApi, type NodeRendererProps, Tree, type TreeApi } from "react-arborist";
-import { delJSON, getJSON, postJSON, putJSON } from "../api";
+import { delJSON, encodePath, getJSON, postJSON, putJSON } from "../api";
 import { ConfirmDialog, PromptDialog } from "./Dialog";
 import { isSavable } from "./FileView";
 import { UploadDialog } from "./UploadDialog";
@@ -97,7 +97,6 @@ const ROW_HEIGHT = 24;
 
 const parentOf = (path: string) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "");
 const join = (dir: string, name: string) => (dir ? `${dir}/${name}` : name);
-const urlPath = (path: string) => path.split("/").map(encodeURIComponent).join("/");
 
 /** What the backend refuses to delete or move: held files are evidence, and
  *  dot-directories are machinery. Offering the action only to have it refused
@@ -198,9 +197,13 @@ function size(bytes?: number): string {
 
 type MenuItem = { label: string; run: () => void; danger?: boolean };
 type MenuState = { item: Item; x: number; y: number };
+/** Each dialog carries the project it was opened for, and acts on that one or
+ *  on none: clearing it when the project changes is an effect, which runs a
+ *  render late, and a submit is not the place to find out which project the
+ *  page is on now (Codex, PR #17). */
 type DialogState =
-  | { kind: "new-file" | "new-folder"; dir: string }
-  | { kind: "delete"; item: Item };
+  | { kind: "new-file" | "new-folder"; dir: string; project: string }
+  | { kind: "delete"; item: Item; project: string };
 
 // The row renderer is handed to arborist as a component type, so it has to be
 // stable across renders — defined inline it would remount every row on every
@@ -256,7 +259,9 @@ export function FileTree({
   // documents, which is a lot of noise in front of the four files anybody came
   // to look at.
   const [showHidden, setShowHidden] = useState(false);
-  const [uploading, setUploading] = useState(false);
+  // The project the upload dialog was opened for, like `dialog` below: files
+  // picked for one project must not land in the next.
+  const [uploading, setUploading] = useState<string | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   // Design and Diagrams open; the rest stay folded. The tree opened with every
@@ -294,8 +299,14 @@ export function FileTree({
   useEffect(() => {
     setMenu(null);
     setDialog(null);
+    setUploading(null);
     setError(null);
   }, [projectId]);
+  // What the open dialog may act on: nothing, unless it was opened here.
+  const live = dialog && dialog.project === projectId ? dialog : null;
+  const stillHere = (project: string, nothing: string) => {
+    if (currentRef.current !== project) throw new Error(`The project changed; ${nothing}.`);
+  };
 
   const changed = () => {
     setBump((n) => n + 1);
@@ -399,7 +410,7 @@ export function FileTree({
       setError(refusal);
       return;
     }
-    setDialog({ kind: "delete", item });
+    setDialog({ kind: "delete", item, project: projectId });
   };
 
   const recoverable = (item: Item) => deleteIsRecoverable(nodes, item.id, loaded.git);
@@ -409,10 +420,13 @@ export function FileTree({
     const n = item.node;
     if (item.kind === "file" && n) out.push({ label: "Open", run: () => onOpen(n) });
     if (!locked(item.dir)) {
-      out.push({ label: "New file here…", run: () => setDialog({ kind: "new-file", dir: item.dir }) });
+      out.push({
+        label: "New file here…",
+        run: () => setDialog({ kind: "new-file", dir: item.dir, project: projectId }),
+      });
       out.push({
         label: "New folder here…",
-        run: () => setDialog({ kind: "new-folder", dir: item.dir }),
+        run: () => setDialog({ kind: "new-folder", dir: item.dir, project: projectId }),
       });
     }
     if (item.kind !== "group" && !locked(item.id)) {
@@ -454,18 +468,18 @@ export function FileTree({
   return (
     <div className="file-tree">
       <div className="tree-actions">
-        <button className="link" onClick={() => setDialog({ kind: "new-file", dir: "" })}>
+        <button className="link" onClick={() => setDialog({ kind: "new-file", dir: "", project: projectId })}>
           + File
         </button>
-        <button className="link" onClick={() => setDialog({ kind: "new-folder", dir: "" })}>
+        <button className="link" onClick={() => setDialog({ kind: "new-folder", dir: "", project: projectId })}>
           + Folder
         </button>
-        <button className="link" onClick={() => setUploading(true)}>
+        <button className="link" onClick={() => setUploading(projectId)}>
           + Upload
         </button>
       </div>
-      {uploading && (
-        <UploadDialog projectId={projectId} onClose={() => setUploading(false)} onUploaded={changed} />
+      {uploading === projectId && (
+        <UploadDialog projectId={uploading} onClose={() => setUploading(null)} onUploaded={changed} />
       )}
       {error && <div className="gate-error small">{error}</div>}
       <input
@@ -540,11 +554,11 @@ export function FileTree({
       {menu && (
         <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.item)} onClose={() => setMenu(null)} />
       )}
-      {dialog?.kind === "new-file" && (
+      {live?.kind === "new-file" && (
         <PromptDialog
           title="New file"
           label="Path in the project"
-          initial={dialog.dir ? `${dialog.dir}/` : ""}
+          initial={live.dir ? `${live.dir}/` : ""}
           placeholder="sensor/board.md"
           submitLabel="Create"
           hint="Ends in .md, .yaml or .yml — those are what the workbench edits."
@@ -555,40 +569,42 @@ export function FileTree({
                 "A new file must end in .md, .yaml or .yml — those are what the workbench edits.",
               );
             }
-            await putJSON(`/api/projects/${projectId}/files/${urlPath(name)}`, { content: "" });
+            stillHere(live.project, "nothing was created");
+            await putJSON(`/api/projects/${live.project}/files/${encodePath(name)}`, { content: "" });
             changed();
             onOpen({ path: name, name: name.split("/").pop() ?? name, dir: false, role: "design" });
           }}
         />
       )}
-      {dialog?.kind === "new-folder" && (
+      {live?.kind === "new-folder" && (
         <PromptDialog
           title="New folder"
           label="Path in the project"
-          initial={dialog.dir ? `${dialog.dir}/` : ""}
+          initial={live.dir ? `${live.dir}/` : ""}
           placeholder="datasheets/NRF9151-LACA-R"
           submitLabel="Create"
           onClose={() => setDialog(null)}
           onSubmit={async (path) => {
-            await postJSON(`/api/projects/${projectId}/folders`, { path });
+            stillHere(live.project, "nothing was created");
+            await postJSON(`/api/projects/${live.project}/folders`, { path });
             changed();
           }}
         />
       )}
-      {dialog?.kind === "delete" && (
+      {live?.kind === "delete" && (
         <ConfirmDialog
-          title={dialog.item.kind === "folder" ? "Delete folder" : "Delete file"}
+          title={live.item.kind === "folder" ? "Delete folder" : "Delete file"}
           confirmLabel="Delete"
           danger
           message={
             <>
-              Delete <code>{dialog.item.id}</code>
-              {dialog.item.kind === "folder" ? " and everything in it" : ""}?{" "}
-              {recoverable(dialog.item) ? (
+              Delete <code>{live.item.id}</code>
+              {live.item.kind === "folder" ? " and everything in it" : ""}?{" "}
+              {recoverable(live.item) ? (
                 "The delete is committed, so it can be recovered from the project's history."
               ) : (
                 <strong>
-                  {dialog.item.kind === "folder" ? "Some of it is" : "It is"} not in git history —
+                  {live.item.kind === "folder" ? "Some of it is" : "It is"} not in git history —
                   this cannot be undone.
                 </strong>
               )}
@@ -596,12 +612,12 @@ export function FileTree({
           }
           onClose={() => setDialog(null)}
           onConfirm={async () => {
-            const path = dialog.item.id;
-            if (currentRef.current !== projectId) throw new Error("The project changed; nothing was deleted.");
+            const path = live.item.id;
+            stillHere(live.project, "nothing was deleted");
             const refusal = canDelete?.(path);
             if (refusal) throw new Error(refusal);
             const r = await delJSON<{ committed?: boolean }>(
-              `/api/projects/${projectId}/files/${urlPath(path)}`,
+              `/api/projects/${live.project}/files/${encodePath(path)}`,
             );
             onDeleted?.(path);
             changed();

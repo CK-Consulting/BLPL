@@ -559,4 +559,34 @@ describe("a tree from a project no longer selected", () => {
     expect(screen.queryByText("old-only.md")).toBeNull();
     expect(screen.getByText("new-only.md")).toBeTruthy();
   });
+
+  it("closes a delete confirmation opened on the previous project, deleting nothing", async () => {
+    const user = userEvent.setup();
+    const calls = mockApi();
+    const { rerender } = render(<FileTree projectId="old" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("overview.md");
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("overview.md") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    expect(screen.getByRole("dialog", { name: "Delete file" })).toBeInTheDocument();
+
+    rerender(<FileTree projectId="new" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("overview.md");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(calls.filter((c) => c.method === "DELETE")).toEqual([]);
+  });
+
+  it("closes the upload dialog, so files picked for one project never land in the next", async () => {
+    // Codex, PR #17, in the same family as the commit dialog: the upload
+    // dialog stayed open across a switch and uploaded to the new project.
+    const user = userEvent.setup();
+    mockTree();
+    const { rerender } = render(<FileTree projectId="old" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("overview.md");
+    await user.click(screen.getByRole("button", { name: "+ Upload" }));
+    expect(screen.getByRole("dialog", { name: "Upload files" })).toBeInTheDocument();
+
+    rerender(<FileTree projectId="new" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("overview.md");
+    expect(screen.queryByRole("dialog", { name: "Upload files" })).toBeNull();
+  });
 });

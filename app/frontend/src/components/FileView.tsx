@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { getJSON, putJSON } from "../api";
+import { encodePath, getJSON, putJSON } from "../api";
 import { Code, langOf } from "./Code";
 import { Diagram, isDiagramFile } from "./Diagram";
 import { LineGutter, NumberedSource } from "./LineGutter";
@@ -199,7 +199,7 @@ export function FileView({
     // buffer saved here replaces the file with it.
     if (!path || !savable || !loaded) return;
     try {
-      await putJSON(`/api/projects/${projectId}/files/${path}`, { content: draft });
+      await putJSON(`/api/projects/${projectId}/files/${encodePath(path)}`, { content: draft });
       setContent(draft);
       setStatus("Saved");
       onSaved();

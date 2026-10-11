@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { getJSON } from "../api";
+import { encodePath, getJSON } from "../api";
 import { boardArtifact } from "../board";
 
 // The bill of materials as a table, from Stage 1's bom.json. This is the sourcing
@@ -38,7 +38,7 @@ export function BomTable({
   useEffect(() => {
     setBom(null);
     getJSON<Bom>(
-      `/api/projects/${projectId}/artifacts/${boardArtifact("bom.json", board)}`,
+      `/api/projects/${projectId}/artifacts/${encodePath(boardArtifact("bom.json", board))}`,
     )
       .then(setBom)
       .catch(() => setBom("missing"));

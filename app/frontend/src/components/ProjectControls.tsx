@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { GitStatus, ImportResult, getJSON, postForm, postJSON } from "../api";
 import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
 import { ProjectIcon } from "./Icons";
@@ -15,7 +15,14 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
   const [st, setSt] = useState<GitStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
-  const [committing, setCommitting] = useState(false);
+  // The project the commit dialog was opened for, not a flag. Codex, PR #17:
+  // the dialog outlived a project switch, and its submit committed and pushed
+  // whichever project was selected by then, with the message written for the
+  // one before. Shown only while it still names the current project, closed
+  // when the project changes, and the commit goes to the stamped id or nowhere.
+  const [committing, setCommitting] = useState<string | null>(null);
+  const currentRef = useRef(projectId);
+  currentRef.current = projectId;
 
   const refresh = () =>
     getJSON<GitStatus>(`/api/projects/${projectId}/git/status`)
@@ -23,6 +30,7 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
       .catch(() => setSt(null));
 
   useEffect(() => {
+    setCommitting(null);
     refresh();
   }, [projectId]);
 
@@ -45,10 +53,11 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
 
   // Run from inside the dialog rather than through act(), so a refused push
   // leaves the dialog open with the reason in it and the message still typed.
-  const commitAndPush = async (message: string) => {
+  const commitAndPush = async (target: string, message: string) => {
+    if (currentRef.current !== target) throw new Error("The project changed; nothing was committed.");
     setNote(null);
-    await postJSON(`/api/projects/${projectId}/git/commit`, { message });
-    if (st.has_remote) await postJSON(`/api/projects/${projectId}/git/push`, {});
+    await postJSON(`/api/projects/${target}/git/commit`, { message });
+    if (st.has_remote) await postJSON(`/api/projects/${target}/git/push`, {});
     setNote("commit ok");
     await refresh();
     onChanged();
@@ -90,19 +99,19 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
       <button
         className="link"
         disabled={busy || (!st.dirty && st.ahead === 0)}
-        onClick={() => setCommitting(true)}
+        onClick={() => setCommitting(projectId)}
       >
         {st.has_remote ? "Commit + Push" : "Commit"}
       </button>
       {note && <span className="muted note">{note}</span>}
-      {committing && (
+      {committing === projectId && (
         <PromptDialog
           title={st.has_remote ? "Commit and push" : "Commit"}
           label="Commit message"
           initial="update from BLPL"
           submitLabel={st.has_remote ? "Commit + Push" : "Commit"}
-          onSubmit={commitAndPush}
-          onClose={() => setCommitting(false)}
+          onSubmit={(message) => commitAndPush(committing, message)}
+          onClose={() => setCommitting(null)}
         />
       )}
     </div>

@@ -203,4 +203,36 @@ describe("renaming the open file", () => {
     await waitFor(() => expect(screen.getByText(/second/)).toBeTruthy());
     expect(screen.queryByRole("textbox")).toBeNull();
   });
+
+  it("saves a renamed file whose name has # ? or % to that file, not a prefix of it", async () => {
+    // Codex, PR #17. Renamed to `victim.md#draft.md`, the editor followed, and
+    // Save put the path into the URL raw: the browser kept `#draft.md` as a
+    // fragment it never sends, and the PUT overwrote `victim.md`.
+    const user = userEvent.setup();
+    const calls: { url: string; method: string }[] = [];
+    globalThis.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, method: init?.method ?? "GET" });
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: async () => "on disk",
+        json: async () => ({ committed: true }),
+      };
+    }) as unknown as typeof fetch;
+    const { rerender } = render(
+      <FileView projectId="p" path="dir/a.md" onSaved={() => {}} reloadToken={0} />,
+    );
+    await waitFor(() => expect(screen.getByText("on disk")).toBeTruthy());
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    await user.type(screen.getByRole("textbox"), " more");
+    rerender(
+      <FileView projectId="p" path="dir/a#b?c%d.md" renamedFrom="dir/a.md" onSaved={() => {}} reloadToken={0} />,
+    );
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true));
+    const put = calls.find((c) => c.method === "PUT")!;
+    expect(put.url).toBe("/api/projects/p/files/dir/a%23b%3Fc%25d.md");
+  });
 });

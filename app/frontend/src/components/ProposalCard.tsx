@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Proposal, getJSON, postJSON } from "../api";
+import { Proposal, encodePath, getJSON, postJSON } from "../api";
 
 /**
  * One proposed file edit, as a diff you accept or reject.
@@ -95,7 +95,7 @@ export function ProposalCard({ projectId, proposal, onDecided }: Props) {
 
   useEffect(() => {
     if (proposal.creates_file) return;
-    getJSON<{ content: string }>(`/api/projects/${projectId}/files/${proposal.path}`)
+    getJSON<{ content: string }>(`/api/projects/${projectId}/files/${encodePath(proposal.path)}`)
       .then((f) => setBefore(f.content))
       .catch(() => setBefore("")); // gone or unreadable — show it as an addition
   }, [projectId, proposal.path, proposal.creates_file]);

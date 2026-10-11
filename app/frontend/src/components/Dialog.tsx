@@ -1,4 +1,5 @@
-import { type FormEvent, type ReactNode, useEffect, useId, useRef, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 /**
  * The app's own prompt and confirm.
@@ -30,8 +31,33 @@ function Modal({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [busy]);
-  return (
-    <div className="modal-backdrop" onClick={() => !busy && onClose()}>
+  // A real modal, not a box drawn over a live page. `aria-modal` alone only
+  // asks assistive tech to ignore the rest; Tab still walked out of the dialog
+  // into the project selector behind it, and switching project there left a
+  // commit dialog open whose submit committed and pushed the *new* project
+  // with the message typed for the old one (Codex, PR #17). So the dialog is
+  // portalled to <body> and everything else there is made `inert` while it is
+  // open — unfocusable, unclickable, out of the accessibility tree — and focus
+  // goes back to whatever opened it. A layout effect, so the opener is read
+  // before the dialog's own focus effect moves focus into it. Elements already
+  // inert are left alone, which is what lets a dialog open over another and
+  // hand the first one back intact when it closes.
+  const backdrop = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    const muted: Element[] = [];
+    for (const el of Array.from(document.body.children)) {
+      if (el === backdrop.current || el.hasAttribute("inert")) continue;
+      el.setAttribute("inert", "");
+      muted.push(el);
+    }
+    return () => {
+      for (const el of muted) el.removeAttribute("inert");
+      if (opener?.isConnected) opener.focus();
+    };
+  }, []);
+  return createPortal(
+    <div ref={backdrop} className="modal-backdrop" onClick={() => !busy && onClose()}>
       <div
         className="modal small"
         role="dialog"
@@ -41,7 +67,8 @@ function Modal({
       >
         {children(titleId)}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
