@@ -83,3 +83,27 @@ describe("sending and the verdicts", () => {
     ]);
   });
 });
+
+describe("a commit that failed", () => {
+  it("says the upload landed but was not committed", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            results: [{ name: "a.pdf", state: "released", path: "references/a.pdf", reasons: [] }],
+            committed: false,
+            commit_error: "saved, but not committed to git: fatal: not a git repository",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    render(<UploadDialog projectId="p" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [pdf("a.pdf")]);
+    await user.selectOptions(screen.getByLabelText("Kind for a.pdf"), "reference");
+    await user.click(screen.getByRole("button", { name: /Upload 1 file/ }));
+    expect(await screen.findByText(/Uploaded — saved, but not committed to git/)).toBeInTheDocument();
+  });
+});
