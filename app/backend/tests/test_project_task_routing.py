@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("sqlalchemy")
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app" / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker

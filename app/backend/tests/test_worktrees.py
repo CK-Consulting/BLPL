@@ -20,7 +20,7 @@ from pathlib import Path
 
 from conftest import sign_in
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app" / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import worktrees  # noqa: E402
 
