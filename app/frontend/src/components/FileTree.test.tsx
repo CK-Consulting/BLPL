@@ -712,3 +712,184 @@ describe("a tree from a project no longer selected", () => {
     expect(screen.queryByRole("dialog", { name: "Upload files" })).toBeNull();
   });
 });
+
+describe("a request that comes back after the project changed", () => {
+  /**
+   * Serves every project's tree at once, and holds each write until the test
+   * releases it — so the switch can land while the request is in flight.
+   */
+  function mockSlowWrites() {
+    const pending: { method: string; url: string; release: (body: unknown) => void }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        if (method === "GET" && url.endsWith("/tree")) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ nodes: NODES }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }
+        return new Promise<Response>((resolve) => {
+          pending.push({
+            method,
+            url,
+            release: (body) =>
+              resolve(
+                new Response(JSON.stringify(body), {
+                  status: 200,
+                  headers: { "content-type": "application/json" },
+                }),
+              ),
+          });
+        });
+      }),
+    );
+    return pending;
+  }
+
+  it("does not follow a rename into the next project, or report on it there", async () => {
+    // Codex, PR #17: a rename sent in project A came back after the header
+    // switched to B and called the onMoved it captured, so the workspace
+    // rewrote B's open file when its path matched A's old name.
+    const user = userEvent.setup();
+    const pending = mockSlowWrites();
+    const movedA = vi.fn();
+    const movedB = vi.fn();
+    const { rerender } = render(
+      <FileTree projectId="a" reloadToken={0} onOpen={() => {}} onMoved={movedA} />,
+    );
+    await screen.findByText("overview.md");
+    await user.click(screen.getByRole("treeitem", { name: /base\// }));
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("board.md") });
+    await user.click(screen.getByRole("menuitem", { name: "Rename" }));
+    const input = await screen.findByLabelText("New name for board.md");
+    await user.clear(input);
+    await user.type(input, "main.md{Enter}");
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    expect(pending[0].url).toBe("/api/projects/a/files/move");
+
+    rerender(<FileTree projectId="b" reloadToken={0} onOpen={() => {}} onMoved={movedB} />);
+    await screen.findByText("overview.md");
+    pending[0].release({ from: "base/board.md", to: "base/main.md", committed: false });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(movedA).not.toHaveBeenCalled();
+    expect(movedB).not.toHaveBeenCalled();
+    expect(screen.queryByText(/not committed/)).toBeNull();
+  });
+
+  it("does not close the next project's file after a delete sent in the last", async () => {
+    const user = userEvent.setup();
+    const pending = mockSlowWrites();
+    const deletedA = vi.fn();
+    const deletedB = vi.fn();
+    const { rerender } = render(
+      <FileTree projectId="a" reloadToken={0} onOpen={() => {}} onDeleted={deletedA} />,
+    );
+    await screen.findByText("overview.md");
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("overview.md") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    await user.click(
+      within(screen.getByRole("dialog", { name: "Delete file" })).getByRole("button", { name: "Delete" }),
+    );
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    expect(pending[0]).toMatchObject({ method: "DELETE", url: "/api/projects/a/files/overview.md" });
+
+    rerender(<FileTree projectId="b" reloadToken={0} onOpen={() => {}} onDeleted={deletedB} />);
+    await screen.findByText("overview.md");
+    pending[0].release({ committed: false });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(deletedA).not.toHaveBeenCalled();
+    expect(deletedB).not.toHaveBeenCalled();
+    expect(screen.queryByText(/not committed/)).toBeNull();
+  });
+
+  it("does not open a file created in the last project in this one", async () => {
+    const user = userEvent.setup();
+    const pending = mockSlowWrites();
+    const openedA = vi.fn();
+    const openedB = vi.fn();
+    const { rerender } = render(<FileTree projectId="a" reloadToken={0} onOpen={openedA} />);
+    await screen.findByText("overview.md");
+    await user.click(screen.getByRole("button", { name: "+ File" }));
+    await user.type(screen.getByLabelText("Path in the project"), "power.md{Enter}");
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    expect(pending[0]).toMatchObject({ method: "PUT", url: "/api/projects/a/files/power.md" });
+
+    rerender(<FileTree projectId="b" reloadToken={0} onOpen={openedB} />);
+    await screen.findByText("overview.md");
+    pending[0].release({});
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(openedA).not.toHaveBeenCalled();
+    expect(openedB).not.toHaveBeenCalled();
+  });
+});
+
+describe("the same folder in two groups", () => {
+  // `shared/` holds a design document and a schematic, so it appears under
+  // Design and again under KiCad. A second entry in each group keeps the
+  // common-prefix rule from dropping the folder.
+  const TWICE: TreeNode[] = [
+    node("top.md", { role: "design" }),
+    node("shared/a.md", { role: "design" }),
+    node("top.kicad_pro", { role: "kicad" }),
+    node("shared/b.kicad_sch", { role: "kicad" }),
+  ];
+
+  async function showBoth() {
+    const user = userEvent.setup();
+    const calls = mockApi(TWICE);
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("top.md");
+    await user.click(screen.getByRole("treeitem", { name: /KiCad/ }));
+    const rows = screen.getAllByRole("treeitem", { name: /^shared\// });
+    return { user, calls, rows };
+  }
+
+  it("shows two rows, and opening one leaves the other folded", async () => {
+    // Codex, PR #17: both rows had the id `shared`, and arborist keys its open
+    // state on the id, so the two could not be told apart.
+    const { user, rows } = await showBoth();
+    expect(rows).toHaveLength(2);
+    await user.click(rows[1]);
+    const after = screen.getAllByRole("treeitem", { name: /^shared\// });
+    expect(after[0]).toHaveAttribute("aria-expanded", "false");
+    expect(after[1]).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("b.kicad_sch")).toBeInTheDocument();
+    expect(screen.queryByText("a.md")).toBeNull();
+  });
+
+  it("renames the row it was asked on, by the real path", async () => {
+    const { user, calls, rows } = await showBoth();
+    await user.pointer({ keys: "[MouseRight]", target: within(rows[1]).getByText("shared/") });
+    await user.click(screen.getByRole("menuitem", { name: "Rename" }));
+    const input = await screen.findByLabelText("New name for shared");
+    // The input is in the KiCad row, not the Design one.
+    const editing = screen.getAllByRole("treeitem").find((r) => r.contains(input));
+    const kicad = screen.getByRole("treeitem", { name: /KiCad/ });
+    expect(editing).toBeTruthy();
+    expect(kicad.compareDocumentPosition(editing!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await user.clear(input);
+    await user.type(input, "common{Enter}");
+    expect(calls).toContainEqual({
+      method: "POST",
+      url: "/api/projects/p/files/move",
+      body: { path: "shared", to: "common" },
+    });
+  });
+
+  it("deletes by the real path, not the row's id", async () => {
+    const { user, calls, rows } = await showBoth();
+    await user.pointer({ keys: "[MouseRight]", target: within(rows[1]).getByText("shared/") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete folder" });
+    expect(dialog).toHaveTextContent("Delete shared and everything in it");
+    await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+    expect(calls).toContainEqual({ method: "DELETE", url: "/api/projects/p/files/shared", body: undefined });
+  });
+});

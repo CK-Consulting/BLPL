@@ -81,8 +81,20 @@ const GROUPS: { role: TreeNode["role"]; label: string }[] = [
 
 /** A row in the tree: a role group, a folder, or a file. */
 type Item = {
-  /** A file or folder's real project path. Groups are `group:<role>`. */
+  /**
+   * The row's identity to arborist, which keys lookup, open state, rename and
+   * drag on it: `<role>:<path>` for a file or folder, `group:<role>` for a
+   * group. Not a path, and never sent anywhere.
+   *
+   * It used to be the real path, but a folder appears once per group holding
+   * something in it — `shared/` under Design and again under KiCad — and two
+   * rows with one id made arborist pick either for a rename, a drag or a
+   * toggle (Codex, PR #17). Namespacing by group makes each row its own.
+   */
   id: string;
+  /** The real project path a rename, move, delete or drop acts on. A group's
+   *  is "", and nothing acts on a group by path. */
+  path: string;
   name: string;
   kind: "group" | "folder" | "file";
   /** The real folder this row puts things in ("" is the project root). A
@@ -117,10 +129,11 @@ export function isHidden(path: string): boolean {
  * Dropping the common prefix is what keeps the grouping worth having: without
  * it every Datasheets entry would sit under a `datasheets/` node that conveys
  * nothing the group heading did not. It is dropped from the screen, not from
- * the address — every row keeps its real path as its id, because a rename or a
- * drop has to name the real thing.
+ * the address — every row keeps its real path in `path`, because a rename or a
+ * drop has to name the real thing. Its `id` is namespaced by `role`, since the
+ * same folder can appear in more than one group.
  */
-function toItems(entries: TreeNode[]): { items: Item[]; prefix: string } {
+function toItems(entries: TreeNode[], role: string): { items: Item[]; prefix: string } {
   if (entries.length === 0) return { items: [], prefix: "" };
   const split = entries.map((f) => f.path.split("/").filter(Boolean));
   let common = 0;
@@ -130,14 +143,15 @@ function toItems(entries: TreeNode[]): { items: Item[]; prefix: string } {
   while (common < shortest && split.every((p) => p[common] === split[0][common])) common += 1;
   const prefix = split[0].slice(0, common).join("/");
 
-  const root: Item = { id: "", name: "", kind: "folder", dir: prefix, count: 0, children: [] };
+  const root: Item = { id: "", path: prefix, name: "", kind: "folder", dir: prefix, count: 0, children: [] };
   const folders = new Map<string, Item>([[prefix, root]]);
   const folderAt = (path: string): Item => {
     const known = folders.get(path);
     if (known) return known;
     const parent = folderAt(parentOf(path));
     const made: Item = {
-      id: path,
+      id: `${role}:${path}`,
+      path,
       name: path.split("/").pop()!,
       kind: "folder",
       dir: path,
@@ -154,7 +168,15 @@ function toItems(entries: TreeNode[]): { items: Item[]; prefix: string } {
       continue;
     }
     const parent = folderAt(parentOf(n.path));
-    parent.children!.push({ id: n.path, name: n.name, kind: "file", dir: parent.dir, node: n, count: 0 });
+    parent.children!.push({
+      id: `${role}:${n.path}`,
+      path: n.path,
+      name: n.name,
+      kind: "file",
+      dir: parent.dir,
+      node: n,
+      count: 0,
+    });
   }
   const finish = (f: Item): number => {
     f.children!.sort(
@@ -307,6 +329,13 @@ export function FileTree({
   const stillHere = (project: string, nothing: string) => {
     if (currentRef.current !== project) throw new Error(`The project changed; ${nothing}.`);
   };
+  // Asked again once a request comes back. Checking before sending is not
+  // enough: the switch can land while the request is in flight, and its
+  // completion — onMoved, onDeleted, onOpen, a notice — would then act on
+  // the project the page shows now rather than the one it changed (Codex,
+  // PR #17). Read through the ref, because the closure's projectId is the
+  // old one by definition.
+  const stillOn = (project: string) => currentRef.current === project;
 
   const changed = () => {
     setBump((n) => n + 1);
@@ -354,9 +383,10 @@ export function FileTree({
     for (const { role, label } of GROUPS) {
       const list = entries.filter((n) => n.role === role);
       if (list.length === 0) continue;
-      const { items, prefix } = toItems(list);
+      const { items, prefix } = toItems(list, role);
       out.push({
         id: `group:${role}`,
+        path: "",
         name: label,
         kind: "group",
         dir: prefix,
@@ -380,6 +410,12 @@ export function FileTree({
       setError(refusal);
       return;
     }
+    // Stamped, like a dialog: a rename still in flight when the header
+    // switched projects came back to the next project's page and called the
+    // onMoved it was handed then, which rewrote that project's open file if
+    // its path happened to match (Codex, PR #17). The move happened in the
+    // project it was sent to; nothing on this page is about that one now.
+    const project = projectId;
     try {
       const r = await postJSON<{
         from?: string;
@@ -387,9 +423,10 @@ export function FileTree({
         committed?: boolean;
         ignore_list_updated?: boolean;
       }>(
-        `/api/projects/${projectId}/files/move`,
+        `/api/projects/${project}/files/move`,
         { path: from, to },
       );
+      if (!stillOn(project)) return;
       // The backend's spelling, not ours: `dir//b.md` lands as `dir/b.md`,
       // and an open file followed to the spelling we sent would point at a
       // path no tree row has (Codex, PR #17).
@@ -408,7 +445,7 @@ export function FileTree({
       }
       if (notes.length) setError(notes.join(" "));
     } catch (e) {
-      setError((e as Error).message);
+      if (stillOn(project)) setError((e as Error).message);
     }
   };
 
@@ -417,7 +454,7 @@ export function FileTree({
   const askDelete = (item: Item) => {
     setError(null);
     if (!current) return;
-    const refusal = canDelete?.(item.id);
+    const refusal = canDelete?.(item.path);
     if (refusal) {
       setError(refusal);
       return;
@@ -425,7 +462,7 @@ export function FileTree({
     setDialog({ kind: "delete", item, project: projectId });
   };
 
-  const recoverable = (item: Item) => deleteIsRecoverable(nodes, item.id, loaded.git);
+  const recoverable = (item: Item) => deleteIsRecoverable(nodes, item.path, loaded.git);
 
   const menuItems = (item: Item): MenuItem[] => {
     const out: MenuItem[] = [];
@@ -441,7 +478,7 @@ export function FileTree({
         run: () => setDialog({ kind: "new-folder", dir: item.dir, project: projectId }),
       });
     }
-    if (item.kind !== "group" && !locked(item.id)) {
+    if (item.kind !== "group" && !locked(item.path)) {
       out.push({ label: "Rename", run: () => void treeRef.current?.edit(item.id) });
       out.push({ label: "Delete…", run: () => askDelete(item), danger: true });
     }
@@ -462,11 +499,11 @@ export function FileTree({
       e.stopPropagation();
       if (item.kind === "file" && item.node) onOpen(item.node);
       else focused.toggle();
-    } else if (e.key === "F2" && item.kind !== "group" && !locked(item.id)) {
+    } else if (e.key === "F2" && item.kind !== "group" && !locked(item.path)) {
       e.preventDefault();
       e.stopPropagation();
       void tree.edit(item.id);
-    } else if (e.key === "Delete" && item.kind !== "group" && !locked(item.id)) {
+    } else if (e.key === "Delete" && item.kind !== "group" && !locked(item.path)) {
       e.preventDefault();
       e.stopPropagation();
       askDelete(item);
@@ -491,7 +528,15 @@ export function FileTree({
         </button>
       </div>
       {uploading === projectId && (
-        <UploadDialog projectId={uploading} onClose={() => setUploading(null)} onUploaded={changed} />
+        <UploadDialog
+          projectId={uploading}
+          onClose={() => setUploading(null)}
+          // The dialog closes on a switch, but an upload it already sent still
+          // comes back and calls this; it changed the old project, not this one.
+          onUploaded={() => {
+            if (stillOn(uploading)) changed();
+          }}
+        />
       )}
       {error && <div className="gate-error small">{error}</div>}
       <input
@@ -518,12 +563,23 @@ export function FileTree({
             openByDefault={false}
             initialOpenState={openMap}
             disableMultiSelection
-            disableDrag={(d) => d.kind === "group" || locked(d.id)}
-            disableEdit={(d) => d.kind === "group" || locked(d.id)}
+            disableDrag={(d) => d.kind === "group" || locked(d.path)}
+            disableEdit={(d) => d.kind === "group" || locked(d.path)}
+            // Asked of real paths as well as of rows: the same folder shown in
+            // another group is a different row but the same directory, and a
+            // folder dropped into its own copy there is still a folder dropped
+            // into itself.
             disableDrop={({ parentNode, dragNodes }) =>
               parentNode.isRoot ||
               locked(parentNode.data.dir) ||
-              dragNodes.some((d) => d.id === parentNode.id || d.isAncestorOf(parentNode))
+              dragNodes.some(
+                (d) =>
+                  d.id === parentNode.id ||
+                  d.isAncestorOf(parentNode) ||
+                  (d.data.kind === "folder" &&
+                    (parentNode.data.dir === d.data.path ||
+                      parentNode.data.dir.startsWith(`${d.data.path}/`))),
+              )
             }
             onToggle={(id) => {
               if (filtering) setFilterOpen({ q, map: { ...fMap, [id]: !fMap[id] } });
@@ -534,17 +590,19 @@ export function FileTree({
               if (it.kind === "file" && it.node) onOpen(it.node);
               else node.toggle();
             }}
-            onRename={({ id, name, node }) => {
+            onRename={({ name, node }) => {
               const next = name.trim();
               if (!next || next === node.data.name) return;
-              void move(id, join(parentOf(id), next));
+              const from = node.data.path;
+              void move(from, join(parentOf(from), next));
             }}
-            onMove={({ dragIds, parentNode }) => {
+            onMove={({ dragNodes, parentNode }) => {
               if (!parentNode) return;
               const dir = parentNode.data.dir;
-              for (const id of dragIds) {
-                if (parentOf(id) === dir) continue;
-                void move(id, join(dir, id.split("/").pop()!));
+              for (const d of dragNodes) {
+                const from = d.data.path;
+                if (parentOf(from) === dir) continue;
+                void move(from, join(dir, from.split("/").pop()!));
               }
             }}
           >
@@ -583,6 +641,7 @@ export function FileTree({
             }
             stillHere(live.project, "nothing was created");
             await putJSON(`/api/projects/${live.project}/files/${encodePath(name)}`, { content: "" });
+            if (!stillOn(live.project)) return;
             changed();
             onOpen({ path: name, name: name.split("/").pop() ?? name, dir: false, role: "design" });
           }}
@@ -599,6 +658,7 @@ export function FileTree({
           onSubmit={async (path) => {
             stillHere(live.project, "nothing was created");
             await postJSON(`/api/projects/${live.project}/folders`, { path });
+            if (!stillOn(live.project)) return;
             changed();
           }}
         />
@@ -610,7 +670,7 @@ export function FileTree({
           danger
           message={
             <>
-              Delete <code>{live.item.id}</code>
+              Delete <code>{live.item.path}</code>
               {live.item.kind === "folder" ? " and everything in it" : ""}?{" "}
               {recoverable(live.item) ? (
                 "The delete is committed, so it can be recovered from the project's history."
@@ -624,13 +684,14 @@ export function FileTree({
           }
           onClose={() => setDialog(null)}
           onConfirm={async () => {
-            const path = live.item.id;
+            const path = live.item.path;
             stillHere(live.project, "nothing was deleted");
             const refusal = canDelete?.(path);
             if (refusal) throw new Error(refusal);
             const r = await delJSON<{ committed?: boolean }>(
               `/api/projects/${live.project}/files/${encodePath(path)}`,
             );
+            if (!stillOn(live.project)) return;
             onDeleted?.(path);
             changed();
             // The bytes are gone either way; say so when no commit records it.
@@ -678,7 +739,7 @@ function Row({ node, style, dragHandle }: NodeRendererProps<Item>) {
       style={style}
       className={classes}
       onContextMenu={onContextMenu}
-      title={n ? `${n.path}${n.bytes !== undefined ? ` · ${size(n.bytes)}` : ""}` : it.id}
+      title={n ? `${n.path}${n.bytes !== undefined ? ` · ${size(n.bytes)}` : ""}` : it.path}
     >
       {/* A caret alone would be the only thing distinguishing a folder from a
           file, and it is four pixels wide. The count says it too. */}
