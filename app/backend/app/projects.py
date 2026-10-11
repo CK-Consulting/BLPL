@@ -534,9 +534,23 @@ class Projects:
             raise ProjectError("this project has no remote to pull from; add one in project settings")
         dest = self._destination(d, "fetch", url)
         branch = self._git(d, "branch", "--show-current").strip()
-        if not self._upstream(d):
+        if not branch:
+            raise ProjectError("the checkout is not on a branch; there is nothing to pull into")
+        # No upstream requirement: the fetch below names the URL and the branch
+        # itself, so the upstream decides nothing. Requiring one refused every
+        # pull after "Change remote…" (which forgets the upstream, see
+        # _forget_remote_state) even when the new origin held a plain
+        # fast-forward of HEAD, and Commit + Push was then rejected as behind —
+        # no way left to synchronise through the UI (Codex, PR #10). Whether
+        # origin has the branch is asked instead, so its absence is a sentence
+        # rather than fetch's "couldn't find remote ref".
+        heads = self._git(
+            d, "ls-remote", "--heads", "--", dest, f"refs/heads/{branch}", env=_net_env(env)
+        )
+        if not heads.strip():
             raise ProjectError(
-                f"branch {branch!r} has no upstream to pull from yet; push it first"
+                f"origin ({_redact_url(dest)}) has no branch {branch!r} to pull from; "
+                "push to publish it there"
             )
         # From the resolved URL, into origin's tracking ref and then the branch
         # of the same name. The URL, not the name: see _destination.
@@ -544,7 +558,11 @@ class Projects:
         out = self._git(
             d, "fetch", "--", dest, f"+refs/heads/{branch}:{tracking}", env=_net_env(env)
         )
-        return out + self._git(d, "merge", "--ff-only", tracking)
+        out += self._git(d, "merge", "--ff-only", tracking)
+        # The fetch just wrote origin's tracking ref; record the upstream beside
+        # it, as push does, so plain git in this checkout agrees with the panel.
+        self._track_origin(d, branch)
+        return out
 
     def commit_all(self, name: str, message: str) -> str | None:
         """Stage everything and commit. Returns the commit output, or None if the
@@ -566,11 +584,6 @@ class Projects:
         if not (d / ".git").exists():
             raise ProjectError(f"{d.name!r} is not a git checkout")
         return d
-
-    def _upstream(self, d: Path) -> str:
-        return self._git_allow_fail(
-            d, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"
-        ).strip()
 
     def commit_checkout(self, checkout: Path, message: str) -> str | None:
         """``commit_all`` for a checkout the caller already resolved.
@@ -618,9 +631,13 @@ class Projects:
         # the push named a URL: origin's tracking ref, which status measures
         # publication against, and the branch's upstream.
         self._git(d, "update-ref", f"refs/remotes/{self.REMOTE}/{branch}", sha)
+        self._track_origin(d, branch)
+        return out
+
+    def _track_origin(self, d: Path, branch: str) -> None:
+        """Make origin's ``branch`` the upstream of the local one."""
         self._git(d, "config", f"branch.{branch}.remote", self.REMOTE)
         self._git(d, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
-        return out
 
     # -- inspection ----------------------------------------------------------
 

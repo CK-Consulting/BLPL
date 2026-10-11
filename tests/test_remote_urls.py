@@ -397,6 +397,61 @@ def test_pull_uses_the_url_it_was_given(tmp_path):
         store.pull("p", url=leased_for)
 
 
+def _commit_file(work, name):
+    (work / name).write_text(f"{name}\n")
+    subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", name],
+                   cwd=work, check=True)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=work,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def test_pull_after_changing_remote_fast_forwards_without_an_upstream(tmp_path):
+    # Codex P1 on #10: "Change remote…" forgets the upstream, and pull refused
+    # without one, so an origin holding a fast-forward of HEAD could be neither
+    # pulled (no upstream) nor pushed to (remote ahead).
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    a = tmp_path / "a.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(a)], check=True)
+    store.set_remote(work, f"file://{a}")
+    store.push("p")
+
+    # B is this history plus one commit someone else pushed there.
+    b = _bare(tmp_path, "b", work)
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(b), str(other)], check=True)
+    ahead_tip = _commit_file(other, "theirs.md")
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=other, check=True)
+
+    store.set_remote(work, f"file://{b}")
+    store.pull("p", url=store.remote_of("p", operation="fetch"))
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=work,
+                          capture_output=True, text=True).stdout.strip()
+    assert head == ahead_tip
+    st = store.status("p", checkout=work)
+    assert not st.unpublished and (st.ahead, st.behind) == (0, 0)
+    upstream = subprocess.run(["git", "rev-parse", "--abbrev-ref", "@{upstream}"], cwd=work,
+                              capture_output=True, text=True).stdout.strip()
+    assert upstream == "origin/main"
+
+    mine = _commit_file(work, "mine.md")
+    store.push("p")
+    tip = subprocess.run(["git", "rev-parse", "main"], cwd=b,
+                         capture_output=True, text=True).stdout.strip()
+    assert tip == mine
+
+
+def test_pulling_a_branch_origin_does_not_have_says_so(tmp_path):
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    empty = tmp_path / "empty.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(empty)], check=True)
+    store.set_remote(work, f"file://{empty}")
+    with pytest.raises(ProjectError, match="has no branch 'main' to pull from"):
+        store.pull("p")
+
+
 def test_the_several_urls_refusal_never_shows_a_token(tmp_path):
     # Codex P1 on #10: a hand-edited config can still hold a token in a URL,
     # and the refusal listed every URL to any member who pressed Pull.
