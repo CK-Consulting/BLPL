@@ -183,6 +183,40 @@ def test_the_https_helper_answers_only_for_its_own_host(tmp_path) -> None:
         assert "ghp_scoped" not in fill("evil.example", cred.env)
 
 
+@pytest.mark.parametrize("stored", ["2001:db8::1", "[2001:DB8::1]"])
+def test_the_https_helper_reads_a_bracketed_ipv6_host_whole(tmp_path, stored) -> None:
+    """Codex P2 on #10: the port was cut at the first colon, so git's
+    `[2001:db8::1]:8443` became `[2001` — never matching the stored host, and
+    matching any other address that began `[2001`. host_of drops the brackets,
+    so a row may hold either spelling; both must compare bare."""
+    import os
+    import subprocess
+    from types import SimpleNamespace
+    from app import vault
+
+    key = b"6" * 32
+    nonce, ct = vault.encrypt_secret(key, "git-endpoint:v6", "ghp_v6")
+    row = SimpleNamespace(
+        name="v6", method="https_token", username="me", host=stored,
+        nonce=nonce, ciphertext=ct,
+    )
+
+    def fill(host: str, env: dict) -> str:
+        r = subprocess.run(
+            ["git", "credential", "fill"],
+            input=f"protocol=https\nhost={host}\n\n", capture_output=True, text=True,
+            env={**os.environ, **env, "HOME": str(tmp_path)}, cwd=tmp_path,
+        )
+        return r.stdout
+
+    assert gitstore.host_of("https://[2001:db8::1]:8443/o/p.git") == "2001:db8::1"
+    with gitstore.lease(key, row) as cred:
+        assert "password=ghp_v6" in fill("[2001:db8::1]", cred.env)
+        assert "password=ghp_v6" in fill("[2001:db8::1]:8443", cred.env)
+        assert "ghp_v6" not in fill("[2001:db8::2]:8443", cred.env)
+        assert "ghp_v6" not in fill("[2001", cred.env)
+
+
 # -- one credential per host --------------------------------------------------
 
 

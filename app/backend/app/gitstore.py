@@ -205,6 +205,16 @@ def for_remote(session: Session, user: User, remote: str) -> GitEndpoint | None:
     )
 
 
+def _bare_host(host: str) -> str:
+    """A stored host as the helper compares it: lowercase, IPv6 unbracketed.
+
+    ``put`` keeps whatever brackets the user typed, while ``host_of`` — and
+    the helper — drop them, so ``[2001:db8::1]`` must be compared bare.
+    """
+    h = host.strip().lower()
+    return h[1:].split("]", 1)[0] if h.startswith("[") else h
+
+
 @dataclass(frozen=True)
 class Credential:
     """Everything a git subprocess needs, and nothing that outlives it."""
@@ -230,18 +240,22 @@ def lease(master_key: bytes, row: GitEndpoint):
         # Answers only `get`, and only for the host the credential was stored
         # for. The helper used to answer every request, so whichever host git
         # ended up talking to (a second push URL, a remote changed mid-request)
-        # was handed this token. Git passes host=... on stdin, port included.
+        # was handed this token. Git passes host=... on stdin, port included,
+        # and an IPv6 literal in brackets: `[2001:db8::1]:8443`. Cutting at the
+        # first colon left `[2001` of that, so the brackets are stripped
+        # instead — matching host_of, whose urlsplit drops them too.
         helper = (
             "!f() { test \"$1\" = get || exit 0; h=; "
             "while IFS= read -r l; do case \"$l\" in host=*) h=\"${l#host=}\";; esac; done; "
-            "h=$(printf %s \"${h%%:*}\" | tr A-Z a-z); "
+            "case \"$h\" in \\[*) h=\"${h#\\[}\"; h=\"${h%%\\]*}\";; *) h=\"${h%%:*}\";; esac; "
+            "h=$(printf %s \"$h\" | tr A-Z a-z); "
             "test -n \"$GIT_HTTP_HOST\" && test \"$h\" = \"$GIT_HTTP_HOST\" || exit 0; "
             "echo \"username=${GIT_HTTP_USER}\"; echo \"password=${GIT_HTTP_TOKEN}\"; }; f"
         )
         yield Credential(env={
             "GIT_HTTP_USER": row.username or "git",
             "GIT_HTTP_TOKEN": secret,
-            "GIT_HTTP_HOST": (getattr(row, "host", "") or "").lower(),
+            "GIT_HTTP_HOST": _bare_host(getattr(row, "host", "") or ""),
             # Clear any configured helpers first (the empty helper resets the
             # list), then install ours. Without the reset, a system helper could
             # answer first with the wrong identity.

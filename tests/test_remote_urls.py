@@ -418,3 +418,63 @@ def test_cloning_a_malformed_url_is_a_400(unlocked):
     # was validated, so this was still a 500.
     r = unlocked.post("/api/projects/clone", json={"name": "x", "remote": "https://[bad/repo", "branch": "main"})
     assert r.status_code == 400, r.text
+
+
+def test_a_token_already_in_origin_is_refused_before_git_sees_it(tmp_path):
+    # Codex P1 on #10: the setter refuses a URL with a token, but a repository
+    # configured before it (or edited by hand) still handed that URL to git as
+    # an argument — on the command line for anything on the host to read, and
+    # back to every member in the error when the operation failed.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://me:ghp_secret123@host-a.example/o/p.git"],
+        cwd=work, check=True,
+    )
+    for op in ("fetch", "push"):
+        with pytest.raises(ProjectError, match="password or token") as exc:
+            store.remote_of("p", operation=op)
+        assert "ghp_secret123" not in str(exc.value)
+    for call in (store.pull, store.push):
+        with pytest.raises(ProjectError, match="password or token") as exc:
+            call("p")
+        assert "ghp_secret123" not in str(exc.value)
+
+    # A username alone is not a secret and still resolves.
+    _config(work, "remote.origin.url", "https://me@host-a.example/o/p.git")
+    assert store.remote_of("p", operation="push") == "https://me@host-a.example/o/p.git"
+
+
+def test_a_failing_git_command_never_repeats_a_token(tmp_path):
+    # Defence in depth for the same finding: _git's error quotes every argument
+    # and git's stderr, and both can carry a URL with a token in it.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    with pytest.raises(ProjectError) as exc:
+        store._git(work, "rev-parse", "--verify", "https://me:ghp_secret123@host-a.example/o/p.git")
+    assert "ghp_secret123" not in str(exc.value)
+    assert "https://me:***@host-a.example" in str(exc.value)
+
+
+def test_saving_the_fetch_url_over_a_separate_push_url_forgets_the_push_side(tmp_path):
+    # Codex P2 on #10: origin fetched from A and pushed to B. Saving A dropped
+    # the pushurl, moving every push from B to A, but the old URL was read
+    # without --push, compared equal, and origin/main from B survived — so
+    # status said published, nothing ahead, with A holding none of it.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    a = tmp_path / "a.git"
+    b = tmp_path / "b.git"
+    for bare in (a, b):
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", f"file://{a}"], cwd=work, check=True)
+    subprocess.run(["git", "remote", "set-url", "--push", "origin", f"file://{b}"], cwd=work, check=True)
+    store.push("p")
+    assert "main" in _heads(b) and not store.status("p", checkout=work).unpublished
+
+    store.set_remote(work, f"file://{a}")
+
+    st = store.status("p", checkout=work)
+    assert st.unpublished and st.ahead == 1
+    store.push("p")
+    assert "main" in _heads(a)

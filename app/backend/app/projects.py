@@ -135,6 +135,27 @@ def _redact_url(url: str) -> str:
     return f"{scheme}{user}:***@{rest}" if ":" in userinfo else f"{scheme}{user}@{rest}"
 
 
+# Any URL's password, wherever it sits in a longer string: an argv joined into
+# an error, or git's own stderr, which quotes the URL it could not reach.
+_URL_PASSWORD = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^/@\s:]*):[^/@\s]*@")
+
+
+def _redact_text(text: str) -> str:
+    """``text`` with the password of every URL in it replaced by ``***``."""
+    return _URL_PASSWORD.sub(r"\1:***@", text)
+
+
+def _carries_password(url: str) -> bool:
+    if "://" not in url:
+        return False
+    try:
+        return urlsplit(url).password is not None
+    except ValueError:
+        # Unparseable: the redacting pattern is the judge, so a malformed URL
+        # with a token in it is still refused rather than handed to git.
+        return _redact_text(url) != url
+
+
 # Remote transports git may use for anything a user names. Read by both the URL
 # check below and git itself (GIT_ALLOW_PROTOCOL), so the two cannot disagree.
 # `file` is for the test suite's local bare repositories and nothing else: a
@@ -357,7 +378,19 @@ class Projects:
         url = check_remote_url(url)
         d = self._checkout("", checkout)
         if self._primary_remote(d):
-            previous = self._git_allow_fail(d, "remote", "get-url", self.REMOTE).strip()
+            # Both directions, every URL. Read without --push, an origin that
+            # fetched from this same URL but pushed to a separate one looked
+            # unchanged, though dropping the pushurl below moves every push to
+            # a new destination — and origin/<branch> from the old one then
+            # reported it as already published.
+            previous = {
+                u.strip()
+                for args in (("--all",), ("--all", "--push"))
+                for u in self._git_allow_fail(
+                    d, "remote", "get-url", *args, self.REMOTE
+                ).splitlines()
+                if u.strip()
+            }
             # --unset-all first: `set-url` replaces only the first of several
             # `url` values, and a second one would stay a second destination
             # for every push (see _single_destination).
@@ -366,7 +399,7 @@ class Projects:
             # A separate pushurl would keep pushes going to the old place while
             # the panel showed the new one. Dropped, so pushes use `url`.
             self._git_allow_fail(d, "config", "--unset-all", f"remote.{self.REMOTE}.pushurl")
-            if previous != url:
+            if previous != {url}:
                 self._forget_remote_state(d)
         else:
             self._git(d, "remote", "add", self.REMOTE, url)
@@ -422,6 +455,17 @@ class Projects:
                 f"({', '.join(_redact_url(u) for u in urls)}), and a "
                 f"{operation} would go to all of them with a credential meant for one. "
                 "Set a single URL in Project settings → Git."
+            )
+        if urls and _carries_password(urls[0]):
+            # Same history as above. Used, the token went onto git's command
+            # line — readable from /proc by anything on the host — and into the
+            # error any member sees when the operation fails. The URL is not
+            # repeated, even redacted: the fix is the same whatever it says.
+            raise ProjectError(
+                f"origin's {operation} URL carries a password or token, which "
+                "BLPL will not send. Set the URL again without it in Project "
+                "settings → Git, and add the credential under Account & app "
+                "settings → Git endpoints/accounts."
             )
         return urls[0] if urls else ""
 
@@ -760,9 +804,13 @@ class Projects:
             env={**os.environ, **env} if env else None,
         )
         if proc.returncode != 0:
-            raise ProjectError(
+            # Redacted: this message reaches project members, and an argument
+            # or git's stderr can quote a URL with a token in it. Nothing
+            # should pass one any more (see _single_destination); this is for
+            # whatever path still does.
+            raise ProjectError(_redact_text(
                 f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
-            )
+            ))
         return proc.stdout
 
     def _git_allow_fail(self, cwd: Path, *args: str) -> str:
