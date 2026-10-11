@@ -241,4 +241,4 @@ def test_pulling_a_branch_that_was_never_pushed_says_so(unlocked, second_user, t
     subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=main.PROJECTS_ROOT / "mine", check=True)
     _share(unlocked, second_user)
     r = second_user.post("/api/projects/mine/git/pull")
-    assert r.status_code == 400 and "push it first" in r.json()["detail"]
+    assert r.status_code == 400 and "push to publish it there" in r.json()["detail"]
