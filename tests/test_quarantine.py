@@ -517,6 +517,117 @@ def test_only_top_level_keys_describe_the_stream(tmp_path):
     assert r.state == "cannot_inspect" and not r.is_inert
 
 
+# A content stream whose own text says `endstream`, then something that reads
+# as `/JS`. Both are data: they sit inside the body its /Length declares.
+_CONTENT = b"BT (endstream) Tj /JS 12 Tf ET"
+_TAIL = b"trailer<</Root 1 0 R>>\n%%EOF\n"
+
+
+def _content_stream(length: bytes, after: bytes = b"") -> bytes:
+    return (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n"
+        b"4 0 obj<</Length " + length + b">>stream\n" + _CONTENT
+        + b"\nendstream endobj\n" + after + _TAIL
+    )
+
+
+def test_an_indirect_length_is_resolved_so_a_body_stays_data(tmp_path):
+    """Codex, PR #15: with `/Length 6 0 R` unresolved, the body ended at the
+    `endstream` in its own text and the rest was read as structure, so a
+    benign `/JS` in a content stream held the file. Resolved, it is data."""
+    define = b"6 0 obj\n%d\nendobj\n" % len(_CONTENT)
+    data = _content_stream(b"6 0 R", define)
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "inspected" and r.is_inert, [f.name for f in r.findings]
+    # Defined before the stream, in another spelling of the same integer.
+    data = b"%PDF-1.4\n6 0 obj +0" + str(len(_CONTENT)).encode() + b" endobj\n" + _content_stream(b"6 0 R")[9:]
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", data))
+    assert r.state == "inspected" and r.is_inert, [f.name for f in r.findings]
+
+
+def test_an_indirect_length_that_cannot_be_resolved_falls_back(tmp_path):
+    """Defined twice with different values, undefined, or landing anywhere
+    but on `endstream`, a reference is not a length: the body ends at the
+    first `endstream`, as it did before, and what follows is structure."""
+    n = len(_CONTENT)
+    for after in (
+        b"6 0 obj %d endobj\n6 0 obj %d endobj\n" % (n, n + 1),   # disagree
+        b"",                                                     # undefined
+        b"6 0 obj %d endobj\n" % (n - 3),                         # misses
+        b"6 0 obj -%d endobj\n" % n,                              # negative
+    ):
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", _content_stream(b"6 0 R", after)))
+        assert "JS" in {f.name for f in r.active}, after
+
+
+def test_a_resolved_length_cannot_swallow_an_object(tmp_path):
+    """The resolved value is the file's word against the xref's, and the real
+    object may hide in an object stream. A length that reached past the first
+    `endstream`, over an object, to a later stream's `endstream` would blank
+    an /OpenAction a reader with the honest length parses. It falls back."""
+    head = b"%PDF-1.4\n4 0 obj<</Length 6 0 R>>stream\nabc"
+    rest = (
+        b"\nendstream endobj\n"
+        b"1 0 obj<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>endobj\n"
+        b"8 0 obj<</Length 3>>stream\nabc"
+    )
+    data = head + rest + b"\nendstream endobj\n6 0 obj %d endobj\n" % (3 + len(rest)) + _TAIL
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_resolved_length_does_not_vouch_for_an_unfiltered_object_stream(tmp_path):
+    """A decoy definition can put a resolved end at an `endstream` the body
+    supplies, and for raw objects the bytes cut off are objects. Only a
+    direct /Length vouches for an unfiltered object stream's end."""
+    body = b"1 0 2 30 <</A/xendstream>> <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    cut = body.index(b"endstream")
+    for value in (cut, len(body)):
+        data = _objstm(b"/Length 12 0 R", body).replace(_TAIL, b"12 0 obj %d endobj\n" % value + _TAIL)
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect" and not r.is_inert, value
+
+
+def test_only_a_top_level_type_or_n_and_first_make_an_object_stream(tmp_path):
+    """Codex, PR #15: `/First` or `/ObjStm` anywhere in the dictionary made a
+    stream an object stream, nested values included, so a content stream was
+    read as objects and its text reported `/JS`, and an image whose filter
+    this does not decode made the file `cannot_inspect`."""
+    text = b"BT /JS 12 Tf (hello) Tj ET"
+    for extra in (b"/Params<</First 1/N 1>>", b"/X<</Type/ObjStm>>", b"/N 1/X<</First 1>>"):
+        data = (
+            b"%%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n4 0 obj<</Length %d" % len(text)
+            + extra + b">>stream\n" + text + b"\nendstream endobj\n" + _TAIL
+        )
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "inspected" and r.is_inert, (extra, r.reason, [f.name for f in r.findings])
+    image = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n"
+        b"4 0 obj<</Subtype/Image/Filter/DCTDecode/DecodeParms<</First 0>>/Length 4>>stream\n"
+        b"\xff\xd8\xff\xd9\nendstream endobj\n" + _TAIL
+    )
+    assert pdf_inspect.inspect(_write(tmp_path, "b.pdf", image)).state == "inspected"
+
+
+def test_a_type_less_object_stream_is_still_found_by_its_top_level_keys(tmp_path):
+    """The other side: leaving out /Type does not hide an object stream whose
+    /N and /First are at top level, integers or references; and a dictionary
+    that cannot be read, naming /First anywhere, is unknown, never ordinary."""
+    for keys in (b"/N 1/First 4", b"/N 1/First 9 0 R"):
+        data = (
+            b"%PDF-1.5\n5 0 obj<<" + keys + b"/Filter/FlateDecode>>stream\n"
+            + zlib.compress(_HIDDEN) + b"\nendstream endobj\n" + _TAIL
+        )
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, keys
+    data = (
+        b"%PDF-1.5\n5 0 obj<</X<</First 4>>/Filter/FlateDecode/Filter/FlateDecode>>stream\n"
+        + zlib.compress(_HIDDEN) + b"\nendstream endobj\n" + _TAIL
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
 def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
     data = (
         b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"

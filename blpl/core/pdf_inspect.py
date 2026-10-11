@@ -235,9 +235,11 @@ class _Stream:
     dictionary: bytes   # canonical tokens of the dictionary
     start: int          # body offsets into the file
     end: int
-    # Whether a direct /Length put the end there, rather than the first
-    # `endstream` after the body began, which the body itself can supply.
-    trusted_end: bool = False
+    # What put the end there: a direct /Length ("length"), an indirect one
+    # resolved from its definition elsewhere in the file ("reference"), or the
+    # first `endstream` after the body began ("search"), which the body itself
+    # can supply. Only "length" is what the reader is certain to use too.
+    ended_by: str = "search"
 
 
 def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
@@ -268,6 +270,7 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
     the depth is still reset there so the rest of the file is read for what
     it reports.
     """
+    lengths = _length_objects(data)
     out = bytearray()
     streams: list[_Stream] = []
     opens: list[int] = []               # offsets in `out` of unclosed `<<`
@@ -327,8 +330,8 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
                 pos += 2
             elif pos < n and data[pos] in b"\r\n":
                 pos += 1
-            close, trusted = _body_end(data, pos, dictionary)
-            streams.append(_Stream(dictionary, pos, n if close < 0 else close, trusted))
+            close, ended_by = _body_end(data, pos, dictionary, lengths)
+            streams.append(_Stream(dictionary, pos, n if close < 0 else close, ended_by))
             if close >= 0:
                 pos = close
             continue
@@ -401,8 +404,50 @@ def _is_reference(value: list[bytes] | None) -> bool:
     return value is not None and len(value) == 3 and value[2] == b"R"
 
 
-def _body_end(data: bytes, start: int, dictionary: bytes) -> tuple[int, bool]:
-    """Where a stream body ends, and whether a direct /Length put it there:
+# `N G obj <integer> endobj`, anywhere in the raw bytes. Preceded by a
+# non-regular byte so `11 0 obj` is not read as `1 0 obj`.
+_WSP = rb"[\x00\t\n\x0c\r ]+"
+_LENGTH_OBJECT = re.compile(
+    rb"(?<!" + _REGULAR + rb")(\d+)" + _WSP + rb"(\d+)" + _WSP + rb"obj" + _WSP
+    + rb"([+-]?\d+)" + _WSP + rb"endobj(?!" + _REGULAR + rb")"
+)
+# A keyword that begins something a reader parses as structure: an object, a
+# stream body, a trailer. Whole words, so `endstream` and `endobj` are not.
+_STRUCTURE_WORD = re.compile(
+    rb"(?<!" + _REGULAR + rb")(?:obj|stream|trailer)(?!" + _REGULAR + rb")"
+)
+
+
+def _length_objects(data: bytes) -> dict[tuple[bytes, bytes], int]:
+    """Every object whose whole body is one integer, keyed by `(N, G)` in
+    canonical form, where the file defines it one way only.
+
+    Found by pattern over the raw bytes rather than by the tokenizer, because
+    the tokenizer is what needs the answer: it is deciding where stream
+    bodies end, and the definition of a length usually follows the stream
+    whose length it is. So a candidate may sit inside some other stream's
+    body or a string. An object defined twice with different values (an
+    incremental update, or a decoy) resolves to nothing; with one value it
+    resolves to that value, which _body_end still accepts only where it lands
+    on an `endstream` and swallows no structure the fallback would have read.
+    """
+    seen: dict[tuple[bytes, bytes], set[bytes]] = {}
+    for m in _LENGTH_OBJECT.finditer(data):
+        key = (_canonical_word(m.group(1)), _canonical_word(m.group(2)))
+        seen.setdefault(key, set()).add(_canonical_word(m.group(3)))
+    return {
+        key: int(next(iter(values)))
+        for key, values in seen.items()
+        if len(values) == 1
+        and _INT.fullmatch(next(iter(values)))
+        and len(next(iter(values))) <= 20
+    }
+
+
+def _body_end(
+    data: bytes, start: int, dictionary: bytes, lengths: dict[tuple[bytes, bytes], int]
+) -> tuple[int, str]:
+    """Where a stream body ends, and what put it there (see _Stream.ended_by):
     at the declared /Length when that lands on an `endstream`, otherwise at
     the first `endstream` after it.
 
@@ -410,24 +455,50 @@ def _body_end(data: bytes, start: int, dictionary: bytes) -> tuple[int, bool]:
     contain one, and a file can arrange that they do: a stored Deflate block
     holding `%endstream` cut the body there, the rest of the object stream was
     never inflated, and an /OpenAction after the cut went unseen. /Length is
-    what a reader uses. An indirect length (`12 0 R`) is not resolved here, so
-    its end is untrusted: the object stream check refuses an untrusted end
-    wherever no filter's end-of-data marker can confirm the body is whole.
+    what a reader uses.
+
+    An indirect length (`12 0 R`) is resolved from _length_objects. Codex,
+    PR #15: left unresolved, a metadata or content stream whose text holds the
+    word `endstream` was cut there, and the rest of its text was read as
+    structure, so a benign `/JS` in it held the file. The same fallback lets a
+    body supply its own `endstream` and fake structure after it.
+
+    What the resolution cannot know is whether a reader, walking the xref,
+    resolves the reference to the same object: the real one may sit in a
+    compressed object stream, invisible to the raw pattern, with a decoy in
+    the raw bytes. So a resolved length is held to what makes it no worse
+    than the fallback it replaces. It must land exactly on an `endstream`,
+    which the fallback would have accepted had it come first. And where it
+    reaches past the first `endstream`, the bytes it adds to the body must
+    hold no `obj`, `stream` or `trailer`: those bytes are structure to the
+    fallback, and a body that absorbed an object would hide from this check
+    an object a reader with a shorter length still parses. Anything else falls
+    back. A decoy definition elsewhere can only make the candidates disagree,
+    which falls back, or agree on a value held to the same two tests. An
+    unfiltered object stream still demands a direct /Length (_unreadable),
+    because there the bytes a decoy could cut off are objects.
     """
     entries = _entries(dictionary)
     length = entries.get("Length") if entries else None
+    first = data.find(_ENDSTREAM, start)
+    declared, how = None, "length"
     # Twenty digits is past any file this will ever see, so a longer length
     # cannot land on an `endstream` and is treated as one that does not. It is
     # checked before int() because Python 3.11+ refuses to convert more than
     # 4,300 digits, and that ValueError aborted the upload (Codex, PR #15).
     if length is not None and len(length) == 1 and _INT.fullmatch(length[0]) and len(length[0]) <= 20:
-        end = start + int(length[0])
+        declared = int(length[0])
+    elif _is_reference(length):
+        declared, how = lengths.get((length[0], length[1])), "reference"
+    if declared is not None:
+        end = start + declared
         # PDF whitespace, NUL included: bytes.lstrip() keeps NUL, so a benign
         # `\x00endstream` missed its declared length and fell back to the
         # first `endstream`, which may sit inside the compressed bytes.
         if end <= len(data) and data[end : end + 64].lstrip(_WS).startswith(_ENDSTREAM):
-            return end, True
-    return data.find(_ENDSTREAM, start), False
+            if how == "length" or end <= first or not _STRUCTURE_WORD.search(data, first, end):
+                return end, how
+    return first, "search"
 
 
 def _names_in(structure: bytes) -> set[str]:
@@ -495,12 +566,13 @@ def _unreadable(st: _Stream) -> tuple[str | None, list[str]]:
     and blanks them, while the object stream is read only up to the cut, so
     an object after the cut is seen by neither. Flate, ASCIIHex and ASCII85
     each have to reach an end-of-data marker, so a cut there is caught in
-    _decode; raw objects have no such marker. Resolving `12 0 R` instead was
-    considered and refused: the length object may itself sit in an object
-    stream, or be defined twice across incremental updates, and a decoy copy
-    in some other stream's body is indistinguishable from it without a full
-    xref walk. Refusing costs nothing measurable: of 1,435 object streams in
-    77 project PDFs, none is unfiltered, and every one has a direct /Length.
+    _decode; raw objects have no such marker. A `12 0 R` that _body_end
+    resolved does not count either: the length object may itself sit in an
+    object stream, or be defined twice across incremental updates, and a decoy
+    copy in some other stream's body is indistinguishable from it without a
+    full xref walk. That is tolerable for an image, not for objects. Refusing
+    costs nothing measurable: of 1,435 object streams in 77 project PDFs, none
+    is unfiltered, and every one has a direct /Length.
     """
     entries = _entries(st.dictionary)
     if entries is None:
@@ -523,7 +595,7 @@ def _unreadable(st: _Stream) -> tuple[str | None, list[str]]:
         return "an external file (/F)", filters
     if st.end - st.start > _MAX_INFLATE:
         return "a body over the inspection limit", filters
-    if not filters and not st.trusted_end:
+    if not filters and st.ended_by != "length":
         return "an unfiltered object stream whose end no direct /Length confirms", filters
     return None, filters
 
@@ -568,6 +640,34 @@ def _decode(body: bytes, filters: list[str]) -> bytes | None:
     return body
 
 
+def _is_object_stream(dictionary: bytes) -> bool:
+    """Whether a reader could take this stream for an object stream.
+
+    `/Type /ObjStm`, or — for a file that leaves the type out to hide its
+    objects — a top-level /N and /First, without which no reader can find the
+    objects inside. Codex, PR #15: matching `/First` or `/ObjStm` anywhere in
+    the dictionary took `/DecodeParms <</First 1>>` or a nested `/Type
+    /ObjStm` for one, so an image or a content stream was read as objects,
+    its data could report `/JS`, and an image filter this check does not
+    decode made the file `cannot_inspect`. /N and /First may be integers or
+    references, since a reader that resolves either still finds the objects.
+    A dictionary this cannot read is an object stream if either name appears
+    anywhere in it, so _unreadable refuses it rather than this guessing.
+    """
+    entries = _entries(dictionary)
+    if entries is None:
+        return bool({"ObjStm", "First"} & _names_in(dictionary))
+    if entries.get("Type") == [b"/ObjStm"]:
+        return True
+
+    def counts(value: list[bytes] | None) -> bool:
+        return value is not None and (
+            _is_reference(value) or (len(value) == 1 and bool(_INT.fullmatch(value[0])))
+        )
+
+    return counts(entries.get("N")) and counts(entries.get("First"))
+
+
 def _object_streams(
     data: bytes, streams: list[_Stream]
 ) -> tuple[list[bytes], list[str], int]:
@@ -575,10 +675,8 @@ def _object_streams(
 
     Only object streams, because only they hold objects: an image, a page's
     drawing operators or an XMP packet is data, and reading names out of data
-    is the false positive this module used to have. A stream counts as an
-    object stream if its dictionary says `/Type /ObjStm` *or* carries `/First`
-    — no reader can locate the objects inside without `/First`, so a file that
-    omits the type to hide its objects still has to declare it.
+    is the false positive this module used to have. Which streams count is
+    _is_object_stream.
 
     Decoded by the filter the dictionary declares, which is what a reader does.
     An unfiltered object stream is already structure and is read as it stands:
@@ -598,7 +696,7 @@ def _object_streams(
     # Object streams are chosen first and the cap applied to them, not to every
     # stream: capping all streams let 4,000 images push an object stream past
     # the limit, unread, while the file reported clean. Past the cap, unknown.
-    objstms = [st for st in streams if {"ObjStm", "First"} & _names_in(st.dictionary)]
+    objstms = [st for st in streams if _is_object_stream(st.dictionary)]
     if len(objstms) > _MAX_STREAMS:
         return [], [f"more than {_MAX_STREAMS} object streams"], len(objstms)
     for st in objstms:
