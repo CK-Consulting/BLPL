@@ -185,7 +185,12 @@ bwrap --unshare-all --die-with-parent --new-session \
   the same gap seen from the other side.
 - **Limits.** The container gets memory and CPU limits in compose. Each session
   gets `prlimit` for processes and file size, an idle timeout (30 min without
-  input closes it), and a cap of 2 sessions per member and 8 per host.
+  input closes it), **one session per member per project**, and 8 per host.
+  Two independent shells in one worktree would be two writers racing over
+  the same files and pipeline outputs, which is the race the run exclusion
+  below exists to prevent. A second tab therefore attaches to the member's
+  existing session, the same PTY with its output fanned out to both sockets,
+  rather than starting another shell.
 
 ### 3. The backend's part
 
@@ -208,13 +213,14 @@ need a person.
   spends the ticket. The ticket replaces any need to carry the Clerk token on
   the socket. It is single-use and short-lived, so its appearance in an nginx
   access log is harmless, unlike a bearer token's.
-- **Holding the workspace open, per session, not per member.** The registry's
-  `holders` is a `set[int]` of user ids. With two sessions per member allowed,
-  `release(workspace, user_id)` on closing either socket would report nobody
-  left and seal the checkout under the other live shell. So holders become
-  **per-session tokens**: an opaque string such as `term:<session id>` beside
-  the plain user ids that locking uses, or a count per user. The workspace is
-  released only when the last holder of any kind is gone.
+- **Holding the workspace open, per socket, not per member.** The registry's
+  `holders` is a `set[int]` of user ids. A member's session can have several
+  attached tabs, and the member may also hold the project open through the
+  file pane, so `release(workspace, user_id)` on closing one socket would
+  report nobody left and seal the checkout under the live shell. Holders
+  become **per-socket tokens**: an opaque string such as `term:<socket id>`
+  beside the plain user ids that locking uses. The workspace is released only
+  when the last holder of any kind is gone.
 
   While a socket is open, the backend touches the registry with that holder,
   rate-limited to once a minute. That keeps idle sealing (`IDLE_AFTER`) from
@@ -234,6 +240,15 @@ need a person.
     is queued, running or cancelling, with the same wording the editor uses.
   - Starting a run answers **409** while the member has a terminal session
     open: "close your terminal to run the pipeline".
+  - **Atomic, not two checks.** Separate checks race: a session request and a
+    run request arriving together can each see the other absent and both
+    proceed. `runqueue.enqueue` is itself a query followed by an insert today.
+    So both paths take one **per-(member, project) admission lock**, a Postgres
+    `pg_advisory_xact_lock` keyed on the pair, and check and create inside that
+    transaction. A terminal session is a row (`terminal_session`), not just
+    process state, so the run path can see it under the same lock. A partial
+    unique index on active sessions per (member, project) backs the
+    one-session rule up in the database.
 
   The Run button says why it is disabled, and the terminal tab offers to close
   the session. It is coarse, but it is correct. Remounting the checkout
@@ -305,6 +320,15 @@ The proposal is a third ledger state, `released_active`, beside `held` and
 - The app only ever renders it through pdf.js with `enableScripting: false`,
   never by handing the browser a URL to the raw file. Download is still allowed,
   behind a notice naming what the file contains.
+- **Enforced at the server, not only in the viewer.** The blob route looks the
+  file up in the ledger, by path and by content hash so a rename does not shed
+  the state. For `released_active`, it never answers inline: it serves
+  `application/octet-stream` with `Content-Disposition: attachment` and
+  `nosniff`, exactly as it serves `retrieved/`. The pdf.js view fetches the
+  bytes through a separate route that only it calls. A raw link, an old tree
+  link or a pasted URL therefore downloads the file and never opens it in the
+  browser's own PDF viewer. Moving or renaming a released file is already
+  refused (PR #17), which keeps the ledger's path truthful.
 - Text and spec extraction from it run in this sandbox:
   `bwrap --unshare-all` with the file bound read-only and output to a tmpfs,
   under the same seccomp profile.
@@ -325,7 +349,7 @@ JavaScript.
 | Put vendor PDFs and reference designs into the project (`sudo cp`) | `+ Upload` (done 2026-09-26). TE's PDFs failed only because of a `pdf_inspect` false positive (fix in progress). |
 | Delete or rename a file or folder | File tree context menu (in progress) |
 | Retype a pin, fix a footprint line, small surgical edits across several files | **This terminal** |
-| Run `blpl` CLI stages or `kicad-cli` by hand | **This terminal** (same image, same tools) |
+| Run deterministic `blpl` stages or `kicad-cli` by hand | **This terminal** (same image, same tools). LLM stages (`stage0-llm`, `stage1`, a `blpl run` that includes them) stay in the **Run panel**: the shell has no network and no provider keys by design, and the worker injects the member's provider configuration only into runs it starts. |
 | Inspect `retrieved/quarantine.json`, look at a held file | Terminal for reading. Releasing stays a deliberate app action. |
 | `chown` files back from root | Not needed since containers run as `BLPL_UID` |
 
@@ -356,7 +380,12 @@ documentation, and anything still on the left with no right-hand side is a bug.
    commands. Tests that matter:
    - Idle sealing does not fire while a session is open, and does fire after
      it closes.
-   - Closing one of a member's two sessions does not seal under the other.
+   - Closing one of two tabs attached to a session does not seal under the
+     other.
+   - A second session request from the same member attaches; it does not spawn.
+   - A session request and a run request fired concurrently never both succeed.
+   - The blob route serves a `released_active` PDF as an attachment, never
+     inline.
    - A planted hook does not run when the Git panel commits.
    - A session cannot open during a run, and a run cannot start while a
      session is open.
