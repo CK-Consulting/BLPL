@@ -104,6 +104,11 @@ describe("preflight's project-wide findings", () => {
     await waitFor(() => expect(screen.getByText(/power\/ holds design tables/)).toBeTruthy());
     const headings = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
     expect(headings).toEqual(["Whole project", "main"]);
+    // Codex, PR #16: the project section reused the board report, which
+    // printed "Every table was recognised" above this finding and offered an
+    // Open KiCad button with no board to open. One of each now: main's.
+    expect(screen.getAllByText(/Every table was recognised/)).toHaveLength(1);
+    expect(screen.queryAllByRole("button", { name: /KiCad/i }).length).toBeLessThanOrEqual(1);
   });
 });
 
