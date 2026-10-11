@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 
 # Deliberately *not* a module-level fastapi skip. Only one of these needs the
-# webapp extras; skipping the file for its sake would take the validation and
+# backend's requirements; skipping the file for its sake would take the validation and
 # atomic-write tests with it, and those are the parts worth pinning.
 pytest.importorskip("jsonschema")
 
