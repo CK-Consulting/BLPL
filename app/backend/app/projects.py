@@ -358,7 +358,11 @@ class Projects:
         d = self._checkout("", checkout)
         if self._primary_remote(d):
             previous = self._git_allow_fail(d, "remote", "get-url", self.REMOTE).strip()
-            self._git(d, "remote", "set-url", self.REMOTE, url)
+            # --unset-all first: `set-url` replaces only the first of several
+            # `url` values, and a second one would stay a second destination
+            # for every push (see _single_destination).
+            self._git_allow_fail(d, "config", "--unset-all", f"remote.{self.REMOTE}.url")
+            self._git(d, "config", f"remote.{self.REMOTE}.url", url)
             # A separate pushurl would keep pushes going to the old place while
             # the panel showed the new one. Dropped, so pushes use `url`.
             self._git_allow_fail(d, "config", "--unset-all", f"remote.{self.REMOTE}.pushurl")
@@ -394,6 +398,29 @@ class Projects:
             self._git_allow_fail(d, "config", "--unset", f"branch.{branch}.remote")
             self._git_allow_fail(d, "config", "--unset", f"branch.{branch}.merge")
 
+    def _single_destination(self, d: Path, operation: str) -> str:
+        """The one URL ``operation`` talks to on origin, or a refusal.
+
+        `git remote get-url` answers with the first URL only, while `git push`
+        contacts every configured push URL (and with no pushurl, every `url`).
+        A credential leased for the first host was then offered by the helper
+        to the second, leaking that token and usually failing the push there.
+        Rather than lease per host, one destination per operation is required:
+        it is the only shape Project settings ever writes, and a hand-edited
+        config with several is something to fix, not to guess about.
+        """
+        args = ["remote", "get-url", "--all"] + (["--push"] if operation == "push" else [])
+        urls = list(dict.fromkeys(
+            u.strip() for u in self._git_allow_fail(d, *args, self.REMOTE).splitlines() if u.strip()
+        ))
+        if len(urls) > 1:
+            raise ProjectError(
+                f"origin has {len(urls)} {operation} URLs ({', '.join(urls)}), and a "
+                f"{operation} would go to all of them with a credential meant for one. "
+                "Set a single URL in Project settings → Git."
+            )
+        return urls[0] if urls else ""
+
     def remote_of(
         self, name: str, *, operation: str, checkout: Path | None = None
     ) -> str:
@@ -419,10 +446,9 @@ class Projects:
         if not remote:
             return ""
         # The URL git itself connects to for this operation: for a push,
-        # pushurl when one is set, else url; for a fetch, always url.
-        if operation == "push":
-            return self._git_allow_fail(d, "remote", "get-url", "--push", remote)
-        return self._git_allow_fail(d, "remote", "get-url", remote)
+        # pushurl when one is set, else url; for a fetch, always url. Refused
+        # when there is more than one, before any credential is leased.
+        return self._single_destination(d, operation)
 
     def pull(
         self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None
@@ -436,7 +462,8 @@ class Projects:
         d = self._checkout(name, checkout)
         if not self._primary_remote(d):
             raise ProjectError("this project has no remote to pull from; add one in project settings")
-        branch = self._git(d, "branch", "--show-current").strip()
+        self._single_destination(d, "fetch")
+        branch =self._git(d, "branch", "--show-current").strip()
         if not self._upstream(d):
             raise ProjectError(
                 f"branch {branch!r} has no upstream to pull from yet; push it first"
@@ -497,6 +524,7 @@ class Projects:
         d = self._checkout(name, checkout)
         if not self._primary_remote(d):
             raise ProjectError("this project has no remote to push to; add one in project settings")
+        self._single_destination(d, "push")
         # To origin by name, as the branch of the same name — never an
         # argument-less push, whose destination pushRemote, pushDefault and a
         # branch's upstream can all redirect (see REMOTE). --set-upstream so a

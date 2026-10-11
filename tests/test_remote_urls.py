@@ -302,6 +302,60 @@ def test_changing_a_remote_drops_its_separate_push_url(tmp_path):
     assert push == "https://github.com/o/new.git"
 
 
+def _config(work, *args):
+    subprocess.run(["git", "config", *args], cwd=work, check=True)
+
+
+def test_two_push_urls_are_refused_before_any_credential(tmp_path):
+    # Codex P1 on #10: get-url answers with the first push URL only, while git
+    # push contacts every one, so a credential leased for host A was offered
+    # to host B.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    subprocess.run(["git", "remote", "add", "origin", "https://host-a.example/o/p.git"], cwd=work, check=True)
+    _config(work, "--add", "remote.origin.pushurl", "https://host-a.example/o/p.git")
+    _config(work, "--add", "remote.origin.pushurl", "https://host-b.example/o/p.git")
+
+    with pytest.raises(ProjectError, match="Set a single URL in Project settings"):
+        store.remote_of("p", operation="push")
+    with pytest.raises(ProjectError, match="2 push URLs"):
+        store.push("p")
+    # The fetch side has one URL and is unaffected.
+    assert store.remote_of("p", operation="fetch") == "https://host-a.example/o/p.git"
+
+
+def test_two_urls_and_no_push_url_refuse_both_directions(tmp_path):
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    subprocess.run(["git", "remote", "add", "origin", "https://host-a.example/o/p.git"], cwd=work, check=True)
+    _config(work, "--add", "remote.origin.url", "https://host-b.example/o/p.git")
+
+    for op in ("fetch", "push"):
+        with pytest.raises(ProjectError, match="Set a single URL"):
+            store.remote_of("p", operation=op)
+    with pytest.raises(ProjectError, match="Set a single URL"):
+        store.push("p")
+    with pytest.raises(ProjectError, match="Set a single URL"):
+        store.pull("p")
+
+
+def test_setting_the_remote_leaves_exactly_one_url(tmp_path):
+    # set-url alone replaces only the first url, so the second would stay a
+    # second destination for every push.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    subprocess.run(["git", "remote", "add", "origin", "https://host-a.example/o/p.git"], cwd=work, check=True)
+    _config(work, "--add", "remote.origin.url", "https://host-b.example/o/p.git")
+
+    store.set_remote(work, "https://github.com/o/new.git")
+    urls = subprocess.run(
+        ["git", "remote", "get-url", "--all", "--push", "origin"],
+        cwd=work, capture_output=True, text=True,
+    ).stdout.split()
+    assert urls == ["https://github.com/o/new.git"]
+    assert store.remote_of("p", operation="push") == "https://github.com/o/new.git"
+
+
 def test_cloning_a_malformed_url_is_a_400(unlocked):
     # Codex P2 on #10: credentials were looked up (parsing the URL) before it
     # was validated, so this was still a 500.
