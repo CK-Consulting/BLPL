@@ -355,8 +355,10 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
         excluded) and with the row's ceiling. The usage must equal the walk,
         the limit must equal the ceiling, and the usage must not exceed it.
         The repository's `.git` gets the same check against its history
-        ID's row. If any of that fails, the POST refuses with a message and
-        no session starts. The admission is what makes every path above safe, including
+        ID's row. Every regular file the walk visits must also have no link
+        outside the tree it is tagged for (`st_nlink` equal to the links the
+        walk found; "Every inode under an ID", below). If any of that fails,
+        the POST refuses with a message and no session starts. The admission is what makes every path above safe, including
         ones nobody has listed yet: whatever recreated the tree, a shell only
         ever starts in one the kernel has just been seen to bound.
       - **A full walk, not a sample.** A sample of paths can miss exactly the
@@ -368,6 +370,74 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
         limited to one per member per project) and once per unseal. A project
         large enough for that to show is large enough that its `git status`
         shows first.
+      - **Every inode under an ID has all its links under that ID.** A
+        project ID belongs to the inode, not to the path, so a file with a
+        second hard link outside the tree is in one project at a time,
+        whichever tagged it last. `components.attach` makes such files
+        today. It runs `git submodule add` with the part repository's
+        absolute path, and git clones a plain local path with its local
+        optimisation: the files under `objects/` are hard links to the part
+        repository's own whenever the two are on one filesystem, and
+        `submodule add` passes no `--no-hardlinks`. In the default layout
+        they are on one filesystem: `data/components/u<id>/` and
+        `data/projects/` both sit under `app/data`. (That is git-clone's
+        documented behaviour for a path rather than a URL. It was not
+        reproduced on this host for this revision; the first test below is
+        what settles it.) Assigning the history ID would then retag inodes
+        the member's component library shares, and that every other project
+        attaching the same part shares too. The kernel moves each such
+        inode's whole usage to the ID that tagged it last, so the other
+        projects' usage falls below what their own walks count, their next
+        admission refuses, and the reassignment that repairs one breaks the
+        next: verification flapping between projects, and per-project
+        accounting that matches none of them.
+        - **No clone makes a link.** `gitcmd` is the one place that clones,
+          and it never asks git to link. `components.attach` records the part
+          as a `file://` URL, for which git uses its transport and writes new
+          files (it ignores the local optimisation for a URL); `projects.clone`
+          passes `--no-hardlinks`, which matters only when the remote is a
+          path, such as another project's directory.
+        - **And any link that appears anyway is broken before tagging.**
+          Prevention depends on every clone being spelled right, and a
+          `submodule update --init` of an entry an older attach recorded as a
+          bare path would still link. `components.update` runs one, and
+          clones when the submodule is not yet initialised in that checkout;
+          `components.sync`, which nothing calls today, would too. So before `quota` assigns or reassigns an ID, the
+          backend walks the tree and counts, for each regular file, the links
+          it found inside it. A file whose `st_nlink` is larger has a link
+          outside, and is copied up: copied to a temporary file in the same
+          directory and renamed over the original, so that the tree holds its
+          own inode with the same bytes. For a store that runs under the
+          store lock, and git objects and packs are immutable once written,
+          so nothing any reader can see changes. For a checkout it runs
+          under `worktree_write`; git tracks content, not inodes, so neither
+          git nor the editor can tell. Links whose ends are all inside the
+          tree are left alone: one inode, one ID, counted once by both the
+          kernel and the walk.
+        - **The kernel stops new ones once the ID is set.** ext4 and XFS
+          both refuse a hard link into a `PROJINHERIT` directory from an
+          inode with a different project ID (`EXDEV`), and git's clone falls
+          back to copying when a link fails, unless `--local` was given
+          explicitly. So the exposure is files linked before the ID was
+          assigned: every attach made before the project's first terminal,
+          and anything a writer outside the app, such as the KiCad desktop
+          (which mounts every project as one tree), links between projects.
+          A seal and unseal also breaks such links, because tar extracts
+          fresh files, but nothing should depend on a seal having happened.
+        - **Git worktrees share by path, not by link.** A member's worktree
+          reaches the common store through its `.git` file and the
+          `commondir` entry, and `git worktree add` writes the checkout's
+          files fresh, so worktrees add no links. Nothing in the backend
+          passes `--reference` or `--shared`, which would share objects
+          through `objects/info/alternates`; an alternates file in a store
+          would put content outside its ID, so verification refuses one too.
+
+        It is not a problem today, before any quota exists. Git writes an
+        object once and never modifies it in place (a repack writes new
+        files and deletes old ones, and a delete removes one link, not the
+        inode), so a hard link between a part repository and a project's
+        module store cannot carry a change from one to the other. The links
+        save disk and cost nothing until something tags inodes by project.
       - The POST also takes a workspace holder for the pending session
         (`term-pending:<session id>`), replaced by the socket's holder when it
         opens and dropped when the reservation expires, so the tree cannot be
@@ -590,14 +660,14 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
       | `projects.py:_commit` (from `commit_checkout`, `commit_all`) | `add -A`, `commit` | index, objects, branch ref, reflog |
       | `projects.py:pull` | `pull --ff-only` | objects from the remote, refs, index, working tree |
       | `projects.py:push` | `push [--set-upstream]` | remote-tracking ref; `--set-upstream` writes `.git/config` |
-      | `projects.py:clone` | `clone` | a new store (no other writer can exist yet) |
+      | `projects.py:clone` | `clone` | a new store (no other writer can exist yet); hard links to the source's objects if the remote is a local path |
       | `projects.py:init_local` | `init`, `commit --allow-empty` | a new store |
       | `projects.py:apply_baseline_gitignore` (from `init_local`) | `rm -r --cached`, `add -A`, `commit` | index, objects, ref: a commit that bypasses `_commit` |
       | `projects.py:_ensure_identity` (from `clone`, `init_local`) | `config user.email`, `config user.name` | `.git/config` |
       | `worktrees.py:ensure` (from `_project_dir`, on a member's first request) | `branch --list`, `worktree add [-b]` | a branch ref, `.git/worktrees/<name>/` with its index, and the whole checkout |
       | `worktrees.py:remove` (member removal) | `worktree remove --force` | deletes the checkout and its `.git/worktrees/` entry |
       | `worktrees.py:prune` | `worktree prune` | `.git/worktrees/` |
-      | `components.py:attach` | `submodule add` (with `protocol.file.allow=always`), `commit` | `.gitmodules`, a clone of the part repository into the common `.git/modules/components/<name>`, index, objects, ref |
+      | `components.py:attach` | `submodule add` (with `protocol.file.allow=always`), `commit` | `.gitmodules`, a clone of the part repository into the common `.git/modules/components/<name>` (today by a bare path, so its objects are hard links to the part repository's; see "Every inode under an ID"), index, objects, ref |
       | `components.py:update` | `submodule update --init --remote`, `add`, `commit` | fetches into `.git/modules/…`, index, objects, ref |
       | `components.py:detach` | `submodule deinit -f`, `rm -f`, `commit`, then `shutil.rmtree(<checkout>/.git/modules/…)` | `.git/config`, index, objects, ref, and deletes a module store directly |
       | `components.py:ensure_part`, `add_document`, `prune_failed` | `init`, `add`, `rm --cached`, `commit` | a part repository in the user's component library: a different store, not the project's |
@@ -673,7 +743,9 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
         live-registry check `worktree_write` uses, not a context variable),
         and raises if not. It passes `-c core.hooksPath=/dev/null
         -c core.fsmonitor=false -c gc.auto=0 -c maintenance.auto=false` and
-        the member's identity on every call.
+        the member's identity on every call, and it gives every clone a
+        source git will not hard-link (a `file://` URL, or `--no-hardlinks`;
+        "Every inode under an ID").
       - The lock itself is taken with `store_write(store, member, reason)`,
         and that scope is where the measured-growth charge is settled: it
         reads the `.git` ID's usage on entry and charges the difference on
@@ -798,7 +870,13 @@ need a person.
   - Creating a terminal session answers **409** while one of the member's runs
     is queued, running or cancelling, with the same wording the editor uses.
   - Starting a run answers **409** while the member has a terminal session
-    open: "close your terminal to run the pipeline".
+    open: "close your terminal to run the pipeline". A session counts as
+    open until the terminal service has confirmed it dead (`pending`,
+    `active` and `reclaiming` rows all block; see "A row stops blocking only
+    when its shell is confirmed dead").
+  - Every other write to the checkout answers **409** while one of the
+    member's runs is in flight, for the same reason a shell cannot open
+    then ("A run excludes the other writers too", under "Other writers").
   - **Atomic, not two checks.** Separate checks race: a session request and a
     run request arriving together can each see the other absent and both
     proceed. `runqueue.enqueue` is itself a query followed by an insert today.
@@ -824,20 +902,18 @@ need a person.
       setting. Admission claims one in a single statement:
       `UPDATE terminal_slot SET session_id = :sid WHERE slot = (SELECT slot
       FROM terminal_slot WHERE <free> ORDER BY slot LIMIT 1 FOR UPDATE SKIP
-      LOCKED) RETURNING slot`, where `<free>` is "`session_id` is null, or
-      names a row that no longer counts" (a `pending` row past its expiry, an
-      `active` row past its heartbeat). No row returned means the host is
-      full, and the POST answers 503 saying so. Two transactions cannot claim
-      the same row, so the cap holds however many requests arrive, without a
-      lock every admission must remember: there are only that many rows to
-      hold.
+      LOCKED) RETURNING slot`, where `<free>` is "`session_id` is null". No
+      row returned means the host is full, and the POST answers 503 saying
+      so. Two transactions cannot claim the same row, so the cap holds
+      however many requests arrive, without a lock every admission must
+      remember: there are only that many rows to hold.
     - **It gives crash cleanup one shape.** A slot is released in the same
-      transaction that closes its session row, for whatever reason it closes.
-      A claim that reclaims a slot from a row that no longer counts closes
-      that row in the same statement's transaction, and the terminal
-      service, finding its row closed on the next heartbeat, kills whatever
-      is left of that session. A crash on either side therefore leaves slots
-      that the next claim reclaims, never a host that stays full.
+      transaction that closes its session row, for whatever reason it closes,
+      and a row closes only once its shell is known to be gone ("A row stops
+      blocking only when its shell is confirmed dead", below). A crash on
+      either side therefore leaves slots that are reclaimed as soon as the
+      terminal service can confirm what it is running, never a host that
+      stays full while the terminal service answers.
     - A second tab attaching to an existing session claims no slot; the slot
       belongs to the session, not to its sockets. The terminal service
       refuses to spawn more PTYs than there are slots, as a second line.
@@ -853,15 +929,91 @@ need a person.
   - **Reservations expire, and the table is reconciled with reality.** The row
     is created in the POST transaction, so that no run can start between the
     preflight and the socket opening. It starts `pending`, with the ticket's
-    expiry. A pending row past its expiry counts for nothing and is swept up.
-    It becomes `active` when the socket opens, and the terminal service
-    heartbeats each live PTY every 30 seconds. An active row without a
-    heartbeat for two minutes is dead: the browser dropped, or either service
-    crashed. Both services reconcile on start: rows whose PTY the terminal
-    service does not report are closed, and session cgroups with no live row
-    are killed and removed. A crash therefore cannot leave a row
-    that blocks runs for ever, or a tab trying to attach to a PTY that no
-    longer exists.
+    expiry. It becomes `active` when the socket opens, and the terminal
+    service heartbeats each live PTY every 30 seconds. A `pending` row past
+    its expiry, or an `active` row without a heartbeat for two minutes, is
+    *presumed* dead: the browser dropped, or either service crashed. Presumed
+    is not enough to stop blocking runs, for the reason that follows.
+  - **A row stops blocking only when its shell is confirmed dead.** An
+    earlier draft let a claim reclaim a slot from a row past its heartbeat by
+    closing that row in the claim's own transaction, and left the shell to
+    be killed when the terminal service next heartbeated and found its row
+    closed. Between those two moments the row was closed, so run admission
+    saw no session and could start the worker, while the shell, and any
+    background job in it, went on writing the same checkout. A late
+    heartbeat is exactly the case where the terminal service is slow or
+    unreachable, so that gap has no bound: under a network partition the
+    shell can outlive its row indefinitely. So:
+    - **`reclaiming` is a blocking state.** A row presumed dead moves to
+      `reclaiming`, not to closed. Run admission treats `pending`, `active`
+      and `reclaiming` alike: any of them for the pair refuses the run. The
+      row keeps its slot. A `reclaiming` row cannot be redeemed, attached to
+      or heartbeated back to life; the only way out is confirmation.
+    - **Confirmation comes from the terminal service, about the cgroup.**
+      The backend asks the service to end the session: the service writes
+      `1` to `session-<id>/cgroup.kill`, waits until `cgroup.events` reports
+      `populated 0`, removes the directory, records the id among those it
+      refuses to spawn, and answers "gone". It gives the same answer, after
+      recording the id, for a session it never spawned. Only on that answer
+      does the backend close the row and release its slot, in one
+      transaction. "Gone" is a statement about every process in the
+      cgroup, background jobs included, not about the PTY or the socket.
+    - **Synchronously where it can be.** The confirmation is asked for at
+      the moment something needs the row out of the way, not left to a
+      later heartbeat. A run enqueue that finds a presumed-dead row for its
+      pair marks it `reclaiming`, commits, asks the terminal service, and
+      on "gone" closes the row and retries the admission, all within the
+      request; a slot claim that finds the host full does the same for
+      presumed-dead rows before answering 503. A sweep every 30 seconds
+      covers rows nobody is waiting on. The kill is milliseconds when the
+      service answers, so the common case costs the person nothing.
+    - **Unreachable means blocked (fail closed).** If the terminal service
+      does not answer, or answers anything but "gone", the row stays
+      `reclaiming` and keeps its slot. A run for that pair is refused with
+      409, "a terminal session for this checkout could not be confirmed
+      closed; the terminal service is not answering", and the host has one
+      slot fewer until it does.
+    - **A restart of the terminal container is itself the confirmation.**
+      Every process a session runs is a descendant of the terminal
+      container's init, so stopping the container kills all of them. The
+      service picks a random epoch when it starts, and every row records the
+      epoch of the service that spawned it. A service that answers with a
+      different epoch than a row's has, by construction, no process left from
+      that row, so the row closes without a kill. Its reconciliation on start
+      then removes the empty session cgroups the old instance left.
+    - **An admin can force-clear, and only for a service that is down.** A
+      server admin may close `reclaiming` rows by hand, after confirming that
+      the terminal container is stopped. The route refuses while the
+      terminal service answers, because then the ordinary confirmation is
+      available and a force-clear could only be wrong. The force-clear is
+      recorded in the activity feed. It exists for a terminal container that
+      cannot be restarted; restarting it is the better answer, because the
+      new epoch confirms by itself.
+    - **The terminal service fences itself.** If it has not reached the
+      backend for the length of the heartbeat timeout, it kills every session
+      it holds, on its own monotonic clock. That is a liveness measure, not
+      the safety one: the backend never closes a row because time passed, only
+      on "gone" or a new epoch. It means a partition that heals finds the
+      sessions already dead, so the first answer after it is "gone" and runs
+      unblock without anyone acting.
+
+    The trade-off is liveness for correctness, and it is deliberate. A
+    terminal service that is down or partitioned blocks runs in the
+    checkouts it had sessions in, and holds their slots, until it answers
+    again, restarts or an admin clears it. The alternative is a run producing
+    artifacts from a checkout a shell was still changing, which is the
+    failure this whole exclusion exists to prevent, and it would be silent:
+    a mixed-version board that looks like any other. A refused run says
+    why, and the self-fence and the epoch make the wait short in every case
+    but a terminal container that is both alive and unreachable.
+
+    Both services reconcile on start: a backend starting asks the terminal
+    service which sessions it runs, and moves every row it does not report to
+    `reclaiming`, which the service then confirms; the terminal service
+    starting kills and removes every session cgroup with no row in
+    `pending` or `active`. A crash therefore cannot leave a row that blocks
+    runs for ever while the terminal service answers, or a tab trying to
+    attach to a PTY that no longer exists.
 
   The Run button says why it is disabled, and the terminal tab offers to close
   the session. It is coarse, but it is correct. Remounting the checkout
@@ -883,11 +1035,105 @@ need a person.
   reason, bound)`, and every mutation of a worktree goes through it. It:
   1. takes the per-(member, project) admission lock, so a session cannot open
      and a run cannot start during the write;
-  2. if a session is open, freezes it (below) and fails the write if the
+  2. under that lock, refuses with 409 if the member has a run for this
+     project that is `queued`, `running` or `cancelling` (below);
+  3. if a session is open, freezes it (below) and fails the write if the
      freeze does not take;
-  3. widens the quota ceiling by the write's bound, and after the write
+  4. widens the quota ceiling by the write's bound, and after the write
      settles it by the measured delta, capped at that bound (see "Limits");
-  4. thaws, in a `finally`, whatever happened.
+  5. thaws, in a `finally`, whatever happened.
+
+  **A run excludes the other writers too, not only the shell.** The
+  admission lock is `pg_advisory_xact_lock`, so it is released when the
+  transaction that took it commits. For a run, that is the enqueue: the lock
+  makes the check for an open session atomic with the insert of the run's
+  row, and is gone a moment later, long before the worker starts. Holding
+  the lock therefore keeps nobody out for the length of a run. An earlier
+  draft stopped there, and so every writer that took the pair lock after
+  the enqueue found no session, proceeded, and changed the checkout under a
+  queued or running stage: an editor save, an upload, a pull, a proposal
+  accept, a component attach, or a tool write in a chat turn's task. The run
+  then produces artifacts from a mix of input versions, which match no
+  commit of the design.
+
+  What lasts for the length of the run is its row. From the enqueue until
+  the worker records `done` or `cancelled`, the run is `queued`, `running`
+  or `cancelling` (a stale `running` row goes back to `queued`, and a stale
+  `cancelling` one to `cancelled`, in `runqueue.reclaim_stale`, so neither
+  leaves a gap or blocks for ever). So step 2 checks the row, under the
+  same pair lock the enqueue takes: the enqueue checks for sessions and
+  inserts under it, the wrapper checks for runs under it, and whichever
+  takes the lock second sees the other. A write and a run cannot both pass.
+  The refusal is 409 with the wording `decide_proposal` already uses: "a
+  pipeline run is in flight in your checkout; try again once it finishes".
+  A tool write in a chat turn gets the same message as its tool error, so
+  the assistant can say why it did not write.
+
+  The key is the pair because the pair is the checkout: `worktrees.path_for`
+  gives each (project, member) exactly one checkout, the owner's being the
+  repository directory, and runs are scoped the same way (`RunActive`).
+  Were two pairs ever to share a checkout, the lock key and the check would
+  both have to move to the checkout path.
+
+  The exceptions, all of them:
+  - **The run's own writes.** The worker writes the run's outputs from
+    another container, inside the run. It never calls `worktree_write`, so
+    there is nothing to exempt; it is the writer the exclusion protects.
+  - **Writes confined to `.blpl/` that do not commit.** Transcript appends,
+    conversation create and archive, chat attachments and
+    `.blpl/references.json` proceed while a run is in flight. No stage reads
+    `.blpl/` (a search of `blpl/` at f277796 finds none; the only `.blpl` it
+    names is `~/.blpl/modules`, a default in the home directory, not the
+    project), so they cannot change a run's inputs. That is a fact about the
+    code today, so the run namespace ("Symlinks", part 2) makes it a fact
+    about the run: it masks the checkout's `.blpl/` with an empty tmpfs, and
+    a stage that started reading it would find nothing rather than a
+    half-written transcript. A write that commits is not exempt even under
+    `.blpl/` (`set_llm_ignore` commits `llm-ignore.json`), because a commit
+    moves `HEAD` and the index, which `provenance` records for the run.
+    Refusing these would make the chat unusable for the length of every
+    run, which is often when someone wants to ask the assistant about it.
+    During a run they take no quota settlement of their own: the run is
+    writing under the same project ID, so a measured delta would include
+    its output. They fall inside the run's own widening and settlement
+    instead, and no shell can be open to profit from that, because runs and
+    sessions exclude each other. The exemption is decided by the wrapper
+    from the paths the write declares (`worktree_write(..., paths=…)`),
+    never by a flag the caller sets: every declared path must be under
+    `.blpl/`, and `projects._commit` raises inside an exempted scope, so a
+    writer cannot claim the exemption and then commit.
+  - **Everything else refuses,** including the writes that touch nothing a
+    stage reads today (`make_folder`, the lifecycle table): a list of which
+    paths each stage reads is a list that the next stage falls off, and the
+    cost of refusing is a retry after the run.
+
+  **This is a live bug today, without a terminal.** Checked against `main`
+  at f277796, only two places look for a run in flight at all:
+  - `main.py:_seal_workspace` refuses to seal while any run in the project
+    is `queued`, `running` or `cancelling`.
+  - `main.py:decide_proposal` refuses to accept a proposal while the
+    member's own run is in flight. Even that is a query followed by the
+    write, with no lock, and `runqueue.enqueue` is itself a query followed
+    by an insert, so an accept and an enqueue arriving together can both
+    pass.
+
+  Nothing else checks. `write_file` (the editor's `PUT`), `upload_files`
+  (which lands files in `datasheets/`, where Stage 2's resolver looks),
+  `git_pull`, `git_commit`, `set_llm_ignore`, `put_board_config` (a
+  board's `project.yaml`, which the pipeline reads), `post_lifecycle`,
+  `make_folder`, `attach_component`, `update_component` and
+  `detach_component` (which add or remove a whole directory under
+  `datasheets/`) all write the member's checkout with a run in flight. So
+  do the agent's tools in the turn's task: `_fetch_datasheet` and
+  `_stage_library_documents` write PDFs into `datasheets/`, `_bulk_route`
+  rewrites a board's `.kicad_pcb`, and `_assembly_files`, `_simulate` and
+  `_extract_module` write their outputs into the checkout, all in
+  `agent/registry.py`,
+  checking only `FilesystemSandbox.check_write`, which knows nothing of
+  runs. The fix does not need the terminal, so it lands in phase 0: the
+  pair lock in `runqueue.enqueue`, and one run check under it that every
+  writer above calls, `decide_proposal`'s included. In phase 2 that check
+  becomes step 2 of `worktree_write`.
 
   **The wrapper is held where the write happens, not around the route that
   caused it.** Some writers write after their request has returned.
@@ -907,7 +1153,8 @@ need a person.
   exception that proves it. The worker is another container and cannot be
   frozen, so runs are excluded instead: the enqueue is the write the admission
   lock covers, and the run's row exists from then until it finishes, so there
-  is no moment when a run executes that a session could have opened in.
+  is no moment when a run executes that a session could have opened in, or
+  that a wrapped write could have landed in (step 2 above).
 
   **The scope cannot be inherited or forged.** An earlier draft had the
   wrapper set a context variable and the guard test it. A task created inside
@@ -1081,18 +1328,24 @@ need a person.
      shared modes in "Lock order" mean an exclusive project or account key
      waits for every admission in flight under it and holds off every new
      one, without naming each member.
-  2. **In that transaction it changes the access first,** then closes every
-     `pending` or `active` row the change covers and releases their slots,
-     and commits. From that commit on, any admission or ticket redemption
-     that takes the lock sees the access gone and refuses, and any row that
-     was already pending is closed, so its ticket cannot be spent.
+  2. **In that transaction it changes the access first,** then moves every
+     `pending` or `active` row the change covers to `reclaiming`, and
+     commits. From that commit on, any admission or ticket redemption that
+     takes the lock sees the access gone and refuses, and a ticket for a row
+     that is no longer `pending` cannot be spent.
   3. **It then terminates what was running,** before the route returns: the
-     socket is closed, every process in each session's cgroup is killed
-     through `cgroup.kill` (killing one process group would miss the shell's
-     other jobs, for the reason given under "Other writers"), the cgroup is
-     removed once empty. Those rows are already closed, so a terminal
-     service that misses the request kills the session at its next
-     heartbeat.
+     socket is closed, and the terminal service is asked to end each
+     session, which kills every process in its cgroup through `cgroup.kill`
+     (killing one process group would miss the shell's other jobs, for the
+     reason given under "Other writers") and answers only once
+     `cgroup.events` reports `populated 0`. Each row closes, and its slot is
+     released, on that answer, as for any reclaim. A terminal service that
+     does not answer leaves the rows `reclaiming`: the access is gone
+     whatever happens, the rows go on blocking runs in those checkouts, and
+     the route reports that the session could not be confirmed closed. For
+     a member removal, `worktrees.remove` waits for the confirmation, and is
+     left to the sweep that gets it, because removing a checkout under a
+     shell that still has it bound removes nothing the shell can see.
 
   The gap that ordering alone leaves is between a redemption marking its row
   `active` and the shell existing: a revocation landing in between would
@@ -1101,7 +1354,12 @@ need a person.
   still holds the locks**, and commits only once the spawn has answered. A
   revocation waiting on the lock therefore finds either no row or a row
   whose shell exists and can be killed. If the commit fails after a spawn,
-  the backend kills the session it just started. As a second line, the
+  the backend kills the session it just started. If the backend dies
+  between the spawn and the commit, the row is still `pending` in the
+  database with a shell behind it; it is presumed dead at its expiry and
+  confirmed like any other ("A row stops blocking only when its shell is
+  confirmed dead"), which is why an expired `pending` row is not simply
+  dropped. As a second line, the
   terminal service remembers the session ids it was told to kill for as long
   as a ticket could be valid, and refuses to spawn one of them.
 
@@ -1552,8 +1810,31 @@ documentation, and anything still on the left with no right-hand side is a bug.
 
 ## Phases
 
-0. **Gaps that exist today.** Four of them, independent of each other and of
+0. **Gaps that exist today.** Five of them, independent of each other and of
    the terminal, so they land first and do not wait for it.
+   - **Writers that ignore a run in flight.** `runqueue.enqueue` takes the
+     per-(member, project) advisory lock before its query; one run check,
+     under the same lock, refuses with 409 every write in the table under
+     "Other writers" while the member's run is `queued`, `running` or
+     `cancelling`, with the non-committing `.blpl/` writes as the one
+     exception; `decide_proposal`'s unlocked check moves into it; the
+     agent's writing tools return the refusal as a tool error. The
+     concurrency tests run on Postgres, where the lock exists. Tests that
+     matter:
+     - With a run queued, then running, then cancelling: an editor save, an
+       upload, a pull, a Git-panel commit, an LLM-ignore change, a board
+       config save, a proposal accept, a component attach, update and
+       detach, and each writing agent tool (`_fetch_datasheet`,
+       `_stage_library_documents`, `_bulk_route`) answer 409 and leave the
+       checkout byte-identical; a transcript append and a chat attachment
+       succeed.
+     - Once the run is `done` or `cancelled`, the same writes succeed.
+     - Another member's run in the same project does not block this
+       member's writes.
+     - A write and an enqueue fired concurrently for the same pair, repeated
+       with the interleaving varied by test hooks, never both succeed.
+     - A writer that declares only `.blpl/` paths and then commits raises,
+       run or no run.
    - **PDF trust by content hash.** This closes the PDF gap (import, clone,
      pull, library staging). The `pdf_verdict` table and its seeding
      migration, read-once hashing in `get_blob` (the bytes hashed are the
@@ -1627,9 +1908,12 @@ documentation, and anything still on the left with no right-hand side is a bug.
      to `.gitmodules` and the submodule path; `snapshot` through a temporary
      index; `detach` removing the module store from the common directory,
      and only when no other checkout uses it; `--no-optional-locks` on every
-     read, `provenance` included. The tests that matter are the component,
-     snapshot, detach and scan tests listed under phase 2, without the
-     charging.
+     read, `provenance` included; clones that never link (`file://` for a
+     component attach, `--no-hardlinks` for `projects.clone`), which costs
+     nothing now and means the quota service later finds few links to break.
+     The tests that matter are the component, snapshot, detach and scan
+     tests listed under phase 2, without the charging, and the clone-link
+     test there.
 1. **Service and sandbox.** Build the `terminal` container, the seccomp
    profile, the delegated cgroup subtree, the `quota` service, the bwrap
    launcher and ticket verification. Test it from the host with `websocat`
@@ -1639,6 +1923,10 @@ documentation, and anything still on the left with no right-hand side is a bug.
    - `curl` fails.
    - A file created in the sandbox is owned by `BLPL_UID` on the host.
    - Killing the socket kills the shell, and its background jobs.
+   - Asked to end a session with a background job running, the service
+     answers "gone" only after `cgroup.events` reports `populated 0`; asked
+     about a session id it never spawned, it answers "gone" and refuses a
+     later spawn of that id.
    - The terminal container can create, freeze and kill a session cgroup as
      `BLPL_UID`, and nothing inside the sandbox can move itself out of it.
    - Freezing a session stops a background job and a pipeline, not just the
@@ -1677,6 +1965,8 @@ documentation, and anything still on the left with no right-hand side is a bug.
 2. **Backend routes.** The session preflight with its 423 flow, the one-time
    ticket, per-session holders, relay, activity and limits (the host cap as
    slot rows), the admission locks and revocation under them, the
+   `reclaiming` state with its confirmation from the terminal service, the
+   service epoch and the self-fence, the
    `worktree_write` wrapper on every writer in the table under "Other
    writers", the quota ceiling and its owner-only raise, project-ID
    reassignment on unseal and verification at admission, the per-project
@@ -1726,6 +2016,25 @@ documentation, and anything still on the left with no right-hand side is a bug.
      is issued.
    - A worktree recreated by `worktrees.ensure`, by an import or by a clone is
      verified at admission like an unsealed one.
+   - Clone links: with the component library and `data/projects` on one
+     filesystem, attaching a part as today (a bare path) leaves files under
+     `.git/modules/` with `st_nlink` > 1, which is the claim this design
+     rests on; attaching through `gitcmd` (`file://`) leaves every file
+     there at `st_nlink` 1, and so does `projects.clone` of a local path.
+   - A project whose module store holds objects hard-linked to the part
+     repository, attached before any quota existed, gets its first
+     `terminal_quota` row: the links are copied up first, the part
+     repository's files keep their own inodes and project ID, and the
+     project's usage equals its walk.
+   - Two projects attaching the same part, each then given a history ID and
+     each admitted in turn, many times: neither admission ever refuses for a
+     usage mismatch, and each project's kernel usage equals its own walk.
+   - A file in a checkout hard-linked to a file in another project (made by
+     a test hook, standing in for the KiCad desktop) is copied up before
+     tagging; one that reappears between the copy-up and the verification
+     makes the admission refuse, naming it. A hard link between two files
+     inside one checkout is left alone and counted once.
+   - A store with an `objects/info/alternates` file fails verification.
    - Only the owner or an admin can raise the allowance, and the raise is in
      the activity feed.
    - Fill the allowance with incompressible data, commit it from the Git
@@ -1802,19 +2111,49 @@ documentation, and anything still on the left with no right-hand side is a bug.
      slots held or PTYs running, and the rest are refused with the host-full
      message.
    - A slot held by a pending row past its expiry, or by an active row past
-     its heartbeat, is reclaimed by the next claim, which closes that row;
-     the terminal service then kills that session at its next heartbeat.
-     Killing the backend mid-POST leaves no slot that stays held.
+     its heartbeat, is reclaimed by the next claim only after the terminal
+     service answers "gone": the row passes through `reclaiming`, and at no
+     point between the presumption and the answer can a run for that pair
+     start. A background job left writing in that session has stopped
+     (`populated 0`) before the row closes.
+   - With the terminal service unreachable (its socket blocked by a test
+     hook), a presumed-dead row stays `reclaiming` and keeps its slot, a run
+     for that pair answers 409 naming the unconfirmed session, and the slot
+     claim answers 503 once the other slots are taken. Unblocking the
+     service lets the next request or the sweep confirm, and the run is
+     admitted.
+   - With the terminal service partitioned from the backend for longer than
+     the heartbeat timeout, it kills its sessions on its own; after the
+     partition heals, the first confirmation answers "gone" with no admin
+     action.
+   - Restarting the terminal container closes every row from the previous
+     epoch without a kill request, and leaves no session cgroup behind.
+   - The admin force-clear refuses while the terminal service answers, and
+     closes `reclaiming` rows when it does not, with an activity entry.
+   - The backend killed between a redemption's spawn and its commit leaves a
+     `pending` row with a live shell behind it; that row blocks runs past
+     its expiry until the terminal service confirms the shell dead.
+     Killing the backend mid-POST leaves no slot that stays held once the
+     terminal service answers.
+   - A revocation while the terminal service is unreachable takes the
+     access away at once, leaves the rows `reclaiming` and blocking runs,
+     and reports that the session could not be confirmed closed.
    - A Git-panel commit while a background shell job is writing sees no file
      change between `git add -A` and the commit.
    - A commit whose freeze times out fails, and the tree is not committed.
    - A stale editor buffer cannot overwrite a shell's change.
    - A POST whose socket never opens stops blocking runs once the ticket
-     expires, and a killed terminal service leaves no live-looking rows after
+     has expired and the terminal service has confirmed no shell exists for
+     it, and a killed terminal service leaves no live-looking rows after
      restart.
    - A planted hook does not run when the Git panel commits.
    - A session cannot open during a run, and a run cannot start while a
      session is open.
+   - With a session open and a run refused, then the session closed and a
+     run queued: an editor save, an upload and a tool write in a chat turn
+     answer 409 for as long as the run is queued, running or cancelling
+     (phase 0's run check, now step 2 of `worktree_write`), and a
+     transcript append goes through without a settlement of its own.
 3. **Frontend tab.** xterm.js, mounted while hidden, resize, the run-in-flight
    banner.
 4. **Reattach after reload** (tmux), and **`released_active`** for PDFs using
@@ -1861,3 +2200,13 @@ documentation, and anything still on the left with no right-hand side is a bug.
     deployment-wide secret to a process parsing a member's project, or moved
     to per-member credentials like provider keys, so that a run carries only
     secrets belonging to the member who started it.
+12. Writes while a run is in flight: refused, with non-committing writes
+    under `.blpl/` (the chat) as the one exception (proposed), or the chat
+    refused as well, which keeps the rule exceptionless at the cost of no
+    conversation for the length of a run. The refusal lands in phase 0
+    either way, because it is a gap today.
+13. A terminal session that cannot be confirmed dead: its row and slot stay
+    blocking until the terminal service answers, restarts or an admin
+    force-clears it (proposed), or a time-based reclaim that unblocks runs
+    after a fixed wait, which is live under a partition and lets a run start
+    beside a shell that may still be writing.
