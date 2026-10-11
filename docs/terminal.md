@@ -56,7 +56,7 @@ This is a new compose service, `terminal`, with these properties:
 - **Built from the backend image**, so kicad-cli, the `blpl` CLI, git and
   Python are all there and match what the pipeline uses. It gets a different
   command, and **none of the backend's secrets**: no database URL, no provider
-  keys, no `server.key`, no ssh mount, no database URL.
+  keys, no `server.key`, no ssh mount.
 - **Mounts only `./data/projects`**, at the same path the backend uses. It does
   not mount `./data` as a whole, so `modules`, `kicad-desktop`, `ssh` and
   `runs.db` are not there to be reached.
