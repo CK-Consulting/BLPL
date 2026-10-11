@@ -1,14 +1,14 @@
 [submodule "kicad-symbols"]
-	path = kicad-symbols
+	path = core/kicad-symbols
 	url = https://gitlab.com/kicad/libraries/kicad-symbols
 [submodule "kicad-footprints"]
-	path = kicad-footprints
+	path = core/kicad-footprints
 	url = https://gitlab.com/kicad/libraries/kicad-footprints
 [submodule "kicad-templates"]
 	path = kicad-templates
 	url = https://gitlab.com/kicad/libraries/kicad-templates
 [submodule "kicad-library-utils"]
-	path = kicad-library-utils
+	path = core/kicad-library-utils
 	url = https://gitlab.com/kicad/libraries/kicad-library-utils
 [submodule "kicad-footprint-generator"]
 	path = kicad-footprint-generator
@@ -20,7 +20,7 @@
 	path = kicad-packages3D-source
 	url = https://gitlab.com/kicad/libraries/kicad-packages3D-source
 [submodule "kicad-happy"]
-	path = kicad-happy
+	path = core/kicad-happy
 	url = https://github.com/CK-Consulting/kicad-happy.git
 [submodule "kicad-ai-assistant"]
 	path = kicad-ai-assistant
