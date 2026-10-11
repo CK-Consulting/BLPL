@@ -234,6 +234,17 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
   projects. The placeholder costs one file for the length of a session and
   keeps those projects usable.
 
+- **A symlink the shell makes is harmless to the shell and not to anyone
+  else.** `/app/data` does not exist inside the sandbox, so
+  `ln -s /app/data/projects/victim/.pipeline .pipeline` makes a link that
+  dangles there and does nothing. The worker and the backend mount all of
+  `./data` at `/app/data`, so for them the same link resolves, and it stays in
+  the checkout after the session ends. The sandbox cannot stop the shell making
+  links; what stops them mattering is the rule that nothing outside the
+  sandbox follows a link out of a checkout. That rule closes a gap that exists
+  today, without a terminal: see [Symlinks that point out of the
+  checkout](#symlinks-that-point-out-of-the-checkout).
+
 - **Quarantined directories are read-only, and that is not what makes a PDF
   safe to open.** `datasheets/` and `references/` are where
   `quarantine.accept_upload` puts files that passed inspection, the malware
@@ -327,7 +338,8 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
         workspace is handed to anyone, the backend asks `quota` to reassign
         every worktree of that project that has a `terminal_quota` row: a walk
         that sets the row's project ID on every inode and `PROJINHERIT` on
-        every directory, and the owner's `.git` its own unlimited ID again. It
+        every directory, and the repository's `.git` its history ID again
+        (see "History is bounded too"). It
         is one ioctl per inode, the same order of work as the extract that
         just ran.
       - **On every session admission,** inside the POST's admission lock and
@@ -338,8 +350,9 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
         inodes, as the kernel counts them, with the owner's `.git` subtree
         excluded) and with the row's ceiling. The usage must equal the walk,
         the limit must equal the ceiling, and the usage must not exceed it.
-        If any of that fails, the POST refuses with a message and no session
-        starts. The admission is what makes every path above safe, including
+        The repository's `.git` gets the same check against its history
+        ID's row. If any of that fails, the POST refuses with a message and
+        no session starts. The admission is what makes every path above safe, including
         ones nobody has listed yet: whatever recreated the tree, a shell only
         ever starts in one the kernel has just been seen to bound.
       - **A full walk, not a sample.** A sample of paths can miss exactly the
@@ -361,10 +374,11 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
       shell's behalf.
     - **The owner's checkout is the repository directory,** so it contains the
       shared `.git`, where every member's commits write objects. The `quota`
-      service gives `.git` a project ID of its own with no limit, so other
-      members' git traffic is never charged to the owner's shell. Inheritance
-      follows the parent directory, so objects created under `.git` keep that
-      ID.
+      service gives `.git` a project ID of its own, so other members' git
+      traffic is never charged to the owner's shell. Inheritance follows the
+      parent directory, so objects created under `.git` keep that ID. That ID
+      is not unlimited, because history is the one place the worktree ceiling
+      cannot see: see "History is bounded too" below.
 
     **App-side writers.** The kernel charges every write in the directory to
     the project ID, whoever makes it: uploads (up to `BLPL_UPLOAD_MAX_MB` per
@@ -418,6 +432,94 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
     can choose. And the arithmetic depends on the wrapper being the only path
     by which the backend writes a worktree, which is the reason for the
     structural guard below.
+
+    **History is bounded too.** The worktree ceiling bounds what is in the
+    checkout, not what has ever been in it. Fill the allowance with
+    incompressible data, commit it from the Git panel, delete it, commit the
+    deletion, fill again: the checkout never passes its ceiling, and every
+    round leaves an allowance's worth of blobs in `.git`, reachable from
+    history, where nothing would limit them. The Git panel is not the only way
+    in. The agent's undo snapshot (`kicad_bridge.snapshot`, taken before an
+    autoroute or a KiCad tool call) writes the whole working tree into the
+    store, untracked shell files included. Three ways to bound it were weighed:
+    - *A per-member history allowance in the database, alone.* Each commit
+      charges the member for what it adds. That attributes the growth to the
+      right person, but it is the app's arithmetic with nothing under it. A
+      path that writes objects and forgets to charge is unbounded again (the
+      snapshot above was nearly missed in this draft), and so is a pull.
+      Measuring growth with `git count-objects -v` before and after does not
+      rescue it: the count includes other members' commits landing at the
+      same time, and a pack or gc in between can shrink the store by more than
+      the commit grew it.
+    - *`.git` under its own limited project ID, alone.* The kernel then bounds
+      every writer of the store, whatever it is: commits, snapshots, pulls and
+      `git gc`'s temporary packs. But it is one budget per project, so one
+      member's shell could spend all of it, and every member's next commit
+      would fail.
+    - **Both (chosen).** The kernel limit is what protects the shared
+      filesystem. The per-member charge decides who spent it, and refuses
+      before the kernel would.
+
+    How each works:
+    - **The repository's `.git` gets a limited project ID** when the first
+      `terminal_quota` row in the project is created. Its ceiling is its size
+      then (measured the same way as a worktree baseline) plus
+      `BLPL_HISTORY_QUOTA_MB`, kept in a `history_quota` row keyed on the
+      project, reassigned on unseal and verified at admission like a
+      worktree's ceiling. Nothing untrusted can write `.git`: it is read-only
+      to every shell, by both paths. So the backend may widen this limit for
+      an operation that must not fail halfway, without a freeze. That
+      operation is `git gc`, which writes the new pack before deleting the old
+      ones and so needs transient room up to the size of what it repacks. The
+      backend passes `-c gc.auto=0` on its own git commands, so a gc never
+      starts inside a commit near the limit. It runs gc itself, under a
+      per-project lock that every store-writing operation also takes, with
+      the limit widened by the store's size, and puts the limit back to the
+      ceiling afterwards. Packing really does shrink the store, and the kernel
+      counts the result, so a gc gives the project's limit room back.
+    - **Each Git-panel commit and each snapshot charges the member** for the
+      blobs it adds, before it writes any. Under the freeze, the backend lists
+      what it will stage (`git status --porcelain -z --untracked-files=all`,
+      or the whole tree for a snapshot) and hashes each file without writing
+      it (`git hash-object --stdin-paths`). It asks the store which of those
+      object IDs it lacks (`git cat-file --batch-check`) and sums those files'
+      sizes. That is the uncompressed size, which is what incompressible data
+      costs on disk, give or take zlib's few bytes of framing per object.
+      Compressible data costs less on disk and is charged the same, which
+      errs the right way. Charges are never refunded when a later gc packs the
+      blobs smaller; the kernel's count is where packing shows. If the charge
+      would take the member past `BLPL_TERMINAL_HISTORY_MB` (kept beside the
+      allowance in the `terminal_quota` row, as `history_used`), the commit is
+      refused with a message naming the allowance, and nothing has been
+      written. Otherwise it proceeds and `history_used` grows by the charge.
+      Deleting the files and committing the deletion charges nothing and
+      refunds nothing, because the blobs are still in history. The charge
+      applies to worktrees with a `terminal_quota` row; a member who has
+      never had a shell is bounded by the project's limit alone.
+    - **The guard is structural here too.** `projects._commit` and
+      `kicad_bridge.snapshot` take the charge themselves, so a new route that
+      commits or snapshots cannot skip it, in the same way they assert the
+      write scope ("Other writers").
+    - **Only commits that stage the working tree are charged to the member.**
+      `_commit_landed_write` stages only the paths its caller wrote ("A write
+      commits only what it wrote" below), so shell bytes cannot ride in on an
+      upload, a proposal or an editor save. Those blobs count against the
+      project's history limit, not the member's terminal allowance.
+    - **Pulls are bounded by the project's limit, and never widen it.** A pull
+      grows the store with whatever the remote carries, which comes from
+      whoever can push there, outside the app's accounting, so it is charged
+      to no member. Settling the limit upwards by a pull's measured growth
+      would reopen the same loop through the remote: push junk, pull, repeat.
+      So a pull that would pass the limit fails with git's own error, and the
+      Pull button reports it with the limit and the owner's option to raise
+      it. A push writes nothing to the local store beyond a remote-tracking
+      ref.
+    - **Raising either is the owner's decision,** in project settings, as with
+      the worktree allowance, and recorded in the activity feed. History is
+      append-only by design: gc reclaims only unreachable objects, and a blob
+      that was committed and then deleted is still reachable. A project at its
+      limit stays there until someone raises it or deliberately rewrites
+      history.
 
     **If the filesystem cannot do this, the terminal refuses to start.** The
     `quota` service reads the limits back from the kernel after setting them,
@@ -537,6 +639,63 @@ need a person.
      settles it by the measured delta, capped at that bound (see "Limits");
   4. thaws, in a `finally`, whatever happened.
 
+  **The wrapper is held where the write happens, not around the route that
+  caused it.** Some writers write after their request has returned.
+  `start_chat_turn` persists the user's message and calls
+  `ChatSessionManager.start`, which schedules `_run` with
+  `asyncio.create_task` and returns. The transcript appends, the library
+  document staging, the distributor fetch, the `pinmap_parse` results, the undo
+  snapshot and autoroute's board write all happen later, in that task.
+  `resolve_approval` only resolves a future: the approved tool runs in the
+  turn's task when it resumes. A wrapper around either route would freeze the
+  shell, write nothing, and thaw before any of it. So each of those operations
+  takes `worktree_write` itself, around that one write, inside the task, when
+  it runs. `start_chat_turn` stays wrapped for the one thing it writes
+  synchronously, the user's message, and `resolve_approval` moves to
+  `NOT_A_WORKTREE_WRITE`. The rule holds for any background work, present or
+  future: whatever writes takes the scope at the moment it writes. Runs are the
+  exception that proves it. The worker is another container and cannot be
+  frozen, so runs are excluded instead: the enqueue is the write the admission
+  lock covers, and the run's row exists from then until it finishes, so there
+  is no moment when a run executes that a session could have opened in.
+
+  **The scope cannot be inherited or forged.** An earlier draft had the
+  wrapper set a context variable and the guard test it. A task created inside
+  the scope copies the context when it is created, so the turn's task would
+  have carried the marker and passed the guard long after the scope had exited
+  and the shell had thawed. `asyncio.to_thread` copies the context into its
+  thread in the same way. So the marker is a token tied to the live lock:
+  - Entering the scope creates a `WriteScope` record in a process-wide
+    registry keyed on the checkout. It holds the owner
+    (`asyncio.current_task()`, or the thread id for synchronous code), a
+    generation number from a counter that only increases, and a `live` flag.
+    The context variable holds only (checkout, generation).
+  - The guard (`projects._commit`, `projects.pull`,
+    `FilesystemSandbox.check_write`, and the beneath-the-checkout open helper
+    under [Symlinks](#symlinks-that-point-out-of-the-checkout)) passes only if
+    the registry has a live scope for that checkout, with that generation,
+    owned by the task or thread that is asking. A copied context fails on the
+    owner, because it runs in a different task. If it runs after the scope
+    has exited, it fails on the registry too: the record is gone, and any new
+    scope has a new generation. Setting the context variable by hand achieves
+    nothing, for the same reasons.
+  - Leaving the scope clears `live` and removes the record before it thaws, in
+    the `finally`.
+  - Work handed to a thread from inside a scope goes through
+    `scope.to_thread(fn)`, which adds that thread to the scope's owners for the
+    length of the call. The scope does not exit while the call is running. If
+    the awaiting task is cancelled, the scope waits, shielded, for the thread
+    to return before it clears and thaws, because a cancelled `to_thread` call
+    keeps running in its thread.
+  - A task that already holds a live scope for the same checkout re-enters it
+    rather than acquiring another, with the inner write's bound added to the
+    outer one. Taking the advisory lock again from a second database session
+    would wait on itself.
+
+  This guards against a writer that forgot the wrapper, which is the mistake
+  that happens. It is not a defence against hostile code in the backend
+  process, which could call anything.
+
   There is no `freeze=False`. A writer that touches only paths the shell
   cannot write (`.blpl/`, `retrieved/`, both bound read-only) cannot race the
   shell over those files, but its settlement measures the whole project ID,
@@ -564,7 +723,8 @@ need a person.
   | `create_conversation`, `append_message`, `archive_conversation`, `delete_failed_message` | `.blpl/conversations/` |
   | `upload_attachments` | `.blpl/` attachment store |
   | `attach_component`, `update_component`, `detach_component` | `components.attach` / `update` / `detach` in the checkout |
-  | `start_chat_turn`, `resolve_approval` | the agent's writing tools during a turn: `_stage_library_documents` in `agent/registry.py` (PDFs into `datasheets/<mpn>/`), the distributor fetch through `quarantine`, `pinmap_parse` results, the turn's transcript |
+  | `start_chat_turn` | the user's message, synchronously, under the route's scope; everything after it is in the turn's task (next row) |
+  | the turn's task (`ChatSessionManager._run`, started by `asyncio.create_task`) | each write under its own scope, taken when it runs: transcript appends, `_stage_library_documents` in `agent/registry.py` (PDFs into `datasheets/<mpn>/`), the distributor fetch through `quarantine`, `pinmap_parse` results, `kicad_bridge.snapshot` and `restore`, autoroute's board write |
   | `run_stage`, `build_release`, `run_review_panel`, `run_pipeline` | a run in the worker; already mutually exclusive with a session (above) |
   | `import_project` | `projects.commit_all` on a project that has just been created, so no session can exist; it goes through the wrapper anyway, for the guard |
 
@@ -584,14 +744,17 @@ need a person.
   ("Decisions wanted").
 
   `git_push`, `stop_run`, `put_project_routing`, `update_policy`,
-  `open_in_kicad_desktop` and the membership routes are POSTs that do not
-  write the worktree (push sends objects, the KiCad route writes its request
-  file elsewhere, the rest change database rows).
+  `open_in_kicad_desktop`, `resolve_approval` and the membership routes are
+  POSTs that do not write the worktree (push sends objects, the KiCad route
+  writes its request file elsewhere, `resolve_approval` resolves a future that
+  the turn's task acts on under its own scopes, the rest change database
+  rows).
 
   **A structural guard, so a new route cannot skip it.**
   - `projects._commit`, which both `commit_checkout` and `commit_all` reach,
-    asserts that a `worktree_write` scope is held for that checkout (a
-    context variable the wrapper sets) and raises if not. Any route that
+    asserts that a live `worktree_write` scope for that checkout is held by
+    the calling task (the registry check above, not merely a context
+    variable) and raises if not. Any route that
     commits without the wrapper fails the first time a test exercises it.
     `projects.pull` does the same.
   - `FilesystemSandbox.check_write`, which every agent tool already calls
@@ -851,6 +1014,134 @@ This depends on the false-positive fix in `pdf_inspect` landing first.
 Otherwise `released_active` would mostly be releasing files that never had
 JavaScript.
 
+## Symlinks that point out of the checkout
+
+**A symlink means a different thing in each container.** Inside the terminal's
+sandbox `/app/data` does not exist, so a link from a checkout to
+`/app/data/projects/victim/.pipeline` dangles and does nothing. The worker and
+the backend both mount all of `./data` at `/app/data`. For them the link
+resolves, and a run then writes into another project's plaintext checkout, as
+the uid that owns it. A relative link (`../victim/.pipeline`) does the same,
+since every checkout sits beside the others under `data/projects`.
+
+**This is a live bug today, without a terminal.** git checks a symlink out as
+a symlink (`core.symlinks` defaults to true on Linux), and nothing in the app
+looks at links that arrive that way:
+- `clone_project` (`projects.clone`) and `git_pull` (`projects.pull`) run a
+  plain `git clone` and `git pull --ff-only`, and bring in whatever links the
+  remote carries, absolute or relative.
+- `blpl/core/cli.py`'s `_project_dir` resolves the project directory itself
+  and then runs `(p / ".pipeline").mkdir(parents=True, exist_ok=True)`, which
+  succeeds on a link to an existing directory. Every stage then writes beneath
+  it with a plain `write_text` (`emitter/sch.py`, `emitter/pcb.py`,
+  `emitter/lib_tables.py` and others), which follows a link in any component
+  of the path. kicad-cli and Freerouting open their own paths in the same way.
+  A committed link at an output path, a link to a *file*, overwrites whatever
+  it points at: another project's design document, `blpl.toml`, or
+  `server.key`, and losing that loses every sealed project.
+- Reads follow links too. A design `*.md` that is a link to a file under
+  `/app/data` is read by Stage 0 in the worker, and the LLM stages send their
+  input to a provider the member configured. That path was not traced end to
+  end, but nothing on it refuses a link.
+- The backend's own fixed-name writers do not check either. `quarantine`
+  writes under `datasheets/`, `references/` and `retrieved/`, and
+  `llm_ignore`, `conversations` and `attachments` write under `.blpl/`, all
+  with plain `mkdir` and write calls. A committed
+  `datasheets -> /app/data/projects/victim/datasheets` sends the next upload
+  there. The routes that take a path from the browser (`_tree_target`,
+  `_editable_file`, `make_folder`) already resolve the path and then check it
+  is inside the project, so they are not affected, apart from the gap between
+  their check and their write.
+- `import_project` is not affected. It writes each accepted entry's bytes as
+  a regular file, so a link inside an uploaded zip arrives as a small text
+  file.
+
+Checked on this host, 2026-10-11, with a scratch repository: a committed
+`.pipeline` link to another directory, cloned with plain `git clone`, then
+`_project_dir` and one `write_text` beneath `.pipeline`, put the file in the
+other directory. A link whose target does not exist makes `_project_dir` fail
+with `FileExistsError` instead. So what matters is a link that resolves where
+the run executes, and that is exactly what a shell can make: dangling in the
+sandbox, live in the worker.
+
+**The fix has three parts, one for each kind of writer.**
+
+1. **Admission refuses links that leave the checkout.** Before a run is
+   enqueued, the backend walks the checkout with `lstat`, never following a
+   link, and answers 409, naming the paths, if any symlink has an absolute
+   target or a target that leaves the checkout. The worker repeats the walk
+   immediately before it spawns the job, because time passes in the queue,
+   and a failure there finishes the run as refused, with the same message.
+   The walk also runs inside `worktree_write` after a clone or a pull, so a
+   link from the remote is reported where it arrived. The pull itself has
+   landed by then; the message names the links, and runs refuse until they
+   are gone.
+   - **Absolute targets are refused outright,** even ones that point inside
+     the checkout. An absolute path names a different place in each
+     container, which is the whole bug.
+   - **A relative target is allowed only if `os.path.realpath` of the link
+     stays inside the checkout.** `realpath` follows links the way the kernel
+     does. A lexical `normpath` would be fooled by `sub/../x` where `sub` is
+     itself a link to `.`: lexically that is inside, but the kernel takes `..`
+     from where `sub` points.
+
+   The walk checks one instant. That is enough against a shell, because runs
+   and sessions exclude each other, but not against every writer (the KiCad
+   desktop is not excluded from anything). So the walk is the early, readable
+   refusal, and the enforcement is part 2.
+
+2. **A run executes in a mount namespace that contains only its checkout.**
+   Two ways were weighed:
+   - *Resolve beneath the checkout in the pipeline's own writes.* Python has no
+     wrapper for `openat2` with `RESOLVE_BENEATH`, but `os.open` takes
+     `dir_fd`. A helper can walk a path one component at a time, opening each
+     with `O_NOFOLLOW | O_DIRECTORY` relative to the last, create the final
+     file with `O_NOFOLLOW | O_CREAT | O_EXCL`, and rename it into place with
+     `os.replace(..., src_dir_fd=..., dst_dir_fd=...)`. That is race-free for
+     each component. But it has to replace every write in `blpl/` and stay
+     that way, which is the list of writers that must remember again. It does
+     not reach kicad-cli, Freerouting or kicad-happy's scripts, which open
+     their own paths, and it does nothing for reads.
+   - **A mount namespace per run (chosen).** The worker starts each job under
+     bwrap, as the terminal does. The checkout is bound read-write at its own
+     path, the repository's `.git` read-only, and the libraries and modules
+     read-only at the paths the worker has them. The app's code and venv are
+     read-only, `/tmp` and Freerouting's work directory are a tmpfs, and the
+     network is shared, because the LLM stages need it. `/app/data` itself is
+     not bound, so `server.key`, `runs.db`, other projects and other members'
+     worktrees do not exist for the run. An absolute link resolves to nothing.
+     A `../` link leaves the checkout into an empty directory that bwrap made.
+     That holds for every process the run starts, kicad-cli and Freerouting
+     included, for reads as well as writes, and for whatever the next stage
+     does. The log is unchanged: the worker writes it from the job's stdout,
+     outside the namespace.
+
+   The costs are real. The worker needs the same user-namespace allowance as
+   the terminal service (the custom seccomp profile, "Decisions wanted"), and
+   the bind list must name every path a stage reads. That is the same list the
+   terminal's sandbox already has to get right, so the two are built from one
+   definition. A stage found to write somewhere unlisted fails with a
+   read-only error, loudly, instead of writing there.
+
+3. **The backend's writes resolve beneath the checkout.** The backend is one
+   process serving every project, so it cannot be put in a namespace per
+   write. Its writes are Python, though, and there are not many, so the
+   beneath helper from part 2's first option works here. `worktree_write`
+   hands its write a descriptor for the checkout root, and every writer opens
+   through it: `quarantine`, `llm_ignore`, `conversations`, `attachments`,
+   `components`, `put_board_config` and the editor save. The routes that
+   already resolve and then check containment move to it too, so there is one
+   rule instead of two. Under `worktree_write` nothing can swap a path
+   component between their check and their write, but the helper does not
+   depend on that. The helper is also one of the places the write-scope guard
+   is asserted ("Other writers").
+
+Setting `core.symlinks=false` on the backend's git commands was considered.
+git would then check links out as plain files holding the target's text. That
+closes clone and pull, but not a shell, not the KiCad desktop and not links
+already in checkouts, and it breaks legitimate links inside a project. It is
+not proposed; the admission walk reports pulled links instead.
+
 ## What has been done over ssh, and where it goes
 
 | job done over ssh | replaced by |
@@ -869,31 +1160,55 @@ documentation, and anything still on the left with no right-hand side is a bug.
 
 ## Phases
 
-0. **PDF trust by content hash.** This closes a gap that exists today
-   (import, clone, pull, library staging), so it lands first and does not
-   wait for the terminal. The `pdf_verdict` table and its seeding migration,
-   read-once hashing in `get_blob` (the bytes hashed are the bytes sent),
-   inspection on first view. Tests that matter:
-   - A PDF written at the project root, in a board directory and in
-     `datasheets/` with no verdict is served as an attachment with `nosniff`,
-     never inline.
-   - The same bytes after an upload releases them are served inline, under
-     any path.
-   - A PDF in a pulled commit, alongside a ledger row in the pulled
-     `quarantine.json` claiming it was released, is still served as an
-     attachment until this backend has inspected it.
-   - A PDF staged by `_stage_library_documents` gets a verdict before it is
-     ever served inline.
-   - First view of a clean PDF records `released` and serves it inline; of
-     one with an OpenAction records `released_active` and does not.
-   - Overwriting a released PDF in place with different bytes of the same
-     length, and restoring its mtime with `touch -d`, gets the new bytes
-     served as an attachment, never inline.
-   - A file swapped for another between the hash and the response (a test
-     hook between the two) does not change what is sent: the body is
-     byte-identical to the buffer that was hashed.
-   - A PDF over `BLPL_UPLOAD_MAX_MB` is served as an attachment with
-     `nosniff`, without being read into memory or inspected.
+0. **Gaps that exist today.** Two of them, independent of each other and of
+   the terminal, so they land first and do not wait for it.
+   - **PDF trust by content hash.** This closes the PDF gap (import, clone,
+     pull, library staging). The `pdf_verdict` table and its seeding
+     migration, read-once hashing in `get_blob` (the bytes hashed are the
+     bytes sent), inspection on first view. Tests that matter:
+     - A PDF written at the project root, in a board directory and in
+       `datasheets/` with no verdict is served as an attachment with `nosniff`,
+       never inline.
+     - The same bytes after an upload releases them are served inline, under
+       any path.
+     - A PDF in a pulled commit, alongside a ledger row in the pulled
+       `quarantine.json` claiming it was released, is still served as an
+       attachment until this backend has inspected it.
+     - A PDF staged by `_stage_library_documents` gets a verdict before it is
+       ever served inline.
+     - First view of a clean PDF records `released` and serves it inline; of
+       one with an OpenAction records `released_active` and does not.
+     - Overwriting a released PDF in place with different bytes of the same
+       length, and restoring its mtime with `touch -d`, gets the new bytes
+       served as an attachment, never inline.
+     - A file swapped for another between the hash and the response (a test
+       hook between the two) does not change what is sent: the body is
+       byte-identical to the buffer that was hashed.
+     - A PDF over `BLPL_UPLOAD_MAX_MB` is served as an attachment with
+       `nosniff`, without being read into memory or inspected.
+   - **Symlinks out of the checkout.** The admission walk in the backend's
+     run enqueue, in the worker before it spawns, and after a clone or a
+     pull; runs in a per-run mount namespace; the backend's writes through
+     the beneath-the-checkout helper. Tests that matter:
+     - A run in a checkout with a committed link to an absolute path, or a
+       relative one that leaves the checkout, is refused at enqueue with the
+       links named, and again by the worker if the link appears after
+       enqueue (a test hook between the two).
+     - A link inside the checkout that stays inside it does not block a run.
+     - `sub/../x`, with `sub` a link to `.`, is refused although it looks
+       inside lexically.
+     - With the admission walk disabled (a test hook), a run whose `.pipeline`
+       is a link to another project's directory, and one whose output file is
+       a link to a file under `/app/data`, writes nothing outside its
+       checkout: the namespace has no such path. The run fails, and the
+       target is byte-identical afterwards.
+     - Inside the run's namespace, `server.key`, `runs.db` and a sibling
+       project do not exist, and the stock libraries are read-only.
+     - A clone or pull that brings in an escaping link reports it, and runs
+       refuse until it is removed.
+     - An upload into a project whose `datasheets` is a link to another
+       project's directory fails, and nothing lands in the other project; so
+       does a transcript append through a linked `.blpl`.
 1. **Service and sandbox.** Build the `terminal` container, the seccomp
    profile, the delegated cgroup subtree, the `quota` service, the bwrap
    launcher and ticket verification. Test it from the host with `websocat`
@@ -915,6 +1230,9 @@ documentation, and anything still on the left with no right-hand side is a bug.
      limit is still set while no session is open.
    - In the owner's checkout, another member's commits (objects under `.git`)
      do not count against the owner's ceiling.
+   - The repository's `.git` carries its own project ID with the
+     `history_quota` ceiling as its kernel limit, and a write under `.git`
+     past it gets `EDQUOT`.
    - On a filesystem without project quotas the session refuses to start.
    - A fork bomb stops at `pids.max` and does not affect the backend.
    - In a plain-directory project, `/home/project/.git` cannot be created,
@@ -929,6 +1247,10 @@ documentation, and anything still on the left with no right-hand side is a bug.
    - A PDF written from the shell at `/home/project/evil.pdf` is served by the
      blob route as an attachment, not inline (phase 0's rule, seen from the
      shell).
+   - A link the shell makes to `/app/data/projects/<other>/.pipeline`
+     dangles inside the sandbox; after the session closes, a run in that
+     checkout is refused at admission and names the link (phase 0's rule, seen
+     from the shell).
    - The service starts with no database reachable.
    - Stage 5 resolves a stock footprint.
 2. **Backend routes.** The session preflight with its 423 flow, the one-time
@@ -944,6 +1266,18 @@ documentation, and anything still on the left with no right-hand side is a bug.
      fails it.
    - Calling `commit_checkout`, `commit_all` or `pull`, or writing through
      `FilesystemSandbox.check_write`, outside a `worktree_write` scope raises.
+   - A write in a task created inside a `worktree_write` scope, but executing
+     after the scope has exited, is refused by the guard, although the task's
+     copied context still carries the marker. So is a write in a thread
+     started with plain `asyncio.to_thread` from inside the scope, and one
+     made after setting the context variable by hand.
+   - A chat turn's transcript appends and tool writes, all made after
+     `start_chat_turn` has returned, each freeze the session (`frozen 1`
+     observed at each write), and none happens while the session is thawed.
+   - Cancelling a task that is awaiting `scope.to_thread` does not thaw the
+     session until the thread has returned.
+   - A nested `worktree_write` for the same checkout in the same task
+     re-enters the scope and does not deadlock.
    - An upload, an LLM-ignore change, a transcript append and a pull each
      freeze a session that has a background job writing, and fail cleanly if
      the freeze times out. No writer can opt out of the freeze.
@@ -970,6 +1304,19 @@ documentation, and anything still on the left with no right-hand side is a bug.
      verified at admission like an unsealed one.
    - Only the owner or an admin can raise the allowance, and the raise is in
      the activity feed.
+   - Fill the allowance with incompressible data, commit it from the Git
+     panel, delete it, commit the deletion, refill and commit: once
+     `history_used` would pass `BLPL_TERMINAL_HISTORY_MB`, the commit is
+     refused, nothing is written to the store, and the store has grown by no
+     more than the allowance plus trees and commits.
+   - An undo snapshot of a tree holding large untracked shell files is charged
+     like a commit, and refused past the allowance.
+   - An upload's commit is charged to the project's history limit, not to the
+     member's terminal allowance.
+   - A pull that would pass the history limit fails with a message, and the
+     limit is unchanged afterwards.
+   - `git gc` near the history limit succeeds, and the kernel limit is back at
+     the ceiling afterwards.
    - The pdf.js byte route answers `application/octet-stream`, attachment,
      `nosniff`, and refuses a request without `X-BLPL-Viewer` or with
      `Sec-Fetch-Mode: navigate`.
@@ -1000,7 +1347,7 @@ documentation, and anything still on the left with no right-hand side is a bug.
 ## Decisions wanted
 
 1. The custom seccomp profile (recommended) or `seccomp:unconfined`, the same as
-   kicad-desktop.
+   kicad-desktop. With item 10 as proposed, the worker needs the same choice.
 2. `systempaths=unconfined` for a private `/proc`, or no `/proc` in the shell.
 3. Shell changes are committed through the Git panel (the shell's git is
    read-only), or also auto-committed at session end.
@@ -1015,9 +1362,17 @@ documentation, and anything still on the left with no right-hand side is a bug.
    attachments until someone asks for an inspection explicitly. First view is
    friendlier; the explicit step keeps a GET from running a scanner.
 8. The terminal allowance defaults (`BLPL_TERMINAL_QUOTA_MB`,
-   `BLPL_TERMINAL_QUOTA_INODES`) and the run widening (`BLPL_RUN_QUOTA_MB`),
-   and whether a server admin as well as the owner may raise a member's
-   allowance.
+   `BLPL_TERMINAL_QUOTA_INODES`), the run widening (`BLPL_RUN_QUOTA_MB`), the
+   history allowances (`BLPL_TERMINAL_HISTORY_MB` per member,
+   `BLPL_HISTORY_QUOTA_MB` per project), and whether a server admin as well as
+   the owner may raise them. Also whether the project history limit should
+   apply to every project, not only those that have had a terminal: repeated
+   uploads, deletes and re-uploads grow history without one today.
 9. The KiCad desktop's projects mount: read-only by default (proposed), with a
    writable mount as a documented deployment choice the write wrapper cannot
    see, or writable as today.
+10. Runs in a per-run mount namespace (proposed), which gives the worker the
+    same user-namespace allowance as the terminal service, or beneath-the-
+    checkout resolution in the pipeline's own writes, which leaves kicad-cli,
+    Freerouting and every read uncovered. Either way the admission walk for
+    symlinks lands first, in phase 0.
