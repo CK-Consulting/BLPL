@@ -2,7 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { FileTree, destinationFor, isHidden, type TreeNode } from "./FileTree";
+import { FileTree, destinationFor, isHidden, moveRefusalForDraft, type TreeNode } from "./FileTree";
 
 const node = (path: string, over: Partial<TreeNode> = {}): TreeNode => ({
   path,
@@ -331,5 +331,18 @@ describe("managing files", () => {
     await user.keyboard("{Enter}");
     expect(opened).toHaveBeenCalledWith(expect.objectContaining({ path: "overview.md" }));
     expect(screen.queryByLabelText(/New name for/)).toBeNull();
+  });
+});
+
+describe("a rename that would hide an unsaved draft", () => {
+  it("is refused only when the open, dirty file stops being a text document", () => {
+    // Codex, PR #17: renaming a dirty .md to .pdf handed the editor no path,
+    // hid the draft, and the next file opened discarded it.
+    expect(moveRefusalForDraft("notes/a.md", true, "notes/a.md", "notes/a.pdf")).toMatch(/unsaved edits/);
+    expect(moveRefusalForDraft("notes/a.md", true, "notes", "docs")).toBeNull();
+    expect(moveRefusalForDraft("notes/a.md", true, "notes/a.md", "notes/b.md")).toBeNull();
+    expect(moveRefusalForDraft("notes/a.md", false, "notes/a.md", "notes/a.pdf")).toBeNull();
+    expect(moveRefusalForDraft("notes/a.md", true, "other.md", "other.pdf")).toBeNull();
+    expect(moveRefusalForDraft("b/a.md", true, "b/a.md", "b/a.kicad_sch")).toMatch(/Save or discard/);
   });
 });

@@ -33,7 +33,7 @@ import { NavActions } from "./components/NavActions";
 import { Chat as ChatIcon, Cog, PlusSquare, Share as ShareIcon } from "./components/Icons";
 import { BoardPanel } from "./components/BoardPanel";
 import { RailToggle, Section } from "./components/Rail";
-import { FileTree, destinationFor, type TreeNode } from "./components/FileTree";
+import { FileTree, destinationFor, moveRefusalForDraft, type TreeNode } from "./components/FileTree";
 import { useResizable } from "./useResizable";
 import { Project, getJSON } from "./api";
 
@@ -71,6 +71,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   // The path the open file had before a rename, so the editor knows a new path
   // is the same document and keeps its unsaved draft instead of reloading.
   const [renamedFrom, setRenamedFrom] = useState<string | null>(null);
+  // Whether the editor holds unsaved work, so the tree can refuse a rename
+  // that would hide it.
+  const [editorDirty, setEditorDirty] = useState(false);
   const [railCollapsed, setRailCollapsed] = useState(
     () => localStorage.getItem("blpl.railCollapsed") === "1",
   );
@@ -233,6 +236,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                           return f;
                         });
                       }}
+                      canMove={(from, to) =>
+                        moveRefusalForDraft(openFile?.path ?? null, editorDirty, from, to)
+                      }
                       onDeleted={(path) =>
                         setOpenFile((f) =>
                           f && (f.path === path || f.path.startsWith(`${path}/`)) ? null : f,
@@ -330,6 +336,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                     openFile && destinationFor(openFile) === "text" ? openFile.path : null
                   }
                   renamedFrom={renamedFrom}
+                  onDirtyChange={setEditorDirty}
                 />
               )}
               {tab === "kicad" && openFile && (

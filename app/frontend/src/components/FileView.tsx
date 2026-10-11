@@ -28,12 +28,16 @@ export function FileView({
   onSaved,
   reloadToken,
   renamedFrom = null,
+  onDirtyChange,
 }: {
   projectId: string;
   /** Project-relative path chosen in the file tree. */
   path: string | null;
   /** The path this same document had before a rename in the file tree. */
   renamedFrom?: string | null;
+  /** Told whenever there starts or stops being unsaved work, so a rename that
+   *  would hide it can be refused before it happens. */
+  onDirtyChange?: (dirty: boolean) => void;
   onSaved: () => void;
   /** Bumped when something outside this pane changes the project — a proposal
    *  applied from the chat, a sync, a run that rewrote a document. */
@@ -56,6 +60,11 @@ export function FileView({
   // sees whether there is unsaved work right now.
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+  // Unmounted, there is no draft left to protect.
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
   // Keyed by project *and* path. Path alone was not enough: switching project
   // with the same filename open left `openedAnother` false, so a dirty editor
   // kept the previous project's draft and Save wrote it into the new project.

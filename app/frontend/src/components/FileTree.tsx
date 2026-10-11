@@ -209,6 +209,7 @@ export function FileTree({
   onChanged,
   onMoved,
   onDeleted,
+  canMove,
 }: {
   projectId: string;
   reloadToken: number;
@@ -220,6 +221,8 @@ export function FileTree({
   onMoved?: (from: string, to: string) => void;
   /** A file or folder is gone; an open file under it should be closed. */
   onDeleted?: (path: string) => void;
+  /** Asked before a move; a sentence refuses it, null lets it go ahead. */
+  canMove?: (from: string, to: string) => string | null;
 }) {
   const [nodes, setNodes] = useState<TreeNode[]>([]);
   const [filter, setFilter] = useState("");
@@ -319,6 +322,11 @@ export function FileTree({
 
   const move = async (from: string, to: string) => {
     setError(null);
+    const refusal = canMove?.(from, to);
+    if (refusal) {
+      setError(refusal);
+      return;
+    }
     try {
       await postJSON(`/api/projects/${projectId}/files/move`, { path: from, to });
       onMoved?.(from, to);
@@ -698,6 +706,26 @@ export function destinationFor(node: TreeNode): "text" | "kicad" | "browser" {
   // LICENSE, Makefile. Guessing wrong here costs a wasted tab, not data.
   if (!name.includes(".") && (node.bytes ?? 0) < 512 * 1024) return "text";
   return "browser";
+}
+
+/**
+ * Why a move must wait, or null. The editor keeps an unsaved draft across a
+ * rename only while the file stays a text document: renamed to .pdf or
+ * .kicad_sch, the editor is handed no path, the draft is hidden, and the next
+ * file opened discards it. Only the older on-disk contents would have moved.
+ */
+export function moveRefusalForDraft(
+  openPath: string | null,
+  dirty: boolean,
+  from: string,
+  to: string,
+): string | null {
+  if (!dirty || !openPath) return null;
+  if (openPath !== from && !openPath.startsWith(`${from}/`)) return null;
+  const moved = to + openPath.slice(from.length);
+  const name = moved.split("/").pop() ?? moved;
+  if (destinationFor({ name } as TreeNode) === "text") return null;
+  return `${openPath} has unsaved edits, and as ${name} it would no longer open in the editor. Save or discard them first.`;
 }
 
 /** Kept for callers that only ask the older question. */
