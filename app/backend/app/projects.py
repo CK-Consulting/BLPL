@@ -23,16 +23,25 @@ ever passes through application code or lands in a log line.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class ProjectError(RuntimeError):
     """A git or filesystem operation on a project failed. Carries the git stderr
     so the UI can show what actually went wrong instead of a generic 500."""
+
+
+# What a pull or push says when another one, or a change of remote, held the
+# repository's origin lock for longer than it would wait (see _remote_lock).
+_BUSY = "another pull, push or change of remote is in progress for this project; try again"
 
 
 # Paths that are always changing and are never work anyone would lose: the
@@ -108,6 +117,17 @@ class GitStatus:
     #: which is a poor property for a control that pushes.
     remote_name: str = ""
     remote_url: str = ""
+    #: The branch has a remote to go to but has never been pushed there (no
+    #: upstream). `ahead` then counts the commits origin does not have, and the
+    #: push button must stay live even with nothing new to commit: adding a
+    #: remote to a clean local project is exactly this state, and the first
+    #: push is the only way its history gets anywhere.
+    unpublished: bool = False
+    #: Why pull and push would refuse origin as configured (several URLs, a
+    #: fetch URL and a different push URL, a token in the URL), or "". When
+    #: set, `ahead`, `behind` and `unpublished` are not measured: origin's
+    #: tracking ref is no evidence of what the push destination holds.
+    remote_problem: str = ""
 
 
 def _redact_url(url: str) -> str:
@@ -120,12 +140,188 @@ def _redact_url(url: str) -> str:
     made from one. The userinfo is replaced rather than dropped so the URL still
     reads as authenticated, which is information worth keeping.
     """
-    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]+)@(.*)$", url)
-    if not match:
-        return url
-    scheme, userinfo, rest = match.groups()
-    user = userinfo.split(":", 1)[0]
-    return f"{scheme}{user}:***@{rest}" if ":" in userinfo else f"{scheme}{user}@{rest}"
+    # Up to the *last* @ before the path: a password may itself contain an @
+    # (`user:tok@en@host`), and stopping at the first one left its tail on
+    # screen (Codex, PR #10).
+    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/]+)@(.*)$", url)
+    if match:
+        scheme, userinfo, rest = match.groups()
+        user = userinfo.split(":", 1)[0]
+        url = f"{scheme}{user}:***@{rest}" if ":" in userinfo else f"{scheme}{user}@{rest}"
+    # Then the query and fragment, the other place a token sits
+    # (`...repo.git?access_token=...`) and which a remote never needs (Codex,
+    # PR #10). check_remote_url refuses them; an origin configured before that,
+    # or by hand, can still have one, and the status panel shows origin.
+    return _strip_query(url)
+
+
+# Any URL's password, wherever it sits in a longer string: an argv joined into
+# an error, or git's own stderr, which quotes the URL it could not reach.
+#
+# Purely textual, so it works on a URL urlsplit refuses to parse — which is
+# exactly the input a validation error quotes back (Codex, PR #10:
+# `https://user:token@[bad/repo` raised in urlsplit, and the message carried
+# the token). The password runs to the *last* @ before the path or whitespace,
+# so `user:tok@en@host` loses all of `tok@en`, not just `tok`.
+_URL_PASSWORD = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:]*):[^/\s]*@")
+
+
+# Any URL's query string or fragment, likewise wherever it sits. A token rides
+# there as easily as in the userinfo — `https://host/repo.git?access_token=...`
+# has no password for the pattern above to find (Codex, PR #10). Runs to the
+# end of the URL: whitespace or a quote, since git's stderr quotes the URL it
+# could not reach ('https://host/x?tok=...': ...) and the quote is not the token.
+_URL_QUERY = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s?#'\"]*)[?#][^\s'\"]*")
+
+
+def _strip_query(url: str) -> str:
+    """One URL with its query string and fragment removed.
+
+    The scp-like form (`git@host:path?x`) has no scheme for _URL_QUERY to
+    anchor on, so for a lone URL anything from the first ? or # goes.
+    """
+    if "://" in url:
+        return _URL_QUERY.sub(r"\1", url)
+    return re.split(r"[?#]", url, maxsplit=1)[0]
+
+
+def _redact_text(text: str) -> str:
+    """``text`` with the password, query and fragment of every URL in it
+    removed. Password first: the other way round, a ? inside a password
+    (`https://u:p?x@host/`) cut the URL short and left the password's head."""
+    return _URL_QUERY.sub(r"\1", _URL_PASSWORD.sub(r"\1:***@", text))
+
+
+def _carries_query(url: str) -> bool:
+    """A remote URL with a query string or fragment, local paths aside.
+
+    No git transport needs either: smart HTTP appends its own query
+    (`/info/refs?service=...`), and ssh and the scp-like form have no notion
+    of one. So what a pasted one is likely to carry is what Codex found on
+    PR #10 — `?access_token=...` — and refusing the shape outright is sturdier
+    than a list of parameter names that would always be one short. The
+    scp-like `host:path?x` is refused too: a ? is legal in a path there in
+    principle, but a repository named that way is far less likely than a
+    token, and the same URL written as ssh:// is refused anyway.
+
+    A local path (``/...``, test fixtures only) is exempt: a ? or # in a
+    directory name is just a name, and no token travels with it.
+    """
+    return not url.startswith("/") and ("?" in url or "#" in url)
+
+
+_QUERY_REFUSAL = (
+    "this URL has a query string or fragment (after ? or #). A git remote "
+    "needs neither, and a token can ride in one — remove it, and add any "
+    "credential under Account & app settings → Git endpoints/accounts"
+)
+
+
+def _carries_password(url: str) -> bool:
+    if "://" not in url:
+        return False
+    try:
+        return urlsplit(url).password is not None
+    except ValueError:
+        # Unparseable: the redacting pattern is the judge, so a malformed URL
+        # with a token in it is still refused rather than handed to git.
+        return _redact_text(url) != url
+
+
+# Remote transports git may use for anything a user names. Read by both the URL
+# check below and git itself (GIT_ALLOW_PROTOCOL), so the two cannot disagree.
+# `file` is for the test suite's local bare repositories and nothing else: a
+# deployment that allowed it would let any signed-in user clone another
+# project's repository off the server's own disk into a project they own.
+_DEFAULT_PROTOCOLS = "https:ssh"
+
+
+def allowed_protocols() -> list[str]:
+    raw = os.environ.get("BLPL_GIT_ALLOWED_PROTOCOLS", _DEFAULT_PROTOCOLS)
+    return [p.strip().lower() for p in raw.split(":") if p.strip()]
+
+
+def _net_env(env: dict[str, str] | None) -> dict[str, str]:
+    """Environment for a git command that talks to a remote."""
+    return {**(env or {}), "GIT_ALLOW_PROTOCOL": ":".join(allowed_protocols())}
+
+
+_SCP_LIKE = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9.-]+):(?P<path>[^:].*)$")
+
+
+def check_remote_url(url: str) -> str:
+    """The remote URL, if it is one a user may point a project at. Else raise.
+
+    Accepted: https://host/..., ssh://host/..., and git's user@host:path. Not:
+    local paths and file:// (another repository on this server's disk — the
+    clone route copied them for any signed-in user), transport helpers such as
+    ext::, and anything git could read as an option. `file` is accepted only
+    when BLPL_GIT_ALLOWED_PROTOCOLS includes it, which the test suite does.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        raise ProjectError("a remote URL is required")
+    # None of the refusals below quotes the URL back. They used to, redacted —
+    # but redaction is a pattern, and a malformed URL is exactly the input a
+    # pattern was not written for: `https://user:tok en@host/x` has whitespace
+    # inside its userinfo, the password pattern cannot cross it, and the 400
+    # handed the token back (Codex, PR #10). The user has the URL they typed;
+    # what they need from the error is what is wrong with it.
+    if raw.startswith("-"):
+        raise ProjectError("a remote URL cannot begin with -")
+    if any(c.isspace() or ord(c) < 32 for c in raw):
+        raise ProjectError("a remote URL cannot contain spaces or control characters")
+    allowed = allowed_protocols()
+    if "://" in raw:
+        scheme = raw.split("://", 1)[0].lower()
+        if scheme not in allowed:
+            # Named only when it is shaped like a scheme: everything before the
+            # first :// can be anything at all, a pasted credential included.
+            named = (
+                f"{scheme}:// remotes" if re.fullmatch(r"[a-z][a-z0-9+.-]*", scheme)
+                else "remotes of that kind"
+            )
+            raise ProjectError(f"{named} are not allowed here; use an https:// or ssh:// URL")
+        try:
+            host = urlsplit(raw).hostname
+        except ValueError as exc:
+            # urlsplit raises on malformed input such as an unclosed IPv6
+            # bracket — `https://[bad/repo` — which would otherwise surface as
+            # a 500 from a route that only expects ProjectError. The parser's
+            # own message is left out: some of urllib's quote the netloc, which
+            # is where a token sits, with no scheme for _redact_text to anchor
+            # on (Codex, PR #10).
+            raise ProjectError(
+                "this URL could not be parsed — check any brackets around an IPv6 address"
+            ) from exc
+        if scheme != "file" and not host:
+            raise ProjectError("this URL names no host")
+        if _carries_query(raw):
+            # Not quoted, even stripped: it would tell the user nothing they
+            # do not know, and the query is the secret part.
+            raise ProjectError(_QUERY_REFUSAL)
+        if urlsplit(raw).password is not None:
+            # A token in the URL would be written to .git/config in plaintext
+            # and kept there; display-time redaction does nothing about that.
+            # Credentials belong in the per-user git store, leased per command.
+            raise ProjectError(
+                "this URL carries a password or token — remove it, and add the "
+                "credential under Account & app settings → Git endpoints/accounts"
+            )
+        return raw
+    if "::" in raw:
+        raise ProjectError("git transport helpers (such as ext::) are not allowed")
+    m = _SCP_LIKE.match(raw)
+    if m and "ssh" in allowed:
+        if _carries_query(raw):
+            raise ProjectError(_QUERY_REFUSAL)
+        return raw
+    if raw.startswith("/") and "file" in allowed:
+        return raw
+    raise ProjectError(
+        "this is not a remote URL — use https://host/owner/repo.git "
+        "or git@host:owner/repo.git (local paths are not allowed)"
+    )
 
 
 class Projects:
@@ -171,7 +367,13 @@ class Projects:
         dest = self.project_dir(name)
         if dest.exists():
             raise ProjectError(f"project {name!r} already exists at {dest}")
-        self._git(self.root, "clone", "--branch", branch, remote, dest.name, env=env)
+        remote = check_remote_url(remote)
+        if branch.startswith("-"):
+            raise ProjectError(f"{branch!r} is not a branch name")
+        # `--` so nothing user-supplied can be read as an option to clone.
+        self._git(
+            self.root, "clone", "--branch", branch, "--", remote, dest.name, env=_net_env(env)
+        )
         self._ensure_identity(dest)
         return dest
 
@@ -249,14 +451,268 @@ class Projects:
 
     # -- sync ----------------------------------------------------------------
 
-    def remote_of(self, name: str) -> str:
-        """The origin URL, or "" for a local-only project. For credential
-        matching — which is why a missing remote is an empty answer, not an
-        error: no remote means no credential could apply."""
-        return self._git_allow_fail(self.project_dir(name), "remote", "get-url", "origin")
+    # The project's remote is `origin`, always, and every command that talks
+    # to it names it. Resolving "the" remote the way git does — the branch's
+    # upstream, then branch.<b>.pushRemote, remote.pushDefault, push URLs, and
+    # each member worktree's own branch — took three review rounds and still
+    # left ways for the remote shown, the host a credential was leased for and
+    # the place a push actually went to disagree. Naming origin explicitly
+    # makes them one thing, for the owner and every member alike.
+    REMOTE = "origin"
+
+    def _primary_remote(self, d: Path) -> str | None:
+        """`origin` if the checkout has it, else None (local-only)."""
+        return self.REMOTE if self.REMOTE in self._git(d, "remote").split() else None
+
+    # How long each side waits for the other under _remote_lock. A pull or
+    # push waits out whatever holds it — set_remote is a few config writes, and
+    # another push is bounded by _git's own 300 s timeout. Changing the remote
+    # gives up sooner, with a sentence, rather than hang the settings dialog
+    # behind somebody's slow push.
+    NETWORK_LOCK_WAIT = 330.0
+    SET_REMOTE_LOCK_WAIT = 30.0
+
+    @contextlib.contextmanager
+    def _remote_lock(self, d: Path, wait: float, busy: str):
+        """Hold the repository's origin lock: one change of origin or one
+        network operation at a time.
+
+        A push validated origin's URL, pushed to it, then recreated
+        refs/remotes/origin/<branch> and the upstream. An owner changing the
+        remote while the push was in flight had set_remote clear those refs in
+        between, and the push wrote them back — so status measured the branch
+        as published, ahead 0, against a new repository holding none of it,
+        and the clean tree disabled the push that would have published it
+        (Codex, PR #10). The change and the whole operation, bookkeeping
+        included, now exclude each other.
+
+        Keyed on git's common directory, not the checkout: origin's config and
+        its tracking refs are shared by every member's worktree, so a member's
+        push races the owner's change exactly as the owner's own would. `flock`
+        on a file there for the reasons in workspace._project_lock — request
+        threads, uvicorn workers and containers sharing the bind mount all
+        exclude each other, because each call opens its own descriptor.
+        """
+        common = self._git(d, "rev-parse", "--git-common-dir").strip()
+        # Relative to the checkout when git answers relatively (".git").
+        lock_path = Path(d) / common / "blpl-remote.lock"
+        with open(lock_path, "a") as fh:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ProjectError(busy) from None
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+    def set_remote(self, checkout: Path, url: str) -> str:
+        """Point a project's `origin` at a URL, adding origin if there is none.
+
+        Set in the repository's config, so every member's worktree — which
+        shares that config — sees the same remote. Waits for a pull or push in
+        progress to finish first (see _remote_lock).
+        """
+        url = check_remote_url(url)
+        d = self._checkout("", checkout)
+        with self._remote_lock(
+            d, self.SET_REMOTE_LOCK_WAIT,
+            "a pull or push is in progress for this project; "
+            "change the remote once it has finished",
+        ):
+            return self._set_remote_locked(d, url)
+
+    def _set_remote_locked(self, d: Path, url: str) -> str:
+        if self._primary_remote(d):
+            # Both directions, every URL. Read without --push, an origin that
+            # fetched from this same URL but pushed to a separate one looked
+            # unchanged, though dropping the pushurl below moves every push to
+            # a new destination — and origin/<branch> from the old one then
+            # reported it as already published.
+            previous = {
+                u.strip()
+                for args in (("--all",), ("--all", "--push"))
+                for u in self._git_allow_fail(
+                    d, "remote", "get-url", *args, self.REMOTE
+                ).splitlines()
+                if u.strip()
+            }
+            # --unset-all first: `set-url` replaces only the first of several
+            # `url` values, and a second one would stay a second destination
+            # for every push (see _single_destination).
+            self._git_allow_fail(d, "config", "--unset-all", f"remote.{self.REMOTE}.url")
+            self._git(d, "config", f"remote.{self.REMOTE}.url", url)
+            # A separate pushurl would keep pushes going to the old place while
+            # the panel showed the new one. Dropped, so pushes use `url`.
+            self._git_allow_fail(d, "config", "--unset-all", f"remote.{self.REMOTE}.pushurl")
+            if previous != {url}:
+                self._forget_remote_state(d)
+        else:
+            self._git(d, "remote", "add", self.REMOTE, url)
+        return url
+
+    def _forget_remote_state(self, d: Path) -> None:
+        """Drop what the repository remembers about the old origin.
+
+        refs/remotes/origin/* and the branches tracking origin describe the
+        repository origin used to name. Kept, a move from a pushed repository
+        to an empty one read as "published, nothing ahead" against the old
+        refs, and the push button stayed disabled while the new remote had none
+        of the history. Every branch is covered, not only this checkout's,
+        because members' worktrees share the one repository config.
+        """
+        refs = self._git_allow_fail(
+            d, "for-each-ref", "--format=%(refname)", f"refs/remotes/{self.REMOTE}/"
+        ).split()
+        for ref in refs:
+            self._git_allow_fail(d, "update-ref", "-d", ref)
+        tracking = self._git_allow_fail(
+            d, "config", "--get-regexp", r"^branch\..*\.remote$"
+        ).splitlines()
+        for line in tracking:
+            key, _, remote = line.partition(" ")
+            if remote.strip() != self.REMOTE:
+                continue
+            branch = key[len("branch."):-len(".remote")]
+            self._git_allow_fail(d, "config", "--unset", f"branch.{branch}.remote")
+            self._git_allow_fail(d, "config", "--unset", f"branch.{branch}.merge")
+
+    def _single_destination(self, d: Path, operation: str) -> str:
+        """The one URL ``operation`` talks to on origin, or a refusal.
+
+        `git remote get-url` answers with the first URL only, while `git push`
+        contacts every configured push URL (and with no pushurl, every `url`).
+        A credential leased for the first host was then offered by the helper
+        to the second, leaking that token and usually failing the push there.
+        Rather than lease per host, one destination per operation is required:
+        it is the only shape Project settings ever writes, and a hand-edited
+        config with several is something to fix, not to guess about.
+        """
+        urls = self._origin_urls(d, operation)
+        if len(urls) > 1:
+            # Redacted: the setter refuses a URL with a token in it, but a
+            # repository configured before that, or edited by hand, can still
+            # hold one, and this sentence goes to any member who presses Pull.
+            raise ProjectError(
+                f"origin has {len(urls)} {operation} URLs "
+                f"({', '.join(_redact_url(u) for u in urls)}), and a "
+                f"{operation} would go to all of them with a credential meant for one. "
+                "Set a single URL in Project settings → Git."
+            )
+        if urls and _carries_password(urls[0]):
+            # Same history as above. Used, the token went onto git's command
+            # line — readable from /proc by anything on the host — and into the
+            # error any member sees when the operation fails. The URL is not
+            # repeated, even redacted: the fix is the same whatever it says.
+            raise ProjectError(
+                f"origin's {operation} URL carries a password or token, which "
+                "BLPL will not send. Set the URL again without it in Project "
+                "settings → Git, and add the credential under Account & app "
+                "settings → Git endpoints/accounts."
+            )
+        if urls and _carries_query(urls[0]):
+            # The same history, for the other place a token sits: the setter
+            # now refuses `?access_token=...`, but an origin configured before
+            # it still went into git's argv and, on failure, into the error a
+            # member sees (Codex, PR #10).
+            raise ProjectError(
+                f"origin's {operation} URL has a query string or fragment, which "
+                "can carry a token and which BLPL will not send. Set the URL "
+                "again without it in Project settings → Git."
+            )
+        # One destination per *remote*, not only per operation. origin fetching
+        # from A with a pushurl for B left refs/remotes/origin/<branch>
+        # describing A while every push went to B, so with A already holding
+        # HEAD and B empty, status reported "published, nothing ahead", Commit +
+        # Push stayed disabled, and the branch could never reach B through the
+        # UI (Codex, PR #10). Refused rather than tracked separately (a
+        # BLPL-owned "published to B" ref): set_remote writes one URL and drops
+        # pushurl, so a split origin is only ever a hand edit, and refusing it
+        # makes the tracking ref and the push destination the same repository
+        # by construction instead of keeping two bookkeeping systems agreeing.
+        # Compared as git resolves them, so a pushInsteadOf rewriting the URL
+        # counts too: git applies it to the URL a push is handed as well.
+        #
+        # Only against a single URL on the other side. Several there is that
+        # operation's own refusal above; a fetch from the one url stays
+        # harmless while every push is refused.
+        other = self._origin_urls(d, "fetch" if operation == "push" else "push")
+        if urls and len(other) == 1 and other[0] != urls[0]:
+            fetch, push = (urls[0], other[0]) if operation == "fetch" else (other[0], urls[0])
+            raise ProjectError(
+                f"origin fetches from {_redact_url(fetch)} but pushes to "
+                f"{_redact_url(push)}, so BLPL cannot tell what has been "
+                "published where. Use Change remote… in Project settings → Git "
+                "to set the one URL both should use."
+            )
+        return urls[0] if urls else ""
+
+    def _origin_urls(self, d: Path, operation: str) -> list[str]:
+        """Every URL git uses on origin for ``operation``, as git resolves
+        them: for a push, the pushurls when any are set, else the urls."""
+        args = ["remote", "get-url", "--all"] + (["--push"] if operation == "push" else [])
+        return list(dict.fromkeys(
+            u.strip() for u in self._git_allow_fail(d, *args, self.REMOTE).splitlines() if u.strip()
+        ))
+
+    def remote_of(
+        self, name: str, *, operation: str, checkout: Path | None = None
+    ) -> str:
+        """The URL ``operation`` ("fetch" or "push") talks to, or "" for a
+        local-only project. For credential matching — which is why a missing
+        remote is an empty answer, not an error: no remote means no credential
+        could apply.
+
+        Required, not defaulted, because the two can be different hosts. A
+        remote with a fetch URL on one host and a pushurl on another answered
+        with the push URL for everything, so a pull fetched from the first host
+        while the credential helper offered it the second host's token —
+        leaking that token and failing the pull.
+
+        Pass the checkout the operation runs in. A member's worktree branch can
+        resolve a different remote from the owner's, and a credential chosen
+        for the owner's remote would be offered to the member's host.
+        """
+        if operation not in ("fetch", "push"):
+            raise ValueError(f"operation must be 'fetch' or 'push', not {operation!r}")
+        d = checkout if checkout is not None else self.project_dir(name)
+        remote = self._primary_remote(d) if (d / ".git").exists() else None
+        if not remote:
+            return ""
+        # The URL git itself connects to for this operation: for a push,
+        # pushurl when one is set, else url; for a fetch, always url. Refused
+        # when there is more than one, before any credential is leased.
+        return self._single_destination(d, operation)
+
+    def _destination(self, d: Path, operation: str, url: str | None) -> str:
+        """The URL to run ``operation`` against: the one the caller leased a
+        credential for, provided origin still says the same.
+
+        The route resolves the URL, leases a credential for its host, then calls
+        pull or push. Naming `origin` to git at that point re-read the config,
+        so an owner changing the remote in between sent the member's token for
+        host A to host B. Git is now handed this exact URL, and a URL that no
+        longer matches origin is refused rather than used.
+        """
+        dest = self._single_destination(d, operation)
+        if url is not None and url != dest:
+            raise ProjectError(
+                "the project's remote changed while this was starting; try again"
+            )
+        return dest
 
     def pull(
-        self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None
+        self,
+        name: str,
+        *,
+        env: dict[str, str] | None = None,
+        checkout: Path | None = None,
+        url: str | None = None,
     ) -> str:
         """Fast-forward the working copy from its remote. Returns git's output.
 
@@ -265,12 +721,45 @@ class Projects:
         app papers over. --ff-only turns divergence into a clear error.
         """
         d = self._checkout(name, checkout)
-        if self._has_remote(d) and not self._upstream(d):
-            branch = self._git(d, "branch", "--show-current").strip()
+        # Held from validating the URL to recording the upstream, so origin
+        # cannot change in between (see _remote_lock).
+        with self._remote_lock(d, self.NETWORK_LOCK_WAIT, _BUSY):
+            return self._pull_locked(d, url, env)
+
+    def _pull_locked(self, d: Path, url: str | None, env: dict[str, str] | None) -> str:
+        if not self._primary_remote(d):
+            raise ProjectError("this project has no remote to pull from; add one in project settings")
+        dest = self._destination(d, "fetch", url)
+        branch = self._git(d, "branch", "--show-current").strip()
+        if not branch:
+            raise ProjectError("the checkout is not on a branch; there is nothing to pull into")
+        # No upstream requirement: the fetch below names the URL and the branch
+        # itself, so the upstream decides nothing. Requiring one refused every
+        # pull after "Change remote…" (which forgets the upstream, see
+        # _forget_remote_state) even when the new origin held a plain
+        # fast-forward of HEAD, and Commit + Push was then rejected as behind —
+        # no way left to synchronise through the UI (Codex, PR #10). Whether
+        # origin has the branch is asked instead, so its absence is a sentence
+        # rather than fetch's "couldn't find remote ref".
+        heads = self._git(
+            d, "ls-remote", "--heads", "--", dest, f"refs/heads/{branch}", env=_net_env(env)
+        )
+        if not heads.strip():
             raise ProjectError(
-                f"branch {branch!r} has no upstream to pull from yet; push it first"
+                f"origin ({_redact_url(dest)}) has no branch {branch!r} to pull from; "
+                "push to publish it there"
             )
-        return self._git(d, "pull", "--ff-only", env=env)
+        # From the resolved URL, into origin's tracking ref and then the branch
+        # of the same name. The URL, not the name: see _destination.
+        tracking = f"refs/remotes/{self.REMOTE}/{branch}"
+        out = self._git(
+            d, "fetch", "--", dest, f"+refs/heads/{branch}:{tracking}", env=_net_env(env)
+        )
+        out += self._git(d, "merge", "--ff-only", tracking)
+        # The fetch just wrote origin's tracking ref; record the upstream beside
+        # it, as push does, so plain git in this checkout agrees with the panel.
+        self._track_origin(d, branch, dest, "fetch")
+        return out
 
     def commit_all(self, name: str, message: str) -> str | None:
         """Stage everything and commit. Returns the commit output, or None if the
@@ -292,14 +781,6 @@ class Projects:
         if not (d / ".git").exists():
             raise ProjectError(f"{d.name!r} is not a git checkout")
         return d
-
-    def _has_remote(self, d: Path) -> bool:
-        return bool(self._git(d, "remote").strip())
-
-    def _upstream(self, d: Path) -> str:
-        return self._git_allow_fail(
-            d, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"
-        ).strip()
 
     def commit_checkout(self, checkout: Path, message: str) -> str | None:
         """``commit_all`` for a checkout the caller already resolved.
@@ -323,17 +804,57 @@ class Projects:
         return self._git(d, "commit", "-m", message)
 
     def push(
-        self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None
+        self,
+        name: str,
+        *,
+        env: dict[str, str] | None = None,
+        checkout: Path | None = None,
+        url: str | None = None,
     ) -> str:
         d = self._checkout(name, checkout)
-        if self._has_remote(d) and not self._upstream(d):
-            # A member's worktree branch starts with no upstream, and a plain
-            # push then refuses. Publish it under its own name, and track it so
-            # status can count ahead and behind from then on.
-            names = self._git(d, "remote").split()
-            remote = "origin" if "origin" in names else names[0]
-            return self._git(d, "push", "--set-upstream", remote, "HEAD", env=env)
-        return self._git(d, "push", env=env)
+        # Held across the push and the tracking-ref write after it, which is
+        # what set_remote clears (see _remote_lock).
+        with self._remote_lock(d, self.NETWORK_LOCK_WAIT, _BUSY):
+            return self._push_locked(d, url, env)
+
+    def _push_locked(self, d: Path, url: str | None, env: dict[str, str] | None) -> str:
+        if not self._primary_remote(d):
+            raise ProjectError("this project has no remote to push to; add one in project settings")
+        dest = self._destination(d, "push", url)
+        branch = self._git(d, "branch", "--show-current").strip()
+        if not branch:
+            raise ProjectError("the checkout is not on a branch; there is nothing to push")
+        sha = self._git(d, "rev-parse", "HEAD").strip()
+        # To the resolved URL, as the branch of the same name — never an
+        # argument-less push, whose destination pushRemote, pushDefault and a
+        # branch's upstream can all redirect (see REMOTE), and not origin by
+        # name either, which git would re-read (see _destination).
+        out = self._git(d, "push", "--", dest, f"{sha}:refs/heads/{branch}", env=_net_env(env))
+        # What --set-upstream origin would have recorded, done by hand because
+        # the push named a URL: origin's tracking ref, which status measures
+        # publication against, and the branch's upstream.
+        if self._still_origin(d, dest, "push"):
+            self._git(d, "update-ref", f"refs/remotes/{self.REMOTE}/{branch}", sha)
+        self._track_origin(d, branch, dest, "push")
+        return out
+
+    def _still_origin(self, d: Path, dest: str, operation: str) -> bool:
+        """Whether origin still names ``dest``. _remote_lock keeps the app from
+        changing it mid-operation; this covers a hand edit of the config, which
+        no lock sees. Bookkeeping recorded for a URL origin no longer names
+        would claim the new remote has what only the old one received."""
+        try:
+            return self._single_destination(d, operation) == dest
+        except ProjectError:
+            return False
+
+    def _track_origin(self, d: Path, branch: str, dest: str, operation: str) -> None:
+        """Make origin's ``branch`` the upstream of the local one, provided
+        origin is still the ``dest`` the operation just talked to."""
+        if not self._still_origin(d, dest, operation):
+            return
+        self._git(d, "config", f"branch.{branch}.remote", self.REMOTE)
+        self._git(d, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
 
     # -- inspection ----------------------------------------------------------
 
@@ -344,32 +865,66 @@ class Projects:
         # name but no commit yet, and that is a valid state to report on.
         branch = self._git(d, "branch", "--show-current").strip()
         dirty = self._has_design_changes(d)
-        has_remote = bool(self._git(d, "remote").strip())
+        has_remote = self._primary_remote(d) is not None
         ahead = behind = 0
+        unpublished = False
+        # Whatever pull and push would refuse origin for, asked the same way
+        # they ask. With a problem, origin's tracking ref is not evidence of
+        # what the push destination holds — a fetch URL and a separate pushurl
+        # made it describe one repository while pushes went to another, and
+        # status reported "published, nothing ahead" for a branch the push
+        # destination had never seen (Codex, PR #10). So nothing is measured
+        # against it, and the problem is reported instead.
+        remote_problem = ""
         if has_remote:
-            # Counts against the upstream, when one is configured. No upstream
-            # (a fresh local repo) leaves both at zero, which is the truth.
+            try:
+                for op in ("fetch", "push"):
+                    self._single_destination(d, op)
+            except ProjectError as exc:
+                remote_problem = str(exc)
+        # Measured against origin's copy of this branch — the ref
+        # `push --set-upstream origin HEAD` updates — not @{upstream}. Every
+        # push goes to origin by name, so a branch tracking another remote, or
+        # an upstream left from before origin was changed, measured the wrong
+        # destination and could disable the push button with nothing pushed.
+        published = (
+            f"refs/remotes/{self.REMOTE}/{branch}"
+            if branch and self._git_allow_fail(
+                d, "rev-parse", "--verify", "--quiet", f"refs/remotes/{self.REMOTE}/{branch}"
+            ).strip()
+            else ""
+        )
+        measurable = has_remote and not remote_problem
+        if measurable and published:
             counts = self._git_allow_fail(
-                d, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"
+                d, "rev-list", "--left-right", "--count", f"{published}...HEAD"
             )
             if counts:
                 parts = counts.split()
                 if len(parts) == 2:
                     behind, ahead = int(parts[0]), int(parts[1])
+        elif measurable:
+            # Never pushed. Zero here hid the project's whole history from the
+            # push button the moment a remote was added to it: clean tree,
+            # ahead 0, button disabled. Count what origin lacks instead — every
+            # commit, for a remote just added.
+            unpublished = True
+            count = self._git_allow_fail(
+                d, "rev-list", "--count", "HEAD", "--not", f"--remotes={self.REMOTE}"
+            )
+            ahead = int(count) if count.isdigit() else 0
         remote_name = ""
         remote_url = ""
         if has_remote:
-            # "origin" when it exists, else whatever the first remote is called:
-            # a clone names it origin, but a repository someone set up by hand
-            # need not have one, and reporting nothing in that case would be the
-            # same blind spot in a different place.
-            names = self._git(d, "remote").split()
-            remote_name = "origin" if "origin" in names else names[0]
-            remote_url = _redact_url(
-                self._git_allow_fail(d, "remote", "get-url", remote_name).strip()
-            )
+            # origin, which every pull and push names (see REMOTE), and every
+            # URL a push goes to — resolved as push resolves it, so the panel
+            # cannot name one repository while the button pushes to another.
+            # With no problem that is one URL, and the same one fetch uses.
+            remote_name = self.REMOTE
+            remote_url = ", ".join(_redact_url(u) for u in self._origin_urls(d, "push"))
         return GitStatus(branch=branch, ahead=ahead, behind=behind, dirty=dirty,
-                         has_remote=has_remote, remote_name=remote_name, remote_url=remote_url)
+                         has_remote=has_remote, remote_name=remote_name, remote_url=remote_url,
+                         unpublished=unpublished, remote_problem=remote_problem)
 
     # -- diff ----------------------------------------------------------------
 
@@ -498,9 +1053,13 @@ class Projects:
             env={**os.environ, **env} if env else None,
         )
         if proc.returncode != 0:
-            raise ProjectError(
+            # Redacted: this message reaches project members, and an argument
+            # or git's stderr can quote a URL with a token in it. Nothing
+            # should pass one any more (see _single_destination); this is for
+            # whatever path still does.
+            raise ProjectError(_redact_text(
                 f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
-            )
+            ))
         return proc.stdout
 
     def _git_allow_fail(self, cwd: Path, *args: str) -> str:

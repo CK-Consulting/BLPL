@@ -885,7 +885,7 @@ function GitEndpoints({ onError }: { onError: (m: string) => void }) {
   return (
     <section>
       <p className="muted">
-        A credential is matched by the host in a remote URL — paste a GitHub remote and the
+        A credential is matched by the host and port in a remote URL — paste a GitHub remote and the
         github row answers. The secret is a personal access token (HTTPS) or a private key
         (SSH), stored sealed under your master key; it is used during clone, pull and push and
         never shown again.
@@ -905,7 +905,17 @@ function GitEndpoints({ onError }: { onError: (m: string) => void }) {
             {data.endpoints.map((e) => (
               <tr key={e.name}>
                 <td>{e.name}</td>
-                <td>{e.host}</td>
+                <td>
+                  {e.host}
+                  {/* Two legacy spellings of one host: clone, pull and push
+                      refuse to pick one, so say which pair it is here. */}
+                  {e.conflicts_with && e.conflicts_with.length > 0 && (
+                    <p className="gate-error small">
+                      Same host as {e.conflicts_with.join(", ")} — remove one; clone, pull and
+                      push refuse to choose between them.
+                    </p>
+                  )}
+                </td>
                 <td>{e.method === "ssh_key" ? "SSH key" : "HTTPS token"}</td>
                 <td>{e.username ?? "—"}</td>
                 <td>
@@ -933,7 +943,7 @@ function GitEndpoints({ onError }: { onError: (m: string) => void }) {
         <span className="muted">— or define your own below</span>
       </div>
       <input placeholder="name (e.g. github, work-gitlab)" value={name} onChange={(e) => setName(e.target.value)} />
-      <input placeholder="host (e.g. github.com)" value={host} onChange={(e) => setHost(e.target.value)} />
+      <input placeholder="host, :port if not the default (e.g. github.com)" value={host} onChange={(e) => setHost(e.target.value)} />
       <select value={method} onChange={(e) => setMethod(e.target.value)}>
         <option value="https_token">HTTPS with access token</option>
         <option value="ssh_key">SSH with private key</option>

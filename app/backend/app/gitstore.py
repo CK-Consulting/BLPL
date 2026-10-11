@@ -1,4 +1,4 @@
-"""One user's git credentials: stored sealed, matched by host, lent to a subprocess.
+"""One user's git credentials: stored sealed, matched by host and port, lent to a subprocess.
 
 The keystore's sibling, with the same shape for the same reasons — every
 function takes a user, the secret is sealed under that user's master key, and
@@ -79,7 +79,11 @@ def host_of(remote: str) -> str | None:
     if not raw or raw.startswith(("/", "./", "../", "file://")):
         return None
     if "://" in raw:
-        return (urlsplit(raw).hostname or "").lower() or None
+        try:
+            return (urlsplit(raw).hostname or "").lower() or None
+        except ValueError:
+            # Malformed (e.g. an unclosed IPv6 bracket): no host to match.
+            return None
     m = _SCP_LIKE.match(raw)
     if m and "@" in raw.split(":", 1)[0] + ":":
         # user@host:path — but a bare "name:path" on Windows-ish inputs is not
@@ -89,6 +93,47 @@ def host_of(remote: str) -> str | None:
         if m.group("user") or "." in host:
             return host.lower()
     return None
+
+
+#: The port each remote scheme means when its URL names none. A credential's
+#: scope is host *and* port, with the default normalised away, so `host` and
+#: `host:443` are one destination over HTTPS and `host:8443` is another.
+_DEFAULT_PORTS = {
+    "https": 443, "http": 80, "ssh": 22, "git+ssh": 22, "ssh+git": 22, "git": 9418,
+}
+#: What a row's port defaults to, by the method it is stored under.
+_METHOD_PORTS = {"https_token": 443, "ssh_key": 22}
+
+#: A credential scope: (host, port). Lowercase, IPv6 unbracketed, and the port
+#: None when it is the default for the scheme or method in play.
+Scope = tuple[str, int | None]
+
+
+def scope_of(remote: str) -> Scope | None:
+    """The host-and-port authority a remote URL points at — what credentials match.
+
+    Not ``host_of``: the hostname alone treated every port on it as the same
+    destination, so a token saved for `git.corp.example` was released to
+    whatever answered on `git.corp.example:8443` (Codex, PR #10). The port
+    is kept unless it is the scheme's own default; scp-like remotes carry no
+    port, so they are always the default one.
+    """
+    host = host_of(remote)
+    if host is None:
+        return None
+    raw = remote.strip()
+    if "://" not in raw:
+        return (_unbracket(host), None)
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        # An out-of-range or non-numeric port: no authority to match, rather
+        # than falling back to the bare host and lending its credential.
+        return None
+    if port == _DEFAULT_PORTS.get(parts.scheme.lower()):
+        port = None
+    return (_unbracket(host), port)
 
 
 def put(
@@ -109,12 +154,42 @@ def put(
             "the endpoint name must be lowercase letters, digits, dots, dashes or "
             "underscores — it names the credential in the UI and seals it in storage"
         )
-    host = (host or "").strip().lower().rstrip("/")
-    host = re.sub(r"^[a-z]+://", "", host).split("/")[0]
-    if not host or " " in host:
-        raise GitStoreError(f"{host!r} is not a hostname")
     if method not in METHODS:
         raise GitStoreError(f"method must be one of {', '.join(METHODS)} — got {method!r}")
+    host = (host or "").strip().lower().rstrip("/")
+    host = re.sub(r"^[a-z]+://", "", host).split("/")[0]
+    if "@" in host:
+        # A pasted `https://user:token@host` leaves its userinfo here once the
+        # scheme is stripped. Not echoed — the refusal would hand the token
+        # back to the client (Codex, PR #10) — and not stored either: it would
+        # sit in the host column in plaintext and never match a remote's host.
+        raise GitStoreError(
+            "the host is a hostname alone — leave out any user name or token "
+            "(those have fields of their own)"
+        )
+    if "?" in host or "#" in host:
+        # `github.com?access_token=...` survives the cut at the first / above.
+        # Refused unquoted, like the userinfo case: a query is where the remote
+        # form refuses a token too (Codex, PR #10).
+        raise GitStoreError(
+            "the host is a hostname alone — leave out any query string or fragment"
+        )
+    if not host or any(c.isspace() or ord(c) < 32 for c in host):
+        # Not quoted either: whatever was pasted here is not a hostname, and
+        # it may be a token with the @ that would have caught it missing.
+        raise GitStoreError("the host must be a hostname, with no spaces in it")
+    # Stored as a normalised authority: `[2001:db8::1]` kept its brackets while
+    # host_of drops them, so for_remote's lookup missed (Codex, PR #10); and a
+    # port is part of the scope, not noise to discard — `git.corp.example:8443`
+    # is a different service from `git.corp.example` (Codex, PR #10). The
+    # method's default port is dropped so `host:443` and `host` are one row.
+    scope = _parse_scope(host, _METHOD_PORTS[method])
+    if scope is None:
+        raise GitStoreError(
+            "the host must be a hostname, optionally followed by :port "
+            "(an IPv6 address with a port goes in brackets: [2001:db8::1]:8443)"
+        )
+    host = _format_scope(scope)
     if not (secret or "").strip():
         raise GitStoreError("an empty secret is not a credential")
     if method == "https_token" and not (username or "").strip():
@@ -123,24 +198,20 @@ def put(
         # username fails in a way that reads as a wrong token.
         raise GitStoreError("HTTPS access needs a username to send alongside the token")
 
-    # One credential per host, because matching by host is the only selection
-    # mechanism there is. A second row for the same host would make every
-    # clone, pull and push a coin toss between identities — and a push under
-    # the wrong account is the failure that looks like success. Refused with
-    # the other row's name so the fix is obvious; the database constraint
-    # backs this up for any path that skips the check.
-    other = session.scalar(
-        select(GitEndpoint).where(
-            GitEndpoint.user_id == user.id,
-            GitEndpoint.host == host,
-            GitEndpoint.name != name,
-        )
+    # One credential per host and port, because matching by authority is the
+    # only selection mechanism there is. A second row for the same one would
+    # make every clone, pull and push a coin toss between identities — and a
+    # push under the wrong account is the failure that looks like success.
+    # Refused with the other row's name so the fix is obvious; the database
+    # constraint backs this up for any path that skips the check.
+    other = next(
+        (r for r in _rows_for_scope(session, user, scope) if r.name != name), None
     )
     if other is not None:
         raise GitStoreError(
             f"{other.name!r} already holds the credential for {host} — credentials are "
-            "matched by host, so a second one would be chosen at random. Update or remove "
-            f"{other.name!r} instead."
+            "matched by host and port, so a second one would be chosen at random. Update "
+            f"or remove {other.name!r} instead."
         )
 
     nonce, ciphertext = vault.encrypt_secret(master_key, _aad(name), secret)
@@ -163,14 +234,25 @@ def put(
 
 
 def list_endpoints(session: Session, user: User) -> list[dict]:
-    """What the settings screen may see: everything except the secret."""
-    rows = session.scalars(
+    """What the settings screen may see: everything except the secret.
+
+    ``conflicts_with`` names the other rows matching the same host and port
+    once normalised. Only a pre-upgrade database can have any, and for_remote
+    refuses to choose between them — so the listing is where the user learns
+    which pair it is and removes one (Codex, PR #10).
+    """
+    rows = list(session.scalars(
         select(GitEndpoint).where(GitEndpoint.user_id == user.id).order_by(GitEndpoint.name)
-    )
+    ))
     return [
         {
             "name": r.name, "host": r.host, "method": r.method, "username": r.username,
             "updated_at": r.updated_at.isoformat() if r.updated_at else "",
+            "conflicts_with": [
+                o.name for o in rows
+                if o is not r and _row_scope(o) is not None
+                and _row_scope(o) == _row_scope(r)
+            ],
         }
         for r in rows
     ]
@@ -193,12 +275,95 @@ def for_remote(session: Session, user: User, remote: str) -> GitEndpoint | None:
     credential, and failing the clone because no row matched would break the
     case that used to be the only one that worked.
     """
-    host = host_of(remote)
-    if host is None:
+    scope = scope_of(remote)
+    if scope is None:
         return None
-    return session.scalar(
-        select(GitEndpoint).where(GitEndpoint.user_id == user.id, GitEndpoint.host == host)
+    rows = _rows_for_scope(session, user, scope)
+    if len(rows) > 1:
+        # put refuses a second row for an authority, but a database from before
+        # hosts were normalised can hold `[2001:db8::1]` and `2001:db8::1` (or
+        # `host` and `host:443`) side by side, and both match once normalised.
+        # Taking the first would pick an identity by alphabetical accident and
+        # push under whichever account that was (Codex, PR #10). Refused, naming
+        # both, so the user can remove the wrong one; the endpoints listing
+        # flags the pair as well.
+        names = " and ".join(repr(r.name) for r in rows)
+        raise GitStoreError(
+            f"two saved credentials match host {_format_scope(scope)} ({names}) — remove "
+            "one in Account & app settings → Git endpoints/accounts"
+        )
+    return rows[0] if rows else None
+
+
+def _rows_for_scope(session: Session, user: User, scope: Scope) -> list[GitEndpoint]:
+    """This user's rows for ``scope``, each row's host normalised on read.
+
+    ``put`` now stores normalised authorities, but rows written before it did
+    may still hold `[2001:db8::1]` or `host:443`, and an exact SQL match would
+    miss them for good (Codex, PR #10). Normalising on read covers those
+    without a migration that could itself collide two legacy spellings under
+    the unique constraint. A user holds a handful of rows, so filtering them
+    here costs nothing.
+    """
+    rows = session.scalars(
+        select(GitEndpoint).where(GitEndpoint.user_id == user.id).order_by(GitEndpoint.name)
     )
+    return [r for r in rows if _row_scope(r) == scope]
+
+
+def _row_scope(row: GitEndpoint) -> Scope | None:
+    """A stored row's scope. A legacy row with no port means the default one."""
+    return _parse_scope(row.host or "", _METHOD_PORTS.get(row.method or ""))
+
+
+def _unbracket(host: str) -> str:
+    h = host.strip().lower()
+    return h[1:].split("]", 1)[0] if h.startswith("[") else h
+
+
+def _parse_scope(text: str, default_port: int | None) -> Scope | None:
+    """``host``, ``host:port``, ``[v6]``, ``[v6]:port`` or a bare ``v6``, as a scope.
+
+    None when it is none of those — an unclosed bracket, a port that is not a
+    number in range — so a malformed row matches nothing rather than its host.
+    A bare IPv6 literal (two or more colons, no brackets) has no port: there is
+    no telling where the address would end and a port begin.
+    """
+    h = (text or "").strip().lower()
+    port_text = None
+    if h.startswith("["):
+        if "]" not in h:
+            return None
+        h, rest = h[1:].split("]", 1)
+        if rest:
+            if not rest.startswith(":"):
+                return None
+            port_text = rest[1:]
+    elif h.count(":") == 1:
+        h, port_text = h.split(":")
+    if not h:
+        return None
+    port = None
+    if port_text is not None:
+        if not port_text.isdigit() or not 0 < int(port_text) < 65536:
+            return None
+        port = int(port_text)
+    if port == default_port:
+        port = None
+    return (h, port)
+
+
+def _format_scope(scope: Scope) -> str:
+    """A scope as git's credential protocol spells ``host=``, default port left off.
+
+    The bare address when the port is the default — the IPv6 spelling earlier
+    rows were stored in — and brackets around an IPv6 literal only when a port
+    follows it, the one place they are needed to read it back.
+    """
+    host, port = scope
+    if port is None:
+        return host
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
 @dataclass(frozen=True)
@@ -223,10 +388,33 @@ def lease(master_key: bytes, row: GitEndpoint):
     """
     secret = vault.decrypt_secret(master_key, _aad(row.name), row.nonce, row.ciphertext)
     if row.method == "https_token":
-        helper = "!f() { echo \"username=${GIT_HTTP_USER}\"; echo \"password=${GIT_HTTP_TOKEN}\"; }; f"
+        # Answers only `get`, and only for the host and port the credential was
+        # stored for. The helper used to answer every request, so whichever
+        # host git ended up talking to (a second push URL, a remote changed
+        # mid-request) was handed this token. Git passes host=... on stdin with
+        # the port when the URL named one, and an IPv6 literal in brackets:
+        # `[2001:db8::1]:8443`. The port used to be cut off before comparing,
+        # which released a token saved for `git.corp.example` to whatever ran
+        # on `git.corp.example:8443` (Codex, PR #10). Now only the protocol's
+        # default port is dropped, brackets go only when no port follows, and
+        # what is left must equal the row's authority spelled the same way.
+        helper = (
+            "!f() { test \"$1\" = get || exit 0; h=; p=; "
+            "while IFS= read -r l; do case \"$l\" in "
+            "host=*) h=\"${l#host=}\";; protocol=*) p=\"${l#protocol=}\";; esac; done; "
+            "h=$(printf %s \"$h\" | tr A-Z a-z); "
+            "case \"$p\" in https) h=\"${h%:443}\";; http) h=\"${h%:80}\";; esac; "
+            "case \"$h\" in \\[*\\]) h=\"${h#\\[}\"; h=\"${h%\\]}\";; esac; "
+            "test -n \"$GIT_HTTP_HOST\" && test \"$h\" = \"$GIT_HTTP_HOST\" || exit 0; "
+            "echo \"username=${GIT_HTTP_USER}\"; echo \"password=${GIT_HTTP_TOKEN}\"; }; f"
+        )
+        scope = _parse_scope(getattr(row, "host", "") or "", _METHOD_PORTS["https_token"])
         yield Credential(env={
             "GIT_HTTP_USER": row.username or "git",
             "GIT_HTTP_TOKEN": secret,
+            # Empty for a host that does not parse: the helper then answers
+            # nothing, rather than matching on some fragment of it.
+            "GIT_HTTP_HOST": _format_scope(scope) if scope else "",
             # Clear any configured helpers first (the empty helper resets the
             # list), then install ours. Without the reset, a system helper could
             # answer first with the wrong identity.

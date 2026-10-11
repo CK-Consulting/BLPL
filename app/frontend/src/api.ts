@@ -418,6 +418,13 @@ export type GitStatus = {
   /** Where it points. Any credential embedded in the URL is replaced
    *  server-side, so this is safe to display and to screenshot. */
   remote_url: string;
+  /** Has a remote but has never been pushed to it. `ahead` then counts what
+   *  the remote lacks, and pushing is allowed with a clean tree. */
+  unpublished?: boolean;
+  /** Why pull and push would refuse the remote as configured (several URLs,
+   *  or a fetch URL and a different push URL), else empty. When set, `ahead`
+   *  and `unpublished` are not measured and say nothing. */
+  remote_problem?: string;
 };
 
 export type LibraryPolicyValues = {
@@ -445,6 +452,9 @@ export type GitEndpointMeta = {
   method: string;
   username: string | null;
   updated_at: string;
+  /** Other rows matching the same host — only a pre-upgrade database has any,
+   *  and clone, pull and push refuse to choose until one is removed. */
+  conflicts_with?: string[];
 };
 
 export type GitEndpoints = {

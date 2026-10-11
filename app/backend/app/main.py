@@ -103,7 +103,7 @@ from .models import Project, ProjectInvitation, ProjectPolicy, Run, User
 from blpl.core import limits, project_manifest, quarantine
 from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
-from .projects import ProjectError, Projects
+from .projects import ProjectError, Projects, check_remote_url
 from .vault import VaultError
 from .references import (
     FilesystemSandbox,
@@ -1743,7 +1743,13 @@ def _git_credentials(session: Session, master_key: bytes, user: User, remote: st
     """
     from . import gitstore
 
-    row = gitstore.for_remote(session, user, remote)
+    try:
+        row = gitstore.for_remote(session, user, remote)
+    except gitstore.GitStoreError as exc:
+        # Two legacy rows for one host: refused rather than guessed. Raised as
+        # the ProjectError clone, pull and push already turn into a 400, so the
+        # user reads which credentials collide instead of a 500.
+        raise ProjectError(str(exc)) from exc
     if row is None:
         yield None
         return
@@ -1761,6 +1767,10 @@ def clone_project(
     """Clone a remote into a new working copy, owned by whoever cloned it."""
     _refuse_taken_name(session, body.name)
     try:
+        # Validated before any credential is looked up for it: the lookup parses
+        # the URL itself, and a credential should never be chosen for a remote
+        # that is about to be refused.
+        check_remote_url(body.remote)
         with _git_credentials(session, master_key, user, body.remote) as env:
             projects.clone(body.name, body.remote, body.branch, env=env)
     except ProjectError as exc:
@@ -2385,7 +2395,41 @@ def git_status(project_id: str, user: User = Depends(require_onboarded),
         "branch": st.branch, "ahead": st.ahead, "behind": st.behind,
         "dirty": st.dirty, "has_remote": st.has_remote,
         "remote_name": st.remote_name, "remote_url": st.remote_url,
+        "unpublished": st.unpublished,
+        "remote_problem": st.remote_problem,
     }
+
+
+class RemoteBody(BaseModel):
+    url: str
+
+
+@app.put("/api/projects/{project_id}/git/remote")
+def set_git_remote(
+    project_id: str,
+    body: RemoteBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Point a project at a remote. Owner only.
+
+    Where Push sends every member's work is the owner's decision, the same as
+    who may see the project. The URL passes the same check as cloning —
+    https://, ssh:// or user@host:path, never a path on this server.
+    """
+    try:
+        projectacl.require_owner(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    except projectacl.NotTheOwner:
+        raise HTTPException(status_code=403, detail="only the owner can set this project's remote")
+    checkout = _project_dir(session, user, project_id)
+    try:
+        projects.set_remote(checkout, body.url)
+        st = projects.status(project_id, checkout=checkout)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "remote_name": st.remote_name, "remote_url": st.remote_url}
 
 
 class CommitBody(BaseModel):
@@ -2421,8 +2465,13 @@ def git_pull(project_id: str, user: User = Depends(require_onboarded),
     master_key: bytes = Depends(require_master_key)) -> dict:
     checkout = _project_dir(session, user, project_id)
     try:
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
-            out = projects.pull(project_id, env=env, checkout=checkout)
+        # A pull fetches, so the credential is the fetch URL's — which need not
+        # be the host a push goes to.
+        # Resolved once: the credential is leased for this URL and git is
+        # handed this URL, so the two cannot diverge if origin changes between.
+        dest = projects.remote_of(project_id, operation="fetch", checkout=checkout)
+        with _git_credentials(session, master_key, user, dest) as env:
+            out = projects.pull(project_id, env=env, checkout=checkout, url=dest)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}
@@ -2436,8 +2485,9 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
     # the commit it made rather than the owner's branch.
     checkout = _project_dir(session, user, project_id)
     try:
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
-            out = projects.push(project_id, env=env, checkout=checkout)
+        dest = projects.remote_of(project_id, operation="push", checkout=checkout)
+        with _git_credentials(session, master_key, user, dest) as env:
+            out = projects.push(project_id, env=env, checkout=checkout, url=dest)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}
