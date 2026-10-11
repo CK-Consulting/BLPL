@@ -262,6 +262,56 @@ def test_a_body_cut_short_with_no_usable_length_is_unknown(tmp_path):
     assert not r.is_inert
 
 
+def test_stream_is_a_whole_keyword_not_the_tail_of_a_name(tmp_path):
+    """Codex, PR #15: `stream` matched the end of `/foo-stream`, and a later
+    name containing `endstream` closed the 'body', blanking an /OpenAction
+    between them that a reader parses normally."""
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/X/foo-stream\n"
+        b"/OpenAction<</S/JavaScript/JS(x)>>/Y/bar-endstream>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_nul_is_whitespace_between_a_dictionary_and_its_stream(tmp_path):
+    """Codex, PR #15: NUL is PDF whitespace, and bytes.strip() kept it, so the
+    object stream lost its dictionary and was never inflated."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode>>\x00stream\n"
+        + zlib.compress(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_escaped_filter_key_is_still_the_filter(tmp_path):
+    """Codex, PR #15: `/#46ilter` is `/Filter` to a reader. Missed, the
+    ASCII85 body was read as unfiltered and its action went unseen."""
+    import base64
+
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/#46ilter/ASCII85Decode>>stream\n"
+        + base64.a85encode(inner) + b"~>"
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_unclosed_angle_bracket_does_not_swallow_the_rest(tmp_path):
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Odd < /OpenAction<</S/JavaScript/JS(x)>>>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert "OpenAction" in {f.name for f in r.active}
+
+
 def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
     data = (
         b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"

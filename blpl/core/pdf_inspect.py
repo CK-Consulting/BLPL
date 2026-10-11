@@ -147,114 +147,137 @@ def _unescape(name: bytes) -> str:
     )
 
 
-# Where something that is not structure may begin: a literal string, a hex
-# string (but not the `<<` that opens a dictionary), a comment, or the body of
-# a stream. `stream` must stand alone so `/Substream` is not mistaken for one.
-_NOT_STRUCTURE = re.compile(rb"[(%]|(?<!<)<(?!<)|(?<![A-Za-z0-9#/])stream\r?\n")
+# PDF's own lexical rules (ISO 32000-1, 7.2): six whitespace bytes, NUL
+# among them, and ten delimiters. Everything else is a regular character, and
+# a name or a keyword is a run of them. Matching `stream` or a name with a
+# regex of its own was wrong in a new way each time Codex looked: `stream`
+# matched the tail of `/foo-stream`, a NUL between a dictionary and its
+# `stream` was not whitespace to bytes.strip(), and `/#46ilter` was not
+# `/Filter`. A tokenizer that follows the spec gets all three by construction.
+_WS = b"\x00\t\n\x0c\r "
+_REGULAR = rb"[^\x00\t\n\x0c\r ()<>\[\]{}/%]"
+_TOKEN = re.compile(
+    rb"(?P<ws>[\x00\t\n\x0c\r ]+)"
+    rb"|(?P<comment>%[^\r\n]*)"
+    rb"|(?P<name>/" + _REGULAR + rb"*)"
+    rb"|(?P<dict><<|>>)"
+    # Only hex digits and whitespace: an unclosed or non-hex `<` is a lone
+    # delimiter, never a span that swallows the structure after it.
+    rb"|(?P<hex><[0-9A-Fa-f\x00\t\n\x0c\r ]*>)"
+    rb"|(?P<string>\()"
+    rb"|(?P<word>" + _REGULAR + rb"+)"
+    rb"|(?P<other>.)",
+    re.DOTALL,
+)
 _ENDSTREAM = b"endstream"
-_EOL = re.compile(rb"[\r\n]")
-_DICT_DELIM = re.compile(rb"<<|>>")
+_PLAIN = re.compile(rb"[A-Za-z0-9]")
+
+
+def _canonical_name(raw: bytes) -> bytes:
+    """A name as `/` plus only letters, digits and #xx escapes.
+
+    Every spelling of one name comes out identical: `/#46ilter` and `/Filter`
+    are both `/Filter`. A byte outside [A-Za-z0-9] is re-escaped, so `/foo-stream`
+    stays one name (`/foo#2Dstream`) and the downstream `/[A-Za-z0-9#]+`
+    matches a whole name or nothing.
+    """
+    name = _HEX_ESCAPE.sub(lambda m: bytes([int(m.group(1), 16)]), raw[1:])
+    return b"/" + b"".join(
+        bytes([c]) if _PLAIN.match(bytes([c])) else b"#%02X" % c for c in name
+    )
+
+
+def _string_end(data: bytes, start: int) -> int:
+    """Index just past a literal string opening at `start`, or len(data).
+    Strings nest on balanced parens; `\\(` and `\\)` do not count."""
+    depth, i, n = 0, start, len(data)
+    while i < n:
+        c = data[i]
+        if c == 0x5C:            # backslash: skip the escaped byte
+            i += 2
+            continue
+        if c == 0x28:
+            depth += 1
+        elif c == 0x29:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
 
 
 @dataclass
 class _Stream:
     """One stream as a reader meets it: its dictionary and where its body is."""
 
-    dictionary: bytes   # the dictionary's structure, strings and comments blanked
+    dictionary: bytes   # canonical tokens of the dictionary
     start: int          # body offsets into the file
     end: int
 
 
 def _parse(data: bytes) -> tuple[bytes, list[_Stream]]:
-    """`data` with every stream body, string and comment blanked out, and each
-    stream paired with the dictionary that introduces it.
+    """The file's structure as canonical tokens, and each stream paired with
+    the dictionary that introduces it.
 
-    What is left is what a PDF reader parses as objects, and the only place a
-    name means anything. A blanked span becomes one space so tokens either side
-    of it stay apart.
+    Strings, comments and stream bodies are dropped; names are written in
+    canonical form; tokens are separated by one space. What is left is what a
+    PDF reader parses as objects, and the only place a name means anything.
 
-    The dictionary is found in the same pass, from the structure, rather than
-    by searching backwards through the raw bytes for `obj`. That search was
-    defeated by a comment reading `% obj`, or a string containing `obj`, between
-    the dictionary's keys and the `stream` keyword: it cut the dictionary short,
-    the object stream's `/Type /ObjStm` fell outside the cut, and the stream was
-    never decompressed. Here comments and strings are already gone, and the
-    dictionary is whichever one closed last before the keyword.
+    A stream's dictionary is the top-level one that closed immediately before
+    the `stream` keyword, found from the tokens rather than by searching the
+    raw bytes, which a `% obj` comment or an `(obj)` string defeated.
 
-    Errs towards keeping bytes: a stream with no `endstream`, or a string that
-    never closes, leaves the rest of the file in place to be scanned. A file
-    built to confuse this gets more scrutiny, not less.
+    Errs towards keeping bytes: a string that never closes ends the scan where
+    a reader would, and a stream with no `endstream` leaves the rest of the
+    file to be tokenized as structure. A file built to confuse this gets more
+    scrutiny, not less.
     """
     out = bytearray()
     streams: list[_Stream] = []
     opens: list[int] = []               # offsets in `out` of unclosed `<<`
     last_dict: tuple[int, int] | None = None
+    pos, n = 0, len(data)
 
-    def keep(chunk: bytes) -> None:
-        nonlocal last_dict
-        base = len(out)
-        out.extend(chunk)
-        for m in _DICT_DELIM.finditer(chunk):
-            if m.group() == b"<<":
-                opens.append(base + m.start())
-            elif opens:
-                begin = opens.pop()
-                if not opens:
-                    last_dict = (begin, base + m.end())
-
-    pos = 0
-    n = len(data)
-    while True:
-        m = _NOT_STRUCTURE.search(data, pos)
-        if m is None:
-            keep(data[pos:])
-            break
-        start = m.start()
-        keep(data[pos:start])
-        lead = data[start : start + 1]
-        if lead == b"(":
-            # Literal strings nest on balanced parens; `\(` and `\)` do not count.
-            depth, i = 0, start
-            while i < n:
-                c = data[i]
-                if c == 0x5C:            # backslash: skip the escaped byte
-                    i += 2
-                    continue
-                if c == 0x28:
-                    depth += 1
-                elif c == 0x29:
-                    depth -= 1
-                    if depth == 0:
-                        break
-                i += 1
-            if i >= n:
-                keep(data[start:])
-                break
-            end = i + 1
-        elif lead == b"<":
-            close = data.find(b">", start + 1)
-            if close < 0:
-                keep(data[start:])
-                break
-            end = close + 1
-        elif lead == b"%":
-            nl = _EOL.search(data, start)
-            end = n if nl is None else nl.end()
-        else:                            # a stream body, up to its endstream
-            # Its dictionary is the one that closed last, provided nothing but
-            # whitespace (and blanked strings or comments) came after it.
+    while pos < n:
+        m = _TOKEN.match(data, pos)
+        kind = m.lastgroup
+        tok = m.group()
+        pos = m.end()
+        if kind in ("ws", "comment", "hex"):
+            continue
+        if kind == "string":
+            pos = _string_end(data, m.start())
+            continue
+        if kind == "name":
+            out += _canonical_name(tok) + b" "
+            continue
+        if kind == "dict":
+            if tok == b"<<":
+                opens.append(len(out))
+                out += b"<< "
+            else:
+                out += b">> "
+                if opens:
+                    begin = opens.pop()
+                    if not opens:
+                        last_dict = (begin, len(out))
+            continue
+        if kind == "word" and tok == b"stream":
             dictionary = b""
-            if last_dict is not None and not bytes(out[last_dict[1] :]).strip():
+            if last_dict is not None and last_dict[1] == len(out):
                 dictionary = bytes(out[last_dict[0] : last_dict[1]])
-            close = _body_end(data, m.end(), dictionary)
-            streams.append(_Stream(dictionary, m.end(), n if close < 0 else close))
-            if close < 0:
-                keep(data[start:])
-                break
-            keep(b"stream ")
-            end = close
-        out.extend(b" ")
-        pos = end
+            out += b"stream "
+            # The body starts after the EOL that ends the keyword's line.
+            if data.startswith(b"\r\n", pos):
+                pos += 2
+            elif pos < n and data[pos] in b"\r\n":
+                pos += 1
+            close = _body_end(data, pos, dictionary)
+            streams.append(_Stream(dictionary, pos, n if close < 0 else close))
+            if close >= 0:
+                pos = close
+            continue
+        out += tok + b" "
     return bytes(out), streams
 
 
