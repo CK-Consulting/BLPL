@@ -29,6 +29,8 @@ IMPORTED = "imported"
 SHARED = "shared"
 JOINED = "joined"
 UPLOADED = "uploaded"
+DELETED = "deleted"
+MOVED = "moved"
 
 # What each kind reads as in a feed. Kept here rather than in the frontend so a
 # new kind cannot appear in the UI as a raw enum nobody recognises.
@@ -40,6 +42,8 @@ PHRASING = {
     SHARED: "shared",
     JOINED: "joined",
     UPLOADED: "uploaded",
+    DELETED: "deleted",
+    MOVED: "moved",
 }
 
 

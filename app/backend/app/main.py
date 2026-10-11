@@ -3341,6 +3341,147 @@ def make_folder(
     return {"ok": True, "path": "/".join(parts)}
 
 
+def _managed_path(session: Session, user: User, project_id: str, name: str) -> tuple[Path, Path, str]:
+    """Resolve a path the file manager may delete or move: (checkout, target, rel).
+
+    Wider than ``_editable_file`` in what it may name — any file type, and
+    folders, because a datasheet PDF filed in the wrong folder is exactly what
+    someone wants to move — and narrower in two places:
+
+    - nothing under a ``retrieved`` segment. Held files are kept as evidence and
+      the quarantine ledger beside them never lies by omission; a delete button
+      over either would let it.
+    - the target itself is not resolved. A symlink inside the project is deleted
+      or moved as the link, never followed, so only its *parent* has to resolve
+      inside the project — the same check ``make_folder`` makes.
+    """
+    proj = _project_dir(session, user, project_id)
+    parts = [seg for seg in name.split("/") if seg]
+    if (
+        not parts
+        or "\\" in name
+        or name.startswith("/")
+        or any(seg == ".." or seg.startswith(".") for seg in parts)
+    ):
+        raise HTTPException(status_code=400, detail=f"invalid path {name!r}")
+    if "retrieved" in parts:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "files under retrieved/ are held by quarantine and kept as "
+                "evidence — they cannot be deleted or moved from here"
+            ),
+        )
+    root = proj.resolve()
+    parent = proj.joinpath(*parts[:-1]).resolve()
+    if not parent.is_relative_to(root):
+        raise HTTPException(status_code=400, detail=f"invalid path {name!r}")
+    target = parent / parts[-1]
+    if target == root:
+        raise HTTPException(status_code=400, detail=f"invalid path {name!r}")
+    try:
+        _sandbox_for(session, user, project_id).check_write(target)
+    except ReferencePolicyError as exc:
+        raise HTTPException(status_code=403, detail=f"refused by the project sandbox: {exc}")
+    return proj, target, "/".join(parts)
+
+
+def _refuse_while_running(session: Session, user: User, project: Project, then: str) -> None:
+    """409 while one of this user's runs is queued or running on the project.
+
+    This user's runs only: their change lands in their own worktree, so someone
+    else's run cannot be disturbed by it. A run reads the tree it was started
+    on, and a file deleted or renamed underneath it fails the stage halfway with
+    an error naming a file the user can no longer see.
+    """
+    in_flight = session.scalar(
+        select(Run).where(
+            Run.project_id == project.id,
+            Run.user_id == user.id,
+            Run.status.in_([runqueue.QUEUED, runqueue.RUNNING, runqueue.CANCELLING]),
+        )
+    )
+    if in_flight is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"a pipeline run is in flight for this project — {then} once it finishes",
+        )
+
+
+def _commit_quietly(checkout: Path, message: str) -> bool:
+    # Reported, never fatal, for the reason write_file gives: the change is
+    # already on disk, and failing the request would misstate what happened.
+    try:
+        return projects.commit_checkout(checkout, message) is not None
+    except ProjectError:
+        return False
+
+
+@app.delete("/api/projects/{project_id}/files/{name:path}")
+def delete_path(
+    project_id: str, name: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Delete a file, or a folder and everything in it.
+
+    Committed like any other edit, so a delete is one ``git revert`` from being
+    undone — which is what makes it acceptable to offer behind one confirmation.
+    """
+    project = _project_or_404(session, user, project_id)
+    checkout, target, rel = _managed_path(session, user, project_id, name)
+    _refuse_while_running(session, user, project, "delete it")
+    if not target.exists() and not target.is_symlink():
+        raise HTTPException(status_code=404, detail=f"no file or folder {rel!r}")
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+        kind = "folder"
+    else:
+        target.unlink()
+        kind = "file"
+    activity.record(session, project, user, activity.DELETED, rel)
+    committed = _commit_quietly(checkout, f"delete: {rel}")
+    return {"ok": True, "path": rel, "kind": kind, "committed": committed}
+
+
+class MoveBody(BaseModel):
+    # Not from/to: "from" is a Python keyword, and the alias that works around
+    # it warns under this FastAPI/pydantic pair.
+    path: str
+    to: str
+
+
+@app.post("/api/projects/{project_id}/files/move")
+def move_path(
+    project_id: str, body: MoveBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Rename or move a file or folder within the project.
+
+    A plain rename followed by the usual ``add -A`` commit: git records a
+    rename by content, not by how it was made, so this is what ``git mv`` would
+    have produced and ``log --follow`` still finds the history.
+    """
+    project = _project_or_404(session, user, project_id)
+    checkout, src, src_rel = _managed_path(session, user, project_id, body.path)
+    _, dst, dst_rel = _managed_path(session, user, project_id, body.to)
+    _refuse_while_running(session, user, project, "move it")
+    if not src.exists() and not src.is_symlink():
+        raise HTTPException(status_code=404, detail=f"no file or folder {src_rel!r}")
+    if dst.exists() or dst.is_symlink():
+        # Never an overwrite: the file at the destination is somebody's work,
+        # and a rename is not where anyone expects to find it replaced.
+        raise HTTPException(status_code=409, detail=f"{dst_rel} already exists")
+    if src.is_dir() and not src.is_symlink() and dst.is_relative_to(src):
+        raise HTTPException(status_code=400, detail="a folder cannot be moved inside itself")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src.rename(dst)
+    activity.record(session, project, user, activity.MOVED, f"{src_rel} → {dst_rel}")
+    committed = _commit_quietly(checkout, f"move: {src_rel} -> {dst_rel}")
+    return {"ok": True, "from": src_rel, "to": dst_rel, "committed": committed}
+
+
 @app.get("/api/projects/{project_id}/artifacts/{name}")
 def read_artifact(project_id: str, name: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)):

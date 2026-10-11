@@ -326,6 +326,173 @@ def test_generated_pipeline_files_are_not_editable(client) -> None:
     assert r.status_code in (400, 404)
 
 
+# -- delete and move: the file manager --------------------------------------
+
+
+def _git_log(project: str) -> str:
+    import app.main as main
+
+    return subprocess.run(
+        ["git", "log", "--format=%s", "--name-status"],
+        cwd=main.projects.project_dir(project), capture_output=True, text=True, check=True,
+    ).stdout
+
+
+def _scratch_with_files(client) -> None:
+    sign_in(client)
+    client.post("/api/projects/init", json={"name": "scratch"})
+    for rel in ("overview.md", "power/power.md", "power/notes.yaml"):
+        assert client.put(f"/api/projects/scratch/files/{rel}", json={"content": f"# {rel}\n"}).status_code == 200
+
+
+def test_a_file_can_be_deleted_and_the_delete_is_committed(client) -> None:
+    """Committed so a delete is one revert from undone — the reason it is safe
+    to offer behind a single confirmation."""
+    _scratch_with_files(client)
+    r = client.delete("/api/projects/scratch/files/overview.md")
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "file" and r.json()["committed"] is True
+    assert client.get("/api/projects/scratch/files/overview.md").status_code == 404
+    assert "delete: overview.md" in _git_log("scratch")
+
+
+def test_a_folder_is_deleted_with_everything_in_it(client) -> None:
+    _scratch_with_files(client)
+    r = client.delete("/api/projects/scratch/files/power")
+    assert r.status_code == 200 and r.json()["kind"] == "folder"
+    names = {f["name"] for f in client.get("/api/projects/scratch/files").json()}
+    assert not any(n.startswith("power/") for n in names), names
+
+
+def test_deleting_something_that_is_not_there_is_a_404(client) -> None:
+    _scratch_with_files(client)
+    assert client.delete("/api/projects/scratch/files/nope.md").status_code == 404
+
+
+def test_delete_refuses_paths_outside_the_project_and_dot_directories(client) -> None:
+    _scratch_with_files(client)
+    for bad in ("../secret.md", ".git", ".blpl/proposals", ".pipeline", "power/../../x.md", "/etc/passwd"):
+        r = client.delete(f"/api/projects/scratch/files/{bad}")
+        assert r.status_code in (400, 404, 405), f"{bad!r} should be refused, got {r.status_code}"
+    import app.main as main
+    assert (main.projects.project_dir("scratch") / ".git").is_dir()
+
+
+def test_held_files_and_the_ledger_cannot_be_deleted_or_moved(client) -> None:
+    """Held files are evidence and the ledger never lies by omission; a delete
+    button over retrieved/ would let both."""
+    _scratch_with_files(client)
+    import app.main as main
+    held = main.projects.project_dir("scratch") / "retrieved"
+    held.mkdir()
+    (held / "quarantine.json").write_text("{}\n")
+    (held / "abc-held.pdf").write_bytes(b"%PDF-1.4\n")
+    for rel in ("retrieved", "retrieved/quarantine.json", "retrieved/abc-held.pdf"):
+        assert client.delete(f"/api/projects/scratch/files/{rel}").status_code == 400, rel
+    r = client.post("/api/projects/scratch/files/move",
+                    json={"path": "retrieved/abc-held.pdf", "to": "datasheets/abc.pdf"})
+    assert r.status_code == 400
+    r = client.post("/api/projects/scratch/files/move", json={"path": "overview.md", "to": "retrieved/x.md"})
+    assert r.status_code == 400
+    assert (held / "abc-held.pdf").exists() and (held / "quarantine.json").exists()
+
+
+def test_a_symlink_is_deleted_as_the_link_never_followed(client) -> None:
+    """Following it would delete the folder it points at, which the user
+    never asked about and may not know is behind the link."""
+    _scratch_with_files(client)
+    import app.main as main
+    proj = main.projects.project_dir("scratch")
+    (proj / "power-link").symlink_to(proj / "power")
+    assert client.delete("/api/projects/scratch/files/power-link").status_code == 200
+    assert not (proj / "power-link").is_symlink()
+    assert (proj / "power" / "power.md").read_text() == "# power/power.md\n"
+
+
+def test_nothing_outside_the_project_is_reachable_through_a_link(client, tmp_path) -> None:
+    _scratch_with_files(client)
+    import app.main as main
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.md").write_text("precious\n")
+    (main.projects.project_dir("scratch") / "link").symlink_to(outside)
+    # Through the link: the parent resolves outside the project.
+    assert client.delete("/api/projects/scratch/files/link/keep.md").status_code == 400
+    # The link itself points outside, so the sandbox refuses it too — the
+    # conservative answer, and the outside folder is untouched either way.
+    assert client.delete("/api/projects/scratch/files/link").status_code in (400, 403)
+    assert (outside / "keep.md").read_text() == "precious\n"
+
+
+def test_a_file_can_be_renamed_and_git_sees_a_rename(client) -> None:
+    _scratch_with_files(client)
+    r = client.post("/api/projects/scratch/files/move", json={"path": "power/power.md", "to": "power/board.md"})
+    assert r.status_code == 200, r.text
+    assert r.json()["committed"] is True
+    assert client.get("/api/projects/scratch/files/power/board.md").json()["content"] == "# power/power.md\n"
+    log = _git_log("scratch")
+    assert "move: power/power.md -> power/board.md" in log
+    # R100: recorded as a rename, so log --follow keeps the history.
+    assert "R100\tpower/power.md\tpower/board.md" in log
+
+
+def test_a_move_creates_the_destination_folder(client) -> None:
+    _scratch_with_files(client)
+    r = client.post("/api/projects/scratch/files/move", json={"path": "overview.md", "to": "main/main.md"})
+    assert r.status_code == 200, r.text
+    assert client.get("/api/projects/scratch/files/main/main.md").status_code == 200
+
+
+def test_a_move_never_overwrites(client) -> None:
+    _scratch_with_files(client)
+    r = client.post("/api/projects/scratch/files/move", json={"path": "overview.md", "to": "power/power.md"})
+    assert r.status_code == 409
+    assert client.get("/api/projects/scratch/files/power/power.md").json()["content"] == "# power/power.md\n"
+    assert client.get("/api/projects/scratch/files/overview.md").status_code == 200
+
+
+def test_a_folder_cannot_be_moved_inside_itself(client) -> None:
+    _scratch_with_files(client)
+    r = client.post("/api/projects/scratch/files/move", json={"path": "power", "to": "power/inner/power"})
+    assert r.status_code == 400
+
+
+def test_move_refuses_paths_outside_the_project(client) -> None:
+    _scratch_with_files(client)
+    for src, dst in (("overview.md", "../escaped.md"), ("../x.md", "y.md"),
+                     ("overview.md", ".git/hooks/pre-commit"), ("overview.md", ".blpl/x.md")):
+        r = client.post("/api/projects/scratch/files/move", json={"path": src, "to": dst})
+        assert r.status_code == 400, f"{src} -> {dst} gave {r.status_code}"
+    assert client.get("/api/projects/scratch/files/overview.md").status_code == 200
+
+
+def test_delete_and_move_wait_for_a_run_in_flight(client) -> None:
+    """A run reads the tree it started on; deleting a file under it fails the
+    stage halfway with an error naming a file nobody can see any more."""
+    _scratch_with_files(client)
+    from sqlalchemy import select
+
+    import app.db
+    from app import runqueue
+    from app.models import Project, Run, User
+
+    with app.db.SessionFactory() as s:
+        project = s.scalar(select(Project).where(Project.name == "scratch"))
+        user = s.scalar(select(User))
+        s.add(Run(
+            id="run_inflight", project_id=project.id, user_id=user.id, kind="pipeline",
+            cmd=["blpl", "run"], status=runqueue.RUNNING,
+            env_nonce=b"x" * 12, env_ciphertext=b"sealed",
+        ))
+        s.commit()
+
+    r = client.delete("/api/projects/scratch/files/overview.md")
+    assert r.status_code == 409 and "in flight" in r.json()["detail"]
+    r = client.post("/api/projects/scratch/files/move", json={"path": "overview.md", "to": "o.md"})
+    assert r.status_code == 409
+    assert client.get("/api/projects/scratch/files/overview.md").status_code == 200
+
+
 # -- cookie Secure flag: the footgun that dropped sessions over HTTP ----------
 
 
