@@ -187,6 +187,28 @@ def _canonical_name(raw: bytes) -> bytes:
     )
 
 
+_SIGNED_INT = re.compile(rb"([+-]?)0*(\d+)")
+
+
+def _canonical_word(tok: bytes) -> bytes:
+    """An integer in one spelling; every other word as it stands.
+
+    PDF integers may carry a sign and leading zeros (ISO 32000-1, 7.3.3), so
+    `+88`, `088` and `88` are one length to a reader. Patterns that matched
+    only the last spelling missed the others in a new place each time Codex
+    looked (PR #15): `/Length +88` fell back to the first raw `endstream`, and
+    `/Filter +9 0 R` was not seen as indirect. Writing integers canonically
+    here fixes every consumer of these tokens at once. String operations, not
+    int(), so a 5,000-digit integer costs nothing and raises nothing. Reals
+    keep their `.` and so never pass for an integer downstream.
+    """
+    m = _SIGNED_INT.fullmatch(tok)
+    if m is None:
+        return tok
+    sign, digits = m.groups()
+    return (b"-" if sign == b"-" and digits != b"0" else b"") + digits
+
+
 def _string_end(data: bytes, start: int) -> int:
     """Index just past a literal string opening at `start`, or len(data).
     Strings nest on balanced parens; `\\(` and `\\)` do not count."""
@@ -213,6 +235,9 @@ class _Stream:
     dictionary: bytes   # canonical tokens of the dictionary
     start: int          # body offsets into the file
     end: int
+    # Whether a direct /Length put the end there, rather than the first
+    # `endstream` after the body began, which the body itself can supply.
+    trusted_end: bool = False
 
 
 def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
@@ -255,10 +280,20 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
         kind = m.lastgroup
         tok = m.group()
         pos = m.end()
-        if kind in ("ws", "comment", "hex"):
+        if kind in ("ws", "comment"):
+            continue
+        # A string's bytes are dropped, but inside a dictionary its place is
+        # kept as `()`: without it `/Note (x) /Filter /A85` read as a /Note
+        # whose value is the name /Filter, and /A85 as a key. Outside one it
+        # leaves nothing, so `>> (x) stream` pairs as it always did.
+        if kind == "hex":
+            if opens:
+                out += b"() "
             continue
         if kind == "string":
             pos = _string_end(data, m.start())
+            if opens:
+                out += b"() "
             continue
         if kind == "name":
             out += _canonical_name(tok) + b" "
@@ -292,43 +327,107 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
                 pos += 2
             elif pos < n and data[pos] in b"\r\n":
                 pos += 1
-            close = _body_end(data, pos, dictionary)
-            streams.append(_Stream(dictionary, pos, n if close < 0 else close))
+            close, trusted = _body_end(data, pos, dictionary)
+            streams.append(_Stream(dictionary, pos, n if close < 0 else close, trusted))
             if close >= 0:
                 pos = close
             continue
+        if kind == "word":
+            tok = _canonical_word(tok)
         out += tok + b" "
     return bytes(out), streams, unbalanced
 
 
-_DIRECT_LENGTH = re.compile(rb"/Length\s+(\d+)(?!\s+\d+\s+R)")
+_INT = re.compile(rb"\d+")     # a canonical non-negative integer token
+_OPENERS = {b"<<": b">>", b"[": b"]"}
 
 
-def _body_end(data: bytes, start: int, dictionary: bytes) -> int:
-    """Where a stream body ends: at its declared /Length when that lands on an
-    `endstream`, otherwise at the first `endstream` after it.
+def _entries(dictionary: bytes) -> dict[str, list[bytes]] | None:
+    """The top-level entries of a canonical dictionary, key to value tokens,
+    or None when it cannot be read as one.
+
+    Searching the dictionary's tokens for `/Filter` found a key wherever it
+    sat, including inside a nested dictionary, so `/X <</Filter /A85>>` could
+    name a filter the stream does not have. Only top-level keys belong to the
+    stream. A value is one token, a bracketed array or dictionary, or an
+    `N G R` reference. A key given twice is None, not first-wins or
+    last-wins: readers disagree, so either answer is a guess.
+    """
+    toks = dictionary.split()
+    if len(toks) < 2 or toks[0] != b"<<" or toks[-1] != b">>":
+        return None
+    toks = toks[1:-1]
+    out: dict[str, list[bytes]] = {}
+    i = 0
+    while i < len(toks):
+        key = toks[i]
+        if not key.startswith(b"/") or i + 1 >= len(toks):
+            return None
+        i += 1
+        if toks[i] in _OPENERS:
+            stack, j = [], i
+            while j < len(toks):
+                t = toks[j]
+                if t in _OPENERS:
+                    stack.append(_OPENERS[t])
+                elif t in (b">>", b"]"):
+                    if not stack or stack.pop() != t:
+                        return None
+                j += 1
+                if not stack:
+                    break
+            if stack:
+                return None
+            value, i = toks[i:j], j
+        elif (
+            _INT.fullmatch(toks[i])
+            and i + 2 < len(toks)
+            and _INT.fullmatch(toks[i + 1])
+            and toks[i + 2] == b"R"
+        ):
+            value, i = toks[i : i + 3], i + 3
+        elif toks[i] in (b">>", b"]"):
+            return None
+        else:
+            value, i = [toks[i]], i + 1
+        name = _unescape(key[1:])
+        if name in out:
+            return None
+        out[name] = value
+    return out
+
+
+def _is_reference(value: list[bytes] | None) -> bool:
+    return value is not None and len(value) == 3 and value[2] == b"R"
+
+
+def _body_end(data: bytes, start: int, dictionary: bytes) -> tuple[int, bool]:
+    """Where a stream body ends, and whether a direct /Length put it there:
+    at the declared /Length when that lands on an `endstream`, otherwise at
+    the first `endstream` after it.
 
     The first `endstream` alone is wrong whenever the compressed bytes happen to
     contain one, and a file can arrange that they do: a stored Deflate block
     holding `%endstream` cut the body there, the rest of the object stream was
     never inflated, and an /OpenAction after the cut went unseen. /Length is
-    what a reader uses. An indirect length (`12 0 R`) is not resolved here; for
-    those the inflate in _decode must still reach the end of its data, so a
-    body cut short is reported rather than half-read.
+    what a reader uses. An indirect length (`12 0 R`) is not resolved here, so
+    its end is untrusted: the object stream check refuses an untrusted end
+    wherever no filter's end-of-data marker can confirm the body is whole.
     """
-    m = _DIRECT_LENGTH.search(dictionary)
+    entries = _entries(dictionary)
+    length = entries.get("Length") if entries else None
     # Twenty digits is past any file this will ever see, so a longer length
     # cannot land on an `endstream` and is treated as one that does not. It is
     # checked before int() because Python 3.11+ refuses to convert more than
     # 4,300 digits, and that ValueError aborted the upload (Codex, PR #15).
-    if m is not None and len(m.group(1)) <= 20:
-        end = start + int(m.group(1))
+    if length is not None and len(length) == 1 and _INT.fullmatch(length[0]) and len(length[0]) <= 20:
+        end = start + int(length[0])
         # PDF whitespace, NUL included: bytes.lstrip() keeps NUL, so a benign
         # `\x00endstream` missed its declared length and fell back to the
         # first `endstream`, which may sit inside the compressed bytes.
         if end <= len(data) and data[end : end + 64].lstrip(_WS).startswith(_ENDSTREAM):
-            return end
-    return data.find(_ENDSTREAM, start)
+            return end, True
+    return data.find(_ENDSTREAM, start), False
 
 
 def _names_in(structure: bytes) -> set[str]:
@@ -354,42 +453,79 @@ def _findings(structure: bytes, where: str) -> dict[str, Finding]:
     return found
 
 
-_FILTER = re.compile(rb"/Filter\s*(\[[^\]]*\]|/[A-Za-z0-9#]+)")
-
-
-def _filters(dictionary: bytes) -> list[str]:
-    """The stream's filter chain, in the order a reader applies it."""
-    m = _FILTER.search(dictionary)
-    if m is None:
+def _filters(value: list[bytes] | None) -> list[str] | None:
+    """The stream's filter chain, in the order a reader applies it, or None
+    when the /Filter value is neither absent, null, a name nor an array of
+    names — a value this check would otherwise have to guess at."""
+    if value is None or value == [b"null"]:
         return []
-    return [_unescape(n) for n in _NAME.findall(m.group(1))]
+    if value[0] == b"[" and value[-1] == b"]":
+        value = value[1:-1]
+    elif len(value) != 1:
+        return None
+    if not all(t.startswith(b"/") for t in value):
+        return None
+    return [_unescape(t[1:]) for t in value]
 
 
-_INDIRECT_FILTER = re.compile(rb"/(Filter|F|DecodeParms|DP)\s+\d+\s+\d+\s+R")
-_DECODE_PARMS = re.compile(rb"/(DecodeParms|DP)\s+(?!null)")
-
-
-def _unreadable(dictionary: bytes, body_len: int) -> str | None:
-    """Why this object stream cannot be decoded faithfully here, or None.
+def _unreadable(st: _Stream) -> tuple[str | None, list[str]]:
+    """Why this object stream cannot be decoded faithfully here, or None; and
+    its filter chain.
 
     Each is a way to turn a decode into a partial read that looks complete,
     and each is answered by refusing rather than guessing:
+    - a dictionary whose top level cannot be read, or that gives a key twice;
     - an indirect /Filter or /DecodeParms (`9 0 R`), whose value lives in
-      another object this check does not resolve;
+      another object this check does not resolve, or a /Filter or /Length
+      that is not a value of the kind the spec allows;
     - any /DecodeParms, such as a PNG or TIFF predictor, which zlib does not
       undo, so a stream would inflate cleanly into still-encoded bytes;
+    - /F, which puts the stream's data in an external file and makes the
+      body something no reader reads;
     - a body larger than the inspection limit, which would be read as its
-      first 8 MB.
+      first 8 MB;
+    - an unfiltered body whose end no direct /Length confirms (below).
     None of the 3,079 object streams in the 92 datasheets this was measured
     on has any of these, so the price is paid only by a file that does.
+
+    The last one is the indirect-length form of a Codex finding (PR #15).
+    Without a direct /Length the body ends at the first `endstream`, and an
+    unfiltered object stream can supply its own — in a string, a comment or
+    a name. The outer parse then reads the bytes after it as a new stream
+    and blanks them, while the object stream is read only up to the cut, so
+    an object after the cut is seen by neither. Flate, ASCIIHex and ASCII85
+    each have to reach an end-of-data marker, so a cut there is caught in
+    _decode; raw objects have no such marker. Resolving `12 0 R` instead was
+    considered and refused: the length object may itself sit in an object
+    stream, or be defined twice across incremental updates, and a decoy copy
+    in some other stream's body is indistinguishable from it without a full
+    xref walk. Refusing costs nothing measurable: of 1,435 object streams in
+    77 project PDFs, none is unfiltered, and every one has a direct /Length.
     """
-    if _INDIRECT_FILTER.search(dictionary):
-        return "an indirect /Filter or /DecodeParms"
-    if _DECODE_PARMS.search(dictionary):
-        return "/DecodeParms"
-    if body_len > _MAX_INFLATE:
-        return "a body over the inspection limit"
-    return None
+    entries = _entries(st.dictionary)
+    if entries is None:
+        return "a stream dictionary this check cannot read", []
+    value = entries.get("Filter")
+    if any(_is_reference(entries.get(k)) for k in ("Filter", "DecodeParms", "DP")):
+        return "an indirect /Filter or /DecodeParms", []
+    filters = _filters(value)
+    if filters is None:
+        return "a /Filter that is not a name or an array of names", []
+    length = entries.get("Length")
+    if length is not None and not _is_reference(length) and not (
+        len(length) == 1 and _INT.fullmatch(length[0])
+    ):
+        return "a /Length that is not an integer or a reference", filters
+    for key in ("DecodeParms", "DP"):
+        if entries.get(key, [b"null"]) != [b"null"]:
+            return "/DecodeParms", filters
+    if "F" in entries:
+        return "an external file (/F)", filters
+    if st.end - st.start > _MAX_INFLATE:
+        return "a body over the inspection limit", filters
+    if not filters and not st.trusted_end:
+        return "an unfiltered object stream whose end no direct /Length confirms", filters
+    return None, filters
 
 
 def _decode(body: bytes, filters: list[str]) -> bytes | None:
@@ -466,12 +602,15 @@ def _object_streams(
     if len(objstms) > _MAX_STREAMS:
         return [], [f"more than {_MAX_STREAMS} object streams"], len(objstms)
     for st in objstms:
-        problem = _unreadable(st.dictionary, st.end - st.start)
+        problem, filters = _unreadable(st)
+        body = data[st.start : st.end]
         if problem:
             undecodable.append(problem)
+            # What can be read is still read, so the verdict carries whatever
+            # the readable prefix shows; the file is unknown either way.
+            if not filters and len(body) <= _MAX_INFLATE:
+                out.append(body)
             continue
-        body = data[st.start : st.end]
-        filters = _filters(st.dictionary)
         decoded = _decode(body, filters)
         if decoded is None:
             undecodable.append("/".join(filters))

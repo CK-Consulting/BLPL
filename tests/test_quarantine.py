@@ -444,6 +444,79 @@ def test_nul_before_endstream_still_honours_the_declared_length(tmp_path):
     assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
 
 
+# An unfiltered object stream whose first object carries `endstream stream` in
+# a string. Cut there, the outer parse reads the rest as a new stream and
+# blanks it, and the object stream is read only up to the cut.
+_DECOY_BODY = (
+    b"1 0 2 30 <</X(endstream stream)>> "
+    b"<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+)
+
+
+def test_a_signed_or_zero_padded_length_is_still_the_length(tmp_path):
+    """Codex, PR #15: `/Length +88` is a legal integer, but only `88` was
+    recognised, so the body fell back to the `endstream` in the string and
+    the /OpenAction after it went unseen."""
+    for spelling in (b"+%d", b"000%d", b"+00%d"):
+        length = spelling % len(_DECOY_BODY)
+        data = _objstm(b"/Length " + length, _DECOY_BODY)
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, length
+    # Read whole, a benign unfiltered object stream is inspected.
+    benign = b"1 0 <</Type/Catalog>>"
+    data = _objstm(b"/Length +%d" % len(benign), benign)
+    assert pdf_inspect.inspect(_write(tmp_path, "b.pdf", data)).state == "inspected"
+
+
+def test_a_length_that_is_not_an_integer_is_unknown(tmp_path):
+    for length in (b"-5", b"88.0", b"/Big", b"[88]"):
+        data = _objstm(b"/Length " + length, _DECOY_BODY)
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect" and not r.is_inert, length
+
+
+def test_an_unfiltered_object_stream_with_an_indirect_length_is_unknown(tmp_path):
+    """The indirect-length form of the finding above: with `/Length 12 0 R`
+    nothing corrects the cut, and raw objects have no end-of-data marker to
+    show the body was read short. A string, a comment or a name can each
+    supply the `endstream`."""
+    for body in (
+        _DECOY_BODY,
+        b"1 0 2 30 % endstream stream\n<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>",
+        b"1 0 2 30 <</A/xendstream>> <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>",
+    ):
+        for extra in (b"/Length 12 0 R", b""):
+            data = _objstm(extra, body)
+            r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+            assert r.state == "cannot_inspect" and not r.is_inert, (body, extra)
+
+
+def test_a_signed_indirect_filter_is_still_indirect(tmp_path):
+    """Codex, PR #15: `/Filter +9 0 R` was not seen as a reference, no filter
+    name was found, and the ASCII85 body was scanned as unfiltered bytes."""
+    import base64
+
+    for ref in (b"+9 0 R", b"09 +00 R"):
+        data = _objstm(b"/Filter " + ref, base64.a85encode(_HIDDEN) + b"~>")
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect" and not r.is_inert, ref
+
+
+def test_only_top_level_keys_describe_the_stream(tmp_path):
+    """A /Filter inside a nested dictionary is not the stream's filter. Read
+    as one, an unfiltered body was decoded as ASCII85 (a `~>` in a comment
+    makes that succeed on nothing), and its raw /OpenAction was never read.
+    A key given twice is unknown: readers disagree about which one wins."""
+    body = b"%%~>\n" + _HIDDEN
+    data = _objstm(b"/X<</Filter/ASCII85Decode>>/Length %d" % len(body), body)
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+    data = _objstm(b"/Filter/FlateDecode/Filter/ASCII85Decode", zlib.compress(_HIDDEN))
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
 def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
     data = (
         b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"
