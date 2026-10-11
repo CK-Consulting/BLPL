@@ -90,6 +90,765 @@ def test_a_whole_name_is_matched_not_a_prefix(tmp_path):
     assert r.is_inert, [f.name for f in r.findings]
 
 
+def test_base64_in_a_metadata_stream_is_data_not_names(tmp_path):
+    """The TE ANT-916-HESM datasheet was held for JavaScript it did not have.
+    Its XMP packet carries base64 JPEG thumbnails, base64 uses `/` as an
+    ordinary character, and `...snx/JS/1TJ...` was read as the name `/JS`."""
+    xmp = (
+        b"<x:xmpmeta><wn_previews:base64_data>/9j/4AAQSkZJRgABAgEASABIAAD"
+        b"snx/JS/1TJ84f8+aA/AA/q9Launch/Zz</wn_previews:base64_data></x:xmpmeta>"
+    )
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Metadata 2 0 R>>endobj\n"
+        + b"2 0 obj<</Type/Metadata/Subtype/XML/Length " + str(len(xmp)).encode()
+        + b">>stream\n"
+        + xmp
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.is_inert, [f.name for f in r.findings]
+
+
+def test_ascii85_in_an_image_stream_is_data_not_names(tmp_path):
+    data = (
+        b"%PDF-1.4\n4 0 obj<</Type/XObject/Subtype/Image/Filter/ASCII85Decode>>stream\n"
+        b"9jqo^BlbD-BleB1DJ+*+F(f,q/JavaScript(JhKF<GL>Cj@.4Gp$d7F!,L7@<6@)/0JDEF<G%<+EV:2F!,O<~>"
+        b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.is_inert, [f.name for f in r.findings]
+
+
+def test_a_name_inside_a_string_is_text_not_structure(tmp_path):
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Title(see /Launch here \\) and (/JS) nested)>>endobj\n"
+        b"2 0 obj<</Subject<2F4A53>>>endobj\n"
+        b"% a comment naming /OpenAction is not one\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.is_inert, [f.name for f in r.findings]
+
+
+def test_javascript_on_open_in_the_structure_is_still_caught(tmp_path):
+    """Blanking strings must not blank the action that carries one."""
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/OpenAction<</S/JavaScript/JS(app.alert(1))>>>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JavaScript", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_object_stream_that_hides_its_type_is_still_read(tmp_path):
+    """No reader can find the objects in an object stream without /First, so
+    leaving out /Type/ObjStm does not keep them from being scanned."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    packed = (
+        b"%PDF-1.5\n5 0 obj<</N 1/First 4/Filter/FlateDecode>>stream\n"
+        + zlib.compress(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", packed))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_unfiltered_object_stream_is_read_as_structure(tmp_path):
+    """Codex, PR #15. With no /Filter the body is already the objects, but it
+    was only offered to zlib, failed to inflate and was skipped — and stream
+    bodies are blanked from the raw scan, so the /OpenAction went unseen."""
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4>>stream\n"
+        b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+        b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_comment_reading_obj_does_not_cut_the_dictionary_short(tmp_path):
+    """Codex, PR #15. The dictionary was found by searching back for `obj`, so a
+    `% obj` comment after its keys hid /Type/ObjStm and the stream was skipped."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode\n% obj\n>>stream\n"
+        + zlib.compress(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_string_containing_obj_does_not_cut_the_dictionary_short(tmp_path):
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Note(an obj)>>stream\n"
+        + zlib.compress(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_object_stream_through_a_filter_chain_is_decoded(tmp_path):
+    import base64
+
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    body = base64.a85encode(zlib.compress(inner)) + b"~>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter[/ASCII85Decode/FlateDecode]>>stream\n"
+        + body
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_object_stream_this_cannot_decode_is_unknown_not_clean(tmp_path):
+    """Its objects are real to a reader that can decode them and invisible
+    here. Skipping it would release whatever is inside."""
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/LZWDecode>>stream\n"
+        b"\x80\x0b\x60\x50\x22\x0c\x0c\x85\x01"
+        b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+    assert "LZWDecode" in r.reason
+
+
+def _deflate_hiding_endstream(inner: bytes) -> bytes:
+    """A valid zlib stream whose compressed bytes contain `endstream`: a
+    non-final stored block carrying it literally, then the real objects in a
+    compressed final block. Every reader inflates all of it."""
+    import struct
+
+    decoy = b"%endstream\n"
+    co = zlib.compressobj(wbits=-15)
+    rest = co.compress(inner) + co.flush()
+    stored = b"\x00" + struct.pack("<HH", len(decoy), len(decoy) ^ 0xFFFF) + decoy
+    return b"\x78\x01" + stored + rest + struct.pack(">I", zlib.adler32(decoy + inner))
+
+
+def test_an_endstream_inside_compressed_bytes_does_not_end_the_body(tmp_path):
+    """Codex, PR #15. The body ended at the first `endstream`, which a file can
+    place inside its own compressed data; the rest was never inflated and an
+    /OpenAction after the cut went unseen. /Length is where it really ends."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    body = _deflate_hiding_endstream(inner)
+    assert b"endstream" in body and zlib.decompress(body).endswith(inner)
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length "
+        + str(len(body)).encode()
+        + b">>stream\n"
+        + body
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_body_cut_short_with_no_usable_length_is_unknown(tmp_path):
+    """With an indirect /Length there is nothing to correct the cut by, so the
+    inflate stops before its end. A prefix of an object stream is objects
+    nobody read: unknown, never clean."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length 9 0 R>>stream\n"
+        + _deflate_hiding_endstream(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert not r.is_inert
+
+
+def test_stream_is_a_whole_keyword_not_the_tail_of_a_name(tmp_path):
+    """Codex, PR #15: `stream` matched the end of `/foo-stream`, and a later
+    name containing `endstream` closed the 'body', blanking an /OpenAction
+    between them that a reader parses normally."""
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/X/foo-stream\n"
+        b"/OpenAction<</S/JavaScript/JS(x)>>/Y/bar-endstream>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_nul_is_whitespace_between_a_dictionary_and_its_stream(tmp_path):
+    """Codex, PR #15: NUL is PDF whitespace, and bytes.strip() kept it, so the
+    object stream lost its dictionary and was never inflated."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode>>\x00stream\n"
+        + zlib.compress(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_escaped_filter_key_is_still_the_filter(tmp_path):
+    """Codex, PR #15: `/#46ilter` is `/Filter` to a reader. Missed, the
+    ASCII85 body was read as unfiltered and its action went unseen."""
+    import base64
+
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/#46ilter/ASCII85Decode>>stream\n"
+        + base64.a85encode(inner) + b"~>"
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_unclosed_angle_bracket_does_not_swallow_the_rest(tmp_path):
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Odd < /OpenAction<</S/JavaScript/JS(x)>>>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert "OpenAction" in {f.name for f in r.active}
+
+
+_HIDDEN = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+
+
+def _objstm(dict_extra: bytes, body: bytes) -> bytes:
+    return (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4" + dict_extra + b">>stream\n"
+        + body + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+
+
+def test_an_object_stream_with_decode_parms_is_unknown(tmp_path):
+    """Codex, PR #15: a predictor inflates cleanly into still-encoded bytes,
+    so the scan saw nothing and the file came back inspected."""
+    data = _objstm(b"/Filter/FlateDecode/DecodeParms<</Predictor 2/Columns 4>>", zlib.compress(b"\x02" * 40))
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and "DecodeParms" in r.reason
+
+
+def test_decode_parms_of_only_nulls_gives_no_parameters(tmp_path):
+    """Codex, PR #15: `/DecodeParms [null]` beside `/Filter [/FlateDecode]` is
+    the spec's way of saying the one filter takes no parameters, but only a
+    scalar null was accepted and a benign file was held. An array of nulls,
+    one per filter, is read; any other array is still unknown."""
+    import base64
+
+    benign = b"1 0 <</Type/Catalog>>"
+    for extra, body in (
+        (b"/Filter[/FlateDecode]/DecodeParms[null]", zlib.compress(benign)),
+        (b"/Filter/FlateDecode/DP[ null ]", zlib.compress(benign)),
+        (b"/Filter[/A85/Fl]/DecodeParms[null null]", base64.a85encode(zlib.compress(benign)) + b"~>"),
+    ):
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", _objstm(extra, body)))
+        assert r.state == "inspected" and r.is_inert, (extra, r.reason)
+    # Read, so what is inside is seen.
+    data = _objstm(b"/Filter[/FlateDecode]/DecodeParms[null]", zlib.compress(_HIDDEN))
+    assert {"OpenAction", "JS"} <= {f.name for f in pdf_inspect.inspect(_write(tmp_path, "b.pdf", data)).active}
+    for extra in (
+        b"/Filter[/FlateDecode]/DecodeParms[null null]",          # one too many
+        b"/Filter[/FlateDecode]/DecodeParms[]",                   # one too few
+        b"/Filter[/FlateDecode]/DecodeParms[<</Predictor 2>>]",   # parameters
+        b"/Filter[/FlateDecode]/DecodeParms[/null]",              # a name, not null
+    ):
+        r = pdf_inspect.inspect(_write(tmp_path, "c.pdf", _objstm(extra, zlib.compress(benign))))
+        assert r.state == "cannot_inspect" and "DecodeParms" in r.reason, extra
+
+
+def test_an_indirect_filter_is_unknown_not_unfiltered(tmp_path):
+    """Codex, PR #15: `/Filter 9 0 R` read as no filter at all, so an ASCII85
+    object stream was scanned as raw bytes and its action missed."""
+    import base64
+
+    data = _objstm(b"/Filter 9 0 R", base64.a85encode(_HIDDEN) + b"~>")
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+def test_an_object_stream_over_the_limit_is_unknown_not_a_prefix(tmp_path, monkeypatch):
+    """Codex, PR #15: an unfiltered object stream past the limit was read as
+    its first 8 MB, and an object after the cut went unseen."""
+    monkeypatch.setattr(pdf_inspect, "_MAX_INFLATE", 64)
+    data = _objstm(b"", b"(" + b"x" * 100 + b") " + _HIDDEN)
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+def test_ordinary_streams_cannot_push_an_object_stream_past_the_cap(tmp_path, monkeypatch):
+    """Codex, PR #15: the cap counted every stream, so enough images ahead of
+    an object stream left it unread while the file reported clean."""
+    monkeypatch.setattr(pdf_inspect, "_MAX_STREAMS", 3)
+    images = b"".join(
+        b"%d 0 obj<</Subtype/Image/Length 3>>stream\nabc\nendstream endobj\n" % i for i in range(10, 20)
+    )
+    data = (
+        b"%PDF-1.5\n" + images
+        + b"5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode>>stream\n"
+        + zlib.compress(_HIDDEN) + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+    # And past the cap of object streams themselves: unknown, never clean.
+    many = b"".join(
+        b"%d 0 obj<</Type/ObjStm/N 0/First 0>>stream\n\nendstream endobj\n" % i for i in range(30, 35)
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", b"%PDF-1.5\n" + many + b"%%EOF\n"))
+    assert r.state == "cannot_inspect"
+
+
+def test_an_ascii85_body_cut_short_is_unknown(tmp_path):
+    """Codex, PR #15: with an indirect /Length nothing corrects a cut at an
+    `endstream` inside the ASCII85 bytes, and a85decode accepted the aligned
+    prefix without its `~>`. The decoder must reach end-of-data."""
+    import base64
+
+    encoded = base64.a85encode(b"padding!" * 4 + _HIDDEN)
+    cut = 40  # a multiple of 5, so the prefix decodes cleanly on its own
+    body = encoded[:cut] + b"endstream" + encoded[cut:] + b"~>"
+    data = _objstm(b"/Filter/ASCII85Decode/Length 99 0 R", body)
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert not r.is_inert
+
+
+def test_ascii85_honours_every_pdf_whitespace_byte(tmp_path):
+    """Codex, PR #15: NUL and form feed are PDF whitespace; a85decode refused
+    them and a benign object stream was held as undecodable."""
+    import base64
+
+    enc = base64.a85encode(b"1 0 <</Type/Catalog>>")
+    body = enc[:5] + b"\x00\x0c" + enc[5:] + b"~>"
+    data = _objstm(b"/Filter/ASCII85Decode", body)
+    assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
+
+
+def test_a_stray_open_dictionary_cannot_hide_a_later_object_stream(tmp_path):
+    """Codex, PR #15: one unmatched `<<` in an unused object kept the depth
+    above zero for the rest of the file, so the object stream after it never
+    had a dictionary, was not counted, and its compressed /OpenAction came
+    back inspected. Without `endobj`, the next `obj` must catch it, and with
+    neither, the `stream` keyword itself."""
+    objstm = (
+        b"5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode>>stream\n"
+        + zlib.compress(_HIDDEN) + b"\nendstream endobj\n"
+    )
+    tail = b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    for stray in (
+        b"4 0 obj<</Junk 1 endobj\n",       # closed by endobj
+        b"4 0 obj<</Junk 1\n",              # no endobj: the next obj
+        b"<</Junk 1\n",                     # no object at all: the stream
+    ):
+        data = b"%PDF-1.5\n" + stray + objstm + tail
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect" and not r.is_inert, stray
+    # A surplus `>>` is the same imbalance from the other side.
+    data = b"%PDF-1.5\n4 0 obj<</Junk 1>>>>endobj\n" + objstm + tail
+    assert pdf_inspect.inspect(_write(tmp_path, "b.pdf", data)).state == "cannot_inspect"
+    # Balanced dictionaries, nested ones included, are not held for it.
+    assert pdf_inspect.inspect(_write(tmp_path, "c.pdf", BENIGN)).state == "inspected"
+
+
+def test_an_absurdly_long_length_does_not_abort_the_inspection(tmp_path):
+    """Codex, PR #15: int() refuses more than 4,300 digits on Python 3.11+, and
+    the ValueError escaped and aborted the upload instead of a verdict."""
+    data = _objstm(b"/Filter/FlateDecode/Length " + b"9" * 5000, zlib.compress(_HIDDEN))
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_nul_before_endstream_still_honours_the_declared_length(tmp_path):
+    """Codex, PR #15: bytes.lstrip() keeps NUL, so a NUL before `endstream`
+    made a direct /Length look wrong; the body was cut at an `endstream` in
+    the compressed bytes and a benign file was held as undecodable."""
+    body = _deflate_hiding_endstream(b"1 0 <</Type/Catalog>>")
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length "
+        + str(len(body)).encode() + b">>stream\n"
+        + body + b"\x00endstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
+
+
+# An unfiltered object stream whose first object carries `endstream stream` in
+# a string. Cut there, the outer parse reads the rest as a new stream and
+# blanks it, and the object stream is read only up to the cut.
+_DECOY_BODY = (
+    b"1 0 2 30 <</X(endstream stream)>> "
+    b"<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+)
+
+
+def test_a_signed_or_zero_padded_length_is_still_the_length(tmp_path):
+    """Codex, PR #15: `/Length +88` is a legal integer, but only `88` was
+    recognised, so the body fell back to the `endstream` in the string and
+    the /OpenAction after it went unseen."""
+    for spelling in (b"+%d", b"000%d", b"+00%d"):
+        length = spelling % len(_DECOY_BODY)
+        data = _objstm(b"/Length " + length, _DECOY_BODY)
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, length
+    # Read whole, a benign unfiltered object stream is inspected.
+    benign = b"1 0 <</Type/Catalog>>"
+    data = _objstm(b"/Length +%d" % len(benign), benign)
+    assert pdf_inspect.inspect(_write(tmp_path, "b.pdf", data)).state == "inspected"
+
+
+def test_a_length_that_is_not_an_integer_is_unknown(tmp_path):
+    for length in (b"-5", b"88.0", b"/Big", b"[88]"):
+        data = _objstm(b"/Length " + length, _DECOY_BODY)
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect" and not r.is_inert, length
+
+
+def test_an_unfiltered_object_stream_with_an_indirect_length_is_unknown(tmp_path):
+    """The indirect-length form of the finding above: with `/Length 12 0 R`
+    nothing corrects the cut, and raw objects have no end-of-data marker to
+    show the body was read short. A string, a comment or a name can each
+    supply the `endstream`."""
+    for body in (
+        _DECOY_BODY,
+        b"1 0 2 30 % endstream stream\n<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>",
+        b"1 0 2 30 <</A/xendstream>> <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>",
+    ):
+        for extra in (b"/Length 12 0 R", b""):
+            data = _objstm(extra, body)
+            r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+            assert r.state == "cannot_inspect" and not r.is_inert, (body, extra)
+
+
+def test_a_signed_indirect_filter_is_still_indirect(tmp_path):
+    """Codex, PR #15: `/Filter +9 0 R` was not seen as a reference, no filter
+    name was found, and the ASCII85 body was scanned as unfiltered bytes."""
+    import base64
+
+    for ref in (b"+9 0 R", b"09 +00 R"):
+        data = _objstm(b"/Filter " + ref, base64.a85encode(_HIDDEN) + b"~>")
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect" and not r.is_inert, ref
+
+
+def test_only_top_level_keys_describe_the_stream(tmp_path):
+    """A /Filter inside a nested dictionary is not the stream's filter. Read
+    as one, an unfiltered body was decoded as ASCII85 (a `~>` in a comment
+    makes that succeed on nothing), and its raw /OpenAction was never read.
+    A key given twice is unknown: readers disagree about which one wins."""
+    body = b"%%~>\n" + _HIDDEN
+    data = _objstm(b"/X<</Filter/ASCII85Decode>>/Length %d" % len(body), body)
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+    data = _objstm(b"/Filter/FlateDecode/Filter/ASCII85Decode", zlib.compress(_HIDDEN))
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+# A content stream whose own text says `endstream`, then something that reads
+# as `/JS`. Both are data: they sit inside the body its /Length declares.
+_CONTENT = b"BT (endstream) Tj /JS 12 Tf ET"
+_TAIL = b"trailer<</Root 1 0 R>>\n%%EOF\n"
+
+
+def _content_stream(length: bytes, after: bytes = b"") -> bytes:
+    return (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n"
+        b"4 0 obj<</Length " + length + b">>stream\n" + _CONTENT
+        + b"\nendstream endobj\n" + after + _TAIL
+    )
+
+
+def test_an_indirect_length_is_resolved_so_a_body_stays_data(tmp_path):
+    """Codex, PR #15: with `/Length 6 0 R` unresolved, the body ended at the
+    `endstream` in its own text and the rest was read as structure, so a
+    benign `/JS` in a content stream held the file. Resolved, it is data."""
+    define = b"6 0 obj\n%d\nendobj\n" % len(_CONTENT)
+    data = _content_stream(b"6 0 R", define)
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "inspected" and r.is_inert, [f.name for f in r.findings]
+    # Defined before the stream, in another spelling of the same integer.
+    data = b"%PDF-1.4\n6 0 obj +0" + str(len(_CONTENT)).encode() + b" endobj\n" + _content_stream(b"6 0 R")[9:]
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", data))
+    assert r.state == "inspected" and r.is_inert, [f.name for f in r.findings]
+
+
+def test_an_indirect_length_that_cannot_be_resolved_falls_back(tmp_path):
+    """Defined twice with different values, undefined, or landing anywhere
+    but on `endstream`, a reference is not a length: the body ends at the
+    first `endstream`, as it did before, and what follows is structure."""
+    n = len(_CONTENT)
+    for after in (
+        b"6 0 obj %d endobj\n6 0 obj %d endobj\n" % (n, n + 1),   # disagree
+        b"",                                                     # undefined
+        b"6 0 obj %d endobj\n" % (n - 3),                         # misses
+        b"6 0 obj -%d endobj\n" % n,                              # negative
+    ):
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", _content_stream(b"6 0 R", after)))
+        assert "JS" in {f.name for f in r.active}, after
+
+
+def test_a_resolved_length_cannot_swallow_an_object(tmp_path):
+    """The resolved value is the file's word against the xref's, and the real
+    object may hide in an object stream. A length that reached past the first
+    `endstream`, over an object, to a later stream's `endstream` would blank
+    an /OpenAction a reader with the honest length parses. It falls back."""
+    head = b"%PDF-1.4\n4 0 obj<</Length 6 0 R>>stream\nabc"
+    rest = (
+        b"\nendstream endobj\n"
+        b"1 0 obj<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>endobj\n"
+        b"8 0 obj<</Length 3>>stream\nabc"
+    )
+    data = head + rest + b"\nendstream endobj\n6 0 obj %d endobj\n" % (3 + len(rest)) + _TAIL
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_resolved_length_does_not_vouch_for_an_unfiltered_object_stream(tmp_path):
+    """A decoy definition can put a resolved end at an `endstream` the body
+    supplies, and for raw objects the bytes cut off are objects. Only a
+    direct /Length vouches for an unfiltered object stream's end."""
+    body = b"1 0 2 30 <</A/xendstream>> <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    cut = body.index(b"endstream")
+    for value in (cut, len(body)):
+        data = _objstm(b"/Length 12 0 R", body).replace(_TAIL, b"12 0 obj %d endobj\n" % value + _TAIL)
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect" and not r.is_inert, value
+
+
+def test_only_a_top_level_type_or_n_and_first_make_an_object_stream(tmp_path):
+    """Codex, PR #15: `/First` or `/ObjStm` anywhere in the dictionary made a
+    stream an object stream, nested values included, so a content stream was
+    read as objects and its text reported `/JS`, and an image whose filter
+    this does not decode made the file `cannot_inspect`."""
+    text = b"BT /JS 12 Tf (hello) Tj ET"
+    for extra in (b"/Params<</First 1/N 1>>", b"/X<</Type/ObjStm>>", b"/N 1/X<</First 1>>"):
+        data = (
+            b"%%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n4 0 obj<</Length %d" % len(text)
+            + extra + b">>stream\n" + text + b"\nendstream endobj\n" + _TAIL
+        )
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "inspected" and r.is_inert, (extra, r.reason, [f.name for f in r.findings])
+    image = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n"
+        b"4 0 obj<</Subtype/Image/Filter/DCTDecode/DecodeParms<</First 0>>/Length 4>>stream\n"
+        b"\xff\xd8\xff\xd9\nendstream endobj\n" + _TAIL
+    )
+    assert pdf_inspect.inspect(_write(tmp_path, "b.pdf", image)).state == "inspected"
+
+
+def test_a_type_less_object_stream_is_still_found_by_its_top_level_keys(tmp_path):
+    """The other side: leaving out /Type does not hide an object stream whose
+    /N and /First are at top level, integers or references; and a dictionary
+    that cannot be read, naming /First anywhere, is unknown, never ordinary."""
+    for keys in (b"/N 1/First 4", b"/N 1/First 9 0 R"):
+        data = (
+            b"%PDF-1.5\n5 0 obj<<" + keys + b"/Filter/FlateDecode>>stream\n"
+            + zlib.compress(_HIDDEN) + b"\nendstream endobj\n" + _TAIL
+        )
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, keys
+    data = (
+        b"%PDF-1.5\n5 0 obj<</X<</First 4>>/Filter/FlateDecode/Filter/FlateDecode>>stream\n"
+        + zlib.compress(_HIDDEN) + b"\nendstream endobj\n" + _TAIL
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+_CATALOG = b"1 0 obj<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>endobj\n"
+
+
+def test_an_unclosed_string_cannot_hide_a_later_catalog(tmp_path):
+    """Codex, PR #15: an unused object with one unclosed `(` ran the string to
+    EOF and the scan stopped, but a reader walking the xref still parses the
+    catalog after it from its offset. Unknown, and what follows is still read
+    so the verdict carries it. A trailing backslash is the same string."""
+    for junk in (b"4 0 obj (never closed endobj\n", b"4 0 obj (x\\"):
+        for data in (
+            b"%PDF-1.4\n" + junk + _CATALOG + _TAIL,
+            b"%PDF-1.4\n" + _CATALOG + _TAIL + junk,
+        ):
+            r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+            assert r.state == "cannot_inspect" and not r.is_inert, data
+            assert "literal string" in r.reason
+        r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", b"%PDF-1.4\n" + junk + _CATALOG + _TAIL))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, junk
+    # Closed strings, nested and escaped ones included, are not held for it.
+    data = b"%PDF-1.4\n4 0 obj (a (b) \\) c) endobj\n1 0 obj<</Type/Catalog>>endobj\n" + _TAIL
+    assert pdf_inspect.inspect(_write(tmp_path, "c.pdf", data)).state == "inspected"
+
+
+def test_an_unclosed_string_in_an_object_stream_cannot_hide_the_next_object(tmp_path):
+    """The same inside an object stream, where it matters more: a reader finds
+    each object at its offset from /First, so object 2 is parsed whatever
+    object 1 left open, and this scan stopped at the `(`."""
+    inner = b"1 0 2 12 (unclosed    <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = _objstm(b"/Filter/FlateDecode", zlib.compress(inner))
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_stream_keyword_in_an_object_stream_is_unknown(tmp_path):
+    """An object stream cannot hold a stream. Taken as one, `stream` blanked
+    everything to the next `endstream` (here in a later object's string),
+    while a reader parses the catalog whose offset falls inside."""
+    inner = b"1 0 2 12 <</A 1>> stream\n<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>> (endstream)"
+    data = _objstm(b"/Filter/FlateDecode", zlib.compress(inner))
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+def test_a_stream_body_that_never_ends_is_unknown(tmp_path):
+    """With no `endstream` the body is tokenized as structure, and its bytes
+    steer the tokenizer: a `(` in the data, closed by a stray `)` after the
+    catalog, blanked an /OpenAction that a reader using /Length parses."""
+    data = (
+        b"%PDF-1.4\n4 0 obj<</Length 1>>stream\n(\n" + _CATALOG + b")\n" + _TAIL
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+    assert "endstream" in r.reason
+
+
+def test_a_dictionary_still_open_at_eof_is_unbalanced(tmp_path):
+    data = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n" + _TAIL + b"<</Junk 1\n"
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+def _xref_to(data: bytes, target: bytes) -> bytes:
+    """`data` with an xref table naming `target`'s offset as object 1, the
+    catalog: where a reader that trusts the xref goes to parse it."""
+    xref = b"xref\n0 2\n0000000000 65535 f \n%010d 00000 n \n" % data.index(target)
+    return data + xref + b"trailer<</Size 2/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % len(data)
+
+
+def test_a_catalog_inside_a_string_or_comment_is_still_read(tmp_path):
+    """Codex, PR #15: a balanced string can enclose a whole catalog. The parse
+    skipped the string as data, but the xref names the catalog's offset, so a
+    reader seeks into the string and parses its /OpenAction; a reader with a
+    broken xref finds the header by scanning the file. A comment is the same."""
+    for wrap in (
+        b"4 0 obj(" + _CATALOG.rstrip() + b")endobj\n",
+        b"%" + _CATALOG,
+    ):
+        data = _xref_to(b"%PDF-1.4\n" + wrap, b"1 0 obj")
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, wrap
+
+
+def test_a_catalog_inside_another_streams_body_is_still_read(tmp_path):
+    """Codex, PR #15: the same inside a stream whose direct /Length spans the
+    catalog. The parse trusts the span and blanks it; the xref does not care.
+    An object stream hidden the same way is decoded like any other."""
+    packed = zlib.compress(_HIDDEN)
+    for hidden in (
+        _CATALOG,
+        b"5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length %d>>stream\n" % len(packed)
+        + packed + b"\nendstream endobj\n",
+    ):
+        data = _xref_to(
+            b"%%PDF-1.4\n4 0 obj<</Length %d>>stream\n" % len(hidden) + hidden + b"\nendstream endobj\n",
+            hidden[:7],
+        )
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, hidden[:20]
+
+
+def test_an_object_hidden_in_data_that_does_not_end_is_unknown(tmp_path):
+    """A header inside a string whose object never reaches `endobj` cleanly
+    is what a reader may parse and this cannot read: unknown, not clean."""
+    for wrap in (
+        b"4 0 obj(1 0 obj<</Type/Catalog/Note\\(>>)endobj\n",   # a string that runs on
+        b"4 0 obj(1 0 obj<</Type/Catalog)endobj\n",              # a `<<` never closed
+    ):
+        data = b"%PDF-1.4\n" + wrap + _TAIL
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect", wrap
+
+
+def test_a_header_a_comment_swallowed_is_read_and_stays_benign(tmp_path):
+    """The one place the 77-PDF corpus has a header inside skipped bytes: an
+    incremental update appended with no newline after `%%EOF`, so a comment
+    holds the catalog's `1 0 obj`. It is read like any object, and a benign
+    catalog stays inspected."""
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n" + _TAIL.rstrip(b"\n")
+        + b"1 0 obj\r<</Type/Catalog/Lang(zh)/MarkInfo<</Marked true>>>>\rendobj\r" + _TAIL
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "inspected" and r.is_inert, (r.reason, [f.name for f in r.findings])
+
+
+def test_many_headers_inside_one_string_cost_little(tmp_path):
+    """Each hidden object is parsed once and stops at the next `obj`, so a
+    string of a hundred thousand headers is linear work, not quadratic."""
+    import time
+
+    data = b"%PDF-1.4\n4 0 obj(" + b"1 0 obj " * 100_000 + b"1 0 obj<</A 1>>endobj)endobj\n" + _TAIL
+    t = time.monotonic()
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert time.monotonic() - t < 20
+    assert r.state == "inspected" and r.is_inert, r.reason
+
+
+def test_a_line_of_comment_gaps_costs_little(tmp_path):
+    """Finding `N G obj V endobj` with comments allowed between the tokens was
+    a regex that tried every digit as a start and scanned the comment after
+    it to the end of its line each time. A megabyte of `1 % obj ` on one line
+    took about twenty minutes. Found from each `obj` and walked back, it is
+    linear. The length still resolves when the comments are real gaps."""
+    import time
+
+    data = b"%PDF-1.4\n4 0 obj(" + b"1 % obj " * 125_000 + b")endobj\n" + _TAIL
+    t = time.monotonic()
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert time.monotonic() - t < 10
+    assert r.state == "inspected" and r.is_inert, r.reason
+    define = b"6 %x 1 %y\n0 %z\nobj % a\n%b\n" + str(len(_CONTENT)).encode() + b" %c\nendobj\n"
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", _content_stream(b"6 0 R", define)))
+    assert r.state == "inspected" and r.is_inert, [f.name for f in r.findings]
+
+
+def test_a_comment_is_whitespace_in_an_indirect_length(tmp_path):
+    """Codex, PR #15: comments are lexical whitespace, but the length pattern
+    allowed only whitespace, so `6 0 obj % comment` left the reference
+    unresolved, the body was cut at the `endstream` in its text, and a benign
+    `/JS` in it held the file."""
+    n = str(len(_CONTENT)).encode()
+    for define in (
+        b"6 0 obj % the length\n" + n + b"\nendobj\n",
+        b"6%a\r0%b\robj%c\n+" + n + b"%d\nendobj\n",
+        b"6 0 obj\n%%%%\n" + n + b" % done\r\nendobj\n",
+    ):
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", _content_stream(b"6 0 R", define)))
+        assert r.state == "inspected" and r.is_inert, (define, [f.name for f in r.findings])
+
+
+def test_a_comment_before_endstream_still_honours_the_declared_length(tmp_path):
+    """The same whitespace rule after a body: a reader's lexer skips a comment
+    between the body and `endstream`. Missed, a direct /Length looked wrong,
+    the body was cut at an `endstream` inside the compressed bytes, and a
+    benign object stream was held as undecodable."""
+    body = _deflate_hiding_endstream(b"1 0 <</Type/Catalog>>")
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length "
+        + str(len(body)).encode() + b">>stream\n"
+        + body + b"\n% end of body\nendstream endobj\n" + _TAIL
+    )
+    assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
+
+
+def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
+    data = (
+        b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
+
+
 def test_an_encrypted_pdf_is_unknown_rather_than_clean(tmp_path):
     """Its streams cannot be read, so there is nothing to match. Reporting that
     as clean would be the single most misleading thing this module could do."""
@@ -108,7 +867,12 @@ def test_something_that_is_not_a_pdf_says_so(tmp_path):
 
 def test_a_zip_bomb_costs_a_few_megabytes_not_the_machine(tmp_path):
     """A stream that inflates to gigabytes is not a datasheet's structure."""
-    bomb = b"%PDF-1.5\n1 0 obj<</Filter/FlateDecode>>stream\n" + zlib.compress(b"\0" * (64 << 20))
+    # Terminated: a body with no `endstream` is unknown in its own right (see
+    # test_a_stream_body_that_never_ends_is_unknown), and this is about cost.
+    bomb = (
+        b"%PDF-1.5\n1 0 obj<</Filter/FlateDecode>>stream\n" + zlib.compress(b"\0" * (64 << 20))
+        + b"\nendstream endobj\n%%EOF\n"
+    )
     r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", bomb))
     assert r.state == "inspected"
 

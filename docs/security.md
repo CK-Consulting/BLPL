@@ -210,7 +210,17 @@ theatre:
   comparison.
 * **Compressed object streams.** Since PDF 1.5 most structure lives in
   Flate-compressed object streams, so `b"/OpenAction" in data` is a test that a
-  modern hostile file passes. Every stream that decompresses is scanned too.
+  modern hostile file passes. Every object stream is decompressed and scanned
+  too — recognised by `/Type /ObjStm` or by `/First`, which no reader can do
+  without, so omitting the type does not hide one.
+
+Names are read from the file's **structure only**. Stream bodies, strings and
+comments are blanked before matching, and image, page and metadata streams are
+not decompressed for names. A name inside data is not a name: base64 and
+ASCII85, which vendors use for XMP thumbnails and images, both use `/` as an
+ordinary character, and matching across the raw bytes read `x/JS/1T` in a
+thumbnail as `/JS`. That held TE's ANT-916-HESM datasheet for JavaScript it
+does not have. `/Encrypt` is detected the same structural way.
 
 One case is reported rather than papered over: an **encrypted** PDF has its
 streams enciphered, so there is nothing to match. That is `cannot_inspect`, not
