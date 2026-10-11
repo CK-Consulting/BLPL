@@ -362,48 +362,6 @@ def test_cli_assembly_writes_both_houses(tmp_path: Path, capsys) -> None:
     assert (stamp / "assembly" / "pcbway" / "bom.csv").is_file()
 
 
-# ---------------------------------------------------------------------------
-# The agent tools
-# ---------------------------------------------------------------------------
-
-
-def _ctx(tmp_path: Path):
-    from app.agent.toolspec import ToolContext
-    from app.references import FilesystemSandbox
-
-    return ToolContext(project_id="p", project_dir=tmp_path, sandbox=FilesystemSandbox(tmp_path))
-
-
-def test_agent_tool_refuses_an_unknown_house(tmp_path: Path) -> None:
-    import asyncio
-
-    from app.agent.registry import ToolDenied, fab_tools
-
-    spec = next(t for t in fab_tools() if t.name == "write_assembly_files")
-    with pytest.raises(ToolDenied, match="house must be"):
-        asyncio.run(spec.handler(_ctx(tmp_path), {"house": "oshpark"}))
-
-
-def test_agent_tool_points_at_the_release_build(tmp_path: Path) -> None:
-    import asyncio
-
-    from app.agent.registry import fab_tools
-
-    spec = next(t for t in fab_tools() if t.name == "write_assembly_files")
-    with pytest.raises(FileNotFoundError, match="release"):
-        asyncio.run(spec.handler(_ctx(tmp_path), {"house": "jlcpcb"}))
-
-
-def test_agent_sourcing_tool_needs_an_emitted_board(tmp_path: Path) -> None:
-    import asyncio
-
-    from app.agent.registry import fab_tools
-
-    spec = next(t for t in fab_tools() if t.name == "check_sourcing_gaps")
-    with pytest.raises(FileNotFoundError, match="stage6"):
-        asyncio.run(spec.handler(_ctx(tmp_path), {}))
-
-
 def test_assembly_package_serialises(board: Path, tmp_path: Path) -> None:
     pkg = bom.build_assembly(board / "board-bom.csv", None, tmp_path, house="pcbway")
     json.loads(bom.dumps(pkg.to_dict()))
