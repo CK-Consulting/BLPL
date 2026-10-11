@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getJSON, putJSON } from "../api";
+import { announceCommitted } from "../commitEvents";
 import { Code, langOf } from "./Code";
 import { Diagram, isDiagramFile } from "./Diagram";
 import { LineGutter, NumberedSource } from "./LineGutter";
@@ -138,10 +139,19 @@ export function FileView({
 
   const save = async () => {
     if (!path || !savable) return;
+    // A save that commits must not leave the last one's warning standing.
+    setError(null);
     try {
-      await putJSON(`/api/projects/${projectId}/files/${path}`, { content: draft });
+      const out = await putJSON<{ committed?: boolean; commit_error?: string }>(
+        `/api/projects/${projectId}/files/${path}`,
+        { content: draft },
+      );
       setContent(draft);
+      // A save can land and still fail to commit. Saying only "Saved" then is
+      // how a broken repository went unnoticed for two days.
       setStatus("Saved");
+      if (out?.commit_error) setError(`Saved — ${out.commit_error}`);
+      else if (out?.committed) announceCommitted(projectId);
       onSaved();
     } catch (e) {
       setError((e as Error).message);
