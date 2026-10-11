@@ -109,6 +109,12 @@ class GitStatus:
     #: which is a poor property for a control that pushes.
     remote_name: str = ""
     remote_url: str = ""
+    #: The branch has a remote to go to but has never been pushed there (no
+    #: upstream). `ahead` then counts the commits origin does not have, and the
+    #: push button must stay live even with nothing new to commit: adding a
+    #: remote to a clean local project is exactly this state, and the first
+    #: push is the only way its history gets anywhere.
+    unpublished: bool = False
 
 
 def _redact_url(url: str) -> str:
@@ -359,22 +365,35 @@ class Projects:
             self._git(d, "remote", "add", self.REMOTE, url)
         return url
 
-    def remote_of(self, name: str, *, checkout: Path | None = None) -> str:
-        """The URL the checkout's remote pushes to, or "" for a local-only
-        project. For credential matching — which is why a missing remote is an
-        empty answer, not an error: no remote means no credential could apply.
+    def remote_of(
+        self, name: str, *, operation: str, checkout: Path | None = None
+    ) -> str:
+        """The URL ``operation`` ("fetch" or "push") talks to, or "" for a
+        local-only project. For credential matching — which is why a missing
+        remote is an empty answer, not an error: no remote means no credential
+        could apply.
+
+        Required, not defaulted, because the two can be different hosts. A
+        remote with a fetch URL on one host and a pushurl on another answered
+        with the push URL for everything, so a pull fetched from the first host
+        while the credential helper offered it the second host's token —
+        leaking that token and failing the pull.
 
         Pass the checkout the operation runs in. A member's worktree branch can
         resolve a different remote from the owner's, and a credential chosen
         for the owner's remote would be offered to the member's host.
         """
+        if operation not in ("fetch", "push"):
+            raise ValueError(f"operation must be 'fetch' or 'push', not {operation!r}")
         d = checkout if checkout is not None else self.project_dir(name)
         remote = self._primary_remote(d) if (d / ".git").exists() else None
         if not remote:
             return ""
-        # The URL a push to that remote goes to, which is what the credential
-        # must match: pushurl when one is set, else url.
-        return self._git_allow_fail(d, "remote", "get-url", "--push", remote)
+        # The URL git itself connects to for this operation: for a push,
+        # pushurl when one is set, else url; for a fetch, always url.
+        if operation == "push":
+            return self._git_allow_fail(d, "remote", "get-url", "--push", remote)
+        return self._git_allow_fail(d, "remote", "get-url", remote)
 
     def pull(
         self, name: str, *, env: dict[str, str] | None = None, checkout: Path | None = None
@@ -466,9 +485,8 @@ class Projects:
         dirty = self._has_design_changes(d)
         has_remote = self._primary_remote(d) is not None
         ahead = behind = 0
-        if has_remote:
-            # Counts against the upstream, when one is configured. No upstream
-            # (a fresh local repo) leaves both at zero, which is the truth.
+        unpublished = False
+        if has_remote and self._upstream(d):
             counts = self._git_allow_fail(
                 d, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"
             )
@@ -476,6 +494,16 @@ class Projects:
                 parts = counts.split()
                 if len(parts) == 2:
                     behind, ahead = int(parts[0]), int(parts[1])
+        elif has_remote:
+            # Never pushed. Zero here hid the project's whole history from the
+            # push button the moment a remote was added to it: clean tree,
+            # ahead 0, button disabled. Count what origin lacks instead — every
+            # commit, for a remote just added.
+            unpublished = True
+            count = self._git_allow_fail(
+                d, "rev-list", "--count", "HEAD", "--not", f"--remotes={self.REMOTE}"
+            )
+            ahead = int(count) if count.isdigit() else 0
         remote_name = ""
         remote_url = ""
         if has_remote:
@@ -486,7 +514,8 @@ class Projects:
                 self._git_allow_fail(d, "remote", "get-url", "--push", remote_name).strip()
             )
         return GitStatus(branch=branch, ahead=ahead, behind=behind, dirty=dirty,
-                         has_remote=has_remote, remote_name=remote_name, remote_url=remote_url)
+                         has_remote=has_remote, remote_name=remote_name, remote_url=remote_url,
+                         unpublished=unpublished)
 
     # -- diff ----------------------------------------------------------------
 

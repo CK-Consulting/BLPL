@@ -2389,6 +2389,7 @@ def git_status(project_id: str, user: User = Depends(require_onboarded),
         "branch": st.branch, "ahead": st.ahead, "behind": st.behind,
         "dirty": st.dirty, "has_remote": st.has_remote,
         "remote_name": st.remote_name, "remote_url": st.remote_url,
+        "unpublished": st.unpublished,
     }
 
 
@@ -2457,7 +2458,9 @@ def git_pull(project_id: str, user: User = Depends(require_onboarded),
     master_key: bytes = Depends(require_master_key)) -> dict:
     checkout = _project_dir(session, user, project_id)
     try:
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id, checkout=checkout)) as env:
+        # A pull fetches, so the credential is the fetch URL's — which need not
+        # be the host a push goes to.
+        with _git_credentials(session, master_key, user, projects.remote_of(project_id, operation="fetch", checkout=checkout)) as env:
             out = projects.pull(project_id, env=env, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2472,7 +2475,7 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
     # the commit it made rather than the owner's branch.
     checkout = _project_dir(session, user, project_id)
     try:
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id, checkout=checkout)) as env:
+        with _git_credentials(session, master_key, user, projects.remote_of(project_id, operation="push", checkout=checkout)) as env:
             out = projects.push(project_id, env=env, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

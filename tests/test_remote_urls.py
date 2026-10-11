@@ -161,7 +161,7 @@ def test_the_projects_remote_is_origin_whatever_the_branch_tracks(tmp_path):
 
     st = store.status("p", checkout=work)
     assert (st.remote_name, st.remote_url) == ("origin", f"file://{origin}")
-    assert store.remote_of("p") == f"file://{origin}"
+    assert store.remote_of("p", operation="push") == f"file://{origin}"
 
 
 def test_pushes_go_to_origin_despite_push_overrides_and_from_members(tmp_path):
@@ -194,7 +194,41 @@ def test_pushes_go_to_origin_despite_push_overrides_and_from_members(tmp_path):
     store.push("p", checkout=member)
     assert "user/2" in _heads(origin) and "user/2" not in _heads(decoy)
     # …and the credential would be chosen for exactly that URL.
-    assert store.remote_of("p", checkout=member) == f"file://{origin}"
+    assert store.remote_of("p", operation="push", checkout=member) == f"file://{origin}"
+
+
+def test_pull_and_push_credentials_follow_their_own_urls(tmp_path):
+    # Codex P1 on #10: remote_of answered with the push URL for everything, so
+    # with origin fetching from host A and pushing to host B, a pull fetched
+    # from A while the credential helper offered it B's token — leaking the
+    # token to the wrong host and failing the pull.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    subprocess.run(["git", "remote", "add", "origin", "https://host-a.example/o/p.git"], cwd=work, check=True)
+    subprocess.run(["git", "remote", "set-url", "--push", "origin", "https://host-b.example/o/p.git"], cwd=work, check=True)
+
+    assert store.remote_of("p", operation="fetch") == "https://host-a.example/o/p.git"
+    assert store.remote_of("p", operation="push") == "https://host-b.example/o/p.git"
+    with pytest.raises(ValueError):
+        store.remote_of("p", operation="both")
+
+
+def test_a_never_pushed_branch_still_has_something_to_push(tmp_path):
+    # Codex P1 on #10: after adding origin to a clean local project there is
+    # no upstream, so ahead stayed 0 and the clean tree disabled Commit + Push
+    # — the only way that history could ever reach the new remote.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    store.set_remote(work, f"file://{origin}")
+
+    st = store.status("p", checkout=work)
+    assert st.unpublished and st.ahead == 1 and not st.dirty
+
+    store.push("p")
+    st = store.status("p", checkout=work)
+    assert not st.unpublished and st.ahead == 0
 
 
 def test_with_no_remote_at_all_origin_is_added(tmp_path):

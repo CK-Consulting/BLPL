@@ -411,6 +411,9 @@ export type GitStatus = {
   /** Where it points. Any credential embedded in the URL is replaced
    *  server-side, so this is safe to display and to screenshot. */
   remote_url: string;
+  /** Has a remote but has never been pushed to it. `ahead` then counts what
+   *  the remote lacks, and pushing is allowed with a clean tree. */
+  unpublished?: boolean;
 };
 
 export type LibraryPolicyValues = {

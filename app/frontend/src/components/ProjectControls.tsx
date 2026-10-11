@@ -68,6 +68,11 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
         </span>
       )}
       {st.ahead > 0 && <span className="badge">↑{st.ahead}</span>}
+      {st.has_remote && st.unpublished && (
+        <span className="badge" title="This branch has never been pushed to the remote.">
+          not pushed yet
+        </span>
+      )}
       {st.behind > 0 && <span className="badge">↓{st.behind}</span>}
       {!st.has_remote && (
         <span
@@ -83,7 +88,15 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
           Pull
         </button>
       )}
-      <button className="link" disabled={busy || (!st.dirty && st.ahead === 0)} onClick={commitAndPush}>
+      {/* A branch never pushed is publishable even when clean and even when
+          origin already has all its commits: the push is what creates it
+          there. Gating on `ahead` alone left a just-added remote with no way
+          to receive the project's history. */}
+      <button
+        className="link"
+        disabled={busy || (!st.dirty && st.ahead === 0 && !(st.has_remote && st.unpublished))}
+        onClick={commitAndPush}
+      >
         {st.has_remote ? "Commit + Push" : "Commit"}
       </button>
       {note && <span className="muted note">{note}</span>}
