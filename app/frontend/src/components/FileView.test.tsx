@@ -136,6 +136,60 @@ describe("renaming the open file", () => {
     expect(f).toHaveBeenCalledTimes(1);
   });
 
+  it("loads the new path when the rename overtook the first load", async () => {
+    // Codex, PR #17. The rename skip asked whether the old path was *shown*,
+    // not whether it had loaded. Renamed before its first /blob returned, the
+    // cancelled request was never replaced: the pane sat on empty content under
+    // the new name, and Edit then Save wrote that over the renamed file.
+    const user = userEvent.setup();
+    const held: Record<string, (body: string) => void> = {};
+    const f = vi.fn(async (url: string) => {
+      const p = new URL(url, "http://x").searchParams.get("path")!;
+      const body = await new Promise<string>((r) => (held[p] = r));
+      return { ok: true, status: 200, statusText: "OK", text: async () => body };
+    });
+    globalThis.fetch = f as unknown as typeof fetch;
+
+    const { rerender } = render(
+      <FileView projectId="p" path="a.md" onSaved={() => {}} reloadToken={0} />,
+    );
+    await waitFor(() => expect(held["a.md"]).toBeTruthy());
+    rerender(<FileView projectId="p" path="b.md" renamedFrom="a.md" onSaved={() => {}} reloadToken={0} />);
+
+    // Nothing has been read for b.md yet, so there is nothing Edit may start
+    // from and nothing Save may write.
+    const edit = screen.getByRole("button", { name: "Edit" }) as HTMLButtonElement;
+    expect(edit.disabled).toBe(true);
+    await user.click(edit);
+    expect(screen.queryByRole("textbox")).toBeNull();
+
+    await waitFor(() => expect(held["b.md"]).toBeTruthy());
+    held["a.md"]("STALE FROM BEFORE THE RENAME");
+    held["b.md"]("renamed body");
+    await waitFor(() => expect(screen.getByText("renamed body")).toBeTruthy());
+    expect(screen.queryByText(/STALE FROM BEFORE/)).toBeNull();
+    expect(edit.disabled).toBe(false);
+  });
+
+  it("never shows the previous file's text under a new path", async () => {
+    const held: ((body: string) => void)[] = [];
+    globalThis.fetch = vi.fn(async () => {
+      const body = await new Promise<string>((r) => held.push(r));
+      return { ok: true, status: 200, statusText: "OK", text: async () => body };
+    }) as unknown as typeof fetch;
+    const { rerender } = render(
+      <FileView projectId="p" path="a.md" onSaved={() => {}} reloadToken={0} />,
+    );
+    await waitFor(() => expect(held.length).toBe(1));
+    held[0]("first file body");
+    await waitFor(() => expect(screen.getByText("first file body")).toBeTruthy());
+
+    rerender(<FileView projectId="p" path="b.md" onSaved={() => {}} reloadToken={0} />);
+    await waitFor(() => expect(held.length).toBe(2));
+    expect(screen.queryByText("first file body")).toBeNull();
+    expect((screen.getByRole("button", { name: "Edit" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("still treats an unrelated path change as another file", async () => {
     const user = userEvent.setup();
     globalThis.fetch = serve("first", "second");

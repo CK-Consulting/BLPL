@@ -81,19 +81,39 @@ export function FileView({
   // the pane keeps its pre-change content until something unrelated reloads it.
   const pending = useRef(false);
   const [retry, setRetry] = useState(0);
+  // Whose bytes `content` holds: the key of the last fetch that landed, or
+  // null while none has for this file. Codex, PR #17: following a rename
+  // skipped the refetch whenever the old path was the one *shown*, but shown is
+  // not loaded — renamed before its first /blob returned, the cancelled request
+  // was never replaced, the pane sat on empty (or the previous file's) content
+  // under the new name, and Edit then Save wrote those bytes over the renamed
+  // file. State, so Edit and Save can refuse until it matches; a ref beside it
+  // so the effect reads the current value rather than the one it closed over.
+  const [loadedKey, setLoadedKeyState] = useState<string | null>(null);
+  const loadedRef = useRef<string | null>(null);
+  const setLoadedKey = (k: string | null) => {
+    loadedRef.current = k;
+    setLoadedKeyState(k);
+  };
+  const loaded = !!path && loadedKey === `${projectId}\u0000${path}`;
 
   useEffect(() => {
     const key = `${projectId}\u0000${path ?? ""}`;
     // A rename is the same document under a new name, not another file. Treated
     // as opening another, it left the editor and replaced the unsaved draft
     // with the file fetched from the new path: renaming lost the edits. The
-    // bytes on disk did not change, so there is nothing to fetch either.
+    // bytes on disk did not change, so there is nothing to fetch either —
+    // provided they were ever fetched. A rename that overtook the first load
+    // has nothing to preserve, and falls through to load the new path.
+    const before = renamedFrom === null ? null : `${projectId}\u0000${renamedFrom}`;
     if (
-      renamedFrom !== null &&
+      before !== null &&
       shownKey.current !== key &&
-      shownKey.current === `${projectId}\u0000${renamedFrom}`
+      shownKey.current === before &&
+      loadedRef.current === before
     ) {
       shownKey.current = key;
+      setLoadedKey(key);
       return;
     }
     const openedAnother = shownKey.current !== key;
@@ -114,6 +134,12 @@ export function FileView({
     if (openedAnother) {
       setEditing(false);
       setSource(false);
+      // The last file's text is not this file's. Left in place it was shown
+      // under the new name until the fetch landed, and was what Edit started
+      // from if the fetch never did.
+      setLoadedKey(null);
+      setContent("");
+      setDraft("");
     }
     setStatus(null);
     setError(null);
@@ -149,6 +175,7 @@ export function FileView({
           return text;
         });
         setDraft(text);
+        setLoadedKey(key);
       } catch (e) {
         if (!cancelled) setError((e as Error).message);
       }
@@ -168,7 +195,9 @@ export function FileView({
   }, [dirty]);
 
   const save = async () => {
-    if (!path || !savable) return;
+    // Never write what was not read from this path: an empty or foreign
+    // buffer saved here replaces the file with it.
+    if (!path || !savable || !loaded) return;
     try {
       await putJSON(`/api/projects/${projectId}/files/${path}`, { content: draft });
       setContent(draft);
@@ -229,8 +258,14 @@ export function FileView({
           </button>
           <button
             className={editing ? "on" : ""}
-            disabled={!savable}
-            title={savable ? undefined : "This file is not one the workbench edits"}
+            disabled={!savable || !loaded}
+            title={
+              !savable
+                ? "This file is not one the workbench edits"
+                : loaded
+                  ? undefined
+                  : "Still loading"
+            }
             onClick={() => {
               setDraft(content);
               setSource(false);
@@ -242,7 +277,7 @@ export function FileView({
           </button>
         </div>
         {editing && (
-          <button onClick={save} disabled={!dirty}>
+          <button onClick={save} disabled={!dirty || !loaded}>
             Save
           </button>
         )}
