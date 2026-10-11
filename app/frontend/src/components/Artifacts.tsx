@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { getJSON } from "../api";
+import { encodePath, getJSON } from "../api";
 import { withBoard } from "../board";
 
 /**
@@ -85,7 +85,7 @@ export function Artifacts({
 }
 
 function ArtifactView({ projectId, meta }: { projectId: string; meta: Meta }) {
-  const url = `/api/projects/${projectId}/artifacts/${meta.name}`;
+  const url = `/api/projects/${projectId}/artifacts/${encodePath(meta.name)}`;
   const [data, setData] = useState<unknown>(undefined);
   const [error, setError] = useState<string | null>(null);
   const isJson = meta.name.endsWith(".json");

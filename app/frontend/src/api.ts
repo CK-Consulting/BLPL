@@ -125,6 +125,20 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
   return res;
 }
 
+/**
+ * A project file path, made safe to put in a URL path.
+ *
+ * Each segment is encoded and the `/` between them kept, because the routes
+ * take `{name:path}` and the server decodes each `%xx` back. Interpolated raw,
+ * a valid filename stopped being one: `victim.md#draft.md` was sent as
+ * `victim.md` with a fragment the browser never transmits, so saving the
+ * renamed file overwrote an unrelated one (Codex, PR #17). `?` and `%` break
+ * the same way. Every URL that carries a project path goes through here.
+ */
+export function encodePath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
 export async function getJSON<T>(path: string): Promise<T> {
   const res = await request(path);
   if (!res.ok) await fail(res);
@@ -155,6 +169,14 @@ export async function postForm<T>(path: string, form: FormData): Promise<T> {
 export async function del(path: string): Promise<void> {
   const res = await request(path, { method: "DELETE" });
   if (!res.ok) await fail(res);
+}
+
+/** A DELETE whose answer matters — the body when there is one, else null. */
+export async function delJSON<T>(path: string): Promise<T | null> {
+  const res = await request(path, { method: "DELETE" });
+  if (!res.ok) await fail(res);
+  const text = await res.text();
+  return text ? (JSON.parse(text) as T) : null;
 }
 
 // Read an SSE body and dispatch each frame. Used for run streams, which are

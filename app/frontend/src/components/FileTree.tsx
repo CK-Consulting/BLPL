@@ -1,5 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
-import { getJSON, postJSON, putJSON } from "../api";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { type NodeApi, type NodeRendererProps, Tree, type TreeApi } from "react-arborist";
+import { delJSON, encodePath, getJSON, postJSON, putJSON } from "../api";
+import { ConfirmDialog, PromptDialog } from "./Dialog";
+import { isSavable } from "./FileView";
 import { UploadDialog } from "./UploadDialog";
 
 /**
@@ -22,6 +25,14 @@ import { UploadDialog } from "./UploadDialog";
  * The group's common prefix is dropped, so the Datasheets group does not open
  * with a `datasheets/` folder containing everything — that folder is what the
  * word "Datasheets" already said.
+ *
+ * It is also where files are managed: right-click (or F2, Delete, drag) to
+ * rename, move and delete. There was no way to delete a file at all before,
+ * so a file made by mistake stayed in the project until someone went in over
+ * ssh. The tree itself is react-arborist, which brings a complete ARIA tree —
+ * roving focus, arrow keys, type-ahead — where the hand-built one had
+ * deliberately stopped at disclosure buttons, because a half-built tree widget
+ * is worse than none.
  */
 
 export type TreeNode = {
@@ -42,6 +53,13 @@ export type TreeNode = {
   modified?: string;
   /** On the LLM-ignore list: the assistant leaves it alone unless asked by name. */
   llm_ignore?: boolean;
+  /** Not in git as it is now — untracked, ignored, or with uncommitted
+   *  changes: deleted here, git cannot bring these bytes back. */
+  untracked?: boolean;
+  /** A folder whose listing left something out — skipped tooling such as
+   *  node_modules, or contents below the depth limit. Deleting it removes
+   *  files the tree never showed, so nothing can be promised about them. */
+  incomplete?: boolean;
 };
 
 // Order matters: this is the order the groups appear, which is roughly the
@@ -61,42 +79,42 @@ const GROUPS: { role: TreeNode["role"]; label: string }[] = [
   { role: "quarantined", label: "Quarantine" },
 ];
 
-type Dir = {
+/** A row in the tree: a role group, a folder, or a file. */
+type Item = {
+  /**
+   * The row's identity to arborist, which keys lookup, open state, rename and
+   * drag on it: `<role>:<path>` for a file or folder, `group:<role>` for a
+   * group. Not a path, and never sent anywhere.
+   *
+   * It used to be the real path, but a folder appears once per group holding
+   * something in it — `shared/` under Design and again under KiCad — and two
+   * rows with one id made arborist pick either for a rename, a drag or a
+   * toggle (Codex, PR #17). Namespacing by group makes each row its own.
+   */
+  id: string;
+  /** The real project path a rename, move, delete or drop acts on. A group's
+   *  is "", and nothing acts on a group by path. */
+  path: string;
   name: string;
-  dirs: Map<string, Dir>;
-  files: TreeNode[];
+  kind: "group" | "folder" | "file";
+  /** The real folder this row puts things in ("" is the project root). A
+   *  file's is its parent; a group's is the prefix its rows share. */
+  dir: string;
+  node?: TreeNode;
+  count: number;
+  children?: Item[];
 };
 
-const emptyDir = (name: string): Dir => ({ name, dirs: new Map(), files: [] });
+const ROW_HEIGHT = 24;
 
-/**
- * Build a directory tree from flat paths, dropping the segments every file in
- * the group shares.
- *
- * Dropping the common prefix is what keeps the grouping worth having: without
- * it every Datasheets entry would sit under a `datasheets/` node that conveys
- * nothing the group heading did not.
- */
-function toTree(files: TreeNode[]): Dir {
-  const root = emptyDir("");
-  if (files.length === 0) return root;
-  const split = files.map((f) => f.path.split("/").filter(Boolean));
-  let common = 0;
-  // Never consume a file's own last segment: a group holding one file would
-  // otherwise strip its name away and leave an empty tree.
-  const shortest = Math.min(...split.map((p) => p.length - 1));
-  while (common < shortest && split.every((p) => p[common] === split[0][common])) common += 1;
-  files.forEach((f, i) => {
-    const parts = split[i].slice(common);
-    let here = root;
-    for (const seg of parts.slice(0, -1)) {
-      if (!here.dirs.has(seg)) here.dirs.set(seg, emptyDir(seg));
-      here = here.dirs.get(seg)!;
-    }
-    here.files.push(f);
-  });
-  return root;
-}
+const parentOf = (path: string) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "");
+const join = (dir: string, name: string) => (dir ? `${dir}/${name}` : name);
+
+/** What the backend refuses to delete or move: held files are evidence, and
+ *  dot-directories are machinery. Offering the action only to have it refused
+ *  would be a menu that lies. */
+const locked = (path: string) =>
+  path.split("/").some((seg) => seg === "retrieved" || seg.startsWith("."));
 
 /** Any segment beginning with a dot. A file in `.pipeline/` is as hidden as
  *  `.gitignore` is, and hiding only the leaf would be half a rule. */
@@ -104,9 +122,91 @@ export function isHidden(path: string): boolean {
   return path.split("/").some((seg) => seg.startsWith("."));
 }
 
-function countIn(dir: Dir): number {
-  let n = dir.files.length;
-  for (const d of dir.dirs.values()) n += countIn(d);
+/**
+ * Build a group's rows from flat paths, dropping the segments every entry
+ * shares.
+ *
+ * Dropping the common prefix is what keeps the grouping worth having: without
+ * it every Datasheets entry would sit under a `datasheets/` node that conveys
+ * nothing the group heading did not. It is dropped from the screen, not from
+ * the address — every row keeps its real path in `path`, because a rename or a
+ * drop has to name the real thing. Its `id` is namespaced by `role`, since the
+ * same folder can appear in more than one group.
+ */
+function toItems(entries: TreeNode[], role: string): { items: Item[]; prefix: string } {
+  if (entries.length === 0) return { items: [], prefix: "" };
+  const split = entries.map((f) => f.path.split("/").filter(Boolean));
+  let common = 0;
+  // Never consume an entry's own last segment: a group holding one file would
+  // otherwise strip its name away and leave an empty tree.
+  const shortest = Math.min(...split.map((p) => p.length - 1));
+  while (common < shortest && split.every((p) => p[common] === split[0][common])) common += 1;
+  const prefix = split[0].slice(0, common).join("/");
+
+  const root: Item = { id: "", path: prefix, name: "", kind: "folder", dir: prefix, count: 0, children: [] };
+  const folders = new Map<string, Item>([[prefix, root]]);
+  const folderAt = (path: string): Item => {
+    const known = folders.get(path);
+    if (known) return known;
+    const parent = folderAt(parentOf(path));
+    const made: Item = {
+      id: `${role}:${path}`,
+      path,
+      name: path.split("/").pop()!,
+      kind: "folder",
+      dir: path,
+      count: 0,
+      children: [],
+    };
+    parent.children!.push(made);
+    folders.set(path, made);
+    return made;
+  };
+  for (const n of entries) {
+    if (n.dir) {
+      folderAt(n.path);
+      continue;
+    }
+    const parent = folderAt(parentOf(n.path));
+    parent.children!.push({
+      id: `${role}:${n.path}`,
+      path: n.path,
+      name: n.name,
+      kind: "file",
+      dir: parent.dir,
+      node: n,
+      count: 0,
+    });
+  }
+  const finish = (f: Item): number => {
+    f.children!.sort(
+      (a, b) => Number(a.kind === "file") - Number(b.kind === "file") || a.name.localeCompare(b.name),
+    );
+    f.count = f.children!.reduce((n, c) => n + (c.kind === "file" ? 1 : finish(c)), 0);
+    return f.count;
+  };
+  finish(root);
+  return { items: root.children!, prefix };
+}
+
+function allOpen(items: Item[], into: Record<string, boolean> = {}): Record<string, boolean> {
+  for (const it of items) {
+    if (it.children) {
+      into[it.id] = true;
+      allOpen(it.children, into);
+    }
+  }
+  return into;
+}
+
+/** Rows on screen, so the tree is exactly as tall as its content and the
+ *  sidebar — not a box inside it — does the scrolling. */
+function visibleRows(items: Item[], open: Record<string, boolean>): number {
+  let n = 0;
+  for (const it of items) {
+    n += 1;
+    if (it.children && open[it.id]) n += visibleRows(it.children, open);
+  }
   return n;
 }
 
@@ -117,20 +217,62 @@ function size(bytes?: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+type MenuItem = { label: string; run: () => void; danger?: boolean };
+type MenuState = { item: Item; x: number; y: number };
+/** Each dialog carries the project it was opened for, and acts on that one or
+ *  on none: clearing it when the project changes is an effect, which runs a
+ *  render late, and a submit is not the place to find out which project the
+ *  page is on now (Codex, PR #17). */
+type DialogState =
+  | { kind: "new-file" | "new-folder"; dir: string; project: string }
+  | { kind: "delete"; item: Item; project: string };
+
+// The row renderer is handed to arborist as a component type, so it has to be
+// stable across renders — defined inline it would remount every row on every
+// render, and a rename input would lose its focus mid-word. What it needs from
+// the tree comes through context instead of a closure.
+const RowContext = createContext<{ openMenu: (item: Item, x: number, y: number) => void } | null>(
+  null,
+);
+
 export function FileTree({
   projectId,
   reloadToken,
   onOpen,
   onChanged,
+  onMoved,
+  onDeleted,
+  canMove,
+  canDelete,
 }: {
   projectId: string;
   reloadToken: number;
   /** A file the centre panel can show — markdown goes to the editor. */
   onOpen: (node: TreeNode) => void;
-  /** Something was created here. */
+  /** Something was created, moved or deleted here. */
   onChanged?: () => void;
+  /** A file or folder now lives somewhere else; an open file may need following. */
+  onMoved?: (from: string, to: string) => void;
+  /** A file or folder is gone; an open file under it should be closed. */
+  onDeleted?: (path: string) => void;
+  /** Asked before a move; a sentence refuses it, null lets it go ahead. */
+  canMove?: (from: string, to: string) => string | null;
+  /** Asked before a delete, the same way. */
+  canDelete?: (path: string) => string | null;
 }) {
-  const [nodes, setNodes] = useState<TreeNode[]>([]);
+  // Stamped with the project they came from. A tree request still in flight
+  // when the project changed could resolve last and fill the tree with the old
+  // project's rows, while every action used the new projectId, so deleting a
+  // stale row could delete a same-named file in the project now selected.
+  const [loaded, setLoaded] = useState<{ project: string; nodes: TreeNode[]; git: boolean }>({
+    project: "",
+    nodes: [],
+    git: false,
+  });
+  const current = loaded.project === projectId;
+  const nodes = current ? loaded.nodes : [];
+  const currentRef = useRef(projectId);
+  currentRef.current = projectId;
   const [filter, setFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [bump, setBump] = useState(0);
@@ -139,71 +281,234 @@ export function FileTree({
   // documents, which is a lot of noise in front of the four files anybody came
   // to look at.
   const [showHidden, setShowHidden] = useState(false);
-  const [uploading, setUploading] = useState(false);
+  // The project the upload dialog was opened for, like `dialog` below: files
+  // picked for one project must not land in the next.
+  const [uploading, setUploading] = useState<string | null>(null);
+  const [menu, setMenu] = useState<MenuState | null>(null);
+  const [dialog, setDialog] = useState<DialogState | null>(null);
+  // Design and Diagrams open; the rest stay folded. The tree opened with every
+  // group expanded, which put a project's four design documents at the bottom
+  // of a page of generated artifacts — and a project's architecture drawing is
+  // usually the first thing made and the thing most returned to.
+  const [open, setOpen] = useState<Record<string, boolean>>({
+    "group:design": true,
+    "group:diagram": true,
+  });
+  const [filterOpen, setFilterOpen] = useState<{ q: string; map: Record<string, boolean> }>({
+    q: "",
+    map: {},
+  });
+  const treeRef = useRef<TreeApi<Item> | undefined>(undefined);
 
   useEffect(() => {
-    getJSON<{ nodes: TreeNode[] }>(`/api/projects/${projectId}/tree`)
-      .then((d) => setNodes(d.nodes))
-      .catch(() => setNodes([]));
+    // Superseded requests are ignored: only the newest one for this project
+    // may set the tree.
+    let live = true;
+    getJSON<{ nodes: TreeNode[]; git?: boolean }>(`/api/projects/${projectId}/tree`)
+      .then((d) => {
+        if (live) setLoaded({ project: projectId, nodes: d.nodes, git: d.git !== false });
+      })
+      .catch(() => {
+        if (live) setLoaded({ project: projectId, nodes: [], git: false });
+      });
+    return () => {
+      live = false;
+    };
   }, [projectId, reloadToken, bump]);
 
-  // Creating lives with the tree, which is where the project's shape is. It
-  // used to be a "+ New" inside the editor's own file list — the only way to
-  // add anything, tucked inside a panel whose job is showing one file, and
-  // unable to make a folder at all.
-  const create = async (kind: "file" | "folder") => {
-    const raw = prompt(
-      kind === "file"
-        ? "New file (path relative to the project, e.g. sensor/board.md)"
-        : "New folder (path relative to the project, e.g. datasheets/NRF9151-LACA-R)",
-    );
-    const name = (raw ?? "").trim();
-    if (!name) return;
-    if (kind === "file" && !/\.(md|markdown|ya?ml)$/i.test(name)) {
-      setError("A new file must end in .md, .yaml or .yml — those are what the workbench edits.");
-      return;
-    }
-    try {
-      setError(null);
-      if (kind === "file") {
-        await putJSON(`/api/projects/${projectId}/files/${name}`, { content: "" });
-      } else {
-        await postJSON(`/api/projects/${projectId}/folders`, { path: name });
-      }
-      setBump((n) => n + 1);
-      onChanged?.();
-      if (kind === "file") {
-        onOpen({ path: name, name: name.split("/").pop() ?? name, dir: false, role: "design" });
-      }
-    } catch (e) {
-      setError((e as Error).message);
-    }
+  // A menu or dialog opened on the previous project's tree must not act on
+  // this one.
+  useEffect(() => {
+    setMenu(null);
+    setDialog(null);
+    setUploading(null);
+    setError(null);
+  }, [projectId]);
+  // What the open dialog may act on: nothing, unless it was opened here.
+  const live = dialog && dialog.project === projectId ? dialog : null;
+  const stillHere = (project: string, nothing: string) => {
+    if (currentRef.current !== project) throw new Error(`The project changed; ${nothing}.`);
   };
+  // Asked again once a request comes back. Checking before sending is not
+  // enough: the switch can land while the request is in flight, and its
+  // completion — onMoved, onDeleted, onOpen, a notice — would then act on
+  // the project the page shows now rather than the one it changed (Codex,
+  // PR #17). Read through the ref, because the closure's projectId is the
+  // old one by definition.
+  const stillOn = (project: string) => currentRef.current === project;
+
+  const changed = () => {
+    setBump((n) => n + 1);
+    onChanged?.();
+  };
+
+  const q = filter.trim().toLowerCase();
+  const filtering = q.length > 0;
 
   const hiddenCount = useMemo(
     () => nodes.filter((n) => !n.dir && isHidden(n.path)).length,
     [nodes],
   );
 
-  const files = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    return nodes.filter(
+  const files = useMemo(
+    () =>
+      nodes.filter(
+        (n) =>
+          !n.dir && (showHidden || !isHidden(n.path)) && (!q || n.path.toLowerCase().includes(q)),
+      ),
+    [nodes, q, showHidden],
+  );
+
+  // Empty folders too. A folder made with "+ Folder" holds nothing yet, and a
+  // tree built only from files never showed it — the folder you had just made
+  // was nowhere to be found.
+  const entries = useMemo(() => {
+    const occupied = new Set<string>();
+    for (const f of nodes) {
+      if (f.dir) continue;
+      for (let p = parentOf(f.path); p; p = parentOf(p)) occupied.add(p);
+    }
+    const empty = nodes.filter(
       (n) =>
-        !n.dir &&
+        n.dir &&
+        !occupied.has(n.path) &&
         (showHidden || !isHidden(n.path)) &&
         (!q || n.path.toLowerCase().includes(q)),
     );
-  }, [nodes, filter, showHidden]);
+    return [...files, ...empty];
+  }, [nodes, files, q, showHidden]);
 
-  const grouped = useMemo(() => {
-    const out = new Map<string, TreeNode[]>();
-    for (const n of files) {
-      const list = out.get(n.role) ?? [];
-      list.push(n);
-      out.set(n.role, list);
+  const data = useMemo(() => {
+    const out: Item[] = [];
+    for (const { role, label } of GROUPS) {
+      const list = entries.filter((n) => n.role === role);
+      if (list.length === 0) continue;
+      const { items, prefix } = toItems(list, role);
+      out.push({
+        id: `group:${role}`,
+        path: "",
+        name: label,
+        kind: "group",
+        dir: prefix,
+        count: list.filter((n) => !n.dir).length,
+        children: items,
+      });
     }
     return out;
-  }, [files]);
+  }, [entries]);
+
+  // A filter is a search, and a search that leaves its results folded away has
+  // not answered anything — so while filtering, everything starts open.
+  const fMap = filterOpen.q === q ? filterOpen.map : allOpen(data);
+  const openMap = filtering ? fMap : open;
+
+  const move = async (from: string, to: string) => {
+    setError(null);
+    if (!current) return;
+    const refusal = canMove?.(from, to);
+    if (refusal) {
+      setError(refusal);
+      return;
+    }
+    // Stamped, like a dialog: a rename still in flight when the header
+    // switched projects came back to the next project's page and called the
+    // onMoved it was handed then, which rewrote that project's open file if
+    // its path happened to match (Codex, PR #17). The move happened in the
+    // project it was sent to; nothing on this page is about that one now.
+    const project = projectId;
+    try {
+      const r = await postJSON<{
+        from?: string;
+        to?: string;
+        committed?: boolean;
+        ignore_list_updated?: boolean;
+      }>(
+        `/api/projects/${project}/files/move`,
+        { path: from, to },
+      );
+      if (!stillOn(project)) return;
+      // The backend's spelling, not ours: `dir//b.md` lands as `dir/b.md`,
+      // and an open file followed to the spelling we sent would point at a
+      // path no tree row has (Codex, PR #17).
+      const landed = r?.to ?? to;
+      onMoved?.(r?.from ?? from, landed);
+      changed();
+      // As with a delete: the move happened, so say when no commit records it.
+      const notes: string[] = [];
+      if (r && r.committed === false) {
+        notes.push(`${landed} was moved, but the move was not committed to the project's history.`);
+      }
+      // The file is still ignored at its new path; the old name stayed on the
+      // list too, and would cover a new file made there (Codex, PR #17).
+      if (r && r.ignore_list_updated === false) {
+        notes.push(`The LLM-ignore list still also names ${r?.from ?? from}; remove it there if a new file at that name should be readable.`);
+      }
+      if (notes.length) setError(notes.join(" "));
+    } catch (e) {
+      if (stillOn(project)) setError((e as Error).message);
+    }
+  };
+
+  // Asked before the confirmation, not after: being told to save your edits
+  // only once you have agreed to delete them is too late to be useful.
+  const askDelete = (item: Item) => {
+    setError(null);
+    if (!current) return;
+    const refusal = canDelete?.(item.path);
+    if (refusal) {
+      setError(refusal);
+      return;
+    }
+    setDialog({ kind: "delete", item, project: projectId });
+  };
+
+  const recoverable = (item: Item) => deleteIsRecoverable(nodes, item.path, loaded.git);
+
+  const menuItems = (item: Item): MenuItem[] => {
+    const out: MenuItem[] = [];
+    const n = item.node;
+    if (item.kind === "file" && n) out.push({ label: "Open", run: () => onOpen(n) });
+    if (!locked(item.dir)) {
+      out.push({
+        label: "New file here…",
+        run: () => setDialog({ kind: "new-file", dir: item.dir, project: projectId }),
+      });
+      out.push({
+        label: "New folder here…",
+        run: () => setDialog({ kind: "new-folder", dir: item.dir, project: projectId }),
+      });
+    }
+    if (item.kind !== "group" && !locked(item.path)) {
+      out.push({ label: "Rename", run: () => void treeRef.current?.edit(item.id) });
+      out.push({ label: "Delete…", run: () => askDelete(item), danger: true });
+    }
+    return out;
+  };
+
+  const onKeyDownCapture = (e: React.KeyboardEvent) => {
+    const tree = treeRef.current;
+    if (!tree || (e.target as Element).closest("input, textarea")) return;
+    const focused = tree.focusedNode;
+    if (!focused) return;
+    const item = focused.data;
+    // Enter opens, as it does in every file manager. Arborist's own Enter
+    // starts a rename, which turned "open the file I'm on" into "now you are
+    // editing its name".
+    if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (item.kind === "file" && item.node) onOpen(item.node);
+      else focused.toggle();
+    } else if (e.key === "F2" && item.kind !== "group" && !locked(item.path)) {
+      e.preventDefault();
+      e.stopPropagation();
+      void tree.edit(item.id);
+    } else if (e.key === "Delete" && item.kind !== "group" && !locked(item.path)) {
+      e.preventDefault();
+      e.stopPropagation();
+      askDelete(item);
+    }
+  };
 
   if (nodes.length === 0) {
     return <div className="muted small pad">Nothing on disk yet.</div>;
@@ -212,23 +517,24 @@ export function FileTree({
   return (
     <div className="file-tree">
       <div className="tree-actions">
-        <button className="link" onClick={() => void create("file")}>
+        <button className="link" onClick={() => setDialog({ kind: "new-file", dir: "", project: projectId })}>
           + File
         </button>
-        <button className="link" onClick={() => void create("folder")}>
+        <button className="link" onClick={() => setDialog({ kind: "new-folder", dir: "", project: projectId })}>
           + Folder
         </button>
-        <button className="link" onClick={() => setUploading(true)}>
+        <button className="link" onClick={() => setUploading(projectId)}>
           + Upload
         </button>
       </div>
-      {uploading && (
+      {uploading === projectId && (
         <UploadDialog
-          projectId={projectId}
-          onClose={() => setUploading(false)}
+          projectId={uploading}
+          onClose={() => setUploading(null)}
+          // The dialog closes on a switch, but an upload it already sent still
+          // comes back and calls this; it changed the old project, not this one.
           onUploaded={() => {
-            setBump((n) => n + 1);
-            onChanged?.();
+            if (stillOn(uploading)) changed();
           }}
         />
       )}
@@ -240,35 +546,70 @@ export function FileTree({
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
       />
-      {GROUPS.map(({ role, label }) => {
-        const list = grouped.get(role);
-        if (!list || list.length === 0) return null;
-        return (
-          <Group
-            key={role}
-            label={label}
-            count={list.length}
-            // Design open, everything else folded. The tree opened with every
-            // group and every folder expanded, which put a project's four
-            // design documents at the bottom of a page of generated artifacts.
-            // Design is what the workbench is for.
-            // Design and Diagrams open; the rest stay folded. A project's
-            // architecture drawing is usually the first thing made and the
-            // thing most returned to.
-            defaultOpen={role === "design" || role === "diagram"}
-            // A filter is a search, and a search that leaves its results folded
-            // away has not answered anything.
-            forceOpen={filter.trim().length > 0}
+      <RowContext.Provider value={{ openMenu: (item, x, y) => setMenu({ item, x, y }) }}>
+        <div onKeyDownCapture={onKeyDownCapture}>
+          <Tree<Item>
+            // Remounted per search, so every search starts from "all open"
+            // rather than from wherever the last one was left.
+            key={filtering ? `q:${q}` : "all"}
+            ref={treeRef}
+            data={data}
+            aria-label="Project files"
+            width="100%"
+            height={visibleRows(data, openMap) * ROW_HEIGHT}
+            rowHeight={ROW_HEIGHT}
+            rowClassName="tree-rowwrap"
+            indent={14}
+            openByDefault={false}
+            initialOpenState={openMap}
+            disableMultiSelection
+            disableDrag={(d) => d.kind === "group" || locked(d.path)}
+            disableEdit={(d) => d.kind === "group" || locked(d.path)}
+            // Asked of real paths as well as of rows: the same folder shown in
+            // another group is a different row but the same directory, and a
+            // folder dropped into its own copy there is still a folder dropped
+            // into itself.
+            disableDrop={({ parentNode, dragNodes }) =>
+              parentNode.isRoot ||
+              locked(parentNode.data.dir) ||
+              dragNodes.some(
+                (d) =>
+                  d.id === parentNode.id ||
+                  d.isAncestorOf(parentNode) ||
+                  (d.data.kind === "folder" &&
+                    (parentNode.data.dir === d.data.path ||
+                      parentNode.data.dir.startsWith(`${d.data.path}/`))),
+              )
+            }
+            onToggle={(id) => {
+              if (filtering) setFilterOpen({ q, map: { ...fMap, [id]: !fMap[id] } });
+              else setOpen((o) => ({ ...o, [id]: !o[id] }));
+            }}
+            onActivate={(node) => {
+              const it = node.data;
+              if (it.kind === "file" && it.node) onOpen(it.node);
+              else node.toggle();
+            }}
+            onRename={({ name, node }) => {
+              const next = name.trim();
+              if (!next || next === node.data.name) return;
+              const from = node.data.path;
+              void move(from, join(parentOf(from), next));
+            }}
+            onMove={({ dragNodes, parentNode }) => {
+              if (!parentNode) return;
+              const dir = parentNode.data.dir;
+              for (const d of dragNodes) {
+                const from = d.data.path;
+                if (parentOf(from) === dir) continue;
+                void move(from, join(dir, from.split("/").pop()!));
+              }
+            }}
           >
-            <Branch
-              dir={toTree(list)}
-              depth={0}
-              onOpen={onOpen}
-              forceOpen={filter.trim().length > 0}
-            />
-          </Group>
-        );
-      })}
+            {Row}
+          </Tree>
+        </div>
+      </RowContext.Provider>
       {hiddenCount > 0 && (
         <label className="tree-hidden-toggle">
           <input
@@ -279,130 +620,259 @@ export function FileTree({
           <span>Show hidden ({hiddenCount})</span>
         </label>
       )}
-      {files.length === 0 && <div className="muted small pad">No file matches that.</div>}
+      {entries.length === 0 && <div className="muted small pad">No file matches that.</div>}
+      {menu && (
+        <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.item)} onClose={() => setMenu(null)} />
+      )}
+      {live?.kind === "new-file" && (
+        <PromptDialog
+          title="New file"
+          label="Path in the project"
+          initial={live.dir ? `${live.dir}/` : ""}
+          placeholder="sensor/board.md"
+          submitLabel="Create"
+          hint="Ends in .md, .yaml or .yml — those are what the workbench edits."
+          onClose={() => setDialog(null)}
+          onSubmit={async (name) => {
+            if (!/\.(md|markdown|ya?ml)$/i.test(name)) {
+              throw new Error(
+                "A new file must end in .md, .yaml or .yml — those are what the workbench edits.",
+              );
+            }
+            stillHere(live.project, "nothing was created");
+            const r = await putJSON<{ path?: string }>(
+              `/api/projects/${live.project}/files/${encodePath(name)}`,
+              { content: "" },
+            );
+            if (!stillOn(live.project)) return;
+            changed();
+            // The backend's spelling, as with a move: `dir//a.md` is written as
+            // `dir/a.md`, and an editor left holding the typed spelling has a
+            // path no tree row has, so onMoved and the unsaved-edit guards,
+            // which compare strings, miss it (Codex, PR #17). Dropping empty
+            // segments here is the backend's own rule, for an older backend
+            // that does not send the path back.
+            const path = r?.path ?? name.split("/").filter(Boolean).join("/");
+            onOpen({ path, name: path.split("/").pop() ?? path, dir: false, role: "design" });
+          }}
+        />
+      )}
+      {live?.kind === "new-folder" && (
+        <PromptDialog
+          title="New folder"
+          label="Path in the project"
+          initial={live.dir ? `${live.dir}/` : ""}
+          placeholder="datasheets/NRF9151-LACA-R"
+          submitLabel="Create"
+          onClose={() => setDialog(null)}
+          onSubmit={async (path) => {
+            stillHere(live.project, "nothing was created");
+            await postJSON(`/api/projects/${live.project}/folders`, { path });
+            if (!stillOn(live.project)) return;
+            changed();
+          }}
+        />
+      )}
+      {live?.kind === "delete" && (
+        <ConfirmDialog
+          title={live.item.kind === "folder" ? "Delete folder" : "Delete file"}
+          confirmLabel="Delete"
+          danger
+          message={
+            <>
+              Delete <code>{live.item.path}</code>
+              {live.item.kind === "folder" ? " and everything in it" : ""}?{" "}
+              {recoverable(live.item) ? (
+                "The delete is committed, so it can be recovered from the project's history."
+              ) : (
+                <strong>
+                  {live.item.kind === "folder" ? "Some of it is" : "It is"} not in git history —
+                  this cannot be undone.
+                </strong>
+              )}
+            </>
+          }
+          onClose={() => setDialog(null)}
+          onConfirm={async () => {
+            const path = live.item.path;
+            stillHere(live.project, "nothing was deleted");
+            const refusal = canDelete?.(path);
+            if (refusal) throw new Error(refusal);
+            const r = await delJSON<{ committed?: boolean; ignore_list_updated?: boolean }>(
+              `/api/projects/${live.project}/files/${encodePath(path)}`,
+            );
+            if (!stillOn(live.project)) return;
+            onDeleted?.(path);
+            changed();
+            // The bytes are gone either way; say so when no commit records it.
+            const notes: string[] = [];
+            if (r && r.committed === false) {
+              notes.push(`${path} was deleted, but the delete was not committed to the project's history.`);
+            }
+            // The list could not be rewritten after the delete, so its entry
+            // would cover a new file made at that name (Codex, PR #17).
+            if (r && r.ignore_list_updated === false) {
+              notes.push(`The LLM-ignore list still names ${path}; remove it there if a new file at that name should be readable.`);
+            }
+            if (notes.length) setError(notes.join(" "));
+          }}
+        />
+      )}
     </div>
   );
 }
 
-/** A collapsible category. Folded groups are the difference between a tree you
- *  scan and a tree you scroll. */
-function Group({
-  label,
-  count,
-  defaultOpen,
-  forceOpen,
-  children,
-}: {
-  label: string;
-  count: number;
-  defaultOpen: boolean;
-  forceOpen: boolean;
-  children: React.ReactNode;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  const shown = forceOpen || open;
+function Row({ node, style, dragHandle }: NodeRendererProps<Item>) {
+  const ctx = useContext(RowContext);
+  const it = node.data;
+  const onContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    node.focus();
+    ctx?.openMenu(it, e.clientX, e.clientY);
+  };
+  const caret = (
+    <span className="tree-caret" aria-hidden="true">
+      {node.isOpen ? "▾" : "▸"}
+    </span>
+  );
+  if (it.kind === "group") {
+    return (
+      <div style={style} className="tree-row rail-subtitle tree-group-head" onContextMenu={onContextMenu}>
+        {caret}
+        {it.name} <span className="muted">{it.count}</span>
+      </div>
+    );
+  }
+  const n = it.node;
+  const classes = [
+    "tree-row",
+    it.kind === "folder" ? "tree-folder" : "tree-item",
+    node.isFocused ? "focused" : "",
+    node.willReceiveDrop ? "drop-target" : "",
+  ].join(" ");
   return (
-    <div className="tree-group">
-      <button
-        className="rail-subtitle tree-group-head"
-        aria-expanded={shown}
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span className="tree-caret" aria-hidden="true">
-          {shown ? "▾" : "▸"}
+    <div
+      ref={dragHandle}
+      style={style}
+      className={classes}
+      onContextMenu={onContextMenu}
+      title={n ? `${n.path}${n.bytes !== undefined ? ` · ${size(n.bytes)}` : ""}` : it.path}
+    >
+      {/* A caret alone would be the only thing distinguishing a folder from a
+          file, and it is four pixels wide. The count says it too. */}
+      {it.kind === "folder" ? caret : <span className="tree-caret" aria-hidden="true" />}
+      {node.isEditing ? (
+        <RenameInput node={node} />
+      ) : (
+        <span className="tree-name mono">
+          {it.name}
+          {it.kind === "folder" ? "/" : ""}
         </span>
-        {label} <span className="muted">{count}</span>
-      </button>
-      {shown && children}
+      )}
+      {n?.llm_ignore && (
+        <span className="tree-badge muted small" title="On the LLM-ignore list">
+          LLM ignore
+        </span>
+      )}
+      <span className="spacer" />
+      <span className="muted tree-size">{it.kind === "folder" ? it.count : size(n?.bytes)}</span>
     </div>
   );
 }
 
-/**
- * One level of the tree: its folders, then its files.
- *
- * Disclosure buttons rather than an ARIA tree widget. A `role="tree"` brings
- * roving tabindex and arrow-key navigation with it, and a half-built one is
- * worse than none — it takes the items out of the tab order and then does not
- * replace what it removed. Nested buttons are focusable and operable as they
- * come, and the nesting is announced by the heading structure around them.
- */
-function Branch({
-  dir,
-  depth,
-  onOpen,
-  forceOpen,
-}: {
-  dir: Dir;
-  depth: number;
-  onOpen: (node: TreeNode) => void;
-  forceOpen: boolean;
-}) {
+function RenameInput({ node }: { node: NodeApi<Item> }) {
   return (
-    <>
-      {[...dir.dirs.values()]
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .map((child) => (
-          <Folder key={child.name} dir={child} depth={depth} onOpen={onOpen} forceOpen={forceOpen} />
-        ))}
-      {[...dir.files]
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .map((n) => (
-          <button
-            className="tree-item"
-            key={n.path}
-            style={{ paddingLeft: `${0.45 + depth * 0.85}rem` }}
-            onClick={() => onOpen(n)}
-            title={`${n.path}${n.bytes !== undefined ? ` · ${size(n.bytes)}` : ""}`}
-          >
-            <span className="tree-name mono">{n.name}</span>
-            {n.llm_ignore && (
-              <span className="tree-badge muted small" title="On the LLM-ignore list">
-                LLM ignore
-              </span>
-            )}
-            <span className="spacer" />
-            <span className="muted tree-size">{size(n.bytes)}</span>
-          </button>
-        ))}
-    </>
+    <input
+      autoFocus
+      className="tree-rename mono"
+      aria-label={`New name for ${node.data.name}`}
+      defaultValue={node.data.name}
+      onFocus={(e) => {
+        // The stem selected and the extension left alone, as file managers do:
+        // renaming board.md to power.md should not mean retyping ".md".
+        const v = e.currentTarget.value;
+        const dot = v.lastIndexOf(".");
+        e.currentTarget.setSelectionRange(0, node.data.kind === "file" && dot > 0 ? dot : v.length);
+      }}
+      onClick={(e) => e.stopPropagation()}
+      onBlur={() => node.reset()}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") node.reset();
+        if (e.key === "Enter") node.submit(e.currentTarget.value);
+      }}
+    />
   );
 }
 
-function Folder({
-  dir,
-  depth,
-  onOpen,
-  forceOpen,
+function ContextMenu({
+  x,
+  y,
+  items,
+  onClose,
 }: {
-  dir: Dir;
-  depth: number;
-  onOpen: (node: TreeNode) => void;
-  forceOpen: boolean;
+  x: number;
+  y: number;
+  items: MenuItem[];
+  onClose: () => void;
 }) {
-  // Folded, like the groups above them. A per-MPN datasheet directory is a
-  // place you go when you want it, not something to wade past.
-  const [open, setOpen] = useState(false);
-  const shown = forceOpen || open;
+  const ref = useRef<HTMLDivElement>(null);
+  // Read through a ref so the listeners are installed once: the parent passes a
+  // fresh closure every render, and re-running this would yank focus back to
+  // the first item whenever the tree reloaded underneath an open menu.
+  const close = useRef(onClose);
+  close.current = onClose;
+  useEffect(() => {
+    ref.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    const down = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) close.current();
+    };
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close.current();
+    };
+    window.addEventListener("mousedown", down);
+    window.addEventListener("keydown", key);
+    return () => {
+      window.removeEventListener("mousedown", down);
+      window.removeEventListener("keydown", key);
+    };
+  }, []);
+  if (items.length === 0) return null;
+  const step = (e: React.KeyboardEvent, by: number) => {
+    const buttons = [...(ref.current?.querySelectorAll<HTMLButtonElement>("button") ?? [])];
+    const i = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    buttons[(i + by + buttons.length) % buttons.length]?.focus();
+    e.preventDefault();
+  };
   return (
-    <>
-      <button
-        className="tree-folder"
-        style={{ paddingLeft: `${0.45 + depth * 0.85}rem` }}
-        aria-expanded={shown}
-        onClick={() => setOpen((v) => !v)}
-      >
-        {/* A caret alone would be the only thing distinguishing a folder from a
-            file, and it is four pixels wide. The count says it too. */}
-        <span className="tree-caret" aria-hidden="true">
-          {shown ? "▾" : "▸"}
-        </span>
-        <span className="tree-name mono">{dir.name}/</span>
-        <span className="spacer" />
-        <span className="muted tree-size">{countIn(dir)}</span>
-      </button>
-      {shown && <Branch dir={dir} depth={depth + 1} onOpen={onOpen} forceOpen={forceOpen} />}
-    </>
+    <div
+      ref={ref}
+      className="context-menu"
+      role="menu"
+      // Kept on screen: a menu opened near the bottom of the sidebar would
+      // otherwise hang off the window with its last item unreachable.
+      style={{
+        left: Math.max(0, Math.min(x, window.innerWidth - 200)),
+        top: Math.max(0, Math.min(y, window.innerHeight - items.length * 30 - 12)),
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "ArrowDown") step(e, 1);
+        if (e.key === "ArrowUp") step(e, -1);
+      }}
+    >
+      {items.map((i) => (
+        <button
+          key={i.label}
+          role="menuitem"
+          className={i.danger ? "danger" : ""}
+          onClick={() => {
+            onClose();
+            i.run();
+          }}
+        >
+          {i.label}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -426,6 +896,98 @@ export function destinationFor(node: TreeNode): "text" | "kicad" | "browser" {
   // LICENSE, Makefile. Guessing wrong here costs a wasted tab, not data.
   if (!name.includes(".") && (node.bytes ?? 0) < 512 * 1024) return "text";
   return "browser";
+}
+
+/**
+ * Why nothing may move or delete `path` yet, or null: a save of the document
+ * at `saving` (or of one inside a folder at `path`) has not come back.
+ *
+ * Codex, PR #17: the editor stays dirty until its PUT returns, and a rename to
+ * a savable name is allowed while dirty, so Save then an immediate rename sent
+ * both. If the move reached the backend first, the PUT recreated the old path
+ * holding the draft, the renamed file kept the old bytes, and the PUT's
+ * completion then cleared the unsaved badge under the new name — reporting
+ * saved what was not. The two requests have no order the server can see, so
+ * the only safe order is the one enforced here: the save finishes first.
+ */
+function saveInFlight(saving: string | null, path: string): string | null {
+  if (!saving) return null;
+  if (saving !== path && !saving.startsWith(`${path}/`)) return null;
+  return `${saving} is still being saved. Wait for the save to finish, then try again.`;
+}
+
+/**
+ * Why a move must wait, or null. The editor keeps an unsaved draft across a
+ * rename only while the file stays a text document: renamed to .pdf or
+ * .kicad_sch, the editor is handed no path, the draft is hidden, and the next
+ * file opened discards it. Only the older on-disk contents would have moved.
+ *
+ * "Still opens as text" is not enough, though. a.md renamed to a.txt, a.json
+ * or an extensionless name still opens in the editor with the draft intact,
+ * but FileView will not save those, so Save does nothing and the draft is lost
+ * all the same (Codex, PR #17). The destination has to stay savable, asked of
+ * FileView's own predicate so the two cannot drift.
+ */
+export function moveRefusalForDraft(
+  openPath: string | null,
+  dirty: boolean,
+  from: string,
+  to: string,
+  saving: string | null = null,
+): string | null {
+  const wait = saveInFlight(saving, from);
+  if (wait) return wait;
+  if (!dirty || !openPath) return null;
+  if (openPath !== from && !openPath.startsWith(`${from}/`)) return null;
+  const moved = to + openPath.slice(from.length);
+  const name = moved.split("/").pop() ?? moved;
+  if (isSavable(moved)) return null;
+  return `${openPath} has unsaved edits, and as ${name} the editor could no longer save them. Save or discard them first.`;
+}
+
+/**
+ * Why a delete must wait, or null. Deleting the open, dirty file (or a folder
+ * holding it) closes the editor and drops the only copy of the draft; the
+ * commit holds just the older contents on disk.
+ */
+export function deleteRefusalForDraft(
+  openPath: string | null,
+  dirty: boolean,
+  path: string,
+  saving: string | null = null,
+): string | null {
+  const wait = saveInFlight(saving, path);
+  if (wait) return wait;
+  if (!dirty || !openPath) return null;
+  if (openPath !== path && !openPath.startsWith(`${path}/`)) return null;
+  return `${openPath} has unsaved edits that deleting it would lose. Save or discard your edits first.`;
+}
+
+/**
+ * Whether git can bring back everything a delete of `path` removes. Unknown
+ * when git could not answer, and unknown is not "yes".
+ *
+ * For a folder this is a claim about every file in it, and the tree knows
+ * only the files it listed. "No untracked file among them" promised recovery
+ * for an empty folder — git records no folders, so it cannot come back — and
+ * for one whose listing was partial, where the rmtree also takes whatever was
+ * skipped or lay below the depth limit (Codex, PR #17). So a folder counts as
+ * recoverable only with at least one listed file, none of them untracked, and
+ * no incomplete folder in it, itself included.
+ */
+export function deleteIsRecoverable(nodes: TreeNode[], path: string, git: boolean): boolean {
+  if (!git) return false;
+  let files = 0;
+  for (const n of nodes) {
+    if (n.path !== path && !n.path.startsWith(`${path}/`)) continue;
+    if (n.dir) {
+      if (n.incomplete) return false;
+      continue;
+    }
+    if (n.untracked) return false;
+    files++;
+  }
+  return files > 0;
 }
 
 /** Kept for callers that only ask the older question. */

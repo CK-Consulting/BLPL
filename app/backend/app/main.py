@@ -2834,6 +2834,9 @@ def _tree_role(rel: Path) -> str:
     return "other"
 
 
+_TREE_MAX_DEPTH = 6
+
+
 def _walk_tree(root: Path, base: Path, depth: int = 0) -> list[dict]:
     """Everything in a project, as a flat list of nodes with relative paths.
 
@@ -2841,24 +2844,52 @@ def _walk_tree(root: Path, base: Path, depth: int = 0) -> list[dict]:
     to filter, sort and diff than a tree of dicts. Depth-limited because a
     runaway directory should cost a truncated listing rather than a hung request.
     """
-    if depth > 6:
-        return []
+    return _walk_dir(root, base, depth)[0]
+
+
+def _walk_dir(root: Path, base: Path, depth: int) -> tuple[list[dict], bool]:
+    """The nodes under ``root``, and whether they are *all* of what is there.
+
+    A folder whose listing left something out is marked ``incomplete``, because
+    the tree is also what decides whether deleting the folder can be undone
+    (Codex, PR #17). The delete is an rmtree: it removes what the listing
+    skipped — a ``node_modules`` or a nested ``.git`` — and what lay below the
+    depth limit, and the client, seeing no untracked file among what was
+    listed, promised all of it back from history. Unlisted is not tracked.
+    """
+    if depth > _TREE_MAX_DEPTH:
+        # Past the limit nothing is listed. Complete only if nothing is there.
+        try:
+            return [], next(root.iterdir(), None) is None
+        except OSError:
+            return [], False
     out: list[dict] = []
+    complete = True
     try:
         entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
     except OSError:
-        return out
+        return out, False
     for p in entries:
         if p.name in _TREE_SKIP:
+            # Never a delete target itself — the delete route refuses any
+            # dot-segment, and the rest are tooling, not content — but a
+            # folder holding one loses it to the rmtree all the same.
+            complete = False
             continue
         rel = p.relative_to(base)
         if p.is_dir():
-            out.append({"path": str(rel), "name": p.name, "dir": True, "role": _tree_role(rel)})
-            out.extend(_walk_tree(p, base, depth + 1))
+            node = {"path": str(rel), "name": p.name, "dir": True, "role": _tree_role(rel)}
+            out.append(node)
+            below, whole = _walk_dir(p, base, depth + 1)
+            if not whole:
+                node["incomplete"] = True
+                complete = False
+            out.extend(below)
             continue
         try:
             st = p.stat()
         except OSError:
+            complete = False
             continue
         out.append(
             {
@@ -2870,7 +2901,7 @@ def _walk_tree(root: Path, base: Path, depth: int = 0) -> list[dict]:
                 "modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
             }
         )
-    return out
+    return out, complete
 
 
 @app.get("/api/projects/{project_id}/tree")
@@ -2892,10 +2923,44 @@ def get_tree(
     # Marked on the node so the tree can say which files the assistant has been
     # told to leave alone, rather than that living only in a JSON file.
     ignored = llm_ignore.paths(proj)
+    recoverable = _recoverable_paths(proj)
     for node in nodes:
         if not node["dir"] and node["path"] in ignored:
             node["llm_ignore"] = True
-    return {"project_id": project_id, "nodes": nodes}
+        # Marked so a delete can say whether git can bring the file back: an
+        # untracked or ignored file deleted here is gone, and a confirmation
+        # promising "one revert away" would be untrue for it. So is a tracked
+        # file with uncommitted changes — the delete commits only the deletion,
+        # so a revert restores HEAD's bytes, not the ones that were deleted.
+        # Still named "untracked" for the client, which asks only "can git
+        # bring this back as it is?".
+        if not node["dir"] and recoverable is not None and node["path"] not in recoverable:
+            node["untracked"] = True
+    # False when git could not answer; the client then promises no recovery.
+    return {"project_id": project_id, "nodes": nodes, "git": recoverable is not None}
+
+
+def _recoverable_paths(checkout: Path) -> set[str] | None:
+    """Every path git could restore exactly as it is now, or None when git cannot say.
+
+    That is a file in HEAD with no change since, staged or not. ``ls-files``
+    alone was the earlier answer and said yes too often (Codex, PR #17): it
+    lists a tracked file with uncommitted edits, and a file only ever staged,
+    and deleting either loses bytes no commit holds.
+    """
+    def _names(*args: str) -> set[str]:
+        out = subprocess.run(
+            ["git", "-C", str(checkout), *args],
+            capture_output=True, timeout=20, check=True,
+        ).stdout
+        return {p.decode("utf-8", "surrogateescape") for p in out.split(b"\0") if p}
+
+    try:
+        committed = _names("ls-tree", "-r", "-z", "--name-only", "HEAD")
+        changed = _names("diff", "--name-only", "-z", "--no-renames", "HEAD", "--")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return committed - changed
 
 
 def _tree_target(proj: Path, rel: str) -> Path:
@@ -3180,12 +3245,17 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
     target = _editable_file(session, user, project_id, name)
+    # The spelling the file actually landed at, as the tree lists it: empty
+    # segments are dropped, so ``dir//a.md`` is written as ``dir/a.md``. The
+    # client opens this rather than what it typed, or the editor holds a path
+    # no tree row has and every string-compared guard misses it (Codex, PR #17).
+    rel = "/".join(seg for seg in name.split("/") if seg)
     # A new board's directory may not exist yet; writing its first design
     # document is how a board comes into being.
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body.content, encoding="utf-8")
     activity.record(
-        session, _project_or_404(session, user, project_id), user, activity.EDITED, name
+        session, _project_or_404(session, user, project_id), user, activity.EDITED, rel
     )
     # Committed, the way an accepted proposal is. This was the one edit path
     # that wrote over the previous version and kept no record of it: an edit
@@ -3197,10 +3267,11 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     # and refusing the save that landed would be a lie about what happened.
     # In the checkout the file was written to, which for a member is their own
     # worktree rather than the repository directory the name resolves to.
-    commit = _commit_landed_write(_project_dir(session, user, project_id), f"edit: {name}")
+    commit = _commit_landed_write(_project_dir(session, user, project_id), f"edit: {rel}")
     return {
         "ok": True,
         "name": name,
+        "path": rel,
         "bytes": target.stat().st_size,
         **commit,
     }
@@ -3405,6 +3476,250 @@ def make_folder(
         raise HTTPException(status_code=409, detail=f"{body.path} already exists")
     target.mkdir(parents=True)
     return {"ok": True, "path": "/".join(parts)}
+
+
+def _managed_path(session: Session, user: User, project_id: str, name: str) -> tuple[Path, Path, str]:
+    """Resolve a path the file manager may delete or move: (checkout, target, rel).
+
+    Wider than ``_editable_file`` in what it may name — any file type, and
+    folders, because a datasheet PDF filed in the wrong folder is exactly what
+    someone wants to move — and narrower in two places:
+
+    - nothing under a ``retrieved`` segment. Held files are kept as evidence and
+      the quarantine ledger beside them never lies by omission; a delete button
+      over either would let it.
+    - the target itself is not resolved. A symlink inside the project is deleted
+      or moved as the link, never followed, so only its *parent* is checked —
+      and that parent may contain no symlink at all, since every rule here is
+      decided on the lexical path.
+    """
+    proj = _project_dir(session, user, project_id)
+    parts = [seg for seg in name.split("/") if seg]
+    if (
+        not parts
+        or "\\" in name
+        or name.startswith("/")
+        or any(seg == ".." or seg.startswith(".") for seg in parts)
+    ):
+        raise HTTPException(status_code=400, detail=f"invalid path {name!r}")
+    if "retrieved" in parts:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "files under retrieved/ are held by quarantine and kept as "
+                "evidence — they cannot be deleted or moved from here"
+            ),
+        )
+    root = proj.resolve()
+    parent = proj.joinpath(*parts[:-1]).resolve()
+    if not parent.is_relative_to(root):
+        raise HTTPException(status_code=400, detail=f"invalid path {name!r}")
+    # Inside the project is not enough: every check here and after — the
+    # retrieved/ guard above, the untrusted-folder rule, the ledger, the
+    # ignore list — reads the *lexical* path. A folder link ``alias ->
+    # retrieved`` would let ``alias/quarantine.json`` be deleted, and ``alias
+    # -> datasheets`` would let a vendor file be moved out under a name no
+    # rule recognises (Codex, PR #17). Refused rather than canonicalised: the
+    # link itself can still be deleted or moved, which is all anyone needs.
+    if parent != root.joinpath(*parts[:-1]):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name!r} goes through a symlinked folder; use the folder's real path",
+        )
+    target = parent / parts[-1]
+    if target == root:
+        raise HTTPException(status_code=400, detail=f"invalid path {name!r}")
+    try:
+        _sandbox_for(session, user, project_id).check_write(target)
+    except ReferencePolicyError as exc:
+        raise HTTPException(status_code=403, detail=f"refused by the project sandbox: {exc}")
+    return proj, target, "/".join(parts)
+
+
+def _refuse_while_running(session: Session, user: User, project: Project, then: str) -> None:
+    """409 while one of this user's runs is queued or running on the project.
+
+    This user's runs only: their change lands in their own worktree, so someone
+    else's run cannot be disturbed by it. A run reads the tree it was started
+    on, and a file deleted or renamed underneath it fails the stage halfway with
+    an error naming a file the user can no longer see.
+    """
+    in_flight = session.scalar(
+        select(Run).where(
+            Run.project_id == project.id,
+            Run.user_id == user.id,
+            Run.status.in_([runqueue.QUEUED, runqueue.RUNNING, runqueue.CANCELLING]),
+        )
+    )
+    if in_flight is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"a pipeline run is in flight for this project — {then} once it finishes",
+        )
+
+
+def _commit_quietly(checkout: Path, message: str) -> bool:
+    # Reported, never fatal, for the reason write_file gives: the change is
+    # already on disk, and failing the request would misstate what happened.
+    try:
+        return projects.commit_checkout(checkout, message) is not None
+    except ProjectError:
+        return False
+
+
+@app.delete("/api/projects/{project_id}/files/{name:path}")
+def delete_path(
+    project_id: str, name: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Delete a file, or a folder and everything in it.
+
+    Committed like any other edit, so a delete is one ``git revert`` from being
+    undone — which is what makes it acceptable to offer behind one confirmation.
+    """
+    project = _project_or_404(session, user, project_id)
+    checkout, target, rel = _managed_path(session, user, project_id, name)
+    _refuse_while_running(session, user, project, "delete it")
+    if not target.exists() and not target.is_symlink():
+        raise HTTPException(status_code=404, detail=f"no file or folder {rel!r}")
+    # The same rule as a move, for the same reason: the ledger names a released
+    # file by its path and is never edited to keep up, so deleting one would
+    # leave it recording a release of a file that is not there.
+    recorded = llm_ignore.released_under(checkout, rel)
+    if recorded:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
+                "is recorded in the quarantine ledger as released at its current path; "
+                "deleting it would leave the ledger naming a file that is not there"
+            ),
+        )
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+        kind = "folder"
+    else:
+        target.unlink()
+        kind = "file"
+    # After the delete, unlike a move's list update, and safely so: should this
+    # write fail, the file is already gone and the entry left behind can only
+    # over-ignore a later file of the same name. Nothing becomes readable.
+    # Caught, as a move's post-rename cleanup is (Codex, PR #17): let through,
+    # the error skipped the commit and the dialog reported a failed delete of
+    # bytes that were already gone. The stale entry is reported instead.
+    ignore_list_updated = True
+    try:
+        llm_ignore.drop_entries(checkout, rel)
+    except OSError:
+        ignore_list_updated = False
+    activity.record(session, project, user, activity.DELETED, rel)
+    committed = _commit_quietly(checkout, f"delete: {rel}")
+    return {
+        "ok": True, "path": rel, "kind": kind, "committed": committed,
+        "ignore_list_updated": ignore_list_updated,
+    }
+
+
+class MoveBody(BaseModel):
+    # Not from/to: "from" is a Python keyword, and the alias that works around
+    # it warns under this FastAPI/pydantic pair.
+    path: str
+    to: str
+
+
+@app.post("/api/projects/{project_id}/files/move")
+def move_path(
+    project_id: str, body: MoveBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Rename or move a file or folder within the project.
+
+    A plain rename followed by the usual ``add -A`` commit: git records a
+    rename by content, not by how it was made, so this is what ``git mv`` would
+    have produced and ``log --follow`` still finds the history.
+    """
+    project = _project_or_404(session, user, project_id)
+    checkout, src, src_rel = _managed_path(session, user, project_id, body.path)
+    _, dst, dst_rel = _managed_path(session, user, project_id, body.to)
+    _refuse_while_running(session, user, project, "move it")
+    if not src.exists() and not src.is_symlink():
+        raise HTTPException(status_code=404, detail=f"no file or folder {src_rel!r}")
+    if dst.exists() or dst.is_symlink():
+        # Never an overwrite: the file at the destination is somebody's work,
+        # and a rename is not where anyone expects to find it replaced.
+        raise HTTPException(status_code=409, detail=f"{dst_rel} already exists")
+    if src.is_dir() and not src.is_symlink() and dst.is_relative_to(src):
+        raise HTTPException(status_code=400, detail="a folder cannot be moved inside itself")
+    # The assistant frames a file as untrusted by where it is: anything under
+    # datasheets/ or references/ arrived from outside. Moving one out would
+    # have it read back as the project's own text, vendor instructions and
+    # all, so that is refused. Moving a file *in* is allowed: it only means
+    # more framing, which errs the safe way.
+    if llm_ignore.is_external(src_rel) and not llm_ignore.is_external(dst_rel):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"{src_rel} came from outside the project, and files there are read as "
+                "untrusted wherever they sit under datasheets/ or references/. It cannot be "
+                "moved out of them."
+            ),
+        )
+    # A released file is named in the quarantine ledger by its path, which is
+    # how its origin is shown and how a datasheet is found by MPN. Moving it
+    # would leave the ledger describing a file that is not there, and the
+    # ledger is never edited to keep up, so a released file stays put.
+    recorded = llm_ignore.released_under(checkout, src_rel)
+    if recorded:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
+                "is recorded in the quarantine ledger at its current path; moving it would "
+                "leave the ledger naming a file that is not there"
+            ),
+        )
+    # The ignore list is keyed by path, and it changes in the same commit as
+    # the move. Its new paths are written *before* the rename, beside the old
+    # ones (Codex, PR #17): rewritten after, a failed write left an ignored
+    # file at a name the list did not cover, readable by the assistant, with
+    # the request reporting failure. See llm_ignore.cover_move for why not
+    # rename-then-roll-back.
+    try:
+        before = llm_ignore.cover_move(checkout, src_rel, dst_rel)
+    except OSError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{src_rel} was not moved: the LLM-ignore list could not be updated ({e})",
+        ) from e
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+    except OSError as e:
+        if before is not None:
+            # Best effort. Should this fail too, the superset stays, which
+            # names the file where it still is: over-ignoring, not exposure.
+            try:
+                llm_ignore.restore(checkout, before)
+            except OSError:
+                pass
+        raise HTTPException(status_code=500, detail=f"{src_rel} was not moved: {e}") from e
+    ignore_list_updated = True
+    if before is not None:
+        try:
+            llm_ignore.finish_move(checkout, before)
+        except OSError:
+            # The move happened, and failing the request would misstate that,
+            # as with a commit that fails. The superset still covers the file at
+            # its new path; only a stale entry on the old name is left, said so.
+            ignore_list_updated = False
+    activity.record(session, project, user, activity.MOVED, f"{src_rel} → {dst_rel}")
+    committed = _commit_quietly(checkout, f"move: {src_rel} -> {dst_rel}")
+    return {
+        "ok": True, "from": src_rel, "to": dst_rel, "committed": committed,
+        "ignore_list_updated": ignore_list_updated,
+    }
 
 
 @app.get("/api/projects/{project_id}/artifacts/{name}")

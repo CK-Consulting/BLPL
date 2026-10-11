@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getJSON } from "../api";
+import { encodePath, getJSON } from "../api";
 import { boardArtifact } from "../board";
 
 // The Reports tab renders what the pipeline already knows but only ever said in
@@ -115,7 +115,7 @@ export function Reports({
   useEffect(() => {
     const load = <T,>(name: string, set: (v: T | "missing") => void) =>
       getJSON<T>(
-        `/api/projects/${projectId}/artifacts/${boardArtifact(name, board)}`,
+        `/api/projects/${projectId}/artifacts/${encodePath(boardArtifact(name, board))}`,
       )
         .then(set)
         .catch(() => set("missing"));

@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { GitStatus, ImportResult, getJSON, postForm, postJSON, putJSON } from "../api";
 import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
 import { ProjectIcon } from "./Icons";
 import { BoardConfigPanel } from "./BoardConfigPanel";
+import { PromptDialog } from "./Dialog";
 import { ProjectRoutingPanel } from "./ProjectRoutingPanel";
 
 // The git strip: what state the server's working copy is in, and the three
@@ -24,6 +25,14 @@ export function ProjectSync({
   const [st, setSt] = useState<GitStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  // The project the commit dialog was opened for, not a flag. Codex, PR #17:
+  // the dialog outlived a project switch, and its submit committed and pushed
+  // whichever project was selected by then, with the message written for the
+  // one before. Shown only while it still names the current project, closed
+  // when the project changes, and the commit goes to the stamped id or nowhere.
+  const [committing, setCommitting] = useState<string | null>(null);
+  const currentRef = useRef(projectId);
+  currentRef.current = projectId;
 
   const refresh = () =>
     getJSON<GitStatus>(`/api/projects/${projectId}/git/status`)
@@ -31,6 +40,7 @@ export function ProjectSync({
       .catch(() => setSt(null));
 
   useEffect(() => {
+    setCommitting(null);
     refresh();
   }, [projectId, reloadToken]);
 
@@ -51,16 +61,19 @@ export function ProjectSync({
     }
   };
 
-  const commitAndPush = async () => {
-    const message = prompt("Commit message", "update from BLPL");
-    if (!message) return;
-    await act(async () => {
-      await postJSON(`/api/projects/${projectId}/git/commit`, { message });
-      // Asked fresh, not read from `st`: the status this render captured can
-      // predate a remote added since, and then the push was skipped.
-      const now = await getJSON<GitStatus>(`/api/projects/${projectId}/git/status`);
-      if (now.has_remote) await postJSON(`/api/projects/${projectId}/git/push`, {});
-    }, "commit");
+  // Run from inside the dialog rather than through act(), so a refused push
+  // leaves the dialog open with the reason in it and the message still typed.
+  const commitAndPush = async (target: string, message: string) => {
+    if (currentRef.current !== target) throw new Error("The project changed; nothing was committed.");
+    setNote(null);
+    await postJSON(`/api/projects/${target}/git/commit`, { message });
+    // Asked fresh, not read from `st`: the status this render captured can
+    // predate a remote added since, and then the push was skipped.
+    const now = await getJSON<GitStatus>(`/api/projects/${target}/git/status`);
+    if (now.has_remote) await postJSON(`/api/projects/${target}/git/push`, {});
+    setNote("commit ok");
+    await refresh();
+    onChanged();
   };
 
   return (
@@ -116,11 +129,21 @@ export function ProjectSync({
       <button
         className="link"
         disabled={busy || (!st.dirty && st.ahead === 0 && !(st.has_remote && st.unpublished))}
-        onClick={commitAndPush}
+        onClick={() => setCommitting(projectId)}
       >
         {st.has_remote ? "Commit + Push" : "Commit"}
       </button>
       {note && <span className="muted note">{note}</span>}
+      {committing === projectId && (
+        <PromptDialog
+          title={st.has_remote ? "Commit and push" : "Commit"}
+          label="Commit message"
+          initial="update from BLPL"
+          submitLabel={st.has_remote ? "Commit + Push" : "Commit"}
+          onSubmit={(message) => commitAndPush(committing, message)}
+          onClose={() => setCommitting(null)}
+        />
+      )}
     </div>
   );
 }

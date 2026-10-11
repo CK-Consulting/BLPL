@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AuthGate, UserControl } from "./components/AuthGate";
 import { DesignView, type Highlight } from "./components/Visualizer";
 import { StageRunner } from "./components/StageRunner";
@@ -9,7 +9,7 @@ import { Dashboard } from "./components/Dashboard";
 import { Invitations } from "./components/Invitations";
 import { Logo } from "./components/Logo";
 import { NewProject, ProjectSettings, ProjectSync } from "./components/ProjectControls";
-import { FileView } from "./components/FileView";
+import { FileView, type SaveHandle, useUnsavedGuard } from "./components/FileView";
 import { LaunchKicad } from "./components/LaunchKicad";
 import { KicadFileView } from "./components/KicadFileView";
 import { Reports } from "./components/Reports";
@@ -33,7 +33,13 @@ import { NavActions } from "./components/NavActions";
 import { Chat as ChatIcon, Cog, PlusSquare, Share as ShareIcon } from "./components/Icons";
 import { BoardPanel } from "./components/BoardPanel";
 import { RailToggle, Section } from "./components/Rail";
-import { FileTree, destinationFor, type TreeNode } from "./components/FileTree";
+import {
+  FileTree,
+  deleteRefusalForDraft,
+  destinationFor,
+  moveRefusalForDraft,
+  type TreeNode,
+} from "./components/FileTree";
 import { useResizable } from "./useResizable";
 import { Project, getJSON } from "./api";
 
@@ -68,6 +74,21 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   // What the tree last asked the centre panel to show. The tree is the detail
   // half of the layout; the tabs stay the project-wide half.
   const [openFile, setOpenFile] = useState<TreeNode | null>(null);
+  // The path the open file had before a rename, so the editor knows a new path
+  // is the same document and keeps its unsaved draft instead of reloading.
+  const [renamedFrom, setRenamedFrom] = useState<string | null>(null);
+  // Whether the editor holds unsaved work, so the tree can refuse a rename
+  // that would hide it.
+  const [editorDirty, setEditorDirty] = useState(false);
+  // The path whose save has been sent and not yet answered. Dirty alone is not
+  // enough: it stays true until the PUT returns, and a rename in that window
+  // raced the save (Codex, PR #17).
+  const [editorSaving, setEditorSaving] = useState<string | null>(null);
+  // Everything that takes the editor's project away from it asks first when
+  // there is unsaved work (Codex, PR #17): the header selector, a new project
+  // that would open itself, the way back to the dashboard, closing the tab.
+  const editorSave = useRef<SaveHandle | null>(null);
+  const unsaved = useUnsavedGuard({ dirty: editorDirty, saving: editorSaving, saveHandle: editorSave });
   const [railCollapsed, setRailCollapsed] = useState(
     () => localStorage.getItem("blpl.railCollapsed") === "1",
   );
@@ -123,13 +144,22 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
     <div className="app">
       <Invitations onChanged={refresh} />
       <header>
-        <button className="link dash-back" onClick={onLeave} title="All projects">
+        <button
+          className="link dash-back"
+          onClick={() => unsaved.guard(onLeave, "going back to all projects")}
+          title="All projects"
+        >
           ← <Logo size={30} />
         </button>
         <span className="sep">/</span>
         <select
           value={selected ?? ""}
-          onChange={(e) => setSelected(e.target.value)}
+          onChange={(e) => {
+            // Controlled, so the select shows the old project until the
+            // switch actually happens: Cancel leaves it where it was.
+            const next = e.target.value;
+            if (next !== selected) unsaved.guard(() => setSelected(next), `switching to ${next}`);
+          }}
           disabled={projects.length === 0}
         >
           {projects.map((p) => (
@@ -226,6 +256,31 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                       projectId={selected}
                       reloadToken={reloadToken}
                       onChanged={refresh}
+                      // The open file follows a rename and closes on a delete;
+                      // otherwise the editor would save the old name back into
+                      // existence on the next keystroke.
+                      onMoved={(from, to) => {
+                        if (openFile && (openFile.path === from || openFile.path.startsWith(`${from}/`))) {
+                          setRenamedFrom(openFile.path);
+                        }
+                        setOpenFile((f) => {
+                          if (!f) return f;
+                          if (f.path === from) return { ...f, path: to, name: to.split("/").pop() ?? to };
+                          if (f.path.startsWith(`${from}/`)) return { ...f, path: to + f.path.slice(from.length) };
+                          return f;
+                        });
+                      }}
+                      canMove={(from, to) =>
+                        moveRefusalForDraft(openFile?.path ?? null, editorDirty, from, to, editorSaving)
+                      }
+                      canDelete={(path) =>
+                        deleteRefusalForDraft(openFile?.path ?? null, editorDirty, path, editorSaving)
+                      }
+                      onDeleted={(path) =>
+                        setOpenFile((f) =>
+                          f && (f.path === path || f.path.startsWith(`${path}/`)) ? null : f,
+                        )
+                      }
                       onOpen={(n) => {
                         // Three destinations, because there are three kinds of
                         // file here. Text the panel can render goes to
@@ -236,6 +291,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                         // else goes to the browser, which knows what to do
                         // with a PDF and will offer to save what it does not.
                         const where = destinationFor(n);
+                        setRenamedFrom(null);
                         if (where === "text") {
                           setOpenFile(n);
                           setTab("edit");
@@ -316,6 +372,10 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                   path={
                     openFile && destinationFor(openFile) === "text" ? openFile.path : null
                   }
+                  renamedFrom={renamedFrom}
+                  onDirtyChange={setEditorDirty}
+                  onSavingChange={setEditorSaving}
+                  saveHandle={editorSave}
                 />
               )}
               {tab === "kicad" && openFile && (
@@ -373,10 +433,12 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
           onClose={() => setShowNewProject(false)}
           onCreated={(id) => {
             setShowNewProject(false);
-            refresh().then(() => setSelected(id));
+            // Created either way; only opening it waits on the unsaved edits.
+            refresh().then(() => unsaved.guard(() => setSelected(id), `opening ${id}`));
           }}
         />
       )}
+      {unsaved.dialog}
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
       {showSharing && selected && (
         <div className="modal-backdrop" onClick={() => setShowSharing(false)}>
