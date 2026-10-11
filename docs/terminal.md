@@ -54,9 +54,18 @@ nginx ──► backend ──── authenticates, checks membership, opens the
 This is a new compose service, `terminal`, with these properties:
 
 - **Built from the backend image**, so kicad-cli, the `blpl` CLI, git and
-  Python are all there and match what the pipeline uses. It gets a different
-  command, and **none of the backend's secrets**: no database URL, no provider
-  keys, no `server.key`, no ssh mount.
+  Python are all there and match what the pipeline uses. It gets **none of the
+  backend's secrets**: no database URL, no provider keys, no `server.key`, no
+  ssh mount.
+- **Its own `entrypoint`, not just a different `command`.** The image's
+  `ENTRYPOINT` is `/app/entrypoint.sh`, which runs `alembic upgrade head`
+  before anything else. Compose's `command` replaces only `CMD`, so a terminal
+  service that set only `command` would still try to migrate a database it
+  has no credentials for. Where the deployment uses a non-default password,
+  `app.db` would fall back to the default credentials and fail. The service
+  sets `entrypoint: ["/app/terminal/serve.sh"]`, which starts the terminal
+  server and nothing else. A test asserts that the service starts with no
+  database reachable.
 - **Mounts `./data/projects`**, at the same path the backend uses, and **the
   stock libraries read-only**, at the same paths too: `kicad-symbols`,
   `kicad-footprints`, `kicad-templates`, the 3D model trees, and
@@ -103,6 +112,9 @@ bwrap --unshare-all --die-with-parent --new-session \
       --ro-bind /app/kicad-happy /app/kicad-happy  #   blpl from here, not the venv
       --bind    <worktree>            /home/project
       --ro-bind <worktree>/.git       /home/project/.git   # mask the alias, see "Git"
+      --ro-bind <worktree>/datasheets /home/project/datasheets  # quarantined
+      --ro-bind <worktree>/references /home/project/references  #   content: only
+      --ro-bind <worktree>/retrieved  /home/project/retrieved   #   via Upload
       --ro-bind <project>/.git        <project>/.git       # the real repository
       --ro-bind <stock libraries> <same paths>  # as the worker mounts them
       --tmpfs /tmp  --dev /dev  --proc /proc
@@ -159,6 +171,15 @@ bwrap --unshare-all --die-with-parent --new-session \
   - **Nothing the shell writes reaches the repository** except working-tree
     files, which the Git panel shows as a diff before committing.
 
+- **Quarantined directories are read-only.** `datasheets/` and `references/`
+  hold only files that passed `quarantine.accept_upload`: inspection, the
+  malware scan and the ledger. The blob route serves their PDFs inline on that
+  basis. A file written there from a shell would skip all of it and reach
+  other members' viewers and the models as if it had passed. So these
+  directories, and `retrieved/`, are bound read-only over the writable
+  checkout. A file from outside comes in through **Upload**, exactly as
+  without a terminal. A bind can only mask a directory that exists, so the
+  session creates any missing one, empty, before starting the sandbox.
 - **Commit author** comes from the member's account, not from the image's git
   config. Commits made in projects today show `BLPL <blpl@localhost>`, which is
   the same gap seen from the other side.
@@ -204,9 +225,20 @@ need a person.
 - **Activity.** The activity feed records session start and end, with member
   and duration. Keystrokes and output are deliberately not recorded: a log of
   typing is a log of whatever gets pasted, credentials included.
-- **Runs in flight.** The editor and proposals answer 409 while a pipeline run
-  is in flight. A shell cannot be refused piecemeal. The terminal shows a banner
-  while a run is active instead, and leaves it to the member.
+- **Runs in flight: mutual exclusion, both ways.** A run and a shell share the
+  member's worktree. `runqueue.py` already refuses two runs there because they
+  would race, and an input changed mid-run produces artifacts that match no
+  version of the design. A banner cannot stop a shell's background job from
+  writing, so the exclusion is enforced:
+  - Creating a terminal session answers **409** while one of the member's runs
+    is queued, running or cancelling, with the same wording the editor uses.
+  - Starting a run answers **409** while the member has a terminal session
+    open: "close your terminal to run the pipeline".
+
+  The Run button says why it is disabled, and the terminal tab offers to close
+  the session. It is coarse, but it is correct. Remounting the checkout
+  read-only for the duration of a run is the finer alternative, and it needs
+  the session to survive a remount, which is phase 4 at the earliest.
 - **Committing.** Editor saves commit immediately (`edit: <path>`), but shell
   changes do not. They show as uncommitted in the Git panel, and the member
   commits them there. The shell cannot commit, by design (see "Git" above).
@@ -315,6 +347,8 @@ documentation, and anything still on the left with no right-hand side is a bug.
      objects and refs.
    - `git status` and `git diff` work, and `git commit` fails cleanly.
    - `blpl --help` runs. That proves the package and `PATH` are visible.
+   - Writing into `datasheets/`, `references/` or `retrieved/` fails.
+   - The service starts with no database reachable.
    - Stage 5 resolves a stock footprint.
 2. **Backend routes.** The session preflight with its 423 flow, the one-time
    ticket, per-session holders, relay, activity and limits, plus the
@@ -324,6 +358,8 @@ documentation, and anything still on the left with no right-hand side is a bug.
      it closes.
    - Closing one of a member's two sessions does not seal under the other.
    - A planted hook does not run when the Git panel commits.
+   - A session cannot open during a run, and a run cannot start while a
+     session is open.
 3. **Frontend tab.** xterm.js, mounted while hidden, resize, the run-in-flight
    banner.
 4. **Reattach after reload** (tmux), and **`released_active`** for PDFs using
