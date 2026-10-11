@@ -115,6 +115,15 @@ def put(
         )
     host = (host or "").strip().lower().rstrip("/")
     host = re.sub(r"^[a-z]+://", "", host).split("/")[0]
+    if "@" in host:
+        # A pasted `https://user:token@host` leaves its userinfo here once the
+        # scheme is stripped. Not echoed — the refusal would hand the token
+        # back to the client (Codex, PR #10) — and not stored either: it would
+        # sit in the host column in plaintext and never match a remote's host.
+        raise GitStoreError(
+            "the host is a hostname alone — leave out any user name or token "
+            "(those have fields of their own)"
+        )
     if not host or " " in host:
         raise GitStoreError(f"{host!r} is not a hostname")
     if method not in METHODS:

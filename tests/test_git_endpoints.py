@@ -65,6 +65,23 @@ def test_https_without_a_username_is_refused_with_the_reason(unlocked) -> None:
     assert r.status_code == 400 and "username" in r.json()["detail"]
 
 
+def test_a_host_carrying_a_token_is_refused_without_echoing_it(unlocked) -> None:
+    """Codex P2 on #10: a pasted `https://user:token@host` keeps its userinfo
+    once the scheme is stripped, and the refusal quoted it back."""
+    r = unlocked.put("/api/settings/git/github", json={
+        "host": "https://me:ghp_tokensecret@git hub.com", "method": "https_token",
+        "secret": "tok", "username": "me",
+    })
+    assert r.status_code == 400 and "ghp_tokensecret" not in r.text
+    # Without the space it used to be stored: the token in the host column.
+    r = unlocked.put("/api/settings/git/github", json={
+        "host": "https://me:ghp_tokensecret@github.com", "method": "https_token",
+        "secret": "tok", "username": "me",
+    })
+    assert r.status_code == 400 and "ghp_tokensecret" not in r.text
+    assert "ghp_tokensecret" not in unlocked.get("/api/settings/git").text
+
+
 def test_rotation_replaces_in_place(unlocked) -> None:
     for secret in ("tok-one", "tok-two"):
         unlocked.put("/api/settings/git/github", json={

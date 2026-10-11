@@ -135,7 +135,10 @@ def _redact_url(url: str) -> str:
     made from one. The userinfo is replaced rather than dropped so the URL still
     reads as authenticated, which is information worth keeping.
     """
-    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]+)@(.*)$", url)
+    # Up to the *last* @ before the path: a password may itself contain an @
+    # (`user:tok@en@host`), and stopping at the first one left its tail on
+    # screen (Codex, PR #10).
+    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/]+)@(.*)$", url)
     if not match:
         return url
     scheme, userinfo, rest = match.groups()
@@ -145,12 +148,33 @@ def _redact_url(url: str) -> str:
 
 # Any URL's password, wherever it sits in a longer string: an argv joined into
 # an error, or git's own stderr, which quotes the URL it could not reach.
-_URL_PASSWORD = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^/@\s:]*):[^/@\s]*@")
+#
+# Purely textual, so it works on a URL urlsplit refuses to parse — which is
+# exactly the input a validation error quotes back (Codex, PR #10:
+# `https://user:token@[bad/repo` raised in urlsplit, and the message carried
+# the token). The password runs to the *last* @ before the path or whitespace,
+# so `user:tok@en@host` loses all of `tok@en`, not just `tok`.
+_URL_PASSWORD = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:]*):[^/\s]*@")
+# git's scp-like form has no scheme for the pattern above to anchor on, and a
+# password pasted into one (`me:tok@host:path`) is still a password.
+_SCP_PASSWORD = re.compile(r"^([^/@\s:]*):[^/\s]*@")
 
 
 def _redact_text(text: str) -> str:
     """``text`` with the password of every URL in it replaced by ``***``."""
     return _URL_PASSWORD.sub(r"\1:***@", text)
+
+
+def _shown(raw: str) -> str:
+    """A rejected remote URL, as an error message may quote it.
+
+    Redacted *before* it is shortened: cut first, a long token can lose the @
+    that marks it as one and then be shown whole.
+    """
+    text = _redact_text(raw)
+    if "://" not in text:
+        text = _SCP_PASSWORD.sub(r"\1:***@", text)
+    return repr(text[:60])
 
 
 def _carries_password(url: str) -> bool:
@@ -198,23 +222,30 @@ def check_remote_url(url: str) -> str:
     if not raw:
         raise ProjectError("a remote URL is required")
     if raw.startswith("-") or any(c.isspace() or ord(c) < 32 for c in raw):
-        raise ProjectError(f"{raw[:60]!r} is not a remote URL")
+        raise ProjectError(f"{_shown(raw)} is not a remote URL")
     allowed = allowed_protocols()
     if "://" in raw:
         scheme = raw.split("://", 1)[0].lower()
         if scheme not in allowed:
-            raise ProjectError(
-                f"{scheme}:// remotes are not allowed here; use an https:// or ssh:// URL"
+            # Named only when it is shaped like a scheme: everything before the
+            # first :// can be anything at all, a pasted credential included.
+            named = (
+                f"{scheme}:// remotes" if re.fullmatch(r"[a-z][a-z0-9+.-]*", scheme)
+                else "remotes of that kind"
             )
+            raise ProjectError(f"{named} are not allowed here; use an https:// or ssh:// URL")
         try:
             host = urlsplit(raw).hostname
         except ValueError as exc:
             # urlsplit raises on malformed input such as an unclosed IPv6
             # bracket — `https://[bad/repo` — which would otherwise surface as
-            # a 500 from a route that only expects ProjectError.
-            raise ProjectError(f"{raw[:60]!r} is not a valid URL: {exc}") from exc
+            # a 500 from a route that only expects ProjectError. The parser's
+            # own message is left out: some of urllib's quote the netloc, which
+            # is where a token sits, with no scheme for _redact_text to anchor
+            # on (Codex, PR #10).
+            raise ProjectError(f"{_shown(raw)} is not a valid URL") from exc
         if scheme != "file" and not host:
-            raise ProjectError(f"{raw[:60]!r} names no host")
+            raise ProjectError(f"{_shown(raw)} names no host")
         if urlsplit(raw).password is not None:
             # A token in the URL would be written to .git/config in plaintext
             # and kept there; display-time redaction does nothing about that.
@@ -232,7 +263,7 @@ def check_remote_url(url: str) -> str:
     if raw.startswith("/") and "file" in allowed:
         return raw
     raise ProjectError(
-        f"{raw[:60]!r} is not a remote URL — use https://host/owner/repo.git "
+        f"{_shown(raw)} is not a remote URL — use https://host/owner/repo.git "
         "or git@host:owner/repo.git (local paths are not allowed)"
     )
 

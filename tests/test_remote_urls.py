@@ -281,6 +281,53 @@ def test_with_no_remote_at_all_origin_is_added(tmp_path):
     assert subprocess.run(["git", "remote"], cwd=work, capture_output=True, text=True).stdout.split() == ["origin"]
 
 
+_SECRET_BEARING = [
+    # urlsplit raises on each of these before the password check runs, so the
+    # refusal used to quote the first 60 characters, token and all.
+    ("https://user:ghp_tokensecret@[bad/repo", "ghp_tokensecret"),
+    ("ssh://u:pa55secret@[::1/x", "pa55secret"),
+    # A password containing an @: redaction that stopped at the first one
+    # showed the rest.
+    ("https://user:tok@ensecret@host/x", "ensecret"),
+    # Long enough that cutting to 60 characters before redacting drops the @.
+    ("https://user:" + "s" * 70 + "@[bad/repo", "s" * 20),
+    # Unprintable characters get the "not a remote URL" refusal.
+    ("https://user:ghp_tokensecret@host/o p.git", "ghp_tokensecret"),
+    # A credential where the scheme should be.
+    ("me:ghp_tokensecret@host://x", "ghp_tokensecret"),
+    # And the scp-like form, which has no scheme to anchor on.
+    ("me:ghp_tokensecret@host", "ghp_tokensecret"),
+]
+
+
+@pytest.mark.parametrize("url,secret", _SECRET_BEARING)
+def test_a_refused_url_is_never_quoted_with_its_password(deployment_protocols, url, secret):
+    # Codex P2 on #10: `https://user:token@[bad/repo` failed in urlsplit and
+    # the error echoed the raw URL to the API client, token included.
+    with pytest.raises(ProjectError) as exc:
+        check_remote_url(url)
+    assert secret not in str(exc.value)
+
+
+def test_redaction_takes_a_password_containing_an_at_whole():
+    # Same finding: stopping at the first @ left `ensecret` behind.
+    url = "https://user:tok@ensecret@host/x"
+    assert projects_mod._redact_text(f"git: {url} failed") == "git: https://user:***@host/x failed"
+    assert projects_mod._redact_url(url) == "https://user:***@host/x"
+
+
+def test_the_remote_route_never_echoes_a_password(unlocked, deployment_protocols):
+    _project(unlocked)
+    for url, secret in _SECRET_BEARING:
+        r = unlocked.put("/api/projects/p/git/remote", json={"url": url})
+        assert r.status_code == 400, (url, r.text)
+        assert secret not in r.text, url
+    r = unlocked.post("/api/projects/clone", json={
+        "name": "x", "remote": "https://user:ghp_tokensecret@[bad/repo", "branch": "main",
+    })
+    assert r.status_code == 400 and "ghp_tokensecret" not in r.text
+
+
 def test_a_token_in_the_url_is_refused_not_stored(deployment_protocols):
     # Codex P1 on #10: accepted as-is, the token was written to .git/config in
     # plaintext; the panel only hid it when displaying.
