@@ -216,7 +216,6 @@ services:
       - ../kicad-symbols:/app/kicad-symbols:ro
       - ../kicad-footprints:/app/kicad-footprints:ro
       - ../kicad-happy:/app/kicad-happy
-      - ../kicad-packages:/app/kicad-packages
       - ../kicad-templates:/app/kicad-templates:ro
       - ../KiCAD-Prism:/app/kicad-prism:ro
       # An SSH deploy key for git, if your project remotes need one. The git CLI
@@ -363,7 +362,6 @@ services:
       - ../kicad-symbols:/app/kicad-symbols:ro
       - ../kicad-footprints:/app/kicad-footprints:ro
       - ../kicad-happy:/app/kicad-happy
-      - ../kicad-packages:/app/kicad-packages
       - ../kicad-templates:/app/kicad-templates:ro
       - ../KiCAD-Prism:/app/kicad-prism:ro
       - ./data/ssh:/home/blpl/.ssh:ro

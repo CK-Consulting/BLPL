@@ -267,6 +267,28 @@ def _text_of(path: Path, pages: int) -> bytes | None:
     return re.sub(rb"[^A-Za-z0-9]", b"", b"".join(out)).upper()
 
 
+def _in_quarantine(path: Path, sheets: Path) -> bool:
+    """Whether a file is quarantined, or resolves out of ``datasheets/``.
+
+    The quarantine belongs at the project root, beside datasheets/, but a bug
+    in the fetcher once created it *inside* datasheets/ — and every lookup here
+    then offered held files (one encrypted, one carrying JavaScript) as
+    datasheets, and one was written into the map. Refusing them here makes that
+    impossible whatever the layout: a held file is never a datasheet.
+    """
+    from blpl.core.quarantine import QUARANTINE_DIRNAME
+
+    try:
+        rel = path.resolve().relative_to(sheets.resolve())
+    except ValueError:
+        # Resolves outside datasheets/ — a symlink, typically. Refused rather
+        # than waved through: a link to ../retrieved/<held>.pdf is a held file
+        # under another name, and nothing under datasheets/ has any business
+        # pointing out of it.
+        return True
+    return QUARANTINE_DIRNAME in rel.parts[:-1]
+
+
 def _pdfs(project_dir: Path) -> list[Path]:
     """Every PDF under ``datasheets/``, at any depth.
 
@@ -295,6 +317,7 @@ def _pdfs(project_dir: Path) -> list[Path]:
         if f.is_file()
         and f.suffix.lower() == ".pdf"
         and not any(part.startswith(".") for part in f.relative_to(d).parts)
+        and not _in_quarantine(f, d)
     ]
     return sorted(out)
 
@@ -368,8 +391,38 @@ def _part_folder(project_dir: Path, mpn: str) -> Path | None:
     return None
 
 
+def _refuse_quarantined(name: str, names: tuple[str, ...], *, row: str = "") -> Resolution:
+    where = f"{MAP_NAME} maps {row} to {name!r}" if row else f"{name!r}"
+    return Resolution(
+        path=None,
+        candidates=names,
+        detail=(
+            f"{where}, which is in quarantine — a downloaded file that has not "
+            "passed inspection. It is not used as a datasheet."
+        ),
+    )
+
+
 def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
-    """Find the datasheet for ``mpn``, optionally told which file to use."""
+    """Find the datasheet for ``mpn``, optionally told which file to use.
+
+    Every answer passes one gate on the way out: a file that is quarantined,
+    or that resolves out of ``datasheets/``, is never returned. Checking each
+    lookup step separately is how a symlink to a held file got through the
+    "exact name" step after the scan and map steps had been closed.
+    """
+    project_dir = Path(project_dir)
+    found = _resolve(project_dir, mpn, file=file)
+    sheets = project_dir / "datasheets"
+    if found.path is not None and _in_quarantine(found.path, sheets):
+        return _refuse_quarantined(
+            str(found.path.relative_to(sheets)) if found.path.is_relative_to(sheets) else found.path.name,
+            tuple(str(f.relative_to(sheets)) for f in _pdfs(project_dir)),
+        )
+    return found
+
+
+def _resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
     project_dir = Path(project_dir)
     sheets = project_dir / "datasheets"
     available = _pdfs(project_dir)
@@ -384,6 +437,8 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
         for parent in ([folder] if folder else []) + [sheets]:
             candidate = (parent / wanted).resolve()
             if candidate.is_file() and candidate.parent == parent.resolve():
+                if _in_quarantine(candidate, sheets):
+                    return _refuse_quarantined(file, names)
                 return Resolution(path=candidate, how="explicit")
         # Named but filed deeper: accept a full relative path, or a bare name
         # when only one file in the tree carries it.
@@ -443,6 +498,8 @@ def resolve(project_dir: Path, mpn: str, *, file: str = "") -> Resolution:
         # and `../` in a cell must not become a read outside the project.
         candidate = (sheets / mapped).resolve()
         inside = candidate.is_file() and candidate.is_relative_to(sheets.resolve())
+        if inside and _in_quarantine(candidate, sheets):
+            return _refuse_quarantined(mapped, names, row=mpn)
         if inside:
             return Resolution(path=candidate, how="map")
         # Rows written before bindings carried their directory hold a bare name.

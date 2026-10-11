@@ -176,7 +176,11 @@ def inspect(path: str | Path) -> Inspection:
         data = Path(path).read_bytes()
     except OSError as exc:
         return Inspection(state="cannot_inspect", findings=[], reason=str(exc))
+    return inspect_bytes(data)
 
+
+def inspect_bytes(data: bytes) -> Inspection:
+    """`inspect`, for bytes that are not on disk — a chat attachment, say."""
     if not data.startswith(b"%PDF-"):
         # Worth its own state. Something that is not a PDF but arrived named
         # `.pdf` is not a clean datasheet — it is a surprise, and the caller

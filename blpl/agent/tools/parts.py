@@ -229,17 +229,33 @@ def _download_target(project_dir: Path | None):
 
 
 def _keep(
-    target: Path, project_dir: Path | None, *, mpn: str, distributor: str, source_url: str = ""
+    target: Path,
+    project_dir: Path | None,
+    *,
+    mpn: str,
+    distributor: str,
+    source_url: str = "",
+    dest: Path | None = None,
 ) -> dict | None:
-    """Hand a downloaded file to quarantine, if there is one to hand it to."""
+    """Hand a downloaded file to quarantine, if there is one to hand it to.
+
+    ``dest`` is where a passed file is released to — the exact path the caller
+    will look for next time, so "already downloaded" can find it.
+    """
     if project_dir is None or not target.is_file() or target.stat().st_size == 0:
         return None
     try:
         data = target.read_bytes()
     except OSError:
         return None
+    where: dict = {}
+    if dest is not None:
+        where = {
+            "as_name": dest.name,
+            "dest_dirname": dest.parent.relative_to(project_dir).as_posix(),
+        }
     rec = quarantine.accept_and_release(
-        data, project_dir, mpn=mpn, distributor=distributor, source_url=source_url,
+        data, project_dir, mpn=mpn, distributor=distributor, source_url=source_url, **where,
     )
     return rec.to_dict()
 
@@ -251,6 +267,7 @@ def fetch_datasheet(
     creds: CredResolver | None = None,
     distributors: list[str] | None = None,
     timeout: int = 180,
+    project_dir: Path | None = None,
 ) -> DatasheetFetch:
     """Download one datasheet, trying distributors in order.
 
@@ -264,9 +281,17 @@ def fetch_datasheet(
     creds = creds or CredResolver()
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    # The project is the directory holding datasheets/, which is where
-    # retrieved/ sits beside it.
-    project_dir = dest_dir.parent
+    # Where retrieved/ lives. Given, not guessed: this used to be inferred as
+    # the parent of dest_dir, which held only while datasheets landed at the
+    # top of datasheets/. Once the agent filed each one under its part
+    # (datasheets/<MPN>/), the "project" became datasheets/ itself — so the
+    # quarantine was created at datasheets/retrieved/, outside the ignore rule
+    # that keeps uncleared downloads out of git, its held files became
+    # candidates for every datasheet lookup, and released files landed in
+    # datasheets/datasheets/ where "already downloaded" never looked.
+    # The parent is kept only as the fallback for callers that write to the
+    # top level, where it is still right.
+    project_dir = Path(project_dir) if project_dir is not None else dest_dir.parent
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in mpn)
     out = dest_dir / f"{safe}.pdf"
     if out.is_file() and out.stat().st_size > 0:
@@ -299,6 +324,7 @@ def fetch_datasheet(
             record = _keep(
                 target, project_dir, mpn=mpn, distributor=dist,
                 source_url=str(data.get("datasheet_url") or ""),
+                dest=out,
             )
         if url := str(data.get("manual_url") or ""):
             manual[dist] = url
@@ -312,7 +338,7 @@ def fetch_datasheet(
             return DatasheetFetch(
                 ok=True,
                 mpn=mpn,
-                path=str(dest_dir / record["released_as"]),
+                path=str(project_dir / record["released_to"] / record["released_as"]),
                 distributor=dist,
                 verification=str(ver.get("confidence") or "unverified"),
                 detail=str(ver.get("details") or ""),
