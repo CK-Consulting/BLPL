@@ -69,8 +69,12 @@ being designed against is a pipeline that runs to completion on half the design.
 
 ## Package layout
 
+Three projects share the repository until they are split
+([repo-split.md](repo-split.md)): `core/` (the `blpl` package below, its schemas,
+tests and the submodules it uses), `plugin/` (the KiCad plugin) and `app/`.
+
 ```
-blpl/                           # the library + CLI. No FastAPI import anywhere.
+core/blpl/                      # the library + CLI. No FastAPI import anywhere.
 ├── core/                       # stages 0–8, CLI entry, schemas, LLM adapters
 │   ├── cli.py                  # `blpl` entry point — argparse + subcommand dispatch
 │   ├── doctor.py               # preflight: what Stage 0 would drop, before it runs
@@ -113,15 +117,16 @@ blpl/                           # the library + CLI. No FastAPI import anywhere.
 │   ├── dispatch.py             # batch fan-out with a cost ledger
 │   ├── review_panel.py         # mixture-of-experts review across routed endpoints
 │   └── tools/                  # parts, datasheets, spice, bom
-├── plugin_kicad/               # pcbnew ActionPlugin + standalone CLI
-│   ├── __init__.py             # registers plugin when loaded inside KiCad GUI
-│   ├── action_load_hdm.py      # Tools menu entry
-│   ├── hdm_to_pcb.py           # HDM dict → pcbnew.BOARD
-│   ├── build_pcb.py            # argparse entry for KiCad's Python interpreter
-│   ├── metadata.json           # KiCad Plugin Manager manifest
-│   └── version.txt
 ├── skills/hardware-design/     # Claude Code skill shipped with the package
 └── __init__.py
+
+plugin/blpl_kicad_plugin/       # pcbnew ActionPlugin + standalone CLI (own package)
+├── __init__.py                 # registers plugin when loaded inside KiCad GUI
+├── action_load_hdm.py          # Tools menu entry
+├── hdm_to_pcb.py               # HDM dict → pcbnew.BOARD
+├── build_pcb.py                # argparse entry for KiCad's Python interpreter
+├── metadata.json               # KiCad Plugin Manager manifest
+└── version.txt
 
 app/                            # the web application. Imports blpl, never the reverse.
 ├── backend/app/                # FastAPI (`app.main`)
@@ -150,7 +155,7 @@ app/                            # the web application. Imports blpl, never the r
 └── frontend/                   # React + Vite; ecad-viewer renders the board in-browser
 ```
 
-The one-way dependency is load-bearing: `blpl/` never imports FastAPI or anything
+The one-way dependency is load-bearing: `core/` never imports FastAPI or anything
 under `app/`, so every stage runs headless in CI, in a container, or from a
 subprocess the run manager owns. `app/` shells out to `blpl.core.cli` for stages
 rather than calling them in-process, which is what lets a run survive the request
@@ -168,9 +173,13 @@ that started it.
 - `core/stage8_review.py` → `agent/tools/spice.py` → `agent/kicad_happy.py`
 - `core/release.py` → `agent/tools/bom.py` (per-house BOM/CPL) and `agent/kicad_happy.py`
   (the fab release gate)
-- `plugin_kicad/*.py` → `pcbnew` (KiCad's bundled Python module; not importable in our venv)
+- `plugin/blpl_kicad_plugin/*.py` → `pcbnew` (KiCad's bundled Python module; not importable in our venv)
 
-Nothing in `blpl/` imports `plugin_kicad` — the plugin is invoked as a subprocess from `core/cli.py::_cmd_stage6_plugin` using KiCad's Python.
+Nothing in `blpl` imports the plugin, and the plugin imports nothing of `blpl` —
+it is invoked as a subprocess from `core/cli.py::_cmd_stage6_plugin` using
+KiCad's Python, with the directory holding `blpl_kicad_plugin` on that
+interpreter's `PYTHONPATH` (`BLPL_KICAD_PLUGIN_DIR`, else wherever it is
+installed, else `plugin/` beside `core/`).
 
 ### kicad-happy, and why it is a subprocess
 
@@ -185,7 +194,7 @@ has none of the parts you asked about.
 
 ## Schemas
 
-Every inter-stage artifact is validated against a JSON Schema in `schemas/*.v1.json`:
+Every inter-stage artifact is validated against a JSON Schema in `core/schemas/*.v1.json`:
 
 - `design_artifact.v1.json`
 - `bom.v1.json`

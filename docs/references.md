@@ -6,7 +6,7 @@ symbol libraries — with explicit access controls, without that material having
 live inside the project's own worktree.
 
 > Status: **implemented.** `app/backend/app/references.py` holds the manifest,
-> the sandbox and the manifest validator; `tests/test_references_api.py` covers
+> the sandbox and the manifest validator; `app/backend/tests/test_references_api.py` covers
 > them. The one piece still outstanding is a dedicated editor screen — see
 > [API surface](#api-surface). Sections below marked with a note describe
 > behaviour that differs from the original design; the difference is the
@@ -180,4 +180,4 @@ enforces it; what is missing is a screen in front of it. References are edited b
    sandbox; the risk is a traversal that does not terminate.
 3. **Reference editor UI** — see above.
 3. **Cross-platform file watching**: `watchfiles` works on macOS/Linux; Windows may need extra care for referenced paths outside the worktree.
-4. **Plugin path**: the `plugin_kicad` subprocess bypasses the BLPL FS layer. Phase 3 needs a per-subprocess policy or a warning that plugin invocations can see paths outside the reference graph.
+4. **Plugin path**: the KiCad plugin (`plugin/`) subprocess bypasses the BLPL FS layer. Phase 3 needs a per-subprocess policy or a warning that plugin invocations can see paths outside the reference graph.

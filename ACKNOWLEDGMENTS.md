@@ -51,8 +51,8 @@ ecad-viewer itself builds on:
 ## Tailwind CSS colour palette — MIT
 
 <https://github.com/tailwindlabs/tailwindcss> — Tailwind Labs, Inc.
-`mermaid/customization-inspirations/tailwind-colors.css` is Tailwind's default
-palette, read by `mermaid/tools/palette.py`. License text in
+`core/mermaid/customization-inspirations/tailwind-colors.css` is Tailwind's default
+palette, read by `core/mermaid/tools/palette.py`. License text in
 `licenses/tailwindcss.txt`.
 
 ## kicad-happy — MIT
@@ -61,7 +61,7 @@ palette, read by `mermaid/tools/palette.py`. License text in
 
 The design-review analyzers behind `blpl stage8`: schematic and PCB parsing,
 subcircuit detection, EMC pre-compliance, SPICE, thermal. See
-`kicad-happy/ATTRIBUTION.md` for the details of our divergence.
+`core/kicad-happy/ATTRIBUTION.md` for the details of our divergence.
 
 ## KiCad — GPL / CC-BY-SA
 

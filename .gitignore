@@ -88,8 +88,8 @@ desktop.ini
 # Everything not named below stays tracked — including tailwind-colors.css,
 # which palette.py reads to generate the theme, and the two symbol-library
 # submodules, which cost a pointer each.
-mermaid/customization-inspirations/electronics-symbols/
-mermaid/customization-inspirations/Electrical_symbols_library.svg
+core/mermaid/customization-inspirations/electronics-symbols/
+core/mermaid/customization-inspirations/Electrical_symbols_library.svg
 
 app/certs/*
 

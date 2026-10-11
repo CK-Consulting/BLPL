@@ -75,7 +75,7 @@ You can force-activate with a slash command — `/hardware-design` — if Claude
 
 ## Where skills live
 
-The **sources of truth** are `blpl/skills/hardware-design/` (in the package) and `kicad-happy/skills/*` (the submodule). Project copies under `<project>/.claude/skills/` are installed snapshots — edit the source, then `blpl skills install --force` to refresh projects.
+The **sources of truth** are `core/blpl/skills/hardware-design/` (in the package) and `core/kicad-happy/skills/*` (the submodule). Project copies under `<project>/.claude/skills/` are installed snapshots — edit the source, then `blpl skills install --force` to refresh projects.
 
 ## Editing the hardware-design skill
 

@@ -42,7 +42,7 @@ Hardware projects usually live in two disconnected worlds: narrative design docs
 ```bash
 # From the repo root
 uv venv --python 3.11 .venv
-uv pip install -e ".[dev,all-llm]"
+uv pip install -e "./core[dev,all-llm]"
 blpl --help
 ```
 
@@ -71,7 +71,7 @@ Markdown design docs
         ▼   release  → gerbers, drill, placement, BOM + per-house CPL — if the gate agrees
 ```
 
-Each stage is deterministic and idempotent; stages 0 and 1 use an LLM adapter (Anthropic / OpenAI / Ollama pluggable). Outputs are validated against JSON Schemas (`schemas/*.v1.json`). Every stage can be run standalone, so debugging is about narrowing to one stage and inspecting its artifact.
+Each stage is deterministic and idempotent; stages 0 and 1 use an LLM adapter (Anthropic / OpenAI / Ollama pluggable). Outputs are validated against JSON Schemas (`core/schemas/*.v1.json`). Every stage can be run standalone, so debugging is about narrowing to one stage and inspecting its artifact.
 
 The two ends are what make the middle trustworthy. `blpl doctor` says what your input would lose *before* anything runs, because Stage 0 discards tables it cannot classify without saying so. Stage 8 then sorts every finding by whose fault it is — a generated board trips analyzer rules by construction, and an unclassified review of one is mostly noise.
 
@@ -79,24 +79,34 @@ The two ends are what make the middle trustworthy. `blpl doctor` says what your 
 
 ```
 blpl-repo-root/
-    blpl/
-        core/           # pipeline stages 0–8, plus doctor and release
-        emitter/        # v10 KiCad .kicad_sch / .kicad_pcb / .kicad_pro writer
-        classifier/     # component + connector inference
-        plugin_kicad/   # pcbnew ActionPlugin + standalone build_pcb CLI
-        skills/         # Claude Code skill shipped with the package
-        agent/          # agent tools: parts, datasheets, review panel, batch dispatch
-        importer_kicad/ # reading existing boards; function-set module extraction
-    app/
+    core/               # the headless pipeline — future repo "blpl-core"
+        blpl/
+            core/           # pipeline stages 0–8, plus doctor and release
+            emitter/        # v10 KiCad .kicad_sch / .kicad_pcb / .kicad_pro writer
+            classifier/     # component + connector inference
+            skills/         # Claude Code skill shipped with the package
+            agent/          # agent tools: parts, datasheets, review panel, batch dispatch
+            importer_kicad/ # reading existing boards; function-set module extraction
+        schemas/        # JSON Schemas for every inter-stage artifact
+        tests/          # the pipeline's pytest suite
+        mermaid/        # the diagram palette the skill's class table is held to
+        kicad-happy/    # design-review + sourcing skills (submodule)
+        kicad-{symbols,footprints,library-utils}   # submodules
+    plugin/             # KiCad PCB plugin — future repo "blpl-kicad-plugin"
+        blpl_kicad_plugin/  # pcbnew ActionPlugin + standalone build_pcb CLI
+        tests/
+    app/                # the web app — future repo "blpl-app"
         backend/        # FastAPI backend — auth/vault, git, stages, artifacts, chat, agents
+            tests/      # the backend's pytest suite
         frontend/       # React UI (ecad-viewer for in-browser board rendering)
         docker-compose.yml   # the hosted deploy; KiCad lives in the image
+        kicad-{packages3D,templates,…}, KiCAD-Prism, ecad-viewer   # submodules
     docs/               # user-facing documentation (you're here)
-    schemas/            # JSON Schemas for every inter-stage artifact
-    tests/              # pytest suite
-    kicad-happy/        # design-review + sourcing skills (submodule)
-    kicad-{symbols,footprints,packages3D,…}   # submodules
 ```
+
+The three top-level folders are separate projects that share one repository
+until they are split; [docs/repo-split.md](docs/repo-split.md) says what goes
+where and how.
 
 ## Documentation map
 

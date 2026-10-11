@@ -288,7 +288,7 @@ That silence is the actual usability bug. A `blpl doctor --project-dir <p>` comm
   bogus 4-pin part carrying `VBUS, GND, TIP, RING` that reached the board. Each
   unanchored table now gets its own placeholder (`UNKNOWN_1`, `UNKNOWN_2`, …), so
   unrelated pinouts can never fuse. See `STAGE0-001/002/003` and the tests in
-  `tests/test_stage0_deterministic.py`.
+  `core/tests/test_stage0_deterministic.py`.
 - ~~Grouped pin ranges (`| 1-5 | Power |`) that break pin mapping.~~ **REPORTED**
   (`DOC-003`).
 - ~~Duplicate signal names silently collapsing into one net (the `Reserved` /`NC`
