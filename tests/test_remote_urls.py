@@ -11,6 +11,7 @@ and git is told the same transports through GIT_ALLOW_PROTOCOL.
 from __future__ import annotations
 
 import subprocess
+import threading
 
 import pytest
 
@@ -533,3 +534,67 @@ def test_saving_the_fetch_url_over_a_separate_push_url_forgets_the_push_side(tmp
     assert st.unpublished and st.ahead == 1
     store.push("p")
     assert "main" in _heads(a)
+
+
+def test_changing_the_remote_mid_push_cannot_be_undone_by_the_push(tmp_path):
+    # Codex P1 on #10: push validated origin (A), pushed, then recreated
+    # refs/remotes/origin/main. The owner switching origin to an empty B while
+    # the push was in flight had set_remote clear that ref in between, and the
+    # push wrote it back — so status read "published, ahead 0" against B, which
+    # held nothing, and the clean tree disabled the push B was waiting for.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    a = tmp_path / "a.git"
+    b = tmp_path / "b.git"
+    for bare in (a, b):
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    store.set_remote(work, f"file://{a}")
+
+    real_git = store._git
+    owner = {}
+
+    def change_remote():
+        try:
+            store.set_remote(work, f"file://{b}")
+        except Exception as exc:  # reported below, not swallowed
+            owner["error"] = exc
+
+    def git_with_owner_mid_push(cwd, *args, **kw):
+        if args[:1] == ("push",) and "thread" not in owner:
+            # The owner saves a new remote while this push is under way. Given
+            # a second to land: without the lock it does, before the push.
+            owner["thread"] = threading.Thread(target=change_remote)
+            owner["thread"].start()
+            owner["thread"].join(timeout=1.0)
+        return real_git(cwd, *args, **kw)
+
+    store._git = git_with_owner_mid_push
+    store.push("p", url=store.remote_of("p", operation="push"))
+    owner["thread"].join(timeout=30)
+    store._git = real_git
+
+    assert "error" not in owner
+    assert store.remote_of("p", operation="push") == f"file://{b}"
+    assert "main" in _heads(a) and _heads(b) == set()
+    st = store.status("p", checkout=work)
+    assert st.unpublished and st.ahead == 1
+
+
+def test_changing_the_remote_while_a_member_pushes_says_so(tmp_path, monkeypatch):
+    # The same lock from the other side: origin is shared by every worktree,
+    # so a member's push in progress holds it for the owner too, and a change
+    # that cannot wait it out is a sentence rather than a hang or a race.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    store.set_remote(work, "https://github.com/o/old.git")
+    member = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "user/2", str(member)], cwd=work, check=True)
+    monkeypatch.setattr(store, "SET_REMOTE_LOCK_WAIT", 0.2)
+
+    with store._remote_lock(member, 1.0, "busy"):
+        with pytest.raises(ProjectError, match="in progress"):
+            store.set_remote(work, "https://github.com/o/new.git")
+    assert store.remote_of("p", operation="push") == "https://github.com/o/old.git"
+
+    store.set_remote(work, "https://github.com/o/new.git")
+    assert store.remote_of("p", operation="push") == "https://github.com/o/new.git"

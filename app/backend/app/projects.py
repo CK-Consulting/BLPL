@@ -23,9 +23,12 @@ ever passes through application code or lands in a log line.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -34,6 +37,11 @@ from urllib.parse import urlsplit
 class ProjectError(RuntimeError):
     """A git or filesystem operation on a project failed. Carries the git stderr
     so the UI can show what actually went wrong instead of a generic 500."""
+
+
+# What a pull or push says when another one, or a change of remote, held the
+# repository's origin lock for longer than it would wait (see _remote_lock).
+_BUSY = "another pull, push or change of remote is in progress for this project; try again"
 
 
 # Paths that are always changing and are never work anyone would lose: the
@@ -369,14 +377,70 @@ class Projects:
         """`origin` if the checkout has it, else None (local-only)."""
         return self.REMOTE if self.REMOTE in self._git(d, "remote").split() else None
 
+    # How long each side waits for the other under _remote_lock. A pull or
+    # push waits out whatever holds it — set_remote is a few config writes, and
+    # another push is bounded by _git's own 300 s timeout. Changing the remote
+    # gives up sooner, with a sentence, rather than hang the settings dialog
+    # behind somebody's slow push.
+    NETWORK_LOCK_WAIT = 330.0
+    SET_REMOTE_LOCK_WAIT = 30.0
+
+    @contextlib.contextmanager
+    def _remote_lock(self, d: Path, wait: float, busy: str):
+        """Hold the repository's origin lock: one change of origin or one
+        network operation at a time.
+
+        A push validated origin's URL, pushed to it, then recreated
+        refs/remotes/origin/<branch> and the upstream. An owner changing the
+        remote while the push was in flight had set_remote clear those refs in
+        between, and the push wrote them back — so status measured the branch
+        as published, ahead 0, against a new repository holding none of it,
+        and the clean tree disabled the push that would have published it
+        (Codex, PR #10). The change and the whole operation, bookkeeping
+        included, now exclude each other.
+
+        Keyed on git's common directory, not the checkout: origin's config and
+        its tracking refs are shared by every member's worktree, so a member's
+        push races the owner's change exactly as the owner's own would. `flock`
+        on a file there for the reasons in workspace._project_lock — request
+        threads, uvicorn workers and containers sharing the bind mount all
+        exclude each other, because each call opens its own descriptor.
+        """
+        common = self._git(d, "rev-parse", "--git-common-dir").strip()
+        # Relative to the checkout when git answers relatively (".git").
+        lock_path = Path(d) / common / "blpl-remote.lock"
+        with open(lock_path, "a") as fh:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ProjectError(busy) from None
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
     def set_remote(self, checkout: Path, url: str) -> str:
         """Point a project's `origin` at a URL, adding origin if there is none.
 
         Set in the repository's config, so every member's worktree — which
-        shares that config — sees the same remote.
+        shares that config — sees the same remote. Waits for a pull or push in
+        progress to finish first (see _remote_lock).
         """
         url = check_remote_url(url)
         d = self._checkout("", checkout)
+        with self._remote_lock(
+            d, self.SET_REMOTE_LOCK_WAIT,
+            "a pull or push is in progress for this project; "
+            "change the remote once it has finished",
+        ):
+            return self._set_remote_locked(d, url)
+
+    def _set_remote_locked(self, d: Path, url: str) -> str:
         if self._primary_remote(d):
             # Both directions, every URL. Read without --push, an origin that
             # fetched from this same URL but pushed to a separate one looked
@@ -530,6 +594,12 @@ class Projects:
         app papers over. --ff-only turns divergence into a clear error.
         """
         d = self._checkout(name, checkout)
+        # Held from validating the URL to recording the upstream, so origin
+        # cannot change in between (see _remote_lock).
+        with self._remote_lock(d, self.NETWORK_LOCK_WAIT, _BUSY):
+            return self._pull_locked(d, url, env)
+
+    def _pull_locked(self, d: Path, url: str | None, env: dict[str, str] | None) -> str:
         if not self._primary_remote(d):
             raise ProjectError("this project has no remote to pull from; add one in project settings")
         dest = self._destination(d, "fetch", url)
@@ -561,7 +631,7 @@ class Projects:
         out += self._git(d, "merge", "--ff-only", tracking)
         # The fetch just wrote origin's tracking ref; record the upstream beside
         # it, as push does, so plain git in this checkout agrees with the panel.
-        self._track_origin(d, branch)
+        self._track_origin(d, branch, dest, "fetch")
         return out
 
     def commit_all(self, name: str, message: str) -> str | None:
@@ -615,6 +685,12 @@ class Projects:
         url: str | None = None,
     ) -> str:
         d = self._checkout(name, checkout)
+        # Held across the push and the tracking-ref write after it, which is
+        # what set_remote clears (see _remote_lock).
+        with self._remote_lock(d, self.NETWORK_LOCK_WAIT, _BUSY):
+            return self._push_locked(d, url, env)
+
+    def _push_locked(self, d: Path, url: str | None, env: dict[str, str] | None) -> str:
         if not self._primary_remote(d):
             raise ProjectError("this project has no remote to push to; add one in project settings")
         dest = self._destination(d, "push", url)
@@ -630,12 +706,26 @@ class Projects:
         # What --set-upstream origin would have recorded, done by hand because
         # the push named a URL: origin's tracking ref, which status measures
         # publication against, and the branch's upstream.
-        self._git(d, "update-ref", f"refs/remotes/{self.REMOTE}/{branch}", sha)
-        self._track_origin(d, branch)
+        if self._still_origin(d, dest, "push"):
+            self._git(d, "update-ref", f"refs/remotes/{self.REMOTE}/{branch}", sha)
+        self._track_origin(d, branch, dest, "push")
         return out
 
-    def _track_origin(self, d: Path, branch: str) -> None:
-        """Make origin's ``branch`` the upstream of the local one."""
+    def _still_origin(self, d: Path, dest: str, operation: str) -> bool:
+        """Whether origin still names ``dest``. _remote_lock keeps the app from
+        changing it mid-operation; this covers a hand edit of the config, which
+        no lock sees. Bookkeeping recorded for a URL origin no longer names
+        would claim the new remote has what only the old one received."""
+        try:
+            return self._single_destination(d, operation) == dest
+        except ProjectError:
+            return False
+
+    def _track_origin(self, d: Path, branch: str, dest: str, operation: str) -> None:
+        """Make origin's ``branch`` the upstream of the local one, provided
+        origin is still the ``dest`` the operation just talked to."""
+        if not self._still_origin(d, dest, operation):
+            return
         self._git(d, "config", f"branch.{branch}.remote", self.REMOTE)
         self._git(d, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
 
