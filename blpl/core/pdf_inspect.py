@@ -210,8 +210,10 @@ def _canonical_word(tok: bytes) -> bytes:
 
 
 def _string_end(data: bytes, start: int) -> int:
-    """Index just past a literal string opening at `start`, or len(data).
-    Strings nest on balanced parens; `\\(` and `\\)` do not count."""
+    """Index just past a literal string opening at `start`, or -1 when it
+    never closes. Strings nest on balanced parens; `\\(` and `\\)` do not
+    count. -1 rather than len(data), so no caller can mistake a string that
+    ran to EOF for one that ended there."""
     depth, i, n = 0, start, len(data)
     while i < n:
         c = data[i]
@@ -225,7 +227,7 @@ def _string_end(data: bytes, start: int) -> int:
             if depth == 0:
                 return i + 1
         i += 1
-    return n
+    return -1
 
 
 @dataclass
@@ -242,9 +244,10 @@ class _Stream:
     ended_by: str = "search"
 
 
-def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
+def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool, list[str]]:
     """The file's structure as canonical tokens, each stream paired with the
-    dictionary that introduces it, and whether the dictionaries nest sanely.
+    dictionary that introduces it, whether the dictionaries nest sanely, and
+    which constructs never ended.
 
     Strings, comments and stream bodies are dropped; names are written in
     canonical form; tokens are separated by one space. What is left is what a
@@ -254,10 +257,19 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
     the `stream` keyword, found from the tokens rather than by searching the
     raw bytes, which a `% obj` comment or an `(obj)` string defeated.
 
-    Errs towards keeping bytes: a string that never closes ends the scan where
-    a reader would, and a stream with no `endstream` leaves the rest of the
-    file to be tokenized as structure. A file built to confuse this gets more
-    scrutiny, not less.
+    A construct whose end this has to search for, and that runs to the end of
+    the file instead, is reported in the last value and the caller fails
+    closed. Codex, PR #15: an unused object holding one unclosed `(` made the
+    string run to EOF, the scan stopped there, and a catalog after it — which
+    a reader walking the xref parses from its offset regardless — had its
+    /OpenAction missed and the file came back inspected. Ending the scan
+    "where a reader would" assumed a reader reads the file front to back; it
+    seeks. The constructs are a literal string and a stream body with no
+    `endstream`; the bytes after them are still tokenized as structure, so
+    whatever they show is reported. A hex string cannot run on: an unclosed
+    `<` is a lone delimiter and skips nothing. A comment runs only to its
+    line's end, as it does for a reader. A dictionary still open at EOF is the
+    imbalance below.
 
     Nesting is checked wherever a reader expects it to be level: at `obj` and
     `endobj`, at `stream`, and at every `>>`. Codex, PR #15: an unused object
@@ -276,6 +288,10 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
     opens: list[int] = []               # offsets in `out` of unclosed `<<`
     last_dict: tuple[int, int] | None = None
     unbalanced = False
+    string_ran_on = body_ran_on = False
+    # Past the last `endstream` no body can end, so it is not searched for
+    # again: one search to EOF per `stream` keyword was quadratic in them.
+    last_endstream = data.rfind(_ENDSTREAM)
     pos, n = 0, len(data)
 
     while pos < n:
@@ -294,7 +310,17 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
                 out += b"() "
             continue
         if kind == "string":
-            pos = _string_end(data, m.start())
+            # Once one string has run to EOF the file is unknown, and a later
+            # `(` is left a lone delimiter: searching to EOF from each one
+            # again was quadratic in a file of `(`, and reading the rest as
+            # structure can only add findings.
+            end = -1 if string_ran_on else _string_end(data, m.start())
+            if end < 0:
+                # Never closed: everything after the `(` is still read as
+                # structure, so a later object is scanned rather than skipped.
+                string_ran_on = True
+            else:
+                pos = end
             if opens:
                 out += b"() "
             continue
@@ -330,15 +356,37 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
                 pos += 2
             elif pos < n and data[pos] in b"\r\n":
                 pos += 1
-            close, ended_by = _body_end(data, pos, dictionary, lengths)
+            close, ended_by = (
+                _body_end(data, pos, dictionary, lengths)
+                if pos <= last_endstream else (-1, "search")
+            )
             streams.append(_Stream(dictionary, pos, n if close < 0 else close, ended_by))
             if close >= 0:
                 pos = close
+            else:
+                # The body is tokenized as structure, which is more scrutiny
+                # for the bytes after it but lets the body's own bytes steer
+                # the tokenizer: a `(` in the data opens a string that a `)`
+                # in the real structure later closes, blanking what lies
+                # between. Where the body ends is unknown, so the file is.
+                body_ran_on = True
             continue
         if kind == "word":
             tok = _canonical_word(tok)
         out += tok + b" "
-    return bytes(out), streams, unbalanced
+    # A dictionary still open at EOF is the imbalance checked at every other
+    # boundary; EOF is one more.
+    if opens:
+        unbalanced = True
+    unterminated = [
+        what
+        for what, ran_on in (
+            ("a literal string", string_ran_on),
+            ("a stream body with no endstream", body_ran_on),
+        )
+        if ran_on
+    ]
+    return bytes(out), streams, unbalanced, unterminated
 
 
 _INT = re.compile(rb"\d+")     # a canonical non-negative integer token
@@ -406,7 +454,17 @@ def _is_reference(value: list[bytes] | None) -> bool:
 
 # `N G obj <integer> endobj`, anywhere in the raw bytes. Preceded by a
 # non-regular byte so `11 0 obj` is not read as `1 0 obj`.
-_WSP = rb"[\x00\t\n\x0c\r ]+"
+#
+# Between tokens, a comment is whitespace (ISO 32000-1, 7.2.3). Codex, PR #15:
+# with whitespace alone, `6 0 obj % length\n30 endobj` did not resolve, the
+# stream fell back to its first `endstream`, and a benign file could be held.
+# One whitespace byte or one whole comment per repetition, the comment running
+# to its line's end: a `%` can then start a comment only where the previous one
+# ended, so a line of `%%%%` matches one way and cannot backtrack
+# exponentially, as `(?:[ws]+|%[^\r\n]*)+` would.
+_GAP_UNIT = rb"(?:[\x00\t\n\x0c\r ]|%[^\r\n]*(?=[\r\n]|\Z))"
+_WSP = _GAP_UNIT + rb"+"
+_GAP = re.compile(_GAP_UNIT + rb"*")
 _LENGTH_OBJECT = re.compile(
     rb"(?<!" + _REGULAR + rb")(\d+)" + _WSP + rb"(\d+)" + _WSP + rb"obj" + _WSP
     + rb"([+-]?\d+)" + _WSP + rb"endobj(?!" + _REGULAR + rb")"
@@ -494,8 +552,9 @@ def _body_end(
         end = start + declared
         # PDF whitespace, NUL included: bytes.lstrip() keeps NUL, so a benign
         # `\x00endstream` missed its declared length and fell back to the
-        # first `endstream`, which may sit inside the compressed bytes.
-        if end <= len(data) and data[end : end + 64].lstrip(_WS).startswith(_ENDSTREAM):
+        # first `endstream`, which may sit inside the compressed bytes. And
+        # comments, which a reader's lexer skips there like whitespace.
+        if end <= len(data) and data.startswith(_ENDSTREAM, _GAP.match(data, end).end()):
             if how == "length" or end <= first or not _STRUCTURE_WORD.search(data, first, end):
                 return end, how
     return first, "search"
@@ -505,11 +564,25 @@ def _names_in(structure: bytes) -> set[str]:
     return {_unescape(m.group(1)) for m in _NAME.finditer(structure)}
 
 
-def _scan(data: bytes, where: str) -> dict[str, Finding]:
-    # Nesting inside an object stream is not checked: it holds no `obj`,
-    # `endobj` or `stream` keywords whose meaning depends on it, and its
-    # names are matched whatever the depth.
-    return _findings(_parse(data)[0], where)
+def _scan(data: bytes, where: str) -> tuple[dict[str, Finding], list[str]]:
+    """The findings in a decoded object stream, and why its scan may have
+    stopped short of what a reader parses.
+
+    Nesting inside an object stream is not checked: it holds no `obj` or
+    `endobj` keywords whose meaning depends on it, and its names are matched
+    whatever the depth. Running to EOF is, and matters more here than in the
+    file (Codex, PR #15): a reader finds each object at its offset from
+    /First, so an unclosed `(` in one object does not hide the next from it,
+    only from this scan. A `stream` keyword is refused outright: an object
+    stream cannot hold a stream (ISO 32000-1, 7.5.7), and taken as one it
+    would blank everything up to the next `endstream` while a reader still
+    parses the objects whose offsets fall inside.
+    """
+    structure, streams, _, unterminated = _parse(data)
+    problems = [f"{what} in an object stream" for what in unterminated]
+    if streams:
+        problems.append("a stream keyword in an object stream")
+    return _findings(structure, where), problems
 
 
 def _findings(structure: bytes, where: str) -> dict[str, Finding]:
@@ -670,8 +743,14 @@ def _is_object_stream(dictionary: bytes) -> bool:
 
 def _object_streams(
     data: bytes, streams: list[_Stream]
-) -> tuple[list[bytes], list[str], int]:
+) -> tuple[list[tuple[bytes, bool]], list[str], int]:
     """Every object stream in the file decoded, and the ones that could not be.
+
+    Each decoded body comes with whether it is the declared decode, the one a
+    reader sees. Only that one's scan can fail the file for running to EOF:
+    the readable prefix of an undecodable stream already makes the file
+    unknown, and the speculative zlib pass below may inflate a prefix of
+    bytes that were never compressed, which proves nothing about the file.
 
     Only object streams, because only they hold objects: an image, a page's
     drawing operators or an XMP packet is data, and reading names out of data
@@ -691,7 +770,7 @@ def _object_streams(
     That holds a file using LZW or a crypt filter on its object streams, which
     is rare in datasheets and preferable to releasing objects nobody read.
     """
-    out: list[bytes] = []
+    out: list[tuple[bytes, bool]] = []
     undecodable: list[str] = []
     # Object streams are chosen first and the cap applied to them, not to every
     # stream: capping all streams let 4,000 images push an object stream past
@@ -707,16 +786,16 @@ def _object_streams(
             # What can be read is still read, so the verdict carries whatever
             # the readable prefix shows; the file is unknown either way.
             if not filters and len(body) <= _MAX_INFLATE:
-                out.append(body)
+                out.append((body, False))
             continue
         decoded = _decode(body, filters)
         if decoded is None:
             undecodable.append("/".join(filters))
         else:
-            out.append(decoded)
+            out.append((decoded, True))
         if filters != ["FlateDecode"]:
             try:
-                out.append(zlib.decompressobj().decompress(body, _MAX_INFLATE))
+                out.append((zlib.decompressobj().decompress(body, _MAX_INFLATE), False))
             except zlib.error:
                 pass
     return out, undecodable, len(objstms)
@@ -743,12 +822,15 @@ def inspect_bytes(data: bytes) -> Inspection:
             reason="no %PDF- header; the file is not what its name claims",
         )
 
-    structure, streams, unbalanced = _parse(data)
+    structure, streams, unbalanced, unterminated = _parse(data)
     found = _findings(structure, "raw")
     decoded, undecodable, count = _object_streams(data, streams)
-    for chunk in decoded:
-        for name, finding in _scan(chunk, "stream").items():
+    for chunk, declared in decoded:
+        findings, problems = _scan(chunk, "stream")
+        for name, finding in findings.items():
             found.setdefault(name, finding)
+        if declared:
+            unterminated += problems
 
     # Checked after scanning, so an encrypted file still reports whatever was
     # visible in its unencrypted structure. `/Encrypt` in the trailer means the
@@ -774,6 +856,20 @@ def inspect_bytes(data: bytes) -> Inspection:
                 + ", ".join(sorted(set(undecodable)))
                 + "), so the objects inside it are unknown — which is not the same "
                 "as harmless"
+            ),
+            streams_scanned=count,
+        )
+
+    if unterminated:
+        return Inspection(
+            state="cannot_inspect",
+            findings=sorted(found.values(), key=lambda f: f.name),
+            reason=(
+                "something in it runs to the end of the file without closing ("
+                + ", ".join(sorted(set(unterminated)))
+                + "), and a reader that seeks to each object by its offset still "
+                "parses what comes after it, so that is unknown — which is not "
+                "the same as harmless"
             ),
             streams_scanned=count,
         )

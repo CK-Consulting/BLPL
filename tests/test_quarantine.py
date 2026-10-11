@@ -628,6 +628,97 @@ def test_a_type_less_object_stream_is_still_found_by_its_top_level_keys(tmp_path
     assert r.state == "cannot_inspect" and not r.is_inert
 
 
+_CATALOG = b"1 0 obj<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>endobj\n"
+
+
+def test_an_unclosed_string_cannot_hide_a_later_catalog(tmp_path):
+    """Codex, PR #15: an unused object with one unclosed `(` ran the string to
+    EOF and the scan stopped, but a reader walking the xref still parses the
+    catalog after it from its offset. Unknown, and what follows is still read
+    so the verdict carries it. A trailing backslash is the same string."""
+    for junk in (b"4 0 obj (never closed endobj\n", b"4 0 obj (x\\"):
+        for data in (
+            b"%PDF-1.4\n" + junk + _CATALOG + _TAIL,
+            b"%PDF-1.4\n" + _CATALOG + _TAIL + junk,
+        ):
+            r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+            assert r.state == "cannot_inspect" and not r.is_inert, data
+            assert "literal string" in r.reason
+        r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", b"%PDF-1.4\n" + junk + _CATALOG + _TAIL))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, junk
+    # Closed strings, nested and escaped ones included, are not held for it.
+    data = b"%PDF-1.4\n4 0 obj (a (b) \\) c) endobj\n1 0 obj<</Type/Catalog>>endobj\n" + _TAIL
+    assert pdf_inspect.inspect(_write(tmp_path, "c.pdf", data)).state == "inspected"
+
+
+def test_an_unclosed_string_in_an_object_stream_cannot_hide_the_next_object(tmp_path):
+    """The same inside an object stream, where it matters more: a reader finds
+    each object at its offset from /First, so object 2 is parsed whatever
+    object 1 left open, and this scan stopped at the `(`."""
+    inner = b"1 0 2 12 (unclosed    <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = _objstm(b"/Filter/FlateDecode", zlib.compress(inner))
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_stream_keyword_in_an_object_stream_is_unknown(tmp_path):
+    """An object stream cannot hold a stream. Taken as one, `stream` blanked
+    everything to the next `endstream` (here in a later object's string),
+    while a reader parses the catalog whose offset falls inside."""
+    inner = b"1 0 2 12 <</A 1>> stream\n<</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>> (endstream)"
+    data = _objstm(b"/Filter/FlateDecode", zlib.compress(inner))
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+def test_a_stream_body_that_never_ends_is_unknown(tmp_path):
+    """With no `endstream` the body is tokenized as structure, and its bytes
+    steer the tokenizer: a `(` in the data, closed by a stray `)` after the
+    catalog, blanked an /OpenAction that a reader using /Length parses."""
+    data = (
+        b"%PDF-1.4\n4 0 obj<</Length 1>>stream\n(\n" + _CATALOG + b")\n" + _TAIL
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+    assert "endstream" in r.reason
+
+
+def test_a_dictionary_still_open_at_eof_is_unbalanced(tmp_path):
+    data = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n" + _TAIL + b"<</Junk 1\n"
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+def test_a_comment_is_whitespace_in_an_indirect_length(tmp_path):
+    """Codex, PR #15: comments are lexical whitespace, but the length pattern
+    allowed only whitespace, so `6 0 obj % comment` left the reference
+    unresolved, the body was cut at the `endstream` in its text, and a benign
+    `/JS` in it held the file."""
+    n = str(len(_CONTENT)).encode()
+    for define in (
+        b"6 0 obj % the length\n" + n + b"\nendobj\n",
+        b"6%a\r0%b\robj%c\n+" + n + b"%d\nendobj\n",
+        b"6 0 obj\n%%%%\n" + n + b" % done\r\nendobj\n",
+    ):
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", _content_stream(b"6 0 R", define)))
+        assert r.state == "inspected" and r.is_inert, (define, [f.name for f in r.findings])
+
+
+def test_a_comment_before_endstream_still_honours_the_declared_length(tmp_path):
+    """The same whitespace rule after a body: a reader's lexer skips a comment
+    between the body and `endstream`. Missed, a direct /Length looked wrong,
+    the body was cut at an `endstream` inside the compressed bytes, and a
+    benign object stream was held as undecodable."""
+    body = _deflate_hiding_endstream(b"1 0 <</Type/Catalog>>")
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length "
+        + str(len(body)).encode() + b">>stream\n"
+        + body + b"\n% end of body\nendstream endobj\n" + _TAIL
+    )
+    assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
+
+
 def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
     data = (
         b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"
@@ -654,7 +745,12 @@ def test_something_that_is_not_a_pdf_says_so(tmp_path):
 
 def test_a_zip_bomb_costs_a_few_megabytes_not_the_machine(tmp_path):
     """A stream that inflates to gigabytes is not a datasheet's structure."""
-    bomb = b"%PDF-1.5\n1 0 obj<</Filter/FlateDecode>>stream\n" + zlib.compress(b"\0" * (64 << 20))
+    # Terminated: a body with no `endstream` is unknown in its own right (see
+    # test_a_stream_body_that_never_ends_is_unknown), and this is about cost.
+    bomb = (
+        b"%PDF-1.5\n1 0 obj<</Filter/FlateDecode>>stream\n" + zlib.compress(b"\0" * (64 << 20))
+        + b"\nendstream endobj\n%%EOF\n"
+    )
     r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", bomb))
     assert r.state == "inspected"
 
