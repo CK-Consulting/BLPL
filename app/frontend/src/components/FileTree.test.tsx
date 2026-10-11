@@ -2,7 +2,14 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { FileTree, destinationFor, isHidden, moveRefusalForDraft, type TreeNode } from "./FileTree";
+import {
+  FileTree,
+  deleteRefusalForDraft,
+  destinationFor,
+  isHidden,
+  moveRefusalForDraft,
+  type TreeNode,
+} from "./FileTree";
 
 const node = (path: string, over: Partial<TreeNode> = {}): TreeNode => ({
   path,
@@ -344,5 +351,85 @@ describe("a rename that would hide an unsaved draft", () => {
     expect(moveRefusalForDraft("notes/a.md", false, "notes/a.md", "notes/a.pdf")).toBeNull();
     expect(moveRefusalForDraft("notes/a.md", true, "other.md", "other.pdf")).toBeNull();
     expect(moveRefusalForDraft("b/a.md", true, "b/a.md", "b/a.kicad_sch")).toMatch(/Save or discard/);
+  });
+});
+
+describe("deletes that would lose something", () => {
+  it("refuses to delete the open, dirty file or a folder holding it", async () => {
+    // Codex, PR #17: a delete closed the editor and dropped the only copy of
+    // the draft; the commit held just the older contents on disk.
+    expect(deleteRefusalForDraft("base/board.md", true, "base/board.md")).toMatch(/Save or discard/);
+    expect(deleteRefusalForDraft("base/board.md", true, "base")).toMatch(/unsaved edits/);
+    expect(deleteRefusalForDraft("base/board.md", false, "base")).toBeNull();
+    expect(deleteRefusalForDraft("base/board.md", true, "sensor")).toBeNull();
+
+    const user = userEvent.setup();
+    const calls = mockApi();
+    render(
+      <FileTree
+        projectId="p"
+        reloadToken={0}
+        onOpen={() => {}}
+        canDelete={(p) => deleteRefusalForDraft("base/board.md", true, p)}
+      />,
+    );
+    await screen.findByText("overview.md");
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("base/") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText(/Save or discard your edits first/)).toBeTruthy();
+    expect(calls.filter((c) => c.method === "DELETE")).toEqual([]);
+  });
+
+  it("does not promise recovery for a file git does not track", async () => {
+    // Codex, PR #17: the confirmation said every delete was recoverable from
+    // history, including untracked files git never recorded.
+    const user = userEvent.setup();
+    mockApi([...NODES, node("scratch.md", { role: "design", untracked: true })]);
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("scratch.md");
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("scratch.md") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    expect(screen.getByRole("dialog", { name: "Delete file" })).toHaveTextContent(
+      "not in git history — this cannot be undone",
+    );
+    await user.keyboard("{Escape}");
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("overview.md") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    expect(screen.getByRole("dialog", { name: "Delete file" })).toHaveTextContent(
+      "recovered from the project's history",
+    );
+  });
+});
+
+describe("a tree from a project no longer selected", () => {
+  it("never shows the old project's rows after a switch", async () => {
+    // Codex, PR #17: a slow /tree for the previous project resolved last and
+    // filled the tree with its rows, while actions used the new projectId, so
+    // a delete could hit a same-named file in the project now selected.
+    let releaseOld: (r: Response) => void = () => {};
+    const json = (nodes: TreeNode[]) =>
+      new Response(JSON.stringify({ nodes }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.startsWith("/api/projects/old/")) {
+          return new Promise<Response>((resolve) => {
+            releaseOld = resolve;
+          });
+        }
+        return Promise.resolve(json([node("new-only.md", { role: "design" })]));
+      }),
+    );
+    const { rerender } = render(<FileTree projectId="old" reloadToken={0} onOpen={() => {}} />);
+    rerender(<FileTree projectId="new" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("new-only.md");
+    releaseOld(json([node("old-only.md", { role: "design" })]));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText("old-only.md")).toBeNull();
+    expect(screen.getByText("new-only.md")).toBeTruthy();
   });
 });

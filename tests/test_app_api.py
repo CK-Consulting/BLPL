@@ -541,6 +541,44 @@ def test_a_file_the_ledger_records_stays_where_it_was_released(client) -> None:
     assert (proj / "datasheets" / "LR2021.pdf").exists()
 
 
+def test_a_file_the_ledger_records_cannot_be_deleted_either(client) -> None:
+    """Codex, PR #17: deleting a released file left the ledger claiming a
+    release at a path that no longer exists, which the move rule refuses."""
+    import json as _json
+
+    _scratch_with_files(client)
+    import app.main as main
+    proj = main.projects.project_dir("scratch")
+    (proj / "datasheets").mkdir()
+    (proj / "datasheets" / "LR2021.pdf").write_bytes(b"%PDF-1.4\n")
+    (proj / "datasheets" / "notes.md").write_text("# mine\n")
+    (proj / "retrieved").mkdir()
+    (proj / "retrieved" / "quarantine.json").write_text(_json.dumps({"schema_version": 1, "retrieved": [
+        {"sha256": "x", "filename": "x-LR2021.pdf", "state": "released",
+         "released_as": "LR2021.pdf", "released_to": "datasheets", "reasons": []}
+    ]}))
+    for rel in ("datasheets/LR2021.pdf", "datasheets"):
+        r = client.delete(f"/api/projects/scratch/files/{rel}")
+        assert r.status_code == 409 and "ledger" in r.json()["detail"], rel
+    assert (proj / "datasheets" / "LR2021.pdf").exists()
+    # A file the ledger knows nothing about deletes as usual.
+    assert client.delete("/api/projects/scratch/files/datasheets/notes.md").status_code == 200
+
+
+def test_the_tree_says_which_files_git_cannot_bring_back(client) -> None:
+    """Codex, PR #17: the delete confirmation promised recovery from history
+    for every file, including untracked and ignored ones git never recorded."""
+    _scratch_with_files(client)
+    import app.main as main
+    proj = main.projects.project_dir("scratch")
+    (proj / "scratch-notes.txt").write_text("not committed\n")
+    body = client.get("/api/projects/scratch/tree").json()
+    assert body["git"] is True
+    by_path = {n["path"]: n for n in body["nodes"]}
+    assert by_path["scratch-notes.txt"].get("untracked") is True
+    assert not by_path["overview.md"].get("untracked")
+
+
 def test_the_ignore_list_follows_a_move_and_forgets_a_delete(client) -> None:
     """Codex, PR #17. The ignore list is keyed by path: a move left the entry on
     the old name and the file the user asked the assistant to leave alone was

@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { type NodeApi, type NodeRendererProps, Tree, type TreeApi } from "react-arborist";
-import { del, getJSON, postJSON, putJSON } from "../api";
+import { delJSON, getJSON, postJSON, putJSON } from "../api";
 import { ConfirmDialog, PromptDialog } from "./Dialog";
 import { UploadDialog } from "./UploadDialog";
 
@@ -52,6 +52,8 @@ export type TreeNode = {
   modified?: string;
   /** On the LLM-ignore list: the assistant leaves it alone unless asked by name. */
   llm_ignore?: boolean;
+  /** Not in git: deleted here, nothing can bring it back. */
+  untracked?: boolean;
 };
 
 // Order matters: this is the order the groups appear, which is roughly the
@@ -210,6 +212,7 @@ export function FileTree({
   onMoved,
   onDeleted,
   canMove,
+  canDelete,
 }: {
   projectId: string;
   reloadToken: number;
@@ -223,8 +226,22 @@ export function FileTree({
   onDeleted?: (path: string) => void;
   /** Asked before a move; a sentence refuses it, null lets it go ahead. */
   canMove?: (from: string, to: string) => string | null;
+  /** Asked before a delete, the same way. */
+  canDelete?: (path: string) => string | null;
 }) {
-  const [nodes, setNodes] = useState<TreeNode[]>([]);
+  // Stamped with the project they came from. A tree request still in flight
+  // when the project changed could resolve last and fill the tree with the old
+  // project's rows, while every action used the new projectId, so deleting a
+  // stale row could delete a same-named file in the project now selected.
+  const [loaded, setLoaded] = useState<{ project: string; nodes: TreeNode[]; git: boolean }>({
+    project: "",
+    nodes: [],
+    git: false,
+  });
+  const current = loaded.project === projectId;
+  const nodes = current ? loaded.nodes : [];
+  const currentRef = useRef(projectId);
+  currentRef.current = projectId;
   const [filter, setFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [bump, setBump] = useState(0);
@@ -251,10 +268,28 @@ export function FileTree({
   const treeRef = useRef<TreeApi<Item> | undefined>(undefined);
 
   useEffect(() => {
-    getJSON<{ nodes: TreeNode[] }>(`/api/projects/${projectId}/tree`)
-      .then((d) => setNodes(d.nodes))
-      .catch(() => setNodes([]));
+    // Superseded requests are ignored: only the newest one for this project
+    // may set the tree.
+    let live = true;
+    getJSON<{ nodes: TreeNode[]; git?: boolean }>(`/api/projects/${projectId}/tree`)
+      .then((d) => {
+        if (live) setLoaded({ project: projectId, nodes: d.nodes, git: d.git !== false });
+      })
+      .catch(() => {
+        if (live) setLoaded({ project: projectId, nodes: [], git: false });
+      });
+    return () => {
+      live = false;
+    };
   }, [projectId, reloadToken, bump]);
+
+  // A menu or dialog opened on the previous project's tree must not act on
+  // this one.
+  useEffect(() => {
+    setMenu(null);
+    setDialog(null);
+    setError(null);
+  }, [projectId]);
 
   const changed = () => {
     setBump((n) => n + 1);
@@ -322,6 +357,7 @@ export function FileTree({
 
   const move = async (from: string, to: string) => {
     setError(null);
+    if (!current) return;
     const refusal = canMove?.(from, to);
     if (refusal) {
       setError(refusal);
@@ -336,6 +372,27 @@ export function FileTree({
     }
   };
 
+  // Asked before the confirmation, not after: being told to save your edits
+  // only once you have agreed to delete them is too late to be useful.
+  const askDelete = (item: Item) => {
+    setError(null);
+    if (!current) return;
+    const refusal = canDelete?.(item.id);
+    if (refusal) {
+      setError(refusal);
+      return;
+    }
+    setDialog({ kind: "delete", item });
+  };
+
+  // Whether git can bring back what a delete removes. Unknown when git could
+  // not answer, and unknown is not "yes".
+  const recoverable = (item: Item) =>
+    loaded.git &&
+    !nodes.some(
+      (n) => !n.dir && n.untracked && (n.path === item.id || n.path.startsWith(`${item.id}/`)),
+    );
+
   const menuItems = (item: Item): MenuItem[] => {
     const out: MenuItem[] = [];
     const n = item.node;
@@ -349,7 +406,7 @@ export function FileTree({
     }
     if (item.kind !== "group" && !locked(item.id)) {
       out.push({ label: "Rename", run: () => void treeRef.current?.edit(item.id) });
-      out.push({ label: "Delete…", run: () => setDialog({ kind: "delete", item }), danger: true });
+      out.push({ label: "Delete…", run: () => askDelete(item), danger: true });
     }
     return out;
   };
@@ -375,7 +432,7 @@ export function FileTree({
     } else if (e.key === "Delete" && item.kind !== "group" && !locked(item.id)) {
       e.preventDefault();
       e.stopPropagation();
-      setDialog({ kind: "delete", item });
+      askDelete(item);
     }
   };
 
@@ -515,16 +572,32 @@ export function FileTree({
           message={
             <>
               Delete <code>{dialog.item.id}</code>
-              {dialog.item.kind === "folder" ? " and everything in it" : ""}? The delete is
-              committed, so it can be recovered from the project's history.
+              {dialog.item.kind === "folder" ? " and everything in it" : ""}?{" "}
+              {recoverable(dialog.item) ? (
+                "The delete is committed, so it can be recovered from the project's history."
+              ) : (
+                <strong>
+                  {dialog.item.kind === "folder" ? "Some of it is" : "It is"} not in git history —
+                  this cannot be undone.
+                </strong>
+              )}
             </>
           }
           onClose={() => setDialog(null)}
           onConfirm={async () => {
             const path = dialog.item.id;
-            await del(`/api/projects/${projectId}/files/${urlPath(path)}`);
+            if (currentRef.current !== projectId) throw new Error("The project changed; nothing was deleted.");
+            const refusal = canDelete?.(path);
+            if (refusal) throw new Error(refusal);
+            const r = await delJSON<{ committed?: boolean }>(
+              `/api/projects/${projectId}/files/${urlPath(path)}`,
+            );
             onDeleted?.(path);
             changed();
+            // The bytes are gone either way; say so when no commit records it.
+            if (r && r.committed === false) {
+              setError(`${path} was deleted, but the delete was not committed to the project's history.`);
+            }
           }}
         />
       )}
@@ -726,6 +799,21 @@ export function moveRefusalForDraft(
   const name = moved.split("/").pop() ?? moved;
   if (destinationFor({ name } as TreeNode) === "text") return null;
   return `${openPath} has unsaved edits, and as ${name} it would no longer open in the editor. Save or discard them first.`;
+}
+
+/**
+ * Why a delete must wait, or null. Deleting the open, dirty file (or a folder
+ * holding it) closes the editor and drops the only copy of the draft; the
+ * commit holds just the older contents on disk.
+ */
+export function deleteRefusalForDraft(
+  openPath: string | null,
+  dirty: boolean,
+  path: string,
+): string | null {
+  if (!dirty || !openPath) return null;
+  if (openPath !== path && !openPath.startsWith(`${path}/`)) return null;
+  return `${openPath} has unsaved edits that deleting it would lose. Save or discard your edits first.`;
 }
 
 /** Kept for callers that only ask the older question. */

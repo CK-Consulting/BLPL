@@ -33,7 +33,13 @@ import { NavActions } from "./components/NavActions";
 import { Chat as ChatIcon, Cog, PlusSquare, Share as ShareIcon } from "./components/Icons";
 import { BoardPanel } from "./components/BoardPanel";
 import { RailToggle, Section } from "./components/Rail";
-import { FileTree, destinationFor, moveRefusalForDraft, type TreeNode } from "./components/FileTree";
+import {
+  FileTree,
+  deleteRefusalForDraft,
+  destinationFor,
+  moveRefusalForDraft,
+  type TreeNode,
+} from "./components/FileTree";
 import { useResizable } from "./useResizable";
 import { Project, getJSON } from "./api";
 
@@ -238,6 +244,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                       }}
                       canMove={(from, to) =>
                         moveRefusalForDraft(openFile?.path ?? null, editorDirty, from, to)
+                      }
+                      canDelete={(path) =>
+                        deleteRefusalForDraft(openFile?.path ?? null, editorDirty, path)
                       }
                       onDeleted={(path) =>
                         setOpenFile((f) =>

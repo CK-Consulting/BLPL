@@ -157,6 +157,14 @@ export async function del(path: string): Promise<void> {
   if (!res.ok) await fail(res);
 }
 
+/** A DELETE whose answer matters — the body when there is one, else null. */
+export async function delJSON<T>(path: string): Promise<T | null> {
+  const res = await request(path, { method: "DELETE" });
+  if (!res.ok) await fail(res);
+  const text = await res.text();
+  return text ? (JSON.parse(text) as T) : null;
+}
+
 // Read an SSE body and dispatch each frame. Used for run streams, which are
 // POST/GET fetches (EventSource is GET-only and can't carry our session
 // semantics through the Vite proxy identically). Resolves when the stream

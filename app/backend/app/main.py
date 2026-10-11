@@ -2842,10 +2842,29 @@ def get_tree(
     # Marked on the node so the tree can say which files the assistant has been
     # told to leave alone, rather than that living only in a JSON file.
     ignored = llm_ignore.paths(proj)
+    tracked = _tracked_paths(proj)
     for node in nodes:
         if not node["dir"] and node["path"] in ignored:
             node["llm_ignore"] = True
-    return {"project_id": project_id, "nodes": nodes}
+        # Marked so a delete can say whether git can bring the file back: an
+        # untracked or ignored file deleted here is gone, and a confirmation
+        # promising "one revert away" would be untrue for it.
+        if not node["dir"] and tracked is not None and node["path"] not in tracked:
+            node["untracked"] = True
+    # False when git could not answer; the client then promises no recovery.
+    return {"project_id": project_id, "nodes": nodes, "git": tracked is not None}
+
+
+def _tracked_paths(checkout: Path) -> set[str] | None:
+    """Every path git tracks in this checkout, or None when git cannot say."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(checkout), "ls-files", "-z"],
+            capture_output=True, timeout=20, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {p.decode("utf-8", "surrogateescape") for p in out.split(b"\0") if p}
 
 
 def _tree_target(proj: Path, rel: str) -> Path:
@@ -3433,6 +3452,19 @@ def delete_path(
     _refuse_while_running(session, user, project, "delete it")
     if not target.exists() and not target.is_symlink():
         raise HTTPException(status_code=404, detail=f"no file or folder {rel!r}")
+    # The same rule as a move, for the same reason: the ledger names a released
+    # file by its path and is never edited to keep up, so deleting one would
+    # leave it recording a release of a file that is not there.
+    recorded = llm_ignore.released_under(checkout, rel)
+    if recorded:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
+                "is recorded in the quarantine ledger as released at its current path; "
+                "deleting it would leave the ledger naming a file that is not there"
+            ),
+        )
     if target.is_dir() and not target.is_symlink():
         shutil.rmtree(target)
         kind = "folder"
