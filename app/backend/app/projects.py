@@ -139,11 +139,15 @@ def _redact_url(url: str) -> str:
     # (`user:tok@en@host`), and stopping at the first one left its tail on
     # screen (Codex, PR #10).
     match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/]+)@(.*)$", url)
-    if not match:
-        return url
-    scheme, userinfo, rest = match.groups()
-    user = userinfo.split(":", 1)[0]
-    return f"{scheme}{user}:***@{rest}" if ":" in userinfo else f"{scheme}{user}@{rest}"
+    if match:
+        scheme, userinfo, rest = match.groups()
+        user = userinfo.split(":", 1)[0]
+        url = f"{scheme}{user}:***@{rest}" if ":" in userinfo else f"{scheme}{user}@{rest}"
+    # Then the query and fragment, the other place a token sits
+    # (`...repo.git?access_token=...`) and which a remote never needs (Codex,
+    # PR #10). check_remote_url refuses them; an origin configured before that,
+    # or by hand, can still have one, and the status panel shows origin.
+    return _strip_query(url)
 
 
 # Any URL's password, wherever it sits in a longer string: an argv joined into
@@ -160,9 +164,30 @@ _URL_PASSWORD = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:]*):[^/\s]*@")
 _SCP_PASSWORD = re.compile(r"^([^/@\s:]*):[^/\s]*@")
 
 
+# Any URL's query string or fragment, likewise wherever it sits. A token rides
+# there as easily as in the userinfo — `https://host/repo.git?access_token=...`
+# has no password for the pattern above to find (Codex, PR #10). Runs to the
+# end of the URL: whitespace or a quote, since git's stderr quotes the URL it
+# could not reach ('https://host/x?tok=...': ...) and the quote is not the token.
+_URL_QUERY = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s?#'\"]*)[?#][^\s'\"]*")
+
+
+def _strip_query(url: str) -> str:
+    """One URL with its query string and fragment removed.
+
+    The scp-like form (`git@host:path?x`) has no scheme for _URL_QUERY to
+    anchor on, so for a lone URL anything from the first ? or # goes.
+    """
+    if "://" in url:
+        return _URL_QUERY.sub(r"\1", url)
+    return re.split(r"[?#]", url, maxsplit=1)[0]
+
+
 def _redact_text(text: str) -> str:
-    """``text`` with the password of every URL in it replaced by ``***``."""
-    return _URL_PASSWORD.sub(r"\1:***@", text)
+    """``text`` with the password, query and fragment of every URL in it
+    removed. Password first: the other way round, a ? inside a password
+    (`https://u:p?x@host/`) cut the URL short and left the password's head."""
+    return _URL_QUERY.sub(r"\1", _URL_PASSWORD.sub(r"\1:***@", text))
 
 
 def _shown(raw: str) -> str:
@@ -173,8 +198,33 @@ def _shown(raw: str) -> str:
     """
     text = _redact_text(raw)
     if "://" not in text:
-        text = _SCP_PASSWORD.sub(r"\1:***@", text)
+        text = _strip_query(_SCP_PASSWORD.sub(r"\1:***@", text))
     return repr(text[:60])
+
+
+def _carries_query(url: str) -> bool:
+    """A remote URL with a query string or fragment, local paths aside.
+
+    No git transport needs either: smart HTTP appends its own query
+    (`/info/refs?service=...`), and ssh and the scp-like form have no notion
+    of one. So what a pasted one is likely to carry is what Codex found on
+    PR #10 — `?access_token=...` — and refusing the shape outright is sturdier
+    than a list of parameter names that would always be one short. The
+    scp-like `host:path?x` is refused too: a ? is legal in a path there in
+    principle, but a repository named that way is far less likely than a
+    token, and the same URL written as ssh:// is refused anyway.
+
+    A local path (``/...``, test fixtures only) is exempt: a ? or # in a
+    directory name is just a name, and no token travels with it.
+    """
+    return not url.startswith("/") and ("?" in url or "#" in url)
+
+
+_QUERY_REFUSAL = (
+    "this URL has a query string or fragment (after ? or #). A git remote "
+    "needs neither, and a token can ride in one — remove it, and add any "
+    "credential under Account & app settings → Git endpoints/accounts"
+)
 
 
 def _carries_password(url: str) -> bool:
@@ -246,6 +296,10 @@ def check_remote_url(url: str) -> str:
             raise ProjectError(f"{_shown(raw)} is not a valid URL") from exc
         if scheme != "file" and not host:
             raise ProjectError(f"{_shown(raw)} names no host")
+        if _carries_query(raw):
+            # Not quoted, even stripped: it would tell the user nothing they
+            # do not know, and the query is the secret part.
+            raise ProjectError(_QUERY_REFUSAL)
         if urlsplit(raw).password is not None:
             # A token in the URL would be written to .git/config in plaintext
             # and kept there; display-time redaction does nothing about that.
@@ -259,6 +313,8 @@ def check_remote_url(url: str) -> str:
         raise ProjectError("git transport helpers (such as ext::) are not allowed")
     m = _SCP_LIKE.match(raw)
     if m and "ssh" in allowed:
+        if _carries_query(raw):
+            raise ProjectError(_QUERY_REFUSAL)
         return raw
     if raw.startswith("/") and "file" in allowed:
         return raw
@@ -561,6 +617,16 @@ class Projects:
                 "BLPL will not send. Set the URL again without it in Project "
                 "settings → Git, and add the credential under Account & app "
                 "settings → Git endpoints/accounts."
+            )
+        if urls and _carries_query(urls[0]):
+            # The same history, for the other place a token sits: the setter
+            # now refuses `?access_token=...`, but an origin configured before
+            # it still went into git's argv and, on failure, into the error a
+            # member sees (Codex, PR #10).
+            raise ProjectError(
+                f"origin's {operation} URL has a query string or fragment, which "
+                "can carry a token and which BLPL will not send. Set the URL "
+                "again without it in Project settings → Git."
             )
         return urls[0] if urls else ""
 

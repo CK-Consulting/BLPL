@@ -124,6 +124,13 @@ def put(
             "the host is a hostname alone — leave out any user name or token "
             "(those have fields of their own)"
         )
+    if "?" in host or "#" in host:
+        # `github.com?access_token=...` survives the cut at the first / above.
+        # Refused unquoted, like the userinfo case: a query is where the remote
+        # form refuses a token too (Codex, PR #10).
+        raise GitStoreError(
+            "the host is a hostname alone — leave out any query string or fragment"
+        )
     if not host or " " in host:
         raise GitStoreError(f"{host!r} is not a hostname")
     if method not in METHODS:

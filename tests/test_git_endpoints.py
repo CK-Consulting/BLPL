@@ -82,6 +82,17 @@ def test_a_host_carrying_a_token_is_refused_without_echoing_it(unlocked) -> None
     assert "ghp_tokensecret" not in unlocked.get("/api/settings/git").text
 
 
+def test_a_host_carrying_a_query_is_refused_without_echoing_it(unlocked) -> None:
+    """Codex P1 on #10, the query form: `host?access_token=...` survived the cut
+    at the first / and was stored as the host."""
+    for host in ("github.com?access_token=SECRETQ", "https://github.com#SECRETQ"):
+        r = unlocked.put("/api/settings/git/github", json={
+            "host": host, "method": "https_token", "secret": "tok", "username": "me",
+        })
+        assert r.status_code == 400 and "SECRETQ" not in r.text, host
+    assert "SECRETQ" not in unlocked.get("/api/settings/git").text
+
+
 def test_rotation_replaces_in_place(unlocked) -> None:
     for secret in ("tok-one", "tok-two"):
         unlocked.put("/api/settings/git/github", json={

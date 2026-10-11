@@ -559,6 +559,89 @@ def test_a_failing_git_command_never_repeats_a_token(tmp_path):
     assert "https://me:***@host-a.example" in str(exc.value)
 
 
+# Codex P1 on #10: a token in the query has no password for urlsplit to see, so
+# it was accepted, written to .git/config, and shown back by the status panel.
+# Refused by shape — remotes need no query or fragment — not by parameter name.
+_QUERY_BEARING = [
+    "https://git.example/repo.git?access_token=SECRETQ",
+    "https://git.example/repo.git?private_token=SECRETQ",
+    "https://git.example/repo.git#SECRETQ",
+    "ssh://git@git.example/repo.git?SECRETQ",
+    # scp-like: a ? is legal in a path there in principle; refused all the same.
+    "git@git.example:o/repo.git?token=SECRETQ",
+    "git@git.example:o/repo.git#SECRETQ",
+    # Malformed as well as query-bearing: the "not a valid URL" refusal quotes
+    # the URL, and must not quote the query with it.
+    "https://[bad/repo?access_token=SECRETQ",
+]
+
+
+@pytest.mark.parametrize("url", _QUERY_BEARING)
+def test_a_url_with_a_query_or_fragment_is_refused_without_echo(deployment_protocols, url):
+    with pytest.raises(ProjectError) as exc:
+        check_remote_url(url)
+    assert "SECRETQ" not in str(exc.value)
+
+
+def test_the_remote_route_refuses_a_query_without_echoing_it(unlocked, deployment_protocols):
+    _project(unlocked)
+    for url in _QUERY_BEARING:
+        r = unlocked.put("/api/projects/p/git/remote", json={"url": url})
+        assert r.status_code == 400, (url, r.text)
+        assert "SECRETQ" not in r.text, url
+    assert "SECRETQ" not in unlocked.get("/api/projects/p/git/status").text
+    r = unlocked.post("/api/projects/clone", json={
+        "name": "x", "remote": "https://git.example/repo.git?access_token=SECRETQ",
+        "branch": "main",
+    })
+    assert r.status_code == 400 and "SECRETQ" not in r.text
+
+
+def test_a_query_already_in_origin_is_refused_before_git_runs(tmp_path, monkeypatch):
+    # The same finding for a repository configured before the setter refused
+    # queries: the URL went into git's argv and, on failure, the error.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://host-a.example/o/p.git?access_token=SECRETQ"],
+        cwd=work, check=True,
+    )
+    ran = []
+    real_git = store._git
+    monkeypatch.setattr(store, "_git", lambda cwd, *a, **k: (ran.append(a), real_git(cwd, *a, **k))[1])
+    for op in ("fetch", "push"):
+        with pytest.raises(ProjectError, match="query string") as exc:
+            store.remote_of("p", operation=op)
+        assert "SECRETQ" not in str(exc.value)
+    for call in (store.pull, store.push):
+        with pytest.raises(ProjectError, match="query string") as exc:
+            call("p")
+        assert "SECRETQ" not in str(exc.value)
+    assert not [a for a in ran if any("SECRETQ" in x for x in a)], ran
+
+    # …and the status panel, which reads origin without going through that
+    # check, shows the URL without its query.
+    st = store.status("p")
+    assert st.has_remote and st.remote_url == "https://host-a.example/o/p.git"
+
+
+def test_a_failing_git_command_never_repeats_a_query(tmp_path):
+    # Defence in depth: _git's error quotes its argv and git's stderr, and git
+    # quotes a URL it could not reach — 'https://host/x?tok=...' — in quotes
+    # the stripping must stop at.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    with pytest.raises(ProjectError) as exc:
+        store._git(work, "rev-parse", "--verify", "https://host-a.example/o/p.git?access_token=SECRETQ")
+    assert "SECRETQ" not in str(exc.value)
+    assert "https://host-a.example/o/p.git" in str(exc.value)
+    stderr = "fatal: unable to access 'https://u:pw?x@host/r.git?access_token=SECRETQ': 403"
+    assert projects_mod._redact_text(stderr) == (
+        "fatal: unable to access 'https://u:***@host/r.git': 403"
+    )
+    assert projects_mod._redact_url("git@host:o/r.git?SECRETQ") == "git@host:o/r.git"
+
+
 def test_saving_the_fetch_url_over_a_separate_push_url_forgets_the_push_side(tmp_path):
     # Codex P2 on #10: origin fetched from A and pushed to B. Saving A dropped
     # the pushurl, moving every push from B to A, but the old URL was read
