@@ -794,6 +794,24 @@ def test_many_headers_inside_one_string_cost_little(tmp_path):
     assert r.state == "inspected" and r.is_inert, r.reason
 
 
+def test_a_line_of_comment_gaps_costs_little(tmp_path):
+    """Finding `N G obj V endobj` with comments allowed between the tokens was
+    a regex that tried every digit as a start and scanned the comment after
+    it to the end of its line each time. A megabyte of `1 % obj ` on one line
+    took about twenty minutes. Found from each `obj` and walked back, it is
+    linear. The length still resolves when the comments are real gaps."""
+    import time
+
+    data = b"%PDF-1.4\n4 0 obj(" + b"1 % obj " * 125_000 + b")endobj\n" + _TAIL
+    t = time.monotonic()
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert time.monotonic() - t < 10
+    assert r.state == "inspected" and r.is_inert, r.reason
+    define = b"6 %x 1 %y\n0 %z\nobj % a\n%b\n" + str(len(_CONTENT)).encode() + b" %c\nendobj\n"
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", _content_stream(b"6 0 R", define)))
+    assert r.state == "inspected" and r.is_inert, [f.name for f in r.findings]
+
+
 def test_a_comment_is_whitespace_in_an_indirect_length(tmp_path):
     """Codex, PR #15: comments are lexical whitespace, but the length pattern
     allowed only whitespace, so `6 0 obj % comment` left the reference

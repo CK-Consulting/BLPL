@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import base64
 import bisect
+from array import array
 import re
 import zlib
 from dataclasses import dataclass
@@ -259,6 +260,7 @@ def _parse(
     last_endstream: int | None = None,
     skipped: list[tuple[int, int]] | None = None,
     one_object: bool = False,
+    gaps: _Gaps | None = None,
 ) -> tuple[bytes, list[_Stream], bool, list[str], int]:
     """The file's structure as canonical tokens, each stream paired with the
     dictionary that introduces it, whether the dictionaries nest sanely, which
@@ -305,8 +307,9 @@ def _parse(
     is where a lenient reader takes the next object to begin; anything else,
     reaching `endpos` included, is reported as not ending.
     """
+    gaps = gaps or _Gaps(data)
     if lengths is None:
-        lengths = _length_objects(data)
+        lengths = _length_objects(data, gaps)
     out = bytearray()
     streams: list[_Stream] = []
     opens: list[int] = []               # offsets in `out` of unclosed `<<`
@@ -402,7 +405,7 @@ def _parse(
             elif pos < n and data[pos] in b"\r\n":
                 pos += 1
             close, ended_by = (
-                _body_end(data, pos, dictionary, lengths)
+                _body_end(data, pos, dictionary, lengths, gaps)
                 if pos <= last_endstream else (-1, "search")
             )
             streams.append(_Stream(dictionary, pos, n if close < 0 else close, ended_by))
@@ -506,23 +509,127 @@ def _is_reference(value: list[bytes] | None) -> bool:
     return value is not None and len(value) == 3 and value[2] == b"R"
 
 
-# `N G obj <integer> endobj`, anywhere in the raw bytes. Preceded by a
-# non-regular byte so `11 0 obj` is not read as `1 0 obj`.
+# Between tokens, a comment is whitespace (ISO 32000-1, 7.2.3), running to the
+# end of its line. Codex, PR #15: with whitespace alone, `6 0 obj % length\n30
+# endobj` did not resolve, the stream fell back to its first `endstream`, and a
+# benign file could be held. A gap is therefore whitespace bytes and whole
+# comments, and since nothing that follows one can begin with either, its end
+# is fixed: there is one way to read it, and _Gaps finds it.
 #
-# Between tokens, a comment is whitespace (ISO 32000-1, 7.2.3). Codex, PR #15:
-# with whitespace alone, `6 0 obj % length\n30 endobj` did not resolve, the
-# stream fell back to its first `endstream`, and a benign file could be held.
-# One whitespace byte or one whole comment per repetition, the comment running
-# to its line's end: a `%` can then start a comment only where the previous one
-# ended, so a line of `%%%%` matches one way and cannot backtrack
-# exponentially, as `(?:[ws]+|%[^\r\n]*)+` would.
-_GAP_UNIT = rb"(?:[\x00\t\n\x0c\r ]|%[^\r\n]*(?=[\r\n]|\Z))"
-_WSP = _GAP_UNIT + rb"+"
-_GAP = re.compile(_GAP_UNIT + rb"*")
-_LENGTH_OBJECT = re.compile(
-    rb"(?<!" + _REGULAR + rb")(\d+)" + _WSP + rb"(\d+)" + _WSP + rb"obj" + _WSP
-    + rb"([+-]?\d+)" + _WSP + rb"endobj(?!" + _REGULAR + rb")"
-)
+# Not by regex. The pattern this used, `\d+ (?:ws|%[^\r\n]*)+ ...`, tried
+# every digit in the file as a start and scanned the comment after it to the
+# end of its line from each one, so a line of `1 % obj 1 % obj ...` cost the
+# square of its length: 7.5 s at 80 KB, and twenty minutes or so at 1 MB, on
+# an upload anyone can make. The same shape sat in the gap match after a
+# stream's declared end.
+_NOT_WS = re.compile(rb"[^\x00\t\n\x0c\r ]")
+_EOL_BYTE = re.compile(rb"[\r\n]")
+_VALUE = re.compile(rb"[+-]?\d+")
+_ENDOBJ = re.compile(rb"endobj(?!" + _REGULAR + rb")")
+_REGULAR_BYTE = re.compile(_REGULAR)
+
+
+class _NextByte:
+    """The first offset at or after q where a one-byte pattern matches, or
+    the file's length: at most one block searched, then a table of the first
+    match at or after each block, built the first time a search runs off its
+    block. Repeated queries in one long run therefore cost a block each, not
+    the rest of the run each."""
+
+    _BLOCK = 256
+
+    def __init__(self, data: bytes, pattern: re.Pattern) -> None:
+        self.data, self.pattern = data, pattern
+        self._first: array | None = None
+
+    def __call__(self, q: int) -> int:
+        data, n, b = self.data, len(self.data), self._BLOCK
+        m = self.pattern.search(data, q, min(n, (q // b + 1) * b))
+        if m:
+            return m.start()
+        if self._first is None:
+            blocks = n // b + 1
+            first = array("q", [n]) * (blocks + 1)
+            nxt = n
+            for k in range(blocks - 1, -1, -1):
+                hit = self.pattern.search(data, k * b, min(n, (k + 1) * b))
+                if hit:
+                    nxt = hit.start()
+                first[k] = nxt
+            self._first = first
+        return self._first[q // b + 1]
+
+
+class _Gaps:
+    """Where the gap (whitespace and comments) starting at an offset ends,
+    for one file, in time that does not depend on how often it is asked.
+
+    Each piece a regex rescanned is found once here. The end of a run of
+    whitespace and the end of a comment (the next EOL) come from _NextByte.
+    And everything after a comment's EOL is the same for every comment
+    ending there, so the gap's end from each EOL is remembered.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self._eol = _NextByte(data, _EOL_BYTE)
+        self._solid = _NextByte(data, _NOT_WS)
+        self._after_eol: dict[int, int] = {}
+
+    def end(self, p: int) -> int:
+        data, n, memo = self.data, len(self.data), self._after_eol
+        eols: list[int] = []
+        while p < n:
+            if p in memo:
+                p = memo[p]
+                break
+            c = data[p]
+            if c in _WS:
+                p = self._solid(p)
+            elif c == 0x25:                       # `%`, to the end of its line
+                p = self._eol(p)
+                eols.append(p)
+            else:
+                break
+        for e in eols:
+            memo[e] = p
+        return p
+
+
+def _integer_ends(data: bytes, at: int) -> list[int]:
+    """Every offset r < `at` where an integer ends and a gap runs from r to
+    exactly `at`: the places a header's integers can end, read backwards.
+
+    The gap is walked back from `at`. A whitespace byte is one unit; a
+    comment is the other, and it can end only at an EOL, so where the walk
+    crosses one, every `%` on the line before it may start a comment that
+    ends there, and the walk continues from each. That is every way a forward
+    reader could have reached `at`, and each line is walked once, so the cost
+    is the bytes walked.
+    """
+    out: list[int] = []
+    stack = [at]
+    while stack:
+        i = stack.pop()
+        j = i
+        while j > 0 and data[j - 1] in _WS:
+            j -= 1
+        if j < at and j > 0 and 0x30 <= data[j - 1] <= 0x39:
+            out.append(j)
+        eol = _EOL_BYTE.search(data, j, i)
+        if eol is None:
+            continue
+        # The line ending at the run's first EOL: its text is [start, j).
+        start = j
+        while start > 0 and data[start - 1] not in _EOL:
+            start -= 1
+        q = data.find(b"%", start, j)
+        while q >= 0:
+            stack.append(q)
+            q = data.find(b"%", q + 1, j)
+    return out
+
+
 # A keyword that begins something a reader parses as structure: an object, a
 # stream body, a trailer. Whole words, so `endstream` and `endobj` are not.
 _STRUCTURE_WORD = re.compile(
@@ -530,7 +637,7 @@ _STRUCTURE_WORD = re.compile(
 )
 
 
-def _length_objects(data: bytes) -> dict[tuple[bytes, bytes], int]:
+def _length_objects(data: bytes, gaps: _Gaps | None = None) -> dict[tuple[bytes, bytes], int]:
     """Every object whose whole body is one integer, keyed by `(N, G)` in
     canonical form, where the file defines it one way only.
 
@@ -542,11 +649,37 @@ def _length_objects(data: bytes) -> dict[tuple[bytes, bytes], int]:
     incremental update, or a decoy) resolves to nothing; with one value it
     resolves to that value, which _body_end still accepts only where it lands
     on an `endstream` and swallows no structure the fallback would have read.
+
+    The pattern is `N G obj V endobj` with gaps between, N not preceded by a
+    regular byte. It is found from each `obj` keyword: forwards to V and
+    `endobj`, which is cheap and rules out nearly every `obj`, then backwards
+    to G and N through _integer_ends. Every reading is kept, including ones a
+    leftmost regex would have skipped as overlapping; an extra reading can
+    only make a key's values disagree, which resolves to nothing.
     """
+    gaps = gaps or _Gaps(data)
     seen: dict[tuple[bytes, bytes], set[bytes]] = {}
-    for m in _LENGTH_OBJECT.finditer(data):
-        key = (_canonical_word(m.group(1)), _canonical_word(m.group(2)))
-        seen.setdefault(key, set()).add(_canonical_word(m.group(3)))
+    for m in _OBJ_WORD.finditer(data):
+        p = gaps.end(m.end())
+        v = _VALUE.match(data, p) if p > m.end() else None
+        if v is None:
+            continue
+        q = gaps.end(v.end())
+        if q == v.end() or not _ENDOBJ.match(data, q):
+            continue
+        value = _canonical_word(v.group())
+        for g_end in _integer_ends(data, m.start()):
+            g = g_end
+            while g > 0 and 0x30 <= data[g - 1] <= 0x39:
+                g -= 1
+            for n_end in _integer_ends(data, g):
+                n = n_end
+                while n > 0 and 0x30 <= data[n - 1] <= 0x39:
+                    n -= 1
+                if n > 0 and _REGULAR_BYTE.match(data, n - 1):
+                    continue
+                key = (_canonical_word(data[n:n_end]), _canonical_word(data[g:g_end]))
+                seen.setdefault(key, set()).add(value)
     return {
         key: int(next(iter(values)))
         for key, values in seen.items()
@@ -557,7 +690,11 @@ def _length_objects(data: bytes) -> dict[tuple[bytes, bytes], int]:
 
 
 def _body_end(
-    data: bytes, start: int, dictionary: bytes, lengths: dict[tuple[bytes, bytes], int]
+    data: bytes,
+    start: int,
+    dictionary: bytes,
+    lengths: dict[tuple[bytes, bytes], int],
+    gaps: _Gaps | None = None,
 ) -> tuple[int, str]:
     """Where a stream body ends, and what put it there (see _Stream.ended_by):
     at the declared /Length when that lands on an `endstream`, otherwise at
@@ -608,7 +745,8 @@ def _body_end(
         # `\x00endstream` missed its declared length and fell back to the
         # first `endstream`, which may sit inside the compressed bytes. And
         # comments, which a reader's lexer skips there like whitespace.
-        if end <= len(data) and data.startswith(_ENDSTREAM, _GAP.match(data, end).end()):
+        gaps = gaps or _Gaps(data)
+        if end <= len(data) and data.startswith(_ENDSTREAM, gaps.end(end)):
             if how == "length" or end <= first or not _STRUCTURE_WORD.search(data, first, end):
                 return end, how
     return first, "search"
@@ -678,6 +816,7 @@ def _hidden_objects(
     skipped: list[tuple[int, int]],
     lengths: dict[tuple[bytes, bytes], int],
     last_endstream: int,
+    gaps: _Gaps | None = None,
 ) -> tuple[list[bytes], list[_Stream], bool, list[str], int]:
     """Objects a reader can parse that the front-to-back parse dropped as data.
 
@@ -726,7 +865,7 @@ def _hidden_objects(
             break
         structure, inner, bad, unterminated, stop = _parse(
             data, at, min(len(data), at + budget[0]),
-            lengths=lengths, last_endstream=last_endstream, one_object=True,
+            lengths=lengths, last_endstream=last_endstream, one_object=True, gaps=gaps,
         )
         budget[0] -= max(stop - at, 1)
         structures.append(structure)
@@ -1018,14 +1157,15 @@ def inspect_bytes(data: bytes) -> Inspection:
             reason="no %PDF- header; the file is not what its name claims",
         )
 
-    lengths = _length_objects(data)
+    gaps = _Gaps(data)
+    lengths = _length_objects(data, gaps)
     last_endstream = data.rfind(_ENDSTREAM)
     skipped: list[tuple[int, int]] = []
     structure, streams, unbalanced, unterminated, _ = _parse(
-        data, lengths=lengths, last_endstream=last_endstream, skipped=skipped
+        data, lengths=lengths, last_endstream=last_endstream, skipped=skipped, gaps=gaps
     )
     hidden, hidden_streams, hidden_unbalanced, hidden_problems, hidden_count = _hidden_objects(
-        data, skipped, lengths, last_endstream
+        data, skipped, lengths, last_endstream, gaps
     )
     structure = b" ".join([structure, *hidden])
     known = {st.start for st in streams}
