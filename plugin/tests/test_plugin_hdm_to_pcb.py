@@ -22,13 +22,19 @@ import yaml
 
 
 _PLUGINS_ROOT = Path(__file__).resolve().parent.parent
-_FOOTPRINTS_ROOT = Path(__file__).resolve().parent.parent / "kicad-footprints"
+# The unit tests only use this as a lookup key for the fake pcbnew; the
+# integration test needs real footprints. The plugin vendors no library of its
+# own, so take KiCad's stock footprints from BLPL_KICAD_FOOTPRINTS, or from the
+# pipeline's submodule when this sits beside core/ in the umbrella checkout.
+_FOOTPRINTS_ROOT = Path(
+    os.environ.get("BLPL_KICAD_FOOTPRINTS") or _PLUGINS_ROOT.parent / "core" / "kicad-footprints"
+)
 
 
 # Make the plugin package importable in-venv for unit tests.
 sys.path.insert(0, str(_PLUGINS_ROOT))
 
-from blpl.plugin_kicad import hdm_to_pcb  # noqa: E402
+from blpl_kicad_plugin import hdm_to_pcb  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +273,10 @@ def _find_kicad_python() -> Path | None:
 
 
 @pytest.mark.skipif(
-    _find_kicad_python() is None or shutil.which("kicad-cli") is None,
-    reason="KiCad's bundled Python or kicad-cli not available on this system.",
+    _find_kicad_python() is None
+    or shutil.which("kicad-cli") is None
+    or not _FOOTPRINTS_ROOT.is_dir(),
+    reason="KiCad's bundled Python, kicad-cli or the stock footprints are not available.",
 )
 def test_plugin_produces_kicad_cli_loadable_board(tmp_path: Path) -> None:
     import json
@@ -285,7 +293,7 @@ def test_plugin_produces_kicad_cli_loadable_board(tmp_path: Path) -> None:
     cmd = [
         str(kicad_python),
         "-m",
-        "blpl.plugin_kicad.build_pcb",
+        "blpl_kicad_plugin.build_pcb",
         "--hdm",
         str(hdm_path),
         "--out",

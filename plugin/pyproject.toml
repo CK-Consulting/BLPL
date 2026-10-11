@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# The KiCad PCB plugin: a pcbnew ActionPlugin plus the standalone build_pcb
+# entry point, both of which build a .kicad_pcb from an HDM file through
+# pcbnew's own API. Future repository "blpl-kicad-plugin".
+#
+# It runs under KiCad's bundled Python, which ships neither pyyaml nor anything
+# of ours, so the package imports nothing outside the standard library and
+# pcbnew. That is why `blpl` is not a runtime dependency here even though the
+# two belong together: the pipeline (blpl-core) produces the HDM, and its
+# `blpl stage6-plugin` command launches this package's build_pcb under KiCad's
+# interpreter. Installing it beside blpl is what lets that command find it
+# without a path (see blpl.core.cli._resolve_plugin_dir).
+[project]
+name = "blpl-kicad-plugin"
+version = "0.1.0"  # keep in step with blpl_kicad_plugin/version.txt and metadata.json
+description = "KiCad PCB plugin: build a board from a BLPL HDM file through pcbnew."
+requires-python = ">=3.9"  # KiCad's bundled interpreter, not ours
+dependencies = []
+
+[project.optional-dependencies]
+# pyyaml: the ActionPlugin reads an HDM YAML when one is picked in the GUI, and
+# the tests build their fixtures with it. build_pcb itself reads JSON.
+yaml = ["pyyaml>=6.0"]
+dev = ["pytest>=7.4", "pyyaml>=6.0"]
+
+[tool.setuptools.packages.find]
+include = ["blpl_kicad_plugin*"]
+
+[tool.setuptools.package-data]
+"blpl_kicad_plugin" = ["metadata.json", "version.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
