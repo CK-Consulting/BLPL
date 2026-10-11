@@ -216,6 +216,22 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                       projectId={selected}
                       reloadToken={reloadToken}
                       onChanged={refresh}
+                      // The open file follows a rename and closes on a delete;
+                      // otherwise the editor would save the old name back into
+                      // existence on the next keystroke.
+                      onMoved={(from, to) =>
+                        setOpenFile((f) => {
+                          if (!f) return f;
+                          if (f.path === from) return { ...f, path: to, name: to.split("/").pop() ?? to };
+                          if (f.path.startsWith(`${from}/`)) return { ...f, path: to + f.path.slice(from.length) };
+                          return f;
+                        })
+                      }
+                      onDeleted={(path) =>
+                        setOpenFile((f) =>
+                          f && (f.path === path || f.path.startsWith(`${path}/`)) ? null : f,
+                        )
+                      }
                       onOpen={(n) => {
                         // Three destinations, because there are three kinds of
                         // file here. Text the panel can render goes to

@@ -3,6 +3,7 @@ import { GitStatus, ImportResult, getJSON, postForm, postJSON } from "../api";
 import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
 import { ProjectIcon } from "./Icons";
 import { BoardConfigPanel } from "./BoardConfigPanel";
+import { PromptDialog } from "./Dialog";
 import { ProjectRoutingPanel } from "./ProjectRoutingPanel";
 
 // The git strip: what state the server's working copy is in, and the three
@@ -14,6 +15,7 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
   const [st, setSt] = useState<GitStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  const [committing, setCommitting] = useState(false);
 
   const refresh = () =>
     getJSON<GitStatus>(`/api/projects/${projectId}/git/status`)
@@ -41,13 +43,15 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
     }
   };
 
-  const commitAndPush = async () => {
-    const message = prompt("Commit message", "update from BLPL");
-    if (!message) return;
-    await act(async () => {
-      await postJSON(`/api/projects/${projectId}/git/commit`, { message });
-      if (st.has_remote) await postJSON(`/api/projects/${projectId}/git/push`, {});
-    }, "commit");
+  // Run from inside the dialog rather than through act(), so a refused push
+  // leaves the dialog open with the reason in it and the message still typed.
+  const commitAndPush = async (message: string) => {
+    setNote(null);
+    await postJSON(`/api/projects/${projectId}/git/commit`, { message });
+    if (st.has_remote) await postJSON(`/api/projects/${projectId}/git/push`, {});
+    setNote("commit ok");
+    await refresh();
+    onChanged();
   };
 
   return (
@@ -83,10 +87,24 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
           Pull
         </button>
       )}
-      <button className="link" disabled={busy || (!st.dirty && st.ahead === 0)} onClick={commitAndPush}>
+      <button
+        className="link"
+        disabled={busy || (!st.dirty && st.ahead === 0)}
+        onClick={() => setCommitting(true)}
+      >
         {st.has_remote ? "Commit + Push" : "Commit"}
       </button>
       {note && <span className="muted note">{note}</span>}
+      {committing && (
+        <PromptDialog
+          title={st.has_remote ? "Commit and push" : "Commit"}
+          label="Commit message"
+          initial="update from BLPL"
+          submitLabel={st.has_remote ? "Commit + Push" : "Commit"}
+          onSubmit={commitAndPush}
+          onClose={() => setCommitting(false)}
+        />
+      )}
     </div>
   );
 }
