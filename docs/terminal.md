@@ -30,8 +30,9 @@ checkout.
 - **Not a Nix flake.** A flake pins *which tools exist*, reproducibly. It does
   not confine anything. It is a good answer to a different question ([Tools](#tools)).
 - **Not in the backend container.** The backend holds `server.key`, the
-  database credentials, every provider API key in its environment and the
-  whole of `app/data`. A shell there, however well confined, is one escape away
+  database, SMTP and distributor credentials in its environment, every
+  member's provider keys whenever it decrypts one, and the whole of
+  `app/data`. A shell there, however well confined, is one escape away
   from all of it.
 
 ## Shape
@@ -203,9 +204,10 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
 
   Two further protections:
   - **The backend defends itself regardless.** Every git command it runs
-    passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false`. Nothing in a
-    checkout should be able to choose code for the backend to run, whoever
-    wrote it.
+    passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, because
+    there is one place that starts git and it adds them (`gitcmd`, under
+    "Every writer of the store"). Nothing in a checkout should be able to
+    choose code for the backend to run, whoever wrote it.
   - **Nothing the shell writes reaches the repository** except working-tree
     files, which the Git panel shows as a diff before committing.
 
@@ -501,9 +503,10 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
         stay in step with what `git commit` really does.
       - **Settle by measured growth (chosen).** The objection to measuring
         was that other writers move the store at the same time. That no
-        longer holds here: every operation that writes `.git` (Git-panel
-        commits, landed-write commits, snapshots and restores, pulls, gc)
-        takes the per-project store lock, the shell and the run namespace
+        longer holds here: every git invocation in the backend that writes
+        `.git` goes through one helper that takes the per-project store
+        lock (the full list, and the guard that keeps it full, are under
+        "Every writer of the store" below), the shell and the run namespace
         see `.git` read-only, the backend's git commands pass `-c gc.auto=0
         -c maintenance.auto=false` so no pack starts inside another
         operation, and its read-only commands (`status`, `diff`, `log`) pass
@@ -567,15 +570,143 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
         cannot move.
       - **Anything else** (a FIFO, a socket, a device node) is refused, and
         the commit with it, naming the path. git would not store one either.
-    - **The guard is structural here too.** `projects._commit` and
-      `kicad_bridge.snapshot` take the charge themselves, so a new route that
-      commits or snapshots cannot skip it, in the same way they assert the
-      write scope ("Other writers").
-    - **Only commits that stage the working tree are charged to the member.**
-      `_commit_landed_write` stages only the paths its caller wrote ("A write
-      commits only what it wrote" below), so shell bytes cannot ride in on an
-      upload, a proposal or an editor save. Those blobs count against the
-      project's history limit, not the member's terminal allowance.
+    - **Every writer of the store.** An earlier draft called the list above
+      exhaustive and named Git-panel commits, landed-write commits,
+      snapshots, pulls and gc. It missed the component routes:
+      `components.attach`, `update` and `detach` run their own
+      `git commit` through `components._git`, never reaching
+      `projects._commit`, so they took no store lock and charged no one;
+      `detach` also deletes a submodule's object store under
+      `.git/modules/` with `shutil.rmtree`, which is not a git command at
+      all. A list compiled by remembering routes is the list the next
+      route is missing from, the same lesson as "Other writers". So the
+      list below was compiled by searching `app/backend/app` and `blpl/`
+      for every `git` subprocess (`subprocess.run(["git", ...` and each
+      module's `_git` / `_run` / local `git` helper) and every direct
+      write under a `.git` path, as of `main` at f277796:
+
+      | file:function | git command | what it writes |
+      |---|---|---|
+      | `projects.py:_commit` (from `commit_checkout`, `commit_all`) | `add -A`, `commit` | index, objects, branch ref, reflog |
+      | `projects.py:pull` | `pull --ff-only` | objects from the remote, refs, index, working tree |
+      | `projects.py:push` | `push [--set-upstream]` | remote-tracking ref; `--set-upstream` writes `.git/config` |
+      | `projects.py:clone` | `clone` | a new store (no other writer can exist yet) |
+      | `projects.py:init_local` | `init`, `commit --allow-empty` | a new store |
+      | `projects.py:apply_baseline_gitignore` (from `init_local`) | `rm -r --cached`, `add -A`, `commit` | index, objects, ref: a commit that bypasses `_commit` |
+      | `projects.py:_ensure_identity` (from `clone`, `init_local`) | `config user.email`, `config user.name` | `.git/config` |
+      | `worktrees.py:ensure` (from `_project_dir`, on a member's first request) | `branch --list`, `worktree add [-b]` | a branch ref, `.git/worktrees/<name>/` with its index, and the whole checkout |
+      | `worktrees.py:remove` (member removal) | `worktree remove --force` | deletes the checkout and its `.git/worktrees/` entry |
+      | `worktrees.py:prune` | `worktree prune` | `.git/worktrees/` |
+      | `components.py:attach` | `submodule add` (with `protocol.file.allow=always`), `commit` | `.gitmodules`, a clone of the part repository into the common `.git/modules/components/<name>`, index, objects, ref |
+      | `components.py:update` | `submodule update --init --remote`, `add`, `commit` | fetches into `.git/modules/…`, index, objects, ref |
+      | `components.py:detach` | `submodule deinit -f`, `rm -f`, `commit`, then `shutil.rmtree(<checkout>/.git/modules/…)` | `.git/config`, index, objects, ref, and deletes a module store directly |
+      | `components.py:ensure_part`, `add_document`, `prune_failed` | `init`, `add`, `rm --cached`, `commit` | a part repository in the user's component library: a different store, not the project's |
+      | `agent/kicad_bridge.py:snapshot` | `add -A`, `write-tree`, `commit-tree`, `update-ref` | the **real index** (its docstring says it leaves the index alone; `add -A` does not), objects, `refs/blpl/snapshot` |
+      | `agent/kicad_bridge.py:restore` | `checkout <snapshot> -- .` | index and working tree |
+      | `blpl/core/provenance.py:_git` (in a run) | `rev-parse`, `status --porcelain`, `config --get` | nothing intended, but `status` without `--no-optional-locks` refreshes the index of a project's `libraries/` checkout, outside any lock |
+
+      Read-only and not writers: `agent/registry.py:_git` (`log`, `show`,
+      `diff` for the agent's history tools), `projects.py`'s `_is_dirty`,
+      `_has_design_changes`, `status` and `_upstream`, and
+      `worktrees.py:list_for`. They still pass `--no-optional-locks`, so
+      that they stay that way.
+
+      Three of those rows are bugs today, terminal or not, so their fixes
+      land in phase 0, with the helper below:
+      - **The component commits commit the whole index.** `attach`,
+        `update` and `detach` run a bare `git commit -m`, which commits
+        whatever is staged, not just `.gitmodules` and the submodule path.
+        `snapshot`'s `add -A` stages the entire working tree into that same
+        index, so the next component attach after an autoroute commits
+        every uncommitted change in the checkout under the message
+        "Reference component …". They follow "A write commits only what it
+        wrote": `git commit -- .gitmodules <path>`. `snapshot` builds its
+        tree from a temporary index (`GIT_INDEX_FILE` pointed at a scratch
+        file seeded from the real one), so it really does leave the index
+        alone.
+      - **`detach` deletes the wrong directory, or a shared one.** In a
+        member's worktree `.git` is a file, so `<checkout>/.git/modules/…`
+        does not exist and `ignore_errors=True` hides that nothing was
+        removed. In the owner's checkout it is the common store's module
+        directory, which every member's worktree with that submodule
+        initialised also uses. The helper resolves the module directory
+        from `git rev-parse --git-common-dir`, and removes it under the
+        store lock only when `git worktree list` shows no other checkout
+        with the submodule initialised.
+      - **`provenance` refreshes an index from inside a run.** It gains
+        `--no-optional-locks`. In the per-run namespace `.git` is read-only
+        anyway, so this matters until that lands.
+
+      How each is routed:
+      - **Everything that writes a project's store** (all rows but the
+        part repositories and `clone` / `init_local`, which create a store
+        no one else can see yet) runs under the per-project store lock,
+        inside `worktree_write` when it also changes a working tree
+        (`attach`, `update`, `detach`, `restore`, `pull`, `worktrees.ensure`
+        creating a checkout), with the measured-growth settlement above.
+      - **Who is charged.** `attach` and `update` bring the member's own
+        component library into the store, content the member chose, so
+        they are charged to the member like a commit, by measured growth.
+        `detach`'s commit is charged its trees and commit; the module store
+        it deletes refunds nothing, as for any deletion. `worktrees.ensure`
+        writes a branch ref and a small administrative directory, and its
+        checkout's files land in the worktree before any `terminal_quota`
+        row can exist (the baseline is measured afterwards), so it is
+        charged to no member and bounded by the project's limit. `push`
+        writes a ref and perhaps a config line, under the lock, charged to
+        no one.
+      - **Part repositories** are another user's store, not a project's:
+        they take a lock keyed on the part repository's path, through the
+        same helper, so two uploads to one part cannot interleave their
+        `add` and `commit`.
+
+    - **The guard is structural here too.** One module,
+      `app/backend/app/gitcmd.py`, is the only code in the backend that
+      starts `git`. It has two entry points:
+      - `git_read(repo, *args)` accepts only subcommands on a read-only
+        list (`rev-parse`, `log`, `show`, `diff`, `status`, `ls-files`,
+        `cat-file`, `branch --list` / `--show-current`, `remote` without
+        arguments, `worktree list`, `config --get`) and always passes
+        `--no-optional-locks`.
+      - `git_write(store, *args, reason=…)` is everything else. It asserts
+        that the calling task holds the store lock for `store` (the same
+        live-registry check `worktree_write` uses, not a context variable),
+        and raises if not. It passes `-c core.hooksPath=/dev/null
+        -c core.fsmonitor=false -c gc.auto=0 -c maintenance.auto=false` and
+        the member's identity on every call.
+      - The lock itself is taken with `store_write(store, member, reason)`,
+        and that scope is where the measured-growth charge is settled: it
+        reads the `.git` ID's usage on entry and charges the difference on
+        exit, however many `git_write` calls ran inside it. So a new caller
+        cannot write the store without being charged, any more than it can
+        write it without the lock.
+      - A direct write under a `.git` path (the `detach` case) goes through
+        `gitcmd.remove_module_store`, under the same assertion.
+
+      `projects._git`, `components._git`, `worktrees._run`,
+      `agent/registry.py:_git` and `kicad_bridge`'s local `git` become
+      thin calls into it. A test enforces that nothing else starts git: it
+      parses every module under `app/backend/app` and `blpl/` with `ast`,
+      finds every call to `subprocess.run`, `subprocess.Popen`,
+      `subprocess.check_output`, `subprocess.call` and
+      `asyncio.create_subprocess_exec` whose first argument is a list or
+      tuple beginning with the literal `"git"`, or a name bound to one
+      (`_GIT = ["git", ...]`), and fails unless the call is in `gitcmd.py`.
+      `blpl/core/provenance.py` is the one exception the test names: it
+      runs inside the pipeline, outside the backend, and is read-only
+      (`--no-optional-locks` is asserted on its argument list). A second
+      check in the same test fails on any `shutil.rmtree`, `os.remove`,
+      `unlink` or `open(..., "w")` whose path expression contains the
+      literal `".git"` outside `gitcmd.py`. Like the route walk, it is a
+      guard against forgetting, not against hostile code.
+    - **Landed writes are not charged to the member.** The member's
+      allowance is charged for what can carry shell bytes into history (the
+      Git panel's commit, the snapshot) and for what the member chose to
+      bring in (a component attach or update, above). `_commit_landed_write`
+      stages only the paths its caller wrote ("A write commits only what it
+      wrote" below), so shell bytes cannot ride in on an upload, a proposal
+      or an editor save. Those blobs count against the project's history
+      limit, not the member's terminal allowance.
     - **Pulls are bounded by the project's limit, and never widen it.** A pull
       grows the store with whatever the remote carries, which comes from
       whoever can push there, outside the app's accounting, so it is charged
@@ -841,7 +972,8 @@ need a person.
   | `put_references` | `.blpl/references.json`, the conversations directory |
   | `create_conversation`, `append_message`, `archive_conversation`, `delete_failed_message` | `.blpl/conversations/` |
   | `upload_attachments` | `.blpl/` attachment store |
-  | `attach_component`, `update_component`, `detach_component` | `components.attach` / `update` / `detach` in the checkout |
+  | `attach_component`, `update_component`, `detach_component` | `components.attach` / `update` / `detach`: `.gitmodules`, the submodule's checkout, and the store (each runs its own `git commit`; see "Every writer of the store") |
+  | `_project_dir` (every project route, GETs included), through `worktrees.ensure` | on a member's first request, `git worktree add`: a whole new checkout. No session can exist for a checkout that does not exist yet, so nothing is frozen, but it takes the store lock |
   | `start_chat_turn` | the user's message, synchronously, under the route's scope; everything after it is in the turn's task (next row) |
   | the turn's task (`ChatSessionManager._run`, started by `asyncio.create_task`) | each write under its own scope, taken when it runs: transcript appends, `_stage_library_documents` in `agent/registry.py` (PDFs into `datasheets/<mpn>/`), the distributor fetch through `quarantine`, `pinmap_parse` results, `kicad_bridge.snapshot` and `restore`, autoroute's board write |
   | `run_stage`, `build_release`, `run_review_panel`, `run_pipeline` | a run in the worker; already mutually exclusive with a session (above) |
@@ -864,7 +996,8 @@ need a person.
 
   `git_push`, `stop_run`, `put_project_routing`, `update_policy`,
   `open_in_kicad_desktop`, `resolve_approval` and the membership routes are
-  POSTs that do not write the worktree (push sends objects, the KiCad route
+  POSTs that do not write the worktree (push sends objects and writes only a
+  remote-tracking ref, under the store lock but outside any freeze; the KiCad route
   writes its request file elsewhere, `resolve_approval` resolves a future that
   the turn's task acts on under its own scopes, the rest change database
   rows).
@@ -876,6 +1009,11 @@ need a person.
     variable) and raises if not. Any route that
     commits without the wrapper fails the first time a test exercises it.
     `projects.pull` does the same.
+  - `gitcmd.git_write`, the only code that starts a writing `git`, asserts
+    the store lock in the same way, and a test fails on any `git`
+    subprocess started anywhere else ("Every writer of the store"). That is
+    what catches a module like `components`, which commits through its own
+    helper and never reaches `projects._commit`.
   - `FilesystemSandbox.check_write`, which every agent tool already calls
     before writing, makes the same assertion, so a new writing tool cannot
     forget it either.
@@ -1270,6 +1408,15 @@ sandbox, live in the worker.
      does. The log is unchanged: the worker writes it from the job's stdout,
      outside the namespace.
 
+   **The namespace hides files, not the environment.** An earlier draft
+   stopped at the mounts, and the run would still have started with
+   everything the backend's environment holds, network included: the
+   namespace starts with `--clearenv` and an allowlist, built from the same
+   definition as the terminal's, with `--unshare-pid` so the worker's own
+   `/proc/<pid>/environ` is not there to read either. See [The run's
+   environment](#the-runs-environment), which is a gap today with or
+   without the namespace.
+
    The costs are real. The worker needs the same user-namespace allowance as
    the terminal service (the custom seccomp profile, "Decisions wanted"), and
    the bind list must name every path a stage reads. That is the same list the
@@ -1296,6 +1443,97 @@ closes clone and pull, but not a shell, not the KiCad desktop and not links
 already in checkouts, and it breaks legitimate links inside a project. It is
 not proposed; the admission walk reports pulled links instead.
 
+## The run's environment
+
+**What a run starts with today.** Every run's environment is the backend
+process's own, copied whole:
+- `main.py:_stage_env` begins `env = dict(os.environ)` and, for an LLM stage,
+  adds the member's provider keys on top (`_inject_llm_env`). A deterministic
+  stage gets the copy unchanged. `build_release` passes `dict(os.environ)`,
+  `run_review_panel` passes `_inject_llm_env(dict(os.environ), …)`, and
+  `run_pipeline` starts from `dict(os.environ)` as well.
+- `runqueue.enqueue` seals that whole dictionary into the run's row under
+  the server key, and `worker.py:_run_job` hands it unchanged to
+  `asyncio.create_subprocess_exec(*job.cmd, env=job.env, …)`.
+- Every child the pipeline starts inherits it. Stage 6's plugin path copies
+  `os.environ` (`blpl/core/cli.py`), Stage 8's `lifecycle_env` starts from
+  `dict(os.environ)`, `blpl/agent/kicad_happy.py:run_script` defaults to
+  `dict(os.environ)`, and kicad-cli in Stage 7 and the release, and
+  Freerouting's `java` in `autoroute`, are started with no `env=` at all.
+
+The backend's environment, from `app/docker-compose.yml`, holds
+`BLPL_DATABASE_URL` with the database password in it, `BLPL_SERVER_KEY` when
+the deployment sets it there, `SMTP_USER` and `SMTP_PASS`, the DigiKey OAuth
+client secret and both Mouser API keys, beside configuration that is not
+secret. The compose file's own comment says there are no provider keys in it,
+and that is true: the member's provider keys are the only ones a run gets, and
+they are the ones it is meant to have. Everything else on that list reaches
+kicad-cli, Freerouting, the kicad-happy analyzers and every LLM stage, which
+between them parse content from outside: a cloned or pulled repository's
+design documents and libraries, vendor symbols and footprints in
+`data/modules`, and model output from an endpoint the member configured. The
+network is open. No path was found on which a run executes project content as
+code, so using this takes a parser bug in one of those tools, not a design
+document; but that is exactly the risk the run namespace exists for, and a
+parser that can read a file can read its own environment. What a child prints
+also reaches the member, because the run's log is streamed to the browser.
+
+**The backend's own children are the same, in the backend.** The chat
+agent's tools run inside the backend process, and start subprocesses with the
+backend's whole environment, at the model's choice, over untrusted files:
+`pdftotext` over datasheets (`blpl/agent/tools/datasheets.py`,
+`datasheet_files.py`), `pdfinfo` over chat attachments (`chat.py`), and
+kicad-happy scripts through `run_script`. There the process is also the one
+holding every secret in memory, so an allowlist is defence in depth, not a
+boundary. It is applied anyway, because it costs nothing and narrows what a
+crashed or exploited parser carries.
+
+**The change: an allowlist, not a copy.**
+- One function, `run_env.base()`, builds a run's environment from nothing:
+  `PATH`, `HOME`, `LANG` / `LC_ALL`, `TZ`, `VIRTUAL_ENV`, `PYTHONPATH` where a
+  stage needs it, `PYTHONUNBUFFERED` and `PYTHONDONTWRITEBYTECODE` (the
+  Dockerfile sets both), whatever `KICAD*_DIR` library variables the
+  `kicad/kicad` base image defines (to be read off the image, not guessed),
+  `FREEROUTING_JAR`, `BLPL_MODULES_ROOT`, `BLPL_KICAD_HAPPY`, `BLPL_CONFIG`,
+  `OLLAMA_HOST`, `BLPL_CLAMD_HOST` / `BLPL_CLAMD_PORT` and
+  `BLPL_QUARANTINE_REQUIRE_SCAN`. Each name is listed with the stage that
+  reads it; a name nobody can point at is not on it.
+- **Keys are added per run, by name.** `_inject_llm_env` adds the member's
+  own provider keys and `HDM_LLM_*` as it does now. The distributor
+  credentials Stage 8's lifecycle audit uses are deployment-wide, not the
+  member's, and go only to a run that reaches Stage 8 with the lifecycle
+  audit enabled, under the names `lifecycle_env` already maps them to.
+- `_stage_env`, `build_release`, `run_review_panel` and `run_pipeline` start
+  from `run_env.base()` instead of `os.environ`, so none of the secret names
+  below is ever sealed into a run row in the first place.
+- The backend's own subprocesses (the agent's PDF and kicad-happy tools,
+  `gitcmd`, `projects._git`'s leased credential) use `run_env.child()`,
+  which is the same allowlist minus the run-only names; `projects._git`
+  keeps merging its leased credential on top, for that one command.
+- In the run namespace, bwrap gets `--clearenv` and one `--setenv` per
+  allowed name. The worker's environment then cannot leak through a path
+  the code forgot, and `--unshare-pid` removes `/proc/<worker pid>/environ`,
+  which today any run can read: the run is the worker's uid, in the worker's
+  PID namespace, and the worker itself holds `BLPL_DATABASE_URL`,
+  `BLPL_SERVER_KEY` and the distributor keys. The allowlist alone does not
+  close that, nor `/app/data/server.key`, which the run can read as a file
+  until the namespace stops binding `/app/data`. That is why the allowlist
+  is the immediate step and the namespace the finished one.
+
+**The test enumerates, it does not sample.** A test builds the environment of
+each kind of run (a deterministic stage, an LLM stage, a pipeline range, the
+review panel, a release, and a Stage 8 run with the lifecycle audit on and
+off) with the backend's environment populated with every variable the compose
+file sets, plus a few planted ones. It fails if any name in the result is not
+on the allowlist, and separately if any known secret name appears:
+`BLPL_DATABASE_URL`, `BLPL_SERVER_KEY`, `SMTP_*`, `POSTGRES_*`,
+`BLPL_CLERK_*`, `DIGIKEY_*` and `MOUSER_*` outside the lifecycle case, and
+any name matching `*_KEY`, `*_SECRET`, `*_TOKEN` or `*_PASS*` that is not one
+of the member's injected provider keys. A planted `BLPL_UNLISTED=x` must not
+come through, which is what proves the result is built from a list rather
+than filtered from a copy. Inside the namespace, a stage that runs `env` sees
+exactly that set, and `/proc/1/environ` is the sandbox's own.
+
 ## What has been done over ssh, and where it goes
 
 | job done over ssh | replaced by |
@@ -1314,7 +1552,7 @@ documentation, and anything still on the left with no right-hand side is a bug.
 
 ## Phases
 
-0. **Gaps that exist today.** Two of them, independent of each other and of
+0. **Gaps that exist today.** Four of them, independent of each other and of
    the terminal, so they land first and do not wait for it.
    - **PDF trust by content hash.** This closes the PDF gap (import, clone,
      pull, library staging). The `pdf_verdict` table and its seeding
@@ -1363,6 +1601,35 @@ documentation, and anything still on the left with no right-hand side is a bug.
      - An upload into a project whose `datasheets` is a link to another
        project's directory fails, and nothing lands in the other project; so
        does a transcript append through a linked `.blpl`.
+   - **The run's environment from an allowlist.** `run_env.base()` and
+     `run_env.child()`; `_stage_env`, `build_release`, `run_review_panel`
+     and `run_pipeline` build from it instead of `dict(os.environ)`; the
+     distributor keys only for a Stage 8 lifecycle run; the backend's own
+     subprocesses through `run_env.child()`. This lands before the run
+     namespace, which then adds `--clearenv` and `--unshare-pid`. Tests that
+     matter:
+     - The enumeration test above, for every kind of run: no name outside
+       the allowlist, no known secret name, and a planted unlisted variable
+       does not come through.
+     - A run row's sealed environment, decrypted, holds no
+       `BLPL_DATABASE_URL`, `BLPL_SERVER_KEY` or `SMTP_*`.
+     - A Stage 8 run with the lifecycle audit on gets the distributor
+       credentials under kicad-happy's names; every other run gets none.
+     - An LLM stage still reaches its provider with the member's key, and a
+       deterministic stage still finds kicad-cli, Freerouting and the stock
+       libraries.
+     - Once the namespace lands: `env` inside a run prints exactly the
+       allowlist, and the worker's `/proc/<pid>/environ` does not exist
+       there.
+   - **Git writers that commit more than they wrote.** The `gitcmd` helper
+     and its scan test (the store-lock assertion and the charge join it in
+     phase 2, when the lock and the quota exist); component commits limited
+     to `.gitmodules` and the submodule path; `snapshot` through a temporary
+     index; `detach` removing the module store from the common directory,
+     and only when no other checkout uses it; `--no-optional-locks` on every
+     read, `provenance` included. The tests that matter are the component,
+     snapshot, detach and scan tests listed under phase 2, without the
+     charging.
 1. **Service and sandbox.** Build the `terminal` container, the seccomp
    profile, the delegated cgroup subtree, the `quota` service, the bwrap
    launcher and ticket verification. Test it from the host with `websocat`
@@ -1412,9 +1679,11 @@ documentation, and anything still on the left with no right-hand side is a bug.
    slot rows), the admission locks and revocation under them, the
    `worktree_write` wrapper on every writer in the table under "Other
    writers", the quota ceiling and its owner-only raise, project-ID
-   reassignment on unseal and verification at admission, plus the
-   `core.hooksPath` / `core.fsmonitor` overrides on the backend's own git
-   commands. Tests that matter:
+   reassignment on unseal and verification at admission, the per-project
+   store lock and the measured-growth charge on every writer in the table
+   under "Every writer of the store", asserted by `gitcmd.git_write` (the
+   helper itself, with its `core.hooksPath` / `core.fsmonitor` overrides,
+   lands in phase 0). Tests that matter:
    - The route-walking test: every mutating route under
      `/api/projects/{project_id}/` declares `worktree_write` or is in
      `NOT_A_WORKTREE_WRITE` with a reason. Adding a route that is in neither
@@ -1476,6 +1745,24 @@ documentation, and anything still on the left with no right-hand side is a bug.
    - A backend `git status` in a member's worktree writes nothing under
      `.git` (`--no-optional-locks`), and two members' commits in parallel
      are serialized by the store lock, each charged only its own growth.
+   - The git scan: adding `subprocess.run(["git", "commit", ...])`, or a
+     `shutil.rmtree` of a path containing `".git"`, to any module under
+     `app/backend/app` or `blpl/` other than `gitcmd.py` fails the suite.
+     Calling `git_write` outside a `store_write` scope for that store raises,
+     and so does `git_read` with a subcommand that is not on its list.
+   - A component attach, update and detach, each fired concurrently with a
+     Git-panel commit by another member, are serialized by the store lock,
+     and each is charged only its own measured growth. An attach whose part
+     repository would take the member past `BLPL_TERMINAL_HISTORY_MB` is
+     refused, and the store has not grown.
+   - After an undo snapshot, with the shell's edits uncommitted, a component
+     attach commits exactly `.gitmodules` and the submodule path; the
+     shell's edits are still uncommitted. The snapshot leaves the index
+     byte-identical to what it was.
+   - Detaching a component in a member's worktree removes the module store
+     from the common `.git/modules/`, not from a path under the worktree's
+     `.git` file; detaching it in one checkout while another member's
+     checkout has it initialised leaves that member's submodule working.
    - A Git-panel commit whose working tree holds a symlink to `/dev/zero`,
      one to a directory and one dangling returns promptly, charges each
      link as the blob of its target's text, and the IDs the estimate
@@ -1565,4 +1852,12 @@ documentation, and anything still on the left with no right-hand side is a bug.
     same user-namespace allowance as the terminal service, or beneath-the-
     checkout resolution in the pipeline's own writes, which leaves kicad-cli,
     Freerouting and every read uncovered. Either way the admission walk for
-    symlinks lands first, in phase 0.
+    symlinks and the run's environment allowlist land first, in phase 0; the
+    second option leaves the worker's `/proc/<pid>/environ` and
+    `/app/data/server.key` readable by every run, which only the namespace
+    removes.
+11. The deployment's distributor credentials (DigiKey, Mouser): passed only to
+    a Stage 8 run with the lifecycle audit on (proposed), which still hands a
+    deployment-wide secret to a process parsing a member's project, or moved
+    to per-member credentials like provider keys, so that a run carries only
+    secrets belonging to the member who started it.
