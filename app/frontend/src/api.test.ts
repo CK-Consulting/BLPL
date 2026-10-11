@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 
-import { getJSON, setLockedHandler, setTokenGetter, setUnlockNeededHandler } from "./api";
+import { getJSON, postJSON, setLockedHandler, setTokenGetter, setUnlockNeededHandler } from "./api";
 
 /**
  * What the client does with the two different 423s.
@@ -108,5 +108,16 @@ describe("a 401", () => {
     await expect(getJSON("/api/x")).rejects.toThrow();
     expect(locked).toHaveBeenCalledTimes(1);
     expect(needsUnlock).not.toHaveBeenCalled();
+  });
+});
+
+describe("an error with no detail and no reason phrase", () => {
+  it("still carries a message, so the UI has something to show", async () => {
+    // A FastAPI 500 is plain text, and over HTTP/2 statusText is "". The
+    // message used to be "" and `{error && ...}` rendered nothing: accepting
+    // a proposal failed with no sign on screen that it had.
+    vi.stubGlobal("fetch", vi.fn(async () => res(500, {}, "Internal Server Error")));
+
+    await expect(postJSON("/api/x", {})).rejects.toThrow("Request failed (HTTP 500)");
   });
 });

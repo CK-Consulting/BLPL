@@ -263,6 +263,33 @@ def test_a_proposal_can_create_a_new_file(project) -> None:
     assert ok and (project / "power.md").read_text() == "# Power\n"
 
 
+def test_a_proposal_can_create_a_file_in_a_folder_that_does_not_exist(project) -> None:
+    """Setting up a multi-board project means proposing main/main.md before
+    main/ exists. Accepting it used to raise FileNotFoundError out of the route
+    as a bare 500, leaving the proposal pending and the user with no error."""
+    ctx = _ctx(project)
+    res = _call(
+        ctx, "propose_file_edit", path="main/sub/main.md", new_content="# Main\n", rationale="new board"
+    )
+    assert not res.is_error
+    proposal = ProposalStore(project).pending()[0]
+
+    ok, detail = apply_proposal(proposal, project, ctx.sandbox)
+    assert ok, detail
+    assert (project / "main" / "sub" / "main.md").read_text() == "# Main\n"
+
+
+def test_a_write_that_fails_is_a_refusal_not_a_crash(project) -> None:
+    ctx = _ctx(project)
+    _call(ctx, "propose_file_edit", path="power/power.md", new_content="# P\n", rationale="r")
+    proposal = ProposalStore(project).pending()[0]
+    # A file where the folder should be: mkdir cannot succeed.
+    (project / "power").write_text("not a folder\n", encoding="utf-8")
+
+    ok, detail = apply_proposal(proposal, project, ctx.sandbox)
+    assert not ok and "could not write power/power.md" in detail
+
+
 def test_a_create_proposal_refuses_once_the_file_exists(project) -> None:
     ctx = _ctx(project)
     _call(ctx, "propose_file_edit", path="power.md", new_content="# A\n", rationale="r")

@@ -217,7 +217,14 @@ async function errorParts(res: Response): Promise<{ message: string; detail: unk
 
 async function fail(res: Response): Promise<never> {
   const { message, detail } = await errorParts(res);
-  throw new ApiError(message || res.statusText, res.status, detail);
+  // statusText is empty over HTTP/2, and an unhandled server error has no
+  // JSON detail, so without the status fallback the message was "" — and every
+  // `{error && ...}` in the UI rendered nothing at all for a failed request.
+  throw new ApiError(
+    message || res.statusText || `Request failed (HTTP ${res.status})`,
+    res.status,
+    detail,
+  );
 }
 
 // --- typed shapes the UI consumes ---

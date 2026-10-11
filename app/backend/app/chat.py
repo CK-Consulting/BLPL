@@ -485,7 +485,15 @@ def apply_proposal(
     elif proposal.base_sha is not None:
         return False, f"{proposal.path} no longer exists — re-read and propose again"
 
-    target.write_text(proposal.new_content, encoding="utf-8")
+    # A new board's folder does not exist until its first document is written,
+    # and the agent proposes that document before anyone has made the folder.
+    # Without this the write raised FileNotFoundError, the route answered a bare
+    # 500, and the proposal sat pending with nothing on screen to say why.
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(proposal.new_content, encoding="utf-8")
+    except OSError as exc:
+        return False, f"could not write {proposal.path}: {exc.strerror or exc}"
     return True, f"wrote {proposal.path}"
 
 
