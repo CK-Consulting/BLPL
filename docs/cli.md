@@ -102,7 +102,7 @@ it with [`init`](#init), or edit it in the web UI's Board tab.
 ```
 blpl stage5 --project-dir <proj>
 ```
-It is validated against `schemas/project_config.v1.json` on load, and an invalid
+It is validated against `core/schemas/project_config.v1.json` on load, and an invalid
 file raises rather than being partly used: the fallback it replaced quietly
 substituted a 100 × 80 mm board wherever dimensions were unreadable, which
 produced a complete and entirely wrong board.

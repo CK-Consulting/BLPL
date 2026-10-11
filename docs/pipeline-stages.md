@@ -1,6 +1,6 @@
 # Pipeline Stages
 
-Every stage consumes and produces JSON/YAML artifacts validated against the schemas in `schemas/*.v1.json`. Each stage is standalone — run one in isolation or chain them via `blpl run --from stageX --to stageY`.
+Every stage consumes and produces JSON/YAML artifacts validated against the schemas in `core/schemas/*.v1.json`. Each stage is standalone — run one in isolation or chain them via `blpl run --from stageX --to stageY`.
 
 ## Stage 0 — Markdown → design_artifact
 
@@ -119,7 +119,7 @@ Collapses every pinout entry into nets, where **signal name = net name**. Implem
 
 Combines the stage outputs with hand-authored board geometry (`project.yaml` carries dimensions, stackup, net_classes, boundaries, keepouts, copper_zones). If `project.yaml` is missing, Stage 5 writes a `.template` next to the expected path and halts with an actionable error.
 
-`project.yaml` is **validated on load** against `schemas/project_config.v1.json`,
+`project.yaml` is **validated on load** against `core/schemas/project_config.v1.json`,
 and a file that does not satisfy it raises rather than being partly used. That
 matters more than it sounds: the previous code fell back to `[100, 80]` mm
 wherever dimensions were unreadable, so a typo in the board size produced a

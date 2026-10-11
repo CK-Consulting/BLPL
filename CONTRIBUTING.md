@@ -23,18 +23,25 @@ By taking part you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 See [docs/install.md](docs/install.md). In short:
 
 ```bash
-git clone --recurse-submodules https://github.com/CK-Consulting/BLPL.git
+git clone https://github.com/CK-Consulting/BLPL.git
 cd BLPL
-python -m pip install -e '.[dev]'
-python -m pytest tests/ -q
+git submodule update --init --depth 1 core/kicad-symbols core/kicad-footprints core/kicad-library-utils core/kicad-happy
+python -m pip install -e './core[dev]' -e './plugin[dev]' \
+    -r app/backend/requirements.txt -r app/backend/requirements-dev.txt
+(cd core && python -m pytest -q)                  # the pipeline
+(cd plugin && python -m pytest -q)                # the KiCad plugin
+(cd app/backend && python -m pytest tests -q)     # the web app's backend
 cd app/frontend && npm ci && npx vitest run && npm run build
 ```
 
-`kicad-symbols` and `kicad-footprints` are large. For the test suite a shallow
-checkout of just those two is enough:
-`git submodule update --init --depth 1 kicad-symbols kicad-footprints`.
-Without them about 46 emitter and library tests fail; that is the environment,
-not your change.
+The repository holds three projects — `core/`, `plugin/` and `app/` — each with
+its own tests; see [docs/repo-split.md](docs/repo-split.md). A change that has to
+touch two of them is two commits.
+
+`kicad-symbols` and `kicad-footprints` are large, which is why the clone above
+is not recursive: a shallow checkout of the four submodules the pipeline uses is
+enough for every suite. Without them about 46 emitter and library tests fail;
+that is the environment, not your change.
 
 ## Making a change
 
@@ -55,7 +62,7 @@ comments is not merged.
   a change; keep that habit.
 - Commit messages describe what changed and why, in prose. A one-line subject,
   a blank line, then the reasoning.
-- KiCad files are parsed and rewritten through `blpl/emitter/sexpr.py`, never
+- KiCad files are parsed and rewritten through `core/blpl/emitter/sexpr.py`, never
   edited by hand or by regex.
 
 ### What not to commit

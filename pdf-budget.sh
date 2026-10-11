@@ -92,5 +92,5 @@ echo
 if "$PY" -c "import blpl.agent.tools.pdf_budget" >/dev/null 2>&1; then
   "$PY" -m blpl.agent.tools.pdf_budget "${MODULE_ARGS[@]}"
 else
-  "$PY" "$HERE/blpl/agent/tools/pdf_budget.py" "${MODULE_ARGS[@]}"
+  "$PY" "$HERE/core/blpl/agent/tools/pdf_budget.py" "${MODULE_ARGS[@]}"
 fi

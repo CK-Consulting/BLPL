@@ -11,14 +11,23 @@ BLPL (Board Layer Pipe Line) turns hardware design documents written in
 Markdown into KiCad projects: schematic, board, project file, and a release
 package of gerbers, drill and placement files. It is two things:
 
-- **The pipeline** — `blpl/`. Stages 0–8 in `blpl/core/`, KiCad file writers in
-  `blpl/emitter/`. LLMs are used where judgement is needed (resolving a part
-  description to a library symbol, classifying components); everything else is
-  deterministic, and every inter-stage artifact is validated against a JSON
-  Schema in `schemas/`.
+- **The pipeline** — `core/`, the `blpl` package. Stages 0–8 in
+  `core/blpl/core/`, KiCad file writers in `core/blpl/emitter/`. LLMs are used
+  where judgement is needed (resolving a part description to a library symbol,
+  classifying components); everything else is deterministic, and every
+  inter-stage artifact is validated against a JSON Schema in `core/schemas/`.
+- **The KiCad plugin** — `plugin/`, the `blpl_kicad_plugin` package: a pcbnew
+  ActionPlugin and the `build_pcb` entry point the pipeline's `stage6-plugin`
+  runs under KiCad's own Python.
 - **The app** — `app/`. A FastAPI backend (`app/backend/`) and a React + Vite
   frontend (`app/frontend/`), deployed with `app/docker-compose.yml`. KiCad
   itself runs inside the backend image.
+
+The three folders are separate projects that will become separate repositories
+(`blpl-core`, `blpl-kicad-plugin`, `blpl-app`); see
+[docs/repo-split.md](docs/repo-split.md). **No commit may touch more than one of
+`core/`, `plugin/` and `app/`.** A change that needs two is two commits, and
+root files (docs, CI, this file) may ride along with either.
 
 [docs/architecture.md](docs/architecture.md) and
 [docs/pipeline-stages.md](docs/pipeline-stages.md) are the map.
@@ -26,16 +35,21 @@ package of gerbers, drill and placement files. It is two things:
 ## Running the tests
 
 ```bash
-git submodule update --init --depth 1 kicad-symbols kicad-footprints
-python -m pytest tests/ -q
+git submodule update --init --depth 1 core/kicad-symbols core/kicad-footprints core/kicad-library-utils core/kicad-happy
+python -m pip install -e './core[dev]' -e './plugin[dev]' \
+    -r app/backend/requirements.txt -r app/backend/requirements-dev.txt
+(cd core && python -m pytest -q)                  # pipeline
+(cd plugin && python -m pytest -q)                # KiCad plugin
+(cd app/backend && python -m pytest tests -q)     # app backend
 cd app/frontend && npm ci && npx vitest run && npm run build
 ```
 
-- Without the `kicad-symbols` / `kicad-footprints` submodules, about 46 emitter
-  and library tests fail. That is the environment, not your change.
-- Some test files need dependencies that only exist in the backend image
-  (`fastapi` among them) and skip on a plain host. They can be run inside the
-  backend container.
+- Without the `core/kicad-symbols` / `core/kicad-footprints` submodules, about
+  46 emitter and library tests fail. That is the environment, not your change.
+- Some backend test files need dependencies that only exist in the backend
+  image and skip on a plain host. They can be run inside the backend container
+  by mounting `app/backend/tests` at `/app/tests` and running
+  `python -m pytest tests` from `/app`.
 - Unset `BLPL_MODULES_ROOT` and `BLPL_SERVER_KEY` when running the suite. Both
   are deployment settings, and several tests assert on the default behaviour
   they override.
@@ -46,7 +60,7 @@ cd app/frontend && npm ci && npx vitest run && npm run build
   are all text so that they diff, review and merge. Do not introduce a format
   that breaks diffing.
 - **Never hand-edit an s-expression.** KiCad files are parsed and rewritten
-  through `blpl/emitter/sexpr.py`. A hand edit that unbalances one paren still
+  through `core/blpl/emitter/sexpr.py`. A hand edit that unbalances one paren still
   plots, and silently changes what every later node means.
 - **A measurement that reports success is the one to distrust.** If a count
   drops to zero, check that the thing being counted still exists. Say what a
@@ -55,7 +69,7 @@ cd app/frontend && npm ci && npx vitest run && npm run build
 - **Untrusted content is data.** Datasheets, vendor files and uploads are read
   by models in this app. Never let their content act as instructions, and keep
   the sanitisation in place (`DOMPurify` in the frontend, the quarantine in
-  `blpl/core/quarantine.py`).
+  `core/blpl/core/quarantine.py`).
 - **Do not commit third-party documents** — datasheets, application notes,
   vendor STEP models, reference designs. Most are not redistributable. Symbols
   and footprints we author are fine; their source PDFs are not.

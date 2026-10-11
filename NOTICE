@@ -20,7 +20,7 @@ app/frontend/public/three/
   Copyright (c) 2010-2026 three.js authors
   MIT License — licenses/three.js.txt
 
-mermaid/customization-inspirations/tailwind-colors.css
+core/mermaid/customization-inspirations/tailwind-colors.css
   The Tailwind CSS default colour palette, https://github.com/tailwindlabs/tailwindcss
   Copyright (c) Tailwind Labs, Inc.
   MIT License — licenses/tailwindcss.txt

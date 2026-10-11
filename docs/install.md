@@ -27,26 +27,34 @@
 
 ## Install the Python package
 
-From the repo root:
+The pipeline is the `blpl` package under `core/`. From the repo root:
 
 ```bash
 uv venv --python 3.11 .venv                # create a virtualenv
-uv pip install -e ".[dev]"                 # dev deps (pytest, rich)
+uv pip install -e "./core[dev]"            # the pipeline + dev deps (pytest, rich)
 ```
 
 Optional extras for LLM-backed stages (0 and 1):
 
 ```bash
-uv pip install -e ".[llm-anthropic]"       # default; uses ANTHROPIC_API_KEY
-uv pip install -e ".[llm-openai]"          # uses OPENAI_API_KEY
-uv pip install -e ".[llm-ollama]"          # local; point OLLAMA_HOST at your daemon
-uv pip install -e ".[all-llm]"             # all three
+uv pip install -e "./core[llm-anthropic]"  # default; uses ANTHROPIC_API_KEY
+uv pip install -e "./core[llm-openai]"     # uses OPENAI_API_KEY
+uv pip install -e "./core[llm-ollama]"     # local; point OLLAMA_HOST at your daemon
+uv pip install -e "./core[all-llm]"        # all three
 ```
 
-For the web UI:
+For `blpl stage6-plugin`, which builds the board through pcbnew, install the
+KiCad plugin beside it (or point `BLPL_KICAD_PLUGIN_DIR` at `plugin/`):
 
 ```bash
-uv pip install -e ".[webapp]"                       # fastapi + uvicorn backend
+uv pip install -e ./plugin
+```
+
+For the web UI, the app backend's own requirements (it is a separate project,
+`app/`, that depends on the pipeline):
+
+```bash
+uv pip install -r app/backend/requirements.txt      # fastapi + uvicorn backend
 cd app/frontend && npm install && npm run build     # React frontend → app/frontend/dist/
 ```
 
@@ -86,14 +94,19 @@ blpl --help
 
 ## Initialize submodules
 
-The pipeline relies on the KiCad standard libraries for symbol/footprint lookup. They're git submodules rooted in the legacy `hardware/hdm-to-kicad-pipeline/` path and symlinked into BLPL:
+The pipeline relies on the KiCad standard libraries for symbol/footprint lookup,
+KiCad's library utilities for the KLC check, and kicad-happy for review and
+sourcing. They are git submodules under `core/`, where the pipeline looks for
+them by default:
 
 ```bash
-cd /path/to/blpl                           # the standalone BLPL repo
-git submodule update --init --recursive
+git submodule update --init --depth 1 \
+    core/kicad-symbols core/kicad-footprints core/kicad-library-utils core/kicad-happy
 ```
 
-The BLPL repo root has symlinks (`kicad-footprints`, `kicad-symbols`, `kicad-packages3D`, …) that resolve through to those submodules. If the symlinks are broken (e.g. after a workspace move), recreate them pointing at wherever your submodules live.
+The app's submodules (`app/kicad-packages3D`, `app/kicad-templates`,
+`app/KiCAD-Prism`, …) are only needed for the hosted deploy; `kicad-packages3D`
+in particular is several gigabytes.
 
 ## LLM configuration
 
@@ -207,32 +220,39 @@ Or pass `--kicad-python <path>` per invocation. BLPL auto-discovers several comm
 
 ## Run the tests
 
+Each project has its own suite:
+
 ```bash
-cd blpl-repo-root/
-.venv/bin/python -m pytest tests/
+(cd core && ../.venv/bin/python -m pytest -q)                 # the pipeline
+(cd plugin && ../.venv/bin/python -m pytest -q)               # the KiCad plugin
+(cd app/backend && ../../.venv/bin/python -m pytest tests -q) # the app backend
 ```
 
-Expect **1296 passing and 172 skipped**. The skips are tests whose optional tool
-is absent, which is the intended behaviour rather than a gap:
+The app backend's tests also want `pip install -r app/backend/requirements-dev.txt`.
+
+With the submodules initialised, expect no failures in any of them (at the time
+of the split: 1057 passing and 3 skipped in core, 5 and 1 in plugin, 805
+passing in the app backend inside its image). The skips are tests whose
+optional tool is absent, which is the intended behaviour rather than a gap:
 
 | Test | Skips without |
 |---|---|
-| `test_plugin_hdm_to_pcb.py::test_plugin_produces_kicad_cli_loadable_board` | KiCad |
-| the `needs_ngspice` tests in `test_spice.py` | ngspice |
-| the `needs_translator` tests in `test_bom.py` | the kicad-happy submodule |
-| `test_app_api.py::test_the_spa_fallback_refuses_to_escape_the_static_root` | a built frontend bundle |
+| `plugin/tests/test_plugin_hdm_to_pcb.py::test_plugin_produces_kicad_cli_loadable_board` | KiCad (and stock footprints) |
+| the `needs_ngspice` tests in `core/tests/test_spice.py` | ngspice |
+| the `needs_translator` tests in `core/tests/test_bom.py` | the kicad-happy submodule |
+| `app/backend/tests/test_app_api.py::test_the_spa_fallback_refuses_to_escape_the_static_root` | a built frontend bundle |
 
 A skipped test is reported as skipped, never as passed — the same rule the
 pipeline applies to its own analyzers.
 
-Three files need dependencies that exist only inside the container image
-(`test_kicad_desktop_gate.py`, `test_onboarding.py`, `test_worker_cancel.py`);
-`--ignore` them to run the rest on a bare host.
+Three backend files need dependencies that exist only inside the container
+image (`test_kicad_desktop_gate.py`, `test_onboarding.py`,
+`test_worker_cancel.py`); `--ignore` them to run the rest on a bare host.
 
 Two environment variables have to be **out** of the way:
 
 ```bash
-env -u BLPL_SERVER_KEY -u BLPL_MODULES_ROOT python -m pytest tests/
+env -u BLPL_SERVER_KEY -u BLPL_MODULES_ROOT python -m pytest
 ```
 
 `BLPL_SERVER_KEY` makes one `test_app_api.py` case fail. `BLPL_MODULES_ROOT` is

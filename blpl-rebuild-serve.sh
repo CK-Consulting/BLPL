@@ -83,7 +83,7 @@ _kill_port() {
 }
 
 source ${HOME}/devspace/myprojects/blpl/.venv/bin/activate
-uv pip install -e ".[webapp]"              # fastapi + uvicorn backend
+uv pip install -e ./core -r app/backend/requirements.txt   # pipeline + the backend it serves
 
 # React frontend → app/frontend/dist/, which `blpl serve` mounts when present.
 # (This used to build ui/ — a SolidJS prototype that was superseded by
