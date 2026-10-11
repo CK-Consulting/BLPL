@@ -239,7 +239,14 @@ async function errorParts(res: Response): Promise<{ message: string; detail: unk
 
 async function fail(res: Response): Promise<never> {
   const { message, detail } = await errorParts(res);
-  throw new ApiError(message || res.statusText, res.status, detail);
+  // statusText is empty over HTTP/2, and an unhandled server error has no
+  // JSON detail, so without the status fallback the message was "" — and every
+  // `{error && ...}` in the UI rendered nothing at all for a failed request.
+  throw new ApiError(
+    message || res.statusText || `Request failed (HTTP ${res.status})`,
+    res.status,
+    detail,
+  );
 }
 
 // --- typed shapes the UI consumes ---
@@ -433,6 +440,13 @@ export type GitStatus = {
   /** Where it points. Any credential embedded in the URL is replaced
    *  server-side, so this is safe to display and to screenshot. */
   remote_url: string;
+  /** Has a remote but has never been pushed to it. `ahead` then counts what
+   *  the remote lacks, and pushing is allowed with a clean tree. */
+  unpublished?: boolean;
+  /** Why pull and push would refuse the remote as configured (several URLs,
+   *  or a fetch URL and a different push URL), else empty. When set, `ahead`
+   *  and `unpublished` are not measured and say nothing. */
+  remote_problem?: string;
 };
 
 export type LibraryPolicyValues = {
@@ -460,6 +474,9 @@ export type GitEndpointMeta = {
   method: string;
   username: string | null;
   updated_at: string;
+  /** Other rows matching the same host — only a pre-upgrade database has any,
+   *  and clone, pull and push refuse to choose until one is removed. */
+  conflicts_with?: string[];
 };
 
 export type GitEndpoints = {

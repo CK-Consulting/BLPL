@@ -103,7 +103,7 @@ from .models import Project, ProjectInvitation, ProjectPolicy, Run, User
 from blpl.core import limits, project_manifest, quarantine
 from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
-from .projects import ProjectError, Projects
+from .projects import ProjectError, Projects, check_remote_url
 from .vault import VaultError
 from .references import (
     FilesystemSandbox,
@@ -1743,7 +1743,13 @@ def _git_credentials(session: Session, master_key: bytes, user: User, remote: st
     """
     from . import gitstore
 
-    row = gitstore.for_remote(session, user, remote)
+    try:
+        row = gitstore.for_remote(session, user, remote)
+    except gitstore.GitStoreError as exc:
+        # Two legacy rows for one host: refused rather than guessed. Raised as
+        # the ProjectError clone, pull and push already turn into a 400, so the
+        # user reads which credentials collide instead of a 500.
+        raise ProjectError(str(exc)) from exc
     if row is None:
         yield None
         return
@@ -1761,6 +1767,10 @@ def clone_project(
     """Clone a remote into a new working copy, owned by whoever cloned it."""
     _refuse_taken_name(session, body.name)
     try:
+        # Validated before any credential is looked up for it: the lookup parses
+        # the URL itself, and a credential should never be chosen for a remote
+        # that is about to be refused.
+        check_remote_url(body.remote)
         with _git_credentials(session, master_key, user, body.remote) as env:
             projects.clone(body.name, body.remote, body.branch, env=env)
     except ProjectError as exc:
@@ -2385,7 +2395,41 @@ def git_status(project_id: str, user: User = Depends(require_onboarded),
         "branch": st.branch, "ahead": st.ahead, "behind": st.behind,
         "dirty": st.dirty, "has_remote": st.has_remote,
         "remote_name": st.remote_name, "remote_url": st.remote_url,
+        "unpublished": st.unpublished,
+        "remote_problem": st.remote_problem,
     }
+
+
+class RemoteBody(BaseModel):
+    url: str
+
+
+@app.put("/api/projects/{project_id}/git/remote")
+def set_git_remote(
+    project_id: str,
+    body: RemoteBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Point a project at a remote. Owner only.
+
+    Where Push sends every member's work is the owner's decision, the same as
+    who may see the project. The URL passes the same check as cloning —
+    https://, ssh:// or user@host:path, never a path on this server.
+    """
+    try:
+        projectacl.require_owner(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    except projectacl.NotTheOwner:
+        raise HTTPException(status_code=403, detail="only the owner can set this project's remote")
+    checkout = _project_dir(session, user, project_id)
+    try:
+        projects.set_remote(checkout, body.url)
+        st = projects.status(project_id, checkout=checkout)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "remote_name": st.remote_name, "remote_url": st.remote_url}
 
 
 class CommitBody(BaseModel):
@@ -2421,8 +2465,13 @@ def git_pull(project_id: str, user: User = Depends(require_onboarded),
     master_key: bytes = Depends(require_master_key)) -> dict:
     checkout = _project_dir(session, user, project_id)
     try:
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
-            out = projects.pull(project_id, env=env, checkout=checkout)
+        # A pull fetches, so the credential is the fetch URL's — which need not
+        # be the host a push goes to.
+        # Resolved once: the credential is leased for this URL and git is
+        # handed this URL, so the two cannot diverge if origin changes between.
+        dest = projects.remote_of(project_id, operation="fetch", checkout=checkout)
+        with _git_credentials(session, master_key, user, dest) as env:
+            out = projects.pull(project_id, env=env, checkout=checkout, url=dest)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}
@@ -2436,8 +2485,9 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
     # the commit it made rather than the owner's branch.
     checkout = _project_dir(session, user, project_id)
     try:
-        with _git_credentials(session, master_key, user, projects.remote_of(project_id)) as env:
-            out = projects.push(project_id, env=env, checkout=checkout)
+        dest = projects.remote_of(project_id, operation="push", checkout=checkout)
+        with _git_credentials(session, master_key, user, dest) as env:
+            out = projects.push(project_id, env=env, checkout=checkout, url=dest)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}
@@ -3168,6 +3218,27 @@ def read_file(project_id: str, name: str, user: User = Depends(require_onboarded
     return {"name": name, "content": target.read_text(encoding="utf-8", errors="replace")}
 
 
+
+def _commit_landed_write(checkout: Path, message: str) -> dict:
+    """Commit a write that has already landed, and say plainly if that failed.
+
+    Four routes write a file and then commit it, and all four used to catch the
+    failure and answer `committed: false` — the same answer as "there was
+    nothing to commit". So when a project's repository lost its HEAD to a
+    restore race, every accepted proposal, save and upload for two days went
+    uncommitted with nothing anywhere saying so. Not fatal, still: the bytes
+    are on disk and refusing the write that landed would be a lie. But the
+    failure travels back as a sentence, and into the log.
+    """
+    try:
+        return {"committed": projects.commit_checkout(checkout, message) is not None}
+    except ProjectError as exc:
+        logger.warning("commit failed in %s (%s): %s", checkout, message, exc)
+        return {
+            "committed": False,
+            "commit_error": f"saved, but not committed to git: {exc}",
+        }
+
 @app.put("/api/projects/{project_id}/files/{name:path}")
 def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
@@ -3194,20 +3265,15 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     #
     # Failure to commit is reported, never fatal. The bytes are already on disk
     # and refusing the save that landed would be a lie about what happened.
-    committed = False
-    try:
-        # In the checkout the file was written to, which for a member is their
-        # own worktree rather than the repository directory the name resolves to.
-        checkout = _project_dir(session, user, project_id)
-        committed = projects.commit_checkout(checkout, f"edit: {rel}") is not None
-    except ProjectError:
-        committed = False
+    # In the checkout the file was written to, which for a member is their own
+    # worktree rather than the repository directory the name resolves to.
+    commit = _commit_landed_write(_project_dir(session, user, project_id), f"edit: {rel}")
     return {
         "ok": True,
         "name": name,
         "path": rel,
         "bytes": target.stat().st_size,
-        "committed": committed,
+        **commit,
     }
 
 
@@ -3311,14 +3377,17 @@ async def upload_files(
             session, _project_or_404(session, user, project_id), user, activity.UPLOADED,
             ", ".join(r["name"] for r in landed),
         )
-    committed = False
-    try:
-        # Released files and the ledger; retrieved/ itself is gitignored, so a
-        # held file never enters history.
-        committed = projects.commit_checkout(proj, f"upload: {len(landed)} file(s)") is not None
-    except ProjectError:
-        committed = False
-    return {"results": results, "committed": committed}
+    # Released files and the ledger; retrieved/ itself is gitignored, so a
+    # held file never enters history.
+    # Nothing to commit when every file was refused before quarantine; trying
+    # anyway produced "saved, but not committed" beside a list saying nothing
+    # was uploaded.
+    commit = (
+        _commit_landed_write(proj, f"upload: {len(landed)} file(s)")
+        if landed
+        else {"committed": False}
+    )
+    return {"results": results, **commit}
 
 
 @app.get("/api/projects/{project_id}/quarantine")
@@ -3363,14 +3432,11 @@ def set_llm_ignore(
         raise HTTPException(status_code=404, detail=f"no file {body.path!r} in this project")
     rel = target.relative_to(proj.resolve()).as_posix()
     changed = llm_ignore.set_ignored(proj, rel, body.ignored, by=user.email or f"user {user.id}")
-    committed = False
+    commit: dict = {"committed": False}
     if changed:
         verb = "ignore" if body.ignored else "unignore"
-        try:
-            committed = projects.commit_checkout(proj, f"llm-{verb}: {rel}") is not None
-        except ProjectError:
-            committed = False
-    return {"path": rel, "ignored": body.ignored, "changed": changed, "committed": committed}
+        commit = _commit_landed_write(proj, f"llm-{verb}: {rel}")
+    return {"path": rel, "ignored": body.ignored, "changed": changed, **commit}
 
 
 class FolderBody(BaseModel):
@@ -4953,20 +5019,22 @@ def decide_proposal(
             detail="a pipeline run is in flight for this project — accept the edit once it finishes",
         )
 
-    applied, detail = chat_mod.apply_proposal(proposal, proj, _sandbox_for(session, user, project_id))
+    try:
+        applied, detail = chat_mod.apply_proposal(
+            proposal, proj, _sandbox_for(session, user, project_id)
+        )
+    except chat_mod.ProposalWriteError as exc:
+        # Left pending: nothing about the proposal changed, only the disk.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not applied:
         store.set_status(proposal, "stale")
         raise HTTPException(status_code=409, detail=detail)
 
     store.set_status(proposal, "accepted")
-    committed = False
-    try:
-        committed = projects.commit_checkout(proj, f"chat: {proposal.rationale or proposal.path}") is not None
-    except ProjectError:
-        # A project without git history still gets its file. Losing the commit is
-        # worth reporting, not worth refusing the edit that already landed.
-        committed = False
-    return {"ok": True, "status": "accepted", "detail": detail, "committed": committed}
+    # A project without working git history still gets its file. Losing the
+    # commit is worth reporting, not worth refusing the edit that already landed.
+    commit = _commit_landed_write(proj, f"chat: {proposal.rationale or proposal.path}")
+    return {"ok": True, "status": "accepted", "detail": detail, **commit}
 
 
 # --------------------------------------------------------------------------
@@ -5340,7 +5408,7 @@ def preflight(project_id: str, user: User = Depends(require_onboarded),
                 # the project, so a doctor rooted at core/ could not find the
                 # project's own symbol library and reported every hand-drawn
                 # part on every sub-board as missing.
-                per_board[b] = doctor.run(proj, board=b).to_dict()
+                per_board[b] = doctor.run(proj, board=b, layout=False).to_dict()
             art = project_manifest.artifact_path(
                 proj, "design_artifact.deterministic", board=b
             )
@@ -5352,6 +5420,9 @@ def preflight(project_id: str, user: User = Depends(require_onboarded),
         report = crossboard.check(man, artifacts) if artifacts else None
         return {
             "multi_board": True,
+            # Findings about the project rather than any one board, such as a
+            # folder of design tables no board declares. Once, not per board.
+            "project": doctor.layout(proj).to_dict(),
             "boards": per_board,
             "crossboard": report.to_dict() if report else None,
             # Named so the panel can say why the cross-board section is empty

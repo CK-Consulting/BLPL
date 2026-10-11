@@ -63,6 +63,8 @@ type CrossReport = {
 
 type MultiReport = {
   multi_board: true;
+  /** Findings about the project as a whole: design tables no board owns. */
+  project?: Report;
   boards: Record<string, Report>;
   crossboard: CrossReport | null;
   crossboard_ready: string[];
@@ -106,6 +108,11 @@ export function Preflight({
     const ordered = board && names.includes(board) ? [board, ...names.filter((n) => n !== board)] : names;
     return (
       <div className="reports">
+        {report.project && report.project.findings.length > 0 && (
+          // Above every board: a board folder project.md does not list is
+          // invisible to the per-board reports below, which is the problem.
+          <ProjectFindings report={report.project} />
+        )}
         <CrossBoard report={report} />
         {ordered.map((name) => (
           <BoardReport key={name} report={report.boards[name]} title={name} projectId={projectId} board={name} />
@@ -203,12 +210,6 @@ function BoardReport({
   board?: string | null;
 }) {
   const s = report.summary;
-  const groups = new Map<string, Finding[]>();
-  for (const f of report.findings) {
-    const list = groups.get(f.code);
-    if (list) list.push(f);
-    else groups.set(f.code, [f]);
-  }
 
   return (
     <>
@@ -267,6 +268,40 @@ function BoardReport({
         <div className="muted pad">No findings. Your markdown parses exactly as written.</div>
       )}
 
+      <FindingGroups findings={report.findings} />
+    </>
+  );
+}
+
+/**
+ * The project-wide findings: design content that no board owns. Findings
+ * only. The layout scan reads no tables, so the per-board statistics would
+ * say "every table was recognised" directly above a finding that tables will
+ * never be read, and there is no single board for an Open KiCad button to
+ * open on a multi-board project.
+ */
+function ProjectFindings({ report }: { report: Report }) {
+  return (
+    <>
+      <h2 className="report-board">Whole project</h2>
+      <div className={`fab-banner ${report.ok ? "ok" : "danger"}`}>
+        <strong>Design content no board owns.</strong> Only the boards listed in{" "}
+        <code>project.md</code> are built; what is below is left out of every build.
+      </div>
+      <FindingGroups findings={report.findings} />
+    </>
+  );
+}
+
+function FindingGroups({ findings: all }: { findings: Finding[] }) {
+  const groups = new Map<string, Finding[]>();
+  for (const f of all) {
+    const list = groups.get(f.code);
+    if (list) list.push(f);
+    else groups.set(f.code, [f]);
+  }
+  return (
+    <>
       {[...groups.entries()].map(([code, findings]) => (
         <section className="report-block" key={code}>
           <h3 className={findings[0].severity === "error" ? "danger-h" : undefined}>

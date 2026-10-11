@@ -17,6 +17,7 @@ from app import chat as chat_mod
 from app.agent import ToolContext, ToolExecutor, default_tools
 from app.chat import (
     ProposalStore,
+    ProposalWriteError,
     apply_proposal,
     history_to_messages,
     persist_messages,
@@ -261,6 +262,68 @@ def test_a_proposal_can_create_a_new_file(project) -> None:
 
     ok, _ = apply_proposal(proposal, project, ctx.sandbox)
     assert ok and (project / "power.md").read_text() == "# Power\n"
+
+
+def test_a_proposal_can_create_a_file_in_a_folder_that_does_not_exist(project) -> None:
+    """Setting up a multi-board project means proposing main/main.md before
+    main/ exists. Accepting it used to raise FileNotFoundError out of the route
+    as a bare 500, leaving the proposal pending and the user with no error."""
+    ctx = _ctx(project)
+    res = _call(
+        ctx, "propose_file_edit", path="main/sub/main.md", new_content="# Main\n", rationale="new board"
+    )
+    assert not res.is_error
+    proposal = ProposalStore(project).pending()[0]
+
+    ok, detail = apply_proposal(proposal, project, ctx.sandbox)
+    assert ok, detail
+    assert (project / "main" / "sub" / "main.md").read_text() == "# Main\n"
+
+
+def test_a_write_that_fails_is_not_staleness(project) -> None:
+    """Codex, PR #13: returning False sent an I/O failure down the stale path,
+    and the route marked the proposal stale, so it could never be retried once
+    the disk was fixed. It is a separate error, and the proposal stays valid."""
+    ctx = _ctx(project)
+    _call(ctx, "propose_file_edit", path="power/power.md", new_content="# P\n", rationale="r")
+    proposal = ProposalStore(project).pending()[0]
+    # A file where the folder should be: mkdir cannot succeed.
+    (project / "power").write_text("not a folder\n", encoding="utf-8")
+
+    with pytest.raises(ProposalWriteError, match="could not write power/power.md"):
+        apply_proposal(proposal, project, ctx.sandbox)
+    assert (project / "power").read_text() == "not a folder\n"
+
+    # Fixed underneath, the same proposal applies.
+    (project / "power").unlink()
+    ok, detail = apply_proposal(proposal, project, ctx.sandbox)
+    assert ok, detail
+
+
+def test_accepting_keeps_the_documents_permissions(project) -> None:
+    """Codex, PR #13: the temporary file is created 0600, and renaming it over
+    the document installed that mode, so a 0644 file lost group and other
+    access on every accepted edit."""
+    import os
+    import stat
+
+    ctx = _ctx(project)
+    (project / "overview.md").chmod(0o664)
+    _call(ctx, "read_project_file", path="overview.md")
+    _call(ctx, "propose_file_edit", path="overview.md", new_content="# v2\n", rationale="r")
+    _call(ctx, "propose_file_edit", path="new/fresh.md", new_content="# n\n", rationale="r")
+    edit, create = sorted(ProposalStore(project).pending(), key=lambda p: p.path)[::-1]
+    assert edit.path == "overview.md"
+
+    assert apply_proposal(edit, project, ctx.sandbox)[0]
+    assert stat.S_IMODE((project / "overview.md").stat().st_mode) == 0o664
+
+    old = os.umask(0o022)
+    try:
+        assert apply_proposal(create, project, ctx.sandbox)[0]
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((project / "new" / "fresh.md").stat().st_mode) == 0o644
 
 
 def test_a_create_proposal_refuses_once_the_file_exists(project) -> None:
@@ -537,6 +600,47 @@ def test_rejecting_leaves_the_file_alone(chat_client, monkeypatch) -> None:
     assert chat_client.get("/api/projects/scratch/files/overview.md").json()["content"] == "# Board\n"
     # A decided proposal cannot be decided again.
     assert chat_client.post(f"/api/projects/scratch/proposals/{pid}", json={"action": "accept"}).status_code == 409
+
+
+def test_a_failed_write_leaves_the_proposal_pending(chat_client, monkeypatch) -> None:
+    call = ToolUseBlock(
+        id="t1",
+        name="propose_file_edit",
+        input={"path": "overview.md", "new_content": "# v2\n", "rationale": "r"},
+    )
+    _script(
+        monkeypatch,
+        [
+            _read_then(call),
+            [ToolCall(id=call.id, name=call.name, input=call.input), Done("tool_use", Msg(role="assistant", content=[call]))],
+            [Done("end_turn", Msg.assistant("ok"))],
+        ],
+    )
+    _ready(chat_client)
+    filename = _new_conversation(chat_client)
+    started = chat_client.post(
+        f"/api/projects/scratch/conversations/{filename}/chat", json={"content": "go"}
+    )
+    events = _drain(chat_client, started.json()["turn_id"])
+    pid = next(e for e in events if e["type"] == "proposal")["proposal"]["id"]
+
+    real_replace = chat_mod.os.replace
+    full = {"yes": True}
+
+    def disk_full(src, dst):
+        if full["yes"]:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(chat_mod.os, "replace", disk_full)
+    r = chat_client.post(f"/api/projects/scratch/proposals/{pid}", json={"action": "accept"})
+    assert r.status_code == 503 and "still pending" in r.json()["detail"]
+    assert chat_client.get("/api/projects/scratch/files/overview.md").json()["content"] == "# Board\n"
+    assert [p["id"] for p in chat_client.get("/api/projects/scratch/proposals").json()] == [pid]
+
+    full["yes"] = False
+    retried = chat_client.post(f"/api/projects/scratch/proposals/{pid}", json={"action": "accept"})
+    assert retried.status_code == 200
 
 
 def test_accepting_a_stale_proposal_is_a_409_not_a_clobber(chat_client, monkeypatch) -> None:

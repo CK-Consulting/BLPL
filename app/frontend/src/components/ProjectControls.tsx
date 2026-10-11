@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { GitStatus, ImportResult, getJSON, postForm, postJSON } from "../api";
+import { GitStatus, ImportResult, getJSON, postForm, postJSON, putJSON } from "../api";
 import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
 import { ProjectIcon } from "./Icons";
 import { BoardConfigPanel } from "./BoardConfigPanel";
@@ -11,7 +11,17 @@ import { ProjectRoutingPanel } from "./ProjectRoutingPanel";
 // push. This is the mechanism behind "sit at another workstation and pick up
 // where you left off": the board and markdown live in git on the server.
 
-export function ProjectSync({ projectId, onChanged }: { projectId: string; onChanged: () => void }) {
+export function ProjectSync({
+  projectId,
+  onChanged,
+  reloadToken = 0,
+}: {
+  projectId: string;
+  onChanged: () => void;
+  /** Bumped when something outside the strip changes the repository's
+   *  remote, so the strip re-reads status instead of trusting its own copy. */
+  reloadToken?: number;
+}) {
   const [st, setSt] = useState<GitStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -32,7 +42,7 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
   useEffect(() => {
     setCommitting(null);
     refresh();
-  }, [projectId]);
+  }, [projectId, reloadToken]);
 
   if (!st) return null;
 
@@ -57,7 +67,10 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
     if (currentRef.current !== target) throw new Error("The project changed; nothing was committed.");
     setNote(null);
     await postJSON(`/api/projects/${target}/git/commit`, { message });
-    if (st.has_remote) await postJSON(`/api/projects/${target}/git/push`, {});
+    // Asked fresh, not read from `st`: the status this render captured can
+    // predate a remote added since, and then the push was skipped.
+    const now = await getJSON<GitStatus>(`/api/projects/${target}/git/status`);
+    if (now.has_remote) await postJSON(`/api/projects/${target}/git/push`, {});
     setNote("commit ok");
     await refresh();
     onChanged();
@@ -81,7 +94,20 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
         </span>
       )}
       {st.ahead > 0 && <span className="badge">↑{st.ahead}</span>}
+      {st.has_remote && st.unpublished && (
+        <span className="badge" title="This branch has never been pushed to the remote.">
+          not pushed yet
+        </span>
+      )}
       {st.behind > 0 && <span className="badge">↓{st.behind}</span>}
+      {/* Shown instead of a publication state the server could not measure:
+          an origin fetching from one repository and pushing to another read as
+          "published, nothing ahead" against the wrong one (Codex, PR #10). */}
+      {st.has_remote && st.remote_problem && (
+        <span className="badge warn" title={st.remote_problem}>
+          remote needs fixing
+        </span>
+      )}
       {!st.has_remote && (
         <span
           className="muted"
@@ -96,9 +122,13 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
           Pull
         </button>
       )}
+      {/* A branch never pushed is publishable even when clean and even when
+          origin already has all its commits: the push is what creates it
+          there. Gating on `ahead` alone left a just-added remote with no way
+          to receive the project's history. */}
       <button
         className="link"
-        disabled={busy || (!st.dirty && st.ahead === 0)}
+        disabled={busy || (!st.dirty && st.ahead === 0 && !(st.has_remote && st.unpublished))}
         onClick={() => setCommitting(projectId)}
       >
         {st.has_remote ? "Commit + Push" : "Commit"}
@@ -319,8 +349,11 @@ export function NewProject({
 export function ProjectSettings({
   projectId,
   board,
+  onRemoteChanged,
 }: {
   projectId: string;
+  /** Called after the remote is added or changed, for the git strip. */
+  onRemoteChanged?: () => void;
   /** The active board, because geometry is per board: two boards do not share
    *  an outline or a stackup. Null on a single-board project, whose one board
    *  is implicit — the panel resolves that itself rather than being withheld,
@@ -351,7 +384,7 @@ export function ProjectSettings({
         <div className="modal-body">
           <BoardConfigPanel projectId={projectId} board={board ?? null} />
           <ProjectRoutingPanel projectId={projectId} />
-          <ProjectGitPanel projectId={projectId} />
+          <ProjectGitPanel projectId={projectId} onRemoteChanged={onRemoteChanged} />
           <ProjectPolicyPanel projectId={projectId} />
         </div>
       </div>
@@ -367,19 +400,31 @@ export function ProjectSettings({
  * on `main` is not knowing whose `main`, and a push control whose destination
  * is invisible is one someone will eventually fire at the wrong repository.
  */
-function ProjectGitPanel({ projectId }: { projectId: string }) {
+export function ProjectGitPanel({
+  projectId,
+  onRemoteChanged,
+}: {
+  projectId: string;
+  onRemoteChanged?: () => void;
+}) {
   const [st, setSt] = useState<GitStatus | null>(null);
   // A failure is its own state. It used to be caught into `null`, which is
   // also what "still loading" looks like, so a repository git could not read
   // sat at "Reading repository status…" forever and said nothing about why.
   const [error, setError] = useState<string | null>(null);
 
+  const load = () =>
+    getJSON<GitStatus>(`/api/projects/${projectId}/git/status`)
+      .then((s) => {
+        setSt(s);
+        setError(null);
+      })
+      .catch((e: Error) => setError(e.message || "could not read the repository"));
+
   useEffect(() => {
     setSt(null);
     setError(null);
-    getJSON<GitStatus>(`/api/projects/${projectId}/git/status`)
-      .then(setSt)
-      .catch((e: Error) => setError(e.message || "could not read the repository"));
+    load();
   }, [projectId]);
 
   return (
@@ -403,6 +448,7 @@ function ProjectGitPanel({ projectId }: { projectId: string }) {
                 {/* Any credential in the URL is replaced server-side before it
                     reaches here, so this is safe to show and to screenshot. */}
                 <span className="remote-url">{st.remote_url}</span>
+                {st.remote_problem && <p className="gate-error small">{st.remote_problem}</p>}
               </>
             ) : (
               <span className="muted">
@@ -412,6 +458,99 @@ function ProjectGitPanel({ projectId }: { projectId: string }) {
           </dd>
         </dl>
       )}
+      {st && (
+        <RemoteForm
+          projectId={projectId}
+          hasRemote={st.has_remote}
+          onSet={(remote_name, remote_url) => {
+            // Shown at once, then re-read whole: patching only the name and
+            // URL left the old remote_problem on screen after Change remote
+            // had fixed a split or hand-edited origin, and every other field
+            // the server derives from the remote went stale with it (Codex,
+            // PR #10).
+            setSt({ ...st, has_remote: true, remote_name, remote_url });
+            load();
+            onRemoteChanged?.();
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+/**
+ * Add or change where Push goes.
+ *
+ * There was no way to do this in the app: the panel showed the remote and that
+ * was all, so a project created here stayed local-only unless someone edited
+ * its git config on the server. Owner only — the server decides that, and a
+ * member who tries is told why — and the URL is checked server-side the same
+ * way cloning is: https://, ssh:// or user@host:path, never a local path.
+ */
+export function RemoteForm({
+  projectId,
+  hasRemote,
+  onSet,
+}: {
+  projectId: string;
+  hasRemote: boolean;
+  onSet: (remoteName: string, remoteUrl: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!open) {
+    return (
+      <button className="link" onClick={() => setOpen(true)}>
+        {hasRemote ? "Change remote…" : "Add a remote…"}
+      </button>
+    );
+  }
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const out = await putJSON<{ remote_name: string; remote_url: string }>(
+        `/api/projects/${projectId}/git/remote`,
+        { url: url.trim() },
+      );
+      onSet(out.remote_name, out.remote_url);
+      setOpen(false);
+      setUrl("");
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form className="remote-form" onSubmit={submit}>
+      <label className="small">
+        Remote URL
+        <input
+          type="text"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="https://github.com/owner/repo.git or git@github.com:owner/repo.git"
+          aria-label="Remote URL"
+          autoFocus
+        />
+      </label>
+      <p className="muted small">
+        Credentials for a private remote go in Account &amp; app settings → Git endpoints/accounts, per user — not in this URL.
+      </p>
+      {error && <p className="gate-error small">{error}</p>}
+      <button type="submit" disabled={busy || !url.trim()}>
+        {busy ? "Saving…" : "Save remote"}
+      </button>{" "}
+      <button type="button" className="link" onClick={() => setOpen(false)}>
+        Cancel
+      </button>
+    </form>
   );
 }

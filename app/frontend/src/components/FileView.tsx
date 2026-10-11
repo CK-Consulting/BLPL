@@ -1,5 +1,6 @@
 import { type MutableRefObject, type ReactNode, useEffect, useRef, useState } from "react";
 import { encodePath, getJSON, putJSON } from "../api";
+import { announceCommitted } from "../commitEvents";
 import { Code, langOf } from "./Code";
 import { UnsavedChangesDialog } from "./Dialog";
 import { Diagram, isDiagramFile } from "./Diagram";
@@ -284,8 +285,15 @@ export function FileView({
     savingRef.current = true;
     setSaving(true);
     onSavingChange?.(path);
+    // A save that commits must not leave the last one's warning standing.
+    setError(null);
     try {
-      await putJSON(`/api/projects/${projectId}/files/${encodePath(path)}`, { content: sent });
+      const out = await putJSON<{ committed?: boolean; commit_error?: string }>(
+        `/api/projects/${projectId}/files/${encodePath(path)}`,
+        { content: sent },
+      );
+      // The commit happened in this save's project whatever the pane shows now.
+      if (out?.committed) announceCommitted(projectId);
       onSaved();
       // Codex, PR #17: the completion used to land on whatever the pane showed
       // by then. After a rename or a switch that is another path, whose
@@ -294,7 +302,10 @@ export function FileView({
       // was for takes its result.
       if (currentKey.current !== key) return true;
       setContent(sent);
+      // A save can land and still fail to commit. Saying only "Saved" then is
+      // how a broken repository went unnoticed for two days.
       setStatus("Saved");
+      if (out?.commit_error) setError(`Saved — ${out.commit_error}`);
       return true;
     } catch (e) {
       if (currentKey.current === key) setError((e as Error).message);

@@ -934,6 +934,31 @@ def test_preflight_reports_what_stage0_would_discard(unlocked) -> None:
     assert body["summary"]["tables_discarded"] == 1
 
 
+def test_multi_board_preflight_reports_an_undeclared_board_folder(unlocked) -> None:
+    """Codex, PR #16: Preflight runs the doctor once per declared board, and the
+    project-wide DOC-016 scan only ran with no board named, so a power/ folder
+    project.md does not list never reached the panel. It is reported once, as
+    the project's, not repeated under every board."""
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json={"name": "scratch"})
+    proj = main.PROJECTS_ROOT / "scratch"
+    bom = "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | 0402 |\n"
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    for board in ("main", "power"):
+        (proj / board).mkdir()
+        (proj / board / f"{board}.md").write_text(bom, encoding="utf-8")
+
+    body = unlocked.get("/api/projects/scratch/preflight").json()
+    assert body["multi_board"] is True
+    assert any(
+        f["code"] == "DOC-016" and "power/" in f["summary"] for f in body["project"]["findings"]
+    )
+    assert all(
+        f["code"] != "DOC-016" for f in body["boards"]["main"]["findings"]
+    )
+
+
 def test_preflight_mutates_nothing(unlocked) -> None:
     # It is safe to call on every visit to the tab, which is why the panel does.
     import app.main as main

@@ -1102,3 +1102,138 @@ def test_a_board_still_sees_the_projects_own_libraries(tmp_path: Path) -> None:
     # The wrong call, for contrast: the board directory has no libraries/.
     wrong = {f.code for f in doctor.run(tmp_path / "sb").findings}
     assert {"DOC-010", "DOC-015"} <= wrong
+
+
+# --- DOC-016: design documents no board owns ---------------------------------
+
+_BOM = "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | 0402 |\n"
+
+
+def test_board_folders_without_project_md_are_not_reported_clean(tmp_path: Path) -> None:
+    """verdacor-ear-tag: the design moved into main/ and power/ but no project.md
+    was written, so the project stayed single-board and Stage 0 read only the
+    root. The pre-proposal check ran with board="main", board_dir() answered
+    "the root" for an implicit project, and the root, emptied of its tables
+    by the move, came back with 0 errors."""
+    proj = tmp_path / "p"
+    (proj / "main").mkdir(parents=True)
+    (proj / "board.md").write_text("# Overview\n\nNo tables any more.\n", encoding="utf-8")
+    (proj / "main" / "main.md").write_text("# Main\n\n" + _BOM, encoding="utf-8")
+
+    asked = doctor.run(proj, footprints_root=tmp_path / "nope", board="main")
+    assert not asked.ok and "DOC-016" in _codes(asked)
+
+    whole = doctor.run(proj, footprints_root=tmp_path / "nope")
+    hits = [f for f in whole.findings if f.code == "DOC-016"]
+    assert hits and hits[0].severity == "error" and "main/" in hits[0].summary
+
+
+def test_a_board_missing_from_the_manifest_is_named(tmp_path: Path) -> None:
+    proj = tmp_path / "p"
+    (proj / "power").mkdir(parents=True)
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    (proj / "power" / "power.md").write_text(_BOM, encoding="utf-8")
+
+    asked = doctor.run(proj, footprints_root=tmp_path / "nope", board="power")
+    assert any(f.code == "DOC-016" and "does not list it" in f.summary for f in asked.findings)
+    assert any(
+        f.code == "DOC-016" and "power/" in f.summary
+        for f in doctor.run(proj, footprints_root=tmp_path / "nope").findings
+    )
+
+
+def test_a_declared_board_is_checked_and_not_flagged(tmp_path: Path) -> None:
+    proj = tmp_path / "p"
+    (proj / "main").mkdir(parents=True)
+    (proj / "datasheets").mkdir()
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    (proj / "main" / "main.md").write_text(_BOM, encoding="utf-8")
+    # Reference material with a table in it is not a board.
+    (proj / "datasheets" / "notes.md").write_text(_BOM, encoding="utf-8")
+
+    assert "DOC-016" not in _codes(doctor.run(proj, footprints_root=tmp_path / "nope"))
+    assert "DOC-016" not in _codes(
+        doctor.run(proj, footprints_root=tmp_path / "nope", board="main")
+    )
+
+
+def test_root_tables_in_a_multi_board_project_are_a_warning(tmp_path: Path) -> None:
+    proj = tmp_path / "p"
+    (proj / "main").mkdir(parents=True)
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    (proj / "main" / "main.md").write_text(_BOM, encoding="utf-8")
+    (proj / "board.md").write_text(_BOM, encoding="utf-8")
+
+    hits = [
+        f for f in doctor.run(proj, footprints_root=tmp_path / "nope").findings
+        if f.code == "DOC-016"
+    ]
+    assert len(hits) == 1 and hits[0].severity == "warning"
+
+
+def test_a_single_board_project_with_reference_folders_is_unaffected(tmp_path: Path) -> None:
+    proj = tmp_path / "p"
+    (proj / "libraries").mkdir(parents=True)
+    (proj / "board.md").write_text(_BOM, encoding="utf-8")
+    (proj / "libraries" / "README.md").write_text(_BOM, encoding="utf-8")
+    assert "DOC-016" not in _codes(doctor.run(proj, footprints_root=tmp_path / "nope"))
+
+
+def test_layout_findings_reach_a_check_that_names_a_board(tmp_path: Path) -> None:
+    """Codex, PR #16: the project-wide scan ran only with no board named, and
+    the CLI and the Preflight tab always name one on a multi-board project."""
+    proj = tmp_path / "p"
+    (proj / "main").mkdir(parents=True)
+    (proj / "power").mkdir()
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    (proj / "main" / "main.md").write_text(_BOM, encoding="utf-8")
+    (proj / "power" / "power.md").write_text(_BOM, encoding="utf-8")
+
+    named = doctor.run(proj, footprints_root=tmp_path / "nope", board="main")
+    assert any(f.code == "DOC-016" and "power/" in f.summary for f in named.findings)
+    # The multi-board Preflight reports it once, through layout(), not per board.
+    assert "DOC-016" not in _codes(
+        doctor.run(proj, footprints_root=tmp_path / "nope", board="main", layout=False)
+    )
+    assert "DOC-016" in _codes(doctor.layout(proj))
+
+
+def test_a_gpio_table_counts_as_design_content(tmp_path: Path) -> None:
+    """Codex, PR #16: Stage 0 reads GPIO assignment tables too, so one stranded
+    in an undeclared folder is dropped from the build just the same."""
+    proj = tmp_path / "p"
+    (proj / "power").mkdir(parents=True)
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    (proj / "power" / "io.md").write_text(
+        "## GPIO\n\n| GPIO | Signal |\n|---|---|\n| P0.01 | LED |\n", encoding="utf-8"
+    )
+    assert "DOC-016" in _codes(doctor.layout(proj))
+
+
+def test_mid_split_the_root_tables_are_only_a_warning(tmp_path: Path) -> None:
+    """Codex, PR #16: the procedure keeps the root tables until every board's
+    document is accepted, so while a board document is checked mid-split, the
+    root-tables DOC-016 must be a warning and never an error, or the documented
+    sequence cannot be completed."""
+    proj = tmp_path / "p"
+    (proj / "main").mkdir(parents=True)
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n- power\n", encoding="utf-8")
+    (proj / "board.md").write_text(_BOM, encoding="utf-8")
+    (proj / "main" / "main.md").write_text(_BOM, encoding="utf-8")
+
+    report = doctor.run(proj, footprints_root=tmp_path / "nope", board="main")
+    hits = [f for f in report.findings if f.code == "DOC-016"]
+    assert hits and all(f.severity == "warning" for f in hits)
+
+
+def test_a_modules_list_counts_as_design_content(tmp_path: Path) -> None:
+    """Codex, PR #16: a board built only from '## Modules' has no tables, and
+    Stage 0 expands it into components all the same, so stranded in an
+    undeclared folder it is a whole board missing from the build."""
+    proj = tmp_path / "p"
+    (proj / "power").mkdir(parents=True)
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    (proj / "power" / "power.md").write_text(
+        "# Power\n\n## Modules\n\n- ltc4015-charger — the charger\n", encoding="utf-8"
+    )
+    assert "DOC-016" in _codes(doctor.layout(proj))

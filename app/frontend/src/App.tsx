@@ -135,6 +135,10 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   }, []);
 
   const bump = () => setReloadToken((n) => n + 1);
+  // The git strip and the settings panel each fetch status on their own, so
+  // a remote saved in one never reached the other: the strip kept saying
+  // "local only" and disabled the push the new remote was waiting for.
+  const [gitToken, setGitToken] = useState(0);
 
   return (
     <div className="app">
@@ -165,7 +169,13 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
             </option>
           ))}
         </select>
-        {selected && <ProjectSettings projectId={selected} board={board} />}
+        {selected && (
+          <ProjectSettings
+            projectId={selected}
+            board={board}
+            onRemoteChanged={() => setGitToken((n) => n + 1)}
+          />
+        )}
         {/* The board every tab below is about, where the eye lands first. On a
             project with seven boards "which one am I building" is the question
             behind every stage run, and a highlighted item in the rail did not
@@ -223,7 +233,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
 
       {selected ? (
         <>
-          <ProjectSync projectId={selected} onChanged={bump} />
+          <ProjectSync projectId={selected} onChanged={bump} reloadToken={gitToken} />
           <main>
             {railCollapsed ? (
               // A gutter, not nothing: the control that brings the rail back

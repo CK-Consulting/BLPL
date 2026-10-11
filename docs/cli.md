@@ -25,6 +25,11 @@ blpl doctor --project-dir <proj> [--json]
 | `DOC-009` | A GPIO map whose heading names no host refdes |
 | `DOC-010` | A library-form footprint that does not exist on disk |
 | `DOC-011` | An IC with no pinout table — Stage 3 will halt asking for its pin_map |
+| `DOC-012` | A package value with no library prefix that matches no footprint |
+| `DOC-013` | A package value that names more than one land pattern |
+| `DOC-014` | A package value naming one footprint without its library prefix |
+| `DOC-015` | A symbol that does not exist in the library |
+| `DOC-016` | Design tables no board owns: board folders with no `project.md`, a board `project.md` does not list, or BOM/pinout tables at the root of a multi-board project |
 
 Exit is 0 unless a `DOC-*` **error** was found; warnings do not fail.
 
