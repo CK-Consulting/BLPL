@@ -36,7 +36,11 @@ held for carrying JavaScript it does not have (qpdf's structural parse finds no
 ``/JS`` among its 138 distinct keys), and any Adobe-exported datasheet with
 embedded previews could trip ``/JS``, ``/AA`` or ``/Launch`` at random. Stream
 bodies, strings and comments are blanked before names are matched, and only
-streams a reader would parse as objects are decompressed and read.
+streams a reader would parse as objects are decompressed and read. Blanked is
+not unreachable, though: a reader seeks to an object by its xref offset, or
+scans the file for headers when the xref is broken, and either can land inside
+a string or a body. So an object header found in blanked bytes is parsed on
+its own as well (_hidden_objects).
 
 **One it cannot handle, stated rather than papered over.** An encrypted PDF has
 its strings and streams enciphered, so there is nothing here to match. That is
@@ -47,6 +51,7 @@ codebase, absence of information is never evidence of absence.
 from __future__ import annotations
 
 import base64
+import bisect
 import re
 import zlib
 from dataclasses import dataclass
@@ -209,12 +214,13 @@ def _canonical_word(tok: bytes) -> bytes:
     return (b"-" if sign == b"-" and digits != b"0" else b"") + digits
 
 
-def _string_end(data: bytes, start: int) -> int:
+def _string_end(data: bytes, start: int, n: int | None = None) -> int:
     """Index just past a literal string opening at `start`, or -1 when it
-    never closes. Strings nest on balanced parens; `\\(` and `\\)` do not
-    count. -1 rather than len(data), so no caller can mistake a string that
-    ran to EOF for one that ended there."""
-    depth, i, n = 0, start, len(data)
+    never closes before `n` (EOF by default). Strings nest on balanced parens;
+    `\\(` and `\\)` do not count. -1 rather than len(data), so no caller can
+    mistake a string that ran to EOF for one that ended there."""
+    depth, i = 0, start
+    n = len(data) if n is None else n
     while i < n:
         c = data[i]
         if c == 0x5C:            # backslash: skip the escaped byte
@@ -244,10 +250,19 @@ class _Stream:
     ended_by: str = "search"
 
 
-def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool, list[str]]:
+def _parse(
+    data: bytes,
+    start: int = 0,
+    endpos: int | None = None,
+    *,
+    lengths: dict[tuple[bytes, bytes], int] | None = None,
+    last_endstream: int | None = None,
+    skipped: list[tuple[int, int]] | None = None,
+    one_object: bool = False,
+) -> tuple[bytes, list[_Stream], bool, list[str], int]:
     """The file's structure as canonical tokens, each stream paired with the
-    dictionary that introduces it, whether the dictionaries nest sanely, and
-    which constructs never ended.
+    dictionary that introduces it, whether the dictionaries nest sanely, which
+    constructs never ended, and the offset the parse stopped at.
 
     Strings, comments and stream bodies are dropped; names are written in
     canonical form; tokens are separated by one space. What is left is what a
@@ -281,8 +296,17 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool, list[str]]:
     lenient reader), so an imbalance is reported and the caller fails closed;
     the depth is still reset there so the rest of the file is read for what
     it reports.
+
+    The bytes this drops as data (literal strings, comments and stream
+    bodies) are appended to `skipped` as `(start, end)` offsets when the
+    caller asks, so it can look for objects a reader finds there and this
+    parse does not (_hidden_objects). With `one_object` the parse starts at an
+    object header and stops after its `endobj`, or before a second `obj`, which
+    is where a lenient reader takes the next object to begin; anything else,
+    reaching `endpos` included, is reported as not ending.
     """
-    lengths = _length_objects(data)
+    if lengths is None:
+        lengths = _length_objects(data)
     out = bytearray()
     streams: list[_Stream] = []
     opens: list[int] = []               # offsets in `out` of unclosed `<<`
@@ -291,14 +315,18 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool, list[str]]:
     string_ran_on = body_ran_on = False
     # Past the last `endstream` no body can end, so it is not searched for
     # again: one search to EOF per `stream` keyword was quadratic in them.
-    last_endstream = data.rfind(_ENDSTREAM)
-    pos, n = 0, len(data)
+    if last_endstream is None:
+        last_endstream = data.rfind(_ENDSTREAM)
+    pos, n = start, len(data) if endpos is None else endpos
+    seen_obj = finished = False
 
     while pos < n:
-        m = _TOKEN.match(data, pos)
+        m = _TOKEN.match(data, pos, n)
         kind = m.lastgroup
         tok = m.group()
         pos = m.end()
+        if kind == "comment" and skipped is not None:
+            skipped.append((m.start(), pos))
         if kind in ("ws", "comment"):
             continue
         # A string's bytes are dropped, but inside a dictionary its place is
@@ -314,12 +342,19 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool, list[str]]:
             # `(` is left a lone delimiter: searching to EOF from each one
             # again was quadratic in a file of `(`, and reading the rest as
             # structure can only add findings.
-            end = -1 if string_ran_on else _string_end(data, m.start())
+            end = -1 if string_ran_on else _string_end(data, m.start(), n)
             if end < 0:
                 # Never closed: everything after the `(` is still read as
                 # structure, so a later object is scanned rather than skipped.
                 string_ran_on = True
+                if one_object:
+                    # The search read to `endpos`; the caller's budget is
+                    # charged for that, or a run of `(` costs it nothing.
+                    pos = n
+                    break
             else:
+                if skipped is not None:
+                    skipped.append((m.start(), end))
                 pos = end
             if opens:
                 out += b"() "
@@ -343,6 +378,16 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool, list[str]]:
         if kind == "word" and tok in (b"obj", b"endobj") and opens:
             unbalanced = True
             opens.clear()
+        if one_object and kind == "word" and tok in (b"obj", b"endobj"):
+            if tok == b"obj" and not seen_obj:
+                seen_obj = True
+            else:
+                if tok == b"endobj":
+                    out += tok + b" "
+                else:
+                    pos = m.start()
+                finished = True
+                break
         if kind == "word" and tok == b"stream":
             if opens:
                 unbalanced = True
@@ -362,6 +407,8 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool, list[str]]:
             )
             streams.append(_Stream(dictionary, pos, n if close < 0 else close, ended_by))
             if close >= 0:
+                if skipped is not None:
+                    skipped.append((pos, close))
                 pos = close
             else:
                 # The body is tokenized as structure, which is more scrutiny
@@ -370,6 +417,8 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool, list[str]]:
                 # in the real structure later closes, blanking what lies
                 # between. Where the body ends is unknown, so the file is.
                 body_ran_on = True
+                if one_object:
+                    break
             continue
         if kind == "word":
             tok = _canonical_word(tok)
@@ -386,7 +435,12 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool, list[str]]:
         )
         if ran_on
     ]
-    return bytes(out), streams, unbalanced, unterminated
+    if one_object and not finished and not unterminated:
+        unterminated.append(
+            "an object with no endobj" if n >= len(data)
+            else "more objects than the inspection budget covers"
+        )
+    return bytes(out), streams, unbalanced, unterminated, pos
 
 
 _INT = re.compile(rb"\d+")     # a canonical non-negative integer token
@@ -560,6 +614,128 @@ def _body_end(
     return first, "search"
 
 
+# The keyword that ends an object header, as a whole word after whitespace:
+# a header is `N G obj`, and whatever separates G from `obj` (spaces, or a
+# comment, which runs to an EOL) ends in a whitespace byte.
+_OBJ_WORD = re.compile(rb"(?<=[\x00\t\n\x0c\r ])obj(?!" + _REGULAR + rb")")
+_EOL = b"\r\n"
+
+
+def _after_integer(data: bytes, at: int, budget: list[int]) -> bool:
+    """Whether an integer precedes offset `at` across PDF whitespace and
+    comments, which is what a header's generation number does before `obj`.
+
+    Walked backwards, because the pattern a regex would run forwards from
+    every digit is quadratic in a line of `1 %1 %1 %...` (each start scans the
+    comment to its EOL). Liberal where it cannot be exact: any `%` in a line
+    preceded by an integer counts, and only the generation number is asked
+    for. A false yes costs a scan of something that is not an object; a false
+    no would leave an object a reader parses unread. Each byte walked is taken
+    from `budget`, which the caller bounds.
+    """
+    i, crossed_eol = at, False
+    while True:
+        while i > 0 and data[i - 1] in _WS:
+            i -= 1
+            crossed_eol = crossed_eol or data[i] in _EOL
+            budget[0] -= 1
+        if i > 0 and 0x30 <= data[i - 1] <= 0x39:
+            return True
+        # Otherwise only a comment can lie between here and `obj`, and a
+        # comment ends at an EOL.
+        if not crossed_eol:
+            return False
+        # Out of budget, the answer is unknown, and unknown is a yes: the
+        # caller then finds a header with no budget left and fails closed.
+        # A no here would skip every later header the walk could not afford.
+        if budget[0] <= 0:
+            return True
+        # Walked, not rfind: an rfind for whichever EOL the file does not use
+        # searches back to its start, once per line, which was quadratic.
+        start = i
+        while start > 0 and data[start - 1] not in _EOL:
+            start -= 1
+        line = data[start:i]
+        budget[0] -= len(line) + 1
+        cuts = [k for k in range(len(line)) if line[k] == 0x25]     # `%`
+        if not cuts:
+            return False
+        for k in cuts:
+            j = start + k
+            while j > start and data[j - 1] in _WS:
+                j -= 1
+            if j > start and 0x30 <= data[j - 1] <= 0x39:
+                return True
+        # A comment from the start of the line (whitespace before it at most)
+        # may continue a gap that began on an earlier line.
+        if line[: cuts[0]].strip(_WS):
+            return False
+        i, crossed_eol = start, False
+
+
+def _hidden_objects(
+    data: bytes,
+    skipped: list[tuple[int, int]],
+    lengths: dict[tuple[bytes, bytes], int],
+    last_endstream: int,
+) -> tuple[list[bytes], list[_Stream], bool, list[str], int]:
+    """Objects a reader can parse that the front-to-back parse dropped as data.
+
+    Codex, PR #15, twice: a catalog with an /OpenAction written inside a
+    balanced literal string, and one inside another stream's direct-/Length
+    body. The parse skips both as data, but the xref names the catalog's
+    offset and a reader seeks there and parses it. A reader with a broken xref
+    does the same by scanning the whole file for `N G obj` (pdf.js does).
+    Either way the reader's object begins with a header, so every header whose
+    `obj` falls inside bytes the parse skipped — a string, a comment, a stream
+    body — is parsed on its own, from that `obj` to its `endobj`, and what it
+    shows is structure. A header elsewhere needs nothing: from its `obj` on, a
+    reader reads exactly the tokens the parse already did. This covers both
+    readers without walking the xref, which would mean xref streams, hybrid
+    files and incremental updates, and still leave the recovery scan.
+
+    One that does not end cleanly (an unclosed string, no `endobj`, an
+    unmatched `<<`) is reported, and the caller fails closed, as it does for
+    the same faults in the file proper.
+
+    A header in a skipped region is not suspect by itself: a string may quote
+    one. Only its contents decide. The cost is bounded: each object is parsed
+    once and stops at the next `obj`, and the bytes parsed and walked together
+    may not exceed twice the file; past that the file is unknown.
+
+    Returns the objects' structure, their streams, whether any nested badly,
+    what did not end, and how many were found.
+    """
+    starts = [a for a, _ in skipped]
+    budget = [2 * len(data) + (1 << 16)]
+    structures: list[bytes] = []
+    streams: list[_Stream] = []
+    unbalanced = False
+    problems: list[str] = []
+    found = 0
+    for m in _OBJ_WORD.finditer(data):
+        at = m.start()
+        k = bisect.bisect_right(starts, at) - 1
+        if k < 0 or at >= skipped[k][1]:
+            continue
+        if not _after_integer(data, at, budget):
+            continue
+        found += 1
+        if budget[0] <= 0:
+            problems.append("more objects than the inspection budget covers")
+            break
+        structure, inner, bad, unterminated, stop = _parse(
+            data, at, min(len(data), at + budget[0]),
+            lengths=lengths, last_endstream=last_endstream, one_object=True,
+        )
+        budget[0] -= max(stop - at, 1)
+        structures.append(structure)
+        streams += inner
+        unbalanced = unbalanced or bad
+        problems += unterminated
+    return structures, streams, unbalanced, problems, found
+
+
 def _names_in(structure: bytes) -> set[str]:
     return {_unescape(m.group(1)) for m in _NAME.finditer(structure)}
 
@@ -578,7 +754,7 @@ def _scan(data: bytes, where: str) -> tuple[dict[str, Finding], list[str]]:
     would blank everything up to the next `endstream` while a reader still
     parses the objects whose offsets fall inside.
     """
-    structure, streams, _, unterminated = _parse(data)
+    structure, streams, _, unterminated, _ = _parse(data)
     problems = [f"{what} in an object stream" for what in unterminated]
     if streams:
         problems.append("a stream keyword in an object stream")
@@ -612,6 +788,25 @@ def _filters(value: list[bytes] | None) -> list[str] | None:
     return [_unescape(t[1:]) for t in value]
 
 
+def _no_parameters(value: list[bytes] | None, filters: int) -> bool:
+    """Whether a /DecodeParms value gives no filter any parameters.
+
+    Absent or null, or an array of nulls with one entry per filter: ISO
+    32000-1, 7.3.8.2, has the array parallel the /Filter array, with null for a
+    filter that takes none, so `/Filter [/FlateDecode] /DecodeParms [null]` is
+    a plain inflate. Codex, PR #15: only a scalar null was accepted, and a
+    benign object stream written that way was held as undecodable. An array of
+    any other length is not one the spec allows, so it is still refused.
+    """
+    if value is None or value == [b"null"]:
+        return True
+    return (
+        value[0] == b"[" and value[-1] == b"]"
+        and len(value) - 2 == filters
+        and all(t == b"null" for t in value[1:-1])
+    )
+
+
 def _unreadable(st: _Stream) -> tuple[str | None, list[str]]:
     """Why this object stream cannot be decoded faithfully here, or None; and
     its filter chain.
@@ -622,8 +817,9 @@ def _unreadable(st: _Stream) -> tuple[str | None, list[str]]:
     - an indirect /Filter or /DecodeParms (`9 0 R`), whose value lives in
       another object this check does not resolve, or a /Filter or /Length
       that is not a value of the kind the spec allows;
-    - any /DecodeParms, such as a PNG or TIFF predictor, which zlib does not
-      undo, so a stream would inflate cleanly into still-encoded bytes;
+    - any /DecodeParms that gives parameters (_no_parameters), such as a PNG
+      or TIFF predictor, which zlib does not undo, so a stream would inflate
+      cleanly into still-encoded bytes;
     - /F, which puts the stream's data in an external file and makes the
       body something no reader reads;
     - a body larger than the inspection limit, which would be read as its
@@ -662,7 +858,7 @@ def _unreadable(st: _Stream) -> tuple[str | None, list[str]]:
     ):
         return "a /Length that is not an integer or a reference", filters
     for key in ("DecodeParms", "DP"):
-        if entries.get(key, [b"null"]) != [b"null"]:
+        if not _no_parameters(entries.get(key), len(filters)):
             return "/DecodeParms", filters
     if "F" in entries:
         return "an external file (/F)", filters
@@ -822,7 +1018,23 @@ def inspect_bytes(data: bytes) -> Inspection:
             reason="no %PDF- header; the file is not what its name claims",
         )
 
-    structure, streams, unbalanced, unterminated = _parse(data)
+    lengths = _length_objects(data)
+    last_endstream = data.rfind(_ENDSTREAM)
+    skipped: list[tuple[int, int]] = []
+    structure, streams, unbalanced, unterminated, _ = _parse(
+        data, lengths=lengths, last_endstream=last_endstream, skipped=skipped
+    )
+    hidden, hidden_streams, hidden_unbalanced, hidden_problems, hidden_count = _hidden_objects(
+        data, skipped, lengths, last_endstream
+    )
+    structure = b" ".join([structure, *hidden])
+    known = {st.start for st in streams}
+    streams += [st for st in hidden_streams if st.start not in known]
+    unbalanced = unbalanced or hidden_unbalanced
+    unterminated += [
+        f"{what}, in an object found inside a string, comment or stream body"
+        for what in hidden_problems
+    ]
     found = _findings(structure, "raw")
     decoded, undecodable, count = _object_streams(data, streams)
     for chunk, declared in decoded:

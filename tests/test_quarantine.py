@@ -330,6 +330,34 @@ def test_an_object_stream_with_decode_parms_is_unknown(tmp_path):
     assert r.state == "cannot_inspect" and "DecodeParms" in r.reason
 
 
+def test_decode_parms_of_only_nulls_gives_no_parameters(tmp_path):
+    """Codex, PR #15: `/DecodeParms [null]` beside `/Filter [/FlateDecode]` is
+    the spec's way of saying the one filter takes no parameters, but only a
+    scalar null was accepted and a benign file was held. An array of nulls,
+    one per filter, is read; any other array is still unknown."""
+    import base64
+
+    benign = b"1 0 <</Type/Catalog>>"
+    for extra, body in (
+        (b"/Filter[/FlateDecode]/DecodeParms[null]", zlib.compress(benign)),
+        (b"/Filter/FlateDecode/DP[ null ]", zlib.compress(benign)),
+        (b"/Filter[/A85/Fl]/DecodeParms[null null]", base64.a85encode(zlib.compress(benign)) + b"~>"),
+    ):
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", _objstm(extra, body)))
+        assert r.state == "inspected" and r.is_inert, (extra, r.reason)
+    # Read, so what is inside is seen.
+    data = _objstm(b"/Filter[/FlateDecode]/DecodeParms[null]", zlib.compress(_HIDDEN))
+    assert {"OpenAction", "JS"} <= {f.name for f in pdf_inspect.inspect(_write(tmp_path, "b.pdf", data)).active}
+    for extra in (
+        b"/Filter[/FlateDecode]/DecodeParms[null null]",          # one too many
+        b"/Filter[/FlateDecode]/DecodeParms[]",                   # one too few
+        b"/Filter[/FlateDecode]/DecodeParms[<</Predictor 2>>]",   # parameters
+        b"/Filter[/FlateDecode]/DecodeParms[/null]",              # a name, not null
+    ):
+        r = pdf_inspect.inspect(_write(tmp_path, "c.pdf", _objstm(extra, zlib.compress(benign))))
+        assert r.state == "cannot_inspect" and "DecodeParms" in r.reason, extra
+
+
 def test_an_indirect_filter_is_unknown_not_unfiltered(tmp_path):
     """Codex, PR #15: `/Filter 9 0 R` read as no filter at all, so an ASCII85
     object stream was scanned as raw bytes and its action missed."""
@@ -688,6 +716,82 @@ def test_a_dictionary_still_open_at_eof_is_unbalanced(tmp_path):
     data = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n" + _TAIL + b"<</Junk 1\n"
     r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
     assert r.state == "cannot_inspect" and not r.is_inert
+
+
+def _xref_to(data: bytes, target: bytes) -> bytes:
+    """`data` with an xref table naming `target`'s offset as object 1, the
+    catalog: where a reader that trusts the xref goes to parse it."""
+    xref = b"xref\n0 2\n0000000000 65535 f \n%010d 00000 n \n" % data.index(target)
+    return data + xref + b"trailer<</Size 2/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % len(data)
+
+
+def test_a_catalog_inside_a_string_or_comment_is_still_read(tmp_path):
+    """Codex, PR #15: a balanced string can enclose a whole catalog. The parse
+    skipped the string as data, but the xref names the catalog's offset, so a
+    reader seeks into the string and parses its /OpenAction; a reader with a
+    broken xref finds the header by scanning the file. A comment is the same."""
+    for wrap in (
+        b"4 0 obj(" + _CATALOG.rstrip() + b")endobj\n",
+        b"%" + _CATALOG,
+    ):
+        data = _xref_to(b"%PDF-1.4\n" + wrap, b"1 0 obj")
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, wrap
+
+
+def test_a_catalog_inside_another_streams_body_is_still_read(tmp_path):
+    """Codex, PR #15: the same inside a stream whose direct /Length spans the
+    catalog. The parse trusts the span and blanks it; the xref does not care.
+    An object stream hidden the same way is decoded like any other."""
+    packed = zlib.compress(_HIDDEN)
+    for hidden in (
+        _CATALOG,
+        b"5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length %d>>stream\n" % len(packed)
+        + packed + b"\nendstream endobj\n",
+    ):
+        data = _xref_to(
+            b"%%PDF-1.4\n4 0 obj<</Length %d>>stream\n" % len(hidden) + hidden + b"\nendstream endobj\n",
+            hidden[:7],
+        )
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert {"OpenAction", "JS"} <= {f.name for f in r.active}, hidden[:20]
+
+
+def test_an_object_hidden_in_data_that_does_not_end_is_unknown(tmp_path):
+    """A header inside a string whose object never reaches `endobj` cleanly
+    is what a reader may parse and this cannot read: unknown, not clean."""
+    for wrap in (
+        b"4 0 obj(1 0 obj<</Type/Catalog/Note\\(>>)endobj\n",   # a string that runs on
+        b"4 0 obj(1 0 obj<</Type/Catalog)endobj\n",              # a `<<` never closed
+    ):
+        data = b"%PDF-1.4\n" + wrap + _TAIL
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect", wrap
+
+
+def test_a_header_a_comment_swallowed_is_read_and_stays_benign(tmp_path):
+    """The one place the 77-PDF corpus has a header inside skipped bytes: an
+    incremental update appended with no newline after `%%EOF`, so a comment
+    holds the catalog's `1 0 obj`. It is read like any object, and a benign
+    catalog stays inspected."""
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n" + _TAIL.rstrip(b"\n")
+        + b"1 0 obj\r<</Type/Catalog/Lang(zh)/MarkInfo<</Marked true>>>>\rendobj\r" + _TAIL
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "inspected" and r.is_inert, (r.reason, [f.name for f in r.findings])
+
+
+def test_many_headers_inside_one_string_cost_little(tmp_path):
+    """Each hidden object is parsed once and stops at the next `obj`, so a
+    string of a hundred thousand headers is linear work, not quadratic."""
+    import time
+
+    data = b"%PDF-1.4\n4 0 obj(" + b"1 0 obj " * 100_000 + b"1 0 obj<</A 1>>endobj)endobj\n" + _TAIL
+    t = time.monotonic()
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert time.monotonic() - t < 20
+    assert r.state == "inspected" and r.is_inert, r.reason
 
 
 def test_a_comment_is_whitespace_in_an_indirect_length(tmp_path):
