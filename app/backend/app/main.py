@@ -1743,7 +1743,13 @@ def _git_credentials(session: Session, master_key: bytes, user: User, remote: st
     """
     from . import gitstore
 
-    row = gitstore.for_remote(session, user, remote)
+    try:
+        row = gitstore.for_remote(session, user, remote)
+    except gitstore.GitStoreError as exc:
+        # Two legacy rows for one host: refused rather than guessed. Raised as
+        # the ProjectError clone, pull and push already turn into a 400, so the
+        # user reads which credentials collide instead of a 500.
+        raise ProjectError(str(exc)) from exc
     if row is None:
         yield None
         return

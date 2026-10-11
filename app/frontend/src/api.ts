@@ -445,6 +445,9 @@ export type GitEndpointMeta = {
   method: string;
   username: string | null;
   updated_at: string;
+  /** Other rows matching the same host — only a pre-upgrade database has any,
+   *  and clone, pull and push refuse to choose until one is removed. */
+  conflicts_with?: string[];
 };
 
 export type GitEndpoints = {

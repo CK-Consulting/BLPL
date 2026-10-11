@@ -377,7 +377,7 @@ export function ProjectSettings({
  * on `main` is not knowing whose `main`, and a push control whose destination
  * is invisible is one someone will eventually fire at the wrong repository.
  */
-function ProjectGitPanel({
+export function ProjectGitPanel({
   projectId,
   onRemoteChanged,
 }: {
@@ -390,12 +390,18 @@ function ProjectGitPanel({
   // sat at "Reading repository status…" forever and said nothing about why.
   const [error, setError] = useState<string | null>(null);
 
+  const load = () =>
+    getJSON<GitStatus>(`/api/projects/${projectId}/git/status`)
+      .then((s) => {
+        setSt(s);
+        setError(null);
+      })
+      .catch((e: Error) => setError(e.message || "could not read the repository"));
+
   useEffect(() => {
     setSt(null);
     setError(null);
-    getJSON<GitStatus>(`/api/projects/${projectId}/git/status`)
-      .then(setSt)
-      .catch((e: Error) => setError(e.message || "could not read the repository"));
+    load();
   }, [projectId]);
 
   return (
@@ -434,7 +440,13 @@ function ProjectGitPanel({
           projectId={projectId}
           hasRemote={st.has_remote}
           onSet={(remote_name, remote_url) => {
+            // Shown at once, then re-read whole: patching only the name and
+            // URL left the old remote_problem on screen after Change remote
+            // had fixed a split or hand-edited origin, and every other field
+            // the server derives from the remote went stale with it (Codex,
+            // PR #10).
             setSt({ ...st, has_remote: true, remote_name, remote_url });
+            load();
             onRemoteChanged?.();
           }}
         />

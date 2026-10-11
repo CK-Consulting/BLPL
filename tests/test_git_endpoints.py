@@ -357,6 +357,59 @@ def test_a_bracketed_row_from_before_the_fix_is_still_found(store) -> None:
                      method="https_token", secret="ghp_new", username="me")
 
 
+def _legacy_row(store, name: str, host: str, secret: str) -> None:
+    from app import vault
+    from app.models import GitEndpoint
+
+    nonce, ct = vault.encrypt_secret(b"7" * 32, f"git-endpoint:{name}", secret)
+    store.add(GitEndpoint(user_id=1, name=name, host=host, method="https_token",
+                          username="me", nonce=nonce, ciphertext=ct))
+    store.flush()
+
+
+def test_two_legacy_rows_for_one_host_are_refused_not_guessed(store) -> None:
+    """Codex P2 on #10: a pre-upgrade database can hold `[2001:db8::1]` and
+    `2001:db8::1` as two rows; both match once normalised, and taking the first
+    pushed under whichever account sorted first. Now nothing is chosen, the
+    refusal names both, and the listing flags the pair until one is removed."""
+    _legacy_row(store, "alice", "[2001:db8::1]", "ghp_alice")
+    _legacy_row(store, "bob", "2001:db8::1", "ghp_bob")
+
+    with pytest.raises(gitstore.GitStoreError) as exc:
+        gitstore.for_remote(store, _User(), "https://[2001:db8::1]/repo")
+    msg = str(exc.value)
+    assert "two saved credentials match host 2001:db8::1" in msg
+    assert "'alice'" in msg and "'bob'" in msg and "Git endpoints" in msg
+    assert "ghp_" not in msg
+
+    listing = {e["name"]: e["conflicts_with"] for e in gitstore.list_endpoints(store, _User())}
+    assert listing == {"alice": ["bob"], "bob": ["alice"]}
+
+    # Neither row can be rewritten into a third spelling while the other stands.
+    with pytest.raises(gitstore.GitStoreError):
+        gitstore.put(store, b"7" * 32, _User(), name="alice", host="2001:db8::1",
+                     method="https_token", secret="ghp_new", username="me")
+
+    assert gitstore.delete(store, _User(), "alice")
+    store.flush()
+    row = gitstore.for_remote(store, _User(), "https://[2001:db8::1]/repo")
+    assert row is not None and row.name == "bob"
+    assert gitstore.list_endpoints(store, _User())[0]["conflicts_with"] == []
+
+
+def test_a_credential_collision_reaches_git_operations_as_a_project_error(store) -> None:
+    """Clone, pull and push turn ProjectError into a 400; a collision must take
+    that route rather than surface as a 500."""
+    from app.main import _git_credentials
+    from app.projects import ProjectError
+
+    _legacy_row(store, "alice", "[2001:db8::1]", "ghp_alice")
+    _legacy_row(store, "bob", "2001:db8::1", "ghp_bob")
+    with pytest.raises(ProjectError, match="two saved credentials"):
+        with _git_credentials(store, b"7" * 32, _User(), "https://[2001:db8::1]/repo"):
+            pass
+
+
 def test_a_host_with_spaces_is_refused_without_echoing_it(store) -> None:
     """A token pasted where the host goes, missing the @ that would have
     caught it, used to come back quoted in the refusal."""

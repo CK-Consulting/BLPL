@@ -185,14 +185,24 @@ def put(
 
 
 def list_endpoints(session: Session, user: User) -> list[dict]:
-    """What the settings screen may see: everything except the secret."""
-    rows = session.scalars(
+    """What the settings screen may see: everything except the secret.
+
+    ``conflicts_with`` names the other rows matching the same host once
+    normalised. Only a pre-upgrade database can have any, and for_remote
+    refuses to choose between them — so the listing is where the user learns
+    which pair it is and removes one (Codex, PR #10).
+    """
+    rows = list(session.scalars(
         select(GitEndpoint).where(GitEndpoint.user_id == user.id).order_by(GitEndpoint.name)
-    )
+    ))
     return [
         {
             "name": r.name, "host": r.host, "method": r.method, "username": r.username,
             "updated_at": r.updated_at.isoformat() if r.updated_at else "",
+            "conflicts_with": [
+                o.name for o in rows
+                if o is not r and _bare_host(o.host or "") == _bare_host(r.host or "")
+            ],
         }
         for r in rows
     ]
@@ -218,7 +228,20 @@ def for_remote(session: Session, user: User, remote: str) -> GitEndpoint | None:
     host = host_of(remote)
     if host is None:
         return None
-    return next(iter(_rows_for_host(session, user, host)), None)
+    rows = _rows_for_host(session, user, host)
+    if len(rows) > 1:
+        # put refuses a second row for a host, but a database from before hosts
+        # were stored bare can hold `[2001:db8::1]` and `2001:db8::1` side by
+        # side, and both match once normalised. Taking the first would pick an
+        # identity by alphabetical accident and push under whichever account
+        # that was (Codex, PR #10). Refused, naming both, so the user can remove
+        # the wrong one; the endpoints listing flags the pair as well.
+        names = " and ".join(repr(r.name) for r in rows)
+        raise GitStoreError(
+            f"two saved credentials match host {host} ({names}) — remove one in "
+            "Account & app settings → Git endpoints/accounts"
+        )
+    return rows[0] if rows else None
 
 
 def _rows_for_host(session: Session, user: User, host: str) -> list[GitEndpoint]:

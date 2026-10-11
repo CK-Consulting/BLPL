@@ -905,7 +905,17 @@ function GitEndpoints({ onError }: { onError: (m: string) => void }) {
             {data.endpoints.map((e) => (
               <tr key={e.name}>
                 <td>{e.name}</td>
-                <td>{e.host}</td>
+                <td>
+                  {e.host}
+                  {/* Two legacy spellings of one host: clone, pull and push
+                      refuse to pick one, so say which pair it is here. */}
+                  {e.conflicts_with && e.conflicts_with.length > 0 && (
+                    <p className="gate-error small">
+                      Same host as {e.conflicts_with.join(", ")} — remove one; clone, pull and
+                      push refuse to choose between them.
+                    </p>
+                  )}
+                </td>
                 <td>{e.method === "ssh_key" ? "SSH key" : "HTTPS token"}</td>
                 <td>{e.username ?? "—"}</td>
                 <td>
