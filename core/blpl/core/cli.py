@@ -53,8 +53,9 @@ _STAGE_ORDER = [
 ]
 
 
-# Three levels up from blpl/core/cli.py lands us at board-layer-pipe-line/,
-# where the kicad-symbols/kicad-footprints submodules live (real submodules).
+# Three levels up from blpl/core/cli.py lands us at the pipeline's checkout root
+# (core/ in the umbrella repository), where the kicad-symbols/kicad-footprints
+# submodules live (real submodules). In the backend image it is /app.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_SYMBOLS = _REPO_ROOT / "kicad-symbols"
 _DEFAULT_FOOTPRINTS = _REPO_ROOT / "kicad-footprints"
@@ -271,7 +272,42 @@ _DEFAULT_KICAD_PYTHON_CANDIDATES = (
     "/opt/kicad/bin/python3",
 )
 
-_PLUGIN_PACKAGE_NAME = "blpl.plugin_kicad"
+_PLUGIN_PACKAGE_NAME = "blpl_kicad_plugin"
+
+
+def _resolve_plugin_dir() -> Path | None:
+    """The directory to put on KiCad's PYTHONPATH so the plugin package imports.
+
+    The plugin is its own distribution now (plugin/ in the umbrella checkout,
+    "blpl-kicad-plugin" once split), not a subpackage of blpl. It runs under
+    KiCad's bundled Python, which cannot see our venv, so what is needed is the
+    directory *containing* the package, not an import of it.
+
+    Resolution order: BLPL_KICAD_PLUGIN_DIR > wherever the package is installed
+    in this interpreter (an editable install of plugin/ resolves to plugin/) >
+    plugin/ beside this checkout in the umbrella layout. ``find_spec`` locates
+    the package without importing it — importing would run its pcbnew probe.
+    Returns ``None`` when none of those has the package. A variable that names
+    the wrong place is not quietly overridden by a guess: it returns ``None``.
+    """
+    env = os.environ.get("BLPL_KICAD_PLUGIN_DIR")
+    if env:
+        p = Path(env).expanduser()
+        return p if (p / _PLUGIN_PACKAGE_NAME / "build_pcb.py").is_file() else None
+    candidates: list[Path] = []
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec(_PLUGIN_PACKAGE_NAME)
+    except (ImportError, ValueError):
+        spec = None
+    if spec is not None and spec.origin:
+        candidates.append(Path(spec.origin).resolve().parent.parent)
+    candidates.append(_REPO_ROOT.parent / "plugin")
+    for c in candidates:
+        if (c / _PLUGIN_PACKAGE_NAME / "build_pcb.py").is_file():
+            return c
+    return None
 
 
 def _resolve_kicad_python(cli_value: str | None) -> Path | None:
@@ -332,9 +368,17 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     base = _re.sub(r"[^A-Za-z0-9._-]+", "_", stem.strip()) or "project"
     out_path = project_manifest.pipeline_dir(proj) / f"{base}_{stamp}.kicad_pcb"
 
-    # The plugin lives inside blpl/; PYTHONPATH needs the parent so
-    # `-m blpl.plugin_kicad.build_pcb` resolves under KiCad's Python.
-    blpl_parent = _REPO_ROOT
+    # The plugin is its own package; PYTHONPATH needs the directory holding it
+    # so `-m blpl_kicad_plugin.build_pcb` resolves under KiCad's Python.
+    plugin_dir = _resolve_plugin_dir()
+    if plugin_dir is None:
+        print(
+            f"error: the KiCad plugin package ({_PLUGIN_PACKAGE_NAME}) was not found. "
+            "Install it (pip install -e plugin/) or set BLPL_KICAD_PLUGIN_DIR to the "
+            f"directory that contains {_PLUGIN_PACKAGE_NAME}/.",
+            file=sys.stderr,
+        )
+        return 2
     footprints_root = args.footprints_root or str(_DEFAULT_FOOTPRINTS)
 
     # KiCad's bundled Python doesn't ship with pyyaml; pre-convert to JSON so
@@ -360,11 +404,11 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
         str(footprints_root),
     ]
     env = os.environ.copy()
-    # Prepend the repo root so `-m blpl.plugin_kicad.build_pcb` resolves. We
-    # intentionally don't touch KiCad's own site-packages — adding to
-    # PYTHONPATH composes.
+    # Prepend the plugin's directory so `-m blpl_kicad_plugin.build_pcb`
+    # resolves. We intentionally don't touch KiCad's own site-packages — adding
+    # to PYTHONPATH composes.
     existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{blpl_parent}{os.pathsep}{existing}" if existing else str(blpl_parent)
+    env["PYTHONPATH"] = f"{plugin_dir}{os.pathsep}{existing}" if existing else str(plugin_dir)
 
     print(f"stage6-plugin: using {kicad_python}", file=sys.stderr)
     result = subprocess.run(cmd, env=env)
@@ -374,8 +418,22 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_backend_dir() -> Path:
+    """Where the app backend's source root is, for ``blpl serve``.
+
+    The backend is not part of this distribution: it is the app's (app/backend
+    in the umbrella checkout, "blpl-app" once split). BLPL_APP_BACKEND names it
+    explicitly; otherwise it is looked for beside this checkout, as
+    ../app/backend. The caller checks that it is really there.
+    """
+    env = os.environ.get("BLPL_APP_BACKEND")
+    if env:
+        return Path(env).expanduser().resolve()
+    return _REPO_ROOT.parent / "app" / "backend"
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
-    """Launch the FastAPI backend locally. Requires the 'webapp' extras.
+    """Launch the FastAPI backend locally. Requires the app's requirements.
 
     This runs *the same* backend the container runs (app/backend), not a second
     one. There used to be two: blpl/webapp served the built React bundle against
@@ -391,16 +449,20 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         import uvicorn  # type: ignore[import-not-found]
     except ImportError:
         print(
-            "error: uvicorn not installed. Install the webapp extras with: "
-            "uv pip install -e '.[webapp]'",
+            "error: uvicorn not installed. Install the app backend's requirements "
+            "with: pip install -r app/backend/requirements.txt",
             file=sys.stderr,
         )
         return 2
 
-    repo_root = Path(__file__).resolve().parents[2]
-    backend_dir = repo_root / "app" / "backend"
+    repo_root = _REPO_ROOT
+    backend_dir = _resolve_backend_dir()
     if not (backend_dir / "app" / "main.py").is_file():
-        print(f"error: backend not found at {backend_dir}", file=sys.stderr)
+        print(
+            f"error: backend not found at {backend_dir} — set BLPL_APP_BACKEND to the "
+            "app's backend directory (the one containing app/main.py)",
+            file=sys.stderr,
+        )
         return 2
 
     data_root = Path(
@@ -1654,7 +1716,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser(
         "serve",
-        help="Launch the BLPL FastAPI backend on localhost (requires webapp extras).",
+        help="Launch the BLPL FastAPI backend on localhost (requires the app backend and its requirements).",
     )
     p.add_argument(
         "--workspace",
