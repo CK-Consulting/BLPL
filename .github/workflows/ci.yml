@@ -1,8 +1,11 @@
 name: CI
 
-# Every pull request and every push to main runs the Python suite (pipeline
-# and API) and the frontend's tests and build. Read-only: nothing here needs to
-# write, and a pull request from a fork must not be able to.
+# Every pull request and every push to main runs each project's suite from its
+# own folder: the pipeline (core/), the KiCad plugin (plugin/), and the app's
+# backend and frontend (app/). They are separate projects that will become
+# separate repositories (docs/repo-split.md), so each job installs only what its
+# project declares. Read-only: nothing here needs to write, and a pull request
+# from a fork must not be able to.
 
 on:
   pull_request:
@@ -17,14 +20,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  python:
-    name: Python ${{ matrix.python }}
+  core:
+    name: core (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # The lowest supported version and a current one: workspace cleanup,
-        # for one, takes a different code path below 3.12.
+        # The lowest supported version and a current one.
         python: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +38,7 @@ jobs:
       # footprints, and stage 7's KLC check lives in kicad-library-utils. The
       # other submodules are large and not needed here.
       - name: Stock KiCad libraries
-        run: git submodule update --init --depth 1 -- kicad-symbols kicad-footprints kicad-library-utils
+        run: git submodule update --init --depth 1 -- core/kicad-symbols core/kicad-footprints core/kicad-library-utils
 
       - uses: actions/setup-python@v5
         with:
@@ -46,10 +48,73 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]' -r app/backend/requirements.txt
+          python -m pip install -e './core[dev]'
 
       - name: Test
-        run: python -m pytest tests/ -q
+        working-directory: core
+        run: python -m pytest -q
+
+  plugin:
+    name: plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e './plugin[dev]'
+
+      # Unit tests run against a fake pcbnew; the KiCad integration test skips
+      # without KiCad's Python, as it does here.
+      - name: Test
+        working-directory: plugin
+        run: python -m pytest -q
+
+  app-backend:
+    name: app backend (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Workspace cleanup, for one, takes a different code path below 3.12.
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          persist-credentials: false
+
+      # The backend runs the pipeline, and some of its tests reach the stock
+      # libraries through it (footprint suggestions, library lookups).
+      - name: Stock KiCad libraries
+        run: git submodule update --init --depth 1 -- core/kicad-symbols core/kicad-footprints
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      # The pipeline is installed from core/ the way the backend image installs
+      # it; once the repositories are split this becomes a pinned git or package
+      # dependency instead of a path.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./core \
+            -r app/backend/requirements.txt -r app/backend/requirements-dev.txt
+
+      - name: Test
+        working-directory: app/backend
+        run: python -m pytest tests -q
 
   frontend:
     runs-on: ubuntu-latest

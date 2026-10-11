@@ -16,8 +16,8 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - kicad-ai-assistant
-      - tests/kcaa_contract_check.py
+      - app/kicad-ai-assistant
+      - app/backend/tests/kcaa_contract_check.py
       - .gitmodules
       - .github/workflows/kcaa-upstream-check.yml
 
@@ -28,7 +28,7 @@ permissions:
   contents: read
 
 env:
-  SUBMODULE_PATH: kicad-ai-assistant
+  SUBMODULE_PATH: app/kicad-ai-assistant
 
 jobs:
   check:
@@ -68,7 +68,7 @@ jobs:
       # kcaa's own CI tests on 3.13 with node/jsdom available; mirror that.
       - name: Set up Python 3.13
         if: steps.advance.outputs.changed == 'true'
-        working-directory: kicad-ai-assistant
+        working-directory: app/kicad-ai-assistant
         run: |
           uv python install 3.13
           uv python pin 3.13
@@ -81,7 +81,7 @@ jobs:
 
       - name: Install kcaa deps
         if: steps.advance.outputs.changed == 'true'
-        working-directory: kicad-ai-assistant
+        working-directory: app/kicad-ai-assistant
         run: |
           uv sync --group dev
           npm install jsdom
@@ -89,7 +89,7 @@ jobs:
       - name: Run kcaa test suite
         id: kcaa_tests
         if: steps.advance.outputs.changed == 'true'
-        working-directory: kicad-ai-assistant
+        working-directory: app/kicad-ai-assistant
         env:
           KICAD_VERSION: "10"
         run: uv run python -m pytest tests/ --tb=short -o "addopts="
@@ -97,10 +97,10 @@ jobs:
       - name: Run BLPL contract check
         id: contract
         if: steps.advance.outputs.changed == 'true'
-        working-directory: kicad-ai-assistant
+        working-directory: app/kicad-ai-assistant
         env:
           KICAD_VERSION: "10"
-        run: uv run python ../tests/kcaa_contract_check.py
+        run: uv run python ../backend/tests/kcaa_contract_check.py
 
       # No pull request is opened from here, deliberately. Creating one needs
       # "Allow GitHub Actions to create and approve pull requests", and that same
@@ -170,7 +170,7 @@ jobs:
             gh issue create \
               --title "kicad-ai-assistant upstream update breaks checks" \
               --label kcaa-upstream \
-              --body "The weekly upstream check failed — either kcaa's test suite or BLPL's contract check (\`tests/kcaa_contract_check.py\`) broke against the fork's latest main. See $run_url. The submodule pointer was NOT bumped."
+              --body "The weekly upstream check failed — either kcaa's test suite or BLPL's contract check (\`app/backend/tests/kcaa_contract_check.py\`) broke against the fork's latest main. See $run_url. The submodule pointer was NOT bumped."
           fi
 
   # Pull requests that touch the submodule or the contract check: the same tests
@@ -194,7 +194,7 @@ jobs:
           enable-cache: true
 
       - name: Set up Python 3.13
-        working-directory: kicad-ai-assistant
+        working-directory: app/kicad-ai-assistant
         run: |
           uv python install 3.13
           uv python pin 3.13
@@ -204,19 +204,19 @@ jobs:
           node-version: "20"
 
       - name: Install kcaa deps
-        working-directory: kicad-ai-assistant
+        working-directory: app/kicad-ai-assistant
         run: |
           uv sync --group dev
           npm install jsdom
 
       - name: Run kcaa test suite
-        working-directory: kicad-ai-assistant
+        working-directory: app/kicad-ai-assistant
         env:
           KICAD_VERSION: "10"
         run: uv run python -m pytest tests/ --tb=short -o "addopts="
 
       - name: Run BLPL contract check
-        working-directory: kicad-ai-assistant
+        working-directory: app/kicad-ai-assistant
         env:
           KICAD_VERSION: "10"
-        run: uv run python ../tests/kcaa_contract_check.py
+        run: uv run python ../backend/tests/kcaa_contract_check.py
