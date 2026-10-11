@@ -6,7 +6,8 @@
 
 <!-- Tests added or changed. For a bug fix: the test that fails without it. -->
 
-- [ ] `python -m pytest tests/ -q` passes
+- [ ] The suite of every project it touches passes: `cd core && python -m pytest -q`, `cd plugin && python -m pytest -q`, `cd app/backend && python -m pytest tests -q`
+- [ ] No commit touches more than one of `core/`, `plugin/` and `app/`
 - [ ] `cd app/frontend && npx vitest run && npm run build` passes (if the frontend changed)
 
 ## Checklist
