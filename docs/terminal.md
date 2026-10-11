@@ -249,6 +249,17 @@ need a person.
     process state, so the run path can see it under the same lock. A partial
     unique index on active sessions per (member, project) backs the
     one-session rule up in the database.
+  - **Reservations expire, and the table is reconciled with reality.** The row
+    is created in the POST transaction, so that no run can start between the
+    preflight and the socket opening. It starts `pending`, with the ticket's
+    expiry. A pending row past its expiry counts for nothing and is swept up.
+    It becomes `active` when the socket opens, and the terminal service
+    heartbeats each live PTY every 30 seconds. An active row without a
+    heartbeat for two minutes is dead: the browser dropped, or either service
+    crashed. Both services reconcile on start: rows whose PTY the terminal
+    service does not report are closed. A crash therefore cannot leave a row
+    that blocks runs for ever, or a tab trying to attach to a PTY that no
+    longer exists.
 
   The Run button says why it is disabled, and the terminal tab offers to close
   the session. It is coarse, but it is correct. Remounting the checkout
@@ -259,6 +270,28 @@ need a person.
   commits them there. The shell cannot commit, by design (see "Git" above).
   Auto-committing on session end is possible, but it would sweep up scratch
   files.
+- **Other writers while a shell is open.** A shell is a writer that can work in
+  the background, so every other route that writes the member's worktree
+  respects it, under the same admission lock:
+  - **Git-panel commit** freezes the shell. The backend asks the terminal
+    service to `SIGSTOP` the session's process group, runs `git add -A` and
+    `git commit`, then sends `SIGCONT`. A stopped process group writes nothing,
+    so the commit cannot snapshot a half-written file. A shell job stopped for
+    the length of a commit loses nothing.
+  - **Editor saves and proposal accepts** run under the same freeze. They also
+    require the file to be unchanged since the editor or proposal read it. A
+    proposal already checks this; editor saves gain a base hash. Without that,
+    a browser buffer opened before the shell edited the file would silently
+    overwrite the shell's change.
+- **Revocation ends the session.** A ticket checks membership once, when the
+  socket opens, and a live shell would otherwise outlast its member's access.
+  Its bind mount keeps the checkout reachable even after `worktrees.remove`.
+  So removing a member, deleting a project or revoking an invitation first
+  terminates every session for that member and project: the socket is closed,
+  the sandbox's process group is killed, and the row is closed. Only then does
+  revocation complete. The once-a-minute touch also re-checks membership, as a
+  backstop for any path that changes access without going through those
+  routes.
 
 ### 4. nginx
 
@@ -386,6 +419,12 @@ documentation, and anything still on the left with no right-hand side is a bug.
    - A session request and a run request fired concurrently never both succeed.
    - The blob route serves a `released_active` PDF as an attachment, never
      inline.
+   - Removing a member kills their live shell before the removal returns.
+   - A Git-panel commit while a shell job is writing commits no partial file.
+   - A stale editor buffer cannot overwrite a shell's change.
+   - A POST whose socket never opens stops blocking runs once the ticket
+     expires, and a killed terminal service leaves no live-looking rows after
+     restart.
    - A planted hook does not run when the Git panel commits.
    - A session cannot open during a run, and a run cannot start while a
      session is open.
