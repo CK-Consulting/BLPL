@@ -509,3 +509,98 @@ the board — `core/core.md`, `sb-ble/sb-ble.md` — and every stage takes
 Edit the board's own document, in its own directory: `propose_file_edit`
 accepts any design document in the project, and an edit to a sub-board
 belongs in that sub-board's file, never in a root file describing it.
+
+## Creating a multi-board project, or splitting a single-board one
+
+This is a strict sequence. **Do every step in this order, and do not start a
+step until the user has accepted the proposal from the step before it.** A
+proposal writes nothing until it is accepted, and every check you run reads
+the files on disk. If you propose step 3 while step 1 is still pending, you are
+checking a project that does not exist yet, and the check will tell you so
+only by accident.
+
+Why the order matters: **`project.md` is the only thing that makes a project
+multi-board.** Board folders on their own do not. Without `project.md` the
+project is single-board, whatever folders it has. In that state:
+
+- Stage 0 reads only the root markdown, so every board folder is ignored.
+- `run_doctor` on `main/main.md` cannot check it. It now reports DOC-016. It
+  used to check the root and report it clean.
+- The app shows no board selector, no board panel and no configurations.
+- Stage 5 has no per-board outline, and the pipeline's artifacts have no board
+  in their names.
+
+A project was once left exactly like this. Its design was moved into `main/`
+and `power/`, every check passed, and nothing would have been built from those
+folders.
+
+**1. Agree the split with the user before writing anything.** Get these
+answers:
+
+- **Board names.** They become directory names and part of every artifact
+  name. Use letters, digits, `.`, `_` and `-`, and start with a letter or
+  digit. Use short lowercase names: `core`, `power`, `sb-lora`.
+- **Which board each part goes on.**
+- **Which connectors join the boards**, and whether a cable sits between them.
+- **Which boards are optional.**
+
+Read the existing root documents first, so the plan accounts for every BOM row
+and pinout table. Nothing should be left behind or put on two boards.
+
+**2. Propose `project.md` at the project root, by itself.**
+- It needs a `## Boards` section, one line per board:
+  `- core — the carrier`, `- sb-lora (optional) — the LoRa radio`.
+- Add `## Mates`, `## Cables` and `## Configurations` now if the connectors are
+  known. Otherwise add them in step 7.
+- Wait for acceptance. Then re-read `project.md` and confirm every board from
+  step 1 is listed under the exact name you will use for its directory. A typo
+  here is a board nothing will build.
+
+**3. Propose each board's design document, one board at a time:**
+`<board>/<board>.md`.
+- It carries that board's BOM, its pinout tables, and its own identity,
+  stackup and net-class tables. Boards do not share an outline or a stackup.
+- Before proposing, call `run_doctor` with the same `path` and `content`. It
+  must not report DOC-016. If it does, step 2 has not been accepted or the
+  name does not match.
+- Fix what doctor reports, propose, and wait for acceptance before starting the
+  next board.
+- The proposal creates the board's folder. You do not need to create it first.
+
+**4. Propose each board's `<board>/project.yaml`**, with its own dimensions,
+outline, stackup and net classes. This is what `blpl init --board <board>`
+writes.
+- The root `project.yaml` is only a fallback for boards without their own.
+- **Do not rewrite the root `project.yaml` to describe one board.** That
+  quietly gives every board without its own file that board's outline.
+
+**5. Only now, remove the moved tables from the root documents.**
+- Do it after every board's document from step 3 is accepted, never before.
+  Until then the root is the only place the design exists in the build.
+- The root keeps `project.md`, overview prose, block diagrams and reference
+  material.
+- Doctor warns (DOC-016) about BOM or pinout tables left at the root of a
+  multi-board project, because no board reads them.
+
+**6. Check the whole project.** Call `run_doctor` with no path. There must be
+no DOC-016. Then check each board's document (`path` set to it) and fix what
+it finds.
+
+**7. Declare how the boards meet.** Once each mating connector exists on both
+boards, add `## Mates`, plus `## Cables` for anything joined by a cable, to
+`project.md`. The cross-board check (`blpl crossboard`) lines those connectors
+up pin by pin. It cannot check a connection nobody declared.
+
+**8. Tell the user what changed for the pipeline.**
+- Runs are now per board (`--board core`, or `--board all`).
+- Artifacts are qualified by board (`bom.core.json`).
+- Any unqualified artifacts in `.pipeline/` from before the split describe the
+  old single board. They are stale and should not be read as current.
+
+Two rules that apply at every step:
+
+- `propose_file_edit` takes **the complete file text**. Never put diff markers
+  (`+`, `-`, `@@`) into `new_content`. The user sees a diff because the app
+  draws one. Markers in the content are written into the file verbatim.
+- If a step's proposal is rejected or fails, stop and resolve it with the
+  user. Do not carry on with later steps on the assumption that it will land.

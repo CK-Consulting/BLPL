@@ -619,6 +619,133 @@ def _check_symbols(
         )
 
 
+# Directories every project may hold that are never a board. Skipped when
+# looking for undeclared boards so a notes file under datasheets/ is not taken
+# for one.
+_NOT_BOARD_DIRS = frozenset(
+    {"datasheets", "libraries", "references", "retrieved", "modules", "diagrams", "docs"}
+)
+
+
+def _design_files(directory: Path) -> list[Path]:
+    """Markdown in ``directory`` holding a table Stage 0 consumes."""
+    found = []
+    for md in sorted(directory.glob("*.md")):
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if any(
+            _md.classify(t) in ("bom", "pinout") for t in _md.extract_tables(text, md.name)
+        ):
+            found.append(md)
+    return found
+
+
+def _check_board_layout(report: Report, project_dir: Path, board: str | None) -> bool:
+    """DOC-016: design documents Stage 0 will never read because no board owns
+    them. True when the board asked about is not buildable at all.
+
+    Whether a project is multi-board is decided by one file, ``project.md``,
+    and nothing else. Board directories with no manifest are a single-board
+    project with some folders in it: Stage 0 reads the root and nothing below
+    it. That is how verdacor-ear-tag came to have its whole design in main/ and
+    power/ while every check passed. The agent's pre-proposal doctor ran with
+    board="main", board_dir() answered "the root" for an implicit project, and
+    the root, emptied of its tables by the move, was reported clean.
+    """
+    from . import project_manifest
+
+    try:
+        man = project_manifest.discover(project_dir)
+    except project_manifest.ManifestError as exc:
+        report.findings.append(
+            Finding(
+                code="DOC-016",
+                severity="error",
+                summary=f"project.md cannot be used: {exc}.",
+                fix=(
+                    "project.md is what makes a project multi-board. Give it a "
+                    "'## Boards' section listing each board, one per line: '- core — the carrier'."
+                ),
+                file=project_manifest.MANIFEST_NAME,
+            )
+        )
+        return board is not None
+    declared = {b.name for b in man.boards}
+
+    if board is not None and (man.implicit or board not in declared):
+        why = (
+            "there is no project.md, so this is a single-board project and Stage 0 "
+            "reads only the project root"
+            if man.implicit
+            else "project.md's '## Boards' does not list it"
+        )
+        report.findings.append(
+            Finding(
+                code="DOC-016",
+                severity="error",
+                summary=f"'{board}' is not a board: {why}. Nothing in {board}/ will be built.",
+                fix=(
+                    f"Declare it first: add '- {board}' under '## Boards' in project.md at the "
+                    "project root (create project.md if it does not exist), then check again."
+                ),
+                file=project_manifest.MANIFEST_NAME,
+            )
+        )
+        return True
+
+    if board is not None:
+        return False
+
+    for sub in sorted(p for p in project_dir.iterdir() if p.is_dir()):
+        if sub.name.startswith(".") or sub.name in _NOT_BOARD_DIRS:
+            continue
+        if not man.implicit and sub.name in declared:
+            continue
+        files = _design_files(sub)
+        if not files:
+            continue
+        report.findings.append(
+            Finding(
+                code="DOC-016",
+                severity="error",
+                summary=(
+                    f"{sub.name}/ holds design tables no board declares "
+                    f"({', '.join(f.name for f in files)}); Stage 0 will never read them."
+                ),
+                fix=(
+                    f"If {sub.name} is a board, list it under '## Boards' in project.md "
+                    + ("(create project.md: without it the project is single-board). "
+                       if man.implicit else "")
+                    + "Otherwise move the tables into a board's directory."
+                ),
+                file=f"{sub.name}/{files[0].name}",
+            )
+        )
+
+    if not man.implicit:
+        stray = _design_files(project_dir)
+        if stray:
+            report.findings.append(
+                Finding(
+                    code="DOC-016",
+                    severity="warning",
+                    summary=(
+                        "BOM or pinout tables at the root of a multi-board project "
+                        f"({', '.join(f.name for f in stray)}) belong to no board."
+                    ),
+                    fix=(
+                        "Each board builds only its own directory. Move the tables into the "
+                        "board they describe, e.g. core/core.md; the root holds project.md "
+                        "and reference material."
+                    ),
+                    file=stray[0].name,
+                )
+            )
+    return False
+
+
 def _check_pin_maps(
     report: Report, bom_rows: list[tuple[str, dict, str, int]], pinout_refs: set[str]
 ) -> None:
@@ -693,6 +820,10 @@ def run(
     # directory is still what footprint resolution and libraries/ are relative
     # to; only the documents change.
     md_root = project_dir
+    if _check_board_layout(report, project_dir, board):
+        # The board asked about is not one Stage 0 will ever build, so
+        # anything checked from here would be some other board's documents.
+        return report
     if board is not None:
         from . import project_manifest
 
@@ -705,7 +836,7 @@ def run(
             Finding(
                 code="DOC-000",
                 severity="error",
-                summary=f"No Markdown files at the root of {project_dir}.",
+                summary=f"No Markdown files in {md_root}.",
                 fix=(
                     "Stage 0 reads *.md at the project root only — it does not recurse. "
                     "Move your design documents up, or point --project-dir at the right place."

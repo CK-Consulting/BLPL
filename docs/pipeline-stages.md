@@ -314,6 +314,8 @@ What each section means:
 
 Every stage takes `--board <name>` and qualifies its artifacts with it (`bom.core.json`, `hdm.sb-lora.yaml`, `review.core.md`, `example-handheld_core_<stamp>.kicad_pcb`). Each board reads only its own directory's markdown and its own `project.yaml` (`blpl init --board core` writes `core/project.yaml`; the project root's `project.yaml` is the fallback). Nets are namespaced by board: `core.U1` and `sb-lora.U1` are different parts, and nothing joins across boards by name — a net between boards exists because two connectors are plugged together, which is what `## Mates` writes down.
 
+**Converting a single-board project** is ordered: write `project.md` first, then each board's `<board>/<board>.md` and `<board>/project.yaml`, and only then remove the moved tables from the root. Board folders without a `project.md` naming them are invisible to every stage; `blpl doctor` reports them as `DOC-016`. The agent follows the same sequence (`blpl/skills/hardware-design/SKILL.md`).
+
 ```bash
 blpl crossboard --project-dir <proj>
 ```
@@ -328,4 +330,4 @@ Stage 0 discards tables it cannot classify **without saying so**, so a typo in a
 blpl doctor --project-dir <proj> [--json]
 ```
 
-Twelve checks (`DOC-000` … `DOC-011`), tabulated in [`cli.md`](cli.md#doctor). It is the intended first step of every session, and the **Preflight** tab in the web UI is the same report.
+Seventeen checks (`DOC-000` … `DOC-016`), tabulated in [`cli.md`](cli.md#doctor). It is the intended first step of every session, and the **Preflight** tab in the web UI is the same report.
