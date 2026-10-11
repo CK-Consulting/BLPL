@@ -88,13 +88,70 @@ def set_ignored(project_dir: Path, rel: str, ignored: bool, *, by: str = "") -> 
         rows.append({"path": rel, "added_by": by, "added_at": _now()})
     else:
         rows = [r for r in rows if _norm(r["path"]) != rel]
+    _rewrite(project_dir, rows)
+    return True
+
+
+def _rewrite(project_dir: Path, rows: list[dict]) -> None:
     rows.sort(key=lambda r: r["path"])
     target = Path(project_dir) / LIST_PATH
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + ".tmp")
     tmp.write_text(json.dumps({"schema_version": 1, "files": rows}, indent=2) + "\n", encoding="utf-8")
     tmp.replace(target)
+
+
+def _under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + "/")
+
+
+def move_entries(project_dir: Path, src: str, dst: str) -> bool:
+    """Follow a move: entries for ``src``, or anything under it when it is a
+    folder, now name the new path. Returns whether the list changed.
+
+    The list is keyed by path, so a move that left it alone turned "ignore this
+    file" into "ignore a name nothing has any more", and the file the user
+    asked the assistant to leave alone became readable at its new name.
+    """
+    src, dst = _norm(src), _norm(dst)
+    rows = _load(project_dir)
+    changed = False
+    for r in rows:
+        path = _norm(r["path"])
+        if _under(path, src):
+            r["path"] = dst + path[len(src):]
+            changed = True
+    if changed:
+        _rewrite(project_dir, rows)
+    return changed
+
+
+def drop_entries(project_dir: Path, rel: str) -> bool:
+    """Forget entries for a deleted file, or everything under a deleted folder.
+
+    Ignoring is about one file, not a name: kept, the entry would silently
+    apply to whatever is next created at that path."""
+    rel = _norm(rel)
+    rows = _load(project_dir)
+    kept = [r for r in rows if not _under(_norm(r["path"]), rel)]
+    if len(kept) == len(rows):
+        return False
+    _rewrite(project_dir, kept)
     return True
+
+
+def released_under(project_dir: Path, rel: str) -> list[str]:
+    """Paths the quarantine ledger records a file as released to, at ``rel`` or
+    below it."""
+    rel = _norm(rel)
+    out = []
+    for row in quarantine.ledger(project_dir):
+        if not row.get("released_as"):
+            continue
+        path = f"{row.get('released_to') or quarantine.TRUSTED_DIRNAME}/{row['released_as']}"
+        if _under(path, rel):
+            out.append(path)
+    return sorted(set(out))
 
 
 def is_external(rel: str) -> bool:

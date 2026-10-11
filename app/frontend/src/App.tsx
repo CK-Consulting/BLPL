@@ -68,6 +68,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   // What the tree last asked the centre panel to show. The tree is the detail
   // half of the layout; the tabs stay the project-wide half.
   const [openFile, setOpenFile] = useState<TreeNode | null>(null);
+  // The path the open file had before a rename, so the editor knows a new path
+  // is the same document and keeps its unsaved draft instead of reloading.
+  const [renamedFrom, setRenamedFrom] = useState<string | null>(null);
   const [railCollapsed, setRailCollapsed] = useState(
     () => localStorage.getItem("blpl.railCollapsed") === "1",
   );
@@ -219,14 +222,17 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                       // The open file follows a rename and closes on a delete;
                       // otherwise the editor would save the old name back into
                       // existence on the next keystroke.
-                      onMoved={(from, to) =>
+                      onMoved={(from, to) => {
+                        if (openFile && (openFile.path === from || openFile.path.startsWith(`${from}/`))) {
+                          setRenamedFrom(openFile.path);
+                        }
                         setOpenFile((f) => {
                           if (!f) return f;
                           if (f.path === from) return { ...f, path: to, name: to.split("/").pop() ?? to };
                           if (f.path.startsWith(`${from}/`)) return { ...f, path: to + f.path.slice(from.length) };
                           return f;
-                        })
-                      }
+                        });
+                      }}
                       onDeleted={(path) =>
                         setOpenFile((f) =>
                           f && (f.path === path || f.path.startsWith(`${path}/`)) ? null : f,
@@ -242,6 +248,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                         // else goes to the browser, which knows what to do
                         // with a PDF and will offer to save what it does not.
                         const where = destinationFor(n);
+                        setRenamedFrom(null);
                         if (where === "text") {
                           setOpenFile(n);
                           setTab("edit");
@@ -322,6 +329,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                   path={
                     openFile && destinationFor(openFile) === "text" ? openFile.path : null
                   }
+                  renamedFrom={renamedFrom}
                 />
               )}
               {tab === "kicad" && openFile && (

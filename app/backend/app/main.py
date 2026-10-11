@@ -3439,6 +3439,7 @@ def delete_path(
     else:
         target.unlink()
         kind = "file"
+    llm_ignore.drop_entries(checkout, rel)
     activity.record(session, project, user, activity.DELETED, rel)
     committed = _commit_quietly(checkout, f"delete: {rel}")
     return {"ok": True, "path": rel, "kind": kind, "committed": committed}
@@ -3475,8 +3476,38 @@ def move_path(
         raise HTTPException(status_code=409, detail=f"{dst_rel} already exists")
     if src.is_dir() and not src.is_symlink() and dst.is_relative_to(src):
         raise HTTPException(status_code=400, detail="a folder cannot be moved inside itself")
+    # The assistant frames a file as untrusted by where it is: anything under
+    # datasheets/ or references/ arrived from outside. Moving one out would
+    # have it read back as the project's own text, vendor instructions and
+    # all, so that is refused. Moving a file *in* is allowed: it only means
+    # more framing, which errs the safe way.
+    if llm_ignore.is_external(src_rel) and not llm_ignore.is_external(dst_rel):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"{src_rel} came from outside the project, and files there are read as "
+                "untrusted wherever they sit under datasheets/ or references/. It cannot be "
+                "moved out of them."
+            ),
+        )
+    # A released file is named in the quarantine ledger by its path, which is
+    # how its origin is shown and how a datasheet is found by MPN. Moving it
+    # would leave the ledger describing a file that is not there, and the
+    # ledger is never edited to keep up, so a released file stays put.
+    recorded = llm_ignore.released_under(checkout, src_rel)
+    if recorded:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
+                "is recorded in the quarantine ledger at its current path; moving it would "
+                "leave the ledger naming a file that is not there"
+            ),
+        )
     dst.parent.mkdir(parents=True, exist_ok=True)
     src.rename(dst)
+    # Same commit as the move: the ignore list is keyed by path.
+    llm_ignore.move_entries(checkout, src_rel, dst_rel)
     activity.record(session, project, user, activity.MOVED, f"{src_rel} → {dst_rel}")
     committed = _commit_quietly(checkout, f"move: {src_rel} -> {dst_rel}")
     return {"ok": True, "from": src_rel, "to": dst_rel, "committed": committed}

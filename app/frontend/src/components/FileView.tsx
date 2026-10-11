@@ -27,10 +27,13 @@ export function FileView({
   path,
   onSaved,
   reloadToken,
+  renamedFrom = null,
 }: {
   projectId: string;
   /** Project-relative path chosen in the file tree. */
   path: string | null;
+  /** The path this same document had before a rename in the file tree. */
+  renamedFrom?: string | null;
   onSaved: () => void;
   /** Bumped when something outside this pane changes the project — a proposal
    *  applied from the chat, a sync, a run that rewrote a document. */
@@ -65,6 +68,18 @@ export function FileView({
 
   useEffect(() => {
     const key = `${projectId}\u0000${path ?? ""}`;
+    // A rename is the same document under a new name, not another file. Treated
+    // as opening another, it left the editor and replaced the unsaved draft
+    // with the file fetched from the new path: renaming lost the edits. The
+    // bytes on disk did not change, so there is nothing to fetch either.
+    if (
+      renamedFrom !== null &&
+      shownKey.current !== key &&
+      shownKey.current === `${projectId}\u0000${renamedFrom}`
+    ) {
+      shownKey.current = key;
+      return;
+    }
     const openedAnother = shownKey.current !== key;
     shownKey.current = key;
     // Accepting a proposal rewrites the file under this pane. Until now nothing

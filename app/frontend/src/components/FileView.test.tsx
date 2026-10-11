@@ -109,3 +109,44 @@ describe("edits are never crossed with another project or another version", () =
     expect(box.value).not.toContain("something else entirely");
   });
 });
+
+describe("renaming the open file", () => {
+  it("keeps the unsaved draft and stays in the editor", async () => {
+    // Codex, PR #17. Following a rename changed the path, the pane took it for
+    // another file, left the editor and loaded the file from the new path over
+    // the draft: renaming a file with unsaved edits silently discarded them.
+    const user = userEvent.setup();
+    const f = serve("on disk");
+    globalThis.fetch = f;
+    const { rerender } = render(
+      <FileView projectId="p" path="power/a.md" onSaved={() => {}} reloadToken={0} />,
+    );
+    await waitFor(() => expect(screen.getByText("on disk")).toBeTruthy());
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    await user.type(screen.getByRole("textbox"), " UNSAVED");
+
+    rerender(
+      <FileView projectId="p" path="psu/a.md" renamedFrom="power/a.md" onSaved={() => {}} reloadToken={0} />,
+    );
+    await new Promise((r) => setTimeout(r, 20));
+
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(box.value).toContain("UNSAVED");
+    expect(screen.getByText("psu/a.md")).toBeTruthy();
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it("still treats an unrelated path change as another file", async () => {
+    const user = userEvent.setup();
+    globalThis.fetch = serve("first", "second");
+    const { rerender } = render(
+      <FileView projectId="p" path="a.md" onSaved={() => {}} reloadToken={0} />,
+    );
+    await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    await user.type(screen.getByRole("textbox"), " DRAFT");
+    rerender(<FileView projectId="p" path="b.md" renamedFrom="x.md" onSaved={() => {}} reloadToken={0} />);
+    await waitFor(() => expect(screen.getByText(/second/)).toBeTruthy());
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
+});
