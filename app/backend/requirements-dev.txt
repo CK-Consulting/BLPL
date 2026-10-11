@@ -1,0 +1,10 @@
+# What the backend's tests need on top of requirements.txt and the pipeline.
+#
+#   pip install -e ./core -r app/backend/requirements.txt -r app/backend/requirements-dev.txt
+#   cd app/backend && python -m pytest tests -q
+#
+# httpx is what starlette's TestClient drives the app with. These used to come
+# from the pipeline's `dev` extra, back when the pipeline and the app were one
+# package's tests.
+pytest>=7.4
+httpx>=0.27

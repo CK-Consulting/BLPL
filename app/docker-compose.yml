@@ -63,8 +63,9 @@ services:
     # Dockerfile header for why the official image is load-bearing.
     platform: linux/amd64
     build:
-      # Context is the repo root so the image can pull in blpl/ and
-      # kicad-happy/ alongside the app.
+      # Context is the umbrella checkout's root so the image can pull in the
+      # pipeline (core/: blpl, schemas, kicad-happy) and the KiCad plugin
+      # (plugin/) alongside the app.
       context: ..
       dockerfile: app/backend/Dockerfile
       platforms:
@@ -206,16 +207,16 @@ services:
       # substitute real component models off the official KiCad image.
       - ./kicad-packages3D:/usr/share/kicad/3dmodels:ro
       - ./kicad-packages3D-source:/usr/share/kicad/3dmodels-source:ro
-      # Stock symbol/footprint libraries. The image copies blpl/schemas/kicad-happy
+      # Stock symbol/footprint libraries. The image copies core's blpl/schemas/kicad-happy
       # but NOT these (they are large and versioned as submodules), and inside the
       # container the CLI resolves its default library roots to /app/kicad-symbols
       # and /app/kicad-footprints (parents[2] of /app/blpl/core/cli.py). Without
       # these mounts stage5 marks every real stock symbol as a missing placeholder
       # and stage6 cannot load even Connector_Generic. Mount the same vendored
       # libraries the host pipeline uses, at exactly those default paths.
-      - ../kicad-symbols:/app/kicad-symbols:ro
-      - ../kicad-footprints:/app/kicad-footprints:ro
-      - ../kicad-happy:/app/kicad-happy
+      - ../core/kicad-symbols:/app/kicad-symbols:ro
+      - ../core/kicad-footprints:/app/kicad-footprints:ro
+      - ../core/kicad-happy:/app/kicad-happy
       - ./kicad-templates:/app/kicad-templates:ro
       - ./KiCAD-Prism:/app/kicad-prism:ro
       # An SSH deploy key for git, if your project remotes need one. The git CLI
@@ -359,9 +360,9 @@ services:
       - ./data:/app/data
       - ./kicad-packages3D:/usr/share/kicad/3dmodels:ro
       - ./kicad-packages3D-source:/usr/share/kicad/3dmodels-source:ro
-      - ../kicad-symbols:/app/kicad-symbols:ro
-      - ../kicad-footprints:/app/kicad-footprints:ro
-      - ../kicad-happy:/app/kicad-happy
+      - ../core/kicad-symbols:/app/kicad-symbols:ro
+      - ../core/kicad-footprints:/app/kicad-footprints:ro
+      - ../core/kicad-happy:/app/kicad-happy
       - ./kicad-templates:/app/kicad-templates:ro
       - ./KiCAD-Prism:/app/kicad-prism:ro
       - ./data/ssh:/home/blpl/.ssh:ro
@@ -549,8 +550,8 @@ services:
       # promote deliberately. A part earning a place in the shared library is a
       # decision worth making on purpose rather than by autosave.
       - ./data/modules:/config/shared-libraries:${KICAD_SHARED_LIBRARIES:-ro}
-      - ../kicad-symbols:/usr/share/kicad/symbols:ro
-      - ../kicad-footprints:/usr/share/kicad/footprints:ro
+      - ../core/kicad-symbols:/usr/share/kicad/symbols:ro
+      - ../core/kicad-footprints:/usr/share/kicad/footprints:ro
       - ./kicad-packages3D:/usr/share/kicad/3dmodels:ro
     # Loopback only, and no websocket port. Both halves matter.
     #
