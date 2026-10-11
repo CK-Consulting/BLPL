@@ -397,6 +397,53 @@ def test_ascii85_honours_every_pdf_whitespace_byte(tmp_path):
     assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
 
 
+def test_a_stray_open_dictionary_cannot_hide_a_later_object_stream(tmp_path):
+    """Codex, PR #15: one unmatched `<<` in an unused object kept the depth
+    above zero for the rest of the file, so the object stream after it never
+    had a dictionary, was not counted, and its compressed /OpenAction came
+    back inspected. Without `endobj`, the next `obj` must catch it, and with
+    neither, the `stream` keyword itself."""
+    objstm = (
+        b"5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode>>stream\n"
+        + zlib.compress(_HIDDEN) + b"\nendstream endobj\n"
+    )
+    tail = b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    for stray in (
+        b"4 0 obj<</Junk 1 endobj\n",       # closed by endobj
+        b"4 0 obj<</Junk 1\n",              # no endobj: the next obj
+        b"<</Junk 1\n",                     # no object at all: the stream
+    ):
+        data = b"%PDF-1.5\n" + stray + objstm + tail
+        r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+        assert r.state == "cannot_inspect" and not r.is_inert, stray
+    # A surplus `>>` is the same imbalance from the other side.
+    data = b"%PDF-1.5\n4 0 obj<</Junk 1>>>>endobj\n" + objstm + tail
+    assert pdf_inspect.inspect(_write(tmp_path, "b.pdf", data)).state == "cannot_inspect"
+    # Balanced dictionaries, nested ones included, are not held for it.
+    assert pdf_inspect.inspect(_write(tmp_path, "c.pdf", BENIGN)).state == "inspected"
+
+
+def test_an_absurdly_long_length_does_not_abort_the_inspection(tmp_path):
+    """Codex, PR #15: int() refuses more than 4,300 digits on Python 3.11+, and
+    the ValueError escaped and aborted the upload instead of a verdict."""
+    data = _objstm(b"/Filter/FlateDecode/Length " + b"9" * 5000, zlib.compress(_HIDDEN))
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_nul_before_endstream_still_honours_the_declared_length(tmp_path):
+    """Codex, PR #15: bytes.lstrip() keeps NUL, so a NUL before `endstream`
+    made a direct /Length look wrong; the body was cut at an `endstream` in
+    the compressed bytes and a benign file was held as undecodable."""
+    body = _deflate_hiding_endstream(b"1 0 <</Type/Catalog>>")
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length "
+        + str(len(body)).encode() + b">>stream\n"
+        + body + b"\x00endstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
+
+
 def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
     data = (
         b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"

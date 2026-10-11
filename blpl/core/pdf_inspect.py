@@ -215,9 +215,9 @@ class _Stream:
     end: int
 
 
-def _parse(data: bytes) -> tuple[bytes, list[_Stream]]:
-    """The file's structure as canonical tokens, and each stream paired with
-    the dictionary that introduces it.
+def _parse(data: bytes) -> tuple[bytes, list[_Stream], bool]:
+    """The file's structure as canonical tokens, each stream paired with the
+    dictionary that introduces it, and whether the dictionaries nest sanely.
 
     Strings, comments and stream bodies are dropped; names are written in
     canonical form; tokens are separated by one space. What is left is what a
@@ -231,11 +231,23 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream]]:
     a reader would, and a stream with no `endstream` leaves the rest of the
     file to be tokenized as structure. A file built to confuse this gets more
     scrutiny, not less.
+
+    Nesting is checked wherever a reader expects it to be level: at `obj` and
+    `endobj`, at `stream`, and at every `>>`. Codex, PR #15: an unused object
+    with one stray `<<` left the depth at one for the rest of the file, so no
+    later dictionary ever closed at top level, the object stream after it had
+    no dictionary, was never counted as one, and its compressed /OpenAction
+    came back inspected. Resetting the depth alone would only move the
+    question to whichever boundary is missing (`endobj` is optional to a
+    lenient reader), so an imbalance is reported and the caller fails closed;
+    the depth is still reset there so the rest of the file is read for what
+    it reports.
     """
     out = bytearray()
     streams: list[_Stream] = []
     opens: list[int] = []               # offsets in `out` of unclosed `<<`
     last_dict: tuple[int, int] | None = None
+    unbalanced = False
     pos, n = 0, len(data)
 
     while pos < n:
@@ -261,8 +273,16 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream]]:
                     begin = opens.pop()
                     if not opens:
                         last_dict = (begin, len(out))
+                else:
+                    unbalanced = True
             continue
+        if kind == "word" and tok in (b"obj", b"endobj") and opens:
+            unbalanced = True
+            opens.clear()
         if kind == "word" and tok == b"stream":
+            if opens:
+                unbalanced = True
+                opens.clear()
             dictionary = b""
             if last_dict is not None and last_dict[1] == len(out):
                 dictionary = bytes(out[last_dict[0] : last_dict[1]])
@@ -278,7 +298,7 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream]]:
                 pos = close
             continue
         out += tok + b" "
-    return bytes(out), streams
+    return bytes(out), streams, unbalanced
 
 
 _DIRECT_LENGTH = re.compile(rb"/Length\s+(\d+)(?!\s+\d+\s+R)")
@@ -297,9 +317,16 @@ def _body_end(data: bytes, start: int, dictionary: bytes) -> int:
     body cut short is reported rather than half-read.
     """
     m = _DIRECT_LENGTH.search(dictionary)
-    if m is not None:
+    # Twenty digits is past any file this will ever see, so a longer length
+    # cannot land on an `endstream` and is treated as one that does not. It is
+    # checked before int() because Python 3.11+ refuses to convert more than
+    # 4,300 digits, and that ValueError aborted the upload (Codex, PR #15).
+    if m is not None and len(m.group(1)) <= 20:
         end = start + int(m.group(1))
-        if end <= len(data) and data[end : end + 64].lstrip().startswith(_ENDSTREAM):
+        # PDF whitespace, NUL included: bytes.lstrip() keeps NUL, so a benign
+        # `\x00endstream` missed its declared length and fell back to the
+        # first `endstream`, which may sit inside the compressed bytes.
+        if end <= len(data) and data[end : end + 64].lstrip(_WS).startswith(_ENDSTREAM):
             return end
     return data.find(_ENDSTREAM, start)
 
@@ -309,6 +336,9 @@ def _names_in(structure: bytes) -> set[str]:
 
 
 def _scan(data: bytes, where: str) -> dict[str, Finding]:
+    # Nesting inside an object stream is not checked: it holds no `obj`,
+    # `endobj` or `stream` keywords whose meaning depends on it, and its
+    # names are matched whatever the depth.
     return _findings(_parse(data)[0], where)
 
 
@@ -476,7 +506,7 @@ def inspect_bytes(data: bytes) -> Inspection:
             reason="no %PDF- header; the file is not what its name claims",
         )
 
-    structure, streams = _parse(data)
+    structure, streams, unbalanced = _parse(data)
     found = _findings(structure, "raw")
     decoded, undecodable, count = _object_streams(data, streams)
     for chunk in decoded:
@@ -507,6 +537,18 @@ def inspect_bytes(data: bytes) -> Inspection:
                 + ", ".join(sorted(set(undecodable)))
                 + "), so the objects inside it are unknown — which is not the same "
                 "as harmless"
+            ),
+            streams_scanned=count,
+        )
+
+    if unbalanced:
+        return Inspection(
+            state="cannot_inspect",
+            findings=sorted(found.values(), key=lambda f: f.name),
+            reason=(
+                "its dictionaries do not nest: a `<<` or `>>` is unmatched at an "
+                "object or stream boundary, so which dictionary introduces each "
+                "stream is unknown — which is not the same as harmless"
             ),
             streams_scanned=count,
         )
