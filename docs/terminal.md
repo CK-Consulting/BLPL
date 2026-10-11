@@ -97,17 +97,18 @@ Each session runs:
 ```
 bwrap --unshare-all --die-with-parent --new-session \
       --ro-bind /usr /usr  --ro-bind /etc /etc  --symlink usr/bin /bin  (etc.)
-      --ro-bind /opt/blpl-venv /opt/blpl-venv    # blpl + python deps
-      --bind  <worktree>            /home/project
-      --ro-bind <project>/.git      <project>/.git   # see "git" below: read-only,
-      --bind  <project>/.git/objects  …               #   with only these writable
-      --bind  <project>/.git/worktrees/<member>  …
-      --bind  <project>/.git/refs/heads/user/<id>  …
-      --bind  <project>/.git/logs/refs/heads/user/<id>  …
+      --ro-bind /opt/blpl-venv /opt/blpl-venv    # python deps
+      --ro-bind /app/blpl /app/blpl              # the editable install's source:
+      --ro-bind /app/schemas /app/schemas        #   pip install -e /app resolves
+      --ro-bind /app/kicad-happy /app/kicad-happy  #   blpl from here, not the venv
+      --bind    <worktree>            /home/project
+      --ro-bind <worktree>/.git       /home/project/.git   # mask the alias, see "Git"
+      --ro-bind <project>/.git        <project>/.git       # the real repository
       --ro-bind <stock libraries> <same paths>  # as the worker mounts them
       --tmpfs /tmp  --dev /dev  --proc /proc
       --clearenv --setenv HOME /home/project --setenv TERM xterm-256color
-      --setenv GIT_AUTHOR_NAME … --setenv GIT_AUTHOR_EMAIL …
+      --setenv PATH /opt/blpl-venv/bin:/usr/local/bin:/usr/bin:/bin
+      --setenv VIRTUAL_ENV /opt/blpl-venv
       --chdir /home/project  /bin/bash -l
 ```
 
@@ -117,33 +118,47 @@ bwrap --unshare-all --die-with-parent --new-session \
   no credentials and needs none, because **push and pull stay in the Git
   panel**, which leases a credential for the one command that needs it
   (PR #10).
-- **Git.** A member's worktree is a linked worktree. Its `.git` is a file
-  pointing into the project's shared repository, so git inside the sandbox
-  needs that repository at its real path. **It is bound read-only, with only
-  what a commit on the member's own branch writes made writable on top:**
-  - `objects/`;
-  - the member's own `worktrees/<name>/` (HEAD, index, logs);
-  - `refs/heads/user/<id>` and its reflog, created loose if the ref is packed.
+- **The BLPL package.** The image installs BLPL editable
+  (`pip install -e /app`), so the `blpl` entry point imports from `/app/blpl`,
+  not from the venv. The sandbox binds `/app/blpl`, `/app/schemas` and
+  `/app/kicad-happy` read-only, and sets `PATH` and `VIRTUAL_ENV` explicitly
+  because `--clearenv` removes them. It does not bind the rest of `/app`.
+- **Git is read-only in the shell. Commits go through the Git panel.** An
+  earlier draft made parts of the shared repository writable so `git commit`
+  would work inside the sandbox, and each grant turned out to open something:
+  - A writable `objects/` lets a shell delete or replace other members' packs
+    and loose objects, which a push can never do.
+  - A writable ref file still cannot take its adjacent `.lock`, because the
+    ref's parent directory is read-only.
+  - Binding the checkout writable leaves a second path to the repository:
+    `/home/project/.git`. For an owner, that is the shared `.git` directory
+    itself (`worktrees.path_for` returns the repository root for owners). For
+    a member, it is a pointer file that can be redirected to a planted git
+    directory. Through either, a shell can plant `core.sshCommand`,
+    `core.fsmonitor` or a hook. The backend's next Git-panel commit or push
+    would then run it, holding every secret the backend has.
 
-  Everything else stays read-only, above all **`config`, `hooks/` and
-  `info/`**. A writable `config` or `hooks/` would be code execution in the
-  backend. The backend runs `git commit`, `pull` and `push` in this same
-  repository from the Git panel, so a hook or a `core.fsmonitor` /
-  `core.sshCommand` planted from a shell would run there, with every secret
-  the backend holds. The backend also defends itself regardless: every git
-  command it runs passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false`.
-  A worktree-local `config.worktree` in the member's admin directory is inert,
-  because `extensions.worktreeConfig` would have to be set in the read-only
-  `config`.
+  So the repository is exposed **read-only by both paths**: its real path, and
+  `/home/project/.git` masked with a read-only bind laid over the writable
+  checkout. bwrap applies binds in order, so the later read-only bind wins
+  for that one entry.
+  - `git status`, `log`, `diff`, `show` and `blame` all work, because git reads
+    a read-only repository fine. `status` simply skips refreshing the index.
+  - `git commit`, `checkout` and `stash` fail with git's own "read-only file
+    system" error. The shell prints a one-line note at login saying where
+    commits happen.
+  - Shell edits appear as uncommitted changes in the Git panel, which commits
+    them. That is the decision recorded under "Committing" below, now a
+    requirement rather than a preference.
 
-  Two things remain:
-  - The objects of other members' branches are readable. They already are to
-    every member, so nothing new is disclosed.
-  - A hostile member can write garbage objects. That is no worse than pushing
-    garbage through the app today.
+  Two further protections:
+  - **The backend defends itself regardless.** Every git command it runs
+    passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false`. Nothing in a
+    checkout should be able to choose code for the backend to run, whoever
+    wrote it.
+  - **Nothing the shell writes reaches the repository** except working-tree
+    files, which the Git panel shows as a diff before committing.
 
-  Other members' refs are not writable, so one member cannot move another's
-  branch.
 - **Commit author** comes from the member's account, not from the image's git
   config. Commits made in projects today show `BLPL <blpl@localhost>`, which is
   the same gap seen from the other side.
@@ -194,8 +209,9 @@ need a person.
   while a run is active instead, and leaves it to the member.
 - **Committing.** Editor saves commit immediately (`edit: <path>`), but shell
   changes do not. They show as uncommitted in the Git panel, and the member
-  commits them there. Auto-committing on session end is an option, but it would
-  sweep up scratch files.
+  commits them there. The shell cannot commit, by design (see "Git" above).
+  Auto-committing on session end is possible, but it would sweep up scratch
+  files.
 
 ### 4. nginx
 
@@ -294,8 +310,11 @@ documentation, and anything still on the left with no right-hand side is a bug.
    - `curl` fails.
    - A file created in the sandbox is owned by `BLPL_UID` on the host.
    - Killing the socket kills the shell.
-   - Writing `.git/config`, `.git/hooks/*` or another member's ref fails.
-   - `git commit` on the member's own branch works.
+   - Writing anything under the repository fails by both paths, the real one
+     and `/home/project/.git`, for an owner and for a member: config, hooks,
+     objects and refs.
+   - `git status` and `git diff` work, and `git commit` fails cleanly.
+   - `blpl --help` runs. That proves the package and `PATH` are visible.
    - Stage 5 resolves a stock footprint.
 2. **Backend routes.** The session preflight with its 423 flow, the one-time
    ticket, per-session holders, relay, activity and limits, plus the
@@ -315,6 +334,6 @@ documentation, and anything still on the left with no right-hand side is a bug.
 1. The custom seccomp profile (recommended) or `seccomp:unconfined`, the same as
    kicad-desktop.
 2. `systempaths=unconfined` for a private `/proc`, or no `/proc` in the shell.
-3. Shell changes left uncommitted for the Git panel (recommended), or
-   auto-committed at session end.
+3. Shell changes are committed through the Git panel (the shell's git is
+   read-only), or also auto-committed at session end.
 4. `released_active` for PDFs with real JavaScript, as described above.
