@@ -297,3 +297,70 @@ def test_two_users_may_each_hold_the_same_host(unlocked, second_user) -> None:
         "host": "github.com", "method": "https_token", "secret": "b", "username": "them",
     })
     assert r.status_code == 200
+
+
+# -- IPv6 hosts match in either spelling ---------------------------------------
+
+
+@pytest.fixture()
+def store():
+    """A git_endpoint table on its own, to write rows the API no longer would."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.models import GitEndpoint
+
+    engine = create_engine("sqlite://")
+    GitEndpoint.__table__.create(engine)
+    with sessionmaker(bind=engine)() as s:
+        yield s
+
+
+class _User:
+    id = 1
+
+
+_V6_REMOTES = ["https://[2001:db8::1]/repo", "https://[2001:db8::1]:8443/repo"]
+
+
+@pytest.mark.parametrize("stored", ["[2001:DB8::1]", "2001:db8::1"])
+def test_an_ipv6_credential_is_found_for_its_remote(store, stored) -> None:
+    """Codex P2 on #10: put kept the brackets, host_of drops them, and the
+    exact lookup missed — so a private clone, pull or push went ahead with no
+    credential. Stored bare, both spellings match."""
+    gitstore.put(store, b"7" * 32, _User(), name="v6", host=stored,
+                 method="https_token", secret="ghp_v6", username="me")
+    store.flush()
+    for remote in _V6_REMOTES:
+        row = gitstore.for_remote(store, _User(), remote)
+        assert row is not None and row.name == "v6", remote
+    assert gitstore.for_remote(store, _User(), "https://[2001:db8::2]/repo") is None
+
+
+def test_a_bracketed_row_from_before_the_fix_is_still_found(store) -> None:
+    """Rows written before put stored hosts bare still hold the brackets; the
+    lookup compares bare on both sides rather than trusting a migration."""
+    from app import vault
+    from app.models import GitEndpoint
+
+    nonce, ct = vault.encrypt_secret(b"7" * 32, "git-endpoint:legacy", "ghp_old")
+    store.add(GitEndpoint(user_id=1, name="legacy", host="[2001:DB8::1]",
+                          method="https_token", username="me", nonce=nonce, ciphertext=ct))
+    store.flush()
+    for remote in _V6_REMOTES:
+        row = gitstore.for_remote(store, _User(), remote)
+        assert row is not None and row.name == "legacy", remote
+    # And it still occupies its host: a second row for the bare spelling would
+    # make matching a coin toss between the two.
+    with pytest.raises(gitstore.GitStoreError, match="'legacy'"):
+        gitstore.put(store, b"7" * 32, _User(), name="other", host="2001:db8::1",
+                     method="https_token", secret="ghp_new", username="me")
+
+
+def test_a_host_with_spaces_is_refused_without_echoing_it(store) -> None:
+    """A token pasted where the host goes, missing the @ that would have
+    caught it, used to come back quoted in the refusal."""
+    with pytest.raises(gitstore.GitStoreError) as exc:
+        gitstore.put(store, b"7" * 32, _User(), name="gh", host="ghp_tokensecret github.com",
+                     method="https_token", secret="x", username="me")
+    assert "ghp_tokensecret" not in str(exc.value)

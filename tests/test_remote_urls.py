@@ -297,6 +297,13 @@ _SECRET_BEARING = [
     ("me:ghp_tokensecret@host://x", "ghp_tokensecret"),
     # And the scp-like form, which has no scheme to anchor on.
     ("me:ghp_tokensecret@host", "ghp_tokensecret"),
+    # Whitespace inside the userinfo: the password pattern cannot cross it, so
+    # redaction left the token whole in the quoted URL (Codex, PR #10). The
+    # refusals no longer quote the URL at all.
+    ("https://user:ghp_tokensecret part@host/repo.git", "ghp_tokensecret"),
+    ("https://user:ghp_tokensecret\tpart@host/repo.git", "ghp_tokensecret"),
+    ("https://user:ghp_tokensecret\npart@host/repo.git", "ghp_tokensecret"),
+    ("user:tok en@host:path", "tok"),
 ]
 
 

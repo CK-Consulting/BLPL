@@ -159,9 +159,6 @@ def _redact_url(url: str) -> str:
 # the token). The password runs to the *last* @ before the path or whitespace,
 # so `user:tok@en@host` loses all of `tok@en`, not just `tok`.
 _URL_PASSWORD = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:]*):[^/\s]*@")
-# git's scp-like form has no scheme for the pattern above to anchor on, and a
-# password pasted into one (`me:tok@host:path`) is still a password.
-_SCP_PASSWORD = re.compile(r"^([^/@\s:]*):[^/\s]*@")
 
 
 # Any URL's query string or fragment, likewise wherever it sits. A token rides
@@ -188,18 +185,6 @@ def _redact_text(text: str) -> str:
     removed. Password first: the other way round, a ? inside a password
     (`https://u:p?x@host/`) cut the URL short and left the password's head."""
     return _URL_QUERY.sub(r"\1", _URL_PASSWORD.sub(r"\1:***@", text))
-
-
-def _shown(raw: str) -> str:
-    """A rejected remote URL, as an error message may quote it.
-
-    Redacted *before* it is shortened: cut first, a long token can lose the @
-    that marks it as one and then be shown whole.
-    """
-    text = _redact_text(raw)
-    if "://" not in text:
-        text = _strip_query(_SCP_PASSWORD.sub(r"\1:***@", text))
-    return repr(text[:60])
 
 
 def _carries_query(url: str) -> bool:
@@ -271,8 +256,16 @@ def check_remote_url(url: str) -> str:
     raw = (url or "").strip()
     if not raw:
         raise ProjectError("a remote URL is required")
-    if raw.startswith("-") or any(c.isspace() or ord(c) < 32 for c in raw):
-        raise ProjectError(f"{_shown(raw)} is not a remote URL")
+    # None of the refusals below quotes the URL back. They used to, redacted —
+    # but redaction is a pattern, and a malformed URL is exactly the input a
+    # pattern was not written for: `https://user:tok en@host/x` has whitespace
+    # inside its userinfo, the password pattern cannot cross it, and the 400
+    # handed the token back (Codex, PR #10). The user has the URL they typed;
+    # what they need from the error is what is wrong with it.
+    if raw.startswith("-"):
+        raise ProjectError("a remote URL cannot begin with -")
+    if any(c.isspace() or ord(c) < 32 for c in raw):
+        raise ProjectError("a remote URL cannot contain spaces or control characters")
     allowed = allowed_protocols()
     if "://" in raw:
         scheme = raw.split("://", 1)[0].lower()
@@ -293,9 +286,11 @@ def check_remote_url(url: str) -> str:
             # own message is left out: some of urllib's quote the netloc, which
             # is where a token sits, with no scheme for _redact_text to anchor
             # on (Codex, PR #10).
-            raise ProjectError(f"{_shown(raw)} is not a valid URL") from exc
+            raise ProjectError(
+                "this URL could not be parsed — check any brackets around an IPv6 address"
+            ) from exc
         if scheme != "file" and not host:
-            raise ProjectError(f"{_shown(raw)} names no host")
+            raise ProjectError("this URL names no host")
         if _carries_query(raw):
             # Not quoted, even stripped: it would tell the user nothing they
             # do not know, and the query is the secret part.
@@ -319,7 +314,7 @@ def check_remote_url(url: str) -> str:
     if raw.startswith("/") and "file" in allowed:
         return raw
     raise ProjectError(
-        f"{_shown(raw)} is not a remote URL — use https://host/owner/repo.git "
+        "this is not a remote URL — use https://host/owner/repo.git "
         "or git@host:owner/repo.git (local paths are not allowed)"
     )
 

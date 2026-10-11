@@ -131,8 +131,14 @@ def put(
         raise GitStoreError(
             "the host is a hostname alone — leave out any query string or fragment"
         )
-    if not host or " " in host:
-        raise GitStoreError(f"{host!r} is not a hostname")
+    if not host or any(c.isspace() or ord(c) < 32 for c in host):
+        # Not quoted either: whatever was pasted here is not a hostname, and
+        # it may be a token with the @ that would have caught it missing.
+        raise GitStoreError("the host must be a hostname, with no spaces in it")
+    # Stored bare: `[2001:db8::1]` kept its brackets here while host_of drops
+    # them, so for_remote's lookup missed and a private clone, pull or push
+    # went ahead with no credential at all (Codex, PR #10).
+    host = _bare_host(host)
     if method not in METHODS:
         raise GitStoreError(f"method must be one of {', '.join(METHODS)} — got {method!r}")
     if not (secret or "").strip():
@@ -149,12 +155,8 @@ def put(
     # the wrong account is the failure that looks like success. Refused with
     # the other row's name so the fix is obvious; the database constraint
     # backs this up for any path that skips the check.
-    other = session.scalar(
-        select(GitEndpoint).where(
-            GitEndpoint.user_id == user.id,
-            GitEndpoint.host == host,
-            GitEndpoint.name != name,
-        )
+    other = next(
+        (r for r in _rows_for_host(session, user, host) if r.name != name), None
     )
     if other is not None:
         raise GitStoreError(
@@ -216,16 +218,30 @@ def for_remote(session: Session, user: User, remote: str) -> GitEndpoint | None:
     host = host_of(remote)
     if host is None:
         return None
-    return session.scalar(
-        select(GitEndpoint).where(GitEndpoint.user_id == user.id, GitEndpoint.host == host)
+    return next(iter(_rows_for_host(session, user, host)), None)
+
+
+def _rows_for_host(session: Session, user: User, host: str) -> list[GitEndpoint]:
+    """This user's rows for ``host``, compared bare on both sides.
+
+    ``put`` now stores hosts bare, but rows written before it did may still
+    hold `[2001:db8::1]`, and an exact SQL match would miss them for good
+    (Codex, PR #10). Normalising on read covers those without a migration that
+    could itself collide two legacy spellings under the unique constraint. A
+    user holds a handful of rows, so filtering them here costs nothing.
+    """
+    want = _bare_host(host)
+    rows = session.scalars(
+        select(GitEndpoint).where(GitEndpoint.user_id == user.id).order_by(GitEndpoint.name)
     )
+    return [r for r in rows if _bare_host(r.host or "") == want]
 
 
 def _bare_host(host: str) -> str:
-    """A stored host as the helper compares it: lowercase, IPv6 unbracketed.
+    """A host as the helper compares it: lowercase, IPv6 unbracketed.
 
-    ``put`` keeps whatever brackets the user typed, while ``host_of`` — and
-    the helper — drop them, so ``[2001:db8::1]`` must be compared bare.
+    ``host_of`` — and the helper — drop the brackets git and urlsplit put
+    around an IPv6 literal, so ``[2001:db8::1]`` must be compared bare.
     """
     h = host.strip().lower()
     return h[1:].split("]", 1)[0] if h.startswith("[") else h
