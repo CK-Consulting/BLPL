@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from conftest import enqueue_only, give_endpoint, queued_env, sign_in
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app" / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @pytest.fixture
 def configured(client):

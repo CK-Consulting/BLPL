@@ -29,7 +29,7 @@ pytest.importorskip("webauthn")
 
 from webauthn.helpers import bytes_to_base64url  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app" / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from webauthn_sim import SoftwareAuthenticator  # noqa: E402
 

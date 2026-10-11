@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 from conftest import sign_in, sign_in_only
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app" / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import userkey  # noqa: E402
 
