@@ -217,6 +217,51 @@ def test_an_object_stream_this_cannot_decode_is_unknown_not_clean(tmp_path):
     assert "LZWDecode" in r.reason
 
 
+def _deflate_hiding_endstream(inner: bytes) -> bytes:
+    """A valid zlib stream whose compressed bytes contain `endstream`: a
+    non-final stored block carrying it literally, then the real objects in a
+    compressed final block. Every reader inflates all of it."""
+    import struct
+
+    decoy = b"%endstream\n"
+    co = zlib.compressobj(wbits=-15)
+    rest = co.compress(inner) + co.flush()
+    stored = b"\x00" + struct.pack("<HH", len(decoy), len(decoy) ^ 0xFFFF) + decoy
+    return b"\x78\x01" + stored + rest + struct.pack(">I", zlib.adler32(decoy + inner))
+
+
+def test_an_endstream_inside_compressed_bytes_does_not_end_the_body(tmp_path):
+    """Codex, PR #15. The body ended at the first `endstream`, which a file can
+    place inside its own compressed data; the rest was never inflated and an
+    /OpenAction after the cut went unseen. /Length is where it really ends."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    body = _deflate_hiding_endstream(inner)
+    assert b"endstream" in body and zlib.decompress(body).endswith(inner)
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length "
+        + str(len(body)).encode()
+        + b">>stream\n"
+        + body
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_a_body_cut_short_with_no_usable_length_is_unknown(tmp_path):
+    """With an indirect /Length there is nothing to correct the cut by, so the
+    inflate stops before its end. A prefix of an object stream is objects
+    nobody read: unknown, never clean."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    data = (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode/Length 9 0 R>>stream\n"
+        + _deflate_hiding_endstream(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert not r.is_inert
+
+
 def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
     data = (
         b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"

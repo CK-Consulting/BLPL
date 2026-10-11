@@ -246,7 +246,7 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream]]:
             dictionary = b""
             if last_dict is not None and not bytes(out[last_dict[1] :]).strip():
                 dictionary = bytes(out[last_dict[0] : last_dict[1]])
-            close = data.find(_ENDSTREAM, m.end())
+            close = _body_end(data, m.end(), dictionary)
             streams.append(_Stream(dictionary, m.end(), n if close < 0 else close))
             if close < 0:
                 keep(data[start:])
@@ -256,6 +256,29 @@ def _parse(data: bytes) -> tuple[bytes, list[_Stream]]:
         out.extend(b" ")
         pos = end
     return bytes(out), streams
+
+
+_DIRECT_LENGTH = re.compile(rb"/Length\s+(\d+)(?!\s+\d+\s+R)")
+
+
+def _body_end(data: bytes, start: int, dictionary: bytes) -> int:
+    """Where a stream body ends: at its declared /Length when that lands on an
+    `endstream`, otherwise at the first `endstream` after it.
+
+    The first `endstream` alone is wrong whenever the compressed bytes happen to
+    contain one, and a file can arrange that they do: a stored Deflate block
+    holding `%endstream` cut the body there, the rest of the object stream was
+    never inflated, and an /OpenAction after the cut went unseen. /Length is
+    what a reader uses. An indirect length (`12 0 R`) is not resolved here; for
+    those the inflate in _decode must still reach the end of its data, so a
+    body cut short is reported rather than half-read.
+    """
+    m = _DIRECT_LENGTH.search(dictionary)
+    if m is not None:
+        end = start + int(m.group(1))
+        if end <= len(data) and data[end : end + 64].lstrip().startswith(_ENDSTREAM):
+            return end
+    return data.find(_ENDSTREAM, start)
 
 
 def _names_in(structure: bytes) -> set[str]:
@@ -294,9 +317,16 @@ def _decode(body: bytes, filters: list[str]) -> bytes | None:
     undone here. Covers the filters an object stream realistically uses."""
     for f in filters:
         if f in ("FlateDecode", "Fl"):
+            # The inflate has to finish. A body that stops before the end of
+            # its compressed data (cut short, or past the size limit) decodes
+            # to a prefix, and a prefix of an object stream is objects nobody
+            # read: unknown, so undecodable, never clean.
+            d = zlib.decompressobj()
             try:
-                body = zlib.decompressobj().decompress(body, _MAX_INFLATE)
+                body = d.decompress(body, _MAX_INFLATE)
             except zlib.error:
+                return None
+            if not d.eof:
                 return None
         elif f in ("ASCIIHexDecode", "AHx"):
             digits = re.sub(rb"[^0-9A-Fa-f]", b"", body.split(b">", 1)[0])
