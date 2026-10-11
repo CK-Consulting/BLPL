@@ -63,6 +63,8 @@ type CrossReport = {
 
 type MultiReport = {
   multi_board: true;
+  /** Findings about the project as a whole: design tables no board owns. */
+  project?: Report;
   boards: Record<string, Report>;
   crossboard: CrossReport | null;
   crossboard_ready: string[];
@@ -106,6 +108,11 @@ export function Preflight({
     const ordered = board && names.includes(board) ? [board, ...names.filter((n) => n !== board)] : names;
     return (
       <div className="reports">
+        {report.project && report.project.findings.length > 0 && (
+          // Above every board: a board folder project.md does not list is
+          // invisible to the per-board reports below, which is the problem.
+          <BoardReport report={report.project} title="Whole project" projectId={projectId} board={null} />
+        )}
         <CrossBoard report={report} />
         {ordered.map((name) => (
           <BoardReport key={name} report={report.boards[name]} title={name} projectId={projectId} board={name} />

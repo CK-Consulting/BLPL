@@ -5037,7 +5037,7 @@ def preflight(project_id: str, user: User = Depends(require_onboarded),
                 # the project, so a doctor rooted at core/ could not find the
                 # project's own symbol library and reported every hand-drawn
                 # part on every sub-board as missing.
-                per_board[b] = doctor.run(proj, board=b).to_dict()
+                per_board[b] = doctor.run(proj, board=b, layout=False).to_dict()
             art = project_manifest.artifact_path(
                 proj, "design_artifact.deterministic", board=b
             )
@@ -5049,6 +5049,9 @@ def preflight(project_id: str, user: User = Depends(require_onboarded),
         report = crossboard.check(man, artifacts) if artifacts else None
         return {
             "multi_board": True,
+            # Findings about the project rather than any one board, such as a
+            # folder of design tables no board declares. Once, not per board.
+            "project": doctor.layout(proj).to_dict(),
             "boards": per_board,
             "crossboard": report.to_dict() if report else None,
             # Named so the panel can say why the cross-board section is empty

@@ -1135,7 +1135,7 @@ def test_a_board_missing_from_the_manifest_is_named(tmp_path: Path) -> None:
     (proj / "power" / "power.md").write_text(_BOM, encoding="utf-8")
 
     asked = doctor.run(proj, footprints_root=tmp_path / "nope", board="power")
-    assert "DOC-016" in _codes(asked) and "does not list it" in asked.findings[0].summary
+    assert any(f.code == "DOC-016" and "does not list it" in f.summary for f in asked.findings)
     assert any(
         f.code == "DOC-016" and "power/" in f.summary
         for f in doctor.run(proj, footprints_root=tmp_path / "nope").findings
@@ -1177,3 +1177,34 @@ def test_a_single_board_project_with_reference_folders_is_unaffected(tmp_path: P
     (proj / "board.md").write_text(_BOM, encoding="utf-8")
     (proj / "libraries" / "README.md").write_text(_BOM, encoding="utf-8")
     assert "DOC-016" not in _codes(doctor.run(proj, footprints_root=tmp_path / "nope"))
+
+
+def test_layout_findings_reach_a_check_that_names_a_board(tmp_path: Path) -> None:
+    """Codex, PR #16: the project-wide scan ran only with no board named, and
+    the CLI and the Preflight tab always name one on a multi-board project."""
+    proj = tmp_path / "p"
+    (proj / "main").mkdir(parents=True)
+    (proj / "power").mkdir()
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    (proj / "main" / "main.md").write_text(_BOM, encoding="utf-8")
+    (proj / "power" / "power.md").write_text(_BOM, encoding="utf-8")
+
+    named = doctor.run(proj, footprints_root=tmp_path / "nope", board="main")
+    assert any(f.code == "DOC-016" and "power/" in f.summary for f in named.findings)
+    # The multi-board Preflight reports it once, through layout(), not per board.
+    assert "DOC-016" not in _codes(
+        doctor.run(proj, footprints_root=tmp_path / "nope", board="main", layout=False)
+    )
+    assert "DOC-016" in _codes(doctor.layout(proj))
+
+
+def test_a_gpio_table_counts_as_design_content(tmp_path: Path) -> None:
+    """Codex, PR #16: Stage 0 reads GPIO assignment tables too, so one stranded
+    in an undeclared folder is dropped from the build just the same."""
+    proj = tmp_path / "p"
+    (proj / "power").mkdir(parents=True)
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    (proj / "power" / "io.md").write_text(
+        "## GPIO\n\n| GPIO | Signal |\n|---|---|\n| P0.01 | LED |\n", encoding="utf-8"
+    )
+    assert "DOC-016" in _codes(doctor.layout(proj))

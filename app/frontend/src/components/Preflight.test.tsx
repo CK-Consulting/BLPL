@@ -75,6 +75,38 @@ describe("preflight on a multi-board project", () => {
   });
 });
 
+describe("preflight's project-wide findings", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("shows a board folder no board declares, once, above the boards", async () => {
+    const project = boardReport(0);
+    project.ok = false;
+    project.summary.errors = 1;
+    project.findings = [
+      {
+        code: "DOC-016",
+        severity: "error",
+        summary: "power/ holds design tables no board declares (power.md); Stage 0 will never read them.",
+        fix: "List it under ## Boards.",
+        file: "power/power.md",
+        line: 1,
+      },
+    ];
+    globalThis.fetch = serveJSON({
+      multi_board: true,
+      project,
+      boards: { main: boardReport(0) },
+      crossboard: null,
+      crossboard_ready: [],
+      crossboard_missing: ["main"],
+    });
+    render(<Preflight projectId="p" board="main" reloadToken={0} />);
+    await waitFor(() => expect(screen.getByText(/power\/ holds design tables/)).toBeTruthy());
+    const headings = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
+    expect(headings).toEqual(["Whole project", "main"]);
+  });
+});
+
 describe("preflight on a single-board project", () => {
   beforeEach(() => vi.restoreAllMocks());
 

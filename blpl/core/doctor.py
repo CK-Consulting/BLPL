@@ -628,7 +628,9 @@ _NOT_BOARD_DIRS = frozenset(
 
 
 def _design_files(directory: Path) -> list[Path]:
-    """Markdown in ``directory`` holding a table Stage 0 consumes."""
+    """Markdown in ``directory`` holding a table Stage 0 consumes: a BOM, a
+    pinout, or a GPIO assignment table (Stage 0 reads that into
+    gpio_assignments, and it is dropped from the build just the same)."""
     found = []
     for md in sorted(directory.glob("*.md")):
         try:
@@ -636,28 +638,18 @@ def _design_files(directory: Path) -> list[Path]:
         except OSError:
             continue
         if any(
-            _md.classify(t) in ("bom", "pinout") for t in _md.extract_tables(text, md.name)
+            _md.classify(t) in ("bom", "pinout", "gpio") for t in _md.extract_tables(text, md.name)
         ):
             found.append(md)
     return found
 
 
-def _check_board_layout(report: Report, project_dir: Path, board: str | None) -> bool:
-    """DOC-016: design documents Stage 0 will never read because no board owns
-    them. True when the board asked about is not buildable at all.
-
-    Whether a project is multi-board is decided by one file, ``project.md``,
-    and nothing else. Board directories with no manifest are a single-board
-    project with some folders in it: Stage 0 reads the root and nothing below
-    it. That is how verdacor-ear-tag came to have its whole design in main/ and
-    power/ while every check passed. The agent's pre-proposal doctor ran with
-    board="main", board_dir() answered "the root" for an implicit project, and
-    the root, emptied of its tables by the move, was reported clean.
-    """
+def _manifest_or_finding(report: Report, project_dir: Path):
+    """The project's manifest, or None after recording why it cannot be used."""
     from . import project_manifest
 
     try:
-        man = project_manifest.discover(project_dir)
+        return project_manifest.discover(project_dir)
     except project_manifest.ManifestError as exc:
         report.findings.append(
             Finding(
@@ -671,32 +663,64 @@ def _check_board_layout(report: Report, project_dir: Path, board: str | None) ->
                 file=project_manifest.MANIFEST_NAME,
             )
         )
-        return board is not None
-    declared = {b.name for b in man.boards}
+        return None
 
-    if board is not None and (man.implicit or board not in declared):
-        why = (
-            "there is no project.md, so this is a single-board project and Stage 0 "
-            "reads only the project root"
-            if man.implicit
-            else "project.md's '## Boards' does not list it"
-        )
-        report.findings.append(
-            Finding(
-                code="DOC-016",
-                severity="error",
-                summary=f"'{board}' is not a board: {why}. Nothing in {board}/ will be built.",
-                fix=(
-                    f"Declare it first: add '- {board}' under '## Boards' in project.md at the "
-                    "project root (create project.md if it does not exist), then check again."
-                ),
-                file=project_manifest.MANIFEST_NAME,
-            )
-        )
+
+def _check_requested_board(report: Report, project_dir: Path, board: str) -> bool:
+    """DOC-016 for the board a check was asked about. True when it is not a
+    board Stage 0 will ever build, so nothing further should be checked.
+
+    Whether a project is multi-board is decided by one file, ``project.md``,
+    and nothing else. Board directories with no manifest are a single-board
+    project with some folders in it: Stage 0 reads the root and nothing below
+    it. That is how verdacor-ear-tag came to have its whole design in main/ and
+    power/ while every check passed. The agent's pre-proposal doctor ran with
+    board="main", board_dir() answered "the root" for an implicit project, and
+    the root, emptied of its tables by the move, was reported clean.
+    """
+    from . import project_manifest
+
+    try:
+        man = project_manifest.discover(project_dir)
+    except project_manifest.ManifestError:
+        # Reported by the layout scan; there is no board to check either way.
         return True
-
-    if board is not None:
+    if not man.implicit and board in {b.name for b in man.boards}:
         return False
+    why = (
+        "there is no project.md, so this is a single-board project and Stage 0 "
+        "reads only the project root"
+        if man.implicit
+        else "project.md's '## Boards' does not list it"
+    )
+    report.findings.append(
+        Finding(
+            code="DOC-016",
+            severity="error",
+            summary=f"'{board}' is not a board: {why}. Nothing in {board}/ will be built.",
+            fix=(
+                f"Declare it first: add '- {board}' under '## Boards' in project.md at the "
+                "project root (create project.md if it does not exist), then check again."
+            ),
+            file=project_manifest.MANIFEST_NAME,
+        )
+    )
+    return True
+
+
+def _check_layout(report: Report, project_dir: Path) -> None:
+    """DOC-016 across the project: design tables that no board owns.
+
+    This is about the project, not about whichever board was asked for, so it
+    runs on every check. It first ran only when no board was named, and both
+    public entry points name one on a multi-board project (the CLI through
+    _board(), the Preflight tab once per declared board), so an undeclared
+    power/ was reported only to a direct Python call.
+    """
+    man = _manifest_or_finding(report, project_dir)
+    if man is None:
+        return
+    declared = {b.name for b in man.boards}
 
     for sub in sorted(p for p in project_dir.iterdir() if p.is_dir()):
         if sub.name.startswith(".") or sub.name in _NOT_BOARD_DIRS:
@@ -732,7 +756,7 @@ def _check_board_layout(report: Report, project_dir: Path, board: str | None) ->
                     code="DOC-016",
                     severity="warning",
                     summary=(
-                        "BOM or pinout tables at the root of a multi-board project "
+                        "Design tables at the root of a multi-board project "
                         f"({', '.join(f.name for f in stray)}) belong to no board."
                     ),
                     fix=(
@@ -743,7 +767,14 @@ def _check_board_layout(report: Report, project_dir: Path, board: str | None) ->
                     file=stray[0].name,
                 )
             )
-    return False
+
+
+def layout(project_dir: Path) -> Report:
+    """Only the project-wide DOC-016 scan, for a caller that checks several
+    boards and wants these findings once rather than once per board."""
+    report = Report()
+    _check_layout(report, Path(project_dir))
+    return report
 
 
 def _check_pin_maps(
@@ -805,8 +836,13 @@ def run(
     symbols_root: Path | None = None,
     footprints_root: Path | None = None,
     board: str | None = None,
+    layout: bool = True,
 ) -> Report:
-    """Inspect a project's Markdown and report what Stage 0 would drop or misread."""
+    """Inspect a project's Markdown and report what Stage 0 would drop or misread.
+
+    ``layout=False`` leaves out the project-wide DOC-016 scan, for a caller
+    running every board that reports it once through :func:`layout`.
+    """
     from .stage6_compile_kicad import _DEFAULT_FOOTPRINTS, _DEFAULT_SYMBOLS
 
     project_dir = Path(project_dir)
@@ -820,7 +856,9 @@ def run(
     # directory is still what footprint resolution and libraries/ are relative
     # to; only the documents change.
     md_root = project_dir
-    if _check_board_layout(report, project_dir, board):
+    if layout:
+        _check_layout(report, project_dir)
+    if board is not None and _check_requested_board(report, project_dir, board):
         # The board asked about is not one Stage 0 will ever build, so
         # anything checked from here would be some other board's documents.
         return report
