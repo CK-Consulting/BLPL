@@ -1224,3 +1224,16 @@ def test_mid_split_the_root_tables_are_only_a_warning(tmp_path: Path) -> None:
     report = doctor.run(proj, footprints_root=tmp_path / "nope", board="main")
     hits = [f for f in report.findings if f.code == "DOC-016"]
     assert hits and all(f.severity == "warning" for f in hits)
+
+
+def test_a_modules_list_counts_as_design_content(tmp_path: Path) -> None:
+    """Codex, PR #16: a board built only from '## Modules' has no tables, and
+    Stage 0 expands it into components all the same, so stranded in an
+    undeclared folder it is a whole board missing from the build."""
+    proj = tmp_path / "p"
+    (proj / "power").mkdir(parents=True)
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
+    (proj / "power" / "power.md").write_text(
+        "# Power\n\n## Modules\n\n- ltc4015-charger — the charger\n", encoding="utf-8"
+    )
+    assert "DOC-016" in _codes(doctor.layout(proj))

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import markdown_tables as _md
+from . import modules_remix as _modules_remix
 from . import stage4_synthesize_nets as _stage4
 from .stage0_deterministic import known_refs as _s0_known_refs, refdes_in_heading
 
@@ -628,9 +629,9 @@ _NOT_BOARD_DIRS = frozenset(
 
 
 def _design_files(directory: Path) -> list[Path]:
-    """Markdown in ``directory`` holding a table Stage 0 consumes: a BOM, a
-    pinout, or a GPIO assignment table (Stage 0 reads that into
-    gpio_assignments, and it is dropped from the build just the same)."""
+    """Markdown in ``directory`` holding something Stage 0 builds from: a BOM, a
+    pinout or a GPIO assignment table (read into gpio_assignments), or a
+    ``## Modules`` list."""
     found = []
     for md in sorted(directory.glob("*.md")):
         try:
@@ -639,7 +640,9 @@ def _design_files(directory: Path) -> list[Path]:
             continue
         if any(
             _md.classify(t) in ("bom", "pinout", "gpio") for t in _md.extract_tables(text, md.name)
-        ):
+        ) or _modules_remix.parse_modules_section(text):
+            # A '## Modules' list is a whole board's worth of parts: Stage 0
+            # expands each named module into its components.
             found.append(md)
     return found
 
