@@ -41,7 +41,9 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -201,6 +203,11 @@ def build_system_prompt() -> str:
 class ProposalError(RuntimeError):
     """A proposal could not be created or applied. Carries a message meant for
     the user, not a stack trace."""
+
+
+class ProposalWriteError(ProposalError):
+    """An accepted proposal was still valid but could not be written. Unlike a
+    stale proposal, it can be accepted again once the cause is fixed."""
 
 
 # Provider failures that are about the provider's moment rather than the
@@ -438,6 +445,18 @@ def sha_of(text: str) -> str:
     return _sha(text)
 
 
+def _umask() -> int:
+    """The process umask, read without setting it. os.umask() can only be
+    read by changing it, which races with any other thread creating a file."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("Umask:"):
+                return int(line.split()[1], 8)
+    except (OSError, ValueError):
+        pass
+    return 0o022
+
+
 def apply_proposal(
     proposal: Proposal, project_dir: Path, sandbox: FilesystemSandbox
 ) -> tuple[bool, str]:
@@ -485,7 +504,37 @@ def apply_proposal(
     elif proposal.base_sha is not None:
         return False, f"{proposal.path} no longer exists — re-read and propose again"
 
-    target.write_text(proposal.new_content, encoding="utf-8")
+    # A new board's folder does not exist until its first document is written,
+    # and the agent proposes that document before anyone has made the folder.
+    # Without this the write raised FileNotFoundError, the route answered a bare
+    # 500, and the proposal sat pending with nothing on screen to say why.
+    #
+    # A failure here is not staleness. The proposal is as valid as it was, and
+    # the full disk or the permission problem may be fixed in a minute, so it is
+    # raised separately and the route leaves the proposal pending to retry.
+    # Written beside the target and renamed over it, so a write that fails
+    # halfway never leaves the user's file truncated.
+    tmp = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=target.parent, prefix=f".{target.name}.", delete=False
+        ) as fh:
+            tmp = Path(fh.name)
+            fh.write(proposal.new_content)
+        # NamedTemporaryFile creates 0600, and renaming it over the document
+        # would install that mode: a 0644 design file would lose group and
+        # other access on every accepted edit. Keep the document's own mode,
+        # or for a new one the mode a plain open() would have given it.
+        os.chmod(tmp, stat.S_IMODE(target.stat().st_mode) if exists else 0o666 & ~_umask())
+        os.replace(tmp, target)
+    except OSError as exc:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise ProposalWriteError(
+            f"could not write {proposal.path}: {exc.strerror or exc} — the proposal is "
+            "still pending; accept it again once that is fixed"
+        ) from exc
     return True, f"wrote {proposal.path}"
 
 

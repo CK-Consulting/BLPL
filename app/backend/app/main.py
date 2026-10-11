@@ -4654,7 +4654,13 @@ def decide_proposal(
             detail="a pipeline run is in flight for this project — accept the edit once it finishes",
         )
 
-    applied, detail = chat_mod.apply_proposal(proposal, proj, _sandbox_for(session, user, project_id))
+    try:
+        applied, detail = chat_mod.apply_proposal(
+            proposal, proj, _sandbox_for(session, user, project_id)
+        )
+    except chat_mod.ProposalWriteError as exc:
+        # Left pending: nothing about the proposal changed, only the disk.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not applied:
         store.set_status(proposal, "stale")
         raise HTTPException(status_code=409, detail=detail)
