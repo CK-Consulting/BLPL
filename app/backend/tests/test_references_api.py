@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("fastapi")  # webapp extras must be installed for these tests.
+pytest.importorskip("fastapi")  # the backend's requirements must be installed for these tests.
 
 from app.references import (  # noqa: E402  (import after importorskip)
     FilesystemSandbox,

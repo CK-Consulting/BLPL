@@ -7,7 +7,7 @@
  * line's own shape, which means this file and blpl/core/cli.py have to agree on
  * a format neither one declares.
  *
- * That coupling is pinned from the other end: tests/test_run_log_contract.py
+ * That coupling is pinned from the other end: core/tests/test_run_log_contract.py
  * runs the real orchestrator and asserts it still prints "==> <stage>". If the
  * prefix ever changes, that test fails loudly — rather than this classifier
  * quietly downgrading every header to "plain" and the progress bar never

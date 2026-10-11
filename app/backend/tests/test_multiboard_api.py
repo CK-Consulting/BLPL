@@ -1,15 +1,16 @@
 """Board resolution over the HTTP API.
 
-Split from test_multiboard.py because these need the webapp extras, and a
-module-level importorskip takes the whole file with it — which would have
-silently skipped fifty tests that need nothing but the standard library.
+Split from test_multiboard.py (now in core/tests) because these need the
+backend's requirements, and a module-level importorskip takes the whole file
+with it — which would have silently skipped fifty tests that need nothing but
+the standard library.
 """
 
 from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("fastapi")  # webapp extras must be installed for these tests.
+pytest.importorskip("fastapi")  # the backend's requirements must be installed for these tests.
 
 MANIFEST = """
 ## Boards
