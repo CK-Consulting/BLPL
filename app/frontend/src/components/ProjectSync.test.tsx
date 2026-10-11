@@ -28,6 +28,19 @@ describe("the push button", () => {
     expect(screen.getByText("not pushed yet")).toBeInTheDocument();
   });
 
+  it("re-reads status when a remote is saved elsewhere", async () => {
+    // Codex P1 on #10, second round: the settings panel saved the remote but
+    // the strip never fetched again, so it kept showing "local only" with
+    // Commit disabled until a reload.
+    vi.stubGlobal("fetch", status({ has_remote: false, remote_name: "", remote_url: "" }));
+    const { rerender } = render(<ProjectSync projectId="p" onChanged={() => {}} reloadToken={0} />);
+    expect(await screen.findByRole("button", { name: "Commit" })).toBeInTheDocument();
+
+    vi.stubGlobal("fetch", status({ unpublished: true, ahead: 1 }));
+    rerender(<ProjectSync projectId="p" onChanged={() => {}} reloadToken={1} />);
+    expect(await screen.findByRole("button", { name: "Commit + Push" })).toBeEnabled();
+  });
+
   it("stays disabled for a published, clean branch with nothing ahead", async () => {
     vi.stubGlobal("fetch", status({}));
     render(<ProjectSync projectId="p" onChanged={() => {}} />);

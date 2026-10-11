@@ -10,7 +10,17 @@ import { ProjectRoutingPanel } from "./ProjectRoutingPanel";
 // push. This is the mechanism behind "sit at another workstation and pick up
 // where you left off": the board and markdown live in git on the server.
 
-export function ProjectSync({ projectId, onChanged }: { projectId: string; onChanged: () => void }) {
+export function ProjectSync({
+  projectId,
+  onChanged,
+  reloadToken = 0,
+}: {
+  projectId: string;
+  onChanged: () => void;
+  /** Bumped when something outside the strip changes the repository's
+   *  remote, so the strip re-reads status instead of trusting its own copy. */
+  reloadToken?: number;
+}) {
   const [st, setSt] = useState<GitStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -22,7 +32,7 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
 
   useEffect(() => {
     refresh();
-  }, [projectId]);
+  }, [projectId, reloadToken]);
 
   if (!st) return null;
 
@@ -46,7 +56,10 @@ export function ProjectSync({ projectId, onChanged }: { projectId: string; onCha
     if (!message) return;
     await act(async () => {
       await postJSON(`/api/projects/${projectId}/git/commit`, { message });
-      if (st.has_remote) await postJSON(`/api/projects/${projectId}/git/push`, {});
+      // Asked fresh, not read from `st`: the status this render captured can
+      // predate a remote added since, and then the push was skipped.
+      const now = await getJSON<GitStatus>(`/api/projects/${projectId}/git/status`);
+      if (now.has_remote) await postJSON(`/api/projects/${projectId}/git/push`, {});
     }, "commit");
   };
 
@@ -305,8 +318,11 @@ export function NewProject({
 export function ProjectSettings({
   projectId,
   board,
+  onRemoteChanged,
 }: {
   projectId: string;
+  /** Called after the remote is added or changed, for the git strip. */
+  onRemoteChanged?: () => void;
   /** The active board, because geometry is per board: two boards do not share
    *  an outline or a stackup. Null on a single-board project, whose one board
    *  is implicit — the panel resolves that itself rather than being withheld,
@@ -337,7 +353,7 @@ export function ProjectSettings({
         <div className="modal-body">
           <BoardConfigPanel projectId={projectId} board={board ?? null} />
           <ProjectRoutingPanel projectId={projectId} />
-          <ProjectGitPanel projectId={projectId} />
+          <ProjectGitPanel projectId={projectId} onRemoteChanged={onRemoteChanged} />
           <ProjectPolicyPanel projectId={projectId} />
         </div>
       </div>
@@ -353,7 +369,13 @@ export function ProjectSettings({
  * on `main` is not knowing whose `main`, and a push control whose destination
  * is invisible is one someone will eventually fire at the wrong repository.
  */
-function ProjectGitPanel({ projectId }: { projectId: string }) {
+function ProjectGitPanel({
+  projectId,
+  onRemoteChanged,
+}: {
+  projectId: string;
+  onRemoteChanged?: () => void;
+}) {
   const [st, setSt] = useState<GitStatus | null>(null);
   // A failure is its own state. It used to be caught into `null`, which is
   // also what "still loading" looks like, so a repository git could not read
@@ -402,9 +424,10 @@ function ProjectGitPanel({ projectId }: { projectId: string }) {
         <RemoteForm
           projectId={projectId}
           hasRemote={st.has_remote}
-          onSet={(remote_name, remote_url) =>
-            setSt({ ...st, has_remote: true, remote_name, remote_url })
-          }
+          onSet={(remote_name, remote_url) => {
+            setSt({ ...st, has_remote: true, remote_name, remote_url });
+            onRemoteChanged?.();
+          }}
         />
       )}
     </section>

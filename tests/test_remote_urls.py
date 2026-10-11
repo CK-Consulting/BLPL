@@ -231,6 +231,48 @@ def test_a_never_pushed_branch_still_has_something_to_push(tmp_path):
     assert not st.unpublished and st.ahead == 0
 
 
+def test_moving_origin_to_an_empty_repository_reads_as_unpublished(tmp_path):
+    # Codex P1 on #10, second round: after "Change remote…" from a pushed
+    # repository A to an empty B, the upstream and refs/remotes/origin/* from A
+    # remained, so status counted against A's refs (unpublished false, ahead
+    # 0) and the clean tree disabled the push B was waiting for.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    a = tmp_path / "a.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(a)], check=True)
+    store.set_remote(work, f"file://{a}")
+    store.push("p")
+    assert not store.status("p", checkout=work).unpublished
+
+    b = tmp_path / "b.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(b)], check=True)
+    store.set_remote(work, f"file://{b}")
+
+    st = store.status("p", checkout=work)
+    assert st.unpublished and st.ahead == 1
+    store.push("p")
+    assert "main" in _heads(b)
+    st = store.status("p", checkout=work)
+    assert not st.unpublished and st.ahead == 0
+
+
+def test_publication_is_measured_against_origin_not_the_tracked_remote(tmp_path):
+    # Same round: a branch tracking another remote was measured against that
+    # remote, while every push goes to origin by name.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    other = _bare(tmp_path, "other", work)
+    subprocess.run(["git", "remote", "add", "upstream", f"file://{other}"], cwd=work, check=True)
+    subprocess.run(["git", "fetch", "-q", "upstream"], cwd=work, check=True)
+    subprocess.run(["git", "branch", "-q", "--set-upstream-to=upstream/main"], cwd=work, check=True)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    store.set_remote(work, f"file://{origin}")
+
+    st = store.status("p", checkout=work)
+    assert st.unpublished and st.ahead == 1
+
+
 def test_with_no_remote_at_all_origin_is_added(tmp_path):
     store = projects_mod.Projects(tmp_path / "projects")
     work = _repo(tmp_path / "projects" / "p")

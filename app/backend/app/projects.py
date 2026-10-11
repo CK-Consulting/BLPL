@@ -357,13 +357,42 @@ class Projects:
         url = check_remote_url(url)
         d = self._checkout("", checkout)
         if self._primary_remote(d):
+            previous = self._git_allow_fail(d, "remote", "get-url", self.REMOTE).strip()
             self._git(d, "remote", "set-url", self.REMOTE, url)
             # A separate pushurl would keep pushes going to the old place while
             # the panel showed the new one. Dropped, so pushes use `url`.
             self._git_allow_fail(d, "config", "--unset-all", f"remote.{self.REMOTE}.pushurl")
+            if previous != url:
+                self._forget_remote_state(d)
         else:
             self._git(d, "remote", "add", self.REMOTE, url)
         return url
+
+    def _forget_remote_state(self, d: Path) -> None:
+        """Drop what the repository remembers about the old origin.
+
+        refs/remotes/origin/* and the branches tracking origin describe the
+        repository origin used to name. Kept, a move from a pushed repository
+        to an empty one read as "published, nothing ahead" against the old
+        refs, and the push button stayed disabled while the new remote had none
+        of the history. Every branch is covered, not only this checkout's,
+        because members' worktrees share the one repository config.
+        """
+        refs = self._git_allow_fail(
+            d, "for-each-ref", "--format=%(refname)", f"refs/remotes/{self.REMOTE}/"
+        ).split()
+        for ref in refs:
+            self._git_allow_fail(d, "update-ref", "-d", ref)
+        tracking = self._git_allow_fail(
+            d, "config", "--get-regexp", r"^branch\..*\.remote$"
+        ).splitlines()
+        for line in tracking:
+            key, _, remote = line.partition(" ")
+            if remote.strip() != self.REMOTE:
+                continue
+            branch = key[len("branch."):-len(".remote")]
+            self._git_allow_fail(d, "config", "--unset", f"branch.{branch}.remote")
+            self._git_allow_fail(d, "config", "--unset", f"branch.{branch}.merge")
 
     def remote_of(
         self, name: str, *, operation: str, checkout: Path | None = None
@@ -486,9 +515,21 @@ class Projects:
         has_remote = self._primary_remote(d) is not None
         ahead = behind = 0
         unpublished = False
-        if has_remote and self._upstream(d):
+        # Measured against origin's copy of this branch — the ref
+        # `push --set-upstream origin HEAD` updates — not @{upstream}. Every
+        # push goes to origin by name, so a branch tracking another remote, or
+        # an upstream left from before origin was changed, measured the wrong
+        # destination and could disable the push button with nothing pushed.
+        published = (
+            f"refs/remotes/{self.REMOTE}/{branch}"
+            if branch and self._git_allow_fail(
+                d, "rev-parse", "--verify", "--quiet", f"refs/remotes/{self.REMOTE}/{branch}"
+            ).strip()
+            else ""
+        )
+        if has_remote and published:
             counts = self._git_allow_fail(
-                d, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"
+                d, "rev-list", "--left-right", "--count", f"{published}...HEAD"
             )
             if counts:
                 parts = counts.split()
