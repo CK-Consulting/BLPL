@@ -41,6 +41,17 @@ describe("the push button", () => {
     expect(await screen.findByRole("button", { name: "Commit + Push" })).toBeEnabled();
   });
 
+  it("says when the remote is one pull and push refuse", async () => {
+    // Codex P1 on #10: origin fetching from A and pushing to B read as
+    // published against A. The server now reports the problem rather than a
+    // publication state, and the strip has to show it.
+    const problem = "origin fetches from https://a/x.git but pushes to https://b/x.git";
+    vi.stubGlobal("fetch", status({ remote_problem: problem }));
+    render(<ProjectSync projectId="p" onChanged={() => {}} />);
+
+    expect(await screen.findByText("remote needs fixing")).toHaveAttribute("title", problem);
+  });
+
   it("stays disabled for a published, clean branch with nothing ahead", async () => {
     vi.stubGlobal("fetch", status({}));
     render(<ProjectSync projectId="p" onChanged={() => {}} />);

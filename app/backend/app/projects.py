@@ -123,6 +123,11 @@ class GitStatus:
     #: remote to a clean local project is exactly this state, and the first
     #: push is the only way its history gets anywhere.
     unpublished: bool = False
+    #: Why pull and push would refuse origin as configured (several URLs, a
+    #: fetch URL and a different push URL, a token in the URL), or "". When
+    #: set, `ahead`, `behind` and `unpublished` are not measured: origin's
+    #: tracking ref is no evidence of what the push destination holds.
+    remote_problem: str = ""
 
 
 def _redact_url(url: str) -> str:
@@ -588,10 +593,7 @@ class Projects:
         it is the only shape Project settings ever writes, and a hand-edited
         config with several is something to fix, not to guess about.
         """
-        args = ["remote", "get-url", "--all"] + (["--push"] if operation == "push" else [])
-        urls = list(dict.fromkeys(
-            u.strip() for u in self._git_allow_fail(d, *args, self.REMOTE).splitlines() if u.strip()
-        ))
+        urls = self._origin_urls(d, operation)
         if len(urls) > 1:
             # Redacted: the setter refuses a URL with a token in it, but a
             # repository configured before that, or edited by hand, can still
@@ -623,7 +625,40 @@ class Projects:
                 "can carry a token and which BLPL will not send. Set the URL "
                 "again without it in Project settings → Git."
             )
+        # One destination per *remote*, not only per operation. origin fetching
+        # from A with a pushurl for B left refs/remotes/origin/<branch>
+        # describing A while every push went to B, so with A already holding
+        # HEAD and B empty, status reported "published, nothing ahead", Commit +
+        # Push stayed disabled, and the branch could never reach B through the
+        # UI (Codex, PR #10). Refused rather than tracked separately (a
+        # BLPL-owned "published to B" ref): set_remote writes one URL and drops
+        # pushurl, so a split origin is only ever a hand edit, and refusing it
+        # makes the tracking ref and the push destination the same repository
+        # by construction instead of keeping two bookkeeping systems agreeing.
+        # Compared as git resolves them, so a pushInsteadOf rewriting the URL
+        # counts too: git applies it to the URL a push is handed as well.
+        #
+        # Only against a single URL on the other side. Several there is that
+        # operation's own refusal above; a fetch from the one url stays
+        # harmless while every push is refused.
+        other = self._origin_urls(d, "fetch" if operation == "push" else "push")
+        if urls and len(other) == 1 and other[0] != urls[0]:
+            fetch, push = (urls[0], other[0]) if operation == "fetch" else (other[0], urls[0])
+            raise ProjectError(
+                f"origin fetches from {_redact_url(fetch)} but pushes to "
+                f"{_redact_url(push)}, so BLPL cannot tell what has been "
+                "published where. Use Change remote… in Project settings → Git "
+                "to set the one URL both should use."
+            )
         return urls[0] if urls else ""
+
+    def _origin_urls(self, d: Path, operation: str) -> list[str]:
+        """Every URL git uses on origin for ``operation``, as git resolves
+        them: for a push, the pushurls when any are set, else the urls."""
+        args = ["remote", "get-url", "--all"] + (["--push"] if operation == "push" else [])
+        return list(dict.fromkeys(
+            u.strip() for u in self._git_allow_fail(d, *args, self.REMOTE).splitlines() if u.strip()
+        ))
 
     def remote_of(
         self, name: str, *, operation: str, checkout: Path | None = None
@@ -833,6 +868,20 @@ class Projects:
         has_remote = self._primary_remote(d) is not None
         ahead = behind = 0
         unpublished = False
+        # Whatever pull and push would refuse origin for, asked the same way
+        # they ask. With a problem, origin's tracking ref is not evidence of
+        # what the push destination holds — a fetch URL and a separate pushurl
+        # made it describe one repository while pushes went to another, and
+        # status reported "published, nothing ahead" for a branch the push
+        # destination had never seen (Codex, PR #10). So nothing is measured
+        # against it, and the problem is reported instead.
+        remote_problem = ""
+        if has_remote:
+            try:
+                for op in ("fetch", "push"):
+                    self._single_destination(d, op)
+            except ProjectError as exc:
+                remote_problem = str(exc)
         # Measured against origin's copy of this branch — the ref
         # `push --set-upstream origin HEAD` updates — not @{upstream}. Every
         # push goes to origin by name, so a branch tracking another remote, or
@@ -845,7 +894,8 @@ class Projects:
             ).strip()
             else ""
         )
-        if has_remote and published:
+        measurable = has_remote and not remote_problem
+        if measurable and published:
             counts = self._git_allow_fail(
                 d, "rev-list", "--left-right", "--count", f"{published}...HEAD"
             )
@@ -853,7 +903,7 @@ class Projects:
                 parts = counts.split()
                 if len(parts) == 2:
                     behind, ahead = int(parts[0]), int(parts[1])
-        elif has_remote:
+        elif measurable:
             # Never pushed. Zero here hid the project's whole history from the
             # push button the moment a remote was added to it: clean tree,
             # ahead 0, button disabled. Count what origin lacks instead — every
@@ -866,15 +916,15 @@ class Projects:
         remote_name = ""
         remote_url = ""
         if has_remote:
-            # origin, which every pull and push names (see REMOTE), and its
-            # push URL — where a push actually goes, if a separate one is set.
+            # origin, which every pull and push names (see REMOTE), and every
+            # URL a push goes to — resolved as push resolves it, so the panel
+            # cannot name one repository while the button pushes to another.
+            # With no problem that is one URL, and the same one fetch uses.
             remote_name = self.REMOTE
-            remote_url = _redact_url(
-                self._git_allow_fail(d, "remote", "get-url", "--push", remote_name).strip()
-            )
+            remote_url = ", ".join(_redact_url(u) for u in self._origin_urls(d, "push"))
         return GitStatus(branch=branch, ahead=ahead, behind=behind, dirty=dirty,
                          has_remote=has_remote, remote_name=remote_name, remote_url=remote_url,
-                         unpublished=unpublished)
+                         unpublished=unpublished, remote_problem=remote_problem)
 
     # -- diff ----------------------------------------------------------------
 

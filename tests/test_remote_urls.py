@@ -202,14 +202,21 @@ def test_pull_and_push_credentials_follow_their_own_urls(tmp_path):
     # Codex P1 on #10: remote_of answered with the push URL for everything, so
     # with origin fetching from host A and pushing to host B, a pull fetched
     # from A while the credential helper offered it B's token — leaking the
-    # token to the wrong host and failing the pull.
+    # token to the wrong host and failing the pull. A split origin is now
+    # refused outright (Codex, PR #10: its tracking ref described A while
+    # pushes went to B), so neither direction leases a credential at all.
     store = projects_mod.Projects(tmp_path / "projects")
     work = _repo(tmp_path / "projects" / "p")
     subprocess.run(["git", "remote", "add", "origin", "https://host-a.example/o/p.git"], cwd=work, check=True)
     subprocess.run(["git", "remote", "set-url", "--push", "origin", "https://host-b.example/o/p.git"], cwd=work, check=True)
 
+    for op in ("fetch", "push"):
+        with pytest.raises(ProjectError, match="fetches from https://host-a.example/o/p.git "
+                                               "but pushes to https://host-b.example/o/p.git"):
+            store.remote_of("p", operation=op)
+    store.set_remote(work, "https://host-a.example/o/p.git")
     assert store.remote_of("p", operation="fetch") == "https://host-a.example/o/p.git"
-    assert store.remote_of("p", operation="push") == "https://host-b.example/o/p.git"
+    assert store.remote_of("p", operation="push") == "https://host-a.example/o/p.git"
     with pytest.raises(ValueError):
         store.remote_of("p", operation="both")
 
@@ -660,17 +667,59 @@ def test_saving_the_fetch_url_over_a_separate_push_url_forgets_the_push_side(tmp
     b = tmp_path / "b.git"
     for bare in (a, b):
         subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
-    subprocess.run(["git", "remote", "add", "origin", f"file://{a}"], cwd=work, check=True)
-    subprocess.run(["git", "remote", "set-url", "--push", "origin", f"file://{b}"], cwd=work, check=True)
+    # Published to B, then origin hand-edited to fetch from A and push to B —
+    # a split origin can no longer be pushed through, so it is made after.
+    store.set_remote(work, f"file://{b}")
     store.push("p")
-    assert "main" in _heads(b) and not store.status("p", checkout=work).unpublished
+    _config(work, "remote.origin.url", f"file://{a}")
+    _config(work, "remote.origin.pushurl", f"file://{b}")
+    assert "main" in _heads(b) and store.status("p", checkout=work).remote_problem
 
     store.set_remote(work, f"file://{a}")
 
     st = store.status("p", checkout=work)
-    assert st.unpublished and st.ahead == 1
+    assert not st.remote_problem and st.unpublished and st.ahead == 1
     store.push("p")
     assert "main" in _heads(a)
+
+
+def test_a_separate_push_url_cannot_hide_an_unpublished_branch(tmp_path):
+    # Codex P1 on #10: origin fetched from A, which already held HEAD, and
+    # pushed to an empty B. refs/remotes/origin/main described A, so status
+    # said "published, ahead 0", Commit + Push was disabled, and the branch
+    # could never reach B — the repository the panel named — through the UI.
+    store = projects_mod.Projects(tmp_path / "projects")
+    work = _repo(tmp_path / "projects" / "p")
+    a = tmp_path / "a.git"
+    b = tmp_path / "b.git"
+    for bare in (a, b):
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    store.set_remote(work, f"file://{a}")
+    store.push("p")
+    _config(work, "remote.origin.pushurl", f"file://{b}")
+    assert "main" in _heads(a) and _heads(b) == set()
+
+    st = store.status("p", checkout=work)
+    # Not "published, nothing ahead": the problem is reported instead, and the
+    # URL shown is the one a push would go to.
+    assert "Change remote" in st.remote_problem
+    assert st.remote_url == f"file://{b}"
+    # Both refuse before touching the network, and B stays empty.
+    with pytest.raises(ProjectError, match="but pushes to"):
+        store.push("p")
+    with pytest.raises(ProjectError, match="but pushes to"):
+        store.pull("p")
+    assert _heads(b) == set()
+
+    # Change remote normalises origin to one URL, and the push publishes there.
+    store.set_remote(work, f"file://{b}")
+    st = store.status("p", checkout=work)
+    assert not st.remote_problem and st.unpublished and st.ahead == 1
+    assert st.remote_url == f"file://{b}"
+    store.push("p")
+    assert "main" in _heads(b)
+    st = store.status("p", checkout=work)
+    assert not st.unpublished and st.ahead == 0
 
 
 def test_changing_the_remote_mid_push_cannot_be_undone_by_the_push(tmp_path):

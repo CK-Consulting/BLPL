@@ -87,6 +87,14 @@ export function ProjectSync({
         </span>
       )}
       {st.behind > 0 && <span className="badge">↓{st.behind}</span>}
+      {/* Shown instead of a publication state the server could not measure:
+          an origin fetching from one repository and pushing to another read as
+          "published, nothing ahead" against the wrong one (Codex, PR #10). */}
+      {st.has_remote && st.remote_problem && (
+        <span className="badge warn" title={st.remote_problem}>
+          remote needs fixing
+        </span>
+      )}
       {!st.has_remote && (
         <span
           className="muted"
@@ -411,6 +419,7 @@ function ProjectGitPanel({
                 {/* Any credential in the URL is replaced server-side before it
                     reaches here, so this is safe to show and to screenshot. */}
                 <span className="remote-url">{st.remote_url}</span>
+                {st.remote_problem && <p className="gate-error small">{st.remote_problem}</p>}
               </>
             ) : (
               <span className="muted">

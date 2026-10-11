@@ -414,6 +414,10 @@ export type GitStatus = {
   /** Has a remote but has never been pushed to it. `ahead` then counts what
    *  the remote lacks, and pushing is allowed with a clean tree. */
   unpublished?: boolean;
+  /** Why pull and push would refuse the remote as configured (several URLs,
+   *  or a fetch URL and a different push URL), else empty. When set, `ahead`
+   *  and `unpublished` are not measured and say nothing. */
+  remote_problem?: string;
 };
 
 export type LibraryPolicyValues = {

@@ -2390,6 +2390,7 @@ def git_status(project_id: str, user: User = Depends(require_onboarded),
         "dirty": st.dirty, "has_remote": st.has_remote,
         "remote_name": st.remote_name, "remote_url": st.remote_url,
         "unpublished": st.unpublished,
+        "remote_problem": st.remote_problem,
     }
 
 
