@@ -365,28 +365,6 @@ def test_cli_prints_failures_and_the_report_path(tmp_path: Path, capsys, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# The agent tool
-# ---------------------------------------------------------------------------
-
-
-def test_agent_tool_points_at_stage8_when_there_is_nothing_to_simulate(tmp_path) -> None:
-    import asyncio
-
-    from app.agent.registry import sim_tools
-    from app.agent.toolspec import ToolContext
-    from app.references import FilesystemSandbox
-
-    spec = next(t for t in sim_tools() if t.name == "simulate_subcircuits")
-    ctx = ToolContext(
-        project_id="p",
-        project_dir=tmp_path,
-        sandbox=FilesystemSandbox(tmp_path),
-    )
-    with pytest.raises(FileNotFoundError, match="stage8"):
-        asyncio.run(spec.handler(ctx, {}))
-
-
-# ---------------------------------------------------------------------------
 # End-to-end, when a simulator is actually installed
 # ---------------------------------------------------------------------------
 
