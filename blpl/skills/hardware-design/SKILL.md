@@ -560,12 +560,21 @@ and pinout table. Nothing should be left behind or put on two boards.
 `<board>/<board>.md`.
 - It carries that board's BOM, its pinout tables, and its own identity,
   stackup and net-class tables. Boards do not share an outline or a stackup.
-- Before proposing, call `run_doctor` with the same `path` and `content`. It
-  must not report DOC-016. If it does, step 2 has not been accepted or the
-  name does not match.
+- Before proposing, call `run_doctor` with the same `path` and `content`. DOC-016
+  comes in two kinds here, and they mean opposite things:
+  - **DOC-016 *error*** naming this board ("not a board", or a folder "no board
+    declares"): stop. Step 2 has not been accepted, or the folder name does not
+    match `project.md`.
+  - **DOC-016 *warning*** about tables at the root: **expected** until step 5.
+    The root still holds the design you are moving, on purpose. Ignore this one
+    and only this one until then.
 - Fix what doctor reports, propose, and wait for acceptance before starting the
   next board.
 - The proposal creates the board's folder. You do not need to create it first.
+
+Between step 2 and step 5 the project is mid-cutover. The root tables are no
+longer built, and the boards are not all written yet. Do not run the pipeline
+in this window, and tell the user not to.
 
 **4. Propose each board's `<board>/project.yaml`**, with its own dimensions,
 outline, stackup and net classes. This is what `blpl init --board <board>`
@@ -579,11 +588,12 @@ writes.
   Until then the root is the only place the design exists in the build.
 - The root keeps `project.md`, overview prose, block diagrams and reference
   material.
-- Doctor warns (DOC-016) about BOM or pinout tables left at the root of a
-  multi-board project, because no board reads them.
+- This clears the DOC-016 root-tables warning you were told to ignore in step
+  3. If it remains, a table was missed. Find which board it belongs to rather
+  than deleting it.
 
 **6. Check the whole project.** Call `run_doctor` with no path. There must be
-no DOC-016. Then check each board's document (`path` set to it) and fix what
+no DOC-016 of either kind. Then check each board's document (`path` set to it) and fix what
 it finds.
 
 **7. Declare how the boards meet.** Once each mating connector exists on both

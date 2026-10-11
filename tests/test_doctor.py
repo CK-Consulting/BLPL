@@ -1208,3 +1208,19 @@ def test_a_gpio_table_counts_as_design_content(tmp_path: Path) -> None:
         "## GPIO\n\n| GPIO | Signal |\n|---|---|\n| P0.01 | LED |\n", encoding="utf-8"
     )
     assert "DOC-016" in _codes(doctor.layout(proj))
+
+
+def test_mid_split_the_root_tables_are_only_a_warning(tmp_path: Path) -> None:
+    """Codex, PR #16: the procedure keeps the root tables until every board's
+    document is accepted, so while a board document is checked mid-split, the
+    root-tables DOC-016 must be a warning and never an error, or the documented
+    sequence cannot be completed."""
+    proj = tmp_path / "p"
+    (proj / "main").mkdir(parents=True)
+    (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n- power\n", encoding="utf-8")
+    (proj / "board.md").write_text(_BOM, encoding="utf-8")
+    (proj / "main" / "main.md").write_text(_BOM, encoding="utf-8")
+
+    report = doctor.run(proj, footprints_root=tmp_path / "nope", board="main")
+    hits = [f for f in report.findings if f.code == "DOC-016"]
+    assert hits and all(f.severity == "warning" for f in hits)

@@ -762,7 +762,9 @@ def _check_layout(report: Report, project_dir: Path) -> None:
                     fix=(
                         "Each board builds only its own directory. Move the tables into the "
                         "board they describe, e.g. core/core.md; the root holds project.md "
-                        "and reference material."
+                        "and reference material. While a project is being split, this is "
+                        "expected until every board's document exists; remove the root "
+                        "tables last."
                     ),
                     file=stray[0].name,
                 )
