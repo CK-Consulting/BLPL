@@ -23,8 +23,20 @@ thing to a reader. Every name is normalised before it is compared.
 
 *Objects can be compressed.* Since PDF 1.5 most of a document's structure lives
 in Flate-compressed object streams, so ``b"/OpenAction" in data`` is a test that
-a modern file passes while still containing one. Every stream that decompresses
-is scanned as well as the raw bytes.
+a modern file passes while still containing one. Every object stream is
+decompressed and scanned as well as the file's own structure.
+
+**Only structure is read, because data is not.** A name means something only
+where a reader would parse it as one: in a dictionary, an array, an object.
+Inside a stream body or a string it is just bytes — and base64 and ASCII85, the
+encodings vendors use for XMP thumbnails and images, both use ``/`` as an
+ordinary character. Matching names across the raw file therefore read
+``...snx/JS/1TJ...`` in a thumbnail as ``/JS``: TE's ANT-916-HESM datasheet was
+held for carrying JavaScript it does not have (qpdf's structural parse finds no
+``/JS`` among its 138 distinct keys), and any Adobe-exported datasheet with
+embedded previews could trip ``/JS``, ``/AA`` or ``/Launch`` at random. Stream
+bodies, strings and comments are blanked before names are matched, and only
+streams a reader would parse as objects are decompressed and read.
 
 **One it cannot handle, stated rather than papered over.** An encrypted PDF has
 its strings and streams enciphered, so there is nothing here to match. That is
@@ -135,9 +147,79 @@ def _unescape(name: bytes) -> str:
     )
 
 
+# Where something that is not structure may begin: a literal string, a hex
+# string (but not the `<<` that opens a dictionary), a comment, or the body of
+# a stream. `stream` must stand alone so `/Substream` is not mistaken for one.
+_NOT_STRUCTURE = re.compile(rb"[(%]|(?<!<)<(?!<)|(?<![A-Za-z0-9#/])stream\r?\n")
+_ENDSTREAM = b"endstream"
+_EOL = re.compile(rb"[\r\n]")
+
+
+def _structure(data: bytes) -> bytes:
+    """`data` with every stream body, string and comment blanked out.
+
+    What is left is what a PDF reader parses as objects, and the only place a
+    name means anything. A blanked span becomes one space so tokens either side
+    of it stay apart.
+
+    Errs towards keeping bytes: a stream with no `endstream`, or a string that
+    never closes, leaves the rest of the file in place to be scanned. A file
+    built to confuse this gets more scrutiny, not less.
+    """
+    out: list[bytes] = []
+    pos = 0
+    n = len(data)
+    while True:
+        m = _NOT_STRUCTURE.search(data, pos)
+        if m is None:
+            out.append(data[pos:])
+            break
+        start = m.start()
+        out.append(data[pos:start])
+        lead = data[start : start + 1]
+        if lead == b"(":
+            # Literal strings nest on balanced parens; `\(` and `\)` do not count.
+            depth, i = 0, start
+            while i < n:
+                c = data[i]
+                if c == 0x5C:            # backslash: skip the escaped byte
+                    i += 2
+                    continue
+                if c == 0x28:
+                    depth += 1
+                elif c == 0x29:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            if i >= n:
+                out.append(data[start:])
+                break
+            end = i + 1
+        elif lead == b"<":
+            close = data.find(b">", start + 1)
+            if close < 0:
+                out.append(data[start:])
+                break
+            end = close + 1
+        elif lead == b"%":
+            nl = _EOL.search(data, start)
+            end = n if nl is None else nl.end()
+        else:                            # a stream body, up to its endstream
+            close = data.find(_ENDSTREAM, m.end())
+            if close < 0:
+                out.append(data[start:])
+                break
+            out.append(b"stream ")
+            end = close
+        out.append(b" ")
+        pos = end
+    return b"".join(out)
+
+
 def _scan(data: bytes, where: str) -> dict[str, Finding]:
     found: dict[str, Finding] = {}
-    for match in _NAME.finditer(data):
+    for match in _NAME.finditer(_structure(data)):
         name = _unescape(match.group(1))
         entry = CONSTRUCTS.get(name)
         if entry is None or name in found:
@@ -147,14 +229,24 @@ def _scan(data: bytes, where: str) -> dict[str, Finding]:
     return found
 
 
-def _inflate_streams(data: bytes) -> tuple[list[bytes], int]:
-    """Every stream in the file that Flate-decompresses.
+def _names(data: bytes) -> set[str]:
+    """Every name in the structure of `data`, normalised."""
+    return {_unescape(m.group(1)) for m in _NAME.finditer(_structure(data))}
 
-    Deliberately indiscriminate: rather than parse each stream dictionary to
-    learn its filter, this tries to inflate every stream and keeps what works.
-    Parsing the dictionary would be the tidier route and a second place to be
-    fooled — a stream whose declared filter disagrees with its bytes is exactly
-    the sort of thing an attacker writes.
+
+def _inflate_object_streams(data: bytes) -> tuple[list[bytes], int]:
+    """Every object stream in the file, decompressed.
+
+    Only object streams, because only they hold objects: an image, a page's
+    drawing operators or an XMP packet is data, and reading names out of data
+    is the false positive this module used to have. A stream counts as an
+    object stream if its dictionary says `/Type /ObjStm` *or* carries `/First`
+    — no reader can locate the objects inside without `/First`, so a file that
+    omits the type to hide its objects still has to declare it.
+
+    The filter is not parsed: every candidate is offered to zlib and whatever
+    inflates is kept. A declared filter that disagrees with the bytes is
+    exactly what an attacker writes.
     """
     out: list[bytes] = []
     count = 0
@@ -162,11 +254,18 @@ def _inflate_streams(data: bytes) -> tuple[list[bytes], int]:
         if count >= _MAX_STREAMS:
             break
         count += 1
+        # The stream's dictionary is what precedes the keyword, back to its
+        # `obj`. Bounded, because a dictionary is short and a file is not.
+        head = data[max(0, match.start() - 4096) : match.start()]
+        obj = head.rfind(b"obj")
+        names = _names(head[obj + 3 :] if obj >= 0 else head)
+        if "ObjStm" not in names and "First" not in names:
+            continue
         chunk = data[match.end() : match.end() + _MAX_INFLATE]
         try:
             out.append(zlib.decompressobj().decompress(chunk, _MAX_INFLATE))
         except zlib.error:
-            continue        # not Flate, or not a stream at all — nothing to read
+            continue        # not Flate — nothing this module can read
     return out, count
 
 
@@ -192,7 +291,7 @@ def inspect_bytes(data: bytes) -> Inspection:
         )
 
     found = _scan(data, "raw")
-    inflated, count = _inflate_streams(data)
+    inflated, count = _inflate_object_streams(data)
     for chunk in inflated:
         for name, finding in _scan(chunk, "stream").items():
             found.setdefault(name, finding)
@@ -200,7 +299,8 @@ def inspect_bytes(data: bytes) -> Inspection:
     # Checked after scanning, so an encrypted file still reports whatever was
     # visible in its unencrypted structure. `/Encrypt` in the trailer means the
     # strings and streams are enciphered and their contents cannot be read.
-    if "Encrypt" in {_unescape(m.group(1)) for m in _NAME.finditer(data)}:
+    # Structural like everything else: the word in a thumbnail is not a key.
+    if "Encrypt" in _names(data):
         return Inspection(
             state="cannot_inspect",
             findings=sorted(found.values(), key=lambda f: f.name),

@@ -90,6 +90,77 @@ def test_a_whole_name_is_matched_not_a_prefix(tmp_path):
     assert r.is_inert, [f.name for f in r.findings]
 
 
+def test_base64_in_a_metadata_stream_is_data_not_names(tmp_path):
+    """The TE ANT-916-HESM datasheet was held for JavaScript it did not have.
+    Its XMP packet carries base64 JPEG thumbnails, base64 uses `/` as an
+    ordinary character, and `...snx/JS/1TJ...` was read as the name `/JS`."""
+    xmp = (
+        b"<x:xmpmeta><wn_previews:base64_data>/9j/4AAQSkZJRgABAgEASABIAAD"
+        b"snx/JS/1TJ84f8+aA/AA/q9Launch/Zz</wn_previews:base64_data></x:xmpmeta>"
+    )
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Metadata 2 0 R>>endobj\n"
+        + b"2 0 obj<</Type/Metadata/Subtype/XML/Length " + str(len(xmp)).encode()
+        + b">>stream\n"
+        + xmp
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.is_inert, [f.name for f in r.findings]
+
+
+def test_ascii85_in_an_image_stream_is_data_not_names(tmp_path):
+    data = (
+        b"%PDF-1.4\n4 0 obj<</Type/XObject/Subtype/Image/Filter/ASCII85Decode>>stream\n"
+        b"9jqo^BlbD-BleB1DJ+*+F(f,q/JavaScript(JhKF<GL>Cj@.4Gp$d7F!,L7@<6@)/0JDEF<G%<+EV:2F!,O<~>"
+        b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.is_inert, [f.name for f in r.findings]
+
+
+def test_a_name_inside_a_string_is_text_not_structure(tmp_path):
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Title(see /Launch here \\) and (/JS) nested)>>endobj\n"
+        b"2 0 obj<</Subject<2F4A53>>>endobj\n"
+        b"% a comment naming /OpenAction is not one\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.is_inert, [f.name for f in r.findings]
+
+
+def test_javascript_on_open_in_the_structure_is_still_caught(tmp_path):
+    """Blanking strings must not blank the action that carries one."""
+    data = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/OpenAction<</S/JavaScript/JS(app.alert(1))>>>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JavaScript", "JS"} <= {f.name for f in r.active}
+
+
+def test_an_object_stream_that_hides_its_type_is_still_read(tmp_path):
+    """No reader can find the objects in an object stream without /First, so
+    leaving out /Type/ObjStm does not keep them from being scanned."""
+    inner = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+    packed = (
+        b"%PDF-1.5\n5 0 obj<</N 1/First 4/Filter/FlateDecode>>stream\n"
+        + zlib.compress(inner)
+        + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", packed))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+
+def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
+    data = (
+        b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"
+        b"trailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    assert pdf_inspect.inspect(_write(tmp_path, "a.pdf", data)).state == "inspected"
+
+
 def test_an_encrypted_pdf_is_unknown_rather_than_clean(tmp_path):
     """Its streams cannot be read, so there is nothing to match. Reporting that
     as clean would be the single most misleading thing this module could do."""
