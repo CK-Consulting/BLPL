@@ -122,9 +122,12 @@ This is a new compose service, `terminal`, with these properties:
   initial user namespace, which the terminal container must not have. So a
   separate, single-purpose service, `quota`, does only that: it runs with that
   one capability, has no network and no secrets, mounts only `data/projects`,
-  and listens on a Unix socket shared with `terminal`. It accepts a (project,
-  member) pair, derives the path itself with `worktrees.path_for`, and never
-  takes a path from its caller.
+  and listens on a Unix socket shared with the backend and `terminal`. It
+  accepts a (project, member) pair and one of four operations (assign an ID,
+  measure usage, set the limit, clear), derives the path itself with
+  `worktrees.path_for`, and never takes a path from its caller. The backend
+  calls it too, because the backend is what settles the ceiling after its own
+  writes (see "Limits").
 
 ### 2. The sandbox per session
 
@@ -143,6 +146,7 @@ bwrap --unshare-all --die-with-parent --new-session \
       --ro-bind <worktree>/datasheets /home/project/datasheets  # quarantined
       --ro-bind <worktree>/references /home/project/references  #   content: only
       --ro-bind <worktree>/retrieved  /home/project/retrieved   #   via Upload
+      --ro-bind <worktree>/.blpl      /home/project/.blpl       # app state
       --ro-bind <project>/.git        <project>/.git       # the real repository
       --ro-bind <stock libraries> <same paths>  # as the worker mounts them
       --size 256M --tmpfs /tmp  --dev /dev  --proc /proc
@@ -229,15 +233,29 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
   projects. The placeholder costs one file for the length of a session and
   keeps those projects usable.
 
-- **Quarantined directories are read-only.** `datasheets/` and `references/`
-  hold only files that passed `quarantine.accept_upload`: inspection, the
-  malware scan and the ledger. The blob route serves their PDFs inline on that
-  basis. A file written there from a shell would skip all of it and reach
-  other members' viewers and the models as if it had passed. So these
-  directories, and `retrieved/`, are bound read-only over the writable
-  checkout. A file from outside comes in through **Upload**, exactly as
-  without a terminal. A bind can only mask a directory that exists, so the
-  session creates any missing one, empty, before starting the sandbox.
+- **Quarantined directories are read-only, and that is not what makes a PDF
+  safe to open.** `datasheets/` and `references/` are where
+  `quarantine.accept_upload` puts files that passed inspection, the malware
+  scan and the ledger, and `retrieved/` holds the ledger itself and what was
+  held. The agent's read tools frame anything under them as untrusted by
+  directory. A file a shell wrote there would carry that directory's meaning
+  without having earned it, so these directories are bound read-only over the
+  writable checkout, and `.blpl/` with them: it holds the LLM-ignore list,
+  pending proposals, conversation transcripts and chat attachments, all of
+  which the backend and the models read as the app's own state. A forged
+  transcript is a prompt injection with the assistant's voice; an edited
+  `llm-ignore.json` un-ignores a file the uploader chose to keep from the
+  models. A bind can only mask a directory that exists, so the session
+  creates any missing one, empty, before starting the sandbox.
+
+  Masking directories does not stop a shell writing `evil.pdf` at the root of
+  the checkout or in a board directory, and today the blob route would serve
+  that inline: `get_blob` sends every `.pdf` outside `retrieved/` as
+  `application/pdf`, inline, whatever directory it is in
+  (`_blob_disposition` decides by suffix alone). So the decision moves from
+  the directory to the bytes. See [Which PDFs the browser may
+  open](#which-pdfs-the-browser-may-open): a PDF is opened inline only if its
+  content hash is one this backend inspected and released, wherever it sits.
 - **Commit author** comes from the member's account, not from the image's git
   config. Commits made in projects today show `BLPL <blpl@localhost>`, which is
   the same gap seen from the other side.
@@ -268,15 +286,69 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
       land in it directly, and the kernel bounds bytes and inodes together.
       `PROJINHERIT` makes everything created beneath it inherit the ID.
 
-    At session start the `quota` service gives the worktree a project ID,
-    once, and sets its hard limits to *current usage plus a headroom*:
-    `BLPL_TERMINAL_QUOTA_MB` bytes and `BLPL_TERMINAL_QUOTA_INODES` inodes. A
-    session can add that much and no more, and a write past it fails with
-    `EDQUOT`. The limits apply to every writer of that directory, which is
-    acceptable because no run can be in flight during a session (see below).
-    The only other writers are the Git panel, editor saves and proposal
-    accepts, which are small and which the headroom covers. At session end
-    the limits are lifted again.
+    **The ceiling is persistent, and it is measured from a fixed baseline.**
+    An earlier draft set the limit at each session start to *current usage
+    plus a headroom* and lifted it at session end. That bounds one session and
+    nothing else: fill the headroom, close the tab, reopen, and the new
+    session's "current usage" includes everything the last one wrote, so the
+    next headroom stacks on top. Repeated, it fills the filesystem a session
+    at a time. So:
+    - **The baseline is recorded once,** the first time a terminal session is
+      requested for that worktree, before the sandbox exists, so no shell
+      has written anything yet. The `quota` service assigns the project ID,
+      measures bytes and inodes, and the backend stores them in a
+      `terminal_quota` row keyed on (project, member): the project ID, the
+      baseline, the allowance (`BLPL_TERMINAL_QUOTA_MB` bytes and
+      `BLPL_TERMINAL_QUOTA_INODES` inodes by default) and the current ceiling,
+      starting at baseline plus allowance.
+    - **The kernel limit stays in force while the project ID is assigned.**
+      Closing a session does not lift it, and a new session does not
+      recompute it. A shell that filled its allowance and reconnects finds no
+      more room. The ID, the limit and the row go away only when the worktree
+      does (`worktrees.remove`, including on member removal).
+    - **Raising it is a person's decision.** The project owner, or a server
+      admin, can raise the allowance from project settings; the change is
+      recorded in the activity feed. Nothing raises it automatically on the
+      shell's behalf.
+    - **The owner's checkout is the repository directory,** so it contains the
+      shared `.git`, where every member's commits write objects. The `quota`
+      service gives `.git` a project ID of its own with no limit, so other
+      members' git traffic is never charged to the owner's shell. Inheritance
+      follows the parent directory, so objects created under `.git` keep that
+      ID.
+
+    **App-side writers.** The kernel charges every write in the directory to
+    the project ID, whoever makes it: uploads (up to `BLPL_UPLOAD_MAX_MB` per
+    file), pipeline outputs, editor saves, pulls. Two ways to account for
+    them were weighed:
+    - *One shared allowance.* Simple, and wrong in practice. A single large
+      upload would use up the shell's allowance, and the member's next editor
+      save would then fail with `EDQUOT` for a reason that has nothing to do
+      with the terminal. Which writer hits the wall first would be arbitrary.
+    - **The backend credits the ceiling with its own writes (chosen).** Every
+      app-side mutation of the worktree already passes through the one
+      write wrapper described under "Other writers", and while it runs the
+      session is frozen, or no session exists. So the usage the wrapper reads
+      before and after its write differs by exactly what the app wrote:
+      nothing in the shell can have moved in between. On entry the wrapper
+      widens the kernel limit by the write's bound (the upload cap times the
+      file count, the size of an editor buffer, `BLPL_RUN_QUOTA_MB` for a
+      run); on exit it sets the ceiling to the old ceiling plus the measured
+      net change, never below baseline plus allowance, and puts the kernel
+      limit back to it. The widening is safe because, for its duration,
+      nothing untrusted is writing: the shell is frozen, and runs cannot
+      overlap a session at all.
+
+    The trade-offs are honest ones. A run that writes more than
+    `BLPL_RUN_QUOTA_MB` in a worktree that has ever had a terminal now fails
+    with `EDQUOT`, a new failure mode, though the same bound also stops a
+    runaway pipeline filling the shared filesystem, which nothing does today.
+    The ceiling only tracks what the app wrote, not what it means, so an app
+    write that the shell later deletes gives the shell that much room back.
+    That room is bounded by what the app put there, not by anything the shell
+    can choose. And the arithmetic depends on the wrapper being the only path
+    by which the backend writes a worktree, which is the reason for the
+    structural guard below.
 
     **If the filesystem cannot do this, the terminal refuses to start.** The
     `quota` service reads the limits back from the kernel after setting them,
@@ -380,9 +452,85 @@ need a person.
   Auto-committing on session end is possible, but it would sweep up scratch
   files.
 - **Other writers while a shell is open.** A shell is a writer that can work in
-  the background, so every other route that writes the member's worktree
-  respects it, under the same admission lock:
-  - **Git-panel commit** freezes the whole sandbox. The backend asks the
+  the background, so every other path that writes the member's worktree
+  respects it. An earlier draft listed three (Git-panel commit, editor save,
+  proposal accept) and missed the rest: `/uploads` ends in `commit_checkout`,
+  whose `git add -A` stages the whole checkout, shell changes included, and
+  `/git/pull` rewrites the tree under a running job. A list of routes that
+  must remember to freeze is a list that the next route will be missing from.
+  So there is **one write wrapper**, `worktree_write(project, member,
+  reason, bound)`, and every mutation of a worktree goes through it. It:
+  1. takes the per-(member, project) admission lock, so a session cannot open
+     and a run cannot start during the write;
+  2. if a session is open, freezes it (below) and fails the write if the
+     freeze does not take;
+  3. widens and then settles the quota ceiling (see "Limits");
+  4. thaws, in a `finally`, whatever happened.
+
+  A writer that touches only paths the shell cannot write (`.blpl/`,
+  `retrieved/`, both bound read-only) may pass `freeze=False`, since it cannot
+  race the shell, but still takes the lock and settles the quota.
+
+  **Every current writer, as of `main` at f277796** (all in
+  `app/backend/app/main.py` unless named):
+
+  | path | what it writes |
+  |---|---|
+  | `git_commit` | `commit_checkout`: `git add -A` + commit |
+  | `write_file` | the file, then `_commit_landed_write` → `commit_checkout` |
+  | `upload_files` | `quarantine.accept_upload` into `datasheets/`, `references/`, `retrieved/`; `llm_ignore.set_ignored`; then `_commit_landed_write` |
+  | `set_llm_ignore` | `.blpl/llm-ignore.json`, then `_commit_landed_write` |
+  | `decide_proposal` | the proposed file (and its folder), then `_commit_landed_write` |
+  | `git_pull` | `projects.pull`: `git pull --ff-only` rewrites tracked files |
+  | `put_board_config` | a board's `project.yaml`, by `os.replace` |
+  | `post_lifecycle` | the lifecycle table |
+  | `make_folder` | a directory |
+  | `put_references` | `.blpl/references.json`, the conversations directory |
+  | `create_conversation`, `append_message`, `archive_conversation`, `delete_failed_message` | `.blpl/conversations/` |
+  | `upload_attachments` | `.blpl/` attachment store |
+  | `attach_component`, `update_component`, `detach_component` | `components.attach` / `update` / `detach` in the checkout |
+  | `start_chat_turn`, `resolve_approval` | the agent's writing tools during a turn: `_stage_library_documents` in `agent/registry.py` (PDFs into `datasheets/<mpn>/`), the distributor fetch through `quarantine`, `pinmap_parse` results, the turn's transcript |
+  | `run_stage`, `build_release`, `run_review_panel`, `run_pipeline` | a run in the worker; already mutually exclusive with a session (above) |
+  | `import_project` | `projects.commit_all` on a project that has just been created, so no session can exist; it goes through the wrapper anyway, for the guard |
+
+  Delete and move from the file tree (in progress) join the list when they
+  land. A run cannot be frozen, because the worker is another container; it
+  is handled by exclusion, as above.
+
+  **The KiCad desktop is a writer outside all of this.** `open_in_kicad_desktop`
+  itself writes only a request file outside the worktree, but the desktop
+  container mounts the project tree and saves into it whenever someone saves
+  in KiCad. The backend neither starts those writes nor knows when the
+  desktop is in use, so it can neither freeze them nor exclude them. That gap
+  is not new: the same desktop can already write under a running pipeline.
+  The proposal is that the desktop's projects mount follow its modules mount
+  and become **read-only by default**, writable only as a deliberate
+  deployment choice that is documented as a writer the wrapper does not see
+  ("Decisions wanted").
+
+  `git_push`, `stop_run`, `put_project_routing`, `update_policy`,
+  `open_in_kicad_desktop` and the membership routes are POSTs that do not
+  write the worktree (push sends objects, the KiCad route writes its request
+  file elsewhere, the rest change database rows).
+
+  **A structural guard, so a new route cannot skip it.**
+  - `projects._commit`, which both `commit_checkout` and `commit_all` reach,
+    asserts that a `worktree_write` scope is held for that checkout (a
+    context variable the wrapper sets) and raises if not. Any route that
+    commits without the wrapper fails the first time a test exercises it.
+    `projects.pull` does the same.
+  - `FilesystemSandbox.check_write`, which every agent tool already calls
+    before writing, makes the same assertion, so a new writing tool cannot
+    forget it either.
+  - A test walks `app.routes`. Every POST, PUT, PATCH or DELETE under
+    `/api/projects/{project_id}/` must either declare the `worktree_write`
+    dependency or appear in an explicit `NOT_A_WORKTREE_WRITE` table with a
+    one-line reason (the `git_push` and `update_policy` kind above). A new
+    route that is in neither fails the suite and has to say which it is.
+
+  The freeze itself:
+  - **Git-panel commit**, like every wrapped write, freezes the whole
+    sandbox. The backend asks the
     terminal service to freeze the session. The service writes `1` to
     `session-<id>/cgroup.freeze` and waits until `cgroup.events` reports
     `frozen 1`. Only then does the backend run `git add -A` and `git commit`,
@@ -416,6 +564,13 @@ need a person.
     proposal already checks this; editor saves gain a base hash. Without that,
     a browser buffer opened before the shell edited the file would silently
     overwrite the shell's change.
+  - **A write commits only what it wrote.** The freeze makes `git add -A`
+    consistent, not correct: an upload's commit would still sweep every
+    uncommitted shell change into a commit called `upload: 1 file(s)`. So
+    `_commit_landed_write` gains the paths its caller wrote and stages and
+    commits only those (`git add -- <paths>`, `git commit -- <paths>`).
+    Only the Git panel's own commit stages the whole checkout, because that is
+    what the member asked for after looking at the diff.
 - **Revocation ends the session.** A ticket checks membership once, when the
   socket opens, and a live shell would otherwise outlast its member's access.
   Its bind mount keeps the checkout reachable even after `worktrees.remove`.
@@ -462,6 +617,68 @@ The terminal image is the backend image, so it has what the pipeline has:
   before. Adding a second package manager to a Debian-based KiCad image for
   four tools would cost more than it saves.
 
+## Which PDFs the browser may open
+
+**How it works today.** `get_blob` makes one test, `_is_quarantined`: a file
+under `retrieved/` is served as `application/octet-stream`, attachment,
+`nosniff`. Everything else goes to `_blob_disposition`, which decides by
+suffix alone, so every `.pdf` anywhere else in the checkout is served
+`application/pdf`, inline, into the browser's own viewer. The directory a file
+sits in was meant to say whether it passed quarantine, but nothing makes a
+file in the checkout prove that.
+
+**The gap exists without a terminal.** PDFs already reach the checkout
+without going through `quarantine.accept_upload`:
+- `import_project`: `importer.ALLOWED_SUFFIXES` includes `.pdf`, and the files
+  are written straight into the new project.
+- `clone_project` and `git_pull`: whatever PDFs the remote carries.
+- `_stage_library_documents` in `agent/registry.py` copies a library part's
+  PDFs into `datasheets/<mpn>/`. Those arrived through
+  `POST /api/components/{mpn}/documents`, which stores them with no inspection
+  and no scan, so they land in the "trusted" directory with no ledger entry.
+- The KiCad desktop, which can write anywhere in its mount.
+
+The terminal adds a sixth way, and a much easier one. All of them are closed
+by the same change.
+
+**The change: trust follows the content hash, not the path.**
+- **The authority is the database, not the in-tree ledger.**
+  `retrieved/quarantine.json` is committed (the project `.gitignore` excludes
+  `retrieved/*` but keeps the ledger), so a pull or an import can bring in a
+  ledger row claiming any hash was released. The in-tree ledger stays the
+  readable, diffable record. Beside it the backend keeps a `pdf_verdict` table
+  keyed on (project, sha256): the inspection and scan results, the decision
+  (`released`, `released_active` or `held`), and where it came from (upload,
+  distributor fetch, first view). Only the backend writes it, from the same
+  code that writes the ledger. A migration seeds it once from each project's
+  current ledger, which accepts what is on disk today as this backend's own
+  record. That is a one-time trust decision, and it should be stated as one.
+- **`get_blob` hashes every PDF it is asked for,** wherever it sits, and looks
+  the hash up. The hash is cached on (path, inode, size, mtime), so a file is
+  hashed again only after it changes.
+  - `released`: served inline as `application/pdf`, as today.
+  - `released_active`: never inline (see below).
+  - `held`, or **no verdict at all**: `application/octet-stream`,
+    `Content-Disposition: attachment`, `nosniff`, exactly as `retrieved/` is
+    served today, and the tree marks the file as uninspected.
+- **First view runs the inspection.** A PDF with no verdict is not held for
+  ever. The first request for it runs the same `pdf_inspect` and scanner
+  checks `accept_upload` runs, without moving the file, records the verdict,
+  and serves by that verdict. Files over the upload size cap skip this and
+  stay attachment-only. The file stays where it is. What changes is only how
+  the browser is allowed to receive it. Directory placement stops mattering
+  for safety, so a PDF a shell wrote at the root, a PDF from a pulled
+  branch and one staged from the library are all treated alike.
+- Renames and moves no longer shed state, because state was never attached
+  to the path.
+
+Only PDFs need this. Images are inline but passive, text is always
+`text/plain`, and every other type is already an attachment. The agent's read
+tools are unaffected: their untrusted framing for `datasheets/`,
+`references/` and `retrieved/` is about content models read, and a member's
+shell writing a file the agent then reads is no more than the member can do
+in the editor today.
+
 ## The same sandbox, for untrusted PDFs
 
 The question that prompted this: can PDFs with real JavaScript be handled by
@@ -490,14 +707,31 @@ The proposal is a third ledger state, `released_active`, beside `held` and
   never by handing the browser a URL to the raw file. Download is still allowed,
   behind a notice naming what the file contains.
 - **Enforced at the server, not only in the viewer.** The blob route looks the
-  file up in the ledger, by path and by content hash so a rename does not shed
-  the state. For `released_active`, it never answers inline: it serves
+  file's content hash up in `pdf_verdict` ([above](#which-pdfs-the-browser-may-open)),
+  so neither a rename nor a copy to another directory sheds the state. For
+  `released_active`, it never answers inline: it serves
   `application/octet-stream` with `Content-Disposition: attachment` and
-  `nosniff`, exactly as it serves `retrieved/`. The pdf.js view fetches the
-  bytes through a separate route that only it calls. A raw link, an old tree
-  link or a pasted URL therefore downloads the file and never opens it in the
-  browser's own PDF viewer. Moving or renaming a released file is already
-  refused (PR #17), which keeps the ledger's path truthful.
+  `nosniff`, exactly as it serves `retrieved/`. A raw link, an old tree link
+  or a pasted URL therefore downloads the file and never opens it in the
+  browser's own PDF viewer.
+- **The pdf.js byte route is not a way around that.** pdf.js needs the bytes,
+  and an earlier draft gave it "a separate route that only it calls". Nothing
+  stops a person pasting that route's URL into the address bar, and if it
+  answered `application/pdf` the browser's native viewer would get the active
+  document after all. So the byte route answers exactly as the blob route
+  does for `released_active`: `application/octet-stream`,
+  `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`.
+  pdf.js does not care: it reads the response body as an `ArrayBuffer` and
+  never looks at the type or the disposition. Navigating to it can only
+  download. It additionally requires a request header, `X-BLPL-Viewer: pdfjs`,
+  and answers 400 without one. A navigation (a link, the address bar, an
+  `<iframe>`, `<embed>` or form) cannot set a custom header, and a
+  cross-origin `fetch` that sets one triggers a CORS preflight the backend
+  never grants, so only the app's own pdf.js can use it. The headers alone
+  already keep the file out of the native viewer. The custom header keeps
+  the route from becoming a second download link that skips the notice the
+  app shows before downloading an active PDF. `Sec-Fetch-Mode: navigate` is
+  refused as well, as a second signal where the browser sends it.
 - Text and spec extraction from it run in this sandbox:
   `bwrap --unshare-all` with the file bound read-only and output to a tmpfs,
   under the same seccomp profile.
@@ -527,6 +761,23 @@ documentation, and anything still on the left with no right-hand side is a bug.
 
 ## Phases
 
+0. **PDF trust by content hash.** This closes a gap that exists today
+   (import, clone, pull, library staging), so it lands first and does not
+   wait for the terminal. The `pdf_verdict` table and its seeding migration,
+   hash lookup in `get_blob`, inspection on first view. Tests that matter:
+   - A PDF written at the project root, in a board directory and in
+     `datasheets/` with no verdict is served as an attachment with `nosniff`,
+     never inline.
+   - The same bytes after an upload releases them are served inline, under
+     any path.
+   - A PDF in a pulled commit, alongside a ledger row in the pulled
+     `quarantine.json` claiming it was released, is still served as an
+     attachment until this backend has inspected it.
+   - A PDF staged by `_stage_library_documents` gets a verdict before it is
+     ever served inline.
+   - First view of a clean PDF records `released` and serves it inline; of
+     one with an OpenAction records `released_active` and does not.
+   - Editing a file in place invalidates the cached hash.
 1. **Service and sandbox.** Build the `terminal` container, the seccomp
    profile, the delegated cgroup subtree, the `quota` service, the bwrap
    launcher and ticket verification. Test it from the host with `websocat`
@@ -540,9 +791,14 @@ documentation, and anything still on the left with no right-hand side is a bug.
      `BLPL_UID`, and nothing inside the sandbox can move itself out of it.
    - Freezing a session stops a background job and a pipeline, not just the
      shell. `frozen 1` is observed before anything reads the tree.
-   - A loop creating empty files stops at the inode headroom, and one writing a
-     large file stops at the byte headroom, with `EDQUOT`. Another project's
+   - A loop creating empty files stops at the inode allowance, and one writing
+     a large file stops at the byte allowance, with `EDQUOT`. Another project's
      directory is unaffected.
+   - Fill the allowance, close the session, open a new one: there is no new
+     room. The baseline in `terminal_quota` is unchanged, and the kernel
+     limit is still set while no session is open.
+   - In the owner's checkout, another member's commits (objects under `.git`)
+     do not count against the owner's ceiling.
    - On a filesystem without project quotas the session refuses to start.
    - A fork bomb stops at `pids.max` and does not affect the backend.
    - In a plain-directory project, `/home/project/.git` cannot be created,
@@ -552,13 +808,38 @@ documentation, and anything still on the left with no right-hand side is a bug.
      objects and refs.
    - `git status` and `git diff` work, and `git commit` fails cleanly.
    - `blpl --help` runs. That proves the package and `PATH` are visible.
-   - Writing into `datasheets/`, `references/` or `retrieved/` fails.
+   - Writing into `datasheets/`, `references/`, `retrieved/` or `.blpl/`
+     fails.
+   - A PDF written from the shell at `/home/project/evil.pdf` is served by the
+     blob route as an attachment, not inline (phase 0's rule, seen from the
+     shell).
    - The service starts with no database reachable.
    - Stage 5 resolves a stock footprint.
 2. **Backend routes.** The session preflight with its 423 flow, the one-time
-   ticket, per-session holders, relay, activity and limits, plus the
+   ticket, per-session holders, relay, activity and limits, the
+   `worktree_write` wrapper on every writer in the table under "Other
+   writers", the quota ceiling and its owner-only raise, plus the
    `core.hooksPath` / `core.fsmonitor` overrides on the backend's own git
    commands. Tests that matter:
+   - The route-walking test: every mutating route under
+     `/api/projects/{project_id}/` declares `worktree_write` or is in
+     `NOT_A_WORKTREE_WRITE` with a reason. Adding a route that is in neither
+     fails it.
+   - Calling `commit_checkout`, `commit_all` or `pull`, or writing through
+     `FilesystemSandbox.check_write`, outside a `worktree_write` scope raises.
+   - An upload, an LLM-ignore change and a pull each freeze a session that
+     has a background job writing, and fail cleanly if the freeze times out.
+   - An upload while the shell has uncommitted edits commits only the
+     uploaded files and the ledger; the shell's edits stay uncommitted.
+   - After an upload during a session, the ceiling has grown by exactly the
+     upload's bytes, and the shell's remaining room is what it was.
+   - A run in a worktree with a quota can write up to `BLPL_RUN_QUOTA_MB`, and
+     the ceiling afterwards reflects what it wrote.
+   - Only the owner or an admin can raise the allowance, and the raise is in
+     the activity feed.
+   - The pdf.js byte route answers `application/octet-stream`, attachment,
+     `nosniff`, and refuses a request without `X-BLPL-Viewer` or with
+     `Sec-Fetch-Mode: navigate`.
    - Idle sealing does not fire while a session is open, and does fire after
      it closes.
    - Closing one of two tabs attached to a session does not seal under the
@@ -597,3 +878,13 @@ documentation, and anything still on the left with no right-hand side is a bug.
    the terminal refuses to start, by design.
 6. How the terminal container gets a writable cgroup subtree, once it has
    been tried on this host. The design does not ship without one.
+7. PDFs with no verdict: inspected on first view (proposed), or served as
+   attachments until someone asks for an inspection explicitly. First view is
+   friendlier; the explicit step keeps a GET from running a scanner.
+8. The terminal allowance defaults (`BLPL_TERMINAL_QUOTA_MB`,
+   `BLPL_TERMINAL_QUOTA_INODES`) and the run widening (`BLPL_RUN_QUOTA_MB`),
+   and whether a server admin as well as the owner may raise a member's
+   allowance.
+9. The KiCad desktop's projects mount: read-only by default (proposed), with a
+   writable mount as a documented deployment choice the write wrapper cannot
+   see, or writable as today.
