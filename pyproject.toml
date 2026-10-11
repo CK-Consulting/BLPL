@@ -46,4 +46,3 @@ python_files = ["test_*.py"]
 
 [tool.setuptools.package-data]
 "blpl.skills" = ["hardware-design/SKILL.md"]
-"blpl.plugin_kicad" = ["metadata.json", "version.txt"]

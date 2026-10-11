@@ -95,13 +95,14 @@ def _resolve_bundled_footprints_root():
     from pathlib import Path
 
     here = Path(os.path.dirname(os.path.realpath(__file__)))
-    # Layout: blpl/plugin_kicad/action_load_hdm.py → blpl → board-layer-pipe-line.
+    # Layout: plugin/blpl_kicad_plugin/action_load_hdm.py → plugin → the
+    # umbrella checkout, whose stock footprints are core/kicad-footprints.
     # Installed as ~/Documents/KiCad/10.0/3rdparty/plugins/com_.../ — the symlink
     # chain resolves back into the repo, so the same walks apply.
     for candidate in (
-        here.parent.parent / "kicad-footprints",
+        here.parent.parent / "core" / "kicad-footprints",
         here.parent / "kicad-footprints",
-        here.parent.parent.parent / "kicad-footprints",
+        here.parent.parent / "kicad-footprints",
     ):
         if candidate.exists():
             return candidate

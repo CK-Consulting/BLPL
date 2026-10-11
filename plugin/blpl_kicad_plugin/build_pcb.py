@@ -50,13 +50,16 @@ def _load_hdm(path: Path) -> dict:
 def _resolve_footprints_root(cli_value: str | None) -> Path:
     if cli_value:
         return Path(cli_value)
-    # Walk up from this file to find the bundled kicad-footprints submodule.
-    # Layout: blpl/plugin_kicad/build_pcb.py → blpl → board-layer-pipe-line.
+    # Walk up from this file to find a kicad-footprints checkout.
+    # Layout: plugin/blpl_kicad_plugin/build_pcb.py → plugin → the umbrella
+    # checkout, where the stock footprints are the pipeline's submodule under
+    # core/. The pipeline's stage6-plugin always passes --footprints-root, so
+    # these walks only matter when the plugin is run by hand.
     plugin_dir = Path(__file__).resolve().parent
     candidates = (
-        plugin_dir.parent.parent / "kicad-footprints",   # board-layer-pipe-line/kicad-footprints
-        plugin_dir.parent / "kicad-footprints",           # blpl/kicad-footprints (future)
-        plugin_dir.parent.parent.parent / "kicad-footprints",  # when symlinked up a level
+        plugin_dir.parent.parent / "core" / "kicad-footprints",  # umbrella: core/kicad-footprints
+        plugin_dir.parent / "kicad-footprints",           # plugin/kicad-footprints
+        plugin_dir.parent.parent / "kicad-footprints",    # when symlinked up a level
     )
     for candidate in candidates:
         if candidate.exists():
