@@ -352,6 +352,17 @@ describe("a rename that would hide an unsaved draft", () => {
     expect(moveRefusalForDraft("notes/a.md", true, "other.md", "other.pdf")).toBeNull();
     expect(moveRefusalForDraft("b/a.md", true, "b/a.md", "b/a.kicad_sch")).toMatch(/Save or discard/);
   });
+
+  it("refuses a rename that keeps the draft open but no longer savable", () => {
+    // Codex, PR #17: .txt, .json and extensionless names open as text, so the
+    // old guard let them through — but FileView will not save them, and the
+    // draft was lost to a Save button that did nothing.
+    for (const to of ["notes/a.txt", "notes/a.json", "notes/README"]) {
+      expect(moveRefusalForDraft("notes/a.md", true, "notes/a.md", to)).toMatch(/unsaved edits/);
+    }
+    expect(moveRefusalForDraft("notes/a.md", true, "notes/a.md", "notes/a.yaml")).toBeNull();
+    expect(moveRefusalForDraft("d/a.mmd", true, "d", "e")).toBeNull();
+  });
 });
 
 describe("deletes that would lose something", () => {

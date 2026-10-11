@@ -22,6 +22,13 @@ import { Markdown } from "./Markdown";
 // Diagrams are design documents too: text, versioned, edited here.
 const SAVABLE = /\.(md|markdown|ya?ml|mmd|mermaid)$/i;
 
+/** Whether this pane will save a file at this path. Exported so the tree's
+ *  rename guard asks the same question Save does, rather than a broader one
+ *  ("does it open as text?") that a .txt or .json passes and Save does not. */
+export function isSavable(path: string): boolean {
+  return SAVABLE.test(path);
+}
+
 export function FileView({
   projectId,
   path,
@@ -53,7 +60,7 @@ export function FileView({
   const [error, setError] = useState<string | null>(null);
   const area = useRef<HTMLTextAreaElement | null>(null);
 
-  const savable = !!path && SAVABLE.test(path);
+  const savable = !!path && isSavable(path);
   const dirty = editing && draft !== content;
 
   // Read in the effect rather than closed over, so re-running on reloadToken

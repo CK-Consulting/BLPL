@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState } from 
 import { type NodeApi, type NodeRendererProps, Tree, type TreeApi } from "react-arborist";
 import { delJSON, getJSON, postJSON, putJSON } from "../api";
 import { ConfirmDialog, PromptDialog } from "./Dialog";
+import { isSavable } from "./FileView";
 import { UploadDialog } from "./UploadDialog";
 
 /**
@@ -52,7 +53,8 @@ export type TreeNode = {
   modified?: string;
   /** On the LLM-ignore list: the assistant leaves it alone unless asked by name. */
   llm_ignore?: boolean;
-  /** Not in git: deleted here, nothing can bring it back. */
+  /** Not in git as it is now — untracked, ignored, or with uncommitted
+   *  changes: deleted here, git cannot bring these bytes back. */
   untracked?: boolean;
 };
 
@@ -786,6 +788,12 @@ export function destinationFor(node: TreeNode): "text" | "kicad" | "browser" {
  * rename only while the file stays a text document: renamed to .pdf or
  * .kicad_sch, the editor is handed no path, the draft is hidden, and the next
  * file opened discards it. Only the older on-disk contents would have moved.
+ *
+ * "Still opens as text" is not enough, though. a.md renamed to a.txt, a.json
+ * or an extensionless name still opens in the editor with the draft intact,
+ * but FileView will not save those, so Save does nothing and the draft is lost
+ * all the same (Codex, PR #17). The destination has to stay savable, asked of
+ * FileView's own predicate so the two cannot drift.
  */
 export function moveRefusalForDraft(
   openPath: string | null,
@@ -797,8 +805,8 @@ export function moveRefusalForDraft(
   if (openPath !== from && !openPath.startsWith(`${from}/`)) return null;
   const moved = to + openPath.slice(from.length);
   const name = moved.split("/").pop() ?? moved;
-  if (destinationFor({ name } as TreeNode) === "text") return null;
-  return `${openPath} has unsaved edits, and as ${name} it would no longer open in the editor. Save or discard them first.`;
+  if (isSavable(moved)) return null;
+  return `${openPath} has unsaved edits, and as ${name} the editor could no longer save them. Save or discard them first.`;
 }
 
 /**

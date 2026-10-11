@@ -2842,29 +2842,44 @@ def get_tree(
     # Marked on the node so the tree can say which files the assistant has been
     # told to leave alone, rather than that living only in a JSON file.
     ignored = llm_ignore.paths(proj)
-    tracked = _tracked_paths(proj)
+    recoverable = _recoverable_paths(proj)
     for node in nodes:
         if not node["dir"] and node["path"] in ignored:
             node["llm_ignore"] = True
         # Marked so a delete can say whether git can bring the file back: an
         # untracked or ignored file deleted here is gone, and a confirmation
-        # promising "one revert away" would be untrue for it.
-        if not node["dir"] and tracked is not None and node["path"] not in tracked:
+        # promising "one revert away" would be untrue for it. So is a tracked
+        # file with uncommitted changes — the delete commits only the deletion,
+        # so a revert restores HEAD's bytes, not the ones that were deleted.
+        # Still named "untracked" for the client, which asks only "can git
+        # bring this back as it is?".
+        if not node["dir"] and recoverable is not None and node["path"] not in recoverable:
             node["untracked"] = True
     # False when git could not answer; the client then promises no recovery.
-    return {"project_id": project_id, "nodes": nodes, "git": tracked is not None}
+    return {"project_id": project_id, "nodes": nodes, "git": recoverable is not None}
 
 
-def _tracked_paths(checkout: Path) -> set[str] | None:
-    """Every path git tracks in this checkout, or None when git cannot say."""
-    try:
+def _recoverable_paths(checkout: Path) -> set[str] | None:
+    """Every path git could restore exactly as it is now, or None when git cannot say.
+
+    That is a file in HEAD with no change since, staged or not. ``ls-files``
+    alone was the earlier answer and said yes too often (Codex, PR #17): it
+    lists a tracked file with uncommitted edits, and a file only ever staged,
+    and deleting either loses bytes no commit holds.
+    """
+    def _names(*args: str) -> set[str]:
         out = subprocess.run(
-            ["git", "-C", str(checkout), "ls-files", "-z"],
+            ["git", "-C", str(checkout), *args],
             capture_output=True, timeout=20, check=True,
         ).stdout
+        return {p.decode("utf-8", "surrogateescape") for p in out.split(b"\0") if p}
+
+    try:
+        committed = _names("ls-tree", "-r", "-z", "--name-only", "HEAD")
+        changed = _names("diff", "--name-only", "-z", "--no-renames", "HEAD", "--")
     except (OSError, subprocess.SubprocessError):
         return None
-    return {p.decode("utf-8", "surrogateescape") for p in out.split(b"\0") if p}
+    return committed - changed
 
 
 def _tree_target(proj: Path, rel: str) -> Path:
@@ -3371,8 +3386,9 @@ def _managed_path(session: Session, user: User, project_id: str, name: str) -> t
       the quarantine ledger beside them never lies by omission; a delete button
       over either would let it.
     - the target itself is not resolved. A symlink inside the project is deleted
-      or moved as the link, never followed, so only its *parent* has to resolve
-      inside the project — the same check ``make_folder`` makes.
+      or moved as the link, never followed, so only its *parent* is checked —
+      and that parent may contain no symlink at all, since every rule here is
+      decided on the lexical path.
     """
     proj = _project_dir(session, user, project_id)
     parts = [seg for seg in name.split("/") if seg]
@@ -3395,6 +3411,18 @@ def _managed_path(session: Session, user: User, project_id: str, name: str) -> t
     parent = proj.joinpath(*parts[:-1]).resolve()
     if not parent.is_relative_to(root):
         raise HTTPException(status_code=400, detail=f"invalid path {name!r}")
+    # Inside the project is not enough: every check here and after — the
+    # retrieved/ guard above, the untrusted-folder rule, the ledger, the
+    # ignore list — reads the *lexical* path. A folder link ``alias ->
+    # retrieved`` would let ``alias/quarantine.json`` be deleted, and ``alias
+    # -> datasheets`` would let a vendor file be moved out under a name no
+    # rule recognises (Codex, PR #17). Refused rather than canonicalised: the
+    # link itself can still be deleted or moved, which is all anyone needs.
+    if parent != root.joinpath(*parts[:-1]):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name!r} goes through a symlinked folder; use the folder's real path",
+        )
     target = parent / parts[-1]
     if target == root:
         raise HTTPException(status_code=400, detail=f"invalid path {name!r}")

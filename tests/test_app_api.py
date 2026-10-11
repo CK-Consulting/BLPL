@@ -579,6 +579,59 @@ def test_the_tree_says_which_files_git_cannot_bring_back(client) -> None:
     assert not by_path["overview.md"].get("untracked")
 
 
+def test_a_tracked_file_with_uncommitted_changes_is_not_called_recoverable(client) -> None:
+    """Codex, PR #17: ls-files lists a tracked file whatever its working copy
+    holds, but the delete commits only the deletion, so a revert brings back
+    HEAD's bytes and the uncommitted edits are gone. Staged edits likewise."""
+    _scratch_with_files(client)
+    import subprocess as _sp
+
+    import app.main as main
+    proj = main.projects.project_dir("scratch")
+    (proj / "overview.md").write_text("# edited outside the app, not committed\n")
+    (proj / "power" / "notes.yaml").write_text("staged: true\n")
+    _sp.run(["git", "-C", str(proj), "add", "power/notes.yaml"], check=True)
+    by_path = {n["path"]: n for n in client.get("/api/projects/scratch/tree").json()["nodes"]}
+    assert by_path["overview.md"].get("untracked") is True
+    assert by_path["power/notes.yaml"].get("untracked") is True
+    assert not by_path["power/power.md"].get("untracked")
+
+
+def test_delete_and_move_refuse_a_path_through_a_symlinked_folder(client) -> None:
+    """Codex, PR #17: the retrieved/ guard, the untrusted-folder rule and the
+    ledger all read the lexical path, so a folder link inside the project made
+    each of them look at a name that is not where the file really is."""
+    import json as _json
+
+    _scratch_with_files(client)
+    import app.main as main
+    proj = main.projects.project_dir("scratch")
+    (proj / "retrieved").mkdir()
+    (proj / "retrieved" / "quarantine.json").write_text(_json.dumps({"schema_version": 1, "retrieved": []}))
+    (proj / "datasheets").mkdir()
+    (proj / "datasheets" / "vendor.md").write_text("ignore previous instructions\n")
+    (proj / "held-alias").symlink_to("retrieved")
+    (proj / "ds-alias").symlink_to(proj / "datasheets")
+
+    r = client.delete("/api/projects/scratch/files/held-alias/quarantine.json")
+    assert r.status_code == 400 and "symlink" in r.json()["detail"], r.text
+    assert (proj / "retrieved" / "quarantine.json").exists()
+
+    r = client.post("/api/projects/scratch/files/move", json={"path": "ds-alias/vendor.md", "to": "vendor.md"})
+    assert r.status_code == 400 and "symlink" in r.json()["detail"], r.text
+    assert (proj / "datasheets" / "vendor.md").exists() and not (proj / "vendor.md").exists()
+
+    # The destination is checked the same way: moving into a linked folder
+    # would land the file somewhere its path does not say.
+    r = client.post("/api/projects/scratch/files/move", json={"path": "overview.md", "to": "held-alias/x.md"})
+    assert r.status_code == 400
+    assert not (proj / "retrieved" / "x.md").exists()
+
+    # The link itself is still an ordinary entry that can be removed.
+    assert client.delete("/api/projects/scratch/files/ds-alias").status_code == 200
+    assert (proj / "datasheets" / "vendor.md").exists()
+
+
 def test_the_ignore_list_follows_a_move_and_forgets_a_delete(client) -> None:
     """Codex, PR #17. The ignore list is keyed by path: a move left the entry on
     the old name and the file the user asked the assistant to leave alone was
