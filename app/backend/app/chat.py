@@ -42,6 +42,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -201,6 +202,11 @@ def build_system_prompt() -> str:
 class ProposalError(RuntimeError):
     """A proposal could not be created or applied. Carries a message meant for
     the user, not a stack trace."""
+
+
+class ProposalWriteError(ProposalError):
+    """An accepted proposal was still valid but could not be written. Unlike a
+    stale proposal, it can be accepted again once the cause is fixed."""
 
 
 # Provider failures that are about the provider's moment rather than the
@@ -489,11 +495,28 @@ def apply_proposal(
     # and the agent proposes that document before anyone has made the folder.
     # Without this the write raised FileNotFoundError, the route answered a bare
     # 500, and the proposal sat pending with nothing on screen to say why.
+    #
+    # A failure here is not staleness. The proposal is as valid as it was, and
+    # the full disk or the permission problem may be fixed in a minute, so it is
+    # raised separately and the route leaves the proposal pending to retry.
+    # Written beside the target and renamed over it, so a write that fails
+    # halfway never leaves the user's file truncated.
+    tmp = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(proposal.new_content, encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=target.parent, prefix=f".{target.name}.", delete=False
+        ) as fh:
+            tmp = Path(fh.name)
+            fh.write(proposal.new_content)
+        os.replace(tmp, target)
     except OSError as exc:
-        return False, f"could not write {proposal.path}: {exc.strerror or exc}"
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise ProposalWriteError(
+            f"could not write {proposal.path}: {exc.strerror or exc} — the proposal is "
+            "still pending; accept it again once that is fixed"
+        ) from exc
     return True, f"wrote {proposal.path}"
 
 
