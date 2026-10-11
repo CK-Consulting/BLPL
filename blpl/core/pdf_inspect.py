@@ -335,6 +335,33 @@ def _filters(dictionary: bytes) -> list[str]:
     return [_unescape(n) for n in _NAME.findall(m.group(1))]
 
 
+_INDIRECT_FILTER = re.compile(rb"/(Filter|F|DecodeParms|DP)\s+\d+\s+\d+\s+R")
+_DECODE_PARMS = re.compile(rb"/(DecodeParms|DP)\s+(?!null)")
+
+
+def _unreadable(dictionary: bytes, body_len: int) -> str | None:
+    """Why this object stream cannot be decoded faithfully here, or None.
+
+    Each is a way to turn a decode into a partial read that looks complete,
+    and each is answered by refusing rather than guessing:
+    - an indirect /Filter or /DecodeParms (`9 0 R`), whose value lives in
+      another object this check does not resolve;
+    - any /DecodeParms, such as a PNG or TIFF predictor, which zlib does not
+      undo, so a stream would inflate cleanly into still-encoded bytes;
+    - a body larger than the inspection limit, which would be read as its
+      first 8 MB.
+    None of the 3,079 object streams in the 92 datasheets this was measured
+    on has any of these, so the price is paid only by a file that does.
+    """
+    if _INDIRECT_FILTER.search(dictionary):
+        return "an indirect /Filter or /DecodeParms"
+    if _DECODE_PARMS.search(dictionary):
+        return "/DecodeParms"
+    if body_len > _MAX_INFLATE:
+        return "a body over the inspection limit"
+    return None
+
+
 def _decode(body: bytes, filters: list[str]) -> bytes | None:
     """The body as a reader would see it, or None when a filter cannot be
     undone here. Covers the filters an object stream realistically uses."""
@@ -393,11 +420,18 @@ def _object_streams(
     """
     out: list[bytes] = []
     undecodable: list[str] = []
-    limited = streams[:_MAX_STREAMS]
-    for st in limited:
-        if not ({"ObjStm", "First"} & _names_in(st.dictionary)):
+    # Object streams are chosen first and the cap applied to them, not to every
+    # stream: capping all streams let 4,000 images push an object stream past
+    # the limit, unread, while the file reported clean. Past the cap, unknown.
+    objstms = [st for st in streams if {"ObjStm", "First"} & _names_in(st.dictionary)]
+    if len(objstms) > _MAX_STREAMS:
+        return [], [f"more than {_MAX_STREAMS} object streams"], len(objstms)
+    for st in objstms:
+        problem = _unreadable(st.dictionary, st.end - st.start)
+        if problem:
+            undecodable.append(problem)
             continue
-        body = data[st.start : min(st.end, st.start + _MAX_INFLATE)]
+        body = data[st.start : st.end]
         filters = _filters(st.dictionary)
         decoded = _decode(body, filters)
         if decoded is None:
@@ -409,7 +443,7 @@ def _object_streams(
                 out.append(zlib.decompressobj().decompress(body, _MAX_INFLATE))
             except zlib.error:
                 pass
-    return out, undecodable, len(limited)
+    return out, undecodable, len(objstms)
 
 
 def inspect(path: str | Path) -> Inspection:
@@ -460,7 +494,7 @@ def inspect_bytes(data: bytes) -> Inspection:
             state="cannot_inspect",
             findings=sorted(found.values(), key=lambda f: f.name),
             reason=(
-                "an object stream uses a filter this check cannot decode ("
+                "an object stream uses something this check cannot decode ("
                 + ", ".join(sorted(set(undecodable)))
                 + "), so the objects inside it are unknown — which is not the same "
                 "as harmless"

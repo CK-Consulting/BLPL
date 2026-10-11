@@ -312,6 +312,66 @@ def test_an_unclosed_angle_bracket_does_not_swallow_the_rest(tmp_path):
     assert "OpenAction" in {f.name for f in r.active}
 
 
+_HIDDEN = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(x)>>>>"
+
+
+def _objstm(dict_extra: bytes, body: bytes) -> bytes:
+    return (
+        b"%PDF-1.5\n5 0 obj<</Type/ObjStm/N 1/First 4" + dict_extra + b">>stream\n"
+        + body + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+
+
+def test_an_object_stream_with_decode_parms_is_unknown(tmp_path):
+    """Codex, PR #15: a predictor inflates cleanly into still-encoded bytes,
+    so the scan saw nothing and the file came back inspected."""
+    data = _objstm(b"/Filter/FlateDecode/DecodeParms<</Predictor 2/Columns 4>>", zlib.compress(b"\x02" * 40))
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and "DecodeParms" in r.reason
+
+
+def test_an_indirect_filter_is_unknown_not_unfiltered(tmp_path):
+    """Codex, PR #15: `/Filter 9 0 R` read as no filter at all, so an ASCII85
+    object stream was scanned as raw bytes and its action missed."""
+    import base64
+
+    data = _objstm(b"/Filter 9 0 R", base64.a85encode(_HIDDEN) + b"~>")
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+def test_an_object_stream_over_the_limit_is_unknown_not_a_prefix(tmp_path, monkeypatch):
+    """Codex, PR #15: an unfiltered object stream past the limit was read as
+    its first 8 MB, and an object after the cut went unseen."""
+    monkeypatch.setattr(pdf_inspect, "_MAX_INFLATE", 64)
+    data = _objstm(b"", b"(" + b"x" * 100 + b") " + _HIDDEN)
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert r.state == "cannot_inspect" and not r.is_inert
+
+
+def test_ordinary_streams_cannot_push_an_object_stream_past_the_cap(tmp_path, monkeypatch):
+    """Codex, PR #15: the cap counted every stream, so enough images ahead of
+    an object stream left it unread while the file reported clean."""
+    monkeypatch.setattr(pdf_inspect, "_MAX_STREAMS", 3)
+    images = b"".join(
+        b"%d 0 obj<</Subtype/Image/Length 3>>stream\nabc\nendstream endobj\n" % i for i in range(10, 20)
+    )
+    data = (
+        b"%PDF-1.5\n" + images
+        + b"5 0 obj<</Type/ObjStm/N 1/First 4/Filter/FlateDecode>>stream\n"
+        + zlib.compress(_HIDDEN) + b"\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "a.pdf", data))
+    assert {"OpenAction", "JS"} <= {f.name for f in r.active}
+
+    # And past the cap of object streams themselves: unknown, never clean.
+    many = b"".join(
+        b"%d 0 obj<</Type/ObjStm/N 0/First 0>>stream\n\nendstream endobj\n" % i for i in range(30, 35)
+    )
+    r = pdf_inspect.inspect(_write(tmp_path, "b.pdf", b"%PDF-1.5\n" + many + b"%%EOF\n"))
+    assert r.state == "cannot_inspect"
+
+
 def test_encrypt_in_a_thumbnail_is_not_encryption(tmp_path):
     data = (
         b"%PDF-1.4\n2 0 obj<</Type/Metadata/Subtype/XML>>stream\nAb/Encrypt/Zz\nendstream endobj\n"
