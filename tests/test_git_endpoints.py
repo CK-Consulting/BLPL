@@ -216,7 +216,9 @@ def test_the_https_helper_reads_a_bracketed_ipv6_host_whole(tmp_path, stored) ->
     """Codex P2 on #10: the port was cut at the first colon, so git's
     `[2001:db8::1]:8443` became `[2001` — never matching the stored host, and
     matching any other address that began `[2001`. host_of drops the brackets,
-    so a row may hold either spelling; both must compare bare."""
+    so a row may hold either spelling; both must compare bare. A port on the
+    address is a different destination, though, and must not match a row
+    stored without one (Codex, PR #10)."""
     import os
     import subprocess
     from types import SimpleNamespace
@@ -240,8 +242,9 @@ def test_the_https_helper_reads_a_bracketed_ipv6_host_whole(tmp_path, stored) ->
     assert gitstore.host_of("https://[2001:db8::1]:8443/o/p.git") == "2001:db8::1"
     with gitstore.lease(key, row) as cred:
         assert "password=ghp_v6" in fill("[2001:db8::1]", cred.env)
-        assert "password=ghp_v6" in fill("[2001:db8::1]:8443", cred.env)
-        assert "ghp_v6" not in fill("[2001:db8::2]:8443", cred.env)
+        assert "password=ghp_v6" in fill("[2001:db8::1]:443", cred.env)
+        assert "ghp_v6" not in fill("[2001:db8::1]:8443", cred.env)
+        assert "ghp_v6" not in fill("[2001:db8::2]", cred.env)
         assert "ghp_v6" not in fill("[2001", cred.env)
 
 
@@ -320,7 +323,7 @@ class _User:
     id = 1
 
 
-_V6_REMOTES = ["https://[2001:db8::1]/repo", "https://[2001:db8::1]:8443/repo"]
+_V6_REMOTES = ["https://[2001:db8::1]/repo", "https://[2001:db8::1]:443/repo"]
 
 
 @pytest.mark.parametrize("stored", ["[2001:DB8::1]", "2001:db8::1"])
@@ -335,6 +338,8 @@ def test_an_ipv6_credential_is_found_for_its_remote(store, stored) -> None:
         row = gitstore.for_remote(store, _User(), remote)
         assert row is not None and row.name == "v6", remote
     assert gitstore.for_remote(store, _User(), "https://[2001:db8::2]/repo") is None
+    # Another port on the same address is another service (Codex, PR #10).
+    assert gitstore.for_remote(store, _User(), "https://[2001:db8::1]:8443/repo") is None
 
 
 def test_a_bracketed_row_from_before_the_fix_is_still_found(store) -> None:
@@ -417,3 +422,118 @@ def test_a_host_with_spaces_is_refused_without_echoing_it(store) -> None:
         gitstore.put(store, b"7" * 32, _User(), name="gh", host="ghp_tokensecret github.com",
                      method="https_token", secret="x", username="me")
     assert "ghp_tokensecret" not in str(exc.value)
+
+
+# -- a credential is scoped to host and port -----------------------------------
+
+
+def _fill(tmp_path, env: dict, host: str, protocol: str = "https") -> str:
+    """What a real `git credential fill` gets back through the leased helper."""
+    import os
+    import subprocess
+
+    r = subprocess.run(
+        ["git", "credential", "fill"],
+        input=f"protocol={protocol}\nhost={host}\n\n", capture_output=True, text=True,
+        env={**os.environ, **env, "HOME": str(tmp_path)}, cwd=tmp_path,
+    )
+    return r.stdout
+
+
+def _saved(store, host: str, secret: str = "ghp_corp", name: str = "corp"):
+    gitstore.put(store, b"7" * 32, _User(), name=name, host=host,
+                 method="https_token", secret=secret, username="me")
+    store.flush()
+
+
+def test_a_token_for_a_host_is_not_released_to_another_port_on_it(store, tmp_path) -> None:
+    """Codex P1 on #10: git supplies `host=git.corp.example:8443`, and the
+    helper cut the port off before comparing — so a token saved for
+    `git.corp.example` went to whatever service answered on 8443. Neither the
+    lookup nor the helper may treat every port on a hostname as one place."""
+    _saved(store, "git.corp.example")
+
+    assert gitstore.for_remote(store, _User(), "https://git.corp.example:8443/x") is None
+    for remote in ("https://git.corp.example/x", "https://git.corp.example:443/x",
+                   "https://GIT.corp.example/x"):
+        row = gitstore.for_remote(store, _User(), remote)
+        assert row is not None and row.name == "corp", remote
+
+    with gitstore.lease(b"7" * 32, gitstore.for_remote(
+            store, _User(), "https://git.corp.example/x")) as cred:
+        assert "ghp_corp" not in _fill(tmp_path, cred.env, "git.corp.example:8443")
+        assert "password=ghp_corp" in _fill(tmp_path, cred.env, "git.corp.example")
+        assert "password=ghp_corp" in _fill(tmp_path, cred.env, "git.corp.example:443")
+        # 443 is only the default over https; over http it is a named port.
+        assert "ghp_corp" not in _fill(tmp_path, cred.env, "git.corp.example:443", "http")
+
+
+def test_a_token_saved_with_a_port_is_released_only_for_that_port(store, tmp_path) -> None:
+    _saved(store, "git.corp.example:8443")
+
+    row = gitstore.for_remote(store, _User(), "https://git.corp.example:8443/x")
+    assert row is not None and row.host == "git.corp.example:8443"
+    assert gitstore.for_remote(store, _User(), "https://git.corp.example/x") is None
+    assert gitstore.for_remote(store, _User(), "https://git.corp.example:9443/x") is None
+
+    with gitstore.lease(b"7" * 32, row) as cred:
+        assert "password=ghp_corp" in _fill(tmp_path, cred.env, "git.corp.example:8443")
+        assert "ghp_corp" not in _fill(tmp_path, cred.env, "git.corp.example")
+        assert "ghp_corp" not in _fill(tmp_path, cred.env, "git.corp.example:9443")
+
+
+def test_an_ipv6_token_saved_with_a_port_is_released_only_for_that_port(store, tmp_path) -> None:
+    _saved(store, "[2001:DB8::1]:8443")
+
+    row = gitstore.for_remote(store, _User(), "https://[2001:db8::1]:8443/x")
+    assert row is not None and row.host == "[2001:db8::1]:8443"
+    assert gitstore.for_remote(store, _User(), "https://[2001:db8::1]/x") is None
+
+    with gitstore.lease(b"7" * 32, row) as cred:
+        assert "password=ghp_corp" in _fill(tmp_path, cred.env, "[2001:db8::1]:8443")
+        assert "ghp_corp" not in _fill(tmp_path, cred.env, "[2001:db8::1]")
+        assert "ghp_corp" not in _fill(tmp_path, cred.env, "[2001:db8::2]:8443")
+
+
+def test_the_default_port_is_the_same_credential_and_another_port_is_not(store) -> None:
+    """`host` and `host:443` are one destination over HTTPS, so they collide;
+    `host:8443` is another, so a second identity may hold it."""
+    _saved(store, "git.corp.example:443", name="corp")
+    assert gitstore.list_endpoints(store, _User())[0]["host"] == "git.corp.example"
+    with pytest.raises(gitstore.GitStoreError, match="'corp'"):
+        _saved(store, "git.corp.example", name="other")
+
+    _saved(store, "git.corp.example:8443", secret="ghp_alt", name="alt")
+    assert gitstore.for_remote(store, _User(), "https://git.corp.example:8443/x").name == "alt"
+    assert gitstore.for_remote(store, _User(), "https://git.corp.example/x").name == "corp"
+    assert all(e["conflicts_with"] == [] for e in gitstore.list_endpoints(store, _User()))
+
+
+def test_a_legacy_row_with_the_default_port_spelled_out_collides_with_the_bare_one(store) -> None:
+    """A row from before normalisation can hold `host:443`; that is the same
+    destination as `host`, so the pair is a collision, not two scopes."""
+    _legacy_row(store, "alice", "git.corp.example:443", "ghp_alice")
+    _legacy_row(store, "bob", "git.corp.example", "ghp_bob")
+    with pytest.raises(gitstore.GitStoreError, match="two saved credentials"):
+        gitstore.for_remote(store, _User(), "https://git.corp.example/x")
+    listing = {e["name"]: e["conflicts_with"] for e in gitstore.list_endpoints(store, _User())}
+    assert listing == {"alice": ["bob"], "bob": ["alice"]}
+
+
+def test_an_ssh_key_is_scoped_to_its_port_too(store) -> None:
+    """The same rule over SSH: a key saved for `git.corp.example` is for port
+    22, and an `ssh://...:2222` remote is another service."""
+    gitstore.put(store, b"7" * 32, _User(), name="key", host="git.corp.example",
+                 method="ssh_key", secret="-----BEGIN KEY-----")
+    store.flush()
+    for remote in ("ssh://git@git.corp.example/x.git", "ssh://git@git.corp.example:22/x.git",
+                   "git@git.corp.example:x.git"):
+        assert gitstore.for_remote(store, _User(), remote) is not None, remote
+    assert gitstore.for_remote(store, _User(), "ssh://git@git.corp.example:2222/x.git") is None
+
+
+@pytest.mark.parametrize("host", ["git.corp.example:http", "git.corp.example:0",
+                                  "git.corp.example:70000", "[2001:db8::1", "[2001:db8::1]x"])
+def test_a_host_with_an_unreadable_port_is_refused(store, host) -> None:
+    with pytest.raises(gitstore.GitStoreError, match=":port"):
+        _saved(store, host)
