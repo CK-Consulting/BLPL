@@ -87,7 +87,7 @@ function mermaidOnce() {
  * of why diagrams are worth having. A diagram says `class U1 mcu` and inherits
  * the rest.
  *
- * Generated from Tailwind's oklch ramps by mermaid/tools/palette.py, which
+ * Generated from Tailwind's oklch ramps by core/mermaid/tools/palette.py, which
  * refuses to emit a pair that misses AAA. Regenerate rather than edit.
  *
  * Colour only, and `shape` in the palette is deliberately not read here: a

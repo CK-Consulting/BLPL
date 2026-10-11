@@ -54,23 +54,33 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 COPY app/backend/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# BLPL itself (stages 0-8) plus the review analyzers. Build context is the
-# board-layer-pipe-line/ root so both are reachable.
+# BLPL itself (stages 0-8) plus the review analyzers. The pipeline is its own
+# tree, core/ (the future "blpl-core" repository), so the build context is the
+# umbrella checkout's root, one level above app/, to reach it. It lands at the
+# same /app paths it always has: the package's parents[2] is /app, which is where
+# the CLI looks for kicad-happy and the stock libraries.
 #
 # The kicad-symbols/ and kicad-footprints/ libraries are deliberately NOT copied
 # here — they are large submodules and are bind-mounted at runtime into
 # /app/kicad-symbols and /app/kicad-footprints (the CLI's default library roots),
 # alongside the 3D models. See app/docker-compose.yml. The pipeline cannot resolve
 # stock symbols/footprints without those mounts.
-COPY pyproject.toml README.md /app/
-COPY blpl /app/blpl
-COPY schemas /app/schemas
-COPY kicad-happy /app/kicad-happy
+COPY core/pyproject.toml /app/
+COPY core/blpl /app/blpl
+COPY core/schemas /app/schemas
+COPY core/kicad-happy /app/kicad-happy
 # [all-llm] pulls in the anthropic/openai/ollama SDKs. The webapp lets a project
 # configure a fallback chain over any of the three, and each provider backend
 # lazy-imports its SDK — so without the extra, Stage 0/1 die with
 # ModuleNotFoundError the moment that provider is used (anthropic is the default).
 RUN pip install --no-cache-dir -e /app[all-llm]
+
+# The KiCad PCB plugin (plugin/, the future "blpl-kicad-plugin"), for the
+# stage6-plugin stage. It runs under KiCad's own Python, not this venv, so it is
+# not pip-installed: the stage puts the directory holding the package on that
+# interpreter's PYTHONPATH, and BLPL_KICAD_PLUGIN_DIR (below) says where that is.
+# It used to arrive inside blpl/ as blpl.plugin_kicad.
+COPY plugin/blpl_kicad_plugin /app/plugin/blpl_kicad_plugin
 
 COPY app/backend/app /app/app
 COPY app/backend/alembic.ini /app/alembic.ini
@@ -80,6 +90,7 @@ RUN chmod +x /app/entrypoint.sh
 
 ENV BLPL_PROJECTS_ROOT=/app/projects \
     BLPL_KICAD_HAPPY=/app/kicad-happy \
+    BLPL_KICAD_PLUGIN_DIR=/app/plugin \
     FREEROUTING_JAR=/opt/freerouting/freerouting.jar \
     PYTHONUNBUFFERED=1
 

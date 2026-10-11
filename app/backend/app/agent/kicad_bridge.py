@@ -4,7 +4,7 @@ BLPL's emitter writes a complete board and then stops: every net ships unrouted,
 placement is a grid, and Stage 8 classifies all of that as `expected` rather
 than as defects. Closing that gap needs an interactive editor for an existing
 board — which is exactly what kicad-ai-assistant (kcaa) exposes over MCP, and
-which BLPL has already committed to via `tests/kcaa_contract_check.py`.
+which BLPL has already committed to via `app/backend/tests/kcaa_contract_check.py`.
 
 Two decisions shape this module.
 
@@ -34,7 +34,7 @@ from .toolspec import Approval, ToolContext, ToolDenied, ToolKind, ToolSpec
 # server advertises that is not in this table is simply not exposed — a new
 # upstream tool is a decision to make, not a capability to inherit.
 #
-# Kept in step with tests/kcaa_contract_check.py: that test pins the same names
+# Kept in step with app/backend/tests/kcaa_contract_check.py: that test pins the same names
 # against a real kcaa checkout, so an upstream rename fails in CI rather than at
 # the moment someone asks the agent to route a board.
 POLICY: dict[str, tuple[ToolKind, Approval]] = {
