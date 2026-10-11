@@ -41,6 +41,7 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import time
@@ -444,6 +445,18 @@ def sha_of(text: str) -> str:
     return _sha(text)
 
 
+def _umask() -> int:
+    """The process umask, read without setting it. os.umask() can only be
+    read by changing it, which races with any other thread creating a file."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("Umask:"):
+                return int(line.split()[1], 8)
+    except (OSError, ValueError):
+        pass
+    return 0o022
+
+
 def apply_proposal(
     proposal: Proposal, project_dir: Path, sandbox: FilesystemSandbox
 ) -> tuple[bool, str]:
@@ -509,6 +522,11 @@ def apply_proposal(
         ) as fh:
             tmp = Path(fh.name)
             fh.write(proposal.new_content)
+        # NamedTemporaryFile creates 0600, and renaming it over the document
+        # would install that mode: a 0644 design file would lose group and
+        # other access on every accepted edit. Keep the document's own mode,
+        # or for a new one the mode a plain open() would have given it.
+        os.chmod(tmp, stat.S_IMODE(target.stat().st_mode) if exists else 0o666 & ~_umask())
         os.replace(tmp, target)
     except OSError as exc:
         if tmp is not None:

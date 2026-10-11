@@ -300,6 +300,32 @@ def test_a_write_that_fails_is_not_staleness(project) -> None:
     assert ok, detail
 
 
+def test_accepting_keeps_the_documents_permissions(project) -> None:
+    """Codex, PR #13: the temporary file is created 0600, and renaming it over
+    the document installed that mode, so a 0644 file lost group and other
+    access on every accepted edit."""
+    import os
+    import stat
+
+    ctx = _ctx(project)
+    (project / "overview.md").chmod(0o664)
+    _call(ctx, "read_project_file", path="overview.md")
+    _call(ctx, "propose_file_edit", path="overview.md", new_content="# v2\n", rationale="r")
+    _call(ctx, "propose_file_edit", path="new/fresh.md", new_content="# n\n", rationale="r")
+    edit, create = sorted(ProposalStore(project).pending(), key=lambda p: p.path)[::-1]
+    assert edit.path == "overview.md"
+
+    assert apply_proposal(edit, project, ctx.sandbox)[0]
+    assert stat.S_IMODE((project / "overview.md").stat().st_mode) == 0o664
+
+    old = os.umask(0o022)
+    try:
+        assert apply_proposal(create, project, ctx.sandbox)[0]
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((project / "new" / "fresh.md").stat().st_mode) == 0o644
+
+
 def test_a_create_proposal_refuses_once_the_file_exists(project) -> None:
     ctx = _ctx(project)
     _call(ctx, "propose_file_edit", path="power.md", new_content="# A\n", rationale="r")
