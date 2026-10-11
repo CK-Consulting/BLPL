@@ -3530,6 +3530,9 @@ def delete_path(
     else:
         target.unlink()
         kind = "file"
+    # After the delete, unlike a move's list update, and safely so: should this
+    # write fail, the file is already gone and the entry left behind can only
+    # over-ignore a later file of the same name. Nothing becomes readable.
     llm_ignore.drop_entries(checkout, rel)
     activity.record(session, project, user, activity.DELETED, rel)
     committed = _commit_quietly(checkout, f"delete: {rel}")
@@ -3595,13 +3598,46 @@ def move_path(
                 "leave the ledger naming a file that is not there"
             ),
         )
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src.rename(dst)
-    # Same commit as the move: the ignore list is keyed by path.
-    llm_ignore.move_entries(checkout, src_rel, dst_rel)
+    # The ignore list is keyed by path, and it changes in the same commit as
+    # the move. Its new paths are written *before* the rename, beside the old
+    # ones (Codex, PR #17): rewritten after, a failed write left an ignored
+    # file at a name the list did not cover, readable by the assistant, with
+    # the request reporting failure. See llm_ignore.cover_move for why not
+    # rename-then-roll-back.
+    try:
+        before = llm_ignore.cover_move(checkout, src_rel, dst_rel)
+    except OSError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{src_rel} was not moved: the LLM-ignore list could not be updated ({e})",
+        ) from e
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+    except OSError as e:
+        if before is not None:
+            # Best effort. Should this fail too, the superset stays, which
+            # names the file where it still is: over-ignoring, not exposure.
+            try:
+                llm_ignore.restore(checkout, before)
+            except OSError:
+                pass
+        raise HTTPException(status_code=500, detail=f"{src_rel} was not moved: {e}") from e
+    ignore_list_updated = True
+    if before is not None:
+        try:
+            llm_ignore.finish_move(checkout, before, src_rel, dst_rel)
+        except OSError:
+            # The move happened, and failing the request would misstate that,
+            # as with a commit that fails. The superset still covers the file at
+            # its new path; only a stale entry on the old name is left, said so.
+            ignore_list_updated = False
     activity.record(session, project, user, activity.MOVED, f"{src_rel} → {dst_rel}")
     committed = _commit_quietly(checkout, f"move: {src_rel} -> {dst_rel}")
-    return {"ok": True, "from": src_rel, "to": dst_rel, "committed": committed}
+    return {
+        "ok": True, "from": src_rel, "to": dst_rel, "committed": committed,
+        "ignore_list_updated": ignore_list_updated,
+    }
 
 
 @app.get("/api/projects/{project_id}/artifacts/{name}")

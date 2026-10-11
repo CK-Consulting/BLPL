@@ -80,6 +80,10 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   // Whether the editor holds unsaved work, so the tree can refuse a rename
   // that would hide it.
   const [editorDirty, setEditorDirty] = useState(false);
+  // The path whose save has been sent and not yet answered. Dirty alone is not
+  // enough: it stays true until the PUT returns, and a rename in that window
+  // raced the save (Codex, PR #17).
+  const [editorSaving, setEditorSaving] = useState<string | null>(null);
   const [railCollapsed, setRailCollapsed] = useState(
     () => localStorage.getItem("blpl.railCollapsed") === "1",
   );
@@ -243,10 +247,10 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                         });
                       }}
                       canMove={(from, to) =>
-                        moveRefusalForDraft(openFile?.path ?? null, editorDirty, from, to)
+                        moveRefusalForDraft(openFile?.path ?? null, editorDirty, from, to, editorSaving)
                       }
                       canDelete={(path) =>
-                        deleteRefusalForDraft(openFile?.path ?? null, editorDirty, path)
+                        deleteRefusalForDraft(openFile?.path ?? null, editorDirty, path, editorSaving)
                       }
                       onDeleted={(path) =>
                         setOpenFile((f) =>
@@ -346,6 +350,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                   }
                   renamedFrom={renamedFrom}
                   onDirtyChange={setEditorDirty}
+                  onSavingChange={setEditorSaving}
                 />
               )}
               {tab === "kicad" && openFile && (

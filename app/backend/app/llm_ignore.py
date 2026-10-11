@@ -105,25 +105,53 @@ def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root + "/")
 
 
-def move_entries(project_dir: Path, src: str, dst: str) -> bool:
-    """Follow a move: entries for ``src``, or anything under it when it is a
-    folder, now name the new path. Returns whether the list changed.
+def cover_move(project_dir: Path, src: str, dst: str) -> list[dict] | None:
+    """Before a move: list the destination paths *beside* the source ones, and
+    return the rows as they were, or None when nothing at or under ``src`` is
+    listed and the list need not be touched.
 
-    The list is keyed by path, so a move that left it alone turned "ignore this
-    file" into "ignore a name nothing has any more", and the file the user
-    asked the assistant to leave alone became readable at its new name.
+    Codex, PR #17: the list used to be rewritten after the rename, so a failed
+    write left the file at a name the list did not cover — readable by the
+    assistant, while the request reported failure. Written first as a superset,
+    every moment of the move has the file ignored wherever it is: before the
+    rename at the old path, after it at the new one. The other order, rename
+    then roll the rename back on a failed write, needs a second filesystem
+    operation that can fail too, and that failure is the unignored state again.
     """
+    # The list is keyed by path, so a move that left it alone turned "ignore
+    # this file" into "ignore a name nothing has any more", and the file the
+    # user asked the assistant to leave alone became readable at its new name.
     src, dst = _norm(src), _norm(dst)
-    rows = _load(project_dir)
-    changed = False
+    before = _load(project_dir)
+    added = [
+        {**r, "path": dst + _norm(r["path"])[len(src):]}
+        for r in before
+        if _under(_norm(r["path"]), src)
+    ]
+    if not added:
+        return None
+    _rewrite(project_dir, [dict(r) for r in before] + added)
+    return before
+
+
+def finish_move(project_dir: Path, before: list[dict], src: str, dst: str) -> None:
+    """After the rename: the rows from :func:`cover_move` with ``src`` renamed,
+    dropping the superset's entries for the old path. If this write fails the
+    superset stays, which still covers the file; the cost is a stale entry on
+    the old name, and an entry that over-ignores errs the safe way."""
+    src, dst = _norm(src), _norm(dst)
+    rows = [dict(r) for r in before]
     for r in rows:
         path = _norm(r["path"])
         if _under(path, src):
             r["path"] = dst + path[len(src):]
-            changed = True
-    if changed:
-        _rewrite(project_dir, rows)
-    return changed
+    _rewrite(project_dir, rows)
+
+
+def restore(project_dir: Path, rows: list[dict]) -> None:
+    """Put the list back as :func:`cover_move` found it, after a rename that
+    did not happen."""
+    _rewrite(project_dir, [dict(r) for r in rows])
 
 
 def drop_entries(project_dir: Path, rel: str) -> bool:

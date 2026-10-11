@@ -725,6 +725,69 @@ def test_the_ignore_list_follows_a_move_and_forgets_a_delete(client) -> None:
     assert not llm_ignore.is_ignored(proj, "overview.md")
 
 
+def test_an_ignored_file_is_never_left_at_an_unignored_path(client, monkeypatch) -> None:
+    """Codex, PR #17. The list was rewritten after the rename, so a failed
+    write left the file moved to a name the list did not cover, readable by
+    the assistant, while the request reported failure. Whichever write fails
+    now, the file is ignored wherever it ends up."""
+    from app import llm_ignore
+
+    _scratch_with_files(client)
+    import app.main as main
+    proj = main.projects.project_dir("scratch")
+    llm_ignore.set_ignored(proj, "power/notes.yaml", True)
+    real = llm_ignore._rewrite
+
+    def failing_on(n: int):
+        calls = {"n": 0}
+
+        def rewrite(project_dir, rows):
+            calls["n"] += 1
+            if calls["n"] == n:
+                raise OSError("disk full")
+            real(project_dir, rows)
+        return rewrite
+
+    def where() -> str:
+        return "power" if (proj / "power" / "notes.yaml").exists() else "psu"
+
+    # The first write fails: nothing moves, the request is an error.
+    monkeypatch.setattr(llm_ignore, "_rewrite", failing_on(1))
+    r = client.post("/api/projects/scratch/files/move", json={"path": "power", "to": "psu"})
+    assert r.status_code == 500 and "not moved" in r.json()["detail"]
+    assert where() == "power"
+    assert llm_ignore.paths(proj) == {"power/notes.yaml"}
+
+    # The rename fails after the superset is written: the list goes back.
+    monkeypatch.setattr(llm_ignore, "_rewrite", real)
+    real_rename = main.Path.rename
+
+    def busy(self, target):
+        raise OSError("busy")
+    monkeypatch.setattr(main.Path, "rename", busy)
+    r = client.post("/api/projects/scratch/files/move", json={"path": "power", "to": "psu"})
+    assert r.status_code == 500
+    assert where() == "power"
+    assert llm_ignore.paths(proj) == {"power/notes.yaml"}
+    # Not monkeypatch.undo(): that would also undo the client fixture's setup.
+    monkeypatch.setattr(main.Path, "rename", real_rename)
+
+    # The last write fails: the move happened, and the superset still covers
+    # the file at its new path. Reported, not an error — the move is real.
+    monkeypatch.setattr(llm_ignore, "_rewrite", failing_on(2))
+    r = client.post("/api/projects/scratch/files/move", json={"path": "power", "to": "psu"})
+    assert r.status_code == 200 and r.json()["ignore_list_updated"] is False
+    assert where() == "psu"
+    assert "psu/notes.yaml" in llm_ignore.paths(proj)
+
+    # And when nothing fails, the old path is gone from the list.
+    monkeypatch.setattr(llm_ignore, "_rewrite", real)
+    r = client.post("/api/projects/scratch/files/move", json={"path": "psu", "to": "supply"})
+    assert r.json()["ignore_list_updated"] is True
+    assert "supply/notes.yaml" in llm_ignore.paths(proj)
+    assert not any(p.startswith("psu/") for p in llm_ignore.paths(proj))
+
+
 # -- cookie Secure flag: the footgun that dropped sessions over HTTP ----------
 
 

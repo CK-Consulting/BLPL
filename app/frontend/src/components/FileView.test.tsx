@@ -236,3 +236,48 @@ describe("renaming the open file", () => {
     expect(put.url).toBe("/api/projects/p/files/dir/a%23b%3Fc%25d.md");
   });
 });
+
+describe("a save that comes back after the pane moved on", () => {
+  it("does not land the draft on the file now showing", async () => {
+    // Codex, PR #17: the PUT's completion set `content` and cleared the unsaved
+    // badge for whatever path the pane held by then — another file, whose
+    // content the draft is not.
+    const user = userEvent.setup();
+    let finishPut: () => void = () => {};
+    const saving: (string | null)[] = [];
+    globalThis.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        await new Promise<void>((resolve) => {
+          finishPut = resolve;
+        });
+        return new Response("{}", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(String(url).includes("a.md") ? "a body" : "b body");
+    }) as unknown as typeof fetch;
+    const props = {
+      projectId: "p",
+      onSaved: () => {},
+      reloadToken: 0,
+      onSavingChange: (p: string | null) => {
+        saving.push(p);
+      },
+    };
+    const { rerender } = render(<FileView {...props} path="a.md" />);
+    await screen.findByText("a body");
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    await user.type(screen.getByRole("textbox"), " DRAFT FOR A");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(saving).toEqual(["a.md"]);
+
+    rerender(<FileView {...props} path="b.md" />);
+    await screen.findByText("b body");
+    finishPut();
+    await waitFor(() => expect(saving).toEqual(["a.md", null]));
+    expect(screen.queryByText(/DRAFT FOR A/)).toBeNull();
+    expect(screen.queryByText("Saved")).toBeNull();
+    expect(screen.getByText("b body")).toBeTruthy();
+  });
+});

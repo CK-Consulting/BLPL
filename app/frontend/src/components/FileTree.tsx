@@ -381,7 +381,12 @@ export function FileTree({
       return;
     }
     try {
-      const r = await postJSON<{ from?: string; to?: string; committed?: boolean }>(
+      const r = await postJSON<{
+        from?: string;
+        to?: string;
+        committed?: boolean;
+        ignore_list_updated?: boolean;
+      }>(
         `/api/projects/${projectId}/files/move`,
         { path: from, to },
       );
@@ -392,9 +397,16 @@ export function FileTree({
       onMoved?.(r?.from ?? from, landed);
       changed();
       // As with a delete: the move happened, so say when no commit records it.
+      const notes: string[] = [];
       if (r && r.committed === false) {
-        setError(`${landed} was moved, but the move was not committed to the project's history.`);
+        notes.push(`${landed} was moved, but the move was not committed to the project's history.`);
       }
+      // The file is still ignored at its new path; the old name stayed on the
+      // list too, and would cover a new file made there (Codex, PR #17).
+      if (r && r.ignore_list_updated === false) {
+        notes.push(`The LLM-ignore list still also names ${r?.from ?? from}; remove it there if a new file at that name should be readable.`);
+      }
+      if (notes.length) setError(notes.join(" "));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -809,6 +821,24 @@ export function destinationFor(node: TreeNode): "text" | "kicad" | "browser" {
 }
 
 /**
+ * Why nothing may move or delete `path` yet, or null: a save of the document
+ * at `saving` (or of one inside a folder at `path`) has not come back.
+ *
+ * Codex, PR #17: the editor stays dirty until its PUT returns, and a rename to
+ * a savable name is allowed while dirty, so Save then an immediate rename sent
+ * both. If the move reached the backend first, the PUT recreated the old path
+ * holding the draft, the renamed file kept the old bytes, and the PUT's
+ * completion then cleared the unsaved badge under the new name — reporting
+ * saved what was not. The two requests have no order the server can see, so
+ * the only safe order is the one enforced here: the save finishes first.
+ */
+function saveInFlight(saving: string | null, path: string): string | null {
+  if (!saving) return null;
+  if (saving !== path && !saving.startsWith(`${path}/`)) return null;
+  return `${saving} is still being saved. Wait for the save to finish, then try again.`;
+}
+
+/**
  * Why a move must wait, or null. The editor keeps an unsaved draft across a
  * rename only while the file stays a text document: renamed to .pdf or
  * .kicad_sch, the editor is handed no path, the draft is hidden, and the next
@@ -825,7 +855,10 @@ export function moveRefusalForDraft(
   dirty: boolean,
   from: string,
   to: string,
+  saving: string | null = null,
 ): string | null {
+  const wait = saveInFlight(saving, from);
+  if (wait) return wait;
   if (!dirty || !openPath) return null;
   if (openPath !== from && !openPath.startsWith(`${from}/`)) return null;
   const moved = to + openPath.slice(from.length);
@@ -843,7 +876,10 @@ export function deleteRefusalForDraft(
   openPath: string | null,
   dirty: boolean,
   path: string,
+  saving: string | null = null,
 ): string | null {
+  const wait = saveInFlight(saving, path);
+  if (wait) return wait;
   if (!dirty || !openPath) return null;
   if (openPath !== path && !openPath.startsWith(`${path}/`)) return null;
   return `${openPath} has unsaved edits that deleting it would lose. Save or discard your edits first.`;

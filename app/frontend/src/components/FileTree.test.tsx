@@ -1,6 +1,9 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { FileView } from "./FileView";
 
 import {
   FileTree,
@@ -366,6 +369,115 @@ describe("a rename that would hide an unsaved draft", () => {
   });
 });
 
+describe("a move or delete while a save is in flight", () => {
+  it("waits for the save, of the file or of one inside the folder", () => {
+    // Dirty or not: the draft is on its way to disk, and it is the order of
+    // the two requests that is unsafe, not the draft.
+    expect(moveRefusalForDraft("a.md", true, "a.md", "b.md", "a.md")).toMatch(/Wait for the save/);
+    expect(moveRefusalForDraft("d/a.md", false, "d", "e", "d/a.md")).toMatch(/still being saved/);
+    expect(deleteRefusalForDraft("d/a.md", true, "d", "d/a.md")).toMatch(/Wait for the save/);
+    expect(moveRefusalForDraft("a.md", true, "other.md", "x.md", "a.md")).toBeNull();
+    expect(moveRefusalForDraft("dd/a.md", true, "d", "e", "dd/a.md")).toBeNull();
+    expect(deleteRefusalForDraft("a.md", false, "a.md", null)).toBeNull();
+  });
+
+  /** The tree and the editor wired the way App wires them. */
+  function Workbench() {
+    const [open, setOpen] = useState("overview.md");
+    const [renamedFrom, setRenamedFrom] = useState<string | null>(null);
+    const [dirty, setDirty] = useState(false);
+    const [saving, setSaving] = useState<string | null>(null);
+    return (
+      <>
+        <FileTree
+          projectId="p"
+          reloadToken={0}
+          onOpen={() => {}}
+          canMove={(f, t) => moveRefusalForDraft(open, dirty, f, t, saving)}
+          canDelete={(path) => deleteRefusalForDraft(open, dirty, path, saving)}
+          onMoved={(f, t) => {
+            if (open === f) {
+              setRenamedFrom(open);
+              setOpen(t);
+            }
+          }}
+        />
+        <FileView
+          projectId="p"
+          path={open}
+          renamedFrom={renamedFrom}
+          onSaved={() => {}}
+          reloadToken={0}
+          onDirtyChange={setDirty}
+          onSavingChange={setSaving}
+        />
+      </>
+    );
+  }
+
+  it("refuses Save-then-rename until the PUT has come back", async () => {
+    // Codex, PR #17: the editor stays dirty while its PUT is out, and a rename
+    // to a savable name was allowed while dirty. Had the move reached the
+    // backend first, the PUT recreated overview.md with the draft, the renamed
+    // file kept the old bytes, and the PUT's completion cleared the unsaved
+    // badge under the new name.
+    const user = userEvent.setup();
+    const calls: { method: string; url: string }[] = [];
+    let finishPut: () => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        const json = (b: unknown) =>
+          new Response(JSON.stringify(b), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        if (method === "GET" && url.endsWith("/tree")) return json({ nodes: NODES });
+        if (method === "GET" && url.includes("/blob")) return new Response("original body");
+        calls.push({ method, url });
+        if (method === "PUT") {
+          await new Promise<void>((resolve) => {
+            finishPut = resolve;
+          });
+          return json({});
+        }
+        const body = JSON.parse(String(init?.body));
+        return json({ from: body.path, to: body.to, committed: true });
+      }),
+    );
+    render(<Workbench />);
+    await screen.findByText("original body");
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    await user.type(document.querySelector("textarea.editor-text")!, " DRAFT");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true));
+
+    const rename = async (to: string) => {
+      await user.pointer({
+        keys: "[MouseRight]",
+        // The editor's header names the file too; the tree's row is the target.
+        target: screen.getAllByText("overview.md").find((el) => el.classList.contains("tree-name"))!,
+      });
+      await user.click(screen.getByRole("menuitem", { name: "Rename" }));
+      const input = await screen.findByLabelText("New name for overview.md");
+      await user.clear(input);
+      await user.type(input, `${to}{Enter}`);
+    };
+
+    await rename("intro.md");
+    expect(await screen.findByText(/Wait for the save to finish/)).toBeTruthy();
+    expect(calls.filter((c) => c.method === "POST")).toEqual([]);
+
+    finishPut();
+    await screen.findByText("Saved");
+    await rename("intro.md");
+    await waitFor(() =>
+      expect(calls).toContainEqual({ method: "POST", url: "/api/projects/p/files/move" }),
+    );
+  });
+});
+
 describe("deletes that would lose something", () => {
   it("refuses to delete the open, dirty file or a folder holding it", async () => {
     // Codex, PR #17: a delete closed the editor and dropped the only copy of
@@ -519,6 +631,16 @@ describe("what a move reports", () => {
         "base/main.md was moved, but the move was not committed to the project's history.",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("says when the ignore list kept the old name", async () => {
+    // Codex, PR #17: the backend writes the new paths first and drops the old
+    // ones after the rename; when that last write fails the move still stands.
+    mockMove({
+      ok: true, from: "base/board.md", to: "base/main.md", committed: true, ignore_list_updated: false,
+    });
+    await renameBoard();
+    expect(await screen.findByText(/LLM-ignore list still also names base\/board\.md/)).toBeInTheDocument();
   });
 
   it("says nothing more when it was", async () => {

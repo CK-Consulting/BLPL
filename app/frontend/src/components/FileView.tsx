@@ -36,6 +36,7 @@ export function FileView({
   reloadToken,
   renamedFrom = null,
   onDirtyChange,
+  onSavingChange,
 }: {
   projectId: string;
   /** Project-relative path chosen in the file tree. */
@@ -45,6 +46,9 @@ export function FileView({
   /** Told whenever there starts or stops being unsaved work, so a rename that
    *  would hide it can be refused before it happens. */
   onDirtyChange?: (dirty: boolean) => void;
+  /** Told the path a save was sent for, and null once it has come back, so a
+   *  rename or delete can wait for it rather than race it. */
+  onSavingChange?: (path: string | null) => void;
   onSaved: () => void;
   /** Bumped when something outside this pane changes the project — a proposal
    *  applied from the chat, a sync, a run that rewrote a document. */
@@ -96,6 +100,14 @@ export function FileView({
     setLoadedKeyState(k);
   };
   const loaded = !!path && loadedKey === `${projectId}\u0000${path}`;
+  // Which document is showing now, read when a save comes back: by then the
+  // pane may be on another file, and that file's content is not the draft.
+  const currentKey = useRef<string | null>(null);
+  currentKey.current = path ? `${projectId}\u0000${path}` : null;
+  // One save at a time. A second Ctrl+S while the first is out would be a
+  // second unordered write of the same path.
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
 
   useEffect(() => {
     const key = `${projectId}\u0000${path ?? ""}`;
@@ -197,14 +209,31 @@ export function FileView({
   const save = async () => {
     // Never write what was not read from this path: an empty or foreign
     // buffer saved here replaces the file with it.
-    if (!path || !savable || !loaded) return;
+    if (!path || !savable || !loaded || savingRef.current) return;
+    const key = `${projectId}\u0000${path}`;
+    const sent = draft;
+    savingRef.current = true;
+    setSaving(true);
+    onSavingChange?.(path);
     try {
-      await putJSON(`/api/projects/${projectId}/files/${encodePath(path)}`, { content: draft });
-      setContent(draft);
-      setStatus("Saved");
+      await putJSON(`/api/projects/${projectId}/files/${encodePath(path)}`, { content: sent });
       onSaved();
+      // Codex, PR #17: the completion used to land on whatever the pane showed
+      // by then. After a rename or a switch that is another path, whose
+      // content this draft is not, and clearing its unsaved badge reported
+      // saved what had been written somewhere else. Only the document the save
+      // was for takes its result.
+      if (currentKey.current !== key) return;
+      setContent(sent);
+      setStatus("Saved");
     } catch (e) {
-      setError((e as Error).message);
+      if (currentKey.current === key) setError((e as Error).message);
+    } finally {
+      // Always, mounted or not: a pane closed mid-save that never said the
+      // save was over would hold every later rename of that file refused.
+      savingRef.current = false;
+      setSaving(false);
+      onSavingChange?.(null);
     }
   };
 
@@ -277,7 +306,7 @@ export function FileView({
           </button>
         </div>
         {editing && (
-          <button onClick={save} disabled={!dirty || !loaded}>
+          <button onClick={save} disabled={!dirty || !loaded || saving}>
             Save
           </button>
         )}
