@@ -346,3 +346,32 @@ def test_only_the_owner_changes_the_push_policy(unlocked, second_user):
     inv = second_user.get("/api/invitations").json()[0]["id"]
     second_user.post(f"/api/invitations/{inv}/accept")
     assert second_user.put("/api/projects/p/git/push-policy", json={"policy": "auto"}).status_code == 403
+
+
+# -- the credential, from project settings ------------------------------------
+
+
+def test_project_settings_names_the_credential_a_push_would_use(unlocked, monkeypatch):
+    import app.main as main
+    from app.projects import RemoteProbe
+
+    monkeypatch.setattr(main.projects, "probe_remote", lambda url, env=None: RemoteProbe("ok", True, ""))
+    url = "https://git.example.org/o/board.git"
+    unlocked.post("/api/projects/init", json=init_body("p", remote=url))
+    got = unlocked.get("/api/projects/p/git/credential").json()
+    assert got == {"host": "git.example.org", "credential": None, "method": None, "https": True, "problem": ""}
+
+    r = unlocked.put("/api/projects/p/git/credential", json={"token": TOKEN, "username": "me"})
+    assert r.status_code == 200 and TOKEN not in r.text
+    assert unlocked.get("/api/projects/p/git/credential").json()["credential"] == r.json()["credential"]
+    # Into the one store, and a second token for the host replaces the first
+    # rather than adding a row the matcher would have to choose between.
+    unlocked.put("/api/projects/p/git/credential", json={"token": TOKEN + "-rotated"})
+    assert len(unlocked.get("/api/settings/git").json()["endpoints"]) == 1
+    assert TOKEN not in (main.PROJECTS_ROOT / "p" / ".git" / "config").read_text()
+
+
+def test_a_token_is_refused_for_a_local_or_ssh_remote(unlocked):
+    unlocked.post("/api/projects/init", json=init_body("p"))
+    r = unlocked.put("/api/projects/p/git/credential", json={"token": TOKEN})
+    assert r.status_code == 400 and TOKEN not in r.text

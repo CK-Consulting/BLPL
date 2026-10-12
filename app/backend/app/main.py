@@ -2770,6 +2770,84 @@ def put_project_identity(
     return {"ok": True, "project": identity.as_json()}
 
 
+class CredentialBody(BaseModel):
+    token: str = ""
+    username: str | None = None
+
+
+@app.get("/api/projects/{project_id}/git/credential")
+def get_project_credential(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Which of the caller's saved credentials this project's pushes would use.
+
+    Credentials are per user and matched by the remote's host, so this is a
+    question about the caller, not the project: two members pushing to the
+    same remote each use their own. Names and hosts only, as the settings
+    listing gives them — never a secret.
+    """
+    from . import gitstore
+
+    checkout = _project_dir(session, user, project_id)
+    try:
+        url = projects.remote_of(project_id, operation="push", checkout=checkout)
+    except ProjectError as exc:
+        return {"host": None, "credential": None, "method": None, "https": False, "problem": str(exc)}
+    host = gitstore.authority_of(url) if url else None
+    try:
+        row = gitstore.for_remote(session, user, url) if url else None
+    except gitstore.GitStoreError as exc:
+        return {"host": host, "credential": None, "method": None, "https": False, "problem": str(exc)}
+    return {
+        "host": host,
+        "credential": row.name if row is not None else None,
+        "method": row.method if row is not None else None,
+        "https": url.lower().startswith("https://"),
+        "problem": "",
+    }
+
+
+@app.put("/api/projects/{project_id}/git/credential")
+def put_project_credential(
+    project_id: str,
+    body: CredentialBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Save a new HTTPS token for this project's remote host, into the caller's
+    own credential store — the same rows Account & app settings → Git
+    endpoints/accounts lists, under the row that already holds the host when
+    there is one. Any member may, for themselves. Nothing is echoed back."""
+    from . import gitstore
+
+    checkout = _project_dir(session, user, project_id)
+    token = body.token.strip()
+    try:
+        url = projects.remote_of(project_id, operation="push", checkout=checkout)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not url:
+        raise HTTPException(status_code=400, detail="this project has no remote to save a credential for")
+    if not url.lower().startswith("https://"):
+        raise HTTPException(
+            status_code=400,
+            detail="a token is for an https:// remote — for SSH, save a key under "
+            "Account & app settings → Git endpoints/accounts",
+        )
+    try:
+        name = gitstore.name_for(session, user, url)
+        gitstore.put(
+            session, master_key, user, name=name, host=gitstore.authority_of(url),
+            method="https_token", secret=token, username=(body.username or "").strip() or "git",
+        )
+    except gitstore.GitStoreError as exc:
+        raise HTTPException(status_code=400, detail=autopush.scrub(str(exc), [token]))
+    return {"ok": True, "credential": name}
+
+
 class PushPolicyBody(BaseModel):
     policy: str | None = None
 
