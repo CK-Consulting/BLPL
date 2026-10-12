@@ -99,6 +99,7 @@ from . import (
     userkey,
     users,
     workspace,
+    workspace_files,
     worktrees,
 )
 from blpl.core import schema as hdm_schema
@@ -2853,7 +2854,8 @@ def git_status(project_id: str, user: User = Depends(require_onboarded),
     checkout = _project_dir(session, user, project_id)
     project = _project_or_404(session, user, project_id)
     try:
-        st = projects.status(project_id, checkout=checkout)
+        st = (workspace_files.git_status(checkout) if workspace_files.enabled()
+              else projects.status(project_id, checkout=checkout))
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     member = gitidentity.membership(session, user, project)
@@ -3131,6 +3133,8 @@ def git_diff(project_id: str, user: User = Depends(require_onboarded),
     run do' view. Diffs are size-capped server-side."""
     checkout = _project_dir(session, user, project_id)
     try:
+        if workspace_files.enabled():
+            return workspace_files.git_diff(checkout)
         return projects.diff(project_id, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -3146,9 +3150,12 @@ def git_pull(project_id: str, user: User = Depends(require_onboarded),
         # be the host a push goes to.
         # Resolved once: the credential is leased for this URL and git is
         # handed this URL, so the two cannot diverge if origin changes between.
-        dest = projects.remote_of(project_id, operation="fetch", checkout=checkout)
+        via = workspace_files.enabled()
+        dest = (workspace_files.remote_of(checkout, "fetch") if via
+                else projects.remote_of(project_id, operation="fetch", checkout=checkout))
         with _git_credentials(session, master_key, user, dest) as env:
-            out = projects.pull(project_id, env=env, checkout=checkout, url=dest)
+            out = (workspace_files.pull(checkout, dest, env) if via
+                   else projects.pull(project_id, env=env, checkout=checkout, url=dest))
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}
@@ -3183,9 +3190,13 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
         )
 
     try:
-        dest = projects.remote_of(project_id, operation="push", checkout=checkout)
+        via = workspace_files.enabled()
+        dest = (workspace_files.remote_of(checkout, "push") if via
+                else projects.remote_of(project_id, operation="push", checkout=checkout))
         with _git_credentials(session, master_key, user, dest) as env:
-            out = projects.push(project_id, env=env, checkout=checkout, url=dest, after=after)
+            out = (workspace_files.push(checkout, dest, env) if via
+                   else projects.push(project_id, env=env, checkout=checkout, url=dest,
+                                      after=after))
     except ProjectError as exc:
         if not recorded:
             autopush.record_now(
@@ -3220,6 +3231,19 @@ def _editable_file(session: Session, user: User, project_id: str, name: str) -> 
     clearer error.
     """
     proj = _project_dir(session, user, project_id)
+    parts = _editable_rel(name).split("/")
+    target = proj.joinpath(*parts).resolve()
+    root = proj.resolve()
+    if not target.is_relative_to(root) or target == root:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    return target
+
+
+def _editable_rel(name: str) -> str:
+    """The lexical half of ``_editable_file``: the rules a name must pass before
+    anything is resolved, returned as the normalised relative path. With files
+    going through the workspace agent, the containment half is the agent's,
+    which follows no link at all."""
     parts = [seg for seg in name.split("/") if seg]
     if any(seg.startswith(".") and seg != ".." for seg in parts):
         # The refusal is deliberate, and "invalid filename" taught nobody why:
@@ -3245,13 +3269,9 @@ def _editable_file(session: Session, user: User, project_id: str, name: str) -> 
         or any(seg == ".." for seg in parts)
     ):
         raise HTTPException(status_code=400, detail="invalid filename")
-    target = proj.joinpath(*parts).resolve()
-    root = proj.resolve()
-    if not target.is_relative_to(root) or target == root:
+    if Path(parts[-1]).suffix.lower() not in _EDITABLE_SUFFIXES:
         raise HTTPException(status_code=400, detail="invalid filename")
-    if target.suffix.lower() not in _EDITABLE_SUFFIXES:
-        raise HTTPException(status_code=400, detail="invalid filename")
-    return target
+    return "/".join(parts)
 
 
 class FileBody(BaseModel):
@@ -3610,6 +3630,8 @@ def get_tree(
     pipeline output, and the tree is the only view that says so.
     """
     proj = _project_dir(session, user, project_id)
+    if workspace_files.enabled():
+        return workspace_files.tree(project_id, proj)
     nodes = _walk_tree(proj, proj)
     # Marked on the node so the tree can say which files the assistant has been
     # told to leave alone, rather than that living only in a JSON file.
@@ -3816,6 +3838,8 @@ def get_blob(
     a deliberate act on something the user has been told is unverified.
     """
     proj = _project_dir(session, user, project_id)
+    if workspace_files.enabled():
+        return workspace_files.blob(proj, path)
     target = _tree_target(proj, path)
     if _is_quarantined(proj, target):
         return FileResponse(
@@ -4290,6 +4314,8 @@ def list_files(project_id: str, user: User = Depends(require_onboarded),
     ``_editable_file`` accepts back.
     """
     proj = _project_dir(session, user, project_id)
+    if workspace_files.enabled():
+        return workspace_files.list_files(proj)
     out = []
     for f in sorted(proj.rglob("*")):
         rel = f.relative_to(proj)
@@ -4303,6 +4329,9 @@ def list_files(project_id: str, user: User = Depends(require_onboarded),
 @app.get("/api/projects/{project_id}/files/{name:path}")
 def read_file(project_id: str, name: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)):
+    if workspace_files.enabled():
+        return workspace_files.read_file(
+            _project_dir(session, user, project_id), _editable_rel(name), name)
     target = _editable_file(session, user, project_id, name)
     if not target.is_file():
         raise HTTPException(status_code=404, detail=f"no file {name!r}")
@@ -4341,6 +4370,9 @@ def _commit_and_push(
     push the same commit a second time. What it returns for that is the
     push's number (None when none was scheduled), which the client waits for
     in the member's push status."""
+    if workspace_files.enabled():
+        return workspace_files.commit_as(
+            session, user, project, checkout, message, master_key), None
     identity = gitidentity.resolve(session, user, project)
     out = projects.commit_checkout(checkout, message, identity=identity)
     seq = None
@@ -4485,6 +4517,14 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     master_key: bytes | None = Depends(optional_master_key)) -> dict:
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
+    if workspace_files.enabled():
+        checkout = _project_dir(session, user, project_id)
+        rel = _editable_rel(name)
+        written = workspace_files.write_file(checkout, rel, body.content)
+        project = _project_or_404(session, user, project_id)
+        activity.record(session, project, user, activity.EDITED, rel)
+        commit = _commit_landed_write(session, user, project, checkout, f"edit: {rel}", master_key)
+        return {"ok": True, "name": name, "path": rel, "bytes": written, **commit}
     target = _editable_file(session, user, project_id, name)
     # The spelling the file actually landed at, as the tree lists it: empty
     # segments are dropped, so ``dir//a.md`` is written as ``dir/a.md``. The
@@ -4610,6 +4650,14 @@ async def upload_files(
                 "name": name, "state": "rejected", "path": None,
                 "reasons": [f"larger than the {UPLOAD_MAX_BYTES // (1024 * 1024)} MB upload limit"],
             })
+            continue
+        if workspace_files.enabled():
+            res = await workspace_files.accept_upload(
+                proj, data, original_name=name, kind=spec["kind"], uploaded_by=who,
+                mpn=str(spec.get("mpn") or "").strip(), llm_ignore=bool(spec.get("llm_ignore")),
+                library=str(spec.get("library") or ""),
+            )
+            results.append({"name": name, **res})
             continue
         def record_member(member: quarantine.Record) -> None:
             # Every PDF `accept` inspects during this upload — a bundle's
@@ -4837,6 +4885,9 @@ def make_folder(
         or any(seg == ".." or seg.startswith(".") for seg in parts)
     ):
         raise HTTPException(status_code=400, detail="invalid folder name")
+    if workspace_files.enabled():
+        workspace_files.make_folder(proj, "/".join(parts), body.path)
+        return {"ok": True, "path": "/".join(parts)}
     target = proj.joinpath(*parts)
     root = proj.resolve()
     # Resolve the parent rather than the target: the target does not exist yet,
