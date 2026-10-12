@@ -375,3 +375,34 @@ def test_a_token_is_refused_for_a_local_or_ssh_remote(unlocked):
     unlocked.post("/api/projects/init", json=init_body("p"))
     r = unlocked.put("/api/projects/p/git/credential", json={"token": TOKEN})
     assert r.status_code == 400 and TOKEN not in r.text
+
+
+class Inline:
+    """Runs each job the moment it is submitted — the worst case for timing,
+    and the one that shows when a job is submitted before the request's data
+    is visible to the session the job records with."""
+
+    def submit(self, fn):
+        fn()
+
+
+def test_the_push_is_started_only_once_the_request_has_committed(unlocked, monkeypatch):
+    # The first push of a new project records its outcome on a membership row
+    # created in the same request. Started before that request committed, a
+    # fast failure found no row and was dropped without a word.
+    import shutil
+
+    import app.main as main
+
+    monkeypatch.setattr(main, "AUTOPUSH", Inline())
+    remote = bare_remote()
+    assert unlocked.post(
+        "/api/projects/init", json=init_body("p", remote=remote, push_policy="auto")
+    ).status_code == 200
+    st = unlocked.get("/api/projects/p/git/status").json()
+    assert st["last_push"] is not None and st["last_push"]["ok"] is True
+
+    shutil.rmtree(remote)
+    unlocked.put("/api/projects/p/files/design.md", json={"content": "# board\n"})
+    st = unlocked.get("/api/projects/p/git/status").json()
+    assert st["last_push"]["ok"] is False and st["last_push"]["error"]

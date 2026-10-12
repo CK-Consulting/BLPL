@@ -64,6 +64,7 @@ from pydantic import BaseModel
 # Annotations are lazy (from __future__), which hid that these were never
 # imported — Session only ever appeared in a type hint. select() is a runtime
 # call and would have raised NameError on the first clashing project name.
+from sqlalchemy import event as sa_event
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -3747,7 +3748,23 @@ def _schedule_autopush(
         except Exception:  # noqa: BLE001 — nowhere left to report it but the log
             logger.exception("could not record the automatic push of %s", name)
 
-    AUTOPUSH.submit(job)
+    # Started once the request's transaction has ended, not now. The outcome
+    # is recorded on the member's row from another session, and for a project
+    # created in this very request that row is not visible to anyone until
+    # this transaction commits: a push that failed fast (no credential, a
+    # refused host) looked up the member, found nobody, and its failure was
+    # dropped — the one thing this must never do. On rollback too, because
+    # the git commit has happened whatever the database does.
+    submitted = False
+
+    def submit(*_args) -> None:
+        nonlocal submitted
+        if not submitted:
+            submitted = True
+            AUTOPUSH.submit(job)
+
+    sa_event.listen(session, "after_commit", submit, once=True)
+    sa_event.listen(session, "after_rollback", submit, once=True)
 
 
 #: Where automatic pushes run. A module attribute so the tests can swap in an
