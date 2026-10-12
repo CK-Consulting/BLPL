@@ -330,13 +330,29 @@ and file contents keep the UNTRUSTED framing they have today.
   - `health`, which reports idle seconds and active runs.
 - **Confinement.** A checkout must lie inside the roots given at start (the
   project and its worktrees), with no symlink in its path. Below it, every path
-  is opened one component at a time with `O_NOFOLLOW` from the previous
-  directory's descriptor, so no link is ever followed, final component
-  included. Delete uses the fd-based, link-safe `rmtree`. `..` and `.git` are
-  refused. This is the containment `FilesystemSandbox` reaches by resolving,
-  made race-free by never resolving at all. The plan named `openat2`. Python has
-  no binding for it, and gVisor's support for it is uneven, so the component
-  walk gives the same guarantee portably.
+  is opened one component at a time from the previous directory's descriptor
+  (`open_at`). Each component is `lstat`ed first and refused if it is a link,
+  and the descriptor the open returns must be that same inode, so a link
+  swapped in between is refused too. `..` and `.git` are refused. Delete uses
+  Python's fd-based `rmtree`, which makes the same inode check. A write opens
+  without `O_TRUNC` and truncates only once the descriptor is known to be the
+  file itself.
+
+  `O_NOFOLLOW` alone is not relied on, because it does not hold under gVisor.
+  Measured on this host (2026-10-12): under runsc, `open()` with
+  `O_DIRECTORY | O_NOFOLLOW` *follows* a symlink. A link to a directory that
+  exists opens that directory, and a dangling link fails with `ENOENT`. runc
+  (Linux) refuses both with `ENOTDIR`. `O_NOFOLLOW` on a non-directory open
+  gives `ELOOP` under both. The first build trusted `O_NOFOLLOW | O_DIRECTORY`
+  for directory components, so under runsc a committed link such as
+  `etc -> /etc` would have been followed. The integration test caught the
+  dangling case, as a 404 where runc gave 403. The `lstat` check now makes
+  every link a 403 "is a symlink" on both runtimes.
+
+  Both runtimes are covered. A unit test emulates gVisor's `open()` and fails
+  against the earlier code. The real-container test asserts that its link
+  fixtures exist as links inside the workspace before asserting they are
+  refused, so a fixture that did not materialise cannot pass for confinement.
 - **Credentials.** Each git operation passes its own credential. An HTTPS token
   goes in that command's environment. An ssh key, which the control plane
   leased as a file, is sent as content; the agent writes it to its tmpfs at
@@ -598,9 +614,9 @@ behaviour.
     being gone, the agent's environ unreadable to a run, a real stage, and
     cancel.
 
-  The same test under runsc skips with the reason when the runtime lacks
-  `--host-uds=create`, which it does on this host until the `daemon.json`
-  change above is made.
+  The same test runs under runsc now that the `daemon.json` change above is
+  made (it skips, with the reason, on a host whose runsc lacks
+  `--host-uds=create`).
 - **Not yet off the mount.** Resolving a checkout (the permission and sealed
   checks, and creating a member's worktree on first use) still uses the
   backend's mount, as do the routes that remain:
