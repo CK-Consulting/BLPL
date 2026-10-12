@@ -1,6 +1,7 @@
 # Architecture v2: a control plane and per-project workspaces
 
-Status: **agreed shape, phase 1 built.** The pipeline's own architecture (stages,
+Status: **agreed shape; phases 1 and 2 built** (phase 2 is behind
+`BLPL_RUNS_IN_WORKSPACE=1`, off by default). The pipeline's own architecture (stages,
 schemas, package layout) is still [architecture.md](architecture.md). This
 document covers how the app is deployed around the pipeline and where the trust
 boundary sits. It supersedes the deployment parts of [terminal.md](terminal.md):
@@ -218,13 +219,46 @@ the control plane legitimately does, which is starting a workspace for any
 project and running things in it. The control plane is the authority over
 projects. The proxy removes the step from there to root on the host.
 
-**gVisor.** `runsc` is **not installed on this host** (checked 2026-10-12 with
-`docker info`: runtimes are `runc`, `io.containerd.runc.v2` and `nvidia`).
-Installing it is a daemon-config change for the operator: add `runsc` to
-`/etc/docker/daemon.json`'s `runtimes`, with `--host-uds=create` so the agent
-socket works (see below). After that, set `BLPL_SANDBOX_RUNTIME=runsc`, and set
-`BLPL_PROXY_RUNTIMES=runsc` with `BLPL_PROXY_REQUIRE_RUNTIME=1` to make it
-mandatory.
+**gVisor.** `runsc` is installed on this host (`/usr/local/bin/runsc`,
+registered in `daemon.json` with no `runtimeArgs`). Set
+`BLPL_SANDBOX_RUNTIME=runsc` to use it, and add `BLPL_PROXY_REQUIRE_RUNTIME=1`
+to make it mandatory. What was measured on 2026-10-12, with every integration
+test passing under both runc and runsc:
+
+- **Limits are enforced, but at a different granularity.** Under runc the
+  kernel acts on one process: the OOM killer takes the allocator, or `fork`
+  fails. Under runsc the memory and pids limits apply to the sandbox's cgroup
+  as a whole, so exceeding either one kills the whole sandbox (exit 137 for
+  memory, and the sandbox exits for pids). Every process in that workspace
+  dies, including other runs, and the next `ensure` restarts it. That is
+  acceptable, since one workspace is one project and the blast radius is the
+  same project. It is recorded so that a dead workspace after a runaway stage
+  is understood rather than debugged. The CPU quota throttles identically under
+  both (`--cpus 0.25` ran a fixed loop 3.8× slower under each).
+  `test_limits_are_enforced` asserts the memory and pids limits under whichever
+  runtime is configured. A variant of it with generous limits fails, so the
+  test measures something.
+- **The pids limit must leave room for gVisor itself.** Its sentry and gofer
+  threads count against `PidsLimit`, and a runsc sandbox with `PidsLimit` 32
+  fails to start ("cannot read client sync file"). 48 starts. The default of
+  512 is unaffected, and anything below 64 should not be configured.
+- `runsc` reports `cgroup v2: false` in its feature list, yet the limits above
+  were enforced through Docker's systemd cgroup driver on this cgroup-v2 host.
+  The finding is the measurement, not the feature flag.
+- **The phase-3 agent socket needs one daemon.json change.** The control plane
+  connects to a Unix socket the agent creates inside the sandbox, on a shared
+  volume. gVisor refuses host Unix sockets unless told otherwise, so the
+  operator changes the runsc entry to:
+
+  ```json
+  "runsc": {
+      "path": "/usr/local/bin/runsc",
+      "runtimeArgs": ["--host-uds=create"]
+  }
+  ```
+
+  and then runs `sudo systemctl reload docker`. Running containers are not
+  affected. It is not needed for phases 1 and 2, which use `docker exec`.
 
 ### 6. How work executes inside a workspace
 
@@ -285,6 +319,9 @@ come from the workspace image.
 
 ### 8. Egress
 
+**Decided (2026-10-12):** Squid with a domain allowlist, as below. It is built
+in phase 2 as `app/egress/` and the `squid` service.
+
 The `blpl-egress` network is `internal: true`, so it has no route out. Its only
 other member is the egress proxy, Squid (the `ubuntu/squid` image, config in
 the repo). Squid is attached to `blpl-egress` and to an outbound network, and
@@ -299,6 +336,9 @@ named allowlist entry, not by opening the private ranges. Squid's access log is
 the egress audit record.
 
 ### 9. KiCad desktop sessions
+
+**Decided (2026-10-12):** a 15-minute idle timeout and a cap of 3 desktops per
+host.
 
 There is one desktop per (member, project), created on demand from the
 `desktop` role of the same image family. That is `kicad-base` plus the
@@ -331,6 +371,9 @@ workspace through the agent, and its model calls leave through the egress
 proxy.
 
 ### 11. Self-DoS
+
+**Decided (2026-10-12):** 2 concurrent runs per user, cores ÷ 2 per host, and a
+15-minute idle stop for workspaces (`BLPL_SANDBOX_IDLE_S`, default 900).
 
 - **Run queue:** at most one run per (member, project), as today. A per-user
   cap across projects (`BLPL_RUNS_PER_USER`, default 2) and a host cap
@@ -390,12 +433,12 @@ provides.
 | issue | immediate fix (phase 0) | closed structurally by |
 |---|---|---|
 | **Secrets in the run environment.** Runs get a copy of the backend's whole environment. | `run_env` allowlist in the worker | Phase 2: runs execute in a workspace whose container has no service secret. The run's environment is `runpath.run_env()` plus per-operation injection, and `/proc/<worker>/environ` and `server.key` are not in its mount namespace. |
-| **Symlink escape via pull.** A committed link makes a stage write into another project or `server.key`. | refuse links that leave the checkout after clone/pull | Phase 2: a workspace mounts only its own project, so `/app/data` does not exist there and a link resolves to nothing. Phase 3: the agent's file API opens with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`. |
+| **Symlink escape via pull.** A committed link makes a stage write into another project or `server.key`. | refuse links that leave the checkout after clone/pull | Phase 2 (built): a workspace mounts only its own project and its worktrees, plus `data/modules` read-only, so a link to a sibling project or `server.key` resolves to nothing. The integration test commits such a link and checks. Phase 3: the agent's file API opens with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`. |
 | **Uninspected PDFs served inline.** Any `.pdf` outside `retrieved/` is served `application/pdf`, inline. | trust by content hash (`pdf_verdict` table), not path | Phase 3: blobs are served through the agent, which streams bytes. The control plane decides disposition from `pdf_verdict` and serves `attachment` and `nosniff` for any hash without a released verdict. The inspection itself (`pdf_inspect`, ClamAV) runs in the workspace. |
 | **Writes allowed during runs.** The editor, uploads, pull and agent tools write a checkout with a run in flight. | refuse in `worktree_write` while a run is in flight | Phase 3: the agent is the single writer of a workspace and knows when a run is active. It refuses every write except declared `.blpl/` paths while one is active, so a new writer cannot forget the check. |
 | **Component commits sweep in unrelated changes.** `attach`/`update`/`detach` commit the whole index. | `git commit -- .gitmodules <path>`, and `snapshot` uses a temporary index | Phase 3: git runs in the workspace through one agent verb, `git_commit(paths=[...])`, which commits only the declared paths. A bare commit is not expressible. |
 | **Detach removes the wrong module store.** `rmtree(<checkout>/.git/modules/…)` misses in a worktree and hits the shared store in the owner's checkout. | resolve via `git rev-parse --git-common-dir`, and remove only when no other worktree has the submodule initialised | Phase 3: the removal is an agent verb that does exactly that, inside the project's own storage. Phase 4 adds a pre-operation btrfs snapshot that makes it undoable. |
-| **Provenance rewrites the index.** `git status` in a run refreshes `libraries/`'s index. | `--no-optional-locks` | Phase 2: the run's view of `.git` is read-only (a read-only bind of the git dir over the workspace mount), so a run cannot write any index. |
+| **Provenance rewrites the index.** `git status` in a run refreshes `libraries/`'s index. | `--no-optional-locks` | Phase 3: the agent owns git, and a run's view of `.git` becomes a read-only bind over the workspace mount, so a run cannot write any index. Phase 2 does not change this: the run still sees the project's `.git` read-write. |
 
 ## Migration
 
@@ -416,22 +459,57 @@ tested by unit tests, a refusal matrix, and an integration test against the
 real daemon, both directly and through the proxy. Shipping it changes no
 behaviour.
 
-**Phase 2: runs move into workspaces.**
+**Phase 2: runs move into workspaces (built, behind a flag).**
 
-- Compose gains `docker-proxy` (backend image,
-  `entrypoint: python -m app.sandbox.proxy`, the daemon socket, nothing else),
-  the `blpl-egress` internal network, and Squid.
-- The worker calls `runpath.execute_run` instead of
-  `create_subprocess_exec`, mapping `cancelling` to task cancellation.
-- Storage is the existing project directory: a `BindStorage` whose mount is
-  `data/projects/<name>` read-write, with the proxy allowing a read-write bind
-  only of `projects_root/<name>` for a container labelled with that project.
-  No data moves.
-- Command paths are rewritten from `/app/projects/…` to `/workspace/…`.
-- The worker drops KiCad, the `data` mount and every secret except the proxy
-  socket.
-- Ship behind `BLPL_RUNS_IN_WORKSPACE=1`, with the old path kept for one
-  release.
+- `app/backend/app/sandbox/jobs.py` takes a claimed run through
+  `runpath.execute_run`. The worker uses it when `BLPL_RUNS_IN_WORKSPACE=1`
+  (`worker._Workspaces`). It claims, heartbeats every 20 s whatever the run
+  prints, and turns `cancelling` into task cancellation, which terminates the
+  process in the workspace. A misconfiguration makes the worker refuse to
+  start. It never falls back to running stages in-process.
+- **No data moves, and no paths change.** The workspace bind-mounts
+  `data/projects/<name>` and `data/projects/.worktrees/<name>` read-write at the
+  same paths the worker sees them at. The libraries go at their usual paths
+  read-only, including `data/modules` at `/app/data/modules`. The queued
+  command therefore runs unchanged (the interpreter is the same venv path in
+  both images), and a worktree's absolute `gitdir:` still resolves. The rest of
+  `app/data` (other projects, `server.key`, `runs.db`, ssh keys) does not exist
+  in the workspace, so a committed symlink to a sibling project resolves to
+  nothing.
+- The proxy allows a writable bind only of exactly `<projects>/<P>` and
+  `<projects>/.worktrees/<P>` for a container labelled with project P
+  (`BLPL_PROXY_PROJECT_BIND_ROOTS`). It refuses the projects root, a sibling,
+  a subdirectory, `.sealed`, and anything outside.
+- **Secrets per run** (`jobs.operation_inject`). On top of the allowlist, a run
+  gets the member's LLM chain and only the keys that chain names when it
+  carries one. It gets distributor credentials only when it includes Stage 8.
+  The database URL, server key and SMTP reach no run.
+- **Compose:**
+  - The `workspaces` profile adds `docker-proxy` (backend image, proxy
+    entrypoint, `network_mode: none`, read-only, all capabilities dropped,
+    non-root plus the docker group) and `squid`.
+  - The internal `blpl-egress` network is joined by squid, clamav and ollama.
+    Workspaces reach clamav and ollama directly, because neither holds a secret
+    and clamd does not speak HTTP.
+  - A `blpl-docker-proxy` volume carries the proxy's socket to the worker.
+  - The worker keeps its database URL and server key (it is control plane: it
+    claims runs and opens their sealed environments) and keeps the `data` mount
+    for logs. Those leave in phase 3. What it stops doing is handing its
+    environment and filesystem to the stages.
+- **Turning it on:**
+  1. Build the workspace image (`docker build -f app/workspace/Dockerfile -t
+     blpl-workspace:dev .` from the repo root, with the same `BLPL_UID`).
+  2. Set `BLPL_HOST_REPO_DIR` (the umbrella checkout's absolute host path),
+     `DOCKER_GID` (`getent group docker`) and `BLPL_RUNS_IN_WORKSPACE=1` in
+     `app/.env`. Optionally set `BLPL_SANDBOX_RUNTIME=runsc`.
+  3. Run `docker compose --profile workspaces up -d`.
+- **Tested** end to end against the real daemon, the real proxy and the real
+  workspace image, under runc and runsc (`test_phase2_…`). A queued
+  `stage0-det` writes its artifact into the project's directory on the host,
+  owned by the host user, with the server key absent from its environment.
+  `/app/data` holds only `modules`, the projects root holds only this project
+  and `.worktrees`, and a committed symlink into a sibling project resolves to
+  nothing.
 
 **Phase 3: the agent, and the control plane lets go of the files.**
 
@@ -467,13 +545,14 @@ behaviour.
 - Digest-pinned image allowlist.
 - Library writes only through the reviewed path.
 
-## Running phase 1's pieces
+## Running the pieces
 
 ```bash
 # Unit tests and the refusal matrix (no Docker needed):
 cd app/backend && python -m pytest tests/test_sandbox_*.py tests/test_workspace_image.py -q
 # The integration test uses the local daemon and alpine:latest, never pulls,
-# and removes only what it created (label blpl.test=<uuid>):
+# and removes only what it created (label blpl.test=<uuid> or its own
+# instance label). Add BLPL_SANDBOX_RUNTIME=runsc to run all of it under gVisor:
 python -m pytest tests/test_sandbox_docker_integration.py -q
 # The workspace image:
 docker build -f app/workspace/Dockerfile -t blpl-workspace:dev .
