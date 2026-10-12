@@ -153,6 +153,11 @@ class WorkspaceSpec:
     image: str
     storage: Mount
     libraries: tuple[Mount, ...] = ()
+    # Further read-write storage belonging to the same project: in phase 2, the
+    # members' worktrees, which live beside the project directory rather than
+    # inside it. The proxy allows these only for the project the container is
+    # labelled with.
+    extra_storage: tuple[Mount, ...] = ()
     resources: Resources = Resources()
     # Configuration only — the egress proxy's address, library roots. Never a
     # secret: this is baked into the container and readable by anything in it
@@ -167,8 +172,9 @@ class WorkspaceSpec:
         # Checked here as well as in the proxy. The proxy is the boundary; this
         # is so a wrong spec fails in the test that built it, not in production
         # with a 403.
-        if self.storage.read_only:
-            raise ValueError("a project's own storage is mounted read-write")
+        for m in (self.storage, *self.extra_storage):
+            if m.read_only:
+                raise ValueError("a project's own storage is mounted read-write")
         for lib in self.libraries:
             if not lib.read_only:
                 raise ValueError(f"library mount {lib.target} must be read-only")

@@ -136,6 +136,7 @@ def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig) -> dict[str, Any]:
     # KiCad writes its config there on first start; git reads it for config.
     env.setdefault("HOME", "/tmp")
     mounts = [_mount_body(spec.storage)]
+    mounts += [_mount_body(m) for m in spec.extra_storage]
     mounts += [_mount_body(m) for m in spec.libraries]
     mounts.append(_mount_body(Mount(kind="tmpfs", target="/tmp", size_bytes=r.tmp_bytes)))
 

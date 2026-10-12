@@ -24,6 +24,8 @@ from pathlib import Path
 
 from . import runqueue, serverkey
 from .db import SessionFactory
+from .sandbox import idle as sandbox_idle
+from .sandbox import jobs as sandbox_jobs
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
@@ -114,6 +116,66 @@ async def _run_job(job: runqueue.Claimed) -> int:
         return await proc.wait()
 
 
+class _Workspaces:
+    """Phase 2: runs execute in per-project workspaces, not in this container.
+
+    Off unless BLPL_RUNS_IN_WORKSPACE=1. When on, the driver talks to the
+    socket proxy, never the daemon, and this process stops spawning stages.
+    It still claims, heartbeats and logs exactly as before, so the API cannot
+    tell the difference except that runs no longer see this container's
+    environment or files.
+    """
+
+    SWEEP_EVERY = 60.0
+
+    def __init__(self) -> None:
+        from .sandbox.docker import DockerConfig, DockerDriver
+
+        self.cfg = sandbox_jobs.WorkspaceRunConfig.from_env()
+        self.driver = DockerDriver(DockerConfig.from_env())
+        self.tracker = sandbox_idle.IdleTracker()
+        self._last_sweep = 0.0
+
+    async def run(self, job: runqueue.Claimed) -> int:
+        _LOGS.mkdir(parents=True, exist_ok=True)
+        path = runqueue.log_path(_LOGS, job.run_id)
+        logger.info("running %s in workspace for %s (%s)", job.run_id, job.project_name,
+                    job.cmd[:3])
+
+        async def poll() -> str:
+            with SessionFactory() as session:
+                status = runqueue.heartbeat(session, job.run_id)
+                session.commit()
+            return status
+
+        with path.open("w", encoding="utf-8", buffering=1) as log:
+            try:
+                return await sandbox_jobs.run_job(
+                    self.driver, self.cfg, project_name=job.project_name,
+                    cmd=job.cmd, env=job.env, log=log.write, poll=poll,
+                    poll_every=_HEARTBEAT_EVERY, tracker=self.tracker,
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded in the run's own log
+                # The member reads this log, so say what failed in the
+                # workspace rather than leaving an empty log and a bare -1.
+                log.write(f"blpl: could not run in the project's workspace: {exc}\n")
+                raise
+
+    async def sweep_if_due(self) -> None:
+        now = asyncio.get_running_loop().time()
+        if now - self._last_sweep < self.SWEEP_EVERY:
+            return
+        self._last_sweep = now
+        try:
+            stopped = await sandbox_idle.sweep(
+                self.driver, self.tracker, idle_after_s=self.cfg.idle_after_s
+            )
+            if stopped:
+                logger.info("stopped %d idle workspace(s)", len(stopped))
+        except Exception:  # noqa: BLE001 - a sweep failing must not stop the worker
+            logger.exception("idle sweep failed")
+
+
 async def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -128,8 +190,19 @@ async def main() -> None:
         )
         sys.exit(1)
 
+    workspaces = None
+    if sandbox_jobs.enabled():
+        try:
+            workspaces = _Workspaces()
+        except ValueError as exc:
+            # Misconfigured isolation must not quietly fall back to running
+            # stages in here, with every secret this container holds.
+            logger.error("BLPL_RUNS_IN_WORKSPACE=1 but %s; refusing to start", exc)
+            sys.exit(1)
+
     worker_id = runqueue.worker_name()
-    logger.info("worker %s ready", worker_id)
+    logger.info("worker %s ready (%s)", worker_id,
+                "runs in workspaces" if workspaces else "runs in this container")
 
     while not _stopping:
         try:
@@ -152,12 +225,14 @@ async def main() -> None:
                     logger.info("reclaimed %d stale run(s)", freed)
             except Exception:  # noqa: BLE001
                 logger.exception("could not reclaim stale runs")
+            if workspaces is not None:
+                await workspaces.sweep_if_due()
             await asyncio.sleep(_IDLE_POLL)
             continue
 
         code = runqueue.INTERRUPTED
         try:
-            code = await _run_job(job)
+            code = await (workspaces.run(job) if workspaces else _run_job(job))
         except Exception:  # noqa: BLE001
             logger.exception("run %s failed to execute", job.run_id)
         finally:

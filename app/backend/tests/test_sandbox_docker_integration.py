@@ -30,6 +30,8 @@ from app.sandbox.proxy import DockerProxy, UnixUpstream, serve
 
 SOCK = os.environ.get("BLPL_TEST_DOCKER_SOCK", "/var/run/docker.sock")
 IMAGE = os.environ.get("BLPL_TEST_DOCKER_IMAGE", "alpine:latest")
+# Run the whole file under gVisor with BLPL_SANDBOX_RUNTIME=runsc.
+RUNTIME = os.environ.get("BLPL_SANDBOX_RUNTIME") or None
 
 
 def _daemon_ready() -> str | None:
@@ -85,17 +87,21 @@ class Env:
     def config(self, endpoint: str) -> DockerConfig:
         # "none": the test must not depend on, or create, any network.
         return DockerConfig(endpoint=endpoint, instance=self.instance, network="none",
-                            cancel_grace_s=2.0)
+                            runtime=RUNTIME, cancel_grace_s=2.0)
 
     def cleanup(self) -> None:
-        filters = json.dumps({"label": [f"blpl.test={self.tag}"]})
+        # Ours carry the test label, or this run's unique instance label (a
+        # workspace built by jobs.spec_for has no test label).
         with httpx.Client(transport=httpx.HTTPTransport(uds=SOCK),
                           base_url="http://d/v1.44", timeout=60) as c:
-            for row in c.get("/containers/json", params={"all": "1", "filters": filters}).json():
-                c.delete(f"/containers/{row['Id']}", params={"force": "1"})
-            vols = c.get("/volumes", params={"filters": filters}).json().get("Volumes") or []
-            for v in vols:
-                c.delete(f"/volumes/{v['Name']}")
+            for label in (f"blpl.test={self.tag}", f"blpl.instance={self.instance}"):
+                filters = json.dumps({"label": [label]})
+                for row in c.get("/containers/json",
+                                 params={"all": "1", "filters": filters}).json():
+                    c.delete(f"/containers/{row['Id']}", params={"force": "1"})
+                vols = c.get("/volumes", params={"filters": filters}).json().get("Volumes") or []
+                for v in vols:
+                    c.delete(f"/volumes/{v['Name']}")
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
@@ -119,6 +125,10 @@ async def _lifecycle(driver: DockerDriver, spec: WorkspaceSpec) -> None:
     assert (await driver.status(key)).state is State.ABSENT
     st = await driver.ensure(spec)
     assert st.state is State.RUNNING and st.container_id
+    if RUNTIME == "runsc":
+        # Check the runtime took effect rather than trusting the request.
+        code, out = await _out(driver, key, ["uname", "-r"])
+        assert "gvisor" in out, out
 
     # Confinement, observed from inside rather than assumed from the request.
     code, out = await _out(driver, key, ["id", "-u"])
@@ -188,6 +198,8 @@ def test_driver_through_the_proxy_and_what_the_proxy_refuses(env):
     policy = ProxyPolicy(
         instance=env.instance, images=frozenset({IMAGE}), networks=frozenset({"none"}),
         ro_bind_roots=(str(env.lib),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
     )
 
     async def scenario():
@@ -296,5 +308,141 @@ def test_workspace_image_works_under_the_confinement(env):
         finally:
             await driver.remove(spec.key)
             await driver.aclose()
+
+    asyncio.run(scenario())
+
+
+async def _exhaust(driver: DockerDriver, key: WorkspaceKey, script: str) -> tuple[str | None, State]:
+    """Run script; return its output (None if the exec itself failed, as when
+    the sandbox dies under it) and the workspace's state afterwards."""
+    try:
+        _, out = await _out(driver, key, ["sh", "-c", script])
+    except Exception:  # noqa: BLE001
+        out = None
+    await asyncio.sleep(1.0)
+    return out, (await driver.status(key)).state
+
+
+def test_limits_are_enforced(env):
+    """Memory and pids ceilings hold under whichever runtime is configured.
+
+    They are enforced differently. Under runc the kernel stops one process: the
+    OOM killer takes the allocator, or fork fails and the shell gives up. Under
+    gVisor the limits apply to the whole sandbox's cgroup, so exceeding either
+    one kills the sandbox and every process in it. Both count as enforcement
+    and the test accepts either. What it refuses is the script reporting that
+    the allocation, or all 400 processes, succeeded.
+    """
+    async def scenario():
+        driver = DockerDriver(env.config(f"unix://{SOCK}"))
+        base = env.spec("limits")
+        spec = WorkspaceSpec(
+            key=base.key, image=IMAGE, storage=base.storage, extra_labels=base.extra_labels,
+            command=base.command,
+            # gVisor's own threads count against the pids limit; below ~48 a
+            # runsc sandbox cannot start at all.
+            resources=Resources(memory_bytes=64 * 1024**2, nano_cpus=500_000_000, pids=96,
+                                tmp_bytes=8 * 1024**2),
+        )
+        try:
+            await driver.ensure(spec)
+            out, state = await _exhaust(driver, spec.key, (
+                'awk "BEGIN{s=\\"x\\"; while(length(s)<400000000) s=s s; print \\"ALLOCATED\\"}"'))
+            assert "ALLOCATED" not in (out or ""), "a 400 MB allocation succeeded under 64 MiB"
+            if out is None or state is not State.RUNNING:
+                assert RUNTIME == "runsc", "only gVisor should lose the whole workspace"
+
+            await driver.ensure(spec)  # restart it if gVisor took it down
+            out, state = await _exhaust(driver, spec.key, (
+                'for i in $(seq 1 400); do sleep 60 & done; sleep 1; '
+                'echo ALIVE=$(ps -o args | grep -c "^sleep 60$")'))
+            assert "ALIVE=400" not in (out or ""), "400 processes started under a pids limit of 96"
+            if out is None or state is not State.RUNNING:
+                assert RUNTIME == "runsc"
+        finally:
+            await driver.remove(spec.key)
+            await driver.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_phase2_a_queued_stage_runs_in_its_workspace_through_the_proxy(env):
+    """The phase-2 path end to end, against the real daemon, the real socket
+    proxy and the real workspace image: a stage the API would queue runs in the
+    project's workspace and writes into the project's own directory on the
+    host. The workspace sees no sibling project, and a committed symlink
+    pointing at one resolves to nothing."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    from app.sandbox import jobs
+
+    projects = env.tmp / "projects"
+    project = f"itest-{env.tag}-p2"
+    (projects / project).mkdir(parents=True)
+    (projects / project / "design.md").write_text("# Board\n")
+    victim = projects / "victim"
+    victim.mkdir()
+    (victim / "secret.md").write_text("another project's plaintext\n")
+    (projects / project / "escape").symlink_to(victim)
+    for d in (env.tmp, projects, projects / project, victim):
+        os.chmod(d, 0o755)
+    psock = str(env.tmp / "proxy.sock")
+    policy = ProxyPolicy(
+        instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
+        ro_bind_roots=(str(env.lib),), project_bind_roots=(str(projects),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
+    )
+    cfg = jobs.WorkspaceRunConfig(
+        image=WORKSPACE_IMAGE, projects_root=projects, host_projects_root=str(projects),
+        libraries=(Mount(kind="bind", source=str(env.lib), target="/app/data/modules",
+                         read_only=True),),
+        resources=Resources(memory_bytes=1024**3, nano_cpus=1_000_000_000, pids=256,
+                            tmp_bytes=256 * 1024**2),
+    )
+
+    async def scenario():
+        upstream = UnixUpstream(SOCK)
+        server = await serve(DockerProxy(policy, upstream), psock)
+        driver = DockerDriver(env.config(f"unix://{psock}"))
+        lines: list[str] = []
+
+        async def poll():
+            return "running"
+
+        async def run(cmd, extra_env=None):
+            lines.clear()
+            code = await jobs.run_job(
+                driver, cfg, project_name=project, cmd=cmd,
+                env={"BLPL_MODULES_ROOT": "/app/data/modules", "BLPL_SERVER_KEY": "k" * 44,
+                     **(extra_env or {})},
+                log=lines.append, poll=poll)
+            return code, "".join(lines)
+
+        try:
+            code, out = await run(["/opt/blpl-venv/bin/python", "-m", "blpl.core.cli",
+                                   "stage0-det", "--project-dir", str(projects / project)])
+            assert code == 0, out
+            written = projects / project / ".pipeline" / "design_artifact.deterministic.json"
+            assert written.is_file(), out
+            assert written.stat().st_uid == 1000  # owned by the host user, not root
+
+            # Of all of app/data, only the read-only library is there.
+            code, out = await run(["ls", "-A", "/app/data"])
+            assert out.split() == ["modules"], out
+            code, out = await run(["ls", "-A", str(projects)])
+            assert out.split() == [".worktrees", project], out
+            code, out = await run(["cat", "escape/secret.md"])
+            assert code != 0 and "another project's plaintext" not in out
+            code, out = await run(["sh", "-c", 'echo "[$BLPL_SERVER_KEY]"'])
+            assert out.strip() == "[]"  # queued, but not on the allowlist
+            if RUNTIME == "runsc":
+                code, out = await run(["uname", "-r"])
+                assert "gvisor" in out
+        finally:
+            await driver.remove(WorkspaceKey(project))
+            await driver.aclose()
+            await upstream.aclose()
+            server.close()
 
     asyncio.run(scenario())
