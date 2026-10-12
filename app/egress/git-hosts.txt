@@ -1,0 +1,2 @@
+# Hosts a workspace may reach on port 22 for git over ssh.
+github.com
