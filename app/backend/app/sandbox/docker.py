@@ -137,6 +137,8 @@ def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig) -> dict[str, Any]:
     env.setdefault("HOME", "/tmp")
     mounts = [_mount_body(spec.storage)]
     mounts += [_mount_body(m) for m in spec.extra_storage]
+    if spec.agent_dir is not None:
+        mounts.append(_mount_body(spec.agent_dir))
     mounts += [_mount_body(m) for m in spec.libraries]
     mounts.append(_mount_body(Mount(kind="tmpfs", target="/tmp", size_bytes=r.tmp_bytes)))
 

@@ -71,6 +71,8 @@ class IdleTracker:
 
 
 OnStopped = Callable[[WorkspaceKey], "Awaitable[None] | None"]
+# Seconds idle as something other than the tracker sees it (the agent), or None.
+Activity = Callable[[WorkspaceKey], "Awaitable[float | None]"]
 
 
 async def sweep(
@@ -79,6 +81,7 @@ async def sweep(
     *,
     idle_after_s: float = DEFAULT_IDLE_AFTER_S,
     on_stopped: OnStopped | None = None,
+    activity: Activity | None = None,
 ) -> list[WorkspaceKey]:
     """Stop every running workspace idle longer than idle_after_s.
 
@@ -98,6 +101,15 @@ async def sweep(
         idle = tracker.idle_for(key) or 0.0
         if idle < idle_after_s:
             continue
+        if activity is not None:
+            # A second witness can only make a workspace younger: activity this
+            # process did not see still counts, and a witness that cannot
+            # answer changes nothing.
+            other = await activity(key)
+            if other is not None and other < idle_after_s:
+                continue
+            if other is not None:
+                idle = min(idle, other)
         try:
             await driver.stop(key)
         except DriverError:

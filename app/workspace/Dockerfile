@@ -100,6 +100,15 @@ USER ${BLPL_UID}:${BLPL_GID}
 LABEL org.opencontainers.image.title="blpl-workspace" \
       org.opencontainers.image.description="BLPL per-project workspace (headless KiCad + pipeline)"
 
-# Nothing to serve: work arrives as operations the control plane starts in it.
-# The driver sets Init so a real PID 1 reaps what kicad-cli and java leave.
-CMD ["sleep", "infinity"]
+# The workspace agent (phase 3): the control plane's one way in. Two files of
+# the backend, both stdlib only. agent.py is the server. projects.py is the
+# backend's git layer, so status, commit, pull and push behave exactly as they
+# do there. Nothing else of the control plane is in this image. Root-owned and
+# on the read-only rootfs, so a run cannot replace either file.
+COPY app/backend/app/sandbox/agent.py /opt/blpl/wsagent/agent.py
+COPY app/backend/app/projects.py /opt/blpl/wsagent/projects.py
+
+# The agent serves when the control plane gave it a directory and a token
+# (/run/blpl). Without them (a phase 2 workspace) it only holds the container
+# open. The driver sets Init so a real PID 1 reaps what kicad-cli and java leave.
+CMD ["python", "/opt/blpl/wsagent/agent.py"]

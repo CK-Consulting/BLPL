@@ -33,11 +33,14 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Awaitable, Callable, Mapping, Sequence
 
 from .driver import Mount, Resources, WorkspaceDriver, WorkspaceKey, WorkspaceSpec
 from .idle import IdleTracker
 from .runpath import execute_run
+
+if TYPE_CHECKING:
+    from .agentclient import AgentClient
 
 CANCELLING = "cancelling"
 # What a cancelled run is recorded as, matching a process killed by SIGTERM in
@@ -214,3 +217,62 @@ async def run_job(
             except asyncio.CancelledError:
                 pass
             return CANCELLED_EXIT
+
+
+async def run_job_via_agent(
+    connect: Callable[[], Awaitable["AgentClient"]],
+    *,
+    cmd: Sequence[str],
+    env: Mapping[str, str],
+    log: Callable[[str], None],
+    poll: Callable[[], Awaitable[str]],
+    poll_every: float = 20.0,
+    read_every: float = 0.25,
+    tracker: IdleTracker | None = None,
+    key: "WorkspaceKey | None" = None,
+) -> int:
+    """Phase 3: the same run, started and followed through the workspace's agent.
+
+    The agent owns the process: it is in its own process group, so a cancel
+    reaches everything it started, and its log is kept in the workspace, so a
+    control-plane restart loses only this follower, not the run.
+    """
+    import codecs
+
+    from .runpath import run_env
+
+    client = await connect()
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    loop = asyncio.get_running_loop()
+    busy = tracker.busy(key) if (tracker is not None and key is not None) else None
+    if busy is not None:
+        busy.__enter__()
+    try:
+        rid = await asyncio.to_thread(
+            client.run_start, list(cmd), run_env(env, operation_inject(cmd, env)), None)
+        offset, last_poll, cancelled = 0, loop.time(), False
+        while True:
+            data, offset, done, code = await asyncio.to_thread(client.run_read, rid, offset)
+            if data:
+                if tracker is not None and key is not None:
+                    tracker.touch(key)
+                text = decoder.decode(data)
+                if text:
+                    log(text)
+            elif done:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    log(tail)
+                return code if code is not None else -1
+            if not cancelled and loop.time() - last_poll >= poll_every:
+                last_poll = loop.time()
+                if await poll() == CANCELLING:
+                    log("blpl: run cancelled; stopping it in the workspace\n")
+                    await asyncio.to_thread(client.run_cancel, rid)
+                    cancelled = True
+            if not data:
+                await asyncio.sleep(read_every)
+    finally:
+        if busy is not None:
+            busy.__exit__(None, None, None)
+        client.close()
