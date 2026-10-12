@@ -42,6 +42,36 @@ os.environ["BLPL_DATA_ROOT"] = str(_SESSION_DATA / "data")
 os.environ["BLPL_PROJECTS_ROOT"] = str(_SESSION_DATA / "data" / "projects")
 atexit.register(shutil.rmtree, _SESSION_DATA, True)
 
+# Git sees no configuration but what a test gives it. Every commit the app
+# makes must carry the identity of the person it is for; one that does not
+# has to fail here exactly as it fails in the container, which has no global
+# git config. Run on a workstation, the developer's ~/.gitconfig supplied an
+# email and hid three such commits until the suite ran in a container. The
+# global file is a scratch one with user.useConfigOnly set, which also stops
+# git inventing an address from the hostname; system config is off; and any
+# identity in the environment is cleared (see the autouse fixture below).
+_GIT_GLOBAL = _SESSION_DATA / "gitconfig"
+_GIT_GLOBAL.write_text("[user]\n\tuseConfigOnly = true\n", encoding="utf-8")
+_GIT_IDENTITY_ENV = (
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE", "EMAIL",
+)
+os.environ["GIT_CONFIG_GLOBAL"] = str(_GIT_GLOBAL)
+os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+for _var in _GIT_IDENTITY_ENV:
+    os.environ.pop(_var, None)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_git_identity(monkeypatch):
+    """Per test as well as per session, so a test that sets one of these
+    cannot lend it to the next."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(_GIT_GLOBAL))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for var in _GIT_IDENTITY_ENV:
+        monkeypatch.delenv(var, raising=False)
+
+
 # The suite's git fixtures are local bare repositories, reached over file://.
 # Deployments allow only https and ssh; tests that check that refusal set the
 # default back explicitly.

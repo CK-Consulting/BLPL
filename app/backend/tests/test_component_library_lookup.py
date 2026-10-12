@@ -83,7 +83,7 @@ def _legacy_part(data: Path, uid: int, mpn: str) -> None:
     d = components.root(data, uid) / mpn
     d.mkdir(parents=True)
     components._git(d, "init", "-b", "main")
-    components._git(d, "commit", "--allow-empty", "-m", f"Component {mpn}")
+    components._commit(d, IDENT, "--allow-empty", "-m", f"Component {mpn}")
 
 
 def test_colliding_exact_records_prefer_the_literal_spelling(data) -> None:

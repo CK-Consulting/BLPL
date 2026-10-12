@@ -241,3 +241,19 @@ def test_opening_a_project_clears_the_placeholder_from_its_config(project):
     assert _git_config(repo, "user.email") == "" and _git_config(repo, "user.name") == ""
     # History is not rewritten.
     assert _git(repo, "log", "--format=%H %ae") == log_before
+
+
+def test_no_helper_will_commit_without_an_identity(tmp_path):
+    # Both git helpers once supplied an identity of their own (one in the
+    # call, one in the repository's config). Neither may commit now unless
+    # the caller passes the person's identity.
+    from app import components
+    from app.projects import ProjectError, Projects
+
+    d = tmp_path / "r"
+    d.mkdir()
+    _git(d, "init", "-q", "-b", "main")
+    with pytest.raises(components.ComponentError, match="_commit"):
+        components._git(d, "commit", "--allow-empty", "-m", "x")
+    with pytest.raises(ProjectError, match="no commit identity"):
+        Projects(tmp_path)._git(d, "commit", "--allow-empty", "-m", "x")

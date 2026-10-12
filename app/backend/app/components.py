@@ -101,6 +101,13 @@ def part_repo(data_root: Path, user_id: int, mpn: str) -> Path:
 
 
 def _git(cwd: Path, *args: str, allow_file: bool = False) -> str:
+    if args and args[0] == "commit":
+        # This helper used to add a fixed identity to every call, so a commit
+        # through it was signed by nobody in particular and nothing noticed.
+        # It adds none now, and a commit through it would take whatever the
+        # machine's git config happens to hold — or fail only where there is
+        # none. Commits go through _commit, which needs the person's identity.
+        raise ComponentError("internal: commit through components._commit, with an identity")
     base = ["git"]
     if allow_file:
         base += ["-c", "protocol.file.allow=always"]

@@ -1119,6 +1119,11 @@ class Projects:
         # `env` is extra environment for this one invocation — a leased
         # credential, never a stored one. Merged over the process environment
         # rather than replacing it, because git needs PATH and HOME too.
+        if args and args[0] == "commit" and not (env or {}).get("GIT_AUTHOR_EMAIL"):
+            # A commit with no identity of its own would take the machine's
+            # git config — a developer's on a workstation, nothing (and a
+            # failure) in the container. Refused the same way everywhere.
+            raise ProjectError(_no_identity())
         proc = subprocess.run(
             ["git", *args],
             cwd=str(cwd),
