@@ -298,3 +298,50 @@ def test_an_upload_refuses_a_linked_quarantine_directory(ag, projects):
                         uploaded_by="", mpn="", llm_ignore=False)
     assert e.value.status == 403
     assert sorted(p.name for p in (projects / "victim").iterdir()) == ["secret.md"]
+
+
+@pytest.fixture
+def gvisor_open(monkeypatch):
+    """Emulate runsc: open() with O_DIRECTORY | O_NOFOLLOW follows a symlink
+    (to a directory it opens the target; dangling, it fails ENOENT), where
+    Linux refuses with ENOTDIR. Measured on this host, 2026-10-12."""
+    real = os.open
+
+    def gvisor(path, flags, mode=0o777, *, dir_fd=None):
+        if flags & os.O_DIRECTORY:
+            flags &= ~os.O_NOFOLLOW
+        return real(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", gvisor)
+
+
+def test_confinement_holds_where_o_nofollow_does_not(gvisor_open, ag, projects):
+    _, c, _ = ag
+    board = projects / "board"
+    (board / "sub").mkdir()
+    (board / "sub" / "x.md").write_text("x")
+    (board / "inside").symlink_to(board / "sub")              # target exists
+    (board / "escape").symlink_to(projects / "victim")         # outside the roots
+    (board / "etc").symlink_to("/etc")                          # exists everywhere
+    (board / "gone").symlink_to(projects / "nowhere")           # dangling
+    assert all((board / n).is_symlink() for n in ("inside", "escape", "etc", "gone"))
+    for path in ("inside/x.md", "escape/secret.md", "etc/passwd", "gone/x"):
+        with pytest.raises(AgentCallError) as e:
+            c.read(B(projects), path)
+        # One answer for every link, whatever the target, on every runtime.
+        assert (e.value.status, "symlink" in str(e.value)) == (403, True), path
+    with pytest.raises(AgentCallError) as e:
+        c.write(B(projects), "escape/new.md", b"x")
+    assert e.value.status == 403
+    assert not (projects / "victim" / "new.md").exists()
+    paths = {e["path"] for e in c.list(B(projects))["entries"]}
+    assert not any(p.startswith(("inside/", "escape/", "etc/")) for p in paths)
+
+
+def test_a_write_never_truncates_through_a_link(gvisor_open, ag, projects):
+    _, c, _ = ag
+    (projects / "board" / "leak.md").symlink_to(projects / "victim" / "secret.md")
+    with pytest.raises(AgentCallError) as e:
+        c.write(B(projects), "leak.md", b"")
+    assert e.value.status == 403
+    assert (projects / "victim" / "secret.md").read_text() == "another project's plaintext\n"

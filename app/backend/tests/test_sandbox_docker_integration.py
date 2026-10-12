@@ -494,6 +494,8 @@ def test_phase3_the_agent_in_a_real_workspace(env):
     (projects / "victim" / "secret.md").write_text("another project's plaintext\n")
     subprocess.run(["git", "init", "-q", "-b", "main", str(proj)], check=True)
     (proj / "escape").symlink_to(projects / "victim")
+    (proj / "etc").symlink_to("/etc")
+    assert (proj / "escape").is_symlink() and (proj / "etc").is_symlink()
     for d in (env.tmp, projects, proj, projects / "victim", agents):
         os.chmod(d, 0o755)
 
@@ -530,9 +532,18 @@ def test_phase3_the_agent_in_a_real_workspace(env):
                 # Files, confined.
                 c.write(co, "design.md", b"# Board\n")
                 assert c.read(co, "design.md") == b"# Board\n"
-                with pytest.raises(AgentCallError) as e:
-                    c.read(co, "escape/secret.md")
-                assert e.value.status == 403
+                # The fixtures must exist, as links, as the workspace sees
+                # them: a refusal of something that is not there proves
+                # nothing. Under runsc, `escape` (whose target is not mounted)
+                # is a dangling link and `etc` a link to a directory that
+                # exists; gVisor's open() follows both with O_DIRECTORY.
+                for link in ("escape", "etc"):
+                    st = c.stat(co, link)
+                    assert st["exists"] and st["symlink"], (link, st)
+                for path in ("escape/secret.md", "etc/passwd"):
+                    with pytest.raises(AgentCallError) as e:
+                        c.read(co, path)
+                    assert (e.value.status, "symlink" in str(e.value)) == (403, True), path
 
                 # Git, as the member.
                 assert c.git_commit(co, "edit: design.md", ident) is not None

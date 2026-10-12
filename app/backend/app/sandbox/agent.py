@@ -25,8 +25,10 @@ token file it refuses to serve.
 **Where it may touch.** Every path is relative to a checkout. The checkout is
 an absolute path lying within one of the roots given at start (the project
 directory and its worktrees directory), with no symlink in it. Below the
-checkout a path is opened one component at a time with O_NOFOLLOW from the
-previous directory's descriptor. A symlink anywhere along the way, final
+checkout a path is opened one component at a time from the previous
+directory's descriptor, each component lstat'ed first and the opened descriptor
+checked to be that same inode (``open_at``; O_NOFOLLOW alone does not hold
+under gVisor). A symlink anywhere along the way, final
 component included, is therefore refused rather than followed. That is the
 same rule FilesystemSandbox applies by resolving and containing, made
 race-free by never following a link at all. No path may name ``.git``: git is
@@ -89,6 +91,46 @@ def _forbidden(msg: str) -> AgentError:
 # -- confinement -------------------------------------------------------------------
 
 
+def _same(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def open_at(name: str, dir_fd: int, flags: int, *, want_dir: bool, mode: int = 0o644,
+            create: bool = False) -> int:
+    """Open name in dir_fd without following a link, whatever the kernel does.
+
+    O_NOFOLLOW alone is not enough. Under gVisor (runsc), open() with
+    O_DIRECTORY | O_NOFOLLOW *follows* a symlink: a link to a directory opens
+    the directory it names, and a dangling link fails with ENOENT. Linux
+    refuses both with ENOTDIR. So the decision is taken from lstat, which both
+    report the same way, and the descriptor the open returns must be the
+    inode lstat saw. A link swapped in between the two is refused, not
+    followed. FileNotFoundError means the name does not exist at all.
+    """
+    try:
+        before = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if not create:
+            raise
+        before = None
+    if before is not None:
+        if stat.S_ISLNK(before.st_mode):
+            raise _forbidden(f"{name!r} is a symlink; links are never followed")
+        if want_dir != stat.S_ISDIR(before.st_mode):
+            raise _forbidden(f"{name!r} is {'not ' if want_dir else ''}a directory")
+    fd = os.open(name, flags | os.O_NOFOLLOW | (os.O_DIRECTORY if want_dir else 0),
+                 mode, dir_fd=dir_fd)
+    try:
+        after = os.fstat(fd)
+        now = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if (before is not None and not _same(before, after)) or not _same(now, after):
+            raise _forbidden(f"{name!r} changed while it was being opened")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 class Confined:
     def __init__(self, roots: list[str]):
         self.roots = [os.path.realpath(r) for r in roots if r]
@@ -127,14 +169,15 @@ class Confined:
         try:
             for p in parts:
                 try:
-                    nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    nfd = open_at(p, fd, os.O_RDONLY, want_dir=True)
                 except FileNotFoundError:
                     if not create:
                         raise AgentError(404, "no such directory", "notfound") from None
                     os.mkdir(p, 0o755, dir_fd=fd)
-                    nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    nfd = open_at(p, fd, os.O_RDONLY, want_dir=True)
+                except AgentError:
+                    raise
                 except OSError as e:
-                    # ELOOP / ENOTDIR: a link or a file where a directory was named.
                     raise _forbidden(f"{p!r} is not a directory this agent may enter ({e.strerror})") from None
                 os.close(fd)
                 fd = nfd
@@ -305,9 +348,8 @@ class Agent:
                     node = {"path": rel, "name": e.name, "dir": True}
                     out.append(node)
                     try:
-                        sub = os.open(e.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                      dir_fd=fd)
-                    except OSError:
+                        sub = open_at(e.name, fd, os.O_RDONLY, want_dir=True)
+                    except (OSError, AgentError):
                         node["incomplete"] = True
                         complete = False
                         continue
@@ -345,9 +387,11 @@ class Agent:
         cap = int(b.get("max_bytes", MAX_BODY))
         with self.fs.dir_fd(checkout, parts[:-1]) as dfd:
             try:
-                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                fd = open_at(parts[-1], dfd, os.O_RDONLY, want_dir=False)
             except FileNotFoundError:
                 raise AgentError(404, "no such file", "notfound") from None
+            except AgentError:
+                raise
             except OSError as e:
                 raise _forbidden(f"cannot open {parts[-1]!r}: {e.strerror}") from None
         with os.fdopen(fd, "rb") as fh:
@@ -364,11 +408,16 @@ class Agent:
         self._no_run(parts)
         with self.fs.dir_fd(checkout, parts[:-1], create=q.get("mkdirs") == "1") as dfd:
             try:
-                fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-                             0o644, dir_fd=dfd)
+                # No O_TRUNC: truncating happens only once the descriptor is
+                # known to be the file itself, never something a link named.
+                fd = open_at(parts[-1], dfd, os.O_WRONLY | os.O_CREAT, want_dir=False,
+                             create=True)
+            except AgentError:
+                raise
             except OSError as e:
                 raise _forbidden(f"cannot write {parts[-1]!r}: {e.strerror}") from None
         with os.fdopen(fd, "wb") as fh:
+            os.ftruncate(fh.fileno(), 0)
             fh.write(data)
         return {"bytes": len(data)}
 
