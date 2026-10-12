@@ -447,6 +447,33 @@ export type GitStatus = {
    *  or a fetch URL and a different push URL), else empty. When set, `ahead`
    *  and `unpublished` are not measured and say nothing. */
   remote_problem?: string;
+  /** auto | manual, or null for a project created before anyone was asked
+   *  (it behaves as manual). */
+  push_policy?: "auto" | "manual" | null;
+  /** This member's last push, automatic or by hand. A failure stays here
+   *  until a later push succeeds. Null when they have never pushed. */
+  last_push?: { at: string; ok: boolean; error: string } | null;
+  /** False when a commit by this user would be refused for want of a commit
+   *  identity — neither one for this project nor an account default. */
+  has_identity?: boolean;
+};
+
+export type RemoteCheck = {
+  status: "ok" | "auth_failed" | "not_found" | "error";
+  ok: boolean;
+  /** Only meaningful when ok. A new project needs an empty repository. */
+  empty: boolean | null;
+  message: string;
+  /** git's own explanation, redacted server-side. */
+  detail: string;
+  /** The saved credential that was used, when one matched the host. */
+  credential: string | null;
+};
+
+export type NewProjectDefaults = {
+  identity: { name: string; email: string };
+  identity_is_default: boolean;
+  manual_push_warning: string;
 };
 
 export type LibraryPolicyValues = {

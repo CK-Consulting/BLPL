@@ -936,6 +936,13 @@ header .kicad-launch { margin-left: .4rem; }
 .proj-git .kv dt { color: #7d8590; font-size: 12px; }
 .proj-git .kv dd { margin: 0; }
 .proj-git .remote-url { color: #c8ccd2; word-break: break-all; }
+/* Project git setup: credential, identity and push policy under the remote. */
+.proj-git h4 { margin: 1rem 0 .3rem; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: #b9c3d0; }
+.proj-git .proj-git-policy { margin-top: 1rem; display: flex; flex-direction: column; gap: .5rem; align-items: flex-start; }
+.setup-help { border: 1px solid #414a57; border-radius: 10px; padding: .5rem .8rem; }
+.setup-help summary { cursor: pointer; color: #c3ccd6; }
+.setup-help ol { margin: .5rem 0 .2rem 1.1rem; padding: 0; display: flex; flex-direction: column; gap: .45rem; line-height: 1.45; }
+.setup-help ul { margin: .35rem 0 0 1rem; padding: 0; display: flex; flex-direction: column; gap: .35rem; }
 
 /* ---- board config form ---------------------------------------------------- */
 .board-config .field-row { display: flex; flex-wrap: wrap; gap: .8rem; align-items: flex-end; margin: .6rem 0; }
