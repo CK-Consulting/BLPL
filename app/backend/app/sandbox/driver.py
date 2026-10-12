@@ -37,6 +37,9 @@ LABEL_SPEC = "blpl.spec"
 
 Role = Literal["workspace", "desktop"]
 
+# Where a workspace sees its agent directory (socket, start token).
+AGENT_DIR = "/run/blpl"
+
 
 class State(str, Enum):
     ABSENT = "absent"      # no container exists
@@ -158,6 +161,9 @@ class WorkspaceSpec:
     # inside it. The proxy allows these only for the project the container is
     # labelled with.
     extra_storage: tuple[Mount, ...] = ()
+    # Phase 3: the host directory holding this workspace's agent socket and
+    # start token, mounted read-write at AGENT_DIR. One per container.
+    agent_dir: Mount | None = None
     resources: Resources = Resources()
     # Configuration only — the egress proxy's address, library roots. Never a
     # secret: this is baked into the container and readable by anything in it
@@ -172,6 +178,9 @@ class WorkspaceSpec:
         # Checked here as well as in the proxy. The proxy is the boundary; this
         # is so a wrong spec fails in the test that built it, not in production
         # with a 403.
+        if self.agent_dir is not None and (self.agent_dir.read_only
+                                           or self.agent_dir.target != AGENT_DIR):
+            raise ValueError(f"the agent directory is mounted read-write at {AGENT_DIR}")
         for m in (self.storage, *self.extra_storage):
             if m.read_only:
                 raise ValueError("a project's own storage is mounted read-write")

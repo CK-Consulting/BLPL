@@ -401,3 +401,20 @@ def test_cancelling_a_run_cancels_the_process_and_releases_busy():
     run(scenario())
     assert d.calls[0].cancelled
     assert not tracker.is_busy(KEY)
+
+
+def test_sweep_keeps_a_workspace_the_agent_saw_used_recently():
+    clock, d = Clock(), FakeDriver()
+    tracker = idle.IdleTracker(clock)
+    run(d.ensure(spec()))
+    run(idle.sweep(d, tracker, idle_after_s=60))
+    clock.t += 120  # idle as far as this process knows
+
+    async def recent(key):
+        return 5.0  # the backend's file requests reached it seconds ago
+
+    async def unknown(key):
+        return None  # cannot ask: changes nothing
+
+    assert run(idle.sweep(d, tracker, idle_after_s=60, activity=recent)) == []
+    assert run(idle.sweep(d, tracker, idle_after_s=60, activity=unknown)) == [KEY]

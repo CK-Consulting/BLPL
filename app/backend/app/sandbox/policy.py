@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from .driver import (
+    AGENT_DIR,
     LABEL_INSTANCE,
     LABEL_MANAGED,
     LABEL_PROJECT,
@@ -79,6 +80,10 @@ class ProxyPolicy:
     # labelled with project P may bind, read-write, exactly <root>/P and
     # <root>/.worktrees/P, and nothing else beneath a root.
     project_bind_roots: tuple[str, ...] = ()
+    # Phase 3: host directories holding one agent directory per container. A
+    # container may bind exactly <root>/<its own name>, read-write, at
+    # /run/blpl, and so reach no other workspace's socket or token.
+    agent_dir_roots: tuple[str, ...] = ()
     roles: frozenset[str] = frozenset({"workspace"})
     volume_prefix: str = "blpl-ws-"
     max_memory: int = 16 * GiB
@@ -103,6 +108,7 @@ class ProxyPolicy:
             allow_default_runtime=env.get("BLPL_PROXY_REQUIRE_RUNTIME", "") != "1",
             ro_bind_roots=tuple(words("BLPL_PROXY_RO_BIND_ROOTS")),
             project_bind_roots=tuple(words("BLPL_PROXY_PROJECT_BIND_ROOTS")),
+            agent_dir_roots=tuple(words("BLPL_PROXY_AGENT_DIR_ROOTS")),
         )
 
 
@@ -327,7 +333,12 @@ def _project_dirs(policy: ProxyPolicy, project: str) -> set[str]:
     return out
 
 
-def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "") -> Any:
+def _agent_dirs(policy: ProxyPolicy, container: str) -> set[str]:
+    return {f"{r.rstrip('/')}/{container}" for r in policy.agent_dir_roots if r.rstrip("/")}
+
+
+def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
+            container: str = "") -> Any:
     if not isinstance(v, list):
         raise Refused(f"{where} must be a list")
     out, targets = [], set()
@@ -358,6 +369,9 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "") -> Any:
             if got["ReadOnly"]:
                 if not _under_root(got["Source"], policy.ro_bind_roots):
                     raise Refused(f"{w}.Source {got['Source']} is not a permitted library root")
+            elif got["Source"] in _agent_dirs(policy, container):
+                if got["Target"] != AGENT_DIR:
+                    raise Refused(f"{w}: an agent directory is mounted at {AGENT_DIR} only")
             elif got["Source"] not in _project_dirs(policy, project):
                 # Writable binds are the project's own checkouts and nothing
                 # else: not a library, not a sibling project, not a parent.
@@ -425,7 +439,7 @@ def check_create(policy: ProxyPolicy, query: Mapping[str, str], obj: Any) -> Cre
         "MemorySwap": _int_range(1, policy.max_memory),
         "NanoCpus": _int_range(1, policy.max_nano_cpus),
         "PidsLimit": _int_range(1, policy.max_pids),
-        "Mounts": lambda v, w: _mounts(policy, v, w, labels[LABEL_PROJECT]),
+        "Mounts": lambda v, w: _mounts(policy, v, w, labels[LABEL_PROJECT], name),
         # Empty means the daemon's default runtime, decided below.
         "Runtime": lambda v, w: _DROP if v in ("", None) else _one_of(policy.runtimes)(v, w),
         "RestartPolicy": lambda v, w: _pick(v, {"Name": _one_of({"no", ""})}, w),

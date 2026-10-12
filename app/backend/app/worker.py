@@ -128,13 +128,22 @@ class _Workspaces:
 
     SWEEP_EVERY = 60.0
 
-    def __init__(self) -> None:
+    def __init__(self, server_key: bytes | None = None) -> None:
+        from .sandbox import workspaces
         from .sandbox.docker import DockerConfig, DockerDriver
 
         self.cfg = sandbox_jobs.WorkspaceRunConfig.from_env()
         self.driver = DockerDriver(DockerConfig.from_env())
         self.tracker = sandbox_idle.IdleTracker()
         self._last_sweep = 0.0
+        # Phase 3: with BLPL_FILES_VIA_WORKSPACE=1 the workspace runs its agent,
+        # and runs go through it rather than through docker exec.
+        self.access = None
+        if workspaces.enabled():
+            if server_key is None:
+                raise ValueError("phase 3 needs the server key to derive agent tokens")
+            self.access = workspaces.Access.from_env(
+                server_key, lambda: DockerDriver(DockerConfig.from_env()))
 
     async def run(self, job: runqueue.Claimed) -> int:
         _LOGS.mkdir(parents=True, exist_ok=True)
@@ -150,6 +159,14 @@ class _Workspaces:
 
         with path.open("w", encoding="utf-8", buffering=1) as log:
             try:
+                if self.access is not None:
+                    access = self.access
+                    return await sandbox_jobs.run_job_via_agent(
+                        lambda: access.ensure(job.project_name), cmd=job.cmd, env=job.env,
+                        log=log.write, poll=poll, poll_every=_HEARTBEAT_EVERY,
+                        tracker=self.tracker,
+                        key=access.spec(job.project_name).key,
+                    )
                 return await sandbox_jobs.run_job(
                     self.driver, self.cfg, project_name=job.project_name,
                     cmd=job.cmd, env=job.env, log=log.write, poll=poll,
@@ -167,8 +184,15 @@ class _Workspaces:
             return
         self._last_sweep = now
         try:
+            activity = None
+            if self.access is not None:
+                access = self.access
+
+                async def activity(key):
+                    return await access.agent_idle(key.container_name())
             stopped = await sandbox_idle.sweep(
-                self.driver, self.tracker, idle_after_s=self.cfg.idle_after_s
+                self.driver, self.tracker, idle_after_s=self.cfg.idle_after_s,
+                activity=activity,
             )
             if stopped:
                 logger.info("stopped %d idle workspace(s)", len(stopped))
@@ -193,7 +217,7 @@ async def main() -> None:
     workspaces = None
     if sandbox_jobs.enabled():
         try:
-            workspaces = _Workspaces()
+            workspaces = _Workspaces(server_key)
         except ValueError as exc:
             # Misconfigured isolation must not quietly fall back to running
             # stages in here, with every secret this container holds.

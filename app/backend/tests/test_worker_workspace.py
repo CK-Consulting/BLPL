@@ -40,6 +40,7 @@ def _workspaces(tmp_path, driver) -> worker_mod._Workspaces:
     ws.driver = driver
     ws.tracker = idle.IdleTracker()
     ws._last_sweep = 0.0
+    ws.access = None  # phase 2: docker exec, no agent
     return ws
 
 

@@ -446,3 +446,163 @@ def test_phase2_a_queued_stage_runs_in_its_workspace_through_the_proxy(env):
             server.close()
 
     asyncio.run(scenario())
+
+
+def _runsc_host_uds() -> str | None:
+    """Why the agent socket cannot work under runsc here, or None if it can.
+
+    The agent creates its socket inside the sandbox, on a host directory the
+    control plane then connects to. gVisor allows that only with
+    --host-uds=create (or all) among the runtime's arguments in daemon.json.
+    Asked of the daemon rather than assumed.
+    """
+    with httpx.Client(transport=httpx.HTTPTransport(uds=SOCK), base_url="http://d",
+                      timeout=5) as c:
+        runtimes = c.get("/v1.44/info").json().get("Runtimes") or {}
+    rt = runtimes.get("runsc")
+    if rt is None:
+        return "runsc is not registered with the daemon"
+    args = rt.get("runtimeArgs") or []
+    if not any(a in ("--host-uds=create", "--host-uds=all") for a in args):
+        return ("runsc is registered without --host-uds=create, so a socket the agent "
+                "creates in the sandbox cannot be reached from the host; add "
+                '"runtimeArgs": ["--host-uds=create"] to its daemon.json entry')
+    return None
+
+
+def test_phase3_the_agent_in_a_real_workspace(env):
+    """The workspace image's agent, started through the proxy with a token, and
+    used for files, git and a run, as the control plane will use it."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    if RUNTIME == "runsc" and (why := _runsc_host_uds()):
+        pytest.skip(why)
+    import secrets
+    import subprocess
+
+    from app.sandbox import agentclient, workspaces
+    from app.sandbox.agentclient import AgentCallError
+    from app.sandbox.jobs import WorkspaceRunConfig
+
+    projects = env.tmp / "projects"
+    agents = env.tmp / "agents"
+    project = f"itest-{env.tag}-p3"
+    proj = projects / project
+    proj.mkdir(parents=True)
+    agents.mkdir()
+    (projects / "victim").mkdir()
+    (projects / "victim" / "secret.md").write_text("another project's plaintext\n")
+    subprocess.run(["git", "init", "-q", "-b", "main", str(proj)], check=True)
+    (proj / "escape").symlink_to(projects / "victim")
+    for d in (env.tmp, projects, proj, projects / "victim", agents):
+        os.chmod(d, 0o755)
+
+    psock = str(env.tmp / "proxy.sock")
+    policy = ProxyPolicy(
+        instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
+        ro_bind_roots=(str(env.lib),), project_bind_roots=(str(projects),),
+        agent_dir_roots=(str(agents),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
+    )
+    access = workspaces.Access(
+        run_cfg=WorkspaceRunConfig(
+            image=WORKSPACE_IMAGE, projects_root=projects, host_projects_root=str(projects),
+            resources=Resources(memory_bytes=1024**3, nano_cpus=1_000_000_000, pids=256,
+                                tmp_bytes=256 * 1024**2)),
+        agent_root=agents, host_agent_root=str(agents),
+        server_key=secrets.token_bytes(32),
+        driver_factory=lambda: DockerDriver(env.config(f"unix://{psock}")),
+        ready_timeout_s=60,
+    )
+    ident = {"name": "Ada Lovelace", "email": "ada@example.com"}
+    co = str(proj)
+
+    async def scenario():
+        upstream = UnixUpstream(SOCK)
+        server = await serve(DockerProxy(policy, upstream), psock)
+        try:
+            c = await access.ensure(project)
+            try:
+                name = access.spec(project).key.container_name()
+                assert not (agents / name / agentclient.TOKEN_FILE).exists()
+
+                # Files, confined.
+                c.write(co, "design.md", b"# Board\n")
+                assert c.read(co, "design.md") == b"# Board\n"
+                with pytest.raises(AgentCallError) as e:
+                    c.read(co, "escape/secret.md")
+                assert e.value.status == 403
+
+                # Git, as the member.
+                assert c.git_commit(co, "edit: design.md", ident) is not None
+                out = subprocess.run(["git", "-C", co, "log", "-1", "--format=%an"],
+                                     capture_output=True, text=True).stdout
+                assert out.strip() == "Ada Lovelace"
+                assert c.git_status(co)["dirty"] is False
+
+                # A run: a real stage, then what a run can and cannot reach.
+                rid = c.run_start(["/opt/blpl-venv/bin/python", "-m", "blpl.core.cli",
+                                   "stage0-det", "--project-dir", co], {}, co)
+                code = await _agent_wait(c, rid)
+                assert code == 0
+                assert (proj / ".pipeline" / "design_artifact.deterministic.json").is_file()
+
+                probe = (
+                    "import os, glob\n"
+                    "print('token', os.path.exists('/run/blpl/agent.token'))\n"
+                    "for p in glob.glob('/proc/[0-9]*/cmdline'):\n"
+                    "    try:\n"
+                    "        argv = open(p, 'rb').read().split(b'\\0')\n"
+                    "        if argv[:2] == [b'python', b'/opt/blpl/wsagent/agent.py']:\n"
+                    "            d = os.path.dirname(p)\n"
+                    "            try:\n"
+                    "                open(d + '/environ', 'rb').read(); print('environ readable')\n"
+                    "            except PermissionError:\n"
+                    "                print('environ denied')\n"
+                    "    except OSError:\n"
+                    "        pass\n"
+                    "print('locks', os.environ.get('GIT_OPTIONAL_LOCKS'))\n"
+                )
+                rid = c.run_start(["python", "-c", probe], {}, co)
+                out = await _agent_log(c, rid)
+                assert "token False" in out
+                assert "environ denied" in out and "environ readable" not in out, out
+                assert "locks 0" in out
+
+                # Cancel takes the whole process group.
+                rid = c.run_start(["sh", "-c", "sleep 300 & sleep 300; wait"], {}, co)
+                await asyncio.sleep(1.0)
+                c.run_cancel(rid)
+                code = await _agent_wait(c, rid)
+                assert code is not None and code < 0
+                rid = c.run_start(["sh", "-c", "ps -eo args | grep -c '^sleep 300' || true"], {}, co)
+                assert (await _agent_log(c, rid)).strip() == "0"
+            finally:
+                c.close()
+        finally:
+            d = DockerDriver(env.config(f"unix://{psock}"))
+            await d.remove(access.spec(project).key)
+            await d.aclose()
+            await upstream.aclose()
+            server.close()
+
+    asyncio.run(scenario())
+
+
+async def _agent_wait(c, rid: str, timeout: float = 120) -> int | None:
+    await _agent_log(c, rid, timeout)
+    return c.run_read(rid, 0)[3]
+
+
+async def _agent_log(c, rid: str, timeout: float = 120) -> str:
+    out, offset = b"", 0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        data, offset, done, code = c.run_read(rid, offset)
+        out += data
+        if done and not data:
+            return out.decode()
+        await asyncio.sleep(0.1)
+    raise AssertionError("run did not finish")
