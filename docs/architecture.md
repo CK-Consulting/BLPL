@@ -1,5 +1,10 @@
 # Architecture
 
+This page is the pipeline's architecture: its stages, schemas and package
+layout. How the app is deployed around it, meaning the control plane,
+per-project workspace containers, the Docker socket proxy and where the trust
+boundary sits, is [architecture-v2.md](architecture-v2.md).
+
 ## Data flow
 
 ```
