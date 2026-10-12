@@ -309,7 +309,16 @@ export function NewProject({
     setError(null);
     try {
       if (mode === "clone") {
-        await postJSON("/api/projects/clone", { name, remote, branch, ...policy.value });
+        await postJSON("/api/projects/clone", {
+          name,
+          remote,
+          branch,
+          push_policy: pushPolicy,
+          git_name: identity.name.trim(),
+          git_email: identity.email.trim(),
+          save_as_default: saveDefault,
+          ...policy.value,
+        });
       } else if (mode === "import") {
         const form = new FormData();
         form.append("name", name);
@@ -355,12 +364,10 @@ export function NewProject({
     }
   };
 
-  const initReady =
-    !!remote.trim() &&
-    !!pushPolicy &&
-    !!identity.name.trim() &&
-    !!identity.email.trim() &&
-    (!wantsToken || !!token.trim());
+  // What New and Clone both need: a push policy chosen on purpose and an
+  // identity to commit with.
+  const choicesReady = !!pushPolicy && !!identity.name.trim() && !!identity.email.trim();
+  const initReady = !!remote.trim() && choicesReady && (!wantsToken || !!token.trim());
 
   return (
     <Modal onClose={() => setOpen(false)} busy={busy}>
@@ -480,6 +487,29 @@ export function NewProject({
                     </span>
                   )}
                 </div>
+              </>
+            )}
+            {mode === "clone" && (
+              <>
+                <input
+                  placeholder="git@github.com:you/board.git"
+                  aria-label="Clone URL"
+                  value={remote}
+                  onChange={(e) => setRemote(e.target.value)}
+                />
+                <input placeholder="branch" value={branch} onChange={(e) => setBranch(e.target.value)} />
+                <p className="muted">
+                  The server clones and holds a working copy. A private remote authenticates with your
+                  own git credential for its host — add one under Settings → Git endpoints/accounts.
+                  Public remotes need none.
+                </p>
+              </>
+            )}
+            {/* Asked by New and by Clone alike: either way the project gets
+                commits from this person, and either way someone has to decide
+                whether its unpushed work may sit on this server alone. */}
+            {(mode === "init" || mode === "clone") && (
+              <>
                 <h4>Your commits in this project</h4>
                 <IdentityFields value={identity} onChange={setIdentity} />
                 {!identityIsDefault && (
@@ -497,21 +527,6 @@ export function NewProject({
                   onChange={setPushPolicy}
                   warning={defaults?.manual_push_warning || MANUAL_PUSH_WARNING}
                 />
-              </>
-            )}
-            {mode === "clone" && (
-              <>
-                <input
-                  placeholder="git@github.com:you/board.git"
-                  value={remote}
-                  onChange={(e) => setRemote(e.target.value)}
-                />
-                <input placeholder="branch" value={branch} onChange={(e) => setBranch(e.target.value)} />
-                <p className="muted">
-                  The server clones and holds a working copy. A private remote authenticates with your
-                  own git credential for its host — add one under Settings → Git endpoints/accounts.
-                  Public remotes need none.
-                </p>
               </>
             )}
             {mode === "import" && (
@@ -563,7 +578,7 @@ export function NewProject({
                 busy ||
                 !name ||
                 (mode === "init" && !initReady) ||
-                (mode === "clone" && !remote) ||
+                (mode === "clone" && (!remote || !choicesReady)) ||
                 // No files picked, or the import already ran and we're showing its skip report.
                 (mode === "import" && (picked.length === 0 || skipped.length > 0))
               }

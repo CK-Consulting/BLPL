@@ -250,3 +250,53 @@ describe("the push policy in project settings", () => {
     expect(calls[0].url).toContain("/api/projects/p/git/push-policy");
   });
 });
+
+describe("the clone tab", () => {
+  it("asks for the same push policy and identity, and sends them", async () => {
+    const user = userEvent.setup();
+    const calls = server();
+    const onCreated = vi.fn();
+    render(<NewProject onCreated={onCreated} onClose={() => {}} />);
+    await screen.findByDisplayValue("Ada Lovelace");
+    await user.click(screen.getByRole("button", { name: "Clone git remote" }));
+    await user.type(screen.getByLabelText("Project name"), "c");
+    await user.type(screen.getByLabelText("Clone URL"), "https://github.com/o/existing.git");
+
+    const clone = screen.getByRole("button", { name: "Clone" });
+    // Identity prefilled from the account default; push policy not chosen.
+    expect(screen.getByLabelText("Commit name")).toHaveValue("Ada Lovelace");
+    expect(screen.getByLabelText("Push automatically after every commit")).not.toBeChecked();
+    expect(screen.getByLabelText("I'll push manually")).not.toBeChecked();
+    expect(clone).toBeDisabled();
+
+    await user.click(screen.getByLabelText("I'll push manually"));
+    expect(screen.getByText(/it is not zero/)).toBeInTheDocument();
+    expect(clone).toBeEnabled();
+    await user.clear(screen.getByLabelText("Commit email"));
+    expect(clone).toBeDisabled();
+    await user.type(screen.getByLabelText("Commit email"), "ada@work.example");
+    await user.click(screen.getByLabelText("Also use as my default for other projects"));
+    await user.click(clone);
+
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("c"));
+    expect(calls.find((c) => c.url.includes("/api/projects/clone"))!.body).toMatchObject({
+      name: "c",
+      remote: "https://github.com/o/existing.git",
+      branch: "main",
+      push_policy: "manual",
+      git_name: "Ada Lovelace",
+      git_email: "ada@work.example",
+      save_as_default: true,
+    });
+  });
+
+  it("is not asked on the import tab", async () => {
+    const user = userEvent.setup();
+    server();
+    render(<NewProject onCreated={() => {}} onClose={() => {}} />);
+    await screen.findByDisplayValue("Ada Lovelace");
+    await user.click(screen.getByRole("button", { name: "Import files" }));
+    expect(screen.queryByLabelText("I'll push manually")).toBeNull();
+    expect(screen.queryByLabelText("Commit name")).toBeNull();
+  });
+});
