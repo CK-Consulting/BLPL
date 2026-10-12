@@ -1,7 +1,8 @@
 # Architecture v2: a control plane and per-project workspaces
 
-Status: **agreed shape; phases 1 and 2 built** (phase 2 is behind
-`BLPL_RUNS_IN_WORKSPACE=1`, off by default). The pipeline's own architecture (stages,
+Status: **agreed shape; phases 1 to 3 built**. Phase 2 is behind
+`BLPL_RUNS_IN_WORKSPACE=1` and phase 3 behind `BLPL_FILES_VIA_WORKSPACE=1`, both
+off by default. The pipeline's own architecture (stages,
 schemas, package layout) is still [architecture.md](architecture.md). This
 document covers how the app is deployed around the pipeline and where the trust
 boundary sits. It supersedes the deployment parts of [terminal.md](terminal.md):
@@ -266,11 +267,17 @@ test passing under both runc and runsc:
 `docker exec` is the phase-1 transport, and remains the bootstrap and health
 path.**
 
-The agent, `blpl-wsagent`, is a stdlib-only HTTP/1.1 server in the workspace
-image. It listens on `/run/blpl/agent.sock`. That directory is one subpath of
-a shared volume (`VolumeOptions.Subpath`, Docker ≥ 26). The control plane
-mounts the whole volume, and each workspace sees only its own directory. The
-reasons it wins over `docker exec`:
+The agent, `blpl-wsagent` (`app/backend/app/sandbox/agent.py`), is a
+stdlib-only HTTP/1.1 server and the workspace container's main process. It
+listens on `/run/blpl/agent.sock`. `/run/blpl` is a host directory per
+container, `data/agents/<container>`, bind-mounted read-write. The proxy allows
+exactly that source at exactly that target for that container name and no
+other (`BLPL_PROXY_AGENT_DIR_ROOTS`). The backend and worker already see
+`data/agents` through their `./data` mount. A shared volume with per-workspace
+subpaths was the first plan. A host directory was chosen instead because the
+control plane must create and lock the directory and write the token before
+the container starts, and a volume's data directory is not reachable to a
+non-root process. The reasons the agent wins over `docker exec`:
 
 - **The control plane needs file access it must not have.** The editor, the
   file tree, blob downloads, uploads and git all read and write project files.
@@ -297,6 +304,55 @@ reasons it wins over `docker exec`:
 The agent is inside the untrusted container. Its answers (log lines, exit codes,
 file contents) are therefore data to the control plane and never instructions,
 and file contents keep the UNTRUSTED framing they have today.
+
+**As built (phase 3):**
+
+- **Authentication.** There is one token per container start, never stored.
+  Before starting a container, the control plane writes a random nonce
+  (`agent.nonce`) and `HMAC-SHA256(server key, container, nonce)`
+  (`agent.token`, mode 0600) into the agent directory, under an flock on it.
+  The agent reads the token and unlinks it before serving, so a run started
+  later finds no file. The agent also marks itself non-dumpable
+  (`PR_SET_DUMPABLE 0`), so a same-uid run cannot read the token from
+  `/proc/<agent>/mem` or `environ`. The integration test checks that a run sees
+  neither. Any control-plane process holding the server key (backend or worker)
+  recomputes the token from the nonce. Nothing in the workspace can, because
+  the server key is not there.
+- **Verbs.**
+  - Files: `fs/list|stat|read|write|mkdir|delete|rename`.
+  - `quarantine/accept_upload`: the pipeline's own quarantine, so PDF
+    inspection and ClamAV run in the workspace.
+  - Git: `git/status|diff|commit|remote_of|recoverable|pull|push`. These run the
+    backend's own `projects.py`, which is stdlib only and is copied into the
+    image beside the agent, so git behaves identically.
+  - Runs: `runs` (start), `runs/<id>?offset=` (log and exit) and
+    `runs/<id>/cancel`.
+  - `health`, which reports idle seconds and active runs.
+- **Confinement.** A checkout must lie inside the roots given at start (the
+  project and its worktrees), with no symlink in its path. Below it, every path
+  is opened one component at a time with `O_NOFOLLOW` from the previous
+  directory's descriptor, so no link is ever followed, final component
+  included. Delete uses the fd-based, link-safe `rmtree`. `..` and `.git` are
+  refused. This is the containment `FilesystemSandbox` reaches by resolving,
+  made race-free by never resolving at all. The plan named `openat2`. Python has
+  no binding for it, and gVisor's support for it is uneven, so the component
+  walk gives the same guarantee portably.
+- **Credentials.** Each git operation passes its own credential. An HTTPS token
+  goes in that command's environment. An ssh key, which the control plane
+  leased as a file, is sent as content; the agent writes it to its tmpfs at
+  0600 and deletes it after the command.
+- **Runs** start in their own session and process group. A cancel sends
+  `SIGTERM` to the group and `SIGKILL` after 10 s, so a stage's children die
+  with it. Logs are kept in the workspace's `/tmp` and read by offset, so a
+  restart of the follower loses nothing.
+- **Writes during a run are refused** (409), except under `.blpl/`, where the
+  chat's files live and which no stage reads.
+- **`.git` for runs.** It is not made read-only in phase 3. Every run gets
+  `GIT_OPTIONAL_LOCKS=0`, so no git reader in a run (provenance's `git status`
+  among them) rewrites an index; that was the reported harm. A truly read-only
+  `.git` needs the run in a different mount namespace from the agent, which
+  must write `.git` for commits. Without `CAP_SYS_ADMIN` that means a separate
+  container per run, and that is phase 4.
 
 ### 7. Per-operation secret injection
 
@@ -434,11 +490,11 @@ provides.
 |---|---|---|
 | **Secrets in the run environment.** Runs get a copy of the backend's whole environment. | `run_env` allowlist in the worker | Phase 2: runs execute in a workspace whose container has no service secret. The run's environment is `runpath.run_env()` plus per-operation injection, and `/proc/<worker>/environ` and `server.key` are not in its mount namespace. |
 | **Symlink escape via pull.** A committed link makes a stage write into another project or `server.key`. | refuse links that leave the checkout after clone/pull | Phase 2 (built): a workspace mounts only its own project and its worktrees, plus `data/modules` read-only, so a link to a sibling project or `server.key` resolves to nothing. The integration test commits such a link and checks. Phase 3: the agent's file API opens with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`. |
-| **Uninspected PDFs served inline.** Any `.pdf` outside `retrieved/` is served `application/pdf`, inline. | trust by content hash (`pdf_verdict` table), not path | Phase 3: blobs are served through the agent, which streams bytes. The control plane decides disposition from `pdf_verdict` and serves `attachment` and `nosniff` for any hash without a released verdict. The inspection itself (`pdf_inspect`, ClamAV) runs in the workspace. |
-| **Writes allowed during runs.** The editor, uploads, pull and agent tools write a checkout with a run in flight. | refuse in `worktree_write` while a run is in flight | Phase 3: the agent is the single writer of a workspace and knows when a run is active. It refuses every write except declared `.blpl/` paths while one is active, so a new writer cannot forget the check. |
-| **Component commits sweep in unrelated changes.** `attach`/`update`/`detach` commit the whole index. | `git commit -- .gitmodules <path>`, and `snapshot` uses a temporary index | Phase 3: git runs in the workspace through one agent verb, `git_commit(paths=[...])`, which commits only the declared paths. A bare commit is not expressible. |
-| **Detach removes the wrong module store.** `rmtree(<checkout>/.git/modules/…)` misses in a worktree and hits the shared store in the owner's checkout. | resolve via `git rev-parse --git-common-dir`, and remove only when no other worktree has the submodule initialised | Phase 3: the removal is an agent verb that does exactly that, inside the project's own storage. Phase 4 adds a pre-operation btrfs snapshot that makes it undoable. |
-| **Provenance rewrites the index.** `git status` in a run refreshes `libraries/`'s index. | `--no-optional-locks` | Phase 3: the agent owns git, and a run's view of `.git` becomes a read-only bind over the workspace mount, so a run cannot write any index. Phase 2 does not change this: the run still sees the project's `.git` read-write. |
+| **Uninspected PDFs served inline.** Any `.pdf` outside `retrieved/` is served `application/pdf`, inline. | trust by content hash (`pdf_verdict` table), not path | Phase 3 (built, part): blobs are read through the agent, so a link cannot make the route serve a file outside the checkout, and uploads are inspected and scanned in the workspace. Disposition is still decided by path and suffix, as before. The `pdf_verdict` table that decides by content hash is the phase 0 fix, and is not built. |
+| **Writes allowed during runs.** The editor, uploads, pull and agent tools write a checkout with a run in flight. | refuse in `worktree_write` while a run is in flight | Phase 3 (built): the agent knows when a run is active, and refuses every write it is asked for (files, uploads, commit, pull) except under `.blpl/` while one is, so a new route cannot forget the check. This covers writes that go through the agent. Delete, move and the chat agent's own tools still write through the backend's mount until phase 4 moves them. |
+| **Component commits sweep in unrelated changes.** `attach`/`update`/`detach` commit the whole index. | `git commit -- .gitmodules <path>`, and `snapshot` uses a temporary index | Not closed by phase 3: the component routes still run git on the backend's mount. Phase 4 moves them to an agent verb, `git_commit(paths=[...])`, which commits only the declared paths, so a bare commit is not expressible. |
+| **Detach removes the wrong module store.** `rmtree(<checkout>/.git/modules/…)` misses in a worktree and hits the shared store in the owner's checkout. | resolve via `git rev-parse --git-common-dir`, and remove only when no other worktree has the submodule initialised | Phase 4: the removal becomes an agent verb that does exactly that, inside the project's own storage, with a pre-operation btrfs snapshot that makes it undoable. Not moved in phase 3. |
+| **Provenance rewrites the index.** `git status` in a run refreshes `libraries/`'s index. | `--no-optional-locks` | Phase 3 (built): every run the agent starts has `GIT_OPTIONAL_LOCKS=0`, the environment form of `--no-optional-locks`, so no git reader in a run refreshes an index. A read-only `.git` for runs needs a container per run, which is phase 4. |
 
 ## Migration
 
@@ -511,22 +567,65 @@ behaviour.
   and `.worktrees`, and a committed symlink into a sibling project resolves to
   nothing.
 
-**Phase 3: the agent, and the control plane lets go of the files.**
+**Phase 3: the agent (built, behind a flag).**
 
-- `blpl-wsagent` ships in the workspace image.
-- File reads and writes, the tree, blobs, uploads, quarantine inspection, git
-  operations and runs all go through it.
-- The backend loses its `data/projects` mount. From here the control plane
-  cannot read a project's plaintext except by asking that project's workspace,
-  and every such request is authorised and logged.
-- Exec leaves the proxy's verb list except for health probes.
+- `blpl-wsagent` ships in the workspace image as its main process. Without an
+  agent directory and token, as in a phase 2 workspace, it only holds the
+  container open.
+- `sandbox/workspaces.py` (`Access`) is how either control-plane process gets a
+  client. It prepares the token if the container is about to start, starts it
+  through the driver and proxy, and waits for the agent to answer. A running
+  container that has no agent (phase 2), or whose spec is stale, is replaced
+  once.
+- With `BLPL_FILES_VIA_WORKSPACE=1` (`app/backend/app/workspace_files.py`),
+  these routes reach the project only through the agent:
+  - the tree, the file list, reading and writing a file in the editor,
+    creating a folder, blobs and uploads;
+  - every commit a route makes, through `_commit_as`, including automatic
+    pushes;
+  - git status, diff, pull and push.
 
-**Phase 4: storage with limits, and sealing at stop.**
+  The worker starts and follows runs through the agent instead of
+  `docker exec`. The idle sweep asks the agent how long it has been idle, so
+  the backend's requests keep a workspace alive too.
+- **Tested** three ways:
+  - the agent in-process, covering confinement, tokens, git, runs and
+    cancellation of a process group;
+  - the routes' own existing tests (files, tree, blobs, every git-endpoint
+    test, every upload test) re-run with the flag on against an in-process
+    agent, plus new ones for links and an unavailable workspace;
+  - the real workspace image under runc, through the proxy, covering the token
+    being gone, the agent's environ unreadable to a run, a real stage, and
+    cancel.
+
+  The same test under runsc skips with the reason when the runtime lacks
+  `--host-uds=create`, which it does on this host until the `daemon.json`
+  change above is made.
+- **Not yet off the mount.** Resolving a checkout (the permission and sealed
+  checks, and creating a member's worktree on first use) still uses the
+  backend's mount, as do the routes that remain:
+  - delete and move, whose guards read the quarantine ledger and the ignore
+    list as files;
+  - artifacts and the quarantine ledger view;
+  - the llm-ignore route;
+  - the chat agent's tools;
+  - project creation, clone and import.
+
+  The backend keeps `data/projects` mounted until those move.
+
+**Phase 4: storage with limits, sealing at stop, and the rest of the mount.**
 
 - The `storage` helper and `BtrfsStorage`: one subvolume and qgroup per
   project, migrated one project at a time while it is sealed (unseal into a new
-  subvolume, reseal).
-- `sweep`'s `on_stopped` hook seals.
+  subvolume, reseal). The helper also creates member worktrees, which is the
+  last reason `_project_dir` touches the disk.
+- `sweep`'s `on_stopped` hook seals, through a short-lived sealer container
+  given the project key for that one operation.
+- The routes still on the mount move to agent verbs (delete and move with
+  ledger-aware guards in the agent, artifacts, llm-ignore, the chat agent's
+  tools). Then the backend's `data/projects` mount is removed.
+- Runs move to a container per run, sharing the project's storage with `.git`
+  bind-mounted read-only, which closes the provenance issue fully.
 - Pre-run snapshots.
 
 **Phase 5: terminal and desktops.**
