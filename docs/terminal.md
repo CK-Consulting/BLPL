@@ -271,8 +271,12 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
   open](#which-pdfs-the-browser-may-open): a PDF is opened inline only if its
   content hash is one this backend inspected and released, wherever it sits.
 - **Commit author** comes from the member's account, not from the image's git
-  config. Commits made in projects today show `BLPL <blpl@localhost>`, which is
-  the same gap seen from the other side.
+  config. The app's own commits already work this way: each carries the
+  member's identity for the project, else their account default, passed per
+  invocation by `gitidentity` and never written into a repository's config, and
+  a commit with neither is refused. The terminal should export the same pair
+  as `GIT_AUTHOR_*`/`GIT_COMMITTER_*` for the session and refuse to start
+  without one, rather than fall back to anything.
 - **Limits.** The container gets memory and CPU limits in compose. Each session
   gets an idle timeout (30 min without input closes it), **one session per
   member per project**, and 8 per host (`BLPL_TERMINAL_MAX_SESSIONS`), held
@@ -663,7 +667,7 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
       | `projects.py:clone` | `clone` | a new store (no other writer can exist yet); hard links to the source's objects if the remote is a local path |
       | `projects.py:init_local` | `init`, `commit --allow-empty` | a new store |
       | `projects.py:apply_baseline_gitignore` (from `init_local`) | `rm -r --cached`, `add -A`, `commit` | index, objects, ref: a commit that bypasses `_commit` |
-      | `projects.py:_ensure_identity` (from `clone`, `init_local`) | `config user.email`, `config user.name` | `.git/config` |
+      | `projects.py:_ensure_identity` (from `clone`, `init_local`) — since removed; `drop_placeholder_identity` (on open) now only unsets the placeholder it wrote | `config user.email`, `config user.name` | `.git/config` |
       | `worktrees.py:ensure` (from `_project_dir`, on a member's first request) | `branch --list`, `worktree add [-b]` | a branch ref, `.git/worktrees/<name>/` with its index, and the whole checkout |
       | `worktrees.py:remove` (member removal) | `worktree remove --force` | deletes the checkout and its `.git/worktrees/` entry |
       | `worktrees.py:prune` | `worktree prune` | `.git/worktrees/` |
