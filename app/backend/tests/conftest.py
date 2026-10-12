@@ -201,6 +201,20 @@ def init_body(name: str, **extra) -> dict:
     }
 
 
+def clone_body(name: str, remote: str, **extra) -> dict:
+    """The body POST /api/projects/clone needs: the remote and branch, plus the
+    push policy and commit identity cloning now asks for, as creation does."""
+    return {
+        "name": name,
+        "remote": remote,
+        "branch": "main",
+        "push_policy": "manual",
+        "git_name": "Test Cloner",
+        "git_email": "cloner@example.com",
+        **extra,
+    }
+
+
 def give_endpoint(
     clerk_id: str = "user_test",
     *,

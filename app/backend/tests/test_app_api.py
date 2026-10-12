@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import enqueue_only, queued_env, running_worker, sign_in, init_body
+from conftest import enqueue_only, queued_env, running_worker, sign_in, init_body, clone_body
 
 
 def _seed_remote(tmp_path: Path) -> str:
@@ -135,7 +135,7 @@ def test_a_deleted_key_disappears_from_settings(client) -> None:
 def test_clone_registers_a_project(tmp_path, client) -> None:
     sign_in(client)
     remote = _seed_remote(tmp_path)
-    r = client.post("/api/projects/clone", json={"name": "dev04", "remote": remote, "branch": "main"})
+    r = client.post("/api/projects/clone", json=clone_body("dev04", remote))
     assert r.status_code == 200
     listing = client.get("/api/projects").json()
     assert any(p["id"] == "dev04" and p["is_git"] for p in listing)
@@ -144,7 +144,7 @@ def test_clone_registers_a_project(tmp_path, client) -> None:
 def test_git_status_reports_clean_after_clone(tmp_path, client) -> None:
     sign_in(client)
     remote = _seed_remote(tmp_path)
-    client.post("/api/projects/clone", json={"name": "dev04", "remote": remote, "branch": "main"})
+    client.post("/api/projects/clone", json=clone_body("dev04", remote))
     st = client.get("/api/projects/dev04/git/status").json()
     assert st["branch"] == "main" and st["dirty"] is False and st["has_remote"] is True
 

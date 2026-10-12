@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import bare_remote, init_body
+from conftest import bare_remote, clone_body, init_body
 
 TOKEN = "glpat-SECRET-token-0123456789abcdef"
 
@@ -406,3 +406,51 @@ def test_the_push_is_started_only_once_the_request_has_committed(unlocked, monke
     unlocked.put("/api/projects/p/files/design.md", json={"content": "# board\n"})
     st = unlocked.get("/api/projects/p/git/status").json()
     assert st["last_push"]["ok"] is False and st["last_push"]["error"]
+
+
+# -- cloning asks the same questions ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "override,why",
+    [
+        ({"push_policy": None}, "choose a push policy"),
+        ({"push_policy": "sometimes"}, "choose a push policy"),
+        ({"git_email": "nope"}, "does not look like an address"),
+        ({"git_name": ""}, "commit name is required"),
+    ],
+)
+def test_cloning_refuses_without_a_push_policy_or_identity(unlocked, tmp_path, override, why):
+    import app.main as main
+
+    remote = _remote_with_history(tmp_path)
+    r = unlocked.post("/api/projects/clone", json=clone_body("c", remote, **override))
+    assert r.status_code == 400 and why in r.json()["detail"]
+    # Refused before git ran: no working copy left without a project row.
+    assert not (main.PROJECTS_ROOT / "c").exists()
+
+
+def test_a_clone_records_its_policy_and_the_cloners_identity(unlocked, tmp_path):
+    import app.main as main
+
+    remote = _remote_with_history(tmp_path)
+    r = unlocked.post(
+        "/api/projects/clone",
+        json=clone_body("c", remote, push_policy="auto", git_name="Clo Ner",
+                        git_email="clo@example.com", save_as_default=True),
+    )
+    assert r.status_code == 200, r.text
+    assert unlocked.get("/api/projects/c/git/status").json()["push_policy"] == "auto"
+    got = unlocked.get("/api/projects/c/git/identity").json()
+    assert got["project"] == {"name": "Clo Ner", "email": "clo@example.com"}
+    assert got["default"] == {"name": "Clo Ner", "email": "clo@example.com"}
+
+    unlocked.put("/api/projects/c/files/design.md", json={"content": "# mine\n"})
+    who = _git(main.PROJECTS_ROOT / "c", "log", "-1", "--format=%an <%ae>")
+    assert who == "Clo Ner <clo@example.com>"
+
+
+def test_a_clone_without_save_as_default_leaves_the_default_alone(unlocked, tmp_path):
+    remote = _remote_with_history(tmp_path)
+    unlocked.post("/api/projects/clone", json=clone_body("c", remote))
+    assert unlocked.get("/api/me/git-identity").json()["identity"]["email"] == "test@example.com"

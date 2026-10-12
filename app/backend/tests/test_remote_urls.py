@@ -17,7 +17,7 @@ import pytest
 
 from app import projects as projects_mod
 from app.projects import ProjectError, check_remote_url
-from conftest import init_body
+from conftest import init_body, clone_body
 
 
 @pytest.fixture
@@ -72,7 +72,7 @@ def test_cloning_another_project_off_the_disk_is_refused(unlocked, deployment_pr
     victim = _repo(tmp_path / "victim")
     for remote in (str(victim), f"file://{victim}"):
         r = unlocked.post(
-            "/api/projects/clone", json={"name": "grab", "remote": remote, "branch": "main"}
+            "/api/projects/clone", json=clone_body("grab", remote)
         )
         assert r.status_code == 400, r.text
     import app.main as main
@@ -353,9 +353,7 @@ def test_the_remote_route_never_echoes_a_password(unlocked, deployment_protocols
         r = unlocked.put("/api/projects/p/git/remote", json={"url": url})
         assert r.status_code == 400, (url, r.text)
         assert secret not in r.text, url
-    r = unlocked.post("/api/projects/clone", json={
-        "name": "x", "remote": "https://user:ghp_tokensecret@[bad/repo", "branch": "main",
-    })
+    r = unlocked.post("/api/projects/clone", json=clone_body("x", "https://user:ghp_tokensecret@[bad/repo"))
     assert r.status_code == 400 and "ghp_tokensecret" not in r.text
 
 
@@ -550,7 +548,7 @@ def test_the_several_urls_refusal_never_shows_a_token(tmp_path):
 def test_cloning_a_malformed_url_is_a_400(unlocked):
     # Codex P2 on #10: credentials were looked up (parsing the URL) before it
     # was validated, so this was still a 500.
-    r = unlocked.post("/api/projects/clone", json={"name": "x", "remote": "https://[bad/repo", "branch": "main"})
+    r = unlocked.post("/api/projects/clone", json=clone_body("x", "https://[bad/repo"))
     assert r.status_code == 400, r.text
 
 
@@ -621,10 +619,7 @@ def test_the_remote_route_refuses_a_query_without_echoing_it(unlocked, deploymen
         assert r.status_code == 400, (url, r.text)
         assert "SECRETQ" not in r.text, url
     assert "SECRETQ" not in unlocked.get("/api/projects/p/git/status").text
-    r = unlocked.post("/api/projects/clone", json={
-        "name": "x", "remote": "https://git.example/repo.git?access_token=SECRETQ",
-        "branch": "main",
-    })
+    r = unlocked.post("/api/projects/clone", json=clone_body("x", "https://git.example/repo.git?access_token=SECRETQ"))
     assert r.status_code == 400 and "SECRETQ" not in r.text
 
 

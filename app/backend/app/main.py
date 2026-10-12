@@ -1682,9 +1682,22 @@ class PolicyFields(BaseModel):
 
 
 class CloneBody(PolicyFields):
+    """Clone an existing repository into a new project.
+
+    Asks what creation asks beyond the remote itself, for the same reasons: a
+    push policy chosen on purpose (no default — the manual answer is a risk to
+    read, not to inherit), and the cloner's commit identity for the project,
+    with the option of making it their default. Checked with sentences rather
+    than left to pydantic's 422, as InitBody is.
+    """
+
     name: str
     remote: str
     branch: str = "main"
+    push_policy: str | None = None
+    git_name: str = ""
+    git_email: str = ""
+    save_as_default: bool = False
 
 
 @app.get("/api/dashboard")
@@ -1787,11 +1800,29 @@ def clone_project(
         # the URL itself, and a credential should never be chosen for a remote
         # that is about to be refused.
         check_remote_url(body.remote)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # Then the choices, all before git runs: a clone that succeeded and was
+    # then refused for a missing push policy would leave a working copy no
+    # project row points at.
+    try:
+        policy = autopush.validate_policy(body.push_policy)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        identity = gitidentity.validate(body.git_name, body.git_email)
+    except gitidentity.IdentityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
         with _git_credentials(session, master_key, user, body.remote) as env:
             projects.clone(body.name, body.remote, body.branch, env=env)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     project = projectacl.create(session, user, body.name, remote=body.remote, branch=body.branch)
+    project.push_policy = policy
+    gitidentity.set_for_project(session, user, project, identity)
+    if body.save_as_default:
+        gitidentity.set_account_default(session, user, identity)
     _note_workspace_open(
         session, project.name, PROJECTS_ROOT / project.name,
         grants.create_project_key(session, project, user, master_key),
