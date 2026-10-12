@@ -75,6 +75,10 @@ class ProxyPolicy:
     # Host paths that may be bind-mounted, read-only, at or beneath. The shared
     # libraries, nothing else.
     ro_bind_roots: tuple[str, ...] = ()
+    # Phase 2 storage: host directories holding project checkouts. A container
+    # labelled with project P may bind, read-write, exactly <root>/P and
+    # <root>/.worktrees/P, and nothing else beneath a root.
+    project_bind_roots: tuple[str, ...] = ()
     roles: frozenset[str] = frozenset({"workspace"})
     volume_prefix: str = "blpl-ws-"
     max_memory: int = 16 * GiB
@@ -98,6 +102,7 @@ class ProxyPolicy:
             runtimes=frozenset(words("BLPL_PROXY_RUNTIMES")),
             allow_default_runtime=env.get("BLPL_PROXY_REQUIRE_RUNTIME", "") != "1",
             ro_bind_roots=tuple(words("BLPL_PROXY_RO_BIND_ROOTS")),
+            project_bind_roots=tuple(words("BLPL_PROXY_PROJECT_BIND_ROOTS")),
         )
 
 
@@ -307,7 +312,22 @@ def _under_root(path: str, roots: tuple[str, ...]) -> bool:
     return False
 
 
-def _mounts(policy: ProxyPolicy, v: Any, where: str) -> Any:
+_PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
+def _project_dirs(policy: ProxyPolicy, project: str) -> set[str]:
+    """The host directories a container for project may bind read-write."""
+    if not _PROJECT_NAME.fullmatch(project):
+        return set()
+    out = set()
+    for root in policy.project_bind_roots:
+        root = root.rstrip("/")
+        if root:
+            out |= {f"{root}/{project}", f"{root}/.worktrees/{project}"}
+    return out
+
+
+def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "") -> Any:
     if not isinstance(v, list):
         raise Refused(f"{where} must be a list")
     out, targets = [], set()
@@ -329,14 +349,20 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str) -> Any:
             got = _pick(m, {
                 **common,
                 "Source": _abs_path,
-                "ReadOnly": _must_be(True),
+                "ReadOnly": _bool,
                 "BindOptions": lambda o, ww: _pick(o, {
                     "Propagation": _one_of({"rprivate", "private"}),
                     "ReadOnlyForceRecursive": _bool,
                 }, ww),
             }, w, required=("Source", "Target", "ReadOnly"))
-            if not _under_root(got["Source"], policy.ro_bind_roots):
-                raise Refused(f"{w}.Source {got['Source']} is not a permitted library root")
+            if got["ReadOnly"]:
+                if not _under_root(got["Source"], policy.ro_bind_roots):
+                    raise Refused(f"{w}.Source {got['Source']} is not a permitted library root")
+            elif got["Source"] not in _project_dirs(policy, project):
+                # Writable binds are the project's own checkouts and nothing
+                # else: not a library, not a sibling project, not a parent.
+                raise Refused(f"{w}: a writable bind must be this project's own directory "
+                              f"(ReadOnly must be true for {got['Source']})")
         elif kind == "tmpfs":
             got = _pick(m, {
                 **common,
@@ -399,7 +425,7 @@ def check_create(policy: ProxyPolicy, query: Mapping[str, str], obj: Any) -> Cre
         "MemorySwap": _int_range(1, policy.max_memory),
         "NanoCpus": _int_range(1, policy.max_nano_cpus),
         "PidsLimit": _int_range(1, policy.max_pids),
-        "Mounts": lambda v, w: _mounts(policy, v, w),
+        "Mounts": lambda v, w: _mounts(policy, v, w, labels[LABEL_PROJECT]),
         # Empty means the daemon's default runtime, decided below.
         "Runtime": lambda v, w: _DROP if v in ("", None) else _one_of(policy.runtimes)(v, w),
         "RestartPolicy": lambda v, w: _pick(v, {"Name": _one_of({"no", ""})}, w),
