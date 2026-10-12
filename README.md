@@ -79,7 +79,7 @@ The two ends are what make the middle trustworthy. `blpl doctor` says what your 
 
 ```
 blpl-repo-root/
-    core/               # the headless pipeline — future repo "blpl-core"
+    core/               # the headless pipeline (distribution "blpl")
         blpl/
             core/           # pipeline stages 0–8, plus doctor and release
             emitter/        # v10 KiCad .kicad_sch / .kicad_pcb / .kicad_pro writer
@@ -92,10 +92,10 @@ blpl-repo-root/
         mermaid/        # the diagram palette the skill's class table is held to
         kicad-happy/    # design-review + sourcing skills (submodule)
         kicad-{symbols,footprints,library-utils}   # submodules
-    plugin/             # KiCad PCB plugin — future repo "blpl-kicad-plugin"
+    plugin/             # KiCad PCB plugin (distribution "blpl-kicad-plugin")
         blpl_kicad_plugin/  # pcbnew ActionPlugin + standalone build_pcb CLI
         tests/
-    app/                # the web app — future repo "blpl-app"
+    app/                # the web app
         backend/        # FastAPI backend — auth/vault, git, stages, artifacts, chat, agents
             tests/      # the backend's pytest suite
         frontend/       # React UI (ecad-viewer for in-browser board rendering)

@@ -1,10 +1,17 @@
 # Splitting the repository
 
-This repository holds three projects that are meant to become three
-repositories. Until then they share one history, laid out as three top-level
-folders, with the documentation and CI that cover all of them at the root.
+This repository holds three projects laid out as three top-level folders, with
+the documentation and CI that cover all of them at the root.
 
-| Folder | Future repository | What it is |
+**Decision (2026-10-12): they stay in this one repository.** Everything is
+public under the same licence, and nothing yet needs separate releases, issue
+trackers or permissions, so a split would only add cross-repository pins,
+rulesets and two-repository changes. The folder boundaries are kept so that a
+split stays mechanical if one is ever wanted — for example if the KiCad plugin
+gains its own users and release cadence. The rest of this document is the
+procedure for that day, dry-run against the restructuring branch.
+
+| Folder | Repository, if split | What it is |
 |---|---|---|
 | `core/` | **blpl-core** | The headless pipeline: the `blpl` package (stages 0–8, emitter, classifier, importer, skills, and the LLM agent layer behind the `llm-*` extras), its JSON Schemas, its tests, the Mermaid palette the skill is held to, and the submodules it reads. |
 | `plugin/` | **blpl-kicad-plugin** | The KiCad PCB plugin: the `blpl_kicad_plugin` package — a pcbnew ActionPlugin plus the standalone `build_pcb` entry point — and its tests. |

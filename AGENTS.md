@@ -23,11 +23,12 @@ package of gerbers, drill and placement files. It is two things:
   frontend (`app/frontend/`), deployed with `app/docker-compose.yml`. KiCad
   itself runs inside the backend image.
 
-The three folders are separate projects that will become separate repositories
-(`blpl-core`, `blpl-kicad-plugin`, `blpl-app`); see
-[docs/repo-split.md](docs/repo-split.md). **No commit may touch more than one of
-`core/`, `plugin/` and `app/`.** A change that needs two is two commits, and
-root files (docs, CI, this file) may ride along with either.
+The three folders are separate projects that share this one repository. They
+are kept separable so a split stays mechanical if one is ever needed (see
+[docs/repo-split.md](docs/repo-split.md)): **no commit may touch more than one
+of `core/`, `plugin/` and `app/`**, and a pull request should stay within one of
+them where it can. A change that needs two is two commits, and root files
+(docs, CI, this file) may ride along with either.
 
 [docs/architecture.md](docs/architecture.md) and
 [docs/pipeline-stages.md](docs/pipeline-stages.md) are the map.
