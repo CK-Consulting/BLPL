@@ -197,6 +197,24 @@ services:
       - MOUSER_SEARCH_API_KEY=${MOUSER_SEARCH_API_KEY:-}
       - MOUSER_ORDERS_API_KEY=${MOUSER_ORDERS_API_KEY:-}
       - ELEMENT14_API_KEY=${ELEMENT14_API_KEY:-}
+      # Phase 3 (docs/architecture-v2.md): the file tree, editor, uploads and
+      # git routes reach a project through its workspace's agent instead of
+      # this container's mount. Off by default. The backend starts workspaces
+      # itself when a request needs one, so it carries the same workspace
+      # settings as the worker (keep the two lists in step).
+      - BLPL_FILES_VIA_WORKSPACE=${BLPL_FILES_VIA_WORKSPACE:-0}
+      - BLPL_AGENT_DIR_ROOT=/app/data/agents
+      - BLPL_SANDBOX_HOST_AGENT_DIRS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/agents}
+      - BLPL_SANDBOX_DOCKER=unix:///run/blpl-docker-proxy/docker.sock
+      - BLPL_SANDBOX_INSTANCE=${BLPL_SANDBOX_INSTANCE:-blpl}
+      - BLPL_SANDBOX_NETWORK=blpl-egress
+      - BLPL_SANDBOX_RUNTIME=${BLPL_SANDBOX_RUNTIME:-}
+      - BLPL_SANDBOX_USER=${BLPL_UID}:${BLPL_GID}
+      - BLPL_WORKSPACE_IMAGE=blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}
+      - BLPL_SANDBOX_HOST_PROJECTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/projects}
+      - BLPL_SANDBOX_LIBRARIES=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols:/app/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints:/app/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D:/usr/share/kicad/3dmodels ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source:/usr/share/kicad/3dmodels-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates:/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules:/app/data/modules}
+      - BLPL_SANDBOX_HTTP_PROXY=http://squid:3128
+      - BLPL_SANDBOX_NO_PROXY=ollama,clamav,localhost,127.0.0.1
     volumes:
       # Server key, config, and your git-backed designs. Users and their sealed
       # provider keys live in Postgres (the blpl-db volume) instead — note that
@@ -223,6 +241,9 @@ services:
       # in the container reads ~/.ssh; mount a read-only key here. Optional —
       # local-only projects and https remotes with a token helper don't need it.
       - ./data/ssh:/home/blpl/.ssh:ro
+      # The socket proxy, for starting workspaces in phase 3. Empty and unused
+      # with the flag off.
+      - blpl-docker-proxy:/run/blpl-docker-proxy
 
   # The container with KiCad in it, and the only thing that executes a stage.
   #
@@ -378,6 +399,13 @@ services:
       # secret, and clamd does not speak HTTP.
       - BLPL_SANDBOX_NO_PROXY=ollama,clamav,localhost,127.0.0.1
       - BLPL_SANDBOX_IDLE_S=${BLPL_SANDBOX_IDLE_S:-900}
+      # Phase 3: workspaces run their agent, and file, git and run requests
+      # reach the project through it. Needs BLPL_RUNS_IN_WORKSPACE=1 too.
+      # Agent directories (socket, start token) live in data/agents, which
+      # both this container and the backend already see through ./data.
+      - BLPL_FILES_VIA_WORKSPACE=${BLPL_FILES_VIA_WORKSPACE:-0}
+      - BLPL_AGENT_DIR_ROOT=/app/data/agents
+      - BLPL_SANDBOX_HOST_AGENT_DIRS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/agents}
     volumes:
       # The socket proxy's listening socket. The only Docker access this
       # container has, and it is the proxy's policy, not the daemon's.
@@ -698,6 +726,9 @@ services:
       - BLPL_PROXY_REQUIRE_RUNTIME=${BLPL_PROXY_REQUIRE_RUNTIME:-0}
       - BLPL_PROXY_RO_BIND_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules}
       - BLPL_PROXY_PROJECT_BIND_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/projects}
+      # Phase 3: each workspace may bind <this>/<its own container name> at
+      # /run/blpl for its agent, and no other.
+      - BLPL_PROXY_AGENT_DIR_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/agents}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - blpl-docker-proxy:/run/blpl-docker-proxy

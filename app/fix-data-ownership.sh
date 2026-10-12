@@ -26,7 +26,9 @@ data="$here/data"
 
 # Every bind source docker-compose.yml mounts from under data/. A directory
 # missing here is one Docker would create as root on first start.
-bind_sources=("$data" "$data/ssh" "$data/kicad-desktop" "$data/projects" "$data/modules")
+# data/agents holds each workspace's agent socket and start token (phase 3 of
+# docs/architecture-v2.md); a workspace binds its own subdirectory of it.
+bind_sources=("$data" "$data/ssh" "$data/kicad-desktop" "$data/projects" "$data/modules" "$data/agents")
 
 if [[ -f "$here/.env" ]]; then
     uid="$(sed -n 's/^BLPL_UID=//p' "$here/.env" | tail -1)"
