@@ -103,6 +103,12 @@ ENV BLPL_PROJECTS_ROOT=/app/projects \
 # such a chown a root worker could no longer commit to the projects at all.
 # Matching the uid removes both.
 #
+# /run/blpl-docker-proxy is where the socket proxy (phase 2 of
+# docs/architecture-v2.md, the same image with another entrypoint) listens, in
+# a named volume the worker also mounts. Docker seeds an empty named volume
+# from the image's directory, ownership included, so owning it here is what
+# lets a non-root proxy create its socket there.
+#
 # The uid needs a passwd entry, not just a number in compose's `user:`: ssh
 # (SSH git remotes) exits with "No user exists for uid" without one, and finds
 # ~/.ssh through the entry's home directory rather than $HOME. The KiCad image
@@ -119,7 +125,9 @@ RUN set -eux; \
         useradd -u "${BLPL_UID}" -g "${BLPL_GID}" -d /home/blpl -s /bin/sh blpl; \
     fi; \
     mkdir -p /home/blpl/.ssh; \
-    chown -R "${BLPL_UID}:${BLPL_GID}" /home/blpl
+    chown -R "${BLPL_UID}:${BLPL_GID}" /home/blpl; \
+    mkdir -p /run/blpl-docker-proxy; \
+    chown "${BLPL_UID}:${BLPL_GID}" /run/blpl-docker-proxy
 ENV HOME=/home/blpl \
     PYTHONDONTWRITEBYTECODE=1
 USER ${BLPL_UID}:${BLPL_GID}

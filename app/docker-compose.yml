@@ -262,6 +262,7 @@ services:
     restart: unless-stopped
     networks:
       - blpl
+      - blpl-egress  # local inference for runs in workspaces
     volumes:
       - ollama-models:/root/.ollama
     environment:
@@ -353,7 +354,34 @@ services:
       - DIGIKEY_OAUTH_CLIENT_SECRET=${DIGIKEY_OAUTH_CLIENT_SECRET:-}
       - MOUSER_SEARCH_API_KEY=${MOUSER_SEARCH_API_KEY:-}
       - ELEMENT14_API_KEY=${ELEMENT14_API_KEY:-}
+      # Phase 2 of docs/architecture-v2.md: run stages in per-project workspace
+      # containers instead of in here. Off by default. Turning it on needs the
+      # `workspaces` profile up (docker-proxy, squid), the workspace image
+      # built, and BLPL_HOST_REPO_DIR set in app/.env to the umbrella checkout's
+      # absolute host path. The daemon resolves bind sources on the host, and
+      # this container cannot discover that path for itself. Misconfigured, the
+      # worker refuses to start rather than quietly running stages in here.
+      - BLPL_RUNS_IN_WORKSPACE=${BLPL_RUNS_IN_WORKSPACE:-0}
+      - BLPL_SANDBOX_DOCKER=unix:///run/blpl-docker-proxy/docker.sock
+      - BLPL_SANDBOX_INSTANCE=${BLPL_SANDBOX_INSTANCE:-blpl}
+      - BLPL_SANDBOX_NETWORK=blpl-egress
+      - BLPL_SANDBOX_RUNTIME=${BLPL_SANDBOX_RUNTIME:-}
+      - BLPL_SANDBOX_USER=${BLPL_UID}:${BLPL_GID}
+      - BLPL_WORKSPACE_IMAGE=blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}
+      - BLPL_SANDBOX_HOST_PROJECTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/projects}
+      # Read-only, at the paths a run already uses, so stage commands and
+      # BLPL_MODULES_ROOT need no rewriting. kicad-happy is not here: the
+      # workspace image carries its own copy.
+      - BLPL_SANDBOX_LIBRARIES=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols:/app/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints:/app/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D:/usr/share/kicad/3dmodels ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source:/usr/share/kicad/3dmodels-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates:/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules:/app/data/modules}
+      - BLPL_SANDBOX_HTTP_PROXY=http://squid:3128
+      # Reached directly on blpl-egress, not through squid. Neither holds a
+      # secret, and clamd does not speak HTTP.
+      - BLPL_SANDBOX_NO_PROXY=ollama,clamav,localhost,127.0.0.1
+      - BLPL_SANDBOX_IDLE_S=${BLPL_SANDBOX_IDLE_S:-900}
     volumes:
+      # The socket proxy's listening socket. The only Docker access this
+      # container has, and it is the proxy's policy, not the daemon's.
+      - blpl-docker-proxy:/run/blpl-docker-proxy
       # The same project files and log directory the API serves from. This is
       # what lets an SSE reader in the API tail a log a worker is writing,
       # without a broker between them.
@@ -606,6 +634,9 @@ services:
     restart: unless-stopped
     networks:
       - blpl
+      # So a run in a workspace can scan what it fetches. clamd holds no
+      # secret and has nothing on blpl-egress worth reaching through it.
+      - blpl-egress
     volumes:
       # Persist the signature database. Without it every restart re-downloads
       # ~1 GB from the ClamAV mirrors, which is rude to them and slow for you.
@@ -617,13 +648,97 @@ services:
       start_period: 120s
 
 
+  # --- Phase 2: per-project workspaces (docs/architecture-v2.md) ------------
+  # Up with `docker compose --profile workspaces up -d`. Nothing below starts
+  # without the profile, and with it down the worker runs stages itself as it
+  # always has.
+
+  # The only container with the Docker socket. The worker gets this proxy's
+  # socket instead, and the proxy forwards only what app/sandbox/policy.py
+  # permits: workspace containers labelled for this deployment, from the
+  # workspace image, confined, with this project's storage and the libraries
+  # read-only. No network at all; it listens on a Unix socket in a volume
+  # shared with the worker.
+  docker-proxy:
+    profiles: ["workspaces"]
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: app/backend/Dockerfile
+      platforms:
+        - linux/amd64
+      args:
+        - BLPL_UID=${BLPL_UID:?set BLPL_UID in app/.env to the owner of app/data (id -u)}
+        - BLPL_GID=${BLPL_GID:?set BLPL_GID in app/.env to the owner of app/data (id -g)}
+    container_name: blpl-docker-proxy
+    # Not the image's entrypoint, which runs migrations against a database
+    # this container has no credentials for.
+    entrypoint: ["python", "-m", "app.sandbox.proxy"]
+    command: []
+    user: "${BLPL_UID}:${BLPL_GID}"
+    # The socket is root:docker 0660. Membership of that one group is all the
+    # access this needs; set DOCKER_GID in app/.env (getent group docker).
+    group_add:
+      - "${DOCKER_GID:-docker}"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    environment:
+      - BLPL_PROXY_LISTEN=/run/blpl-docker-proxy/docker.sock
+      - BLPL_PROXY_UPSTREAM=/var/run/docker.sock
+      - BLPL_PROXY_INSTANCE=${BLPL_SANDBOX_INSTANCE:-blpl}
+      - BLPL_PROXY_IMAGES=blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}
+      - BLPL_PROXY_NETWORKS=blpl-egress
+      # runsc (gVisor) is installed on this host. Set both to make it
+      # mandatory: BLPL_SANDBOX_RUNTIME=runsc and BLPL_PROXY_REQUIRE_RUNTIME=1.
+      - BLPL_PROXY_RUNTIMES=${BLPL_SANDBOX_RUNTIME:-}
+      - BLPL_PROXY_REQUIRE_RUNTIME=${BLPL_PROXY_REQUIRE_RUNTIME:-0}
+      - BLPL_PROXY_RO_BIND_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules}
+      - BLPL_PROXY_PROJECT_BIND_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/projects}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - blpl-docker-proxy:/run/blpl-docker-proxy
+
+  # The one way out of blpl-egress. CONNECT to an allowlisted host on 443, or
+  # a git host on 22, and nothing else; private addresses are refused even
+  # for allowlisted names. The access log is the egress audit record. Tag
+  # chosen but not yet pulled or parse-checked here: run
+  # `docker compose --profile workspaces run --rm squid squid -k parse` once.
+  squid:
+    profiles: ["workspaces"]
+    image: ubuntu/squid:6.10-24.10_beta
+    container_name: blpl-squid
+    restart: unless-stopped
+    networks:
+      - blpl-egress
+      - blpl
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./egress/squid.conf:/etc/squid/squid.conf:ro
+      - ./egress/allowlist.txt:/etc/squid/allowlist.txt:ro
+      - ./egress/git-hosts.txt:/etc/squid/git-hosts.txt:ro
+
 networks:
   blpl:
     external: true
+  # Workspaces join only this. `internal`: no route to anywhere except the
+  # other members, which are squid, clamav and ollama. Named explicitly, so
+  # the driver (BLPL_SANDBOX_NETWORK) and the proxy agree on it.
+  blpl-egress:
+    name: blpl-egress
+    internal: true
 
 volumes:
   ollama-models:
   clamav-db:
+  # The socket proxy's listening socket, shared with the worker. Seeded from
+  # the image's /run/blpl-docker-proxy, which is owned by BLPL_UID.
+  blpl-docker-proxy:
+    name: blpl-docker-proxy
   # No blpl-db here. One was declared for a long time and never used: the db
   # service binds ./blpl-db instead, so the named volume was dead config that
   # read as the live arrangement. The bind mount is deliberate — the same
