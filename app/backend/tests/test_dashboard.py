@@ -13,11 +13,11 @@ visit says nothing about it.
 
 from __future__ import annotations
 
-from conftest import sign_in
+from conftest import sign_in, init_body
 
 
 def _make(client, name):
-    assert client.post("/api/projects/init", json={"name": name}).status_code == 200
+    assert client.post("/api/projects/init", json=init_body(name)).status_code == 200
 
 
 def test_the_dashboard_only_shows_your_projects(unlocked, second_user):

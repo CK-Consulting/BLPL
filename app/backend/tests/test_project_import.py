@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+from conftest import init_body
 
 
 def _unlock(client) -> None:
@@ -132,7 +133,7 @@ def test_an_upload_with_nothing_importable_is_a_400_and_leaves_no_project(client
 
 def test_import_refuses_to_clobber_an_existing_project(client) -> None:
     _unlock(client)
-    client.post("/api/projects/init", json={"name": "dev04"})
+    client.post("/api/projects/init", json=init_body("dev04"))
     r = client.post(
         "/api/projects/import",
         data={"name": "dev04"},

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-from conftest import enqueue_only, queued_env, sign_in
+from conftest import enqueue_only, queued_env, sign_in, init_body
 
 
 def test_the_panel_route_dispatches_every_routed_endpoint(client, monkeypatch) -> None:
@@ -32,7 +32,7 @@ def test_the_panel_route_dispatches_every_routed_endpoint(client, monkeypatch) -
     )
     client.put("/api/settings/secrets/anthropic", json={"value": "sk-ant-KEY"})
     client.put("/api/settings/secrets/openai", json={"value": "sk-oai-KEY"})
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
 
     enqueue_only(client, "/api/projects/scratch/review-panel")
 
@@ -61,7 +61,7 @@ def test_the_panel_route_dispatches_every_routed_endpoint(client, monkeypatch) -
 
 def test_the_panel_route_refuses_up_front_when_nothing_can_review(client) -> None:
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     r = client.post("/api/projects/scratch/review-panel")
     assert r.status_code == 400
     assert "key" in r.json()["detail"].lower()

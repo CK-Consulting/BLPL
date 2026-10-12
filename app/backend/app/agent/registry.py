@@ -38,6 +38,7 @@ from blpl.agent.tools.bom import HOUSES as HOUSES_FOR_SCHEMA
 from blpl.agent.tools.parts import fetch_datasheet, search_parts
 
 from .. import llm_ignore
+from ..components import ComponentError
 from .toolspec import ToolContext, ToolDenied, ToolSpec
 
 # Design documents, matching the editor's rule so the assistant can never
@@ -703,6 +704,11 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
             # Never fatal: the extraction is on disk in the project either way.
             # Failing to file a copy is worth less than the result.
             pass
+        except ComponentError as exc:
+            # Said, though: filing is a commit, and a user with no commit
+            # identity set gets the sentence telling them where to set one
+            # rather than a library that quietly never fills.
+            ctx.note(f"{mpn}: not saved to your component library — {exc}")
     return json.dumps(run.to_dict(), indent=2)
 
 

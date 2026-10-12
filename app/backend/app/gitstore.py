@@ -233,6 +233,58 @@ def put(
         existing.nonce, existing.ciphertext = nonce, ciphertext
 
 
+def authority_of(remote: str) -> str | None:
+    """A remote's host and port as a credential row stores them — what ``put``
+    should be given as ``host`` to save a credential for this remote."""
+    scope = scope_of(remote)
+    return _format_scope(scope) if scope is not None else None
+
+
+def transient(master_key: bytes, *, host: str, secret: str, username: str | None) -> GitEndpoint:
+    """An HTTPS credential sealed exactly as a stored one is, but never stored.
+
+    For Test connection in the new-project dialog: the token someone has just
+    typed has to be tried before they decide to keep it, and trying it through
+    ``lease`` — the one path that hands a credential to git — means it is
+    scoped to its host and kept out of the URL in exactly the way a saved one
+    is. The row is not added to any session; dropping it is forgetting it.
+    """
+    if not (secret or "").strip():
+        raise GitStoreError("an empty secret is not a credential")
+    name = "unsaved"
+    nonce, ciphertext = vault.encrypt_secret(master_key, _aad(name), secret)
+    return GitEndpoint(
+        name=name, host=host, method="https_token",
+        username=(username or "").strip() or "git", nonce=nonce, ciphertext=ciphertext,
+    )
+
+
+def name_for(session: Session, user: User, remote: str) -> str:
+    """The name to save a new credential for ``remote``'s host under.
+
+    The row that already matches the host when there is one — saving then
+    rotates its token, which is what entering a new token for a host means,
+    since there can only be one per host. Otherwise the host itself, made into
+    a valid name, with a suffix only if some other host's row already has it:
+    ``put`` under an existing name *moves* that row to the new host, and
+    silently repointing someone's other credential is not what they asked for.
+    """
+    scope = scope_of(remote)
+    if scope is None:
+        raise GitStoreError("this remote names no host to save a credential for")
+    match = _rows_for_scope(session, user, scope)
+    if match:
+        return match[0].name
+    base = re.sub(r"[^a-z0-9._-]+", "-", _format_scope(scope).lower()).strip("-._")[:56] or "git"
+    if not base[0].isalnum():
+        base = "git-" + base
+    taken = {r.name for r in session.scalars(select(GitEndpoint).where(GitEndpoint.user_id == user.id))}
+    name, n = base, 2
+    while name in taken:
+        name, n = f"{base}-{n}", n + 1
+    return name
+
+
 def list_endpoints(session: Session, user: User) -> list[dict]:
     """What the settings screen may see: everything except the secret.
 

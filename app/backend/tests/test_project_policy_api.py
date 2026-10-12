@@ -9,10 +9,11 @@ previous answer.
 from __future__ import annotations
 
 from app import library_policy as lp
+from conftest import init_body
 
 
 def _make(client, name, **policy):
-    r = client.post("/api/projects/init", json={"name": name, **policy})
+    r = client.post("/api/projects/init", json={**init_body(name), **policy})
     assert r.status_code == 200, r.text
     return r
 
@@ -40,7 +41,7 @@ def test_a_declaration_made_at_creation_is_kept(unlocked) -> None:
 
 
 def test_a_value_that_is_not_a_choice_is_rejected(unlocked) -> None:
-    r = unlocked.post("/api/projects/init", json={"name": "bad", "contribute": "yes"})
+    r = unlocked.post("/api/projects/init", json={**init_body("bad"), "contribute": "yes"})
     assert r.status_code == 400 and "contribute" in r.text
 
 

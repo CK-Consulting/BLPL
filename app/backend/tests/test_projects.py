@@ -17,6 +17,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.projects import Projects, ProjectError  # noqa: E402
+from app.gitidentity import GitIdentity  # noqa: E402
+
+# Every commit is somebody's now; these are the tests'.
+IDENT = GitIdentity("Test", "test@example.com")
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -83,7 +87,7 @@ def test_an_edit_shows_as_dirty_then_clean_after_commit(tmp_path: Path, projects
     (d / "design.md").write_text("# design\nmore\n")
     assert projects.status("dev04").dirty is True
 
-    out = projects.commit_all("dev04", "edit design")
+    out = projects.commit_all("dev04", "edit design", identity=IDENT)
     assert out is not None
     assert projects.status("dev04").dirty is False
 
@@ -93,7 +97,7 @@ def test_commit_on_a_clean_tree_is_a_noop(tmp_path: Path, projects: Projects) ->
     d = projects.clone("dev04", f"file://{remote}", "main")
     _git(d, "config", "user.email", "t@t")
     _git(d, "config", "user.name", "t")
-    assert projects.commit_all("dev04", "nothing changed") is None
+    assert projects.commit_all("dev04", "nothing changed", identity=IDENT) is None
 
 
 def test_a_local_commit_shows_as_ahead(tmp_path: Path, projects: Projects) -> None:
@@ -102,7 +106,7 @@ def test_a_local_commit_shows_as_ahead(tmp_path: Path, projects: Projects) -> No
     _git(d, "config", "user.email", "t@t")
     _git(d, "config", "user.name", "t")
     (d / "design.md").write_text("# design\nlocal change\n")
-    projects.commit_all("dev04", "local edit")
+    projects.commit_all("dev04", "local edit", identity=IDENT)
     st = projects.status("dev04")
     assert st.ahead == 1 and st.behind == 0
 
@@ -113,13 +117,13 @@ def test_commit_then_push_clears_ahead(tmp_path: Path, projects: Projects) -> No
     _git(d, "config", "user.email", "t@t")
     _git(d, "config", "user.name", "t")
     (d / "design.md").write_text("# design\npushed change\n")
-    projects.commit_all("dev04", "to push")
+    projects.commit_all("dev04", "to push", identity=IDENT)
     projects.push("dev04")
     assert projects.status("dev04").ahead == 0
 
 
 def test_init_local_creates_a_git_repo_with_no_remote(projects: Projects) -> None:
-    d = projects.init_local("scratch")
+    d = projects.init_local("scratch", identity=IDENT)
     assert (d / ".git").is_dir()
     st = projects.status("scratch")
     assert st.has_remote is False

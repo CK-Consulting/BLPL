@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from conftest import running_worker
+from conftest import running_worker, init_body
 
 
 def _manager(tmp_path: Path):
@@ -162,7 +162,7 @@ def test_a_stage_run_lands_in_history_with_its_log(client) -> None:
     and then reads the record — which is what the browser does too, except that
     its worker is a container."""
     _unlock(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
 
     with running_worker():
         with client.stream("POST", "/api/projects/scratch/stages/doctor") as r:

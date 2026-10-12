@@ -1,0 +1,150 @@
+"""Pushing after every commit, for projects whose owner asked for it, and
+remembering how the last push went.
+
+A project created here used to hold its history on this server until somebody
+pressed Push. Most people never think about that, and the ones who do usually
+think about it after a disk has failed. So a project now declares a push
+policy when it is created: automatic, or manual with the risk spelled out.
+
+What an automatic push does is exactly what Commit + Push does by hand — the
+same ``Projects.push``, from the same checkout (a member's own worktree), to
+the same URL, with the same per-user credential. It only runs in the
+background, so a save does not wait on the network, and it goes through the
+repository's origin lock like every other network operation, so two commits
+landing together push one after the other rather than racing. The second push
+then carries both commits, which is what anyone would want.
+
+What it must never be is silent. A push that fails is recorded on the member's
+row — when, and why, redacted — and shown in the git strip and Project settings
+until a later push, automatic or manual, succeeds and clears it.
+"""
+
+from __future__ import annotations
+
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from .models import ProjectMember
+from .projects import ProjectError, Projects, _redact_text
+
+logger = logging.getLogger("blpl.app.autopush")
+
+POLICIES = ("auto", "manual")
+
+#: What choosing manual means, said once, here, so the dialog, Project
+#: settings and the API all say the same thing.
+MANUAL_WARNING = (
+    "Commits stay only on this server until you push them. If the server "
+    "suffers a catastrophic failure before you push, unpushed work could be "
+    "lost. The chance is small, but it is not zero."
+)
+
+#: Two workers: pushes for one repository serialise on its origin lock anyway,
+#: and this keeps two projects' slow remotes from queueing behind each other
+#: without letting a burst of saves open a connection each. Replaced by an
+#: inline executor in the tests.
+EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="blpl-autopush")
+
+
+def validate_policy(policy: str | None) -> str:
+    """``auto`` or ``manual``, or ValueError. There is no default to fall back
+    to: an absent choice is refused, because the point is that someone chose."""
+    if policy not in POLICIES:
+        raise ValueError(
+            "choose a push policy: push automatically after every commit (auto), "
+            "or push manually (manual)"
+        )
+    return policy
+
+
+def snapshot(row) -> SimpleNamespace | None:
+    """What gitstore.lease reads from a credential row, detached from the
+    request's database session, so the push can run after it has closed."""
+    if row is None:
+        return None
+    return SimpleNamespace(
+        name=row.name, host=row.host, method=row.method, username=row.username,
+        nonce=row.nonce, ciphertext=row.ciphertext,
+    )
+
+
+def scrub(message: str, secrets: list[str]) -> str:
+    """``message`` with any URL credentials and every literal secret removed.
+
+    The token rides the environment and git has no reason to repeat it; this
+    is for the day some transport or helper does, because the result is stored
+    and shown to the user and a stored token in an error column is still a
+    stored token.
+    """
+    out = _redact_text(message)
+    for secret in secrets:
+        if secret and len(secret) >= 4:
+            out = out.replace(secret, "***")
+    return out[:2000]
+
+
+def push_now(
+    projects: Projects,
+    project_name: str,
+    checkout: Path,
+    url: str,
+    cred,
+    master_key: bytes | None,
+) -> str | None:
+    """Push ``checkout`` to ``url`` with ``cred`` leased. None on success, else
+    the reason, already scrubbed. Never raises: the caller is a background
+    thread with nobody to raise to."""
+    from . import gitstore
+
+    secrets: list[str] = []
+    try:
+        if cred is not None and master_key is None:
+            return (
+                "your session was locked, so the saved credential for this remote "
+                "could not be used — unlock and press Push"
+            )
+        lease = gitstore.lease(master_key, cred) if cred is not None else nullcontext(None)
+        with lease as leased:
+            env = leased.env if leased is not None else None
+            secrets = [v for k, v in (env or {}).items() if k == "GIT_HTTP_TOKEN"]
+            projects.push(project_name, env=env, checkout=checkout, url=url)
+        return None
+    except ProjectError as exc:
+        return scrub(str(exc), secrets)
+    except Exception as exc:  # noqa: BLE001 — recorded, not lost in a thread
+        logger.exception("automatic push of %s failed unexpectedly", project_name)
+        return scrub(f"{type(exc).__name__}: {exc}", secrets)
+
+
+def record(session: Session, project_id: int, user_id: int, error: str | None) -> None:
+    """Store the outcome of one push of this member's checkout. A success
+    clears whatever failure was there before."""
+    m = session.scalar(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
+        )
+    )
+    if m is None:
+        # Removed from the project while the push ran. Nothing to show it to.
+        return
+    m.last_push_at = datetime.now(timezone.utc)
+    m.last_push_ok = error is None
+    m.last_push_error = error
+    session.flush()
+
+
+def last_push(m: ProjectMember | None) -> dict | None:
+    if m is None or m.last_push_at is None:
+        return None
+    return {
+        "at": m.last_push_at.isoformat(),
+        "ok": bool(m.last_push_ok),
+        "error": m.last_push_error or "",
+    }

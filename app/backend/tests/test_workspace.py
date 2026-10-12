@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import workspace  # noqa: E402
+from conftest import init_body
 
 
 def _seal_now(client, project="mine"):
@@ -44,7 +45,7 @@ def _share(owner, invitee, project="mine"):
 def test_a_sealed_project_leaves_no_plaintext_on_disk(unlocked):
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/secret.md", json={"content": "MPU6050\n"})
 
     assert _seal_now(unlocked)["sealed"] is True
@@ -59,7 +60,7 @@ def test_a_sealed_project_is_423_not_404(unlocked):
     """Locked, not missing and not forbidden. 404 would say it is gone and 403
     would say it is not yours — both are wrong, and both send the client
     somewhere other than the button that opens it."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/a.md", json={"content": "x\n"})
     _seal_now(unlocked)
 
@@ -76,7 +77,7 @@ def test_a_sealed_project_is_423_not_404(unlocked):
 
 
 def test_opening_restores_the_files(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/a.md", json={"content": "hello\n"})
     _seal_now(unlocked)
 
@@ -86,7 +87,7 @@ def test_opening_restores_the_files(unlocked):
 
 
 def test_opening_an_open_project_is_a_no_op(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     body = unlocked.post("/api/projects/mine/open").json()
     assert body == {"ok": True, "already_open": True}
 
@@ -106,7 +107,7 @@ def test_diffing_survives_a_seal_and_open(unlocked, second_user):
     """
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/board.md", json={"content": "# board\n"})
     unlocked.post("/api/projects/mine/git/commit", json={"message": "owner's work"})
     _share(unlocked, second_user)
@@ -135,7 +136,7 @@ def test_the_key_is_the_project_key_not_a_shared_one(unlocked):
     project's members — not by anyone the server would hand a key to."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/a.md", json={"content": "x\n"})
     _seal_now(unlocked)
 
@@ -150,7 +151,7 @@ def test_locking_seals_what_you_had_open(unlocked):
     """"I am done" is the clearest signal there is."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/a.md", json={"content": "x\n"})
 
     body = unlocked.post("/api/auth/lock").json()
@@ -164,7 +165,7 @@ def test_locking_does_not_seal_a_project_a_colleague_is_in(unlocked, second_user
     lock alone would delete the files out from under whoever is still editing."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _share(unlocked, second_user)
     second_user.get("/api/projects/mine/files")  # they are in it
 
@@ -181,7 +182,7 @@ def test_idle_workspaces_are_sealed_without_being_asked(unlocked):
     which would otherwise leave a project decrypted until someone came back."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/a.md", json={"content": "x\n"})
 
     entry = main.workspaces.all_open()[0]
@@ -199,7 +200,7 @@ def test_the_idle_clock_restarts_when_you_touch_a_project(unlocked):
     """Otherwise a long editing session gets sealed mid-edit at the half hour."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     main.workspaces.all_open()[0].last_touched -= timedelta(hours=2)
 
     unlocked.get("/api/projects/mine/files")
@@ -213,7 +214,7 @@ def test_a_run_in_flight_stops_a_seal(unlocked):
     import app.main as main
     from conftest import enqueue_only
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     enqueue_only(unlocked, "/api/projects/mine/stages/doctor")
 
     assert _seal_now(unlocked)["sealed"] is False
@@ -225,7 +226,7 @@ def test_a_project_created_and_left_alone_still_gets_sealed(unlocked):
     and never re-opened would have sat in plaintext for its whole life."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "fresh"})
+    unlocked.post("/api/projects/init", json=init_body("fresh"))
 
     assert main.workspaces.is_open("fresh")
     assert main.workspaces.key_for("fresh") is not None
@@ -242,7 +243,7 @@ def test_a_member_without_a_grant_is_told_so(unlocked, second_user):
     from app import grants
     from app.models import Project
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _share(unlocked, second_user)
     second_user.get("/api/projects/mine/files")
     _seal_now(unlocked)
@@ -258,7 +259,7 @@ def test_a_member_without_a_grant_is_told_so(unlocked, second_user):
 
 
 def test_a_non_member_cannot_open_or_seal(unlocked, second_user):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _seal_now(unlocked)
 
     assert second_user.post("/api/projects/mine/open").status_code == 404
@@ -271,7 +272,7 @@ def test_an_interrupted_seal_never_loses_the_project(unlocked):
     file and moved into place, so a crash leaves the old blob or the new one."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/a.md", json={"content": "irreplaceable\n"})
     key = main.workspaces.key_for("mine")
 
@@ -299,7 +300,7 @@ def test_unsealing_over_an_open_project_does_not_overwrite_it(unlocked):
     replacing it with the older copy in the blob."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/a.md", json={"content": "old\n"})
     key = main.workspaces.key_for("mine")
     workspace.seal(main.PROJECTS_ROOT, "mine", key)
@@ -320,7 +321,7 @@ def test_a_locked_session_is_not_mistaken_for_a_sealed_project(unlocked):
     """Both answer 423 on these routes and they mean different things: one is
     "decrypt this", the other is "go and unlock". A client that confuses them
     tries to open a project it has no key for, on every request."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.post("/api/auth/lock")
 
     r = unlocked.post("/api/projects/mine/stages/doctor")

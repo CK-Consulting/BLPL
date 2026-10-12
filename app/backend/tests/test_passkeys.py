@@ -32,6 +32,7 @@ from webauthn.helpers import bytes_to_base64url  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from webauthn_sim import SoftwareAuthenticator  # noqa: E402
+from conftest import init_body
 
 RP_ID = "testserver"
 ORIGIN = "https://testserver"
@@ -98,11 +99,11 @@ def test_enrolling_then_unlocking_with_it(unlocked):
     assert created.status_code == 200
 
     unlocked.post("/api/auth/lock")
-    assert unlocked.post("/api/projects/init", json={"name": "while-locked"}).status_code == 423
+    assert unlocked.post("/api/projects/init", json=init_body("while-locked")).status_code == 423
 
     assert _unlock_with(unlocked, auth).json() == {"unlocked": True}
     # And the session really is open — a route that needs the master key works.
-    assert unlocked.post("/api/projects/init", json={"name": "after"}).status_code == 200
+    assert unlocked.post("/api/projects/init", json=init_body("after")).status_code == 200
 
 
 def test_enrolment_needs_an_unlocked_session(client):
@@ -199,7 +200,7 @@ def test_a_valid_signature_with_the_wrong_prf_does_not_unlock(unlocked):
     assert "did not unwrap" in r.json()["detail"]
 
     # Still locked: a failed attempt must not leave a half-open session.
-    assert unlocked.post("/api/projects/init", json={"name": "nope"}).status_code == 423
+    assert unlocked.post("/api/projects/init", json=init_body("nope")).status_code == 423
 
 
 def test_one_persons_passkey_cannot_unlock_another_account(unlocked, second_user):
@@ -226,7 +227,7 @@ def test_both_slots_open_the_same_master_key(unlocked):
     they diverged, data written after enrolling a passkey would be unreadable
     with the passphrase — which is how people lose everything."""
     auth, _ = _enrol(unlocked)
-    unlocked.post("/api/projects/init", json={"name": "shared"})
+    unlocked.post("/api/projects/init", json=init_body("shared"))
     unlocked.put("/api/projects/shared/files/a.md", json={"content": "written\n"})
 
     # Locking seals the workspace, so each slot has to reopen it as well —
@@ -277,6 +278,6 @@ def test_unlocking_with_a_passkey_does_the_same_backfills(unlocked):
     _unlock_with(unlocked, auth)
 
     # A keypair is what sharing seals project keys to.
-    assert unlocked.post("/api/projects/init", json={"name": "p"}).status_code == 200
+    assert unlocked.post("/api/projects/init", json=init_body("p")).status_code == 200
     r = unlocked.post("/api/projects/p/members", json={"email": "other@example.com"})
     assert r.status_code in (200, 404)  # 404 only if the invitee has no account yet

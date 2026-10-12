@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from app import attachments
+from conftest import init_body
 
 CLEAN = (
     b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
@@ -68,7 +69,7 @@ def test_assessment_runs_off_the_event_loop(unlocked, monkeypatch):
         return real(*a, **kw)
 
     monkeypatch.setattr(main.attachments, "save", spy)
-    unlocked.post("/api/projects/init", json={"name": "scratch"})
+    unlocked.post("/api/projects/init", json=init_body("scratch"))
     conv = unlocked.post("/api/projects/scratch/conversations", json={"title": "t"}).json()["filename"]
     r = unlocked.post(
         f"/api/projects/scratch/conversations/{conv}/attachments",

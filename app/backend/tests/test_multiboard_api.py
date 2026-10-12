@@ -9,6 +9,7 @@ the standard library.
 from __future__ import annotations
 
 import pytest
+from conftest import init_body
 
 pytest.importorskip("fastapi")  # the backend's requirements must be installed for these tests.
 
@@ -95,7 +96,7 @@ MULTI = """
 
 
 def _multi_board_project(unlocked, name="shield"):
-    unlocked.post("/api/projects/init", json={"name": name})
+    unlocked.post("/api/projects/init", json=init_body(name))
     unlocked.put(f"/api/projects/{name}/files/project.md", json={"content": MULTI})
     unlocked.put(f"/api/projects/{name}/files/base/design.md", json={"content": "# base\n"})
     unlocked.put(f"/api/projects/{name}/files/sensor/design.md", json={"content": "# sensor\n"})
@@ -119,7 +120,7 @@ def test_all_boards_is_a_pipeline_scope_only_a_multi_board_project_has(unlocked)
     its one board under a misleading label."""
     # /api/projects/init, as everywhere else: a POST to /api/projects has no
     # route, so this test only ever saw a 404 for a project that did not exist.
-    assert unlocked.post("/api/projects/init", json={"name": "single"}).status_code == 200
+    assert unlocked.post("/api/projects/init", json=init_body("single")).status_code == 200
     unlocked.put("/api/projects/single/files/design.md", json={"content": "# one\n"})
     r = unlocked.post("/api/projects/single/pipeline?from_stage=stage5&to_stage=stage8&board=all")
     assert r.status_code == 400

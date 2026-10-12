@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import enqueue_only, queued_env, running_worker, sign_in
+from conftest import enqueue_only, queued_env, running_worker, sign_in, init_body
 
 
 def _seed_remote(tmp_path: Path) -> str:
@@ -149,19 +149,22 @@ def test_git_status_reports_clean_after_clone(tmp_path, client) -> None:
     assert st["branch"] == "main" and st["dirty"] is False and st["has_remote"] is True
 
 
-def test_init_creates_a_local_project(client) -> None:
+def test_init_creates_a_project_pointed_at_its_remote(client) -> None:
+    # It used to create a local-only project, whose one copy was this server.
     sign_in(client)
-    r = client.post("/api/projects/init", json={"name": "scratch"})
+    body = init_body("scratch")
+    r = client.post("/api/projects/init", json=body)
     assert r.status_code == 200
     st = client.get("/api/projects/scratch/git/status").json()
-    assert st["has_remote"] is False
+    assert st["has_remote"] is True and st["remote_url"] == body["remote"]
+    assert st["push_policy"] == "manual"
 
 
 def test_running_an_llm_stage_without_a_key_is_a_clear_error(tmp_path, client) -> None:
     """Stage 1 needs a provider key. With none stored, the app must refuse up
     front with an actionable message, not fail deep inside the subprocess."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     r = client.post("/api/projects/scratch/stages/stage1")
     assert r.status_code == 400
     assert "key" in r.json()["detail"].lower()
@@ -189,7 +192,7 @@ def test_an_llm_stage_injects_the_full_fallback_chain(tmp_path, client, monkeypa
     )
     client.put("/api/settings/secrets/anthropic", json={"value": "sk-ant-KEY"})
     client.put("/api/settings/secrets/openai", json={"value": "sk-oai-KEY"})
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
 
     enqueue_only(client, "/api/projects/scratch/stages/stage1")
     env = queued_env("scratch")
@@ -215,7 +218,7 @@ def test_a_deterministic_stage_runs_without_any_key(tmp_path, client) -> None:
     """doctor is deterministic — it must run with no provider configured. It will
     exit non-zero on an empty project, but the request itself must stream, not 400."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     with running_worker():
         with client.stream("POST", "/api/projects/scratch/stages/doctor") as r:
             assert r.status_code == 200
@@ -228,7 +231,7 @@ def test_a_deterministic_stage_runs_without_any_key(tmp_path, client) -> None:
 
 def test_files_can_be_created_listed_read_and_updated(client) -> None:
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
 
     # A fresh project has no editable files.
     assert client.get("/api/projects/scratch/files").json() == []
@@ -249,7 +252,7 @@ def test_files_can_be_created_listed_read_and_updated(client) -> None:
 
 def test_only_editable_suffixes_are_allowed(client) -> None:
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     # A .py file is not a design input.
     assert client.put("/api/projects/scratch/files/evil.py", json={"content": "x"}).status_code == 400
     # project.yaml (config) is editable.
@@ -267,7 +270,7 @@ def test_file_names_cannot_traverse_out_of_the_project(client) -> None:
     the rest of this list is here to hold.
     """
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     for bad in ("../secret.md", ".hidden.md", "sub/../../secret.md", ".git/config.yaml"):
         r = client.put(f"/api/projects/scratch/files/{bad}", json={"content": "x"})
         assert r.status_code in (400, 404), f"{bad!r} should be rejected, got {r.status_code}"
@@ -278,7 +281,7 @@ def test_a_board_keeps_its_design_document_in_its_own_directory(client) -> None:
     read it back. The editor ignores a selection missing from the listing, so
     a file that can be written but not listed is a click that does nothing."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
 
     w = client.put("/api/projects/scratch/files/base/design.md", json={"content": "# base\n"})
     assert w.status_code == 200, w.text
@@ -304,7 +307,7 @@ def test_a_name_with_url_metacharacters_round_trips_percent_encoded(client) -> N
     back as ``%aft`` — and nginx passes the URI through untouched, so the
     double decode belongs to this harness, not to the app."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     assert client.put("/api/projects/scratch/files/power/victim.md", json={"content": "keep\n"}).status_code == 200
 
     name = "power/victim.md#d?raft.md"
@@ -327,7 +330,7 @@ def test_everything_the_listing_offers_can_actually_be_opened(client) -> None:
     """The listing and the reader must agree on what a name means, or the
     workbench shows files it cannot open."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     for rel in ("overview.md", "base/design.md", "sensor/design.md", "sensor/notes.yaml"):
         assert client.put(f"/api/projects/scratch/files/{rel}", json={"content": "x"}).status_code == 200
 
@@ -340,7 +343,7 @@ def test_the_listing_does_not_wander_into_git_or_the_pipeline(client) -> None:
     """Recursing is what makes board directories visible; recursing everywhere
     would bury the design inputs under machinery."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     client.put("/api/projects/scratch/files/base/design.md", json={"content": "x"})
 
     names = {f["name"] for f in client.get("/api/projects/scratch/files").json()}
@@ -353,7 +356,7 @@ def test_generated_pipeline_files_are_not_editable(client) -> None:
     """.pipeline/ artifacts are read-only outputs, reached through /artifacts, not
     the editor — the editor is only for design inputs."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     # Even with a valid suffix, a path into .pipeline/ must not resolve here.
     r = client.get("/api/projects/scratch/files/.pipeline")
     assert r.status_code in (400, 404)
@@ -373,7 +376,7 @@ def _git_log(project: str) -> str:
 
 def _scratch_with_files(client) -> None:
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     for rel in ("overview.md", "power/power.md", "power/notes.yaml"):
         assert client.put(f"/api/projects/scratch/files/{rel}", json={"content": f"# {rel}\n"}).status_code == 200
 
@@ -383,7 +386,7 @@ def test_a_write_reports_the_path_the_file_landed_at(client) -> None:
     opened the typed spelling, which no tree row has, so every guard that
     compares paths as strings missed it. The response says where it landed."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     r = client.put("/api/projects/scratch/files/dir//a.md", json={"content": "# a\n"})
     assert r.status_code == 200, r.text
     assert r.json()["path"] == "dir/a.md"
@@ -837,7 +840,7 @@ def test_pipeline_range_streams_and_needs_no_key_when_llm_excluded(client) -> No
     """A stage5→8 range has no LLM stage, so it must run with no key configured —
     it will exit non-zero on an unbuilt project, but the request itself streams."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     with running_worker():
         with client.stream("POST", "/api/projects/scratch/pipeline?from_stage=stage5&to_stage=stage8") as r:
             assert r.status_code == 200
@@ -847,7 +850,7 @@ def test_pipeline_range_streams_and_needs_no_key_when_llm_excluded(client) -> No
 
 def test_pipeline_range_including_stage1_requires_a_key(client) -> None:
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     r = client.post("/api/projects/scratch/pipeline?from_stage=stage0&to_stage=stage8")
     assert r.status_code == 400
     assert "key" in r.json()["detail"].lower()
@@ -855,14 +858,14 @@ def test_pipeline_range_including_stage1_requires_a_key(client) -> None:
 
 def test_pipeline_rejects_a_backwards_range(client) -> None:
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     r = client.post("/api/projects/scratch/pipeline?from_stage=stage8&to_stage=stage2")
     assert r.status_code == 400
 
 
 def test_pipeline_rejects_an_unknown_stage(client) -> None:
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     r = client.post("/api/projects/scratch/pipeline?from_stage=stage9&to_stage=stage9")
     assert r.status_code == 400
 
@@ -873,7 +876,7 @@ def test_pipeline_rejects_an_unknown_stage(client) -> None:
 def test_project_list_flags_a_board_with_placeholders(client) -> None:
     import json as _json, os
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
 
     # No review yet → fab is null.
     proj = next(p for p in client.get("/api/projects").json() if p["id"] == "scratch")
@@ -893,7 +896,7 @@ def test_project_list_flags_a_board_with_placeholders(client) -> None:
 
 def test_project_list_fab_is_null_when_review_is_unparseable(client) -> None:
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     import app.main as main
     pipeline = main.PROJECTS_ROOT / "scratch" / ".pipeline"
     pipeline.mkdir(parents=True, exist_ok=True)
@@ -912,7 +915,7 @@ def test_preflight_reports_what_stage0_would_discard(unlocked) -> None:
     rather than inferred from an artifact diff afterwards."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "scratch"})
+    unlocked.post("/api/projects/init", json=init_body("scratch"))
     proj = main.PROJECTS_ROOT / "scratch"
     # A parts-comparison matrix, not a net-classes table: doctor now knows the
     # net-classes table is consumed by `blpl init`, so it stopped being a valid
@@ -941,7 +944,7 @@ def test_multi_board_preflight_reports_an_undeclared_board_folder(unlocked) -> N
     the project's, not repeated under every board."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "scratch"})
+    unlocked.post("/api/projects/init", json=init_body("scratch"))
     proj = main.PROJECTS_ROOT / "scratch"
     bom = "## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | 0402 |\n"
     (proj / "project.md").write_text("# P\n\n## Boards\n\n- main\n", encoding="utf-8")
@@ -963,7 +966,7 @@ def test_preflight_mutates_nothing(unlocked) -> None:
     # It is safe to call on every visit to the tab, which is why the panel does.
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "scratch"})
+    unlocked.post("/api/projects/init", json=init_body("scratch"))
     proj = main.PROJECTS_ROOT / "scratch"
     (proj / "design.md").write_text("## Notes\n\nnothing here\n", encoding="utf-8")
     before = sorted(p.name for p in proj.iterdir())
@@ -994,7 +997,7 @@ def test_a_quarantined_file_is_never_served_as_a_pdf(client) -> None:
     from blpl.core import quarantine
 
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     proj = main.PROJECTS_ROOT / "scratch"
 
     qdir = quarantine.quarantine_dir(proj)
@@ -1017,7 +1020,7 @@ def test_a_released_datasheet_still_opens_in_the_browser(client) -> None:
     import app.main as main
 
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
     proj = main.PROJECTS_ROOT / "scratch"
 
     sheets = proj / "datasheets"
@@ -1614,7 +1617,7 @@ def test_a_pipeline_range_carries_a_chain_for_each_stage_it_will_run(client):
     )
     client.put("/api/settings/secrets/cheap", json={"value": "sk-cheap"})
     client.put("/api/settings/secrets/dear", json={"value": "sk-dear"})
-    client.post("/api/projects/init", json={"name": "routed"})
+    client.post("/api/projects/init", json=init_body("routed"))
 
     enqueue_only(client, "/api/projects/routed/pipeline?from_stage=stage0&to_stage=stage8")
     env = queued_env("routed")
@@ -1640,7 +1643,7 @@ def test_a_range_that_stops_before_stage1_carries_only_stage0s_route(client):
     )
     client.put("/api/settings/secrets/cheap", json={"value": "sk-cheap"})
     client.put("/api/settings/secrets/dear", json={"value": "sk-dear"})
-    client.post("/api/projects/init", json={"name": "shortrange"})
+    client.post("/api/projects/init", json=init_body("shortrange"))
 
     enqueue_only(client, "/api/projects/shortrange/pipeline?from_stage=stage0&to_stage=stage0")
     chains = _json.loads(queued_env("shortrange")["HDM_LLM_CHAINS"])
@@ -1661,7 +1664,7 @@ def test_a_range_runs_when_only_the_stage_it_reaches_is_routable(client):
         },
     )
     client.put("/api/settings/secrets/dear", json={"value": "sk-dear"})
-    client.post("/api/projects/init", json={"name": "onlystage1"})
+    client.post("/api/projects/init", json=init_body("onlystage1"))
 
     enqueue_only(client, "/api/projects/onlystage1/pipeline?from_stage=stage1&to_stage=stage8")
     chains = _json.loads(queued_env("onlystage1")["HDM_LLM_CHAINS"])
@@ -1691,7 +1694,7 @@ def test_opening_a_project_writes_the_path_the_desktop_will_see(client, monkeypa
     import app.main as main
 
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "openme"})
+    client.post("/api/projects/init", json=init_body("openme"))
     _emit_board(client, "openme")
 
     r = client.post("/api/projects/openme/kicad/open")
@@ -1711,7 +1714,7 @@ def test_a_project_with_no_board_yet_is_not_an_error(client):
     """A pipeline that has not reached stage 6 has nothing to open. That is a
     fact about the project, not something the caller did wrong."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "unbuilt"})
+    client.post("/api/projects/init", json=init_body("unbuilt"))
 
     r = client.post("/api/projects/unbuilt/kicad/open")
     assert r.status_code == 200
@@ -1727,7 +1730,7 @@ def test_a_single_project_mount_translates_to_the_root(client, monkeypatch):
     import app.main as main
 
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "solo"})
+    client.post("/api/projects/init", json=init_body("solo"))
     _emit_board(client, "solo")
     monkeypatch.setenv("KICAD_DESKTOP_PROJECT", "solo")
 
@@ -1740,8 +1743,8 @@ def test_a_single_project_mount_translates_to_the_root(client, monkeypatch):
 
 def test_a_project_the_desktop_has_not_mounted_is_refused(client, monkeypatch):
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "mounted"})
-    client.post("/api/projects/init", json={"name": "elsewhere"})
+    client.post("/api/projects/init", json=init_body("mounted"))
+    client.post("/api/projects/init", json=init_body("elsewhere"))
     _emit_board(client, "elsewhere")
     monkeypatch.setenv("KICAD_DESKTOP_PROJECT", "mounted")
 
@@ -1757,7 +1760,7 @@ def test_the_board_is_matched_as_a_delimited_name_not_a_substring(client, monkey
     import app.main as main
 
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "core-board"})
+    client.post("/api/projects/init", json=init_body("core-board"))
     # Board resolution is the manifest's job and is tested elsewhere; what is
     # under test here is the pattern this route hands to the artifact lookup.
     monkeypatch.setattr(main, "_resolve_board", lambda *a, **k: "core")
@@ -1783,7 +1786,7 @@ def test_a_collaborators_worktree_says_why_a_named_mount_cannot_show_it(client, 
     from app import worktrees
 
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "shared"})
+    client.post("/api/projects/init", json=init_body("shared"))
 
     # A board that exists only in a member's worktree.
     wt = main.PROJECTS_ROOT / worktrees.WORKTREES_DIR / "shared" / "u99" / ".pipeline"
@@ -1804,7 +1807,7 @@ def test_a_worktree_is_reachable_when_the_whole_root_is_mounted(client, monkeypa
     from app import worktrees
 
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "shared2"})
+    client.post("/api/projects/init", json=init_body("shared2"))
     wt = main.PROJECTS_ROOT / worktrees.WORKTREES_DIR / "shared2" / "u99" / ".pipeline"
     wt.mkdir(parents=True, exist_ok=True)
     (wt / "shared2_2026-01-01_000000Z.kicad_pro").write_text("{}", encoding="utf-8")

@@ -65,6 +65,11 @@ class User(Base):
     profile_completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
+    # The commit identity used when a project has none of its own for this
+    # user (see gitidentity). Null until the user sets one; a commit with no
+    # identity anywhere is refused, never signed with a placeholder.
+    git_name: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
+    git_email: Mapped[str | None] = mapped_column(String(254), nullable=True, default=None)
 
     keys: Mapped[list["ProviderKey"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
@@ -463,6 +468,11 @@ class Project(Base):
     remote: Mapped[str] = mapped_column(String(512), default="")
     branch: Mapped[str] = mapped_column(String(128), default="main")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    #: auto | manual, or null for a project created before anyone was asked.
+    #: Null behaves as manual — today's behaviour — and Project settings shows
+    #: it as not chosen. No default, because whether unpushed work may sit on
+    #: this server alone is the owner's call, made knowingly.
+    push_policy: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
 
     owner: Mapped[User] = relationship(foreign_keys=[owner_id])
     members: Mapped[list["ProjectMember"]] = relationship(
@@ -495,6 +505,21 @@ class ProjectMember(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     role: Mapped[str] = mapped_column(String(16), default="member")  # owner | member
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    #: This member's commit identity for this project, overriding their account
+    #: default. On the membership because it is exactly that: one person in one
+    #: project. See gitidentity.
+    git_name: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
+    git_email: Mapped[str | None] = mapped_column(String(254), nullable=True, default=None)
+    #: The last push of this member's checkout, automatic or by hand. Per member
+    #: because each pushes their own worktree's branch with their own
+    #: credential, so one member's failure says nothing about another's. A
+    #: failed automatic push must never be silent; this is where it is kept
+    #: until a later push succeeds. The error is redacted before it is stored.
+    last_push_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    last_push_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
+    last_push_error: Mapped[str | None] = mapped_column(String(2000), nullable=True, default=None)
 
     project: Mapped[Project] = relationship(back_populates="members")
     user: Mapped[User] = relationship(back_populates="memberships")

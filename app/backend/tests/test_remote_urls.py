@@ -17,6 +17,7 @@ import pytest
 
 from app import projects as projects_mod
 from app.projects import ProjectError, check_remote_url
+from conftest import init_body
 
 
 @pytest.fixture
@@ -94,7 +95,22 @@ def test_git_itself_refuses_a_disallowed_transport(deployment_protocols, tmp_pat
 
 
 def _project(client, name="p"):
-    assert client.post("/api/projects/init", json={"name": name}).status_code == 200
+    # Created over the suite's file:// transport even where a test has turned
+    # it off: a project now needs a reachable empty remote to exist at all,
+    # and these tests are about what may be set as one afterwards.
+    import os
+
+    saved = os.environ.get("BLPL_GIT_ALLOWED_PROTOCOLS")
+    os.environ["BLPL_GIT_ALLOWED_PROTOCOLS"] = "https:ssh:file"
+    try:
+        body = init_body(name)
+        assert client.post("/api/projects/init", json=body).status_code == 200
+    finally:
+        if saved is None:
+            os.environ.pop("BLPL_GIT_ALLOWED_PROTOCOLS", None)
+        else:
+            os.environ["BLPL_GIT_ALLOWED_PROTOCOLS"] = saved
+    return body["remote"]
 
 
 def test_the_owner_sets_a_remote_and_status_shows_it(unlocked):
@@ -110,10 +126,11 @@ def test_the_owner_sets_a_remote_and_status_shows_it(unlocked):
 
 
 def test_a_local_path_is_refused_as_a_remote(unlocked, deployment_protocols, tmp_path):
-    _project(unlocked)
+    created_with = _project(unlocked)
     r = unlocked.put("/api/projects/p/git/remote", json={"url": str(_repo(tmp_path / "v"))})
     assert r.status_code == 400
-    assert not unlocked.get("/api/projects/p/git/status").json()["has_remote"]
+    # Refused means unchanged: still the remote it was created with.
+    assert unlocked.get("/api/projects/p/git/status").json()["remote_url"] == created_with
 
 
 def test_a_member_who_is_not_the_owner_cannot_set_it(unlocked, second_user):

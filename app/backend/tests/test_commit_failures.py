@@ -9,13 +9,14 @@ proposal, save and upload uncommitted and nothing anywhere saying so.
 from __future__ import annotations
 
 import pytest
+from conftest import init_body
 
 
 @pytest.fixture
 def project(unlocked):
     import app.main as main
 
-    assert unlocked.post("/api/projects/init", json={"name": "p"}).status_code == 200
+    assert unlocked.post("/api/projects/init", json=init_body("p")).status_code == 200
     return unlocked, main.PROJECTS_ROOT / "p"
 
 

@@ -23,6 +23,7 @@ far better answer than asking a model to remember what it changed.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,17 +129,25 @@ def probe(url: str) -> tuple[BridgeStatus, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def snapshot(project_dir: Path) -> str | None:
+def snapshot(project_dir: Path, identity=None) -> str | None:
     """Commit the working tree to a ref, without touching HEAD or the index.
 
     ``commit-tree`` on a written index gives a commit nobody's branch points at,
     so this leaves no trace in history and cannot disturb an in-progress edit —
     it is purely an undo anchor.
+
+    Still a commit, so still somebody's: ``identity`` is the user whose turn is
+    editing the board, passed to git for this one call. It used to borrow the
+    placeholder identity written into the repository's config; with none given
+    and none configured, commit-tree fails and the caller reports that there is
+    no undo anchor, which is the truth.
     """
+    env = {**os.environ, **identity.env()} if identity is not None else None
 
     def git(*args: str) -> str:
         return subprocess.run(
-            ["git", *args], cwd=str(project_dir), capture_output=True, text=True, check=True, timeout=60
+            ["git", *args], cwd=str(project_dir), capture_output=True, text=True, check=True,
+            timeout=60, env=env,
         ).stdout.strip()
 
     try:
@@ -188,7 +197,7 @@ def _make_handler(client: MCPClient, name: str, mutating: bool):
             # rather than at turn start means a read-only conversation never
             # writes a ref.
             if not ctx.extras.get("kicad_snapshot"):
-                commit = await asyncio.to_thread(snapshot, ctx.project_dir)
+                commit = await asyncio.to_thread(snapshot, ctx.project_dir, ctx.git_identity)
                 ctx.extras["kicad_snapshot"] = commit or "none"
                 ctx.note(
                     "snapshotted the board before editing"

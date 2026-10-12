@@ -151,6 +151,19 @@ def test_the_snapshot_leaves_no_trace_in_history(git_project) -> None:
     assert before == after
 
 
+def test_the_snapshot_is_signed_by_the_user_whose_turn_made_it(git_project) -> None:
+    # It borrowed the placeholder identity BLPL used to write into every
+    # repository's config. That is gone; the turn's user signs it instead.
+    from app.gitidentity import GitIdentity
+
+    commit = kb.snapshot(git_project, GitIdentity("Board Editor", "editor@example.com"))
+    who = subprocess.run(
+        ["git", "log", "-1", "--format=%an <%ae>|%cn <%ce>", commit],
+        cwd=git_project, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert who == "Board Editor <editor@example.com>|Board Editor <editor@example.com>"
+
+
 def test_a_project_without_git_still_works_it_just_has_no_undo(tmp_path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()

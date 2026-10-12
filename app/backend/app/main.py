@@ -71,9 +71,11 @@ from . import (
     activity,
     appconfig,
     attachments,
+    autopush,
     chat as chat_mod,
     clerk_auth,
     components,
+    gitidentity,
     grants,
     importer,
     keystore,
@@ -396,6 +398,19 @@ def require_master_key(request: Request, user: User = Depends(require_user)) -> 
     if key is None:
         raise HTTPException(status_code=423, detail="locked: enter your encryption passphrase")
     return key
+
+
+def optional_master_key(request: Request, user: User = Depends(require_user)) -> bytes | None:
+    """The unlocked master key if this session has one, else None — never 423.
+
+    For the routes that commit. A commit needs no secret, so they must keep
+    working while locked; but a project that pushes after every commit needs
+    the user's git credential to do it, and that is sealed under this key. With
+    no key the push is recorded as failed, with the reason, rather than the
+    save being refused.
+    """
+    claims = getattr(request.state, "clerk_claims", {}) or {}
+    return unlocked.get(unlock_mod.session_key_for(user.clerk_user_id, claims))
 
 
 def _load_config() -> AppConfig:
@@ -1787,7 +1802,144 @@ def clone_project(
 
 
 class InitBody(PolicyFields):
+    """A new project, and everything it needs to not lose work on day one.
+
+    Every field past the name is checked here with a sentence rather than left
+    to pydantic, whose 422 for a missing field reads as a bug in the client.
+    Nothing has a default that would stand in for a choice: no remote means no
+    project, and no push policy means no project.
+    """
+
     name: str
+    #: Where the project's history goes. Required: a project whose only copy is
+    #: this server is one disk failure from gone. Must be empty — an existing
+    #: repository is brought in with Clone, not overwritten.
+    remote: str = ""
+    #: auto | manual. See autopush.
+    push_policy: str | None = None
+    #: The creator's commit identity for this project.
+    git_name: str = ""
+    git_email: str = ""
+    #: Also make it the account default, used by projects with none of their own.
+    save_as_default: bool = False
+    #: A new HTTPS token for the remote's host, saved into this user's sealed
+    #: git credential store (gitstore) if the project is created. Never stored
+    #: anywhere else, never echoed back. Absent: an already-saved credential
+    #: for the host is used, or none (an SSH remote with the deploy's key).
+    token: str | None = None
+    token_username: str | None = None
+
+
+class RemoteCheckBody(BaseModel):
+    url: str
+    #: A token typed but not yet saved, tried without being stored.
+    token: str | None = None
+    token_username: str | None = None
+
+
+def _remote_probe(
+    session: Session, master_key: bytes, user: User, url: str,
+    token: str | None, token_username: str | None,
+):
+    """Try ``url`` with the token given, or the user's saved credential for its
+    host. Returns (probe, credential name or None, the secret to scrub).
+
+    The URL is validated first, before any credential is chosen for it — the
+    same order clone keeps. A token is only for HTTPS: over SSH the credential
+    is a key, saved under Account & app settings, and a token typed against an
+    ssh:// URL would be ignored, which reads as accepted.
+    """
+    from . import gitstore
+
+    url = check_remote_url(url)
+    token = (token or "").strip() or None
+    if token is not None:
+        if not url.lower().startswith("https://"):
+            raise ProjectError(
+                "a token is for an https:// remote — for an SSH remote, save an SSH key "
+                "under Account & app settings → Git endpoints/accounts"
+            )
+        host = gitstore.authority_of(url)
+        if host is None:
+            raise ProjectError("this remote names no host for a token to be used with")
+        row = gitstore.transient(master_key, host=host, secret=token, username=token_username)
+        name = None
+    else:
+        try:
+            row = gitstore.for_remote(session, user, url)
+        except gitstore.GitStoreError as exc:
+            raise ProjectError(str(exc)) from exc
+        name = row.name if row is not None else None
+    if row is None:
+        return projects.probe_remote(url), None, None
+    with gitstore.lease(master_key, row) as cred:
+        probe = projects.probe_remote(url, env=cred.env)
+    return probe, name, token
+
+
+_PROBE_SENTENCES = {
+    "ok": "Connected.",
+    "auth_failed": "The remote refused the credential — check the token and its permissions.",
+    "not_found": "No repository was found at that URL, or the credential cannot see it.",
+    "error": "The remote could not be reached.",
+}
+
+#: What creating a project over a repository with history says instead.
+_NOT_EMPTY = (
+    "that repository already has commits. A new project needs an empty one (no "
+    "README, licence or .gitignore). To work on an existing repository, use Clone "
+    "git remote in this dialog instead; to bring in files from your computer, use "
+    "Import files."
+)
+
+
+@app.post("/api/projects/check-remote")
+def check_remote(
+    body: RemoteCheckBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Test connection: can this URL be reached, with which credential, and is
+    it empty. Nothing is saved. The token, if one was typed, is not repeated in
+    any part of the answer — git's message is redacted and the literal secret
+    scrubbed from it besides."""
+    try:
+        probe, name, secret = _remote_probe(
+            session, master_key, user, body.url, body.token, body.token_username
+        )
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=autopush.scrub(str(exc), [body.token or ""]))
+    detail = autopush.scrub(probe.message, [secret or ""])
+    return {
+        "status": probe.status,
+        "ok": probe.status == "ok",
+        "empty": probe.empty if probe.status == "ok" else None,
+        "message": (
+            _NOT_EMPTY if probe.status == "ok" and not probe.empty
+            else _PROBE_SENTENCES[probe.status]
+        ),
+        "detail": detail,
+        #: Which saved credential was used, when one matched. The UI shows it
+        #: so "Connected" says *as whom*.
+        "credential": name,
+    }
+
+
+@app.get("/api/projects/new/defaults")
+def new_project_defaults(
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """What the new-project dialog prefills: the account's commit identity, or
+    failing that the sign-in email to start from, and the warning shown when
+    manual pushing is chosen — from here, so it is one text everywhere."""
+    mine = gitidentity.account_default(user)
+    return {
+        "identity": mine.as_json() if mine else {"name": "", "email": user.email or ""},
+        "identity_is_default": mine is not None,
+        "manual_push_warning": autopush.MANUAL_WARNING,
+    }
 
 
 def _record_policy(session: Session, project, decl, *, actor_id: int) -> None:
@@ -1835,13 +1987,85 @@ def init_project(
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
 ) -> dict:
-    """Create a new, empty, local git project, owned by its creator."""
+    """Create a new project backed by an empty remote, owned by its creator.
+
+    Checked in full before anything touches the disk: the name, the remote URL,
+    the push policy, the commit identity, then the remote itself, with the
+    credential that will be used to push to it. A remote that cannot be
+    reached, refuses the credential, or already has history is refused here —
+    never force-pushed over, never merged into.
+    """
+    from . import gitstore
+
     _refuse_taken_name(session, body.name)
+    if not body.remote.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="a remote repository URL is required — create an empty repository "
+            "with your git provider first (see How do I set this up?)",
+        )
     try:
-        projects.init_local(body.name)
+        remote = check_remote_url(body.remote)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    project = projectacl.create(session, user, body.name)
+    try:
+        policy = autopush.validate_policy(body.push_policy)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        identity = gitidentity.validate(body.git_name, body.git_email)
+    except gitidentity.IdentityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        probe, _, secret = _remote_probe(
+            session, master_key, user, remote, body.token, body.token_username
+        )
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=autopush.scrub(str(exc), [body.token or ""]))
+    if probe.status != "ok":
+        detail = autopush.scrub(probe.message, [secret or ""])
+        raise HTTPException(
+            status_code=400,
+            detail=f"{_PROBE_SENTENCES[probe.status]} {detail}".strip(),
+        )
+    if not probe.empty:
+        raise HTTPException(status_code=409, detail=_NOT_EMPTY)
+
+    token = (body.token or "").strip()
+    if token:
+        try:
+            # Into the one store git credentials live in, under the row that
+            # already holds this host if there is one (a new token replaces
+            # it: there is one credential per host).
+            gitstore.put(
+                session, master_key, user,
+                name=gitstore.name_for(session, user, remote),
+                host=gitstore.authority_of(remote),
+                method="https_token", secret=token,
+                username=(body.token_username or "").strip() or "git",
+            )
+        except gitstore.GitStoreError as exc:
+            raise HTTPException(status_code=400, detail=autopush.scrub(str(exc), [token]))
+
+    try:
+        dest = projects.init_local(body.name, identity=identity)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        projects.set_remote(dest, remote)
+    except ProjectError as exc:
+        # A project without the remote it was created for is the local-only
+        # project this dialog exists to stop making. Rolled back, as an import
+        # that fails half-way is.
+        shutil.rmtree(dest, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    project = projectacl.create(session, user, body.name, remote=remote)
+    project.push_policy = policy
+    gitidentity.set_for_project(session, user, project, identity)
+    if body.save_as_default:
+        gitidentity.set_account_default(session, user, identity)
     _note_workspace_open(
         session, project.name, PROJECTS_ROOT / project.name,
         grants.create_project_key(session, project, user, master_key),
@@ -1849,6 +2073,9 @@ def init_project(
     )
     _record_policy(session, project, body, actor_id=user.id)
     activity.record(session, project, user, activity.IMPORTED, "created empty")
+    # The first commits go out now when pushing is automatic, so the remote
+    # holds the project from its first minute rather than from its first save.
+    _schedule_autopush(session, user, project, dest, master_key)
     return {"ok": True, "id": body.name}
 
 
@@ -1876,6 +2103,7 @@ def open_project(
     project = _project_or_404(session, user, project_id)
     if not workspace.is_sealed(PROJECTS_ROOT, project_id):
         _touch_workspace(session, project_id, user.id)
+        _drop_placeholder_identity(project_id)
         return {"ok": True, "already_open": True}
 
     try:
@@ -1893,8 +2121,25 @@ def open_project(
         raise HTTPException(status_code=400, detail=str(exc))
 
     _note_workspace_open(session, project_id, PROJECTS_ROOT / project_id, project_key, user.id)
+    _drop_placeholder_identity(project_id)
     activity.record(session, project, user, activity.OPENED, "")
     return {"ok": True, "already_open": False}
+
+
+def _drop_placeholder_identity(project_id: str) -> None:
+    """Clear the stand-in identity older versions wrote into this repository.
+
+    On open, because that is the first moment a sealed repository can be
+    reached at all — a migration run at boot finds sealed projects as
+    ciphertext. Best-effort: a repository git cannot read is reported by every
+    route that uses it, and failing the open over a config cleanup would only
+    hide that behind a less useful error.
+    """
+    try:
+        if projects.drop_placeholder_identity(projects.project_dir(project_id)):
+            logger.info("removed the placeholder commit identity from %s", project_id)
+    except (ProjectError, OSError, subprocess.SubprocessError):
+        logger.exception("could not check %s for the placeholder identity", project_id)
 
 
 @app.post("/api/projects/{project_id}/seal")
@@ -2345,8 +2590,12 @@ async def import_project(
             + ("; ".join(f"{s.name} ({s.reason})" for s in skipped) or "no files"),
         )
 
+    # The account's identity: there is no project yet to hold one of its own,
+    # and the import is a commit, so without one the import is refused before
+    # anything is written (init_local says where to set it).
+    identity = gitidentity.account_default(user)
     try:
-        dest = projects.init_local(name)
+        dest = projects.init_local(name, identity=identity)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     try:
@@ -2354,7 +2603,7 @@ async def import_project(
             target = dest / f.path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(f.data)
-        projects.commit_all(name, f"Import {len(imported)} files via app upload")
+        projects.commit_all(name, f"Import {len(imported)} files via app upload", identity=identity)
     except Exception:
         # A half-written project would show up in every listing looking real.
         # Roll the directory back and let the error surface.
@@ -2387,16 +2636,27 @@ async def import_project(
 def git_status(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     checkout = _project_dir(session, user, project_id)
+    project = _project_or_404(session, user, project_id)
     try:
         st = projects.status(project_id, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    member = gitidentity.membership(session, user, project)
+    identity = gitidentity.resolve(session, user, project)
     return {
         "branch": st.branch, "ahead": st.ahead, "behind": st.behind,
         "dirty": st.dirty, "has_remote": st.has_remote,
         "remote_name": st.remote_name, "remote_url": st.remote_url,
         "unpublished": st.unpublished,
         "remote_problem": st.remote_problem,
+        # auto | manual | null (never chosen; behaves as manual).
+        "push_policy": project.push_policy,
+        # This member's last push, automatic or not: a failure stays here, and
+        # in the strip, until a later push succeeds.
+        "last_push": autopush.last_push(member),
+        # Whether a commit by this user would be refused, so the strip can say
+        # so before they try rather than after a save.
+        "has_identity": identity is not None,
     }
 
 
@@ -2432,16 +2692,130 @@ def set_git_remote(
     return {"ok": True, "remote_name": st.remote_name, "remote_url": st.remote_url}
 
 
+class IdentityBody(BaseModel):
+    name: str = ""
+    email: str = ""
+
+
+def _identity_json(identity) -> dict | None:
+    return identity.as_json() if identity is not None else None
+
+
+@app.get("/api/me/git-identity")
+def get_account_identity(user: User = Depends(require_onboarded)) -> dict:
+    """The commit identity used wherever a project has none of this user's own."""
+    return {"identity": _identity_json(gitidentity.account_default(user)), "email": user.email}
+
+
+@app.put("/api/me/git-identity")
+def put_account_identity(
+    body: IdentityBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    try:
+        identity = gitidentity.validate(body.name, body.email)
+    except gitidentity.IdentityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    gitidentity.set_account_default(session, user, identity)
+    return {"ok": True, "identity": identity.as_json()}
+
+
+@app.delete("/api/me/git-identity")
+def delete_account_identity(
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Clear the default. Projects with an identity of their own are unaffected;
+    the rest refuse to commit for this user until one is set again."""
+    gitidentity.set_account_default(session, user, None)
+    return {"ok": True}
+
+
+@app.get("/api/projects/{project_id}/git/identity")
+def get_project_identity(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """This member's identity for the project, the account default it falls
+    back to, and which of the two a commit would use. Only the caller's own:
+    nothing here reads or writes another member's."""
+    project = _project_or_404(session, user, project_id)
+    return {
+        "project": _identity_json(gitidentity.for_project(session, user, project)),
+        "default": _identity_json(gitidentity.account_default(user)),
+        "effective": _identity_json(gitidentity.resolve(session, user, project)),
+    }
+
+
+@app.put("/api/projects/{project_id}/git/identity")
+def put_project_identity(
+    project_id: str,
+    body: IdentityBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Set the caller's identity for this project. Any member may set their own;
+    a blank name and email clears it, falling back to the account default."""
+    project = _project_or_404(session, user, project_id)
+    if not body.name.strip() and not body.email.strip():
+        gitidentity.set_for_project(session, user, project, None)
+        return {"ok": True, "project": None}
+    try:
+        identity = gitidentity.validate(body.name, body.email)
+    except gitidentity.IdentityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    gitidentity.set_for_project(session, user, project, identity)
+    return {"ok": True, "project": identity.as_json()}
+
+
+class PushPolicyBody(BaseModel):
+    policy: str | None = None
+
+
+@app.put("/api/projects/{project_id}/git/push-policy")
+def put_push_policy(
+    project_id: str,
+    body: PushPolicyBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Push after every commit, or only by hand. Owner only, for the reason the
+    remote is: it decides where every member's work goes and when, and whether
+    unpushed work may sit on this server alone is the owner's risk to take."""
+    try:
+        project = projectacl.require_owner(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    except projectacl.NotTheOwner:
+        raise HTTPException(
+            status_code=403, detail="only the owner can change this project's push policy"
+        )
+    try:
+        project.push_policy = autopush.validate_policy(body.policy)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    session.flush()
+    return {
+        "ok": True,
+        "push_policy": project.push_policy,
+        "warning": autopush.MANUAL_WARNING if project.push_policy == "manual" else "",
+    }
+
+
 class CommitBody(BaseModel):
     message: str
 
 
 @app.post("/api/projects/{project_id}/git/commit")
 def git_commit(project_id: str, body: CommitBody, user: User = Depends(require_onboarded),
-    session: Session = Depends(session_scope)) -> dict:
+    session: Session = Depends(session_scope),
+    master_key: bytes | None = Depends(optional_master_key)) -> dict:
+    project = _project_or_404(session, user, project_id)
     checkout = _project_dir(session, user, project_id)
     try:
-        out = projects.commit_checkout(checkout, body.message)
+        out = _commit_as(session, user, project, checkout, body.message, master_key)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "committed": out is not None}
@@ -2484,12 +2858,21 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
     # The checkout /git/commit just committed in, so "Commit + Push" pushes
     # the commit it made rather than the owner's branch.
     checkout = _project_dir(session, user, project_id)
+    project = _project_or_404(session, user, project_id)
     try:
         dest = projects.remote_of(project_id, operation="push", checkout=checkout)
         with _git_credentials(session, master_key, user, dest) as env:
             out = projects.push(project_id, env=env, checkout=checkout, url=dest)
     except ProjectError as exc:
+        # Recorded as an automatic push's failure would be, so the strip shows
+        # one state whichever way the push was started. Committed on its own:
+        # the 400 below rolls the request's session back.
+        with SessionFactory() as s:
+            autopush.record(s, project.id, user.id, autopush.scrub(str(exc), []))
+            s.commit()
         raise HTTPException(status_code=400, detail=str(exc))
+    # A success clears a failure an automatic push left behind.
+    autopush.record(session, project.id, user.id, None)
     return {"ok": True, "output": out}
 
 
@@ -3219,7 +3602,89 @@ def read_file(project_id: str, name: str, user: User = Depends(require_onboarded
 
 
 
-def _commit_landed_write(checkout: Path, message: str) -> dict:
+def _commit_as(
+    session: Session,
+    user: User,
+    project: Project,
+    checkout: Path,
+    message: str,
+    master_key: bytes | None,
+) -> str | None:
+    """Commit ``checkout`` as ``user``, then push it if the project says to.
+
+    The one way a route commits on a person's behalf. Identity is resolved
+    here — this member's for the project, else their account default — and a
+    dirty tree with neither raises the ProjectError that says where to set
+    one. A push follows only a commit that happened.
+    """
+    identity = gitidentity.resolve(session, user, project)
+    out = projects.commit_checkout(checkout, message, identity=identity)
+    if out is not None:
+        _schedule_autopush(session, user, project, checkout, master_key)
+    return out
+
+
+def _schedule_autopush(
+    session: Session, user: User, project: Project, checkout: Path, master_key: bytes | None
+) -> None:
+    """Push in the background after a commit, when the project's policy is auto.
+
+    Everything that needs the request — the destination, the credential row —
+    is resolved here, before the request's session closes; the push itself and
+    the record of how it went happen on the executor. The URL is resolved now
+    and handed to the push, which refuses it if origin has changed since, so a
+    credential leased for one host is never offered to another (see
+    Projects._destination). Whatever goes wrong is recorded on the member's row,
+    including the things that fail before any push is attempted.
+    """
+    if project.push_policy != "auto":
+        return
+    from . import gitstore
+
+    project_id, user_id, name = project.id, user.id, project.name
+
+    def record(error: str | None) -> None:
+        with SessionFactory() as s:
+            autopush.record(s, project_id, user_id, error)
+            s.commit()
+
+    try:
+        url = projects.remote_of(name, operation="push", checkout=checkout)
+        if not url:
+            raise ProjectError(
+                "pushing is automatic for this project, but it has no remote; "
+                "add one in Project settings → Git"
+            )
+        cred = autopush.snapshot(gitstore.for_remote(session, user, url))
+    except (ProjectError, gitstore.GitStoreError) as exc:
+        autopush.record(session, project_id, user_id, autopush.scrub(str(exc), []))
+        return
+
+    def job() -> None:
+        error = autopush.push_now(projects, name, checkout, url, cred, master_key)
+        if error:
+            logger.warning("automatic push of %s for user %s failed: %s", name, user_id, error)
+        try:
+            record(error)
+        except Exception:  # noqa: BLE001 — nowhere left to report it but the log
+            logger.exception("could not record the automatic push of %s", name)
+
+    AUTOPUSH.submit(job)
+
+
+#: Where automatic pushes run. A module attribute so the tests can swap in an
+#: executor that runs the job inline and assert on its outcome.
+AUTOPUSH = autopush.EXECUTOR
+
+
+def _commit_landed_write(
+    session: Session,
+    user: User,
+    project: Project,
+    checkout: Path,
+    message: str,
+    master_key: bytes | None = None,
+) -> dict:
     """Commit a write that has already landed, and say plainly if that failed.
 
     Four routes write a file and then commit it, and all four used to catch the
@@ -3228,10 +3693,12 @@ def _commit_landed_write(checkout: Path, message: str) -> dict:
     restore race, every accepted proposal, save and upload for two days went
     uncommitted with nothing anywhere saying so. Not fatal, still: the bytes
     are on disk and refusing the write that landed would be a lie. But the
-    failure travels back as a sentence, and into the log.
+    failure travels back as a sentence, and into the log. A missing commit
+    identity is one such failure, and its sentence says where to set one.
     """
     try:
-        return {"committed": projects.commit_checkout(checkout, message) is not None}
+        out = _commit_as(session, user, project, checkout, message, master_key)
+        return {"committed": out is not None}
     except ProjectError as exc:
         logger.warning("commit failed in %s (%s): %s", checkout, message, exc)
         return {
@@ -3241,7 +3708,8 @@ def _commit_landed_write(checkout: Path, message: str) -> dict:
 
 @app.put("/api/projects/{project_id}/files/{name:path}")
 def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(require_onboarded),
-    session: Session = Depends(session_scope)) -> dict:
+    session: Session = Depends(session_scope),
+    master_key: bytes | None = Depends(optional_master_key)) -> dict:
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
     target = _editable_file(session, user, project_id, name)
@@ -3267,7 +3735,10 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     # and refusing the save that landed would be a lie about what happened.
     # In the checkout the file was written to, which for a member is their own
     # worktree rather than the repository directory the name resolves to.
-    commit = _commit_landed_write(_project_dir(session, user, project_id), f"edit: {rel}")
+    commit = _commit_landed_write(
+        session, user, _project_or_404(session, user, project_id),
+        _project_dir(session, user, project_id), f"edit: {rel}", master_key,
+    )
     return {
         "ok": True,
         "name": name,
@@ -3383,7 +3854,10 @@ async def upload_files(
     # anyway produced "saved, but not committed" beside a list saying nothing
     # was uploaded.
     commit = (
-        _commit_landed_write(proj, f"upload: {len(landed)} file(s)")
+        _commit_landed_write(
+            session, user, _project_or_404(session, user, project_id), proj,
+            f"upload: {len(landed)} file(s)", master_key,
+        )
         if landed
         else {"committed": False}
     )
@@ -3435,7 +3909,10 @@ def set_llm_ignore(
     commit: dict = {"committed": False}
     if changed:
         verb = "ignore" if body.ignored else "unignore"
-        commit = _commit_landed_write(proj, f"llm-{verb}: {rel}")
+        commit = _commit_landed_write(
+            session, user, _project_or_404(session, user, project_id), proj,
+            f"llm-{verb}: {rel}", master_key,
+        )
     return {"path": rel, "ignored": body.ignored, "changed": changed, **commit}
 
 
@@ -3558,20 +4035,12 @@ def _refuse_while_running(session: Session, user: User, project: Project, then: 
         )
 
 
-def _commit_quietly(checkout: Path, message: str) -> bool:
-    # Reported, never fatal, for the reason write_file gives: the change is
-    # already on disk, and failing the request would misstate what happened.
-    try:
-        return projects.commit_checkout(checkout, message) is not None
-    except ProjectError:
-        return False
-
-
 @app.delete("/api/projects/{project_id}/files/{name:path}")
 def delete_path(
     project_id: str, name: str,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes | None = Depends(optional_master_key),
 ) -> dict:
     """Delete a file, or a folder and everything in it.
 
@@ -3614,9 +4083,13 @@ def delete_path(
     except OSError:
         ignore_list_updated = False
     activity.record(session, project, user, activity.DELETED, rel)
-    committed = _commit_quietly(checkout, f"delete: {rel}")
+    # Reported, never fatal, for the reason write_file gives: the change is
+    # already on disk, and failing the request would misstate what happened.
+    commit = _commit_landed_write(
+        session, user, project, checkout, f"delete: {rel}", master_key
+    )
     return {
-        "ok": True, "path": rel, "kind": kind, "committed": committed,
+        "ok": True, "path": rel, "kind": kind, **commit,
         "ignore_list_updated": ignore_list_updated,
     }
 
@@ -3633,6 +4106,7 @@ def move_path(
     project_id: str, body: MoveBody,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes | None = Depends(optional_master_key),
 ) -> dict:
     """Rename or move a file or folder within the project.
 
@@ -3715,9 +4189,11 @@ def move_path(
             # its new path; only a stale entry on the old name is left, said so.
             ignore_list_updated = False
     activity.record(session, project, user, activity.MOVED, f"{src_rel} → {dst_rel}")
-    committed = _commit_quietly(checkout, f"move: {src_rel} -> {dst_rel}")
+    commit = _commit_landed_write(
+        session, user, project, checkout, f"move: {src_rel} -> {dst_rel}", master_key
+    )
     return {
-        "ok": True, "from": src_rel, "to": dst_rel, "committed": committed,
+        "ok": True, "from": src_rel, "to": dst_rel, **commit,
         "ignore_list_updated": ignore_list_updated,
     }
 
@@ -4106,14 +4582,19 @@ class _Library:
     the answer to "what about an NDA datasheet".
     """
 
-    def __init__(self, user_id: int) -> None:
+    def __init__(self, user_id: int, identity: "gitidentity.GitIdentity | None") -> None:
         self._user_id = user_id
+        # Resolved once, when the turn starts, from the project the chat is in:
+        # the library is the user's, but the person filing a part into it from
+        # this project is who they are in this project. None means a filing
+        # attempt raises ComponentError, which the tool reports.
+        self._identity = identity
 
     def get(self, mpn: str) -> dict | None:
         return components.extraction(_DATA, self._user_id, mpn)
 
     def put(self, mpn: str, payload: dict) -> None:
-        components.save_extraction(_DATA, self._user_id, mpn, payload)
+        components.save_extraction(_DATA, self._user_id, mpn, payload, identity=self._identity)
 
     def find(self, mpn: str) -> list[dict]:
         """What this user already holds for a part, fuzzily. Same closure, same
@@ -4162,7 +4643,11 @@ async def add_component_document(
             detail=f"{file.filename} is larger than {attachments.MAX_DOCUMENT_BYTES // (1024*1024)} MB",
         )
     try:
-        return components.add_document(_DATA, user.id, mpn, file.filename or "document.pdf", data)
+        return components.add_document(
+            _DATA, user.id, mpn, file.filename or "document.pdf", data,
+            # The library belongs to no project, so the account default.
+            identity=gitidentity.account_default(user),
+        )
     except components.ComponentError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -4187,10 +4672,18 @@ def attach_component(
     project_id: str, body: ComponentDocBody,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes | None = Depends(optional_master_key),
 ) -> dict:
     proj = _project_dir(session, user, project_id)
+    project = _project_or_404(session, user, project_id)
     try:
-        return components.attach(proj, _DATA, user.id, body.mpn)
+        out = components.attach(
+            proj, _DATA, user.id, body.mpn,
+            identity=gitidentity.resolve(session, user, project),
+        )
+        if out.get("added"):
+            _schedule_autopush(session, user, project, proj, master_key)
+        return out
     except components.ComponentError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -4200,10 +4693,15 @@ def update_component(
     project_id: str, mpn: str,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes | None = Depends(optional_master_key),
 ) -> dict:
     proj = _project_dir(session, user, project_id)
+    project = _project_or_404(session, user, project_id)
     try:
-        return components.update(proj, mpn)
+        out = components.update(proj, mpn, identity=gitidentity.resolve(session, user, project))
+        if out.get("changed"):
+            _schedule_autopush(session, user, project, proj, master_key)
+        return out
     except components.ComponentError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -4213,10 +4711,13 @@ def detach_component(
     project_id: str, mpn: str,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
+    master_key: bytes | None = Depends(optional_master_key),
 ) -> dict:
     proj = _project_dir(session, user, project_id)
+    project = _project_or_404(session, user, project_id)
     try:
-        components.detach(proj, mpn)
+        components.detach(proj, mpn, identity=gitidentity.resolve(session, user, project))
+        _schedule_autopush(session, user, project, proj, master_key)
     except components.ComponentError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True}
@@ -4735,7 +5236,11 @@ async def start_chat_turn(
             },
         )
 
-    _chat_project = _project_or_404(session, user, project_id).id
+    _chat_project_row = _project_or_404(session, user, project_id)
+    _chat_project = _chat_project_row.id
+    # Resolved once per turn: who this user is in this project, for the
+    # commits a tool makes on their behalf (a library filing, a KiCad snapshot).
+    _chat_identity = gitidentity.resolve(session, user, _chat_project_row)
     chain = _chat_chain(session, user, master_key, project_row_id=_chat_project)
     endpoint = _chat_endpoint(session, user, master_key, _chat_project)
     if payload.endpoint:
@@ -4769,7 +5274,8 @@ async def start_chat_turn(
                 usage_ledger=_blpl_dir(session, user, project_id) / "llm_usage.jsonl",
                 creds=_cred_resolver(),
                 endpoints_for=lambda task: _task_endpoints(session, user, master_key, task),
-                library=_Library(user.id),
+                library=_Library(user.id, _chat_identity),
+                git_identity=_chat_identity,
                 record_tool_call=lambda rec: run_manager.record_tool_call(
                     project_id, rec, conversation=conv.path.name
                 ),
@@ -4978,7 +5484,8 @@ class ProposalDecision(BaseModel):
 @app.post("/api/projects/{project_id}/proposals/{proposal_id}")
 def decide_proposal(
     project_id: str, proposal_id: str, body: ProposalDecision, user: User = Depends(require_onboarded),
-    session: Session = Depends(session_scope)
+    session: Session = Depends(session_scope),
+    master_key: bytes | None = Depends(optional_master_key),
 ) -> dict:
     """Accept an edit (write it, then commit it) or reject it.
 
@@ -5033,7 +5540,10 @@ def decide_proposal(
     store.set_status(proposal, "accepted")
     # A project without working git history still gets its file. Losing the
     # commit is worth reporting, not worth refusing the edit that already landed.
-    commit = _commit_landed_write(proj, f"chat: {proposal.rationale or proposal.path}")
+    commit = _commit_landed_write(
+        session, user, _project_or_404(session, user, project_id), proj,
+        f"chat: {proposal.rationale or proposal.path}", master_key,
+    )
     return {"ok": True, "status": "accepted", "detail": detail, **commit}
 
 

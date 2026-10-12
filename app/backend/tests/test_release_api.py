@@ -8,14 +8,14 @@ separate trees.
 from __future__ import annotations
 
 from blpl.core import release
-from conftest import sign_in
+from conftest import sign_in, init_body
 
 
 def test_the_release_route_serves_the_package_even_when_it_was_refused(client) -> None:
     """A refused package carries a README saying so, which is more useful than a
     download that silently does not exist."""
     sign_in(client)
-    client.post("/api/projects/init", json={"name": "scratch"})
+    client.post("/api/projects/init", json=init_body("scratch"))
 
     assert client.get("/api/projects/scratch/release").json() == {"exists": False}
     assert client.get("/api/projects/scratch/release/latest.zip").status_code == 404

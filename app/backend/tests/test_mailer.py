@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import sign_in
+from conftest import sign_in, init_body
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -139,7 +139,7 @@ def test_a_dead_relay_does_not_undo_the_invitation(unlocked, second_user, smtp_e
 
     monkeypatch.setattr(mailer.smtplib, "SMTP", _Exploding)
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     r = unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
 
     assert r.status_code == 200
@@ -147,7 +147,7 @@ def test_a_dead_relay_does_not_undo_the_invitation(unlocked, second_user, smtp_e
 
 
 def test_an_invitation_names_the_project_and_who_sent_it(unlocked, second_user, smtp_env, fake_smtp):
-    unlocked.post("/api/projects/init", json={"name": "baseboard"})
+    unlocked.post("/api/projects/init", json=init_body("baseboard"))
     unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})  # wrong project
     unlocked.post("/api/projects/baseboard/members", json={"email": "other@example.com"})
 

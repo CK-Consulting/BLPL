@@ -155,11 +155,50 @@ def sign_in(client, clerk_id: str = "user_test", email: str = "test@example.com"
 
         grants.ensure_keypair(s, user, master)
         profile_mod.mark_complete(s, user)
+        # And a commit identity, which every server-side commit now needs and
+        # nothing invents. Set here because nearly every test commits as a
+        # side effect of a save; the tests about having none clear it.
+        user.git_name = f"Test {clerk_id}"
+        user.git_email = email
         s.commit()
     # The stub verifier returns no claims, so there is no sid and the session key
     # is deterministic — see unlock.session_key_for.
     main.unlocked.put(unlock_mod.session_key_for(clerk_id, {}), master)
     return client
+
+
+def bare_remote() -> str:
+    """A fresh, empty bare repository to use as a project's remote.
+
+    Creating a project needs an empty remote it can reach. Local paths are
+    allowed only because the suite turns on the file transport (see
+    BLPL_GIT_ALLOWED_PROTOCOLS above); a deployment refuses them.
+    """
+    import subprocess
+
+    root = _SESSION_DATA / "remotes"
+    root.mkdir(parents=True, exist_ok=True)
+    d = Path(tempfile.mkdtemp(prefix="remote-", suffix=".git", dir=root))
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(d)], check=True)
+    return str(d)
+
+
+def init_body(name: str, **extra) -> dict:
+    """The body POST /api/projects/init needs for a project named ``name``.
+
+    A name used to be enough. Creating a project now also takes an empty
+    remote, a push policy chosen on purpose and the creator's commit identity,
+    so this supplies all three — manual pushing, so a test that does not care
+    about pushes sees none — and lets a test override any of them.
+    """
+    return {
+        "name": name,
+        "remote": bare_remote(),
+        "push_policy": "manual",
+        "git_name": "Test Creator",
+        "git_email": "creator@example.com",
+        **extra,
+    }
 
 
 def give_endpoint(
