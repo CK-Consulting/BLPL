@@ -1,4 +1,4 @@
-"""One user's git credentials: stored sealed, matched by host and port, lent to a subprocess.
+"""One user's git credentials: stored sealed, matched by host, port and method, lent to a subprocess.
 
 The keystore's sibling, with the same shape for the same reasons — every
 function takes a user, the secret is sealed under that user's master key, and
@@ -103,6 +103,7 @@ _DEFAULT_PORTS = {
 }
 #: What a row's port defaults to, by the method it is stored under.
 _METHOD_PORTS = {"https_token": 443, "ssh_key": 22}
+_METHOD_WORDS = {"https_token": "HTTPS token", "ssh_key": "SSH key"}
 
 #: A credential scope: (host, port). Lowercase, IPv6 unbracketed, and the port
 #: None when it is the default for the scheme or method in play.
@@ -134,6 +135,29 @@ def scope_of(remote: str) -> Scope | None:
     if port == _DEFAULT_PORTS.get(parts.scheme.lower()):
         port = None
     return (_unbracket(host), port)
+
+
+def method_for(remote: str) -> str | None:
+    """Which kind of credential a remote can use: ``https_token`` for an
+    http(s) URL, ``ssh_key`` for ssh:// and git's user@host:path, else None.
+
+    Part of what a credential is matched on, with the host and port. Matched
+    on host and port alone, an SSH key and an HTTPS token for the same host
+    normalised to the same scope (each protocol's default port is dropped),
+    so adding a token for https://github.com/... found the github.com SSH
+    row, and saving the token there replaced the key — breaking every SSH
+    remote that used it (Codex, PR #19). A token is no use to ssh and a key
+    is no use to HTTPS, so a remote only ever matches its own kind.
+    """
+    raw = (remote or "").strip()
+    if "://" in raw:
+        scheme = raw.split("://", 1)[0].lower()
+        if scheme in ("https", "http"):
+            return "https_token"
+        if scheme in ("ssh", "git+ssh", "ssh+git"):
+            return "ssh_key"
+        return None
+    return "ssh_key" if host_of(raw) is not None else None
 
 
 def put(
@@ -204,14 +228,16 @@ def put(
     # push under the wrong account is the failure that looks like success.
     # Refused with the other row's name so the fix is obvious; the database
     # constraint backs this up for any path that skips the check.
+    # Per access method: an SSH key and an HTTPS token for one host are two
+    # different credentials for two different kinds of remote (see method_for).
     other = next(
-        (r for r in _rows_for_scope(session, user, scope) if r.name != name), None
+        (r for r in _rows_for_scope(session, user, scope, method) if r.name != name), None
     )
     if other is not None:
         raise GitStoreError(
-            f"{other.name!r} already holds the credential for {host} — credentials are "
-            "matched by host and port, so a second one would be chosen at random. Update "
-            f"or remove {other.name!r} instead."
+            f"{other.name!r} already holds the {_METHOD_WORDS[method]} for {host} — "
+            "credentials are matched by host, port and access method, so a second one "
+            f"would be chosen at random. Update or remove {other.name!r} instead."
         )
 
     nonce, ciphertext = vault.encrypt_secret(master_key, _aad(name), secret)
@@ -260,19 +286,22 @@ def transient(master_key: bytes, *, host: str, secret: str, username: str | None
 
 
 def name_for(session: Session, user: User, remote: str) -> str:
-    """The name to save a new credential for ``remote``'s host under.
+    """The name to save a new credential for ``remote`` under.
 
-    The row that already matches the host when there is one — saving then
-    rotates its token, which is what entering a new token for a host means,
-    since there can only be one per host. Otherwise the host itself, made into
-    a valid name, with a suffix only if some other host's row already has it:
-    ``put`` under an existing name *moves* that row to the new host, and
+    The row that already matches the remote — host, port and access method —
+    when there is one: saving then rotates its secret, which is what entering
+    a new token for a host means, since there is one per host and method. An
+    SSH key for the same host is a different row and is never chosen here:
+    saving a token under its name replaced the key (Codex, PR #19). Otherwise
+    the host itself, made into a valid name, with a suffix if any other row
+    already has it: ``put`` under an existing name *moves* that row, and
     silently repointing someone's other credential is not what they asked for.
     """
     scope = scope_of(remote)
-    if scope is None:
+    method = method_for(remote)
+    if scope is None or method is None:
         raise GitStoreError("this remote names no host to save a credential for")
-    match = _rows_for_scope(session, user, scope)
+    match = _rows_for_scope(session, user, scope, method)
     if match:
         return match[0].name
     base = re.sub(r"[^a-z0-9._-]+", "-", _format_scope(scope).lower()).strip("-._")[:56] or "git"
@@ -303,7 +332,7 @@ def list_endpoints(session: Session, user: User) -> list[dict]:
             "conflicts_with": [
                 o.name for o in rows
                 if o is not r and _row_scope(o) is not None
-                and _row_scope(o) == _row_scope(r)
+                and _row_scope(o) == _row_scope(r) and o.method == r.method
             ],
         }
         for r in rows
@@ -328,9 +357,12 @@ def for_remote(session: Session, user: User, remote: str) -> GitEndpoint | None:
     case that used to be the only one that worked.
     """
     scope = scope_of(remote)
-    if scope is None:
+    method = method_for(remote)
+    if scope is None or method is None:
         return None
-    rows = _rows_for_scope(session, user, scope)
+    # Only a credential of the remote's own kind: an SSH key offered to an
+    # HTTPS push (or a token to ssh) authenticates nothing.
+    rows = _rows_for_scope(session, user, scope, method)
     if len(rows) > 1:
         # put refuses a second row for an authority, but a database from before
         # hosts were normalised can hold `[2001:db8::1]` and `2001:db8::1` (or
@@ -347,7 +379,9 @@ def for_remote(session: Session, user: User, remote: str) -> GitEndpoint | None:
     return rows[0] if rows else None
 
 
-def _rows_for_scope(session: Session, user: User, scope: Scope) -> list[GitEndpoint]:
+def _rows_for_scope(
+    session: Session, user: User, scope: Scope, method: str | None = None
+) -> list[GitEndpoint]:
     """This user's rows for ``scope``, each row's host normalised on read.
 
     ``put`` now stores normalised authorities, but rows written before it did
@@ -360,7 +394,10 @@ def _rows_for_scope(session: Session, user: User, scope: Scope) -> list[GitEndpo
     rows = session.scalars(
         select(GitEndpoint).where(GitEndpoint.user_id == user.id).order_by(GitEndpoint.name)
     )
-    return [r for r in rows if _row_scope(r) == scope]
+    return [
+        r for r in rows
+        if _row_scope(r) == scope and (method is None or r.method == method)
+    ]
 
 
 def _row_scope(row: GitEndpoint) -> Scope | None:

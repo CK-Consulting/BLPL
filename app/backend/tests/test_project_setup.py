@@ -565,3 +565,65 @@ def test_the_commit_route_says_when_an_automatic_push_is_on_its_way(unlocked, pu
     (main.PROJECTS_ROOT / "m" / "x.md").write_text("x\n")
     r = unlocked.post("/api/projects/m/git/commit", json={"message": "m"}).json()
     assert r["committed"] is True and r["auto_push"] is False
+
+
+# -- an SSH key and an HTTPS token for one host are two credentials ----------
+
+
+def _ssh_key_for_github(client):
+    r = client.put("/api/settings/git/github-ssh", json={
+        "host": "github.com", "method": "ssh_key", "secret": "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n",
+    })
+    assert r.status_code == 200, r.text
+
+
+def _methods(client):
+    return sorted((e["name"], e["host"], e["method"]) for e in client.get("/api/settings/git").json()["endpoints"])
+
+
+def test_a_new_https_token_does_not_replace_the_ssh_key_for_the_same_host(unlocked, monkeypatch):
+    # Codex P1 on #19: both normalise to (github.com, default port), so the
+    # token was saved under the SSH row's name, overwriting the key.
+    import app.main as main
+    from app.projects import RemoteProbe
+
+    _ssh_key_for_github(unlocked)
+    monkeypatch.setattr(main.projects, "probe_remote",
+                        lambda url, env=None, branch="main": RemoteProbe("ok", True, ""))
+    r = unlocked.post("/api/projects/init", json=init_body(
+        "p", remote="https://github.com/o/board.git", token=TOKEN, token_username="git"))
+    assert r.status_code == 200, r.text
+    methods = _methods(unlocked)
+    assert ("github-ssh", "github.com", "ssh_key") in methods
+    assert [m for m in methods if m[2] == "https_token"] and len(methods) == 2
+
+    # Rotating the token from project settings touches the token row only.
+    unlocked.put("/api/projects/p/git/credential", json={"token": TOKEN + "-2"})
+    assert _methods(unlocked) == methods
+
+
+def test_each_remote_resolves_to_the_credential_of_its_own_kind(unlocked):
+    _ssh_key_for_github(unlocked)
+    unlocked.put("/api/settings/git/github-https", json={
+        "host": "github.com", "method": "https_token", "secret": TOKEN, "username": "git",
+    })
+    ask = lambda url: unlocked.post("/api/projects/credential-for", json={"url": url}).json()["credential"]
+    assert ask("https://github.com/o/p.git") == "github-https"
+    assert ask("git@github.com:o/p.git") == "github-ssh"
+    assert ask("ssh://git@github.com/o/p.git") == "github-ssh"
+
+
+def test_an_ssh_key_alone_is_not_offered_to_an_https_remote(unlocked):
+    # A key cannot authenticate an HTTPS push; matching it there made the
+    # dialog skip the token the push actually needed.
+    _ssh_key_for_github(unlocked)
+    got = unlocked.post("/api/projects/credential-for", json={"url": "https://github.com/o/p.git"}).json()
+    assert got["credential"] is None
+
+
+def test_a_second_credential_of_the_same_kind_is_still_refused(unlocked):
+    _ssh_key_for_github(unlocked)
+    r = unlocked.put("/api/settings/git/another-ssh", json={
+        "host": "github.com", "method": "ssh_key", "secret": "key",
+    })
+    assert r.status_code == 400 and "already holds the SSH key" in r.json()["detail"]

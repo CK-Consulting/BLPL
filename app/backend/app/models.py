@@ -213,7 +213,9 @@ class GitEndpoint(Base):
     __tablename__ = "git_endpoint"
     __table_args__ = (
         UniqueConstraint("user_id", "name", name="uq_git_endpoint_user_name"),
-        UniqueConstraint("user_id", "host", name="uq_git_endpoint_user_host"),
+        # Host and access method: an SSH key and an HTTPS token for one host
+        # are different credentials for different remotes (gitstore.method_for).
+        UniqueConstraint("user_id", "host", "method", name="uq_git_endpoint_user_host_method"),
         Index("ix_git_endpoint_user", "user_id"),
     )
 
