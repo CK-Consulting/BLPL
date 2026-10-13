@@ -60,7 +60,8 @@ class Refused(Exception):
     """The request is outside policy. The message says which part."""
 
 
-ROLE_NAME_PREFIX = {"workspace": "blpl-ws-", "desktop": "blpl-desk-", "run": "blpl-run-"}
+ROLE_NAME_PREFIX = {"workspace": "blpl-ws-", "desktop": "blpl-desk-", "run": "blpl-run-",
+                    "sealer": "blpl-seal-"}
 MIN_API_MINOR = 44
 
 
@@ -86,7 +87,9 @@ class ProxyPolicy:
     agent_dir_roots: tuple[str, ...] = ()
     # "run" (phase 4) is a container per pipeline run, confined exactly as a
     # workspace is, with the project's .git read-only.
-    roles: frozenset[str] = frozenset({"workspace", "run"})
+    # "sealer" (phase 4) seals or unseals one project and exits; it alone may
+    # mount the projects root, because sealing renames the project directory.
+    roles: frozenset[str] = frozenset({"workspace", "run", "sealer"})
     volume_prefix: str = "blpl-ws-"
     max_memory: int = 16 * GiB
     max_nano_cpus: int = 8_000_000_000
@@ -339,8 +342,11 @@ def _agent_dirs(policy: ProxyPolicy, container: str) -> set[str]:
     return {f"{r.rstrip('/')}/{container}" for r in policy.agent_dir_roots if r.rstrip("/")}
 
 
+SEALER_TARGET = "/projects"
+
+
 def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
-            container: str = "") -> Any:
+            container: str = "", role: str = "") -> Any:
     if not isinstance(v, list):
         raise Refused(f"{where} must be a list")
     out, targets = [], set()
@@ -374,6 +380,9 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
                 if not (_under_root(got["Source"], policy.ro_bind_roots)
                         or got["Source"] in git_dirs):
                     raise Refused(f"{w}.Source {got['Source']} is not a permitted library root")
+            elif role == "sealer" and got["Target"] == SEALER_TARGET and got["Source"] in {
+                    r.rstrip("/") for r in policy.project_bind_roots if r.rstrip("/")}:
+                pass  # the projects root, for a sealer and nothing else
             elif got["Source"] in _agent_dirs(policy, container):
                 if got["Target"] != AGENT_DIR:
                     raise Refused(f"{w}: an agent directory is mounted at {AGENT_DIR} only")
@@ -444,7 +453,8 @@ def check_create(policy: ProxyPolicy, query: Mapping[str, str], obj: Any) -> Cre
         "MemorySwap": _int_range(1, policy.max_memory),
         "NanoCpus": _int_range(1, policy.max_nano_cpus),
         "PidsLimit": _int_range(1, policy.max_pids),
-        "Mounts": lambda v, w: _mounts(policy, v, w, labels[LABEL_PROJECT], name),
+        "Mounts": lambda v, w: _mounts(policy, v, w, labels[LABEL_PROJECT], name,
+                                       labels[LABEL_ROLE]),
         # Empty means the daemon's default runtime, decided below.
         "Runtime": lambda v, w: _DROP if v in ("", None) else _one_of(policy.runtimes)(v, w),
         "RestartPolicy": lambda v, w: _pick(v, {"Name": _one_of({"no", ""})}, w),

@@ -457,8 +457,8 @@ class DockerDriver:
         on_output: OutputSink | None = None,
         stop_grace_s: int = 10,
     ) -> ExecResult:
-        if spec.key.role != "run":
-            raise ValueError("run_container takes a run key")
+        if spec.key.role not in ("run", "sealer"):
+            raise ValueError("run_container takes a run or sealer key")
         if not argv:
             raise ValueError("nothing to run")
         body = build_create_body(replace(spec, command=tuple(argv)), self.cfg)

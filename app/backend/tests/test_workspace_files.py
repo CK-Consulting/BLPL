@@ -344,3 +344,21 @@ def test_the_migrated_routes_need_no_project_mount(client, monkeypatch, via_agen
         _WATCH["root"] = None
     assert seen == [], f"the backend touched the project mount: {seen[:10]}"
     assert via_agent.served > len(calls)
+
+
+def test_sealing_goes_to_the_sealer_not_the_mount(client, monkeypatch):
+    """With the agent path on, a seal (the route, the idle sweep, the last
+    member leaving) runs in a sealer container; the backend's own
+    workspace.seal is not called."""
+    import app.main as main
+    import app.workspace_files as wf
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    calls = []
+    monkeypatch.setattr(wf, "seal", lambda project, key: calls.append((project, len(key))) or 7)
+    monkeypatch.setattr(main.workspace, "seal",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("mount seal")))
+    r = client.post("/api/projects/scratch/seal")
+    assert r.status_code == 200 and r.json()["sealed"] is True
+    assert calls == [("scratch", 32)]

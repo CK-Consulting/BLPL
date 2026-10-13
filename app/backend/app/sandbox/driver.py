@@ -35,8 +35,9 @@ LABEL_MEMBER = "blpl.member"
 # next stopped rather than silently kept forever.
 LABEL_SPEC = "blpl.spec"
 
-Role = Literal["workspace", "desktop", "run"]
-_PREFIX = {"workspace": "blpl-ws-", "desktop": "blpl-desk-", "run": "blpl-run-"}
+Role = Literal["workspace", "desktop", "run", "sealer"]
+_PREFIX = {"workspace": "blpl-ws-", "desktop": "blpl-desk-", "run": "blpl-run-",
+           "sealer": "blpl-seal-"}
 
 # Where a workspace sees its agent directory (socket, start token).
 AGENT_DIR = "/run/blpl"
