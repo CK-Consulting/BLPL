@@ -239,3 +239,6 @@ class AgentClient:
 
     def run_mark(self, rid: str, active: bool, ttl: float = 60.0) -> None:
         self.call("/runs/mark", {"id": rid, "active": active, "ttl": ttl})
+
+    def git_set_remote(self, checkout: str, url: str) -> str:
+        return self.call("/git/set_remote", {"checkout": checkout, "url": url})["url"]

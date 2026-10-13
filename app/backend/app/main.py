@@ -2935,10 +2935,15 @@ def set_git_remote(
         raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
     except projectacl.NotTheOwner:
         raise HTTPException(status_code=403, detail="only the owner can set this project's remote")
-    checkout = _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id,
+                            agent_ready=workspace_files.enabled())
     try:
-        projects.set_remote(checkout, body.url)
-        st = projects.status(project_id, checkout=checkout)
+        if workspace_files.enabled():
+            workspace_files.set_remote(checkout, body.url)
+            st = workspace_files.git_status(checkout)
+        else:
+            projects.set_remote(checkout, body.url)
+            st = projects.status(project_id, checkout=checkout)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "remote_name": st.remote_name, "remote_url": st.remote_url}
