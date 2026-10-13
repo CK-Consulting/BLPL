@@ -1,0 +1,33 @@
+# The backend without the project mount (phase 4, docs/architecture-v2.md,
+# "Running the backend without the project mount").
+#
+# Used on top of docker-compose.yml, never alone. In app/.env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.mountless.yml
+#   COMPOSE_PROFILES=workspaces
+#   BLPL_RUNS_IN_WORKSPACE=1
+#   BLPL_FILES_VIA_WORKSPACE=1
+#
+# or name both files with -f on every docker compose command.
+#
+# The backend still needs the rest of ./data (server.key, blpl.toml, runs.db
+# and run logs, components, modules, agents, ssh), so ./data stays bound and
+# data/projects is covered by an empty, read-only tmpfs. Everything under it
+# goes: the owner's checkouts, .worktrees and .sealed. Compose merges mounts by
+# target, and Docker mounts the deeper target last, so the tmpfs sits over the
+# bind. Nothing in the backend can lift it: it runs as BLPL_UID, with no
+# capability to unmount.
+#
+# The worker keeps its full mount: it still creates worktree directories and
+# checks bind sources on the disk before it asks for a workspace.
+services:
+  backend:
+    environment:
+      - BLPL_PROJECT_MOUNT=absent
+    volumes:
+      - type: tmpfs
+        target: /app/data/projects
+        read_only: true
+        tmpfs:
+          size: 1m
+          mode: 0555
