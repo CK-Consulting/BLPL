@@ -21,8 +21,9 @@ requires-python = ">=3.9"  # KiCad's bundled interpreter, not ours
 dependencies = []
 
 [project.optional-dependencies]
-# pyyaml: the ActionPlugin reads an HDM YAML when one is picked in the GUI, and
-# the tests build their fixtures with it. build_pcb itself reads JSON.
+# pyyaml is optional everywhere: both entry points read HDM JSON with the
+# standard library and read YAML only when pyyaml is importable (hdm_io). The
+# tests build their fixtures with it.
 yaml = ["pyyaml>=6.0"]
 dev = ["pytest>=7.4", "pyyaml>=6.0"]
 

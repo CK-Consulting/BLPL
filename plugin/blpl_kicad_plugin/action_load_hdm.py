@@ -1,9 +1,10 @@
-"""KiCad ActionPlugin — adds a Tools-menu entry that builds a PCB from HDM YAML.
+"""KiCad ActionPlugin — adds a Tools-menu entry that builds a PCB from an HDM file.
 
 Inside KiCad's PCB editor:
     Tools → External Plugins → Load HDM …
 
-Opens a file picker for the HDM YAML, then calls the same ``hdm_to_pcb``
+Opens a file picker for the HDM (JSON, or YAML when pyyaml is available — see
+hdm_io), then calls the same ``hdm_to_pcb``
 translation the CLI uses. Populates the currently-open board with the
 HDM's footprints/nets/outline. If you already have routing on the board,
 the plugin appends — it does not wipe the board.
@@ -21,7 +22,7 @@ class LoadHDMPlugin(pcbnew.ActionPlugin):
         self.name = "Load HDM → PCB"
         self.category = "HDM Pipeline"
         self.description = (
-            "Populate this PCB from an HDM YAML: place footprints, assign nets, "
+            "Populate this PCB from an HDM file: place footprints, assign nets, "
             "draw Edge.Cuts outline. Non-destructive — adds to the existing board."
         )
         self.show_toolbar_button = False
@@ -32,8 +33,13 @@ class LoadHDMPlugin(pcbnew.ActionPlugin):
         # Prompt for the HDM file.
         dlg = wx.FileDialog(
             None,
-            "Choose an HDM YAML",
-            wildcard="HDM YAML (*.yaml;*.yml)|*.yaml;*.yml|All files|*",
+            "Choose an HDM file",
+            # JSON first: it is what KiCad's own Python can always read.
+            wildcard=(
+                "HDM JSON (*.json)|*.json"
+                "|HDM YAML (*.yaml;*.yml)|*.yaml;*.yml"
+                "|All files|*"
+            ),
             style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
         )
         try:
@@ -43,13 +49,17 @@ class LoadHDMPlugin(pcbnew.ActionPlugin):
         finally:
             dlg.Destroy()
 
-        # Lazy imports so the plugin still registers if these are unavailable.
-        import yaml  # type: ignore[import-not-found]
-
         from . import hdm_to_pcb
+        from .hdm_io import HdmLoadError, load_hdm
 
-        with open(hdm_path) as f:
-            hdm = yaml.safe_load(f) or {}
+        try:
+            hdm = load_hdm(hdm_path)
+        except HdmLoadError as exc:
+            # A message box, not a traceback in KiCad's scripting console: on a
+            # stock KiCad this is the YAML-without-pyyaml case, and the fix is
+            # to pick the JSON instead.
+            wx.MessageBox(str(exc), self.name, wx.OK | wx.ICON_ERROR)
+            return
 
         # Use the currently-open board rather than creating a new one — user
         # expects the plugin to overlay HDM onto their working canvas.
