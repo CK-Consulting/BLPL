@@ -439,7 +439,10 @@ def attach(
 
         raise ComponentError(NO_IDENTITY)
     _git(project_dir, "submodule", "add", "--", str(src.resolve()), rel, allow_file=True)
-    _commit(project_dir, identity, "-m", f"Reference component {name}")
+    # Only what this attach changed. A bare commit took the whole index, so the
+    # next attach after anything had been staged (the KiCad bridge's snapshot
+    # stages the entire tree) committed all of it as "Reference component …".
+    _commit(project_dir, identity, "-m", f"Reference component {name}", "--", ".gitmodules", rel)
     return {"mpn": name, "path": rel, "commit": head(src), "added": True}
 
 
@@ -456,10 +459,31 @@ def detach(project_dir: Path, mpn: str, *, identity: GitIdentity | None) -> None
         raise ComponentError(NO_IDENTITY)
     _git(project_dir, "submodule", "deinit", "-f", "--", rel)
     _git(project_dir, "rm", "-f", "--", rel)
-    # deinit leaves the object store behind, which would make re-attaching a
-    # different part at the same path fail with a stale gitdir.
-    shutil.rmtree(project_dir / ".git" / "modules" / MOUNT / name, ignore_errors=True)
-    _commit(project_dir, identity, "-m", f"Stop referencing component {name}")
+    _drop_module_store(project_dir, rel)
+    _commit(project_dir, identity, "-m", f"Stop referencing component {name}",
+            "--", ".gitmodules", rel)
+
+
+def _drop_module_store(project_dir: Path, rel: str) -> bool:
+    """Remove a detached submodule's object store, the one this checkout owns.
+
+    deinit leaves the store behind, which makes re-attaching a part at the same
+    path fail with a stale gitdir, so it has to go. git keeps it under the
+    checkout's own git directory: ``<repo>/.git/modules/<rel>`` for the owner's
+    checkout, ``<repo>/.git/worktrees/<name>/modules/<rel>`` for a member's
+    worktree. This used to remove ``<checkout>/.git/modules/…``. In a member's
+    worktree ``.git`` is a file, so that path did not exist, nothing was
+    removed, and ``ignore_errors`` hid it. The store leaked and a re-attach
+    there failed. The plan believed the owner's store was shared with members.
+    Measured with git 2.47 and 2.55, it is not: each worktree initialises its own, so
+    removing this checkout's store touches no one else's.
+    """
+    git_dir = Path(_git(project_dir, "rev-parse", "--absolute-git-dir").strip())
+    store = git_dir / "modules" / rel
+    if not store.exists():
+        return False
+    shutil.rmtree(store)
+    return True
 
 
 def update(project_dir: Path, mpn: str, *, identity: GitIdentity | None) -> dict:
@@ -488,7 +512,7 @@ def update(project_dir: Path, mpn: str, *, identity: GitIdentity | None) -> dict
     if before == after:
         return {"mpn": name, "changed": False, "commit": after[:7]}
     _git(project_dir, "add", "--", rel)
-    _commit(project_dir, identity, "-m", f"Update component {name} to {after[:7]}")
+    _commit(project_dir, identity, "-m", f"Update component {name} to {after[:7]}", "--", rel)
     return {"mpn": name, "changed": True, "from": before[:7], "commit": after[:7]}
 
 
