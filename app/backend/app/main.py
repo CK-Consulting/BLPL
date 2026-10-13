@@ -77,6 +77,7 @@ from . import (
     chat as chat_mod,
     clerk_auth,
     components,
+    egress,
     gitidentity,
     grants,
     importer,
@@ -693,6 +694,7 @@ def complete_onboarding(
     # later becomes a second endpoint with its own name and its own key, which
     # is what the registry is for.
     endpoint_name = body.provider
+    _check_egress([egress.Target(endpoint_name, info.kind, body.base_url.strip() or info.base_url)])
     cfg = llmconfig.load(session, user)
     cfg.endpoints[endpoint_name] = appconfig.Endpoint(
         name=endpoint_name,
@@ -1366,6 +1368,7 @@ def put_llm_settings(
     cfg = llmconfig.load(session, user)
 
     if body.endpoints is not None:
+        _check_egress([egress.Target(e.name, e.kind, e.base_url or "") for e in body.endpoints])
         cfg.endpoints = {
             e.name: appconfig.Endpoint(
                 name=e.name,
@@ -1404,6 +1407,20 @@ def put_llm_settings(
 
 class SecretBody(BaseModel):
     value: str
+
+
+def _check_egress(targets: list) -> None:
+    """Refuse an LLM endpoint a run in a workspace could not reach (egress.py)."""
+    try:
+        egress.check(targets)
+    except egress.EgressRefused as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/settings/egress")
+def get_egress(user: User = Depends(require_onboarded)) -> dict:
+    """The hosts a run may reach, so the settings screen can say so up front."""
+    return {"enforced": egress.enforced(), "allowlist": egress.allowlist()}
 
 
 @app.put("/api/settings/secrets/{provider}")
@@ -6970,6 +6987,10 @@ def _start_run(
     landing on the process that cannot see the run.
     """
     project = _project_or_404(session, user, project_id)
+    # Again here, not only at save: an endpoint saved before the operator
+    # removed its host, or routed in by a project override, would otherwise
+    # fail inside the run at its first request.
+    _check_egress(egress.targets_in_run_env(env))
     key = serverkey.load(_DATA)
     if key is None:
         raise HTTPException(status_code=503, detail="no server key; cannot dispatch runs")

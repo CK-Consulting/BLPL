@@ -28,7 +28,11 @@ data="$here/data"
 # missing here is one Docker would create as root on first start.
 # data/agents holds each workspace's agent socket and start token (phase 3 of
 # docs/architecture-v2.md); a workspace binds its own subdirectory of it.
-bind_sources=("$data" "$data/ssh" "$data/kicad-desktop" "$data/projects" "$data/modules" "$data/agents")
+# data/sealed holds sealed projects' blobs, beside the projects rather than in
+# them, so a backend without the project mount still sees them. data/egress
+# holds the operator's additions to the egress allowlist, which Squid reads.
+bind_sources=("$data" "$data/ssh" "$data/kicad-desktop" "$data/projects" "$data/modules" "$data/agents"
+              "$data/sealed" "$data/egress")
 
 if [[ -f "$here/.env" ]]; then
     uid="$(sed -n 's/^BLPL_UID=//p' "$here/.env" | tail -1)"
@@ -58,6 +62,15 @@ if [[ "$(id -u)" != "0" ]] && { [[ "$(id -u)" != "$uid" ]] || [[ ! -w "$here" ]]
 fi
 
 $as_root mkdir -p "${bind_sources[@]}"
+# Squid refuses to start on a missing acl file, so the operator's list exists
+# from the start, empty but for how to use it.
+if [[ ! -e "$data/egress/allowlist.txt" ]]; then
+    printf '%s\n' \
+        "# Hosts this deployment adds to the egress allowlist, one per line;" \
+        "# a leading dot covers subdomains. After editing:" \
+        "#   docker compose exec squid squid -k reconfigure" \
+        | $as_root tee "$data/egress/allowlist.txt" >/dev/null
+fi
 if [[ -n "$(find "$data" \( ! -uid "$uid" -o ! -gid "$gid" \) -print -quit)" ]]; then
     $as_root chown -R "$uid:$gid" "$data" 2>/dev/null || sudo chown -R "$uid:$gid" "$data"
 fi
