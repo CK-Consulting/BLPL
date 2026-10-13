@@ -1,0 +1,3 @@
+# Written beside the package by __init__ when KiCad fails to register the
+# ActionPlugin. Local evidence of a failed load, never part of the plugin.
+blpl_kicad_plugin/hdm_plugin_error.log
