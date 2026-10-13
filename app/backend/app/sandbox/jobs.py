@@ -163,9 +163,9 @@ def workspace_env(env: Mapping[str, str]) -> dict[str, str]:
     The proxy, the scanner and the remote policy. Without the scanner and its
     requirement an upload accepted by the agent was scanned by nothing and,
     with nothing requiring a scan, released (Codex, PR #20). NO_PROXY always
-    names the scanner and the model server, whatever the operator listed:
-    clamd does not speak HTTP, and an SDK that honours HTTPS_PROXY would send
-    a local model's traffic to squid, which refuses it.
+    names the scanner, the model server and the fetch service, whatever the
+    operator listed: clamd does not speak HTTP, and an SDK that honours
+    HTTPS_PROXY would send a local model's traffic to squid, which refuses it.
     """
     from .runpath import scan_policy
 
@@ -176,7 +176,10 @@ def workspace_env(env: Mapping[str, str]) -> dict[str, str]:
         hosts = [h for h in re.split(r"[\s,]+", env.get("BLPL_SANDBOX_NO_PROXY",
                                                            "localhost,127.0.0.1")) if h]
         for extra in (_host_of(env.get("BLPL_CLAMD_HOST", "")),
-                      _host_of(env.get("OLLAMA_HOST", ""))):
+                      _host_of(env.get("OLLAMA_HOST", "")),
+                      # The control plane's fetch service (fetchsvc.py), on
+                      # the workspaces' own network.
+                      _host_of(env.get("BLPL_FETCH_SERVICE_URL", ""))):
             if extra and extra not in hosts:
                 hosts.append(extra)
         no_proxy = ",".join(hosts)

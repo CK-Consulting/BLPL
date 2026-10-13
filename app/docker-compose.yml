@@ -232,7 +232,7 @@ services:
       - BLPL_SANDBOX_HOST_SEALED=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/sealed}
       - BLPL_SANDBOX_LIBRARIES=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols:/app/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints:/app/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D:/usr/share/kicad/3dmodels ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source:/usr/share/kicad/3dmodels-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates:/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules:/app/data/modules}
       - BLPL_SANDBOX_HTTP_PROXY=http://squid:3128
-      - BLPL_SANDBOX_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4}
+      - BLPL_SANDBOX_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4} blpl-fetch:${BLPL_EGRESS_FETCH_IP:-172.31.250.5}
       - BLPL_SANDBOX_NO_PROXY=ollama,clamav,localhost,127.0.0.1
     volumes:
       # Server key, config, and your git-backed designs. Users and their sealed
@@ -354,7 +354,11 @@ services:
     user: "${BLPL_UID}:${BLPL_GID}"
     restart: unless-stopped
     networks:
-      - blpl
+      blpl: {}
+      # For the fetch service only: workspaces have no other way to ask for a
+      # document, and nothing else listens on this address.
+      blpl-egress:
+        ipv4_address: ${BLPL_EGRESS_FETCH_IP:-172.31.250.5}
     depends_on:
       db:
         condition: service_healthy
@@ -420,7 +424,7 @@ services:
       # workspace image carries its own copy.
       - BLPL_SANDBOX_LIBRARIES=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols:/app/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints:/app/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D:/usr/share/kicad/3dmodels ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source:/usr/share/kicad/3dmodels-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates:/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules:/app/data/modules}
       - BLPL_SANDBOX_HTTP_PROXY=http://squid:3128
-      - BLPL_SANDBOX_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4}
+      - BLPL_SANDBOX_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4} blpl-fetch:${BLPL_EGRESS_FETCH_IP:-172.31.250.5}
       # Reached directly on blpl-egress, not through squid. Neither holds a
       # secret, and clamd does not speak HTTP.
       - BLPL_SANDBOX_NO_PROXY=ollama,clamav,localhost,127.0.0.1
@@ -439,6 +443,11 @@ services:
       # `storage` profile). Needs quotas enabled first: docs/architecture-v2.md.
       - BLPL_STORAGE=${BLPL_STORAGE:-}
       - BLPL_STORAGE_SOCKET=/run/blpl-storage/storage.sock
+      # Documents for runs in workspaces, fetched here (app/fetchsvc.py), on
+      # this container's address on blpl-egress only. Runs reach it as
+      # blpl-fetch, with their own egress credential.
+      - BLPL_FETCH_LISTEN=${BLPL_EGRESS_FETCH_IP:-172.31.250.5}:8001
+      - BLPL_FETCH_SERVICE_URL=http://blpl-fetch:8001
     volumes:
       # The storage helper's socket (phase 4); empty without the profile.
       - blpl-storage-helper:/run/blpl-storage
@@ -758,7 +767,7 @@ services:
       - BLPL_PROXY_NETWORKS=blpl-egress
       # The /etc/hosts entries a workspace may carry: exactly the worker's.
       - BLPL_PROXY_VERIFY_PATHS=1
-      - BLPL_PROXY_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4}
+      - BLPL_PROXY_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4} blpl-fetch:${BLPL_EGRESS_FETCH_IP:-172.31.250.5}
       # Where runsc (gVisor) is installed, set both to make it mandatory:
       # BLPL_SANDBOX_RUNTIME=runsc and BLPL_PROXY_REQUIRE_RUNTIME=1.
       - BLPL_PROXY_RUNTIMES=${BLPL_SANDBOX_RUNTIME:-}
