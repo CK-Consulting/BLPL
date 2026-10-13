@@ -522,6 +522,12 @@ class ProjectMember(Base):
     )
     last_push_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
     last_push_error: Mapped[str | None] = mapped_column(String(2000), nullable=True, default=None)
+    #: How many automatic pushes have been asked for, and the highest of those
+    #: the recorded last push answers for. The client is handed the number of
+    #: the push its save started and waits until last_push_seq reaches it —
+    #: a completion signal for a push that runs after the response has gone.
+    push_requested: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_push_seq: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
     project: Mapped[Project] = relationship(back_populates="members")
     user: Mapped[User] = relationship(back_populates="memberships")

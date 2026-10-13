@@ -452,7 +452,7 @@ export type GitStatus = {
   push_policy?: "auto" | "manual" | null;
   /** This member's last push, automatic or by hand. A failure stays here
    *  until a later push succeeds. Null when they have never pushed. */
-  last_push?: { at: string; ok: boolean; error: string } | null;
+  last_push?: { at: string; ok: boolean; error: string; seq?: number } | null;
   /** False when a commit by this user would be refused for want of a commit
    *  identity — neither one for this project nor an account default. */
   has_identity?: boolean;

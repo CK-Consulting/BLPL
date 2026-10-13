@@ -3104,7 +3104,10 @@ def git_commit(project_id: str, body: CommitBody, user: User = Depends(require_o
     # client's Commit + Push must not push it again. A second push of the same
     # commit could block the dialog behind the lock, and a transient failure of
     # it would overwrite the automatic push's success (Codex, PR #19).
-    return {"ok": True, "committed": out is not None, "auto_push": scheduled}
+    return {
+        "ok": True, "committed": out is not None,
+        "auto_push": scheduled is not None, "push_seq": scheduled,
+    }
 
 
 @app.get("/api/projects/{project_id}/git/diff")
@@ -3925,18 +3928,20 @@ def _commit_and_push(
 ) -> tuple[str | None, bool]:
     """``_commit_as``, also saying whether an automatic push was scheduled —
     so a caller that would otherwise push itself (Commit + Push) does not
-    push the same commit a second time."""
+    push the same commit a second time. What it returns for that is the
+    push's number (None when none was scheduled), which the client waits for
+    in the member's push status."""
     identity = gitidentity.resolve(session, user, project)
     out = projects.commit_checkout(checkout, message, identity=identity)
-    scheduled = False
+    seq = None
     if out is not None:
-        scheduled = _schedule_autopush(session, user, project, checkout, master_key)
-    return out, scheduled
+        seq = _schedule_autopush(session, user, project, checkout, master_key)
+    return out, seq
 
 
 def _schedule_autopush(
     session: Session, user: User, project: Project, checkout: Path, master_key: bytes | None
-) -> bool:
+) -> int | None:
     """Push in the background after a commit, when the project's policy is auto.
 
     Everything that needs the request — the destination, the credential row —
@@ -3948,13 +3953,17 @@ def _schedule_autopush(
     including the things that fail before any push is attempted.
     """
     if project.push_policy != "auto":
-        return False
+        return None
     from . import gitstore
 
     project_id, user_id, name = project.id, user.id, project.name
 
+    # Numbered now, in the request's transaction, so the response can hand
+    # the number to the client, which waits for the result recorded with it.
+    seq = autopush.request(session, project_id, user_id)
+
     def record(error: str | None) -> None:
-        autopush.record_now(project_id, user_id, error)
+        autopush.record_now(project_id, user_id, error, seq=seq)
 
     try:
         url = projects.remote_of(name, operation="push", checkout=checkout)
@@ -3965,8 +3974,8 @@ def _schedule_autopush(
             )
         cred = autopush.snapshot(gitstore.for_remote(session, user, url))
     except (ProjectError, gitstore.GitStoreError) as exc:
-        autopush.record(session, project_id, user_id, autopush.scrub(str(exc), []))
-        return False
+        autopush.record(session, project_id, user_id, autopush.scrub(str(exc), []), seq=seq)
+        return seq
 
     def job() -> None:
         # The outcome is recorded inside push_now, under the origin lock, so
@@ -3992,7 +4001,7 @@ def _schedule_autopush(
 
     sa_event.listen(session, "after_commit", submit, once=True)
     sa_event.listen(session, "after_rollback", submit, once=True)
-    return True
+    return seq
 
 
 #: Where automatic pushes run. A module attribute so the tests can swap in an
@@ -4020,8 +4029,10 @@ def _commit_landed_write(
     identity is one such failure, and its sentence says where to set one.
     """
     try:
-        out = _commit_as(session, user, project, checkout, message, master_key)
-        return {"committed": out is not None}
+        out, seq = _commit_and_push(session, user, project, checkout, message, master_key)
+        # push_seq: an automatic push of this write is on its way; the client
+        # watches the member's push status until that push is recorded.
+        return {"committed": out is not None, **({"push_seq": seq} if seq is not None else {})}
     except ProjectError as exc:
         logger.warning("commit failed in %s (%s): %s", checkout, message, exc)
         return {

@@ -149,19 +149,46 @@ def push_now(
     return error
 
 
-def record_now(project_id: int, user_id: int, error: str | None) -> None:
+def record_now(
+    project_id: int, user_id: int, error: str | None, *, seq: int | None = None
+) -> None:
     """``record`` in a session of its own, committed at once — for a write
     made under the origin lock, which must be durable before the lock goes."""
     from .db import SessionFactory
 
     with SessionFactory() as s:
-        record(s, project_id, user_id, error)
+        record(s, project_id, user_id, error, seq=seq)
         s.commit()
 
 
-def record(session: Session, project_id: int, user_id: int, error: str | None) -> None:
+def request(session: Session, project_id: int, user_id: int) -> int | None:
+    """Number the automatic push about to be scheduled for this member, and
+    return it — what the client waits for (see ProjectMember.push_requested)."""
+    m = session.scalar(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
+        )
+    )
+    if m is None:
+        return None
+    m.push_requested = (m.push_requested or 0) + 1
+    session.flush()
+    return m.push_requested
+
+
+def record(
+    session: Session, project_id: int, user_id: int, error: str | None,
+    *, seq: int | None = None,
+) -> None:
     """Store the outcome of one push of this member's checkout. A success
-    clears whatever failure was there before."""
+    clears whatever failure was there before.
+
+    ``seq`` is the number of the automatic push this outcome is for; a push
+    started any other way (by hand, or one that failed before it was numbered)
+    pushes everything committed so far, so it answers for every push asked
+    for until now. last_push_seq only moves forward: every push sends the
+    branch as it stands, so whichever is recorded last speaks for all the
+    commits before it."""
     m = session.scalar(
         select(ProjectMember).where(
             ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
@@ -173,6 +200,8 @@ def record(session: Session, project_id: int, user_id: int, error: str | None) -
     m.last_push_at = datetime.now(timezone.utc)
     m.last_push_ok = error is None
     m.last_push_error = error
+    answered = seq if seq is not None else (m.push_requested or 0)
+    m.last_push_seq = max(m.last_push_seq or 0, answered)
     session.flush()
 
 
@@ -183,4 +212,5 @@ def last_push(m: ProjectMember | None) -> dict | None:
         "at": m.last_push_at.isoformat(),
         "ok": bool(m.last_push_ok),
         "error": m.last_push_error or "",
+        "seq": m.last_push_seq or 0,
     }

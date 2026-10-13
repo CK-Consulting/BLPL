@@ -20,3 +20,28 @@ export function onCommitted(projectId: string, handler: () => void): () => void 
   window.addEventListener(EVENT, listener);
   return () => window.removeEventListener(EVENT, listener);
 }
+
+/**
+ * "An automatic push of this project was just started, and is numbered
+ * `seq`", for the git strip, which waits for its result.
+ *
+ * The push runs on the server after the save's response has gone, so the
+ * strip's next status read still showed the previous push: a failed automatic
+ * push stayed invisible until a reload (Codex, PR #19). A save that started
+ * one announces its number here; the strip polls the member's push status
+ * until the recorded result answers for that number.
+ */
+const PUSH_EVENT = "blpl:push-pending";
+
+export function announcePushPending(projectId: string, seq: number): void {
+  window.dispatchEvent(new CustomEvent(PUSH_EVENT, { detail: { projectId, seq } }));
+}
+
+export function onPushPending(projectId: string, handler: (seq: number) => void): () => void {
+  const listener = (e: Event) => {
+    const d = (e as CustomEvent<{ projectId: string; seq: number }>).detail;
+    if (d?.projectId === projectId && typeof d.seq === "number") handler(d.seq);
+  };
+  window.addEventListener(PUSH_EVENT, listener);
+  return () => window.removeEventListener(PUSH_EVENT, listener);
+}

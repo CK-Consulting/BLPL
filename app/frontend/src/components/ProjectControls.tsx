@@ -13,6 +13,7 @@ import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./Library
 import { ProjectIcon } from "./Icons";
 import { BoardConfigPanel } from "./BoardConfigPanel";
 import { Modal, PromptDialog } from "./Dialog";
+import { onPushPending } from "../commitEvents";
 import {
   Identity,
   IdentityFields,
@@ -28,6 +29,12 @@ import { ProjectRoutingPanel } from "./ProjectRoutingPanel";
 // buttons that keep it in sync with the remote you roam through — pull, commit,
 // push. This is the mechanism behind "sit at another workstation and pick up
 // where you left off": the board and markdown live in git on the server.
+
+/** How the strip polls for an automatic push's result: soon, then backing
+ *  off, and giving up (with a pointer to the git panel) after two minutes. */
+const PUSH_POLL_FIRST_MS = 1000;
+const PUSH_POLL_MAX_MS = 10_000;
+const PUSH_WAIT_LIMIT_MS = 120_000;
 
 export function ProjectSync({
   projectId,
@@ -62,6 +69,60 @@ export function ProjectSync({
     refresh();
   }, [projectId, reloadToken]);
 
+  // Waiting for an automatic push to land. The push runs on the server after
+  // the response that started it, so the status read right after a save shows
+  // the push before; this polls, with backoff, until the member's last_push
+  // answers for the push's number, then says how it went (Codex, PR #19).
+  // Bounded: after two minutes it stops and says where to look.
+  const waiting = useRef<{ seq: number; timer: ReturnType<typeof setTimeout> | null } | null>(null);
+  const stopWaiting = () => {
+    if (waiting.current?.timer) clearTimeout(waiting.current.timer);
+    waiting.current = null;
+  };
+  const waitForPush = (target: string, seq: number) => {
+    // A later push answers for an earlier one too, so only the newest is watched.
+    if (waiting.current && waiting.current.seq >= seq) return;
+    stopWaiting();
+    const started = Date.now();
+    let delay = PUSH_POLL_FIRST_MS;
+    const state = { seq, timer: null as ReturnType<typeof setTimeout> | null };
+    waiting.current = state;
+    setNote("pushing automatically…");
+    const tick = async () => {
+      if (waiting.current !== state || currentRef.current !== target) return;
+      let now: GitStatus | null = null;
+      try {
+        now = await getJSON<GitStatus>(`/api/projects/${target}/git/status`);
+      } catch {
+        now = null;
+      }
+      if (waiting.current !== state || currentRef.current !== target) return;
+      if (now) setSt(now);
+      const landed = now?.last_push && (now.last_push.seq ?? 0) >= seq ? now.last_push : null;
+      if (landed) {
+        waiting.current = null;
+        setNote(landed.ok ? "pushed" : `push failed: ${landed.error || "see the git panel"}`);
+        onChanged();
+        return;
+      }
+      if (Date.now() - started >= PUSH_WAIT_LIMIT_MS) {
+        waiting.current = null;
+        setNote("push still running — check the git panel");
+        return;
+      }
+      delay = Math.min(delay * 2, PUSH_POLL_MAX_MS);
+      state.timer = setTimeout(tick, delay);
+    };
+    state.timer = setTimeout(tick, delay);
+  };
+  useEffect(() => {
+    const off = onPushPending(projectId, (seq) => waitForPush(projectId, seq));
+    return () => {
+      off();
+      stopWaiting();
+    };
+  }, [projectId]);
+
   if (!st) return null;
 
   const act = async (fn: () => Promise<unknown>, label: string) => {
@@ -84,7 +145,7 @@ export function ProjectSync({
   const commitAndPush = async (target: string, message: string) => {
     if (currentRef.current !== target) throw new Error("The project changed; nothing was committed.");
     setNote(null);
-    const res = await postJSON<{ committed?: boolean; auto_push?: boolean }>(
+    const res = await postJSON<{ committed?: boolean; auto_push?: boolean; push_seq?: number | null }>(
       `/api/projects/${target}/git/commit`,
       { message },
     );
@@ -92,11 +153,12 @@ export function ProjectSync({
       // The project pushes after every commit and this one is already on its
       // way. Pushing it again here was a second push of the same commit: it
       // could hold the dialog behind the first, and a transient failure of it
-      // overwrote the first one's success (Codex, PR #19). The strip's push
-      // status reports how the automatic push went.
-      setNote("committed; pushing automatically");
+      // overwrote the first one's success (Codex, PR #19). The strip waits for
+      // the automatic push and reports how it went.
       await refresh();
       onChanged();
+      if (typeof res.push_seq === "number") waitForPush(target, res.push_seq);
+      else setNote("committed; pushing automatically");
       return;
     }
     // Asked fresh, not read from `st`: the status this render captured can

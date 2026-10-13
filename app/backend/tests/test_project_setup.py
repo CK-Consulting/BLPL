@@ -493,11 +493,11 @@ def test_overlapping_pushes_record_in_the_order_they_ran(unlocked, pushes, monke
     first_recording = threading.Event()
     release = threading.Event()
 
-    def record(session, project_id, user_id, error):
+    def record(session, project_id, user_id, error, **kw):
         if error is None and not first_recording.is_set():
             first_recording.set()
             release.wait(10)
-        return real_record(session, project_id, user_id, error)
+        return real_record(session, project_id, user_id, error, **kw)
 
     monkeypatch.setattr(autopush_mod, "record", record)
 
@@ -627,3 +627,37 @@ def test_a_second_credential_of_the_same_kind_is_still_refused(unlocked):
         "host": "github.com", "method": "ssh_key", "secret": "key",
     })
     assert r.status_code == 400 and "already holds the SSH key" in r.json()["detail"]
+
+
+def test_a_save_hands_back_the_number_of_its_push_and_status_reports_when_it_lands(
+    unlocked, pushes
+):
+    # Codex P1 on #19: the push runs after the response, and nothing told the
+    # client when it had finished. The save now returns the push's number, and
+    # last_push carries the number its result answers for.
+    import shutil
+
+    remote = bare_remote()
+    unlocked.post("/api/projects/init", json=init_body("p", remote=remote, push_policy="auto"))
+    first = unlocked.put("/api/projects/p/files/a.md", json={"content": "a\n"}).json()
+    assert first["committed"] is True and isinstance(first["push_seq"], int)
+    before = unlocked.get("/api/projects/p/git/status").json()["last_push"]
+    assert before["seq"] < first["push_seq"], "not landed yet: the client keeps waiting"
+    pushes.run()
+    landed = unlocked.get("/api/projects/p/git/status").json()["last_push"]
+    assert landed["seq"] >= first["push_seq"] and landed["ok"] is True
+
+    shutil.rmtree(remote)
+    seq = unlocked.put("/api/projects/p/files/c.md", json={"content": "c\n"}).json()["push_seq"]
+    assert seq > first["push_seq"]
+    pushes.run()
+    st = unlocked.get("/api/projects/p/git/status").json()["last_push"]
+    assert st["seq"] >= seq and st["ok"] is False
+
+
+def test_a_manual_project_hands_back_no_push_number(unlocked):
+    unlocked.post("/api/projects/init", json=init_body("m", remote=bare_remote()))
+    out = unlocked.put("/api/projects/m/files/a.md", json={"content": "a\n"}).json()
+    assert out["committed"] is True and "push_seq" not in out
+    r = unlocked.post("/api/projects/m/git/commit", json={"message": "x"}).json()
+    assert r["push_seq"] is None
