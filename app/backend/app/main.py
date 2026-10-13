@@ -1813,6 +1813,9 @@ def clone_project(
         identity = gitidentity.validate(body.git_name, body.git_email)
     except gitidentity.IdentityError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # And the rest of the request, before git clone puts anything on disk.
+    _refuse_bad_name(body.name)
+    _validate_library_policy(body)
     warning = ""
     try:
         with _git_credentials(session, master_key, user, body.remote) as env:
@@ -2044,6 +2047,34 @@ def new_project_defaults(
     }
 
 
+def _validate_library_policy(decl) -> dict:
+    """The library declaration's values, or the 400 that says what is wrong.
+
+    Separate from _record_policy so the creation routes can ask it first,
+    before anything leaves this server: called only at the end, an invalid
+    value was refused after a clone, an init, or a project's first push had
+    already happened, and the rollback could undo the database but not those
+    (Codex, PR #19).
+    """
+    from . import library_policy
+
+    try:
+        return library_policy.validate(decl.contribute, decl.consume, decl.unique_components)
+    except library_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _refuse_bad_name(name: str) -> None:
+    """A name that cannot be a project directory, or one already on disk,
+    refused before any side effect rather than by init or clone after one."""
+    try:
+        taken = projects.exists(name)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if taken:
+        raise HTTPException(status_code=409, detail=f"the name {name!r} is already taken")
+
+
 def _record_policy(session: Session, project, decl, *, actor_id: int) -> None:
     """Write a project's library declaration, at creation or on change.
 
@@ -2058,13 +2089,7 @@ def _record_policy(session: Session, project, decl, *, actor_id: int) -> None:
     """
     from . import library_policy
 
-    try:
-        values = library_policy.validate(
-            decl.contribute, decl.consume, decl.unique_components
-        )
-    except library_policy.PolicyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
+    values = _validate_library_policy(decl)
     row = session.scalar(
         select(ProjectPolicy).where(ProjectPolicy.project_id == project.id)
     ) or ProjectPolicy(project_id=project.id)
@@ -2118,6 +2143,10 @@ def init_project(
         identity = gitidentity.validate(body.git_name, body.git_email)
     except gitidentity.IdentityError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Everything that can be checked here is checked before the remote is
+    # even asked, let alone pushed to (Codex, PR #19).
+    _refuse_bad_name(body.name)
+    _validate_library_policy(body)
 
     try:
         probe, _, secret, cred_row = _remote_probe(
@@ -2202,21 +2231,42 @@ def init_project(
                 f"created: {autopush.scrub(str(exc), [secret or ''])}",
             )
 
-    project = projectacl.create(session, user, body.name, remote=remote)
-    project.push_policy = policy
-    gitidentity.set_for_project(session, user, project, identity)
-    if body.save_as_default:
-        gitidentity.set_account_default(session, user, identity)
-    _note_workspace_open(
-        session, project.name, PROJECTS_ROOT / project.name,
-        grants.create_project_key(session, project, user, master_key),
-        user.id,
-    )
-    _record_policy(session, project, body, actor_id=user.id)
-    activity.record(session, project, user, activity.IMPORTED, "created empty")
-    if policy == "auto":
-        # Pushed above; recorded now that the member row exists.
-        autopush.record(session, project.id, user.id, None)
+    # Past here a failure is not expected — everything that can be validated
+    # has been — but if one happens after the first push, the local directory
+    # is still removed, and the error says the branch was already published:
+    # deleting someone's remote branch behind their back is not this route's
+    # call, so it is reported for them to decide.
+    try:
+        project = projectacl.create(session, user, body.name, remote=remote)
+        project.push_policy = policy
+        gitidentity.set_for_project(session, user, project, identity)
+        if body.save_as_default:
+            gitidentity.set_account_default(session, user, identity)
+        _note_workspace_open(
+            session, project.name, PROJECTS_ROOT / project.name,
+            grants.create_project_key(session, project, user, master_key),
+            user.id,
+        )
+        _record_policy(session, project, body, actor_id=user.id)
+        activity.record(session, project, user, activity.IMPORTED, "created empty")
+        if policy == "auto":
+            # Pushed above; recorded now that the member row exists.
+            autopush.record(session, project.id, user.id, None)
+    except Exception as exc:  # noqa: BLE001 — cleaned up, then reported
+        shutil.rmtree(dest, ignore_errors=True)
+        if policy != "auto":
+            raise
+        reason = exc.detail if isinstance(exc, HTTPException) else "an internal error"
+        logger.exception("creating %s failed after its first push", body.name)
+        raise HTTPException(
+            status_code=getattr(exc, "status_code", 500),
+            detail=(
+                f"the project could not be created ({reason}), but its first commit had "
+                f"already been pushed to branch main of {autopush.scrub(remote, [])}. That "
+                "branch has been left as it is: delete it there before trying again, or "
+                "bring the repository in with Clone git remote."
+            ),
+        ) from exc
     return {"ok": True, "id": body.name, "warning": warning}
 
 
@@ -2731,6 +2781,12 @@ async def import_project(
             + ("; ".join(f"{s.name} ({s.reason})" for s in skipped) or "no files"),
         )
 
+    # The declaration, checked before the import's commit is made.
+    declaration = PolicyFields(
+        contribute=contribute, consume=consume,
+        unique_components=unique_components, consented=consented,
+    )
+    _validate_library_policy(declaration)
     # The account's identity: there is no project yet to hold one of its own,
     # and the import is a commit, so without one the import is refused before
     # anything is written (init_local says where to set it).

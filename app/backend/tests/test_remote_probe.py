@@ -383,3 +383,54 @@ def test_a_non_empty_remote_is_refused_even_when_the_credential_cannot_write(unl
     body = unlocked.post("/api/projects/check-remote", json={"url": url}).json()
     assert body["empty"] is False and body["writable"] is False
     assert "already has commits" in body["message"]
+
+
+def test_an_invalid_library_policy_is_refused_before_the_first_push(unlocked, http_remote):
+    # Codex P2 on #19: the declaration was validated after the real first
+    # push, so the 400 rolled back the database and left the published branch.
+    import app.main as main
+
+    url, repo = http_remote
+    subprocess.run(["git", "config", "http.receivepack", "true"], cwd=repo, check=True)
+    r = unlocked.post(
+        "/api/projects/init", json=init_body("p", remote=url, push_policy="auto", contribute="yes")
+    )
+    assert r.status_code == 400
+    assert subprocess.run(["git", "for-each-ref"], cwd=repo, capture_output=True, text=True).stdout == ""
+    assert not (main.PROJECTS_ROOT / "p").exists()
+
+
+def test_an_invalid_library_policy_is_refused_before_a_clone(unlocked, tmp_path):
+    import app.main as main
+    from conftest import clone_body
+
+    remote = bare_remote()
+    _seed(remote)
+    r = unlocked.post("/api/projects/clone", json=clone_body("c", remote, consume="whatever"))
+    assert r.status_code == 400
+    assert not (main.PROJECTS_ROOT / "c").exists()
+
+
+def test_a_failure_after_the_first_push_cleans_up_and_says_the_branch_is_published(
+    unlocked, http_remote, monkeypatch
+):
+    # Defence in depth: nothing should fail after the first push now, but if
+    # something does, the directory goes and the user is told the branch was
+    # published (and left alone) rather than finding out later.
+    import app.main as main
+
+    url, repo = http_remote
+    subprocess.run(["git", "config", "http.receivepack", "true"], cwd=repo, check=True)
+
+    def boom(*a, **kw):
+        raise RuntimeError("key store unavailable")
+
+    monkeypatch.setattr(main.grants, "create_project_key", boom)
+    r = unlocked.post("/api/projects/init", json=init_body("p", remote=url, push_policy="auto"))
+    assert r.status_code == 500
+    detail = r.json()["detail"]
+    assert "already been pushed to branch main" in detail and "left as it is" in detail
+    assert not (main.PROJECTS_ROOT / "p").exists()
+    refs = subprocess.run(["git", "for-each-ref", "--format=%(refname)"], cwd=repo,
+                          capture_output=True, text=True).stdout.split()
+    assert refs == ["refs/heads/main"]
