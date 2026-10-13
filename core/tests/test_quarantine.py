@@ -959,6 +959,24 @@ def test_requiring_a_scan_holds_what_nothing_checked(tmp_path, monkeypatch):
     assert any("no scanner" in r for r in rec.reasons)
 
 
+def test_a_caller_can_insist_on_a_scan_this_environment_does_not_require(tmp_path, monkeypatch):
+    """The agent in a workspace keeps the environment it started with; the
+    control plane, whose policy it is, says so with each upload. Insisting
+    only ever holds more: it cannot switch the environment's setting off."""
+    _no_scanner(monkeypatch)
+    monkeypatch.setenv("BLPL_QUARANTINE_REQUIRE_SCAN", "0")
+    rec = quarantine.accept_upload(b"notes\n", tmp_path, original_name="n.txt", kind="reference",
+                                   uploaded_by="", insist_on_scan=True)
+    assert rec.state == quarantine.HELD
+    assert any("no scanner" in r for r in rec.reasons)
+    assert not (tmp_path / "references").exists()
+
+    monkeypatch.setenv("BLPL_QUARANTINE_REQUIRE_SCAN", "1")
+    rec = quarantine.accept_upload(b"other\n", tmp_path, original_name="o.txt", kind="reference",
+                                   uploaded_by="", insist_on_scan=False)
+    assert rec.state == quarantine.HELD
+
+
 def test_the_ledger_records_every_retrieval_whatever_the_outcome(tmp_path, monkeypatch):
     """So that 'no entry' means 'never fetched' rather than 'fetched and fine'."""
     _no_scanner(monkeypatch)

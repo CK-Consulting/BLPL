@@ -362,13 +362,21 @@ def require_scan() -> bool:
     )
 
 
-def _decide(inspection: pdf_inspect.Inspection, scan: av.ScanResult) -> list[str]:
-    """Why this file may not be released. Empty means it may."""
+def _decide(
+    inspection: pdf_inspect.Inspection, scan: av.ScanResult, *, require: bool = False
+) -> list[str]:
+    """Why this file may not be released. Empty means it may.
+
+    ``require`` adds to the environment's setting and never relaxes it: a
+    caller that knows a scan is required where this process's environment
+    does not say so (an agent in a workspace started before the policy was
+    forwarded to it) can insist, and nothing can switch the setting off.
+    """
     reasons: list[str] = []
 
     if scan.state == "infected":
         reasons.append(f"a malware scanner matched {scan.signature or 'a signature'}")
-    if scan.state in ("unscanned", "error") and require_scan():
+    if scan.state in ("unscanned", "error") and (require or require_scan()):
         reasons.append(
             f"no scanner has checked this file ({scan.detail or scan.state}), and "
             "this deployment requires a scan before release"
@@ -452,8 +460,12 @@ def accept(
     original_name: str = "",
     kind: str = "datasheet",
     llm_ignore: bool = False,
+    insist_on_scan: bool = False,
 ) -> Record:
     """Take delivery of a retrieved file: store, inspect, scan, decide.
+
+    ``insist_on_scan`` holds an unscanned file even where
+    ``BLPL_QUARANTINE_REQUIRE_SCAN`` is not set here; see ``_decide``.
 
     Returns the record with its verdict. The bytes are written into
     ``retrieved/`` before anything else happens, so a file that crashes the
@@ -493,7 +505,7 @@ def accept(
             reason=f"no inspector for {suffix} files",
         )
     scan = av.scan_bytes(data)
-    reasons = _decide(inspection, scan)
+    reasons = _decide(inspection, scan, require=insist_on_scan)
 
     rec = Record(
         sha256=digest,
@@ -585,6 +597,7 @@ def accept_upload(
     mpn: str = "",
     llm_ignore: bool = False,
     library: str = "",
+    insist_on_scan: bool = False,
 ) -> Record:
     """The whole path for a file a member uploads, in the order it has to happen.
 
@@ -616,6 +629,7 @@ def accept_upload(
         original_name=original_name,
         kind=kind,
         llm_ignore=llm_ignore,
+        insist_on_scan=insist_on_scan,
     )
     if rec.reasons:
         return rec
