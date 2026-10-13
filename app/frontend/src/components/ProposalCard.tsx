@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Proposal, encodePath, getJSON, postJSON } from "../api";
+import { announcePushFrom } from "../commitEvents";
 
 /**
  * One proposed file edit, as a diff you accept or reject.
@@ -124,6 +125,7 @@ export function ProposalCard({ projectId, proposal, onDecided }: Props) {
         { action },
       );
       setStatus(action === "accept" ? "accepted" : "rejected");
+      announcePushFrom(projectId, out);
       // Accepted and on disk, but git refused it. Not shown on this card: a
       // decided card is unmounted at once, which is how the first version of
       // this warning was never seen. The panel shows it instead.

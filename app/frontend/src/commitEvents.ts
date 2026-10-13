@@ -45,3 +45,17 @@ export function onPushPending(projectId: string, handler: (seq: number) => void)
   window.addEventListener(PUSH_EVENT, listener);
   return () => window.removeEventListener(PUSH_EVENT, listener);
 }
+
+/**
+ * Announce the automatic push a write's response says it started, if any.
+ *
+ * Every route that commits on the user's behalf answers with `push_seq` when
+ * an automatic push followed — a save, an upload, a move or rename, a
+ * delete, a new file, an accepted proposal. Each call site hands its response
+ * here, so the strip waits for every push a user's action triggers rather
+ * than only the editor's.
+ */
+export function announcePushFrom(projectId: string, response: unknown): void {
+  const seq = (response as { push_seq?: unknown } | null | undefined)?.push_seq;
+  if (typeof seq === "number") announcePushPending(projectId, seq);
+}

@@ -1,8 +1,9 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { announcePushPending, onPushPending } from "../commitEvents";
+import { announcePushFrom, announcePushPending, onPushPending } from "../commitEvents";
+import { FileTree } from "./FileTree";
 import { FileView } from "./FileView";
 import { ProjectSync } from "./ProjectControls";
 
@@ -151,5 +152,61 @@ describe("the editor's save", () => {
     await user.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(heard).toEqual([7]));
     off();
+  });
+});
+
+describe("every action that commits", () => {
+  it("has the strip wait for the push a delete started", async () => {
+    // Only the editor's save announced its push, so a delete (or upload,
+    // move, new file, accepted proposal) on an automatic project left the
+    // strip showing the push before it.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let lastPush: Record<string, unknown> = { at: "2026-10-12T00:00:00Z", ok: true, error: "", seq: 4 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        if (url.endsWith("/tree")) {
+          return json({ nodes: [{ path: "overview.md", name: "overview.md", dir: false, role: "design", bytes: 1 }] });
+        }
+        if (url.endsWith("/git/status")) {
+          return json({
+            branch: "main", ahead: 0, behind: 0, dirty: false, has_remote: true,
+            remote_name: "origin", remote_url: "https://a/x.git", unpublished: false,
+            has_identity: true, push_policy: "auto", last_push: lastPush,
+          });
+        }
+        if (method === "DELETE") {
+          return json({ ok: true, path: "overview.md", kind: "file", committed: true, push_seq: 5 });
+        }
+        return json({});
+      }),
+    );
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(
+      <>
+        <ProjectSync projectId="p" onChanged={() => {}} />
+        <FileTree projectId="p" reloadToken={0} onOpen={() => {}} />
+      </>,
+    );
+    await screen.findByText("overview.md");
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("overview.md") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Delete file" })).getByRole("button", { name: "Delete" }));
+
+    expect(await screen.findByText("pushing automatically…")).toBeInTheDocument();
+    lastPush = { at: "2026-10-12T00:01:00Z", ok: false, error: "rejected", seq: 5 };
+    await act(() => vi.advanceTimersByTimeAsync(1500));
+    expect(await screen.findByText("push failed: rejected")).toBeInTheDocument();
+  });
+
+  it("announces nothing for a response that started no push", () => {
+    const heard: number[] = [];
+    const off = onPushPending("p", (seq) => heard.push(seq));
+    announcePushFrom("p", { committed: true });
+    announcePushFrom("p", null);
+    announcePushFrom("p", { push_seq: 9 });
+    off();
+    expect(heard).toEqual([9]);
   });
 });

@@ -1,6 +1,6 @@
 import { type MutableRefObject, type ReactNode, useEffect, useRef, useState } from "react";
 import { encodePath, getJSON, putJSON } from "../api";
-import { announceCommitted, announcePushPending } from "../commitEvents";
+import { announceCommitted, announcePushFrom } from "../commitEvents";
 import { Code, langOf } from "./Code";
 import { UnsavedChangesDialog } from "./Dialog";
 import { Diagram, isDiagramFile } from "./Diagram";
@@ -296,7 +296,7 @@ export function FileView({
       if (out?.committed) announceCommitted(projectId);
       // And on a project that pushes by itself, a push of it is now running;
       // the git strip waits for its result.
-      if (typeof out?.push_seq === "number") announcePushPending(projectId, out.push_seq);
+      announcePushFrom(projectId, out);
       onSaved();
       // Codex, PR #17: the completion used to land on whatever the pane showed
       // by then. After a rename or a switch that is another path, whose

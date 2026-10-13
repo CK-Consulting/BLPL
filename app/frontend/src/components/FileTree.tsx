@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState } from 
 import { type NodeApi, type NodeRendererProps, Tree, type TreeApi } from "react-arborist";
 import { delJSON, encodePath, getJSON, postJSON, putJSON } from "../api";
 import { ConfirmDialog, PromptDialog } from "./Dialog";
+import { announcePushFrom } from "../commitEvents";
 import { isSavable } from "./FileView";
 import { UploadDialog } from "./UploadDialog";
 
@@ -426,6 +427,8 @@ export function FileTree({
         `/api/projects/${project}/files/move`,
         { path: from, to },
       );
+      // For the project the move was made in, whatever the tree shows now.
+      announcePushFrom(project, r);
       if (!stillOn(project)) return;
       // The backend's spelling, not ours: `dir//b.md` lands as `dir/b.md`,
       // and an open file followed to the spelling we sent would point at a
@@ -644,6 +647,7 @@ export function FileTree({
               `/api/projects/${live.project}/files/${encodePath(name)}`,
               { content: "" },
             );
+            announcePushFrom(live.project, r);
             if (!stillOn(live.project)) return;
             changed();
             // The backend's spelling, as with a move: `dir//a.md` is written as
@@ -701,6 +705,7 @@ export function FileTree({
             const r = await delJSON<{ committed?: boolean; ignore_list_updated?: boolean }>(
               `/api/projects/${live.project}/files/${encodePath(path)}`,
             );
+            announcePushFrom(live.project, r);
             if (!stillOn(live.project)) return;
             onDeleted?.(path);
             changed();
