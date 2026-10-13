@@ -89,6 +89,47 @@ class AgentError(Exception):
         self.status, self.kind = status, kind
 
 
+# How long a connection may take to send its request. A body that trickles
+# in, or never ends, holds one thread for this long and no longer.
+REQUEST_TIMEOUT_S = 60.0
+
+
+def read_body(handler: BaseHTTPRequestHandler, cap: int, *, required: bool) -> bytes:
+    """A request body, exactly as long as its Content-Length says, or refused.
+
+    ``int(header)`` accepted ``-1``, and ``rfile.read(-1)`` reads until the
+    peer closes: one request could buffer without limit (Codex, PR #20). So
+    the length must be digits, within the cap, and present when a body is
+    required; a chunked body is refused outright, since nothing here needs
+    one. A refusal closes the connection: the unread body would otherwise be
+    parsed as the next request. The handler's socket timeout bounds a slow one.
+    """
+    def refuse(status: int, message: str) -> AgentError:
+        handler.close_connection = True
+        return AgentError(status, message, "bad_request")
+
+    if handler.headers.get("Transfer-Encoding"):
+        raise refuse(411, "a chunked request body is not accepted; send Content-Length")
+    raw = handler.headers.get("Content-Length")
+    if raw is None:
+        if required:
+            raise refuse(411, "Content-Length is required")
+        return b""
+    raw = raw.strip()
+    if not raw.isdigit() or not raw.isascii():
+        raise refuse(400, "Content-Length must be a non-negative integer")
+    n = int(raw)
+    if n > cap:
+        raise refuse(413, "request body too large")
+    try:
+        data = handler.rfile.read(n) if n else b""
+    except (TimeoutError, OSError):
+        raise refuse(408, "the request body did not arrive in time") from None
+    if len(data) != n:
+        raise refuse(400, "the request body ended early")
+    return data
+
+
 def _forbidden(msg: str) -> AgentError:
     return AgentError(403, msg, "forbidden")
 
@@ -1122,6 +1163,7 @@ _JSON_ROUTES = {
 def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = REQUEST_TIMEOUT_S
 
         def log_message(self, fmt: str, *args: Any) -> None:  # noqa: D401
             logger.info("%s", fmt % args)
@@ -1140,15 +1182,13 @@ def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
             self._send(status, json.dumps(obj).encode())
 
         def _body(self) -> bytes:
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > MAX_BODY:
-                raise AgentError(413, "request body too large", "too_large")
-            return self.rfile.read(n) if n else b""
+            return read_body(self, MAX_BODY, required=self.command in ("POST", "PUT"))
 
         def _dispatch(self, method: str) -> None:
             try:
                 if not agent.authorised(self.headers.get("Authorization")):
-                    self._body()
+                    # Not read at all: closing the connection disposes of it.
+                    self.close_connection = True
                     raise AgentError(401, "not authorised", "unauthorised")
                 url = urlsplit(self.path)
                 q = {k: v[0] for k, v in parse_qs(url.query).items()}

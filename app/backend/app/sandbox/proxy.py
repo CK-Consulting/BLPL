@@ -57,6 +57,10 @@ logger = logging.getLogger("blpl.sandbox.proxy")
 
 MAX_HEADER_BYTES = 64 * 1024
 MAX_BODY_BYTES = 1024 * 1024
+# How long a client may take to send one request. h11 already refuses a
+# malformed or negative Content-Length and the body is capped as it arrives;
+# this bounds a request that trickles in, or never ends.
+REQUEST_TIMEOUT_S = 30.0
 _FULL_ID = re.compile(r"[0-9a-f]{64}")
 
 
@@ -230,13 +234,17 @@ class DockerProxy:
         while True:
             event = conn.next_event()
             if event is h11.NEED_DATA:
-                data = await reader.read(65536)
+                data = await asyncio.wait_for(reader.read(65536), REQUEST_TIMEOUT_S)
                 conn.receive_data(data)
                 if not data and conn.their_state is not h11.DONE:
                     return None
                 continue
             if isinstance(event, h11.Request):
                 method, target = event.method.decode("ascii"), event.target.decode("ascii")
+                # Refused on what it declares, before any of it is read.
+                for name, value in event.headers:
+                    if name == b"content-length" and int(value) > MAX_BODY_BYTES:
+                        raise Refused("request body too large")
             elif isinstance(event, h11.Data):
                 body += event.data
                 if len(body) > MAX_BODY_BYTES:
@@ -272,6 +280,9 @@ class DockerProxy:
                 return
             except Refused as e:
                 await self._reply(conn, writer, 413, str(e))
+                return
+            except asyncio.TimeoutError:
+                await self._reply(conn, writer, 408, "the request did not arrive in time")
                 return
             if req is None:
                 return
