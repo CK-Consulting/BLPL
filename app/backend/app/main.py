@@ -133,6 +133,13 @@ async def _lifespan(_app: FastAPI):
     only thing standing between a database dump and every user's keys. Losing it
     later means every stored key is unreadable and must be re-entered.
     """
+    # First, before anything reads a project: a backend that was told it has
+    # no project mount but can see one refuses to start (MountMisconfigured).
+    mount_warning = workspace_files.check_project_mount(PROJECTS_ROOT)
+    if mount_warning:
+        logger.warning("!" * 72)
+        logger.warning("PROJECT MOUNT: %s", mount_warning)
+        logger.warning("!" * 72)
     key_path = serverkey.key_path(_DATA)
     existed = serverkey.load(_DATA) is not None
     serverkey.load_or_create(_DATA)

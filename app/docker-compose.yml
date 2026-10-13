@@ -203,6 +203,14 @@ services:
       # itself when a request needs one, so it carries the same workspace
       # settings as the worker (keep the two lists in step).
       - BLPL_FILES_VIA_WORKSPACE=${BLPL_FILES_VIA_WORKSPACE:-0}
+      # Phase 4: "absent" when the backend runs without the project mount.
+      # Setting it here removes nothing; the mount itself goes with
+      # docker-compose.mountless.yml, which sets this too. The backend refuses
+      # to start if it is "absent" while it can still see data/projects.
+      - BLPL_PROJECT_MOUNT=${BLPL_PROJECT_MOUNT:-}
+      # With the agent on, the backend is what stops and seals idle
+      # workspaces, so it reads this rather than the worker.
+      - BLPL_SANDBOX_IDLE_S=${BLPL_SANDBOX_IDLE_S:-900}
       - BLPL_AGENT_DIR_ROOT=/app/data/agents
       - BLPL_SANDBOX_HOST_AGENT_DIRS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/agents}
       - BLPL_SANDBOX_DOCKER=unix:///run/blpl-docker-proxy/docker.sock

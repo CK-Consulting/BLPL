@@ -57,6 +57,102 @@ def mount_absent() -> bool:
 
     return enabled() and os.environ.get("BLPL_PROJECT_MOUNT", "") == "absent"
 
+
+class MountMisconfigured(RuntimeError):
+    """BLPL_PROJECT_MOUNT says one thing and the container's mounts another."""
+
+
+
+
+def _unescape(field: str) -> str:
+    # mountinfo writes space, tab, newline and backslash as octal escapes.
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _backing_mount(path: str, mountinfo: str) -> tuple[str, str, str] | None:
+    """The mount path lies on: its root within its filesystem, its mount
+    point, and its filesystem type."""
+    best, found = -1, None
+    for line in mountinfo.splitlines():
+        left, sep, right = line.partition(" - ")
+        fields = left.split()
+        if not sep or len(fields) < 5 or not right.split():
+            continue
+        point = _unescape(fields[4])
+        inside = path == point or path.startswith(point.rstrip("/") + "/")
+        # Longest mount point wins; of two at one point, the later is on top.
+        if inside and len(point) >= best:
+            best, found = len(point), (_unescape(fields[3]), point, right.split()[0])
+    return found
+
+
+def projects_visible(root: Path, mountinfo: str | None = None) -> bool:
+    """Whether this container can see the host's project directories at root.
+
+    Anything in the directory means yes, whatever it is mounted from. An empty
+    one is visible when it lies on a host filesystem, because that is where
+    the next project will appear. It is hidden when a fresh tmpfs is mounted
+    on root itself (the mountless layout's mask), or when nothing is mounted on it or
+    above it but the container's root (the image's own layer). The type of
+    the bind above it says nothing: a host's data directory may be a tmpfs
+    too. Where mountinfo cannot be read, an empty directory counts as hidden
+    only if something is mounted on it."""
+    try:
+        if any(Path(root).iterdir()):
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # cannot tell, so do not claim it is hidden
+    if mountinfo is None:
+        try:
+            mountinfo = Path("/proc/self/mountinfo").read_text()
+        except OSError:
+            import os
+
+            return not os.path.ismount(root)
+    path = str(Path(root).resolve())
+    found = _backing_mount(path, mountinfo)
+    if found is None:
+        return True
+    source, point, fstype = found
+    # A fresh tmpfs is mounted from its own root; a bind of a host directory
+    # that happens to live on a tmpfs is mounted from a path inside it.
+    return not ((point == path and fstype == "tmpfs" and source == "/") or point == "/")
+
+
+def check_project_mount(root: Path, *, mountinfo: str | None = None) -> str | None:
+    """Refuse to start when BLPL_PROJECT_MOUNT=absent is not what the mounts say.
+
+    The flag alone removed nothing: Compose still bound all of ./data into the
+    backend (Codex, PR #20). A backend told the mount is absent that can in
+    fact read every project has a guarantee on paper only, so it does not
+    start. The opposite, a backend that expects the mount and finds none, would
+    answer every remaining route with an empty project; that returns a warning
+    for the caller to log, because a fresh deployment can legitimately look
+    like it.
+    """
+    import os
+
+    absent = os.environ.get("BLPL_PROJECT_MOUNT", "") == "absent"
+    visible = projects_visible(root, mountinfo)
+    if absent and not enabled():
+        raise MountMisconfigured(
+            "BLPL_PROJECT_MOUNT=absent needs BLPL_FILES_VIA_WORKSPACE=1: without the "
+            "workspace agent this backend has no way to reach a project")
+    if absent and visible:
+        raise MountMisconfigured(
+            f"BLPL_PROJECT_MOUNT=absent, but {root} is visible in this container. Start "
+            "the backend with app/docker-compose.mountless.yml (see "
+            "docs/architecture-v2.md, \"Running the backend without the project mount\"), "
+            "or unset BLPL_PROJECT_MOUNT")
+    if not absent and not visible:
+        return (f"{root} is not visible in this container, but BLPL_PROJECT_MOUNT is not "
+                "'absent': every route that reads a project directly will find it empty. "
+                "Set BLPL_PROJECT_MOUNT=absent with BLPL_FILES_VIA_WORKSPACE=1, or restore "
+                "the ./data mount")
+    return None
+
 _ACCESS: workspaces.Access | None = None
 # Agent answers passed to the client as they are. Anything else is the
 # workspace failing, which the client sees as 502.
