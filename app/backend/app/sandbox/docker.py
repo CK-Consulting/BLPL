@@ -256,6 +256,9 @@ class DockerDriver:
             or labels.get(LABEL_INSTANCE) != self.cfg.instance
             or labels.get(LABEL_PROJECT) != key.project
             or labels.get(LABEL_ROLE) != key.role
+            # A run's id, a desktop's member: a container under this name for
+            # another run is not this one's to adopt or remove.
+            or labels.get(LABEL_MEMBER) != key.member
         ):
             raise NotOurs(key.container_name())
         return info
@@ -467,9 +470,21 @@ class DockerDriver:
         # the run's, and the container is removed when the run ends.
         body["Env"] = body["Env"] + [f"{k}={v}" for k, v in (env or {}).items()]
         name = spec.key.container_name()
-        await self._req("POST", "/containers/create", params={"name": name}, json=body,
-                        ok=(201,))
+        # A container may already hold this name: the same run, started by a
+        # worker that died, requeued by reclaim_stale and now retried. It is
+        # still running, still writing the project, and nothing heartbeats or
+        # can cancel it. It is removed (killed) before the retry starts, but only
+        # if its labels say it is exactly this run of this project. Anything
+        # else under the name raises NotOurs from _inspect and is left alone.
+        orphan = await self._inspect(spec.key)
+        if orphan is not None:
+            await self._req("DELETE", f"/containers/{orphan['Id']}",
+                            params={"force": "true"}, ok=(204, 404))
+        created = False
         try:
+            await self._req("POST", "/containers/create", params={"name": name}, json=body,
+                            ok=(201,))
+            created = True
             await self._req("POST", f"/containers/{name}/start", ok=(204, 304))
             try:
                 async with self._http.stream("GET", f"/containers/{name}/logs", params={
@@ -498,8 +513,11 @@ class DockerDriver:
                 await asyncio.sleep(0.1)
             raise DriverError(f"{name} still running after its output ended")
         finally:
-            await asyncio.shield(self._req("DELETE", f"/containers/{name}",
-                                           params={"force": "true"}, ok=(204, 404)))
+            # Only what this call created: a failed create (another process
+            # won the name) must not remove that process's container.
+            if created:
+                await asyncio.shield(self._req("DELETE", f"/containers/{name}",
+                                               params={"force": "true"}, ok=(204, 404)))
 
     async def _terminate(self, cid: str, exec_id: str, pidfile: str) -> None:
         """SIGTERM the exec'd process, then SIGKILL it after the grace period."""

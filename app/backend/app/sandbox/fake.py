@@ -15,6 +15,7 @@ from typing import Callable, Mapping, Sequence
 from .driver import (
     DriverError,
     ExecResult,
+    NotOurs,
     OutputSink,
     State,
     WorkspaceKey,
@@ -56,6 +57,8 @@ class FakeDriver:
     calls: list[ExecCall] = field(default_factory=list)
     ops: list[tuple[str, WorkspaceKey]] = field(default_factory=list)
     run_specs: list[WorkspaceSpec] = field(default_factory=list)
+    # Names held by containers that are not ours (other labels).
+    foreign: set[WorkspaceKey] = field(default_factory=set)
     _n: int = 0
 
     def _status(self, key: WorkspaceKey) -> WorkspaceStatus:
@@ -142,6 +145,12 @@ class FakeDriver:
         """A run container: exists only for the call, then is gone."""
         if spec.key.role not in ("run", "sealer"):
             raise ValueError("run_container takes a run or sealer key")
+        if spec.key in self.foreign:
+            raise NotOurs(spec.key.container_name())
+        if spec.key in self.boxes:  # an orphan of a dead worker: killed first
+            self.ops.append(("remove_orphan", spec.key))
+            del self.boxes[spec.key]
+        self.boxes[spec.key] = _Box(spec, State.RUNNING, f"run-{len(self.run_specs)}")
         self.ops.append(("run_container", spec.key))
         self.run_specs.append(spec)
         call = ExecCall(spec.key, list(argv), dict(env or {}), None)
@@ -154,6 +163,8 @@ class FakeDriver:
             call.cancelled = True
             self.ops.append(("stop", spec.key))
             raise
+        finally:
+            self.boxes.pop(spec.key, None)
         code, chunks = outcome
         for stream, data in chunks:
             if on_output is not None:
