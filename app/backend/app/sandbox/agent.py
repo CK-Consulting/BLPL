@@ -76,6 +76,10 @@ VERSION = 1
 MAX_BODY = 160 * 1024 * 1024  # an upload's cap plus headroom
 RUN_LOG_DIR = Path(os.environ.get("BLPL_AGENT_RUN_LOGS", "/tmp/blpl-runs"))
 CANCEL_GRACE_S = 10.0
+# How long a held origin lock waits for the control plane's release before
+# letting go by itself. Long enough for a database write, short enough that a
+# control plane that died mid-hold blocks the next push only briefly.
+HOLD_TIMEOUT_S = 30.0
 
 
 class AgentError(Exception):
@@ -303,6 +307,8 @@ class Agent:
         self.runs = Runs()
         self.git = _projects.Projects(Path(self.fs.roots[0]) if self.fs.roots else Path("/"))
         self._last = time.monotonic()
+        self._holds: dict[str, threading.Event] = {}
+        self._holds_lock = threading.Lock()
 
     def authorised(self, header: str | None) -> bool:
         if not header or not header.startswith("Bearer "):
@@ -573,8 +579,71 @@ class Agent:
 
     def git_push(self, b: dict) -> dict:
         d = self._checkout_path(b)
+        if b.get("hold"):
+            def op() -> str:
+                with self._credential(b) as env:
+                    # What Projects.push does inside its lock; the lock is
+                    # taken by _held, which keeps it past the answer.
+                    return self.git._push_locked(d, b.get("url"), env)
+            return self._held(d, op)
         with self._credential(b) as env:
             return {"output": self.git.push("", env=env, checkout=d, url=b.get("url"))}
+
+    # -- the origin lock, held for the control plane ---------------------------
+    #
+    # Project setup records a push's outcome while the origin lock is still
+    # held (Projects.push's `after`), so overlapping pushes record in the order
+    # they ran. The lock lives in the project's git directory, where the agent
+    # runs git, and the record lives in the control plane's database. So a held
+    # push does its work under the lock, answers with the outcome and a lease,
+    # and keeps the lock until the control plane has recorded and released it
+    # (or HOLD_TIMEOUT_S passes). /git/hold does the same with no work, for
+    # outcomes that never reached a push (Projects.under_remote_lock).
+
+    def _held(self, d: Path, op) -> dict:
+        lease = uuid.uuid4().hex
+        ready, release = threading.Event(), threading.Event()
+        res: dict[str, Any] = {}
+
+        def under_lock() -> None:
+            try:
+                res["output"] = op()
+            except _projects.ProjectError as e:
+                res["error"] = str(e)
+            ready.set()
+            if not release.wait(HOLD_TIMEOUT_S):
+                logger.warning("origin lock lease %s was not released; letting go", lease)
+
+        def target() -> None:
+            try:
+                self.git.under_remote_lock(d, under_lock)
+            except _projects.ProjectError as e:  # the lock itself could not be had
+                if not ready.is_set():
+                    res["error"], res["unlocked"] = str(e), True
+            except Exception as e:  # noqa: BLE001
+                if not ready.is_set():
+                    res["error"], res["unlocked"] = f"{type(e).__name__}: {e}", True
+            finally:
+                with self._holds_lock:
+                    self._holds.pop(lease, None)
+                ready.set()
+
+        with self._holds_lock:
+            self._holds[lease] = release
+        threading.Thread(target=target, daemon=True).start()
+        ready.wait()
+        return {"output": res.get("output"), "error": res.get("error"),
+                "lease": None if res.get("unlocked") else lease}
+
+    def git_hold(self, b: dict) -> dict:
+        return self._held(self._checkout_path(b), lambda: None)
+
+    def git_release(self, b: dict) -> dict:
+        with self._holds_lock:
+            ev = self._holds.get(str(b.get("lease", "")))
+        if ev is not None:
+            ev.set()
+        return {"released": ev is not None}
 
     # -- runs ------------------------------------------------------------------
 
@@ -597,7 +666,8 @@ _JSON_ROUTES = {
     "/git/status": Agent.git_status, "/git/diff": Agent.git_diff,
     "/git/remote_of": Agent.git_remote_of, "/git/commit": Agent.git_commit,
     "/git/recoverable": Agent.git_recoverable, "/git/pull": Agent.git_pull,
-    "/git/push": Agent.git_push, "/runs": Agent.run_start,
+    "/git/push": Agent.git_push, "/git/hold": Agent.git_hold,
+    "/git/release": Agent.git_release, "/runs": Agent.run_start,
 }
 
 
