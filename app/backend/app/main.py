@@ -1504,7 +1504,8 @@ def _project_or_404(session: Session, user: User, project_id: str) -> Project:
         raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
 
 
-def _project_dir(session: Session, user: User, project_id: str) -> Path:
+def _project_dir(session: Session, user: User, project_id: str, *,
+                 agent_ready: bool = False) -> Path:
     """The working copy, if this user may open it.
 
     The one place project permission is enforced, which is why every route
@@ -1517,6 +1518,14 @@ def _project_dir(session: Session, user: User, project_id: str) -> Path:
     one guess at a time.
     """
     project = _project_or_404(session, user, project_id)
+    if workspace_files.mount_absent() and not agent_ready:
+        # This deployment runs the backend without the project mount, and
+        # this route still reads project files through it. Said plainly,
+        # rather than reading an empty directory and answering as though the
+        # project had no files.
+        raise HTTPException(status_code=503, detail=(
+            "this view still reads project files directly, and this deployment runs "
+            "without the project mount (BLPL_PROJECT_MOUNT=absent)"))
     if workspace.is_sealed(PROJECTS_ROOT, project_id):
         # Encrypted at rest and nobody has opened it. Not an error and not a
         # permission problem — 423 so the client offers to open it rather than
@@ -1533,6 +1542,16 @@ def _project_dir(session: Session, user: User, project_id: str) -> Path:
             headers={"X-BLPL-Sealed": project_id},
         )
     _touch_workspace(session, project_id, user.id)
+    if workspace_files.enabled():
+        try:
+            projects.project_dir(project_id)  # the name's guard, lexical
+        except ProjectError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        try:
+            return workspace_files.ensure_worktree(
+                project_id, user.id, project.owner_id == user.id)
+        except ProjectError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     try:
         # Validates the name before it reaches the filesystem — the guard against
         # ../ lives there, and a worktree path is built from the same name.
@@ -2851,7 +2870,7 @@ async def import_project(
 @app.get("/api/projects/{project_id}/git/status")
 def git_status(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
-    checkout = _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     project = _project_or_404(session, user, project_id)
     try:
         st = (workspace_files.git_status(checkout) if workspace_files.enabled()
@@ -3108,7 +3127,7 @@ def git_commit(project_id: str, body: CommitBody, user: User = Depends(require_o
     session: Session = Depends(session_scope),
     master_key: bytes | None = Depends(optional_master_key)) -> dict:
     project = _project_or_404(session, user, project_id)
-    checkout = _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     try:
         out, scheduled = _commit_and_push(session, user, project, checkout, body.message, master_key)
     except ProjectError as exc:
@@ -3131,7 +3150,7 @@ def git_diff(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     """What changed in the working copy since the last commit — the 'what did that
     run do' view. Diffs are size-capped server-side."""
-    checkout = _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     try:
         if workspace_files.enabled():
             return workspace_files.git_diff(checkout)
@@ -3144,7 +3163,7 @@ def git_diff(project_id: str, user: User = Depends(require_onboarded),
 def git_pull(project_id: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key)) -> dict:
-    checkout = _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     try:
         # A pull fetches, so the credential is the fetch URL's — which need not
         # be the host a push goes to.
@@ -3167,7 +3186,7 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
     master_key: bytes = Depends(require_master_key)) -> dict:
     # The checkout /git/commit just committed in, so "Commit + Push" pushes
     # the commit it made rather than the owner's branch.
-    checkout = _project_dir(session, user, project_id)
+    checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     project = _project_or_404(session, user, project_id)
     project_id_, user_id = project.id, user.id
     recorded = False
@@ -3287,7 +3306,8 @@ def _resolve_board(proj: Path, requested: str | None) -> str | None:
     nobody would think to question.
     """
     try:
-        man = project_manifest.discover(proj)
+        man = (workspace_files.manifest(proj) if workspace_files.enabled()
+               else project_manifest.discover(proj))
     except project_manifest.ManifestError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if man.implicit:
@@ -3629,7 +3649,7 @@ def get_tree(
     with no screen in the app that would show it. A project is more than its
     pipeline output, and the tree is the only view that says so.
     """
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     if workspace_files.enabled():
         return workspace_files.tree(project_id, proj)
     nodes = _walk_tree(proj, proj)
@@ -3837,7 +3857,7 @@ def get_blob(
     as before: it is the evidence directory, and opening a file there should be
     a deliberate act on something the user has been told is unverified.
     """
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     if workspace_files.enabled():
         return workspace_files.blob(proj, path)
     target = _tree_target(proj, path)
@@ -4313,7 +4333,7 @@ def list_files(project_id: str, user: User = Depends(require_onboarded),
     Names are project-relative with forward slashes — the same string
     ``_editable_file`` accepts back.
     """
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     if workspace_files.enabled():
         return workspace_files.list_files(proj)
     out = []
@@ -4331,7 +4351,7 @@ def read_file(project_id: str, name: str, user: User = Depends(require_onboarded
     session: Session = Depends(session_scope)):
     if workspace_files.enabled():
         return workspace_files.read_file(
-            _project_dir(session, user, project_id), _editable_rel(name), name)
+            _project_dir(session, user, project_id, agent_ready=workspace_files.enabled()), _editable_rel(name), name)
     target = _editable_file(session, user, project_id, name)
     if not target.is_file():
         raise HTTPException(status_code=404, detail=f"no file {name!r}")
@@ -4526,7 +4546,7 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     """Create or overwrite an editable file. Creating is intended: a fresh project
     is empty, and this is how the first design doc gets written."""
     if workspace_files.enabled():
-        checkout = _project_dir(session, user, project_id)
+        checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
         rel = _editable_rel(name)
         written = workspace_files.write_file(checkout, rel, body.content)
         project = _project_or_404(session, user, project_id)
@@ -4558,7 +4578,7 @@ def write_file(project_id: str, name: str, body: FileBody, user: User = Depends(
     # worktree rather than the repository directory the name resolves to.
     commit = _commit_landed_write(
         session, user, _project_or_404(session, user, project_id),
-        _project_dir(session, user, project_id), f"edit: {rel}", master_key,
+        _project_dir(session, user, project_id, agent_ready=workspace_files.enabled()), f"edit: {rel}", master_key,
     )
     return {
         "ok": True,
@@ -4616,7 +4636,7 @@ async def upload_files(
     stays in ``retrieved/`` as evidence and the response says why. Only a
     malformed request fails the batch.
     """
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     if len(files) > UPLOAD_MAX_FILES:
         raise HTTPException(status_code=400, detail=f"{len(files)} files; at most {UPLOAD_MAX_FILES} per upload")
     try:
@@ -4823,7 +4843,9 @@ def get_quarantine(
     master_key: bytes = Depends(require_master_key),
 ) -> dict:
     """Everything that has come in from outside, newest first, and what was decided."""
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+    if workspace_files.enabled():
+        return workspace_files.quarantine_view(proj)
     return {"summary": quarantine.summary(proj), "entries": list(reversed(quarantine.ledger(proj)))[:500]}
 
 
@@ -4839,7 +4861,10 @@ def get_llm_ignore(
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
 ) -> dict:
-    return {"files": llm_ignore.entries(_project_dir(session, user, project_id))}
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+    if workspace_files.enabled():
+        return {"files": workspace_files.ignore_entries(proj)}
+    return {"files": llm_ignore.entries(proj)}
 
 
 @app.put("/api/projects/{project_id}/llm-ignore")
@@ -4851,12 +4876,17 @@ def set_llm_ignore(
     master_key: bytes = Depends(require_master_key),
 ) -> dict:
     """Put one file on the LLM-ignore list, or take it off."""
-    proj = _project_dir(session, user, project_id)
-    target = _tree_target(proj, body.path)
-    if not target.is_file():
-        raise HTTPException(status_code=404, detail=f"no file {body.path!r} in this project")
-    rel = target.relative_to(proj.resolve()).as_posix()
-    changed = llm_ignore.set_ignored(proj, rel, body.ignored, by=user.email or f"user {user.id}")
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+    if workspace_files.enabled():
+        r = workspace_files.ignore_set(proj, body.path, body.ignored,
+                                       user.email or f"user {user.id}")
+        rel, changed = r["path"], r["changed"]
+    else:
+        target = _tree_target(proj, body.path)
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"no file {body.path!r} in this project")
+        rel = target.relative_to(proj.resolve()).as_posix()
+        changed = llm_ignore.set_ignored(proj, rel, body.ignored, by=user.email or f"user {user.id}")
     commit: dict = {"committed": False}
     if changed:
         verb = "ignore" if body.ignored else "unignore"
@@ -4885,7 +4915,7 @@ def make_folder(
     per-MPN datasheet folder is a place you make *before* you have the file to
     put in it.
     """
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     parts = [seg for seg in body.path.replace("\\", "/").split("/") if seg]
     if (
         not parts
@@ -5002,6 +5032,15 @@ def delete_path(
     undone — which is what makes it acceptable to offer behind one confirmation.
     """
     project = _project_or_404(session, user, project_id)
+    if workspace_files.enabled():
+        checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+        rel = workspace_files.managed_rel(name)
+        _refuse_while_running(session, user, project, "delete it")
+        done = workspace_files.delete(checkout, rel)
+        activity.record(session, project, user, activity.DELETED, rel)
+        commit = _commit_landed_write(session, user, project, checkout, f"delete: {rel}", master_key)
+        return {"ok": True, "path": rel, "kind": done["kind"], **commit,
+                "ignore_list_updated": done["ignore_list_updated"]}
     checkout, target, rel = _managed_path(session, user, project_id, name)
     _refuse_while_running(session, user, project, "delete it")
     if not target.exists() and not target.is_symlink():
@@ -5085,6 +5124,22 @@ def move_path(
     have produced and ``log --follow`` still finds the history.
     """
     project = _project_or_404(session, user, project_id)
+    if workspace_files.enabled():
+        checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+        src_rel = workspace_files.managed_rel(body.path)
+        dst_rel = workspace_files.managed_rel(body.to)
+        _refuse_while_running(session, user, project, "move it")
+        if llm_ignore.is_external(src_rel) and not llm_ignore.is_external(dst_rel):
+            raise HTTPException(status_code=403, detail=(
+                f"{src_rel} came from outside the project, and files there are read as "
+                "untrusted wherever they sit under datasheets/ or references/. It cannot be "
+                "moved out of them."))
+        done = workspace_files.move(checkout, src_rel, dst_rel)
+        activity.record(session, project, user, activity.MOVED, f"{src_rel} → {dst_rel}")
+        commit = _commit_landed_write(
+            session, user, project, checkout, f"move: {src_rel} -> {dst_rel}", master_key)
+        return {"ok": True, "from": src_rel, "to": dst_rel, **commit,
+                "ignore_list_updated": done["ignore_list_updated"]}
     checkout, src, src_rel = _managed_path(session, user, project_id, body.path)
     _, dst, dst_rel = _managed_path(session, user, project_id, body.to)
     _refuse_while_running(session, user, project, "move it")
@@ -5216,7 +5271,18 @@ def move_path(
 @app.get("/api/projects/{project_id}/artifacts/{name}")
 def read_artifact(project_id: str, name: str, user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)):
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+    if workspace_files.enabled():
+        data = workspace_files.read_artifact(proj, name)
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"no artifact {name!r}")
+        text = data.decode("utf-8", errors="replace")
+        if name.endswith(".json"):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+        return PlainTextResponse(text)
     target = (proj / ".pipeline" / name).resolve()
     if not target.is_relative_to(proj / ".pipeline") or not target.is_file():
         raise HTTPException(status_code=404, detail=f"no artifact {name!r}")
@@ -5401,12 +5467,19 @@ def list_artifacts(project_id: str, board: str | None = None,
     list stops being useful. /design already falls back to the archive when it
     has to, and says so.
     """
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     # The same normalization the run routes get from _resolve_board: on a
     # single-board project the implicit board's name is legal to pass and
     # means "no qualifier" — filtering filenames by it would drop everything,
     # because single-board artifacts carry no board in their names.
     board = _resolve_board(proj, board)
+    if workspace_files.enabled():
+        metas = workspace_files.list_artifacts(proj)
+        if board:
+            metas = [a for a in metas if f".{board}." in a["name"] or f"_{board}_" in a["name"]
+                     or _is_project_level(a["name"])]
+        metas.sort(key=lambda a: a["created"], reverse=True)
+        return {"artifacts": metas}
     pipeline = proj / ".pipeline"
     if not pipeline.is_dir():
         return {"artifacts": []}

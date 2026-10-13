@@ -48,6 +48,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socketserver
@@ -65,10 +66,10 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import parse_qs, urlsplit
 
-try:  # in the backend's tree (tests)
-    from app import projects as _projects  # type: ignore[import-not-found]
-except ImportError:  # pragma: no cover - in the workspace image, beside this file
-    import projects as _projects  # type: ignore[no-redef]
+# The backend modules the agent drives, all stdlib (plus the pipeline's own
+# quarantine). In the backend's tree they are the `app` package itself; in the
+# workspace image the same files sit in /opt/blpl/wsagent/app beside this one.
+from app import projects as _projects  # type: ignore[import-not-found]
 
 logger = logging.getLogger("blpl.wsagent")
 
@@ -299,11 +300,15 @@ def _below_blpl(parts: list[str]) -> bool:
 
 
 class Agent:
-    def __init__(self, token: str, roots: list[str]):
+    def __init__(self, token: str, roots: list[str], *, projects_root: str | None = None):
         if not token:
             raise ValueError("no token")
         self.token = token.encode()
         self.fs = Confined(roots)
+        # The directory projects and .worktrees sit in. In a workspace the
+        # roots are <it>/<P> and <it>/.worktrees/<P>.
+        self._projects_root = projects_root or (
+            os.path.dirname(self.fs.roots[0]) if self.fs.roots else "/")
         self.runs = Runs()
         self.git = _projects.Projects(Path(self.fs.roots[0]) if self.fs.roots else Path("/"))
         self._last = time.monotonic()
@@ -368,6 +373,7 @@ class Agent:
                 else:
                     out.append({"path": rel, "name": e.name, "dir": False,
                                 "bytes": st.st_size, "mtime": st.st_mtime,
+                                "btime": getattr(st, "st_birthtime", None),
                                 "symlink": stat.S_ISLNK(st.st_mode)})
             return complete
 
@@ -476,6 +482,194 @@ class Agent:
                 pass
             os.rename(src[-1], dst[-1], src_dir_fd=sfd, dst_dir_fd=dfd)
         return {"ok": True}
+
+    # -- the file manager's moves and deletes ---------------------------------
+    #
+    # What main.delete_path and main.move_path do after their lexical checks,
+    # here, beside the files: the quarantine ledger and the LLM-ignore list
+    # are read and rewritten where they live, under llm_ignore's own lock.
+    # The order of every step is the route's, for the reasons its comments
+    # give. The control plane still decides who may and which names are legal.
+
+    def _bookkeeping_dirs_are_real(self, checkout: str) -> None:
+        for name in (".blpl", "retrieved", "datasheets", "references"):
+            try:
+                if stat.S_ISLNK(os.lstat(os.path.join(checkout, name)).st_mode):
+                    raise _forbidden(f"{name}/ is a symlink in this checkout; refusing to use it")
+            except FileNotFoundError:
+                pass
+
+    def _link_leaves(self, checkout: str, parts: list[str], dfd: int) -> bool:
+        """Whether parts names a link pointing outside the checkout.
+
+        Such a link is never followed here, so removing or moving it cannot
+        touch what it names. It is refused anyway, as the backend's sandbox
+        refuses it, because a link out of the project is not something the
+        file manager offers to rearrange."""
+        try:
+            target = os.readlink(parts[-1], dir_fd=dfd)
+        except OSError:
+            return False  # not a link
+        if target.startswith("/"):
+            dest = os.path.normpath(target)
+        else:
+            dest = os.path.normpath(os.path.join(checkout, *parts[:-1], target))
+        return not (dest == checkout or dest.startswith(checkout + "/"))
+
+    def managed_delete(self, b: dict) -> dict:
+        from app import llm_ignore
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        parts = self.fs.parts(b.get("path"))
+        rel = "/".join(parts)
+        self._no_run(parts)
+        self._bookkeeping_dirs_are_real(checkout)
+        with self.fs.dir_fd(checkout, parts[:-1]) as dfd:
+            try:
+                st = os.lstat(parts[-1], dir_fd=dfd)
+            except FileNotFoundError:
+                raise AgentError(404, f"no file or folder {rel!r}", "notfound") from None
+            if self._link_leaves(checkout, parts, dfd):
+                raise _forbidden(f"{rel!r} is a link out of the project")
+            recorded = llm_ignore.released_under(Path(checkout), rel)
+            if recorded:
+                raise AgentError(409, (
+                    f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
+                    "is recorded in the quarantine ledger as released at its current path; "
+                    "deleting it would leave the ledger naming a file that is not there"),
+                    "recorded")
+            if stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(parts[-1], dir_fd=dfd)
+                kind = "folder"
+            else:
+                os.unlink(parts[-1], dir_fd=dfd)
+                kind = "file"
+        updated = True
+        try:
+            llm_ignore.drop_entries(Path(checkout), rel)
+        except OSError:
+            updated = False
+        return {"kind": kind, "ignore_list_updated": updated}
+
+    def managed_move(self, b: dict) -> dict:
+        from app import llm_ignore
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        src = self.fs.parts(b.get("src"))
+        dst = self.fs.parts(b.get("dst"))
+        src_rel, dst_rel = "/".join(src), "/".join(dst)
+        self._no_run(src)
+        self._no_run(dst)
+        self._bookkeeping_dirs_are_real(checkout)
+        with self.fs.dir_fd(checkout, src[:-1]) as sfd:
+            try:
+                sst = os.lstat(src[-1], dir_fd=sfd)
+            except FileNotFoundError:
+                raise AgentError(404, f"no file or folder {src_rel!r}", "notfound") from None
+            if self._link_leaves(checkout, src, sfd):
+                raise _forbidden(f"{src_rel!r} is a link out of the project")
+        try:
+            with self.fs.dir_fd(checkout, dst[:-1]) as dfd:
+                os.lstat(dst[-1], dir_fd=dfd)
+            raise AgentError(409, f"{dst_rel} already exists", "exists")
+        except (FileNotFoundError, AgentError) as e:
+            if isinstance(e, AgentError) and e.status != 404:
+                raise
+        if stat.S_ISDIR(sst.st_mode) and (dst_rel == src_rel or dst_rel.startswith(src_rel + "/")):
+            raise AgentError(400, "a folder cannot be moved inside itself")
+        recorded = llm_ignore.released_under(Path(checkout), src_rel)
+        if recorded:
+            raise AgentError(409, (
+                f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
+                "is recorded in the quarantine ledger at its current path; moving it would "
+                "leave the ledger naming a file that is not there"), "recorded")
+        try:
+            before = llm_ignore.cover_move(Path(checkout), src_rel, dst_rel)
+        except OSError as e:
+            raise AgentError(500, f"{src_rel} was not moved: the LLM-ignore list could not "
+                                  f"be updated ({e})", "not_moved") from None
+        try:
+            with self.fs.dir_fd(checkout, src[:-1]) as sfd, \
+                    self.fs.dir_fd(checkout, dst[:-1], create=True) as dfd:
+                os.rename(src[-1], dst[-1], src_dir_fd=sfd, dst_dir_fd=dfd)
+        except (OSError, AgentError) as e:
+            if before is not None:
+                try:
+                    llm_ignore.restore(Path(checkout), before)
+                except OSError:
+                    pass
+            if isinstance(e, AgentError):
+                raise
+            raise AgentError(500, f"{src_rel} was not moved: {e}", "not_moved") from None
+        updated = True
+        if before is not None:
+            try:
+                llm_ignore.finish_move(Path(checkout), before)
+            except OSError:
+                updated = False
+        return {"ignore_list_updated": updated}
+
+    # -- the LLM-ignore list, the quarantine ledger, the board manifest -------
+
+    def ignore_entries(self, b: dict) -> dict:
+        from app import llm_ignore
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._bookkeeping_dirs_are_real(checkout)
+        return {"files": llm_ignore.entries(Path(checkout))}
+
+    def ignore_set(self, b: dict) -> dict:
+        from app import llm_ignore
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        parts = self.fs.parts(b.get("path"))
+        self._no_run([".blpl"])
+        self._bookkeeping_dirs_are_real(checkout)
+        with self.fs.dir_fd(checkout, parts[:-1]) as dfd:
+            try:
+                fd = open_at(parts[-1], dfd, os.O_RDONLY, want_dir=False)
+                os.close(fd)
+            except (FileNotFoundError, AgentError):
+                raise AgentError(404, f"no file {b.get('path')!r} in this project",
+                                 "notfound") from None
+        rel = "/".join(parts)
+        changed = llm_ignore.set_ignored(Path(checkout), rel, bool(b.get("ignored")),
+                                         by=str(b.get("by", "")))
+        return {"path": rel, "changed": changed}
+
+    def quarantine_view(self, b: dict) -> dict:
+        from blpl.core import quarantine
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._bookkeeping_dirs_are_real(checkout)
+        return {"summary": quarantine.summary(Path(checkout)),
+                "entries": list(reversed(quarantine.ledger(Path(checkout))))[:500]}
+
+    def project_boards(self, b: dict) -> dict:
+        from blpl.core import project_manifest
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        try:
+            man = project_manifest.discover(Path(checkout))
+        except project_manifest.ManifestError as e:
+            raise AgentError(400, str(e), "manifest") from None
+        return {"implicit": man.implicit, "boards": [bd.name for bd in man.boards]}
+
+    def worktree_ensure(self, b: dict) -> dict:
+        """worktrees.ensure for a member, in the project's own storage: the
+        owner's checkout is the repository, members get .worktrees/<P>/u<id>."""
+        from app import worktrees
+
+        project = str(b.get("project", ""))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", project):
+            raise _forbidden("invalid project name")
+        repo = self.fs.checkout(os.path.join(self.projects_root(), project))
+        d = worktrees.ensure(Path(os.path.dirname(repo)), project, int(b.get("user_id", 0)),
+                             bool(b.get("is_owner")))
+        return {"path": str(d), "exists": d.is_dir()}
+
+    def projects_root(self) -> str:
+        return self._projects_root
 
     # -- quarantine -----------------------------------------------------------
 
@@ -630,7 +824,7 @@ class Agent:
 
         with self._holds_lock:
             self._holds[lease] = release
-        threading.Thread(target=target, daemon=True).start()
+        threading.Thread(target=target, daemon=True, name="wsagent-hold").start()
         ready.wait()
         return {"output": res.get("output"), "error": res.get("error"),
                 "lease": None if res.get("unlocked") else lease}
@@ -668,6 +862,10 @@ _JSON_ROUTES = {
     "/git/recoverable": Agent.git_recoverable, "/git/pull": Agent.git_pull,
     "/git/push": Agent.git_push, "/git/hold": Agent.git_hold,
     "/git/release": Agent.git_release, "/runs": Agent.run_start,
+    "/managed/delete": Agent.managed_delete, "/managed/move": Agent.managed_move,
+    "/ignore/entries": Agent.ignore_entries, "/ignore/set": Agent.ignore_set,
+    "/quarantine/view": Agent.quarantine_view, "/project/boards": Agent.project_boards,
+    "/worktree/ensure": Agent.worktree_ensure,
 }
 
 

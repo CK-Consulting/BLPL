@@ -212,3 +212,27 @@ class AgentClient:
 
     def run_cancel(self, rid: str) -> None:
         self._check(self._http.post(f"/runs/{rid}/cancel"))
+
+    # phase 4: the rest of the file manager, and the project's own records
+    def managed_delete(self, checkout: str, path: str) -> dict:
+        return self.call("/managed/delete", {"checkout": checkout, "path": path})
+
+    def managed_move(self, checkout: str, src: str, dst: str) -> dict:
+        return self.call("/managed/move", {"checkout": checkout, "src": src, "dst": dst})
+
+    def ignore_entries(self, checkout: str) -> list[dict]:
+        return self.call("/ignore/entries", {"checkout": checkout})["files"]
+
+    def ignore_set(self, checkout: str, path: str, ignored: bool, by: str) -> dict:
+        return self.call("/ignore/set", {"checkout": checkout, "path": path,
+                                         "ignored": ignored, "by": by})
+
+    def quarantine_view(self, checkout: str) -> dict:
+        return self.call("/quarantine/view", {"checkout": checkout})
+
+    def project_boards(self, checkout: str) -> dict:
+        return self.call("/project/boards", {"checkout": checkout})
+
+    def worktree_ensure(self, project: str, user_id: int, is_owner: bool) -> dict:
+        return self.call("/worktree/ensure", {"project": project, "user_id": user_id,
+                                              "is_owner": is_owner})
