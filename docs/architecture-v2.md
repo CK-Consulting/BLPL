@@ -873,6 +873,26 @@ sealing in a container, storage with limits.**
   poll raised was left running, unmarked, while the row said it had ended.
   Every exit from the run, workspace-run and agent-run monitors now stops the
   run and waits for it before returning.
+- **A retry follows only a run that started.** A worker that died between
+  create and start left a `created` container. Docker reports StartedAt at
+  its zero time and ExitCode 0 for it, and the retry followed it and recorded
+  a success for a run that never ran. Now a container is followed only once
+  it has started (running, or exited after starting); one that never started
+  is removed and created afresh. An exit code is trusted only from a
+  container that started and finished with no error; anything less is -1. The
+  agent's runs record the exit of a process they started, and the sealer
+  needs the sealer's own `ok`, so neither can report success without it.
+- **Request bodies are bounded in every server the PR adds.**
+  `Content-Length: -1` reached `rfile.read(-1)`, which reads until the peer
+  closes.
+  - The agent and the fetch service accept only a digits-only Content-Length,
+    within a cap. It is required for POST, a chunked body is refused, and
+    they read exactly that many bytes under a socket timeout.
+  - The agent does not read an unauthorised body at all.
+  - The socket proxy (h11) refuses a declared length over its cap before
+    reading, caps a chunked body as it arrives, and times out a slow request.
+  - The storage helper and the egress decision socket take one line under a
+    size cap and a timeout.
 - **Open workspaces survive a mountless restart.** `openstate.restore` dropped
   every row whose directory it could not see, which through the mask was all
   of them. It deleted the only server-side key of an open project, and that
