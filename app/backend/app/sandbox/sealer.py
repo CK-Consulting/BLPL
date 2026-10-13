@@ -32,7 +32,6 @@ import base64
 import json
 import os
 import sys
-from dataclasses import replace
 from typing import Callable
 
 SEALER_ROOT = "/projects"
@@ -78,8 +77,7 @@ class SealError(RuntimeError):
 
 async def run_sealer(driver, cfg, project: str, key: bytes, op: str) -> dict:
     """Stop the project's workspace, then seal or unseal it in a sealer container."""
-    from .driver import Mount, WorkspaceKey
-    from .jobs import spec_for
+    from .driver import Mount, WorkspaceKey, WorkspaceSpec
 
     if op not in ("seal", "unseal"):
         raise ValueError(op)
@@ -89,18 +87,18 @@ async def run_sealer(driver, cfg, project: str, key: bytes, op: str) -> dict:
     await driver.stop(ws)
     await driver.remove(ws)
 
-    base = spec_for(cfg, project)
-    spec = replace(
-        base,
+    # Not spec_for: the project's directory does not exist while it is
+    # sealed, and the sealer mounts the projects root, not the project.
+    spec = WorkspaceSpec(
+        key=WorkspaceKey(project=project, role="sealer", member="seal"),
         # One name per project, not per call: a sealer left running by a
         # control plane that died is found under it and killed before the next
         # seal starts (run_container), rather than racing it. workspace.seal is
         # written to survive being killed at any point, and gVisor would not
         # share the seal's flock between two sealer sandboxes.
-        key=WorkspaceKey(project=project, role="sealer", member="seal"),
+        image=cfg.image,
         storage=Mount(kind="bind", source=cfg.host_projects_root, target=SEALER_ROOT),
-        extra_storage=(), libraries=(), overlays=(), agent_dir=None,
-        env={},
+        resources=cfg.resources,
     )
     out: list[bytes] = []
     result = await driver.run_container(
