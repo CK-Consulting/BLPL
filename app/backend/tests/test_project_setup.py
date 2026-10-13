@@ -661,3 +661,75 @@ def test_a_manual_project_hands_back_no_push_number(unlocked):
     assert out["committed"] is True and "push_seq" not in out
     r = unlocked.post("/api/projects/m/git/commit", json={"message": "x"}).json()
     assert r["push_seq"] is None
+
+
+def test_two_overlapping_saves_get_two_push_numbers(unlocked):
+    """Codex P1 on #19. Numbering read the count and wrote count + 1, so two
+    overlapping requests could both read the same count and hand back the
+    same number. Two real sessions on the suite's database, interleaved: the
+    first increments and holds its transaction open; the second starts while
+    it is open, so a read-then-write would read the count from before the
+    first commits. SQLite lets that read through and makes the write wait for
+    the first commit — exactly the window the race needs — and the atomic
+    UPDATE ... RETURNING, which reads and writes in one statement under the
+    write lock, is what keeps the two numbers apart."""
+    import threading
+    import time
+
+    import app.db
+    from sqlalchemy import select
+
+    from app import autopush
+    from app.models import Project, User
+
+    unlocked.post("/api/projects/init", json=init_body("p", remote=bare_remote(), push_policy="auto"))
+    with app.db.SessionFactory() as s:
+        project_id = s.scalar(select(Project.id).where(Project.name == "p"))
+        user_id = s.scalar(select(User.id).where(User.clerk_user_id == "user_test"))
+
+    first = app.db.SessionFactory()
+    got: dict[str, int | None] = {}
+    a = autopush.request(first, project_id, user_id)
+
+    def second():
+        with app.db.SessionFactory() as s:
+            got["b"] = autopush.request(s, project_id, user_id)
+            s.commit()
+
+    t = threading.Thread(target=second)
+    t.start()
+    time.sleep(0.5)  # the second has read (or is waiting to write) by now
+    first.commit()
+    first.close()
+    t.join(10)
+    assert a is not None and got["b"] is not None
+    assert a != got["b"], "two overlapping requests were handed the same push number"
+    assert {a, got["b"]} == {1, 2}
+
+
+def test_last_push_seq_never_moves_backwards(unlocked):
+    # Recorded out of order (a slow earlier push after a later one), the
+    # higher number stands — computed by the database, not from a copy.
+    import app.db
+    from sqlalchemy import select
+
+    from app import autopush
+    from app.models import Project, ProjectMember, User
+
+    unlocked.post("/api/projects/init", json=init_body("p", remote=bare_remote(), push_policy="auto"))
+    with app.db.SessionFactory() as s:
+        pid = s.scalar(select(Project.id).where(Project.name == "p"))
+        uid = s.scalar(select(User.id).where(User.clerk_user_id == "user_test"))
+        for _ in range(3):
+            autopush.request(s, pid, uid)
+        autopush.record(s, pid, uid, None, seq=3)
+        autopush.record(s, pid, uid, "late failure", seq=1)
+        s.commit()
+        m = s.scalar(select(ProjectMember).where(ProjectMember.project_id == pid, ProjectMember.user_id == uid))
+        assert m.last_push_seq == 3 and m.last_push_error == "late failure"
+        # A manual push answers for everything asked for so far.
+        autopush.request(s, pid, uid)
+        autopush.record(s, pid, uid, None)
+        s.commit()
+        s.refresh(m)
+        assert m.last_push_seq == 4

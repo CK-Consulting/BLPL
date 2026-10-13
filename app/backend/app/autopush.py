@@ -29,7 +29,7 @@ from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
-from sqlalchemy import select
+from sqlalchemy import case, func, update
 from sqlalchemy.orm import Session
 
 from .models import ProjectMember
@@ -161,19 +161,39 @@ def record_now(
         s.commit()
 
 
+def _member(project_id: int, user_id: int):
+    return (ProjectMember.project_id == project_id) & (ProjectMember.user_id == user_id)
+
+
 def request(session: Session, project_id: int, user_id: int) -> int | None:
     """Number the automatic push about to be scheduled for this member, and
-    return it — what the client waits for (see ProjectMember.push_requested)."""
-    m = session.scalar(
-        select(ProjectMember).where(
-            ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
-        )
-    )
-    if m is None:
-        return None
-    m.push_requested = (m.push_requested or 0) + 1
-    session.flush()
-    return m.push_requested
+    return it — what the client waits for (see ProjectMember.push_requested).
+
+    One UPDATE ... RETURNING, not a read and then a write. Read first, two
+    overlapping saves by one member could both see the same count under
+    READ COMMITTED and both hand back the same number; the client then took
+    the second for one it was already waiting on, stopped when the first
+    push's result landed, and a later failure went unseen (Codex, PR #19).
+    The database increments and answers in one statement, so two requests
+    always get two numbers.
+    """
+    seq = session.execute(
+        update(ProjectMember)
+        .where(_member(project_id, user_id))
+        .values(push_requested=func.coalesce(ProjectMember.push_requested, 0) + 1)
+        .returning(ProjectMember.push_requested)
+        .execution_options(synchronize_session=False)
+    ).scalar_one_or_none()
+    _expire_member(session, project_id, user_id)
+    return seq
+
+
+def _expire_member(session: Session, project_id: int, user_id: int) -> None:
+    """A membership this session has already loaded must not keep the values
+    from before an UPDATE made behind the ORM's back (status reads it)."""
+    for obj in list(session.identity_map.values()):
+        if isinstance(obj, ProjectMember) and obj.project_id == project_id and obj.user_id == user_id:
+            session.expire(obj)
 
 
 def record(
@@ -188,21 +208,28 @@ def record(
     pushes everything committed so far, so it answers for every push asked
     for until now. last_push_seq only moves forward: every push sends the
     branch as it stands, so whichever is recorded last speaks for all the
-    commits before it."""
-    m = session.scalar(
-        select(ProjectMember).where(
-            ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
+    commits before it.
+
+    One UPDATE, with the forward-only rule and the "everything asked for so
+    far" both computed by the database from the row as it is when the write
+    happens — not from a copy read earlier, which a concurrent request could
+    have moved on in between (Codex, PR #19). A member removed while the push
+    ran matches no row, and there is nobody to show it to.
+    """
+    answered = seq if seq is not None else func.coalesce(ProjectMember.push_requested, 0)
+    current = func.coalesce(ProjectMember.last_push_seq, 0)
+    session.execute(
+        update(ProjectMember)
+        .where(_member(project_id, user_id))
+        .values(
+            last_push_at=datetime.now(timezone.utc),
+            last_push_ok=error is None,
+            last_push_error=error,
+            last_push_seq=case((current < answered, answered), else_=current),
         )
+        .execution_options(synchronize_session=False)
     )
-    if m is None:
-        # Removed from the project while the push ran. Nothing to show it to.
-        return
-    m.last_push_at = datetime.now(timezone.utc)
-    m.last_push_ok = error is None
-    m.last_push_error = error
-    answered = seq if seq is not None else (m.push_requested or 0)
-    m.last_push_seq = max(m.last_push_seq or 0, answered)
-    session.flush()
+    _expire_member(session, project_id, user_id)
 
 
 def last_push(m: ProjectMember | None) -> dict | None:
