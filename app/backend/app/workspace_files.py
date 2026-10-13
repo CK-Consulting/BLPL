@@ -45,6 +45,18 @@ from .sandbox.agentclient import AgentCallError, AgentClient
 
 enabled = workspaces.enabled
 
+
+def mount_absent() -> bool:
+    """Whether this backend runs without the project mount (phase 4).
+
+    Only with the agent path on: a backend with neither has no way to reach a
+    project at all. Routes that go through the agent pass agent_ready to
+    main._project_dir; any other route answers 503 in this mode instead of
+    reading a directory that is not there."""
+    import os
+
+    return enabled() and os.environ.get("BLPL_PROJECT_MOUNT", "") == "absent"
+
 _ACCESS: workspaces.Access | None = None
 # Agent answers passed to the client as they are. Anything else is the
 # workspace failing, which the client sees as 502.
@@ -117,10 +129,24 @@ def agent(checkout: Path) -> Iterator[AgentClient]:
     try:
         yield client
     except AgentCallError as exc:
-        raise HTTPException(status_code=exc.status if exc.status in _PASS_THROUGH else 502,
-                            detail=str(exc)) from exc
+        raise HTTPException(status_code=_status(exc), detail=str(exc)) from exc
     finally:
         client.close()
+
+
+def _status(exc: AgentCallError) -> int:
+    """The route's status for an agent's refusal.
+
+    The agent refuses every path through a link, and any `..` or `.git`, with
+    403. The routes have always answered a path that leaves the project with
+    400, so that contract holds whichever side checked. A 500 the agent meant
+    (a move that half-failed) passes through; one it did not mean is the
+    workspace failing, 502."""
+    if exc.status == 403 and exc.kind == "forbidden":
+        return 400
+    if exc.status in _PASS_THROUGH or (exc.status == 500 and exc.kind != "error"):
+        return exc.status
+    return 502
 
 
 def _cred(env: dict[str, str] | None) -> dict[str, Any] | None:
@@ -255,8 +281,7 @@ async def accept_upload(checkout: Path, data: bytes, **meta: Any) -> dict:
     try:
         return await asyncio.to_thread(client.accept_upload, str(checkout), data, **meta)
     except AgentCallError as exc:
-        raise HTTPException(status_code=exc.status if exc.status in _PASS_THROUGH else 502,
-                            detail=str(exc)) from exc
+        raise HTTPException(status_code=_status(exc), detail=str(exc)) from exc
     finally:
         client.close()
 
@@ -383,3 +408,114 @@ def commit_checkout(checkout: Path, message: str, identity) -> str | None:
                 raise ProjectError(str(exc)) from exc
             raise
 
+
+# -- phase 4: the rest of the file manager, records, boards, worktrees -------------
+
+
+def _project_errors(exc: AgentCallError) -> None:
+    if exc.kind == "project":
+        raise ProjectError(str(exc)) from exc
+
+
+def ensure_worktree(project_id: str, user_id: int, is_owner: bool) -> Path:
+    """main._project_dir's worktrees.ensure, done in the project's workspace."""
+    from . import main as m
+
+    with agent(m.PROJECTS_ROOT / project_id) as c:
+        try:
+            r = c.worktree_ensure(project_id, user_id, is_owner)
+        except AgentCallError as exc:
+            _project_errors(exc)
+            raise
+    if not r["exists"]:
+        raise HTTPException(
+            status_code=409, detail=f"project {project_id!r} is registered but has no working copy")
+    return Path(r["path"])
+
+
+def managed_rel(name: str) -> str:
+    """The lexical rules of main._managed_path. Whether a parent is a link
+    is the agent's to refuse, and it refuses every link."""
+    parts = [seg for seg in name.split("/") if seg]
+    if (not parts or "\\" in name or name.startswith("/")
+            or any(seg == ".." or seg.startswith(".") for seg in parts)):
+        raise HTTPException(status_code=400, detail=f"invalid path {name!r}")
+    if "retrieved" in parts:
+        raise HTTPException(status_code=400, detail=(
+            "files under retrieved/ are held by quarantine and kept as "
+            "evidence — they cannot be deleted or moved from here"))
+    return "/".join(parts)
+
+
+def delete(checkout: Path, rel: str) -> dict:
+    with agent(checkout) as c:
+        return c.managed_delete(str(checkout), rel)
+
+
+def move(checkout: Path, src: str, dst: str) -> dict:
+    with agent(checkout) as c:
+        return c.managed_move(str(checkout), src, dst)
+
+
+def ignore_entries(checkout: Path) -> list[dict]:
+    with agent(checkout) as c:
+        return c.ignore_entries(str(checkout))
+
+
+def ignore_set(checkout: Path, path: str, ignored: bool, by: str) -> dict:
+    with agent(checkout) as c:
+        return c.ignore_set(str(checkout), path, ignored, by)
+
+
+def quarantine_view(checkout: Path) -> dict:
+    with agent(checkout) as c:
+        return c.quarantine_view(str(checkout))
+
+
+def manifest(checkout: Path):
+    """What main._resolve_board reads from project_manifest.discover."""
+    from blpl.core import project_manifest
+
+    with agent(checkout) as c:
+        try:
+            r = c.project_boards(str(checkout))
+        except AgentCallError as exc:
+            if exc.kind == "manifest":
+                raise project_manifest.ManifestError(str(exc)) from exc
+            raise
+    boards = [SimpleNamespace(name=n) for n in r["boards"]]
+    return SimpleNamespace(implicit=r["implicit"], boards=boards,
+                           board=lambda n: next((b for b in boards if b.name == n), None))
+
+
+def list_artifacts(checkout: Path) -> list[dict]:
+    """The files directly in .pipeline/, as main._artifact_meta describes them."""
+    with agent(checkout) as c:
+        try:
+            listing = c.list(str(checkout), ".pipeline", max_depth=0)
+        except AgentCallError as exc:
+            if exc.status == 404:
+                return []
+            raise
+    out = []
+    for e in listing["entries"]:
+        if e["dir"] or "/" in e["path"][len(".pipeline/"):]:
+            continue
+        ts = e.get("btime") or e["mtime"]
+        out.append({"name": e["name"], "size": e["bytes"],
+                    "created": datetime.fromtimestamp(ts, tz=timezone.utc)
+                    .strftime("%Y-%m-%d_%H%M%SZ")})
+    return out
+
+
+def read_artifact(checkout: Path, name: str) -> bytes | None:
+    parts = [p for p in name.split("/") if p]
+    if not parts or ".." in parts or name.startswith("/"):
+        return None
+    with agent(checkout) as c:
+        try:
+            return c.read(str(checkout), ".pipeline/" + "/".join(parts))
+        except AgentCallError as exc:
+            if exc.status in (403, 404):
+                return None
+            raise

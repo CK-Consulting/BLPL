@@ -61,7 +61,8 @@ def test_workspace_bakes_in_no_secret_and_no_control_plane():
     # nothing else: no routes, no database, no key handling.
     copied = [ln.split()[1] for ln in _instructions(text) if ln.startswith("COPY ")]
     from_app = sorted(c for c in copied if c.startswith("app/"))
-    assert from_app == ["app/backend/app/projects.py", "app/backend/app/sandbox/agent.py"]
+    assert from_app == ["app/backend/app/llm_ignore.py", "app/backend/app/projects.py",
+                        "app/backend/app/sandbox/agent.py", "app/backend/app/worktrees.py"]
     for ln in _instructions(text):
         if ln.startswith(("ENV ", "ARG ")):
             assert not re.search(r"(KEY|SECRET|TOKEN|PASS)\w*=", ln.split("#")[0]), ln

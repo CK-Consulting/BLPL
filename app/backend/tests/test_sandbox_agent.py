@@ -389,3 +389,36 @@ def test_a_held_push_that_fails_still_holds_and_reports(ag, projects):
     r = c.git_push_held(B(projects), "file:///nowhere.git", None)
     assert r["lease"] and "no remote" in r["error"]
     c.git_release(r["lease"])
+
+
+# -- phase 4 verbs ---------------------------------------------------------------------------
+
+
+def test_a_members_worktree_is_created_in_the_workspace(ag, projects):
+    _, c, _ = ag
+    board = projects / "board"
+    _git(board, "init", "-q", "-b", "main")
+    subprocess.run(["git", "-C", str(board), "commit", "-q", "--allow-empty", "-m", "init"],
+                   check=True, env={**os.environ, "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@b",
+                                    "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@b"})
+    owner = c.worktree_ensure("board", 1, True)
+    assert owner == {"path": str(board), "exists": True}
+    member = c.worktree_ensure("board", 9, False)
+    assert member["exists"] and member["path"].startswith(str(projects / ".worktrees" / "board"))
+    with pytest.raises(AgentCallError) as e:
+        c.worktree_ensure("victim", 9, False)  # another project's: not this workspace's
+    assert e.value.status == 403
+    with pytest.raises(AgentCallError):
+        c.worktree_ensure("../victim", 9, False)
+
+
+def test_moving_or_deleting_a_link_out_of_the_project_is_refused(ag, projects):
+    _, c, _ = ag
+    (projects / "board" / "out").symlink_to(projects / "victim")
+    for call in (lambda: c.managed_delete(B(projects), "out"),
+                 lambda: c.managed_move(B(projects), "out", "elsewhere")):
+        with pytest.raises(AgentCallError) as e:
+            call()
+        assert e.value.status == 403
+    assert (projects / "board" / "out").is_symlink()
+    assert (projects / "victim" / "secret.md").exists()

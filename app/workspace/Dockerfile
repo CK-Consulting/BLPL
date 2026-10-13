@@ -100,13 +100,19 @@ USER ${BLPL_UID}:${BLPL_GID}
 LABEL org.opencontainers.image.title="blpl-workspace" \
       org.opencontainers.image.description="BLPL per-project workspace (headless KiCad + pipeline)"
 
-# The workspace agent (phase 3): the control plane's one way in. Two files of
-# the backend, both stdlib only. agent.py is the server. projects.py is the
-# backend's git layer, so status, commit, pull and push behave exactly as they
-# do there. Nothing else of the control plane is in this image. Root-owned and
-# on the read-only rootfs, so a run cannot replace either file.
+# The workspace agent (phases 3 and 4): the control plane's one way in.
+# agent.py is the server. Beside it, as the `app` package it imports them
+# from, the three backend modules it drives, each stdlib only (plus the
+# pipeline's quarantine): projects.py (git: status, commit, pull, push),
+# llm_ignore.py (the ignore list a move or delete keeps up to date) and
+# worktrees.py (a member's checkout). They behave here exactly as in the
+# backend because they are the same files. Nothing else of the control plane is
+# in this image. Root-owned and on the read-only rootfs, so a run cannot
+# replace any of them.
 COPY app/backend/app/sandbox/agent.py /opt/blpl/wsagent/agent.py
-COPY app/backend/app/projects.py /opt/blpl/wsagent/projects.py
+COPY app/backend/app/projects.py /opt/blpl/wsagent/app/projects.py
+COPY app/backend/app/llm_ignore.py /opt/blpl/wsagent/app/llm_ignore.py
+COPY app/backend/app/worktrees.py /opt/blpl/wsagent/app/worktrees.py
 
 # The agent serves when the control plane gave it a directory and a token
 # (/run/blpl). Without them (a phase 2 workspace) it only holds the container
