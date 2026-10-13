@@ -582,3 +582,37 @@ def test_a_second_start_for_the_same_run_id_follows_the_first(ag, projects, tmp_
     out, code = _wait(c, "run_42")
     assert code == 0 and out.strip().endswith(b"done")
     assert marker.read_text() == "x\n", "the process was started twice"
+
+
+def test_an_upload_in_a_workspace_is_held_when_its_scanner_is_unreachable(ag, projects, monkeypatch):
+    """The control plane requires a scan; the workspace gets its settings and
+    a scanner it cannot reach. The file is held, not released (Codex, PR #20)."""
+    pytest.importorskip("blpl.core.quarantine")
+    from app.sandbox import jobs
+
+    for name in ("BLPL_CLAMD_SOCKET", "BLPL_CLAMD_HOST", "BLPL_CLAMD_PORT",
+                 "BLPL_QUARANTINE_REQUIRE_SCAN"):
+        monkeypatch.delenv(name, raising=False)
+    ws = jobs.workspace_env({"BLPL_CLAMD_HOST": "clamav.invalid", "BLPL_CLAMD_PORT": "3310",
+                             "BLPL_QUARANTINE_REQUIRE_SCAN": "1"})
+    for name, value in ws.items():
+        monkeypatch.setenv(name, value)
+    _, c, _ = ag
+    res = c.accept_upload(B(projects), b"vendor layout notes\n", original_name="notes.txt",
+                          kind="reference", uploaded_by="", mpn="", llm_ignore=False)
+    assert res["state"] == "held" and res["path"] is None
+    assert res["scan"] in ("unscanned", "error")
+    assert not (projects / "board" / "references").exists()
+
+
+def test_the_control_planes_requirement_holds_even_where_the_workspace_was_not_told(
+        ag, projects, monkeypatch):
+    """A workspace created before the policy crossed keeps its old environment;
+    the requirement sent with the request still holds the file."""
+    pytest.importorskip("blpl.core.quarantine")
+    for name in ("BLPL_CLAMD_SOCKET", "BLPL_CLAMD_HOST", "BLPL_QUARANTINE_REQUIRE_SCAN"):
+        monkeypatch.delenv(name, raising=False)
+    _, c, _ = ag
+    res = c.accept_upload(B(projects), b"notes\n", original_name="n.txt", kind="reference",
+                          uploaded_by="", mpn="", llm_ignore=False, require_scan="1")
+    assert res["state"] == "held" and res["path"] is None

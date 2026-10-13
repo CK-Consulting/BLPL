@@ -277,6 +277,15 @@ def blob(checkout: Path, rel: str) -> Response:
 async def accept_upload(checkout: Path, data: bytes, **meta: Any) -> dict:
     """quarantine.accept_upload, run in the workspace: inspection and scanning
     of an untrusted file happen beside the project, not in the control plane."""
+    import os
+
+    from .sandbox.runpath import requires_scan
+
+    # Said on every request, not left to the workspace's environment: the
+    # control plane's policy decides, and a workspace older than this setting,
+    # or one that cannot reach the scanner, then holds rather than releases.
+    if requires_scan(os.environ):
+        meta["require_scan"] = "1"
     client = await asyncio.to_thread(_connect, checkout)
     try:
         return await asyncio.to_thread(client.accept_upload, str(checkout), data, **meta)

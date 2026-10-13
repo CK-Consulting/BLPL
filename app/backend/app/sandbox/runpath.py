@@ -48,11 +48,54 @@ RUN_ENV_ALLOW = frozenset({
 })
 
 
+_TRUE = ("1", "true", "yes", "on")
+_LOOPBACK = ("localhost", "127.", "::1", "0.0.0.0")
+
+
+def scan_policy(source: Mapping[str, str]) -> dict[str, str]:
+    """The quarantine settings a workspace or run must carry, from source.
+
+    Forwarding the scanner's address is not enough on its own. A control plane
+    that scans through ``BLPL_CLAMD_SOCKET``, or a clamd on its own loopback,
+    has a scanner no workspace can reach; the workspace's ``blpl.core.av``
+    would report ``unscanned`` and, with no requirement set, release what the
+    control plane would have scanned (Codex, PR #20: an upload in an agent
+    workspace failed open). So whenever the control plane requires a scan, or
+    relies on a scanner that cannot cross, the copy says to require one: an
+    unreachable scanner then holds the file instead of waving it through.
+    """
+    out: dict[str, str] = {}
+    host = source.get("BLPL_CLAMD_HOST", "").strip()
+    reachable = bool(host) and not host.lower().startswith(_LOOPBACK)
+    if reachable:
+        out["BLPL_CLAMD_HOST"] = host
+        if source.get("BLPL_CLAMD_PORT"):
+            out["BLPL_CLAMD_PORT"] = source["BLPL_CLAMD_PORT"]
+    required = source.get("BLPL_QUARANTINE_REQUIRE_SCAN", "").strip().lower() in _TRUE
+    stranded = bool(source.get("BLPL_CLAMD_SOCKET") or host) and not reachable
+    if required or stranded:
+        out["BLPL_QUARANTINE_REQUIRE_SCAN"] = "1"
+    elif "BLPL_QUARANTINE_REQUIRE_SCAN" in source:
+        out["BLPL_QUARANTINE_REQUIRE_SCAN"] = source["BLPL_QUARANTINE_REQUIRE_SCAN"]
+    return out
+
+
+def requires_scan(source: Mapping[str, str]) -> bool:
+    """Whether what scan_policy hands a workspace holds an unscanned file."""
+    return scan_policy(source).get("BLPL_QUARANTINE_REQUIRE_SCAN") == "1"
+
+
 def run_env(
     source: Mapping[str, str], inject: Mapping[str, str] | None = None
 ) -> dict[str, str]:
-    """A run's environment: the allowlisted part of source, plus inject."""
-    env = {k: v for k, v in source.items() if k in RUN_ENV_ALLOW}
+    """A run's environment: the allowlisted part of source, plus inject.
+
+    The scanner settings are not copied as they stand but through
+    scan_policy, so a run never releases a fetched file that the control
+    plane's own policy would have held."""
+    env = {k: v for k, v in source.items()
+           if k in RUN_ENV_ALLOW and not k.startswith(("BLPL_CLAMD_", "BLPL_QUARANTINE_"))}
+    env.update(scan_policy(source))
     for name, value in (inject or {}).items():
         if not name or "=" in name or "\0" in name or "\0" in value:
             raise ValueError(f"invalid environment name {name!r}")

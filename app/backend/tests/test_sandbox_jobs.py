@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from app.sandbox import jobs
+from app.sandbox import jobs, runpath
 from app.sandbox.docker import DockerConfig, build_create_body
 from app.sandbox.fake import FakeDriver
 from app.sandbox.policy import ProxyPolicy, Refused
@@ -369,3 +369,51 @@ def test_a_reclaimed_run_container_is_followed_and_not_snapshotted_again(tmp_pat
         log=lines.append, poll=poll, snapshot=snap))
     assert code == 0 and "first attempt finished" in "".join(lines)
     assert snaps == [] and ("reattach", spec.key) in d.ops and d.calls == []
+
+
+# -- what crosses into a workspace: the quarantine policy (Codex, PR #20) ---------
+
+
+SCANNING = {
+    "BLPL_SANDBOX_HOST_PROJECTS": HOST,
+    "BLPL_SANDBOX_HTTP_PROXY": "http://squid:3128",
+    "BLPL_SANDBOX_NO_PROXY": "localhost,127.0.0.1",
+    "BLPL_CLAMD_HOST": "clamav",
+    "BLPL_CLAMD_PORT": "3310",
+    "BLPL_QUARANTINE_REQUIRE_SCAN": "1",
+    "OLLAMA_HOST": "http://ollama:11434",
+}
+
+
+def test_a_workspace_carries_the_scanner_and_the_requirement_to_use_it(tmp_path):
+    (tmp_path / "projects" / "pathfinder").mkdir(parents=True)
+    c = jobs.WorkspaceRunConfig.from_env({**SCANNING, "BLPL_PROJECTS_ROOT": str(tmp_path / "projects")})
+    env = jobs.spec_for(c, "pathfinder").env
+    assert env["BLPL_CLAMD_HOST"] == "clamav" and env["BLPL_CLAMD_PORT"] == "3310"
+    assert env["BLPL_QUARANTINE_REQUIRE_SCAN"] == "1"
+    # clamd is not HTTP and ollama is not on the far side of squid, whatever
+    # the operator listed.
+    no_proxy = env["NO_PROXY"].split(",")
+    assert {"clamav", "ollama", "localhost"} <= set(no_proxy)
+    assert env["no_proxy"] == env["NO_PROXY"]
+
+
+def test_a_scanner_the_workspace_cannot_reach_makes_it_hold_rather_than_release():
+    for source in ({"BLPL_CLAMD_SOCKET": "/run/clamd/clamd.sock"},
+                   {"BLPL_CLAMD_HOST": "127.0.0.1"},
+                   {"BLPL_CLAMD_HOST": "localhost", "BLPL_QUARANTINE_REQUIRE_SCAN": "0"}):
+        env = jobs.workspace_env(source)
+        assert env["BLPL_QUARANTINE_REQUIRE_SCAN"] == "1", source
+        assert "BLPL_CLAMD_HOST" not in env and "BLPL_CLAMD_SOCKET" not in env
+        # The same rule for a run's own environment.
+        assert runpath.run_env(source)["BLPL_QUARANTINE_REQUIRE_SCAN"] == "1"
+    # No scanner and no requirement on the control plane: nothing to keep.
+    assert jobs.workspace_env({}) == {}
+    # A reachable scanner without a requirement crosses as the operator set it.
+    env = jobs.workspace_env({"BLPL_CLAMD_HOST": "clamav", "BLPL_QUARANTINE_REQUIRE_SCAN": "0"})
+    assert env == {"BLPL_CLAMD_HOST": "clamav", "BLPL_QUARANTINE_REQUIRE_SCAN": "0"}
+
+
+def test_the_remote_policy_reaches_the_agent_that_enforces_it():
+    env = jobs.workspace_env({"BLPL_GIT_ALLOWED_PROTOCOLS": "https"})
+    assert env["BLPL_GIT_ALLOWED_PROTOCOLS"] == "https"

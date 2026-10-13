@@ -138,6 +138,56 @@ def _pairs(raw: str) -> list[tuple[str, str]]:
     return out
 
 
+# Policy the control plane decides and code inside a workspace container reads.
+# Each crosses because dropping it changes what that code does without saying
+# so; see the audit in docs/architecture-v2.md ("What crosses into a
+# workspace"). The scanner settings go through runpath.scan_policy instead.
+_WORKSPACE_POLICY = (
+    "BLPL_GIT_ALLOWED_PROTOCOLS",  # projects.validate_remote_url, GIT_ALLOW_PROTOCOL
+)
+
+
+def _host_of(value: str) -> str:
+    """The host in an address given as a URL, host:port, or bare host."""
+    from urllib.parse import urlsplit
+
+    value = value.strip()
+    if not value:
+        return ""
+    return urlsplit(value if "//" in value else f"//{value}").hostname or ""
+
+
+def workspace_env(env: Mapping[str, str]) -> dict[str, str]:
+    """The environment a workspace container is created with.
+
+    The proxy, the scanner and the remote policy. Without the scanner and its
+    requirement an upload accepted by the agent was scanned by nothing and,
+    with nothing requiring a scan, released (Codex, PR #20). NO_PROXY always
+    names the scanner and the model server, whatever the operator listed:
+    clamd does not speak HTTP, and an SDK that honours HTTPS_PROXY would send
+    a local model's traffic to squid, which refuses it.
+    """
+    from .runpath import scan_policy
+
+    out: dict[str, str] = {}
+    proxy = env.get("BLPL_SANDBOX_HTTP_PROXY", "")
+    if proxy:
+        out.update(HTTPS_PROXY=proxy, HTTP_PROXY=proxy, https_proxy=proxy, http_proxy=proxy)
+        hosts = [h for h in re.split(r"[\s,]+", env.get("BLPL_SANDBOX_NO_PROXY",
+                                                           "localhost,127.0.0.1")) if h]
+        for extra in (_host_of(env.get("BLPL_CLAMD_HOST", "")),
+                      _host_of(env.get("OLLAMA_HOST", ""))):
+            if extra and extra not in hosts:
+                hosts.append(extra)
+        no_proxy = ",".join(hosts)
+        out.update(NO_PROXY=no_proxy, no_proxy=no_proxy)
+    out.update(scan_policy(env))
+    for name in _WORKSPACE_POLICY:
+        if name in env:
+            out[name] = env[name]
+    return out
+
+
 @dataclass(frozen=True)
 class WorkspaceRunConfig:
     image: str
@@ -164,13 +214,7 @@ class WorkspaceRunConfig:
             Mount(kind="bind", source=h, target=t, read_only=True)
             for h, t in _pairs(env.get("BLPL_SANDBOX_LIBRARIES", ""))
         )
-        ws_env = {}
-        proxy = env.get("BLPL_SANDBOX_HTTP_PROXY", "")
-        if proxy:
-            ws_env.update(HTTPS_PROXY=proxy, HTTP_PROXY=proxy, https_proxy=proxy,
-                          http_proxy=proxy)
-            no_proxy = env.get("BLPL_SANDBOX_NO_PROXY", "localhost,127.0.0.1")
-            ws_env.update(NO_PROXY=no_proxy, no_proxy=no_proxy)
+        ws_env = workspace_env(env)
         return cls(
             image=env.get("BLPL_WORKSPACE_IMAGE", "blpl-workspace:dev"),
             projects_root=Path(env.get("BLPL_PROJECTS_ROOT", "/app/data/projects")),
