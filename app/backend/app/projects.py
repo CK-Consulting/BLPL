@@ -1125,8 +1125,12 @@ class Projects:
         empty = not proc.stdout.strip()
         refused = self._probe_write(url, net, branch)
         if refused is not None:
-            return refused
-        return RemoteProbe("ok", empty=empty, message="")
+            # The write result, with the read result kept beside it.
+            return RemoteProbe(
+                refused.status, empty=empty, message=refused.message,
+                readable=True, writable=False,
+            )
+        return RemoteProbe("ok", empty=empty, message="", readable=True, writable=True)
 
     #: How long either probe waits for the remote before saying it did not answer.
     PROBE_TIMEOUT = 60
@@ -1304,11 +1308,31 @@ _WRITE_REFUSALS = (
 
 @dataclass(frozen=True)
 class RemoteProbe:
+    """What probing a remote found. Reading and writing are separate facts.
+
+    ``status`` is the one-word summary for the UI; ``readable`` and ``empty``
+    come from ls-remote and ``writable`` from the write check, each kept on
+    its own. They used to share ``status``, so a write refusal replaced the
+    read result: a non-empty repository the credential could only read came
+    back as ``read_only`` with ``empty`` unset, and creation — which checked
+    emptiness only for ``ok`` — made a project whose history diverged from
+    the remote's at once (Codex, PR #19).
+    """
+
     #: ok | auth_failed | not_found | read_only | error
     status: str
-    #: The remote holds no refs at all. Only meaningful when status is ok.
+    #: The remote holds no refs at all. Meaningful only when it was readable.
     empty: bool
     message: str
+    #: ls-remote succeeded. None means "not recorded" (results built by hand,
+    #: as some tests do), read as status == "ok".
+    readable: bool | None = None
+    #: The write check passed (True), refused (False), or did not run (None).
+    writable: bool | None = None
+
+    @property
+    def can_read(self) -> bool:
+        return self.readable if self.readable is not None else self.status == "ok"
 
 
 # Substrings of git's stderr, lowercased, that mean the credential was the

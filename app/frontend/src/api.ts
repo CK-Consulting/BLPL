@@ -468,6 +468,9 @@ export type RemoteCheck = {
   detail: string;
   /** The saved credential that was used, when one matched the host. */
   credential: string | null;
+  /** The write check's own answer, separate from readability and emptiness:
+   *  true, false, or null when it did not run. */
+  writable?: boolean | null;
 };
 
 export type NewProjectDefaults = {

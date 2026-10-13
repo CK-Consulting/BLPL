@@ -1972,9 +1972,13 @@ def check_remote(
     return {
         "status": probe.status,
         "ok": probe.status == "ok",
-        "empty": probe.empty if probe.status == "ok" else None,
+        # From the read result alone, whatever the write check said: a remote
+        # with history cannot become a new project however writable it is,
+        # and a read-only credential must not hide that it has history.
+        "empty": probe.empty if probe.can_read else None,
+        "writable": probe.writable,
         "message": (
-            _NOT_EMPTY if probe.status == "ok" and not probe.empty
+            _NOT_EMPTY if probe.can_read and not probe.empty
             else _PROBE_SENTENCES[probe.status]
         ),
         "detail": detail,
@@ -2122,6 +2126,12 @@ def init_project(
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=autopush.scrub(str(exc), [body.token or ""]))
     warning = ""
+    # Emptiness first, and from the read result alone: a credential that
+    # cannot write must not make a non-empty remote look acceptable (Codex,
+    # PR #19). A project created over existing history diverges from it at
+    # once.
+    if probe.can_read and not probe.empty:
+        raise HTTPException(status_code=409, detail=_NOT_EMPTY)
     if probe.status == "read_only" and policy == "manual":
         # Manual pushing over a credential that cannot write is allowed — the
         # owner may fix the token before the first push — and said, as for a
@@ -2137,8 +2147,6 @@ def init_project(
             status_code=400,
             detail=f"{_PROBE_SENTENCES[probe.status]} {detail}".strip(),
         )
-    if probe.status == "ok" and not probe.empty:
-        raise HTTPException(status_code=409, detail=_NOT_EMPTY)
 
     token = (body.token or "").strip()
     if token:

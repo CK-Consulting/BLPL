@@ -363,3 +363,23 @@ def test_the_write_check_aims_at_the_branch_that_will_be_pushed(tmp_path, monkey
     assert argv[-1].endswith(f":refs/heads/{branch}")
     # And still writes nothing.
     assert real(["git", "for-each-ref"], cwd=remote, capture_output=True, text=True).stdout == ""
+
+
+# -- reading and writing are separate facts; validation before side effects --
+
+
+def test_a_non_empty_remote_is_refused_even_when_the_credential_cannot_write(unlocked, http_remote):
+    # Codex P1 on #19: the write refusal replaced the read result, the
+    # emptiness check ran only for "ok", and a manual project was created over
+    # existing history.
+    import app.main as main
+
+    url, repo = http_remote
+    _seed(repo)
+    r = unlocked.post("/api/projects/init", json=init_body("p", remote=url))
+    assert r.status_code == 409 and "already has commits" in r.json()["detail"]
+    assert not (main.PROJECTS_ROOT / "p").exists()
+
+    body = unlocked.post("/api/projects/check-remote", json={"url": url}).json()
+    assert body["empty"] is False and body["writable"] is False
+    assert "already has commits" in body["message"]
