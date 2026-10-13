@@ -837,12 +837,40 @@ class Projects:
         env: dict[str, str] | None = None,
         checkout: Path | None = None,
         url: str | None = None,
+        after=None,
     ) -> str:
+        """Push the checkout's branch. ``after``, when given, is called with
+        None or the ProjectError while the origin lock is still held.
+
+        That is how a push's outcome gets recorded. Written after the lock was
+        released, two overlapping pushes could record out of order: an earlier
+        success, descheduled between the lock and its write, landed after a
+        later failure and hid that the newest commit was unpublished (Codex,
+        PR #19). Under the lock, results are written in the order the pushes
+        ran, because the next push cannot start until this one has written.
+        """
         d = self._checkout(name, checkout)
         # Held across the push and the tracking-ref write after it, which is
         # what set_remote clears (see _remote_lock).
         with self._remote_lock(d, self.NETWORK_LOCK_WAIT, _BUSY):
-            return self._push_locked(d, url, env)
+            try:
+                out = self._push_locked(d, url, env)
+            except ProjectError as exc:
+                if after is not None:
+                    after(exc)
+                raise
+            if after is not None:
+                after(None)
+            return out
+
+    def under_remote_lock(self, checkout: Path, fn):
+        """Run ``fn`` holding the checkout's origin lock, as a push does.
+
+        For recording an outcome that never reached ``push`` — a credential
+        that could not be leased, a remote that could not be resolved — in the
+        same order as the outcomes that did."""
+        with self._remote_lock(Path(checkout), self.NETWORK_LOCK_WAIT, _BUSY):
+            return fn()
 
     def _push_locked(self, d: Path, url: str | None, env: dict[str, str] | None) -> str:
         if not self._primary_remote(d):

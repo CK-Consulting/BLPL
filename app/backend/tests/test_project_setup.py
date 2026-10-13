@@ -454,3 +454,61 @@ def test_a_clone_without_save_as_default_leaves_the_default_alone(unlocked, tmp_
     remote = _remote_with_history(tmp_path)
     unlocked.post("/api/projects/clone", json=clone_body("c", remote))
     assert unlocked.get("/api/me/git-identity").json()["identity"]["email"] == "test@example.com"
+
+
+def test_overlapping_pushes_record_in_the_order_they_ran(unlocked, pushes, monkeypatch):
+    """Codex P1 on #19. Two automatic pushes for one member: the first
+    succeeds, the second fails. If the first records its success after
+    letting go of the origin lock, the second can push, fail and record in
+    between, and the late success then hides that the newest commit is
+    unpublished. Driven step by step: the first push's record is held open
+    until the second has had every chance to run."""
+    import threading
+
+    import app.autopush as autopush_mod
+    import app.main as main
+    from app.projects import ProjectError
+
+    unlocked.post("/api/projects/init", json=init_body("p", remote=bare_remote(), push_policy="auto"))
+    pushes.run()
+    unlocked.put("/api/projects/p/files/a.md", json={"content": "a\n"})
+    unlocked.put("/api/projects/p/files/b.md", json={"content": "b\n"})
+    first, second = pushes.jobs
+    pushes.jobs = []
+
+    real_push = main.projects._push_locked
+    calls = {"n": 0}
+
+    def push_locked(d, url, env):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ProjectError("rejected: the second push failed")
+        return real_push(d, url, env)
+
+    monkeypatch.setattr(main.projects, "_push_locked", push_locked)
+
+    real_record = autopush_mod.record
+    first_recording = threading.Event()
+    release = threading.Event()
+
+    def record(session, project_id, user_id, error):
+        if error is None and not first_recording.is_set():
+            first_recording.set()
+            release.wait(10)
+        return real_record(session, project_id, user_id, error)
+
+    monkeypatch.setattr(autopush_mod, "record", record)
+
+    a = threading.Thread(target=first)
+    a.start()
+    assert first_recording.wait(10)
+    b = threading.Thread(target=second)
+    b.start()
+    b.join(1.5)  # with the fix, b is waiting on the lock a still holds
+    release.set()
+    a.join(30)
+    b.join(30)
+
+    st = unlocked.get("/api/projects/p/git/status").json()
+    assert st["last_push"]["ok"] is False, "a stale success overwrote the newer failure"
+    assert "second push failed" in st["last_push"]["error"]

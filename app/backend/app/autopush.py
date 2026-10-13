@@ -25,6 +25,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime, timezone
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -97,30 +98,65 @@ def push_now(
     url: str,
     cred,
     master_key: bytes | None,
+    record: Callable[[str | None], None],
 ) -> str | None:
-    """Push ``checkout`` to ``url`` with ``cred`` leased. None on success, else
-    the reason, already scrubbed. Never raises: the caller is a background
-    thread with nobody to raise to."""
+    """Push ``checkout`` to ``url`` with ``cred`` leased, and ``record`` the
+    outcome while the origin lock is held (see Projects.push for why). None on
+    success, else the reason, already scrubbed. Never raises: the caller is a
+    background thread with nobody to raise to."""
     from . import gitstore
 
     secrets: list[str] = []
+    recorded = False
+
+    def safe_record(error: str | None) -> None:
+        nonlocal recorded
+        recorded = True
+        try:
+            record(error)
+        except Exception:  # noqa: BLE001 — nowhere left to report it but the log
+            logger.exception("could not record the automatic push of %s", project_name)
+
+    def after(exc: ProjectError | None) -> None:
+        safe_record(None if exc is None else scrub(str(exc), secrets))
+
+    error: str | None = None
     try:
         if cred is not None and master_key is None:
-            return (
+            error = (
                 "your session was locked, so the saved credential for this remote "
                 "could not be used — unlock and press Push"
             )
-        lease = gitstore.lease(master_key, cred) if cred is not None else nullcontext(None)
-        with lease as leased:
-            env = leased.env if leased is not None else None
-            secrets = [v for k, v in (env or {}).items() if k == "GIT_HTTP_TOKEN"]
-            projects.push(project_name, env=env, checkout=checkout, url=url)
-        return None
+        else:
+            lease = gitstore.lease(master_key, cred) if cred is not None else nullcontext(None)
+            with lease as leased:
+                env = leased.env if leased is not None else None
+                secrets.extend(v for k, v in (env or {}).items() if k == "GIT_HTTP_TOKEN")
+                projects.push(project_name, env=env, checkout=checkout, url=url, after=after)
     except ProjectError as exc:
-        return scrub(str(exc), secrets)
+        error = scrub(str(exc), secrets)
     except Exception as exc:  # noqa: BLE001 — recorded, not lost in a thread
         logger.exception("automatic push of %s failed unexpectedly", project_name)
-        return scrub(f"{type(exc).__name__}: {exc}", secrets)
+        error = scrub(f"{type(exc).__name__}: {exc}", secrets)
+    if not recorded:
+        # Failed before reaching the push (or the lock was never had): still
+        # recorded in lock order, unless the lock is what could not be had.
+        try:
+            projects.under_remote_lock(checkout, lambda: safe_record(error))
+        except Exception:  # noqa: BLE001
+            if not recorded:
+                safe_record(error)
+    return error
+
+
+def record_now(project_id: int, user_id: int, error: str | None) -> None:
+    """``record`` in a session of its own, committed at once — for a write
+    made under the origin lock, which must be durable before the lock goes."""
+    from .db import SessionFactory
+
+    with SessionFactory() as s:
+        record(s, project_id, user_id, error)
+        s.commit()
 
 
 def record(session: Session, project_id: int, user_id: int, error: str | None) -> None:

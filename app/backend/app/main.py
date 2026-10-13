@@ -2969,20 +2969,29 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
     # the commit it made rather than the owner's branch.
     checkout = _project_dir(session, user, project_id)
     project = _project_or_404(session, user, project_id)
+    project_id_, user_id = project.id, user.id
+    recorded = False
+
+    def after(exc: ProjectError | None) -> None:
+        # Recorded as an automatic push's outcome is — under the origin lock,
+        # in a session of its own committed before the lock goes — so the
+        # strip shows one state whichever way the push was started, and an
+        # overlapping automatic push cannot record out of order with it. A
+        # success clears a failure an automatic push left behind.
+        nonlocal recorded
+        recorded = True
+        autopush.record_now(
+            project_id_, user_id, None if exc is None else autopush.scrub(str(exc), [])
+        )
+
     try:
         dest = projects.remote_of(project_id, operation="push", checkout=checkout)
         with _git_credentials(session, master_key, user, dest) as env:
-            out = projects.push(project_id, env=env, checkout=checkout, url=dest)
+            out = projects.push(project_id, env=env, checkout=checkout, url=dest, after=after)
     except ProjectError as exc:
-        # Recorded as an automatic push's failure would be, so the strip shows
-        # one state whichever way the push was started. Committed on its own:
-        # the 400 below rolls the request's session back.
-        with SessionFactory() as s:
-            autopush.record(s, project.id, user.id, autopush.scrub(str(exc), []))
-            s.commit()
+        if not recorded:
+            autopush.record_now(project_id_, user_id, autopush.scrub(str(exc), []))
         raise HTTPException(status_code=400, detail=str(exc))
-    # A success clears a failure an automatic push left behind.
-    autopush.record(session, project.id, user.id, None)
     return {"ok": True, "output": out}
 
 
@@ -3754,9 +3763,7 @@ def _schedule_autopush(
     project_id, user_id, name = project.id, user.id, project.name
 
     def record(error: str | None) -> None:
-        with SessionFactory() as s:
-            autopush.record(s, project_id, user_id, error)
-            s.commit()
+        autopush.record_now(project_id, user_id, error)
 
     try:
         url = projects.remote_of(name, operation="push", checkout=checkout)
@@ -3771,13 +3778,11 @@ def _schedule_autopush(
         return
 
     def job() -> None:
-        error = autopush.push_now(projects, name, checkout, url, cred, master_key)
+        # The outcome is recorded inside push_now, under the origin lock, so
+        # overlapping pushes record in the order they ran.
+        error = autopush.push_now(projects, name, checkout, url, cred, master_key, record)
         if error:
             logger.warning("automatic push of %s for user %s failed: %s", name, user_id, error)
-        try:
-            record(error)
-        except Exception:  # noqa: BLE001 — nowhere left to report it but the log
-            logger.exception("could not record the automatic push of %s", name)
 
     # Started once the request's transaction has ended, not now. The outcome
     # is recorded on the member's row from another session, and for a project
