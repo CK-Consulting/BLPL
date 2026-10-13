@@ -304,3 +304,38 @@ def test_a_range_run_keeps_every_tasks_chain_and_exactly_their_keys():
     env = run_env({**queued, "BLPL_EXTRACT_MAX_TOKENS": "32000"}, got)
     assert env["HDM_LLM_CHAINS"] and env["BLPL_EXTRACT_MAX_TOKENS"] == "32000"
 
+
+def test_a_run_container_gets_each_worktree_on_its_own_and_its_gitfile_read_only(tmp_path):
+    c = cfg(tmp_path)
+    root = tmp_path / "projects"
+    (root / "pathfinder" / ".git").mkdir(parents=True)
+    for m in ("u7", "u9"):
+        (root / ".worktrees" / "pathfinder" / m).mkdir(parents=True)
+        (root / ".worktrees" / "pathfinder" / m / ".git").write_text("gitdir: x\n")
+    spec = jobs.run_spec_for(c, "pathfinder", "r1")
+    assert [m.source for m in spec.extra_storage] == [
+        f"{HOST}/.worktrees/pathfinder/u7", f"{HOST}/.worktrees/pathfinder/u9"]
+    assert all(not m.read_only for m in spec.extra_storage)
+    assert {m.source for m in spec.overlays} == {
+        f"{HOST}/pathfinder/.git", f"{HOST}/.worktrees/pathfinder/u7/.git",
+        f"{HOST}/.worktrees/pathfinder/u9/.git"}
+    assert all(m.read_only for m in spec.overlays)
+    body = build_create_body(spec, DockerConfig(network="blpl-egress"))
+    assert json.loads(_create_named(body, spec.key.container_name()).body) == body
+
+
+@pytest.mark.parametrize("source, ro", [
+    (f"{HOST}/.worktrees/victim/u9/.git", True),        # another project's gitfile
+    (f"{HOST}/.worktrees/pathfinder/u9/.git", False),   # its own, writable
+    (f"{HOST}/.worktrees/pathfinder/u9/sub", False),    # not a worktree root
+    (f"{HOST}/.worktrees/pathfinder/../victim", False),
+])
+def test_proxy_refuses_other_worktree_mounts(tmp_path, source, ro):
+    c = cfg(tmp_path)
+    (tmp_path / "projects" / "pathfinder" / ".git").mkdir(parents=True)
+    spec = jobs.run_spec_for(c, "pathfinder", "r1")
+    body = build_create_body(spec, DockerConfig(network="blpl-egress"))
+    body["HostConfig"]["Mounts"].append({"Type": "bind", "Source": source, "Target": "/x",
+                                         "ReadOnly": ro})
+    with pytest.raises(Refused):
+        _create_named(body, spec.key.container_name())

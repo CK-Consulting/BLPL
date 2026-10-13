@@ -310,6 +310,27 @@ def _set_ignored(checkout: str, rel: str, by: str) -> None:
     tmp.replace(target)
 
 
+# Repository-controlled settings that run a program: a hook on commit, push or
+# checkout, and an fsmonitor command on status. None of them may run in the
+# agent's git, whatever the repository's config says, so they are overridden
+# on every command (GIT_CONFIG_PARAMETERS is what `git -c` sets).
+_GIT_HARDENING = ("'core.hooksPath'='/dev/null'", "'core.fsmonitor'='false'",
+                  # GIT_SSH_COMMAND, set for a leased ssh key, still wins over
+                  # this; without one, plain ssh rather than whatever the
+                  # repository's core.sshCommand names.
+                  "'core.sshCommand'='ssh'")
+
+
+def harden_git_environment(environ) -> None:
+    """Put the hardening into environ's GIT_CONFIG_PARAMETERS, keeping
+    anything already there. Called once by main() for the agent's process, so
+    every git it or projects.py starts inherits it."""
+    have = environ.get("GIT_CONFIG_PARAMETERS", "")
+    extra = " ".join(p for p in _GIT_HARDENING if p not in have)
+    if extra:
+        environ["GIT_CONFIG_PARAMETERS"] = (have + " " + extra).strip()
+
+
 def _below_blpl(parts: list[str]) -> bool:
     return bool(parts) and parts[0] == ".blpl"
 
@@ -535,6 +556,7 @@ class Agent:
         from app import llm_ignore
 
         checkout = self.fs.checkout(b.get("checkout"))
+        self._verify_git(checkout)  # llm_ignore's lock follows the gitfile
         parts = self.fs.parts(b.get("path"))
         rel = "/".join(parts)
         self._no_run(parts)
@@ -570,6 +592,7 @@ class Agent:
         from app import llm_ignore
 
         checkout = self.fs.checkout(b.get("checkout"))
+        self._verify_git(checkout)  # llm_ignore's lock follows the gitfile
         src = self.fs.parts(b.get("src"))
         dst = self.fs.parts(b.get("dst"))
         src_rel, dst_rel = "/".join(src), "/".join(dst)
@@ -630,6 +653,7 @@ class Agent:
         from app import llm_ignore
 
         checkout = self.fs.checkout(b.get("checkout"))
+        self._verify_git(checkout)  # llm_ignore's lock follows the gitfile
         self._bookkeeping_dirs_are_real(checkout)
         return {"files": llm_ignore.entries(Path(checkout))}
 
@@ -637,6 +661,7 @@ class Agent:
         from app import llm_ignore
 
         checkout = self.fs.checkout(b.get("checkout"))
+        self._verify_git(checkout)  # llm_ignore's lock follows the gitfile
         parts = self.fs.parts(b.get("path"))
         self._no_run([".blpl"])
         self._bookkeeping_dirs_are_real(checkout)
@@ -695,6 +720,7 @@ class Agent:
 
     def quarantine_accept(self, q: dict, data: bytes) -> dict:
         checkout = self.fs.checkout(q.get("checkout"))
+        self._verify_git(checkout)  # llm_ignore's lock follows the gitfile
         self._no_run(["datasheets"])
         for name in self._QUARANTINE_DIRS:
             try:
@@ -724,7 +750,53 @@ class Agent:
     # -- git -------------------------------------------------------------------
 
     def _checkout_path(self, b: dict) -> Path:
-        return Path(self.fs.checkout(b.get("checkout")))
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._verify_git(checkout)
+        return Path(checkout)
+
+    def _verify_git(self, checkout: str) -> None:
+        """Refuse to run git in a checkout whose .git is not what the app made.
+
+        The owner's checkout, <projects>/<P>, has a .git directory. A member's,
+        <projects>/.worktrees/<P>/<name>, has a .git file pointing at
+        <projects>/<P>/.git/worktrees/<entry>, and that entry's own `gitdir`
+        file points back at it. Anything else (a link, a directory in a
+        worktree, a pointer somewhere a stage could have written hooks to) is
+        refused, not followed (Codex, PR #20). Run containers bind every gitfile
+        read-only, so this is the second line, not the first."""
+        root = self._projects_root.rstrip("/")
+        dot = os.path.join(checkout, ".git")
+        try:
+            st = os.lstat(dot)
+        except FileNotFoundError:
+            return  # not a repository; git will say so itself
+        rel = checkout[len(root) + 1:] if checkout.startswith(root + "/") else None
+        parts = rel.split("/") if rel else []
+        if stat.S_ISDIR(st.st_mode):
+            if len(parts) == 1:
+                return
+            raise _forbidden("a .git directory inside a member's worktree is not the app's")
+        if not stat.S_ISREG(st.st_mode) or len(parts) != 3 or parts[0] != ".worktrees":
+            raise _forbidden(".git here is neither the project's repository nor a worktree's pointer")
+        project = parts[1]
+        with open(dot, encoding="utf-8", errors="replace") as fh:
+            line = fh.read(4096).strip()
+        if not line.startswith("gitdir:"):
+            raise _forbidden("this worktree's .git file is not a gitdir pointer")
+        target = line[len("gitdir:"):].strip()
+        target = os.path.normpath(target if target.startswith("/") else os.path.join(checkout, target))
+        expected_parent = f"{root}/{project}/.git/worktrees"
+        if (os.path.dirname(target) != expected_parent
+                or os.path.realpath(target) != target):
+            raise _forbidden(f"this worktree's .git points at {target}, not into "
+                             f"{expected_parent}; refusing to use it")
+        try:
+            with open(os.path.join(target, "gitdir"), encoding="utf-8") as fh:
+                back = os.path.normpath(fh.read(4096).strip())
+        except OSError:
+            raise _forbidden("this worktree's git directory has no back-pointer") from None
+        if back != os.path.normpath(dot):
+            raise _forbidden("this worktree's git directory belongs to another checkout")
 
     def git_status(self, b: dict) -> dict:
         return asdict(self.git.status("", checkout=self._checkout_path(b)))
@@ -763,8 +835,16 @@ class Agent:
         """The operation's credential, for this one git command, then gone."""
         env = b.get("env")
         key = b.get("ssh_key")
+        if key is None and not env:
+            # No credential: still clear any credential.helper the repository
+            # configures (a program it would run), as a leased credential's
+            # own environment does. GIT_CONFIG_PARAMETERS cannot do this: it
+            # is read after GIT_CONFIG_COUNT and would clear a lease's helper.
+            yield {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper",
+                   "GIT_CONFIG_VALUE_0": "", "GIT_TERMINAL_PROMPT": "0"}
+            return
         if key is None:
-            yield dict(env) if env else None
+            yield dict(env)
             return
         fd, path = tempfile.mkstemp(prefix="blpl-git-", suffix=".key")
         try:
@@ -1025,6 +1105,7 @@ def main() -> None:
         signal.sigwait({signal.SIGTERM, signal.SIGINT})
         return
     _undumpable()
+    harden_git_environment(os.environ)
     agent = Agent(read_token(token_file), roots)
     server = serve(str(run_dir / "agent.sock"), agent)
     signal.signal(signal.SIGTERM, lambda *a: threading.Thread(target=server.shutdown).start())

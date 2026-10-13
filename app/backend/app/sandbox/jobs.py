@@ -312,21 +312,39 @@ def runs_in_containers(env: Mapping[str, str] | None = None) -> bool:
 
 
 def run_spec_for(cfg: WorkspaceRunConfig, project_name: str, run_id: str) -> WorkspaceSpec:
-    """The workspace's spec, as a run container: same storage and libraries,
-    plus the project's .git bound read-only over it.
+    """The workspace's spec, as a run container: the same storage and
+    libraries, with every way into git history made read-only.
 
-    One overlay covers every checkout, because a member's worktree keeps its
-    git directory inside the project's (.git/worktrees/<name>). So no git
-    command a stage runs (provenance's `git status` among them) can rewrite an
-    index, move a ref or install a hook."""
+    - The owner's ``.git`` directory is bound read-only. It holds every
+      member's git directory too (``.git/worktrees/<name>``), so no git command
+      a stage runs can rewrite an index, move a ref or install a hook.
+    - Each member's ``.git`` file is bound read-only. It only points at that git
+      directory, but a stage that could rewrite it could point it at a writable
+      directory of its own, hooks included, which the agent's next commit in
+      that worktree would use (Codex, PR #20).
+    - Each member's worktree is its own mount, instead of all of
+      ``.worktrees/<project>`` as one. A mount point cannot be renamed, so a
+      stage cannot move a worktree aside and put a fresh one, with a gitfile of
+      its choosing, in its place. It also cannot create a new one.
+    """
     base = spec_for(cfg, project_name)
-    root = str(cfg.projects_root)
-    overlays: tuple[Mount, ...] = ()
+    root, host = str(cfg.projects_root), cfg.host_projects_root
+    overlays: list[Mount] = []
     if (cfg.projects_root / project_name / ".git").is_dir():
-        overlays = (Mount(kind="bind", source=f"{cfg.host_projects_root}/{project_name}/.git",
-                          target=f"{root}/{project_name}/.git", read_only=True),)
+        overlays.append(Mount(kind="bind", source=f"{host}/{project_name}/.git",
+                              target=f"{root}/{project_name}/.git", read_only=True))
+    worktrees: list[Mount] = []
+    wt_root = cfg.projects_root / ".worktrees" / project_name
+    for member in sorted(p.name for p in wt_root.iterdir()) if wt_root.is_dir() else []:
+        if not _NAME.fullmatch(member):
+            continue
+        rel = f".worktrees/{project_name}/{member}"
+        worktrees.append(Mount(kind="bind", source=f"{host}/{rel}", target=f"{root}/{rel}"))
+        if (wt_root / member / ".git").is_file():
+            overlays.append(Mount(kind="bind", source=f"{host}/{rel}/.git",
+                                  target=f"{root}/{rel}/.git", read_only=True))
     return replace(base, key=WorkspaceKey(project=project_name, role="run", member=run_id),
-                   overlays=overlays)
+                   extra_storage=tuple(worktrees), overlays=tuple(overlays))
 
 
 async def run_job_in_container(
