@@ -127,7 +127,7 @@ Each project gets its own filesystem with a hard size cap, behind the
   says so: `enforces_quota = False`, and asking it for a quota raises. Phase 2
   uses the existing `data/projects/<name>` directories as the source, so no data
   moves (see the migration).
-- **Phase 4: `BtrfsStorage`.** This host is btrfs, so each project becomes a
+- **Phase 4: `BtrfsStorage`.** On a btrfs filesystem, each project becomes a
   subvolume `data/projects/<id>` with a qgroup limit. A subvolume also makes
   snapshots cheap, and those become pre-run snapshots and backups. Creating a
   subvolume and setting a qgroup needs `CAP_SYS_ADMIN`, so it happens in a
@@ -226,11 +226,11 @@ the control plane legitimately does, which is starting a workspace for any
 project and running things in it. The control plane is the authority over
 projects. The proxy removes the step from there to root on the host.
 
-**gVisor.** `runsc` is installed on this host (`/usr/local/bin/runsc`,
-registered in `daemon.json` with no `runtimeArgs`). Set
+**gVisor.** Where `runsc` is installed and registered in `daemon.json`, set
 `BLPL_SANDBOX_RUNTIME=runsc` to use it, and add `BLPL_PROXY_REQUIRE_RUNTIME=1`
-to make it mandatory. What was measured on 2026-10-12, with every integration
-test passing under both runc and runsc:
+to make it mandatory. The following was measured on 2026-10-12, on a cgroup-v2
+host with Docker's systemd cgroup driver, with every integration test passing
+under both runc and runsc:
 
 - **Limits are enforced, but at a different granularity.** Under runc the
   kernel acts on one process: the OOM killer takes the allocator, or `fork`
@@ -250,7 +250,7 @@ test passing under both runc and runsc:
   fails to start ("cannot read client sync file"). 48 starts. The default of
   512 is unaffected, and anything below 64 should not be configured.
 - `runsc` reports `cgroup v2: false` in its feature list, yet the limits above
-  were enforced through Docker's systemd cgroup driver on this cgroup-v2 host.
+  were enforced through Docker's systemd cgroup driver on a cgroup-v2 host.
   The finding is the measurement, not the feature flag.
 - **The phase-3 agent socket needs one daemon.json change.** The control plane
   connects to a Unix socket the agent creates inside the sandbox, on a shared
@@ -345,7 +345,7 @@ and file contents keep the UNTRUSTED framing they have today.
   file itself.
 
   `O_NOFOLLOW` alone is not relied on, because it does not hold under gVisor.
-  Measured on this host (2026-10-12): under runsc, `open()` with
+  Measured on 2026-10-12: under runsc, `open()` with
   `O_DIRECTORY | O_NOFOLLOW` *follows* a symlink. A link to a directory that
   exists opens that directory, and a dangling link fails with `ENOENT`. runc
   (Linux) refuses both with `ENOTDIR`. `O_NOFOLLOW` on a non-directory open
@@ -412,6 +412,32 @@ denied, including RFC 1918, loopback, link-local (the cloud metadata address)
 and the control plane's own addresses. An Ollama on the host is reached by a
 named allowlist entry, not by opening the private ranges. Squid's access log is
 the egress audit record.
+
+**Two things the build found (2026-10-13):**
+- **git over ssh goes through Squid too.** OpenSSH ignores `HTTP_PROXY`, and
+  a workspace has no other route out, so the agent sets `GIT_SSH_COMMAND` on
+  every pull and push to `ssh … -o ProxyCommand='nc -X connect -x <proxy> %h
+  %p'`. That is OpenBSD netcat, installed in the workspace image for this. The
+  connection then reaches the remote only through Squid's CONNECT on port 22,
+  for the hosts in `git-hosts.txt`, with or without a leased key. Because
+  `GIT_SSH_COMMAND` outranks `core.sshCommand`, a repository's own ssh wrapper
+  never runs.
+  - Everything else in a workspace that talks to the network already honours
+    `HTTPS_PROXY`: git over https, the LLM SDKs (httpx), and kicad-happy's
+    distributor fetchers (urllib and requests).
+  - git:// is refused by the app's protocol allowlist.
+  - Freerouting runs with analytics off (`-da`).
+  - clamd (TCP) and Ollama are on the egress network itself and reached
+    directly, through `NO_PROXY`.
+- **Workspaces name squid, clamav and ollama by `/etc/hosts`, not DNS.**
+  Docker's embedded DNS (127.0.0.11) answers nothing inside a gVisor sandbox:
+  measured, no container name resolves under runsc, on internal or ordinary
+  networks. So `blpl-egress` has a fixed subnet (`BLPL_EGRESS_SUBNET`, default
+  172.31.250.0/24), those three services have fixed addresses, and the driver
+  adds them to each workspace's hosts file (`BLPL_SANDBOX_EXTRA_HOSTS`). The
+  proxy allows exactly those entries (`BLPL_PROXY_EXTRA_HOSTS`), because a
+  hosts entry could otherwise point the proxy's name anywhere. Under runc both
+  work.
 
 ### 9. KiCad desktop sessions
 
@@ -694,24 +720,30 @@ enabled.
 - With `BLPL_STORAGE=btrfs`, a run in a container is preceded by a snapshot,
   and a run whose snapshot fails does not start.
 - Tested against a fake runner that models subvolumes. A real-filesystem test
-  runs where `BLPL_TEST_BTRFS_ROOT` points at a btrfs path with quotas on;
-  here it skips and says why.
+  runs where `BLPL_TEST_BTRFS_ROOT` points at a btrfs path with quotas on.
+  Elsewhere it skips and says why.
 
 **Turning on per-project storage: what the user must decide and run**
 
-The filesystem holding `app/data` is `/home/shaun/devspace`: btrfs, subvolid 5,
-`compress=zstd:3`. Quotas are not enabled on it (kernel 7.2, btrfs-progs 7.1).
-Two commands, in this order, both needing root:
+Below, `<data-fs>` is the mount point of the filesystem holding `app/data`.
+Find it, and check that it is btrfs and whether quotas are on, with:
 
 ```bash
-# 1. Quotas. "Simple" quotas (kernel ≥ 6.7) account each extent to the
-#    subvolume that wrote it and need no backref walks: much cheaper, at the
-#    price of not re-attributing shared extents (a snapshot's blocks stay
-#    charged to the original). Right for per-project limits.
-sudo btrfs quota enable --simple /home/shaun/devspace
+findmnt -no TARGET,FSTYPE,OPTIONS -T app/data      # TARGET is <data-fs>
+sudo btrfs qgroup show <data-fs>                   # an error means quotas are off
+```
+
+Then two steps, in this order, both needing root:
+
+```bash
+# 1. Quotas. "Simple" quotas (kernel ≥ 6.7, btrfs-progs ≥ 6.7) account each
+#    extent to the subvolume that wrote it and need no backref walks: much
+#    cheaper, at the price of not re-attributing shared extents (a snapshot's
+#    blocks stay charged to the original). Right for per-project limits.
+sudo btrfs quota enable --simple <data-fs>
 #    The alternative is full qgroups, which charge shared extents precisely
 #    but cost more (below):
-#    sudo btrfs quota enable /home/shaun/devspace && sudo btrfs quota rescan -w /home/shaun/devspace
+#    sudo btrfs quota enable <data-fs> && sudo btrfs quota rescan -w <data-fs>
 
 # 2. Later, once migration exists (not yet): bring up the helper.
 #    docker compose --profile storage up -d storage-helper   # and BLPL_STORAGE=btrfs in app/.env
@@ -726,7 +758,7 @@ What enabling full qgroups costs on a busy filesystem:
   quota performance problem.
 - Simple quotas avoid the rescan and most of the per-commit work, which is why
   they are recommended here. Either kind is undone with
-  `sudo btrfs quota disable /home/shaun/devspace`, which drops all accounting
+  `sudo btrfs quota disable <data-fs>`, which drops all accounting
   and limits.
 
 **Do not set `BLPL_STORAGE=btrfs` yet.** Existing projects are plain
