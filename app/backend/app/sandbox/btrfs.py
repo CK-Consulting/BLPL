@@ -131,8 +131,18 @@ class BtrfsStore:
         path, snapdir = self._project(name), self._snapdir(name)
         snapdir.mkdir(parents=True, exist_ok=True)
         dest = snapdir / label
+        if dest.is_symlink():
+            raise StorageError(f"snapshot {label} is a symlink; refusing it")
         if dest.exists():
-            raise StorageError(f"snapshot {label} already exists")
+            # The same run asking again: a retry of a reclaimed run whose first
+            # worker took this snapshot and died. It is reused if it is what
+            # this would have made, a read-only subvolume in this project's
+            # snapshot directory. Anything else there is an error (Codex,
+            # PR #20).
+            if not self._is_subvolume(dest) or "ro=true" not in self.run(
+                    ["btrfs", "property", "get", "-ts", str(dest), "ro"]):
+                raise StorageError(f"{label} exists and is not this project's snapshot")
+            return {"snapshot": label, "dropped": [], "existing": True}
         self.run(["btrfs", "subvolume", "snapshot", "-r", str(path), str(dest)])
         dropped = []
         for old in self.snapshots(name)["snapshots"][:-KEEP_SNAPSHOTS]:

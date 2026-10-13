@@ -48,6 +48,9 @@ class _Box:
     spec: WorkspaceSpec
     state: State
     cid: str
+    # For run containers: the command, and what reattaching to it yields.
+    argv: list[str] = field(default_factory=list)
+    outcome: tuple = (0, [])
 
 
 @dataclass
@@ -147,10 +150,23 @@ class FakeDriver:
             raise ValueError("run_container takes a run or sealer key")
         if spec.key in self.foreign:
             raise NotOurs(spec.key.container_name())
-        if spec.key in self.boxes:  # an orphan of a dead worker: killed first
+        orphan = self.boxes.get(spec.key)
+        if orphan is not None and orphan.argv == list(argv):
+            # The first attempt, same command: followed, not run again.
+            self.ops.append(("reattach", spec.key))
+            self.boxes.pop(spec.key, None)
+            code, chunks = orphan.outcome
+            for stream, data in chunks:
+                if on_output is not None:
+                    res = on_output(stream, data)
+                    if inspect.isawaitable(res):
+                        await res
+            return ExecResult(exit_code=code)
+        if orphan is not None:  # a stale container under the name: killed first
             self.ops.append(("remove_orphan", spec.key))
             del self.boxes[spec.key]
-        self.boxes[spec.key] = _Box(spec, State.RUNNING, f"run-{len(self.run_specs)}")
+        self.boxes[spec.key] = _Box(spec, State.RUNNING, f"run-{len(self.run_specs)}",
+                                    argv=list(argv))
         self.ops.append(("run_container", spec.key))
         self.run_specs.append(spec)
         call = ExecCall(spec.key, list(argv), dict(env or {}), None)

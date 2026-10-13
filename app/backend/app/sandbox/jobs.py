@@ -35,7 +35,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Mapping, Sequence
 
-from .driver import Mount, Resources, WorkspaceDriver, WorkspaceKey, WorkspaceSpec
+from .driver import Mount, Resources, State, WorkspaceDriver, WorkspaceKey, WorkspaceSpec
 from .idle import IdleTracker
 from .runpath import execute_run
 
@@ -255,8 +255,14 @@ async def run_job_via_agent(
     read_every: float = 0.25,
     tracker: IdleTracker | None = None,
     key: "WorkspaceKey | None" = None,
+    run_id: str | None = None,
 ) -> int:
     """Phase 3: the same run, started and followed through the workspace's agent.
+
+    Not used by the worker any more: an agent that starts runs shares its
+    socket's directory with them (see agent.Agent.allow_runs). The agent
+    refuses unless started with BLPL_AGENT_RUNS=1. Kept, keyed by run id, for
+    that explicit case.
 
     The agent owns the process: it is in its own process group, so a cancel
     reaches everything it started, and its log is kept in the workspace, so a
@@ -273,8 +279,12 @@ async def run_job_via_agent(
     if busy is not None:
         busy.__enter__()
     try:
+        # Keyed by the database run's id: a retry after the first worker died
+        # follows the run that worker started, from the top of its log,
+        # instead of starting another.
         rid = await asyncio.to_thread(
-            client.run_start, list(cmd), run_env(env, operation_inject(cmd, env)), None)
+            client.run_start, list(cmd), run_env(env, operation_inject(cmd, env)), None,
+            run_id)
         offset, last_poll, cancelled = 0, loop.time(), False
         while True:
             data, offset, done, code = await asyncio.to_thread(client.run_read, rid, offset)
@@ -379,11 +389,17 @@ async def run_job_in_container(
         if text:
             log(text)
 
-    if snapshot is not None:
+    # A container already under this run's name is the first attempt of a
+    # reclaimed run (its worker died). Its snapshot was taken before it
+    # started, and run_container follows or replaces it below, so nothing here
+    # may return early ahead of that (Codex, PR #20).
+    first_attempt_alive = (await driver.status(spec.key)).state is not State.ABSENT
+    if snapshot is not None and not first_attempt_alive:
         # Before anything runs, so a run that wrecks the checkout can be
         # undone to exactly this. A run that cannot have its snapshot does not
         # start: running without the promised way back is not a degraded mode
-        # anyone chose.
+        # anyone chose. Taking it again for the same run reuses the one there
+        # (BtrfsStore.snapshot).
         label = "pre-" + re.sub(r"[^A-Za-z0-9_.-]", "-", run_id)[:59]
         try:
             await snapshot(label)

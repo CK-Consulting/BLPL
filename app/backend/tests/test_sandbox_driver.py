@@ -506,3 +506,34 @@ def test_extra_hosts_come_from_config_and_reach_the_body():
     assert cfg.extra_hosts == ("squid:10.9.0.2", "clamav:10.9.0.3")
     assert build_create_body(spec(), cfg)["HostConfig"]["ExtraHosts"] == list(cfg.extra_hosts)
     assert "ExtraHosts" not in build_create_body(spec(), DockerConfig())["HostConfig"]
+
+
+
+def test_docker_retry_follows_a_same_command_orphan_instead_of_starting_again():
+    daemon = MockDaemon()
+    rs = _run_spec("run_10")
+    body = build_create_body(rs, DockerConfig())
+    daemon.containers[rs.key.container_name()] = {
+        "Id": "a" * 64, "Config": {"Labels": body["Labels"], "Cmd": ["x"]},
+        "State": {"Status": "running"}}
+    calls = []
+    orig = daemon.handler
+
+    def handler(request):
+        calls.append((request.method, request.url.path.split("/", 2)[2]))
+        if request.url.path.endswith("/logs"):
+            frame = bytes([1, 0, 0, 0]) + (5).to_bytes(4, "big") + b"done\n"
+            return httpx.Response(200, stream=httpx.ByteStream(frame))
+        if request.method == "GET" and request.url.path.endswith("/json") and "containers/" in request.url.path:
+            box = daemon.containers.get(request.url.path.split("/")[-2])
+            if box is not None:
+                return httpx.Response(200, json={**box, "State": {"Running": False, "ExitCode": 0}})
+        return orig(request)
+
+    d = DockerDriver(DockerConfig(), transport=httpx.MockTransport(handler))
+    out: list[bytes] = []
+    assert run(d.run_container(rs, ["x"], on_output=lambda s_, b: out.append(b))).exit_code == 0
+    assert b"".join(out) == b"done\n"
+    assert ("POST", "containers/create") not in calls
+    assert not any(m == "DELETE" and "a" * 64 in p and i < len(calls) - 1
+                   for i, (m, p) in enumerate(calls))
