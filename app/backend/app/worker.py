@@ -136,6 +136,16 @@ class _Workspaces:
         self.driver = DockerDriver(DockerConfig.from_env())
         self.tracker = sandbox_idle.IdleTracker()
         self._last_sweep = 0.0
+        # Phase 4: with BLPL_STORAGE=btrfs, every run in a container is
+        # preceded by a snapshot of the project, taken by the storage helper.
+        self.storage = None
+        if os.environ.get("BLPL_STORAGE") == "btrfs":
+            from .sandbox.btrfs import HelperClient, HelperStorage
+
+            self.storage = HelperStorage(
+                HelperClient(os.environ.get("BLPL_STORAGE_SOCKET",
+                                            "/run/blpl-storage/storage.sock")),
+                host_root=os.environ.get("BLPL_SANDBOX_HOST_PROJECTS", ""))
         # Phase 3: with BLPL_FILES_VIA_WORKSPACE=1 the workspace runs its agent,
         # and runs go through it rather than through docker exec.
         self.access = None
@@ -174,10 +184,19 @@ class _Workspaces:
                         finally:
                             client.close()
 
+                    snapshot = None
+                    if self.storage is not None:
+                        storage = self.storage
+
+                        async def snapshot(label: str) -> object:
+                            return await asyncio.to_thread(
+                                storage.snapshot, job.project_name, label)
+
                     return await sandbox_jobs.run_job_in_container(
                         self.driver, self.cfg, project_name=job.project_name,
                         run_id=job.run_id, cmd=job.cmd, env=job.env, log=log.write,
                         poll=poll, mark=mark, poll_every=_HEARTBEAT_EVERY,
+                        snapshot=snapshot,
                     )
                 if self.access is not None:
                     access = self.access

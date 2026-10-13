@@ -69,6 +69,11 @@ ENV BLPL_KICAD_HAPPY=/app/kicad-happy \
 # ---- workspace: the headless role -------------------------------------------
 FROM kicad-base AS workspace
 
+# btrfs-progs, for the storage helper's subvolumes, quotas and snapshots
+# (phase 4). Inert in a workspace: without CAP_SYS_ADMIN it can change nothing.
+RUN apt-get update && apt-get install -y --no-install-recommends btrfs-progs \
+    && rm -rf /var/lib/apt/lists/*
+
 # Same uid handling as the backend, for the same reasons: files the workspace
 # writes into project storage must be owned by the host user that owns the rest
 # of it, and ssh (git over ssh remotes) needs a passwd entry for the uid. The
@@ -118,6 +123,12 @@ COPY app/backend/app/worktrees.py /opt/blpl/wsagent/app/worktrees.py
 COPY app/backend/app/sandbox/sealer.py /opt/blpl/wsagent/sealer.py
 COPY app/backend/app/workspace.py /opt/blpl/wsagent/app/workspace.py
 COPY app/backend/app/vault.py /opt/blpl/wsagent/app/vault.py
+# The storage helper (phase 4) runs `python -m app.sandbox.btrfs` from this
+# image as its own container, the one given CAP_SYS_ADMIN. These three files
+# are all it imports.
+COPY app/backend/app/sandbox/btrfs.py /opt/blpl/wsagent/app/sandbox/btrfs.py
+COPY app/backend/app/sandbox/storage.py /opt/blpl/wsagent/app/sandbox/storage.py
+COPY app/backend/app/sandbox/driver.py /opt/blpl/wsagent/app/sandbox/driver.py
 
 # The agent serves when the control plane gave it a directory and a token
 # (/run/blpl). Without them (a phase 2 workspace) it only holds the container
