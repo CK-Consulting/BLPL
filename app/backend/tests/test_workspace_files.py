@@ -57,6 +57,7 @@ from test_app_api import (  # noqa: E402,F401
     test_the_tree_says_which_files_git_cannot_bring_back,
 )
 from test_git_endpoints import *  # noqa: E402,F401,F403
+from test_remote_urls import *  # noqa: E402,F401,F403
 from test_uploads_api import *  # noqa: E402,F401,F403
 from test_uploads_api import _no_scanner  # noqa: E402,F401
 
@@ -331,6 +332,7 @@ def test_the_migrated_routes_need_no_project_mount(client, monkeypatch, via_agen
         ("get", "/api/projects/scratch/artifacts", {}),
         ("get", "/api/projects/scratch/artifacts/bom.json", {}),
         ("post", "/api/projects/scratch/git/push", {}),
+        ("put", "/api/projects/scratch/git/remote", {"json": {"url": body["remote"]}}),
     ]
     try:
         for method, url, kw in calls:

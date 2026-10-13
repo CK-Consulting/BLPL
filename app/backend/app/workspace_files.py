@@ -570,3 +570,14 @@ async def sweep_and_seal(seal_project) -> list:
         close = getattr(driver, "aclose", None)
         if close is not None:
             await close()
+
+
+def set_remote(checkout: Path, url: str) -> None:
+    """main.set_git_remote's change, made by the agent, so every taker of the
+    origin lock is inside the workspace (gVisor keeps file locks in-sandbox)."""
+    with agent(checkout) as c:
+        try:
+            c.git_set_remote(str(checkout), url)
+        except AgentCallError as exc:
+            _project_errors(exc)
+            raise

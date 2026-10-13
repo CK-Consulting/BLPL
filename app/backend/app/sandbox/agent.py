@@ -844,6 +844,12 @@ class Agent:
         return {"output": res.get("output"), "error": res.get("error"),
                 "lease": None if res.get("unlocked") else lease}
 
+    def git_set_remote(self, b: dict) -> dict:
+        """Projects.set_remote, under the origin lock in this sandbox. With
+        every lock-taker here, the lock means the same under gVisor, whose file
+        locks are not visible outside the sandbox."""
+        return {"url": self.git.set_remote(self._checkout_path(b), str(b.get("url", "")))}
+
     def git_hold(self, b: dict) -> dict:
         return self._held(self._checkout_path(b), lambda: None)
 
@@ -880,6 +886,7 @@ _JSON_ROUTES = {
     "/git/remote_of": Agent.git_remote_of, "/git/commit": Agent.git_commit,
     "/git/recoverable": Agent.git_recoverable, "/git/pull": Agent.git_pull,
     "/git/push": Agent.git_push, "/git/hold": Agent.git_hold,
+    "/git/set_remote": Agent.git_set_remote,
     "/git/release": Agent.git_release, "/runs": Agent.run_start,
     "/managed/delete": Agent.managed_delete, "/managed/move": Agent.managed_move,
     "/ignore/entries": Agent.ignore_entries, "/ignore/set": Agent.ignore_set,
