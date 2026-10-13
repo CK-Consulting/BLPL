@@ -12,7 +12,9 @@ function json(body: unknown, status = 200) {
 }
 
 /** The server as the dialog sees it, recording every request. */
-function server(over: { check?: unknown; init?: [number, unknown]; credentialFor?: Record<string, string> } = {}) {
+function server(
+  over: { check?: unknown; init?: [number, unknown]; clone?: unknown; credentialFor?: Record<string, string> } = {},
+) {
   const calls: { method: string; url: string; body: any }[] = [];
   vi.stubGlobal(
     "fetch",
@@ -40,6 +42,7 @@ function server(over: { check?: unknown; init?: [number, unknown]; credentialFor
       if (url.includes("/api/projects/check-remote")) {
         return json(over.check ?? { status: "ok", ok: true, empty: true, message: "Connected.", detail: "", credential: null });
       }
+      if (url.includes("/api/projects/clone") && over.clone) return json(over.clone);
       if (url.includes("/api/projects/init")) {
         const [status, body] = over.init ?? [200, { ok: true, id: "p" }];
         return json(body, status);
@@ -289,6 +292,22 @@ describe("the clone tab", () => {
       git_email: "ada@work.example",
       save_as_default: true,
     });
+  });
+
+  it("says so when the clone's pushes will fail", async () => {
+    const user = userEvent.setup();
+    // The clone answers with a warning: read-only credential, manual pushing.
+    server({ clone: { ok: true, id: "c", warning: "pushes will fail until it has write access." } });
+    const onCreated = vi.fn();
+    render(<NewProject onCreated={onCreated} onClose={() => {}} />);
+    await screen.findByDisplayValue("Ada Lovelace");
+    await user.click(screen.getByRole("button", { name: "Clone git remote" }));
+    await user.type(screen.getByLabelText("Project name"), "c");
+    await user.type(screen.getByLabelText("Clone URL"), "https://github.com/o/existing.git");
+    await user.click(screen.getByLabelText("I'll push manually"));
+    await user.click(screen.getByRole("button", { name: "Clone" }));
+    expect(await screen.findByText(/pushes will fail until it has write access/)).toBeInTheDocument();
+    expect(onCreated).toHaveBeenCalledWith("c");
   });
 
   it("is not asked on the import tab", async () => {

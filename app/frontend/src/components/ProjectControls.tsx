@@ -234,6 +234,7 @@ export function NewProject({
   const [branch, setBranch] = useState("main");
   const [picked, setPicked] = useState<File[]>([]);
   const [skipped, setSkipped] = useState<ImportResult["skipped"]>([]);
+  const [cloneWarning, setCloneWarning] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // The library declaration, common to all three tabs: how a project arrives
@@ -329,7 +330,7 @@ export function NewProject({
     setError(null);
     try {
       if (mode === "clone") {
-        await postJSON("/api/projects/clone", {
+        const result = await postJSON<{ warning?: string }>("/api/projects/clone", {
           name,
           remote,
           branch,
@@ -339,6 +340,14 @@ export function NewProject({
           save_as_default: saveDefault,
           ...policy.value,
         });
+        if (result?.warning) {
+          // Cloned, but its pushes will fail (a read-only credential with
+          // manual pushing). Kept open so that is read, as an import's skip
+          // report is; the project exists, so the app can switch to it.
+          setCloneWarning(result.warning);
+          onCreated(name);
+          return;
+        }
       } else if (mode === "import") {
         const form = new FormData();
         form.append("name", name);
@@ -518,6 +527,11 @@ export function NewProject({
                   onChange={(e) => setRemote(e.target.value)}
                 />
                 <input placeholder="branch" value={branch} onChange={(e) => setBranch(e.target.value)} />
+                {cloneWarning && (
+                  <div className="gate-error" role="status">
+                    Cloned. {cloneWarning}
+                  </div>
+                )}
                 <p className="muted">
                   The server clones and holds a working copy. A private remote authenticates with your
                   own git credential for its host — add one under Settings → Git endpoints/accounts.
@@ -598,7 +612,7 @@ export function NewProject({
                 busy ||
                 !name ||
                 (mode === "init" && !initReady) ||
-                (mode === "clone" && (!remote || !choicesReady)) ||
+                (mode === "clone" && (!remote || !choicesReady || !!cloneWarning)) ||
                 // No files picked, or the import already ran and we're showing its skip report.
                 (mode === "import" && (picked.length === 0 || skipped.length > 0))
               }

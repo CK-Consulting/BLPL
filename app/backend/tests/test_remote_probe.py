@@ -135,3 +135,85 @@ def test_a_remote_that_does_not_answer_is_a_result_not_a_500(unlocked, monkeypat
     assert r.json()["status"] == "error" and r.json()["ok"] is False
     r = unlocked.post("/api/projects/init", json=init_body("p", remote=remote))
     assert r.status_code == 400 and "did not answer" in r.json()["detail"]
+
+
+# -- clones -------------------------------------------------------------------
+
+
+def _seed(repo) -> None:
+    """Give the served repository a commit to clone, written straight to disk
+    rather than over http (whose receive-pack these tests switch off)."""
+    import tempfile
+
+    work = tempfile.mkdtemp()
+    subprocess.run(["git", "init", "-q", "-b", "main", work], check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=s@example.com", "-c", "user.name=s", "commit", "-q",
+         "--allow-empty", "-m", "seed"], cwd=work, check=True,
+    )
+    subprocess.run(["git", "push", "-q", str(repo), "main"], cwd=work, check=True)
+
+
+def _clone_body(url, policy):
+    from conftest import clone_body
+
+    return clone_body("c", url, push_policy=policy)
+
+
+def test_an_automatic_clone_over_a_read_only_remote_is_refused(unlocked, http_remote):
+    # Codex P2 on #19: the clone read fine, the automatic policy was recorded,
+    # and every later push failed.
+    import app.main as main
+
+    url, repo = http_remote
+    _seed(repo)
+    r = unlocked.post("/api/projects/clone", json=_clone_body(url, "auto"))
+    assert r.status_code == 400 and "not write" in r.json()["detail"]
+    assert not (main.PROJECTS_ROOT / "c").exists()
+    assert unlocked.get("/api/projects").json() == []
+    # Clone takes no new token; nothing was added to the store either.
+    assert unlocked.get("/api/settings/git").json()["endpoints"] == []
+
+
+def test_a_manual_clone_over_a_read_only_remote_is_allowed_with_a_warning(unlocked, http_remote):
+    import app.main as main
+
+    url, repo = http_remote
+    _seed(repo)
+    r = unlocked.post("/api/projects/clone", json=_clone_body(url, "manual"))
+    assert r.status_code == 200, r.text
+    assert "pushes will fail" in r.json()["warning"]
+    assert (main.PROJECTS_ROOT / "c" / ".git").is_dir()
+
+
+def test_an_automatic_clone_over_a_writable_remote_is_accepted(unlocked, http_remote):
+    url, repo = http_remote
+    _seed(repo)
+    subprocess.run(["git", "config", "http.receivepack", "true"], cwd=repo, check=True)
+    r = unlocked.post("/api/projects/clone", json=_clone_body(url, "auto"))
+    assert r.status_code == 200, r.text
+    assert r.json()["warning"] == ""
+    assert unlocked.get("/api/projects/c/git/status").json()["push_policy"] == "auto"
+    # The write check wrote nothing.
+    refs = subprocess.run(["git", "for-each-ref", "--format=%(refname)"], cwd=repo,
+                          capture_output=True, text=True).stdout.split()
+    assert refs == ["refs/heads/main"]
+
+
+def test_an_automatic_clone_refuses_a_remote_that_does_not_answer(unlocked, monkeypatch, tmp_path):
+    import app.main as main
+    import app.projects as projects_mod
+
+    real = subprocess.run
+    remote = bare_remote()
+    _seed(remote)
+
+    def run(argv, *a, **kw):
+        if argv[:2] == ["git", "push"]:
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout", 60))
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(projects_mod.subprocess, "run", run)
+    r = unlocked.post("/api/projects/clone", json=_clone_body(remote, "auto"))
+    assert r.status_code == 400 and "did not answer" in r.json()["detail"]
+    assert not (main.PROJECTS_ROOT / "c").exists()

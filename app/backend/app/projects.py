@@ -1130,6 +1130,14 @@ class Projects:
     #: How long either probe waits for the remote before saying it did not answer.
     PROBE_TIMEOUT = 60
 
+    def probe_write(self, url: str, *, env: dict[str, str] | None = None) -> RemoteProbe | None:
+        """The write half of probe_remote on its own: None if ``env``'s
+        credential may push to ``url``, else why not. For a clone, whose
+        remote already has history (so the read half's emptiness is moot)
+        and whose clone itself proves it can be read."""
+        url = check_remote_url(url)
+        return self._probe_write(url, {**os.environ, **_net_env(env), "GIT_TERMINAL_PROMPT": "0"})
+
     def _probe_write(self, url: str, net: dict[str, str]) -> RemoteProbe | None:
         """None if the credential may push to ``url``, else why not.
 

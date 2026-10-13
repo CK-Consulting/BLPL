@@ -1813,8 +1813,28 @@ def clone_project(
         identity = gitidentity.validate(body.git_name, body.git_email)
     except gitidentity.IdentityError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    warning = ""
     try:
         with _git_credentials(session, master_key, user, body.remote) as env:
+            # Can this credential push here? A clone only reads (upload-pack),
+            # so a read-only token cloned fine and an automatic policy then
+            # recorded a failure after every commit (Codex, PR #19). Asked
+            # before git clone runs, so a refusal leaves nothing behind.
+            refused = projects.probe_write(body.remote, env=env)
+            if refused is not None and policy == "auto":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_PROBE_SENTENCES[refused.status]} "
+                    f"{autopush.scrub(refused.message, [])}".strip()
+                    + (" Pushing cannot be automatic with this credential." if refused.status == "read_only" else ""),
+                )
+            if refused is not None and refused.status == "read_only":
+                # Manual pushing over a read-only credential is a legitimate
+                # way to follow a repository; it is said, not refused.
+                warning = (
+                    "This credential can read the repository but not write to it, so "
+                    "pushes will fail until it has write access."
+                )
             projects.clone(body.name, body.remote, body.branch, env=env)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1830,7 +1850,7 @@ def clone_project(
     )
     _record_policy(session, project, body, actor_id=user.id)
     activity.record(session, project, user, activity.IMPORTED, f"cloned from {body.remote}")
-    return {"ok": True, "id": body.name}
+    return {"ok": True, "id": body.name, "warning": warning}
 
 
 class InitBody(PolicyFields):
