@@ -1426,3 +1426,108 @@ def test_a_sink_that_fails_does_not_lose_the_file(tmp_path, monkeypatch):
         rec = quarantine.accept_and_release(BENIGN, tmp_path, mpn="X")
     assert rec.state == quarantine.RELEASED
     assert (tmp_path / "datasheets" / "X.pdf").is_file()
+
+
+# -- fetched for a workspace by the control plane (blpl.core.fetcher) -----------------
+
+
+class _Fetcher:
+    """Stands in for the control plane's fetch service."""
+
+    def __init__(self, data=None, held=None):
+        self.data, self.held, self.asked = data, held, []
+
+    def get(self, url):
+        from blpl.core.fetcher import Fetched
+
+        self.asked.append(url)
+        if self.held is not None:
+            return Fetched(url=url, held=True, verdict=self.held)
+        return Fetched(url=url, data=self.data)
+
+
+def test_standalone_core_still_downloads_directly(tmp_path, resolver, monkeypatch):
+    from blpl.agent.tools.parts import fetch_datasheet
+    from blpl.core import fetcher
+
+    monkeypatch.delenv("BLPL_FETCH_SERVICE", raising=False)
+    assert fetcher.get_fetcher() is None
+    resolver.write_bytes(BENIGN)
+    got = fetch_datasheet("TPS62840", tmp_path / "proj" / "datasheets")
+    assert got.ok and got.quarantine["state"] == quarantine.RELEASED
+
+
+def test_in_a_workspace_the_document_comes_from_the_fetcher_not_the_script(tmp_path, resolver):
+    """The script only resolves the part; what it downloads goes nowhere, and
+    the file in the project is the one the control plane fetched, through this
+    project's quarantine as well."""
+    from blpl.agent.tools.parts import fetch_datasheet
+
+    resolver.write_bytes(b"%PDF-1.4 what the script fetched directly\n")
+    f = _Fetcher(data=BENIGN)
+    proj = tmp_path / "proj"
+    got = fetch_datasheet("TPS62840", proj / "datasheets", project_dir=proj, fetcher=f)
+    assert f.asked == ["https://ti.com/lit/ds/x.pdf"]
+    assert got.ok and Path(got.path).read_bytes() == BENIGN
+    row = quarantine.record_for(proj, got.quarantine["sha256"])
+    assert row["source_url"] == "https://ti.com/lit/ds/x.pdf"
+    assert not any(b"fetched directly" in p.read_bytes()
+                   for p in proj.rglob("*") if p.is_file())
+
+
+def test_a_file_the_control_plane_held_never_reaches_the_project(tmp_path, resolver):
+    from blpl.agent.tools.parts import fetch_datasheet
+
+    resolver.write_bytes(b"irrelevant")
+    verdict = {"held": True, "sha256": "ab" * 32, "bytes": 123,
+               "reasons": ["it does something when opened"], "inspection": {}, "scan": {}}
+    proj = tmp_path / "proj"
+    got = fetch_datasheet("EVIL", proj / "datasheets", project_dir=proj,
+                          fetcher=_Fetcher(held=verdict))
+    assert not got.ok and "held in quarantine" in got.detail
+    assert not list(proj.rglob("*.pdf"))
+    (row,) = quarantine.held(proj)
+    assert row["released_to"] == quarantine.HELD_ELSEWHERE and row["filename"] == ""
+    assert row["reasons"] == ["it does something when opened"]
+
+
+def test_the_service_fetcher_speaks_to_the_fetch_service(tmp_path):
+    """Bytes for an accepted file; a 422 with the verdict for a held one; the
+    run's own credential on every request, and never through a proxy."""
+    import base64
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from blpl.core.fetcher import ServiceFetcher
+
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append((self.headers["Authorization"], body["url"]))
+            if body["url"].endswith("evil.pdf"):
+                out = json.dumps({"held": True, "reasons": ["no"]}).encode()
+                self.send_response(422)
+            else:
+                out = BENIGN
+                self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        f = ServiceFetcher(f"http://127.0.0.1:{srv.server_port}", "g-1:tok")
+        ok = f.get("https://vendor.example/ds.pdf")
+        held = f.get("https://vendor.example/evil.pdf")
+    finally:
+        srv.shutdown()
+    assert ok.data == BENIGN and not ok.held
+    assert held.held and held.data is None and held.verdict["reasons"] == ["no"]
+    assert seen[0][0] == "Basic " + base64.b64encode(b"g-1:tok").decode()
