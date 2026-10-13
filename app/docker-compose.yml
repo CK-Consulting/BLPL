@@ -214,6 +214,7 @@ services:
       - BLPL_SANDBOX_HOST_PROJECTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/projects}
       - BLPL_SANDBOX_LIBRARIES=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols:/app/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints:/app/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D:/usr/share/kicad/3dmodels ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source:/usr/share/kicad/3dmodels-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates:/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules:/app/data/modules}
       - BLPL_SANDBOX_HTTP_PROXY=http://squid:3128
+      - BLPL_SANDBOX_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4}
       - BLPL_SANDBOX_NO_PROXY=ollama,clamav,localhost,127.0.0.1
     volumes:
       # Server key, config, and your git-backed designs. Users and their sealed
@@ -282,8 +283,9 @@ services:
     profiles: ["local-models"]
     restart: unless-stopped
     networks:
-      - blpl
-      - blpl-egress  # local inference for runs in workspaces
+      blpl: {}
+      blpl-egress:  # local inference for runs in workspaces
+        ipv4_address: ${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4}
     volumes:
       - ollama-models:/root/.ollama
     environment:
@@ -395,6 +397,7 @@ services:
       # workspace image carries its own copy.
       - BLPL_SANDBOX_LIBRARIES=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols:/app/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints:/app/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D:/usr/share/kicad/3dmodels ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source:/usr/share/kicad/3dmodels-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates:/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules:/app/data/modules}
       - BLPL_SANDBOX_HTTP_PROXY=http://squid:3128
+      - BLPL_SANDBOX_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4}
       # Reached directly on blpl-egress, not through squid. Neither holds a
       # secret, and clamd does not speak HTTP.
       - BLPL_SANDBOX_NO_PROXY=ollama,clamav,localhost,127.0.0.1
@@ -670,10 +673,11 @@ services:
     # scanner is part of the deployment rather than a decision.
     restart: unless-stopped
     networks:
-      - blpl
+      blpl: {}
       # So a run in a workspace can scan what it fetches. clamd holds no
       # secret and has nothing on blpl-egress worth reaching through it.
-      - blpl-egress
+      blpl-egress:
+        ipv4_address: ${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3}
     volumes:
       # Persist the signature database. Without it every restart re-downloads
       # ~1 GB from the ClamAV mirrors, which is rude to them and slow for you.
@@ -729,6 +733,8 @@ services:
       - BLPL_PROXY_INSTANCE=${BLPL_SANDBOX_INSTANCE:-blpl}
       - BLPL_PROXY_IMAGES=blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}
       - BLPL_PROXY_NETWORKS=blpl-egress
+      # The /etc/hosts entries a workspace may carry: exactly the worker's.
+      - BLPL_PROXY_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4}
       # Where runsc (gVisor) is installed, set both to make it mandatory:
       # BLPL_SANDBOX_RUNTIME=runsc and BLPL_PROXY_REQUIRE_RUNTIME=1.
       - BLPL_PROXY_RUNTIMES=${BLPL_SANDBOX_RUNTIME:-}
@@ -787,8 +793,9 @@ services:
     container_name: blpl-squid
     restart: unless-stopped
     networks:
-      - blpl-egress
-      - blpl
+      blpl-egress:
+        ipv4_address: ${BLPL_EGRESS_SQUID_IP:-172.31.250.2}
+      blpl: {}
     security_opt:
       - no-new-privileges:true
     volumes:
@@ -802,9 +809,18 @@ networks:
   # Workspaces join only this. `internal`: no route to anywhere except the
   # other members, which are squid, clamav and ollama. Named explicitly, so
   # the driver (BLPL_SANDBOX_NETWORK) and the proxy agree on it.
+  #
+  # A fixed subnet, so squid, clamav and ollama have fixed addresses. Workspaces
+  # find them through /etc/hosts entries (BLPL_SANDBOX_EXTRA_HOSTS), not
+  # Docker's DNS, because the embedded DNS answers nothing inside a gVisor
+  # sandbox. Change the subnet if it collides with one on your host, and the
+  # three addresses with it.
   blpl-egress:
     name: blpl-egress
     internal: true
+    ipam:
+      config:
+        - subnet: ${BLPL_EGRESS_SUBNET:-172.31.250.0/24}
 
 volumes:
   ollama-models:

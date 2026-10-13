@@ -321,6 +321,45 @@ _GIT_HARDENING = ("'core.hooksPath'='/dev/null'", "'core.fsmonitor'='false'",
                   "'core.sshCommand'='ssh'")
 
 
+def _connect_proxy(environ) -> tuple[str, int] | None:
+    """The workspace's egress proxy, from the HTTPS_PROXY the driver set."""
+    from urllib.parse import urlsplit
+
+    raw = (environ.get("HTTPS_PROXY") or environ.get("https_proxy")
+           or environ.get("HTTP_PROXY") or environ.get("http_proxy") or "")
+    if not raw:
+        return None
+    parts = urlsplit(raw if "://" in raw else "http://" + raw)
+    if not parts.hostname:
+        return None
+    return parts.hostname, parts.port or 3128
+
+
+def ssh_command(key_path: str | None, environ) -> str:
+    """GIT_SSH_COMMAND for one network git command in the workspace.
+
+    A workspace sits on an internal network whose one way out is the egress
+    proxy, and OpenSSH ignores HTTP_PROXY. So ssh is told to reach the
+    remote through the proxy itself: CONNECT host:22, which Squid allows for
+    the allowlisted git hosts only (app/egress). OpenBSD netcat
+    (`nc -X connect`) speaks CONNECT, and the image installs it for this.
+
+    Always set for a pull or push, with or without a leased key. GIT_SSH_COMMAND
+    outranks core.sshCommand, so whatever ssh wrapper the repository's config
+    names never runs."""
+    import shlex
+
+    parts = ["ssh"]
+    if key_path:
+        parts += ["-i", shlex.quote(key_path), "-o", "IdentitiesOnly=yes"]
+    parts += ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+    proxy = _connect_proxy(environ)
+    if proxy is not None:
+        host, port = proxy
+        parts += ["-o", shlex.quote(f"ProxyCommand=nc -X connect -x {host}:{port} %h %p")]
+    return " ".join(parts)
+
+
 def harden_git_environment(environ) -> None:
     """Put the hardening into environ's GIT_CONFIG_PARAMETERS, keeping
     anything already there. Called once by main() for the agent's process, so
@@ -835,25 +874,24 @@ class Agent:
         """The operation's credential, for this one git command, then gone."""
         env = b.get("env")
         key = b.get("ssh_key")
-        if key is None and not env:
+        if not env:
             # No credential: still clear any credential.helper the repository
             # configures (a program it would run), as a leased credential's
             # own environment does. GIT_CONFIG_PARAMETERS cannot do this: it
             # is read after GIT_CONFIG_COUNT and would clear a lease's helper.
-            yield {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper",
+            env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper",
                    "GIT_CONFIG_VALUE_0": "", "GIT_TERMINAL_PROMPT": "0"}
-            return
         if key is None:
-            yield dict(env)
+            # ssh remotes go through the egress proxy even without a key
+            # (a public repository, or a host key the operator mounted).
+            yield {**env, "GIT_SSH_COMMAND": ssh_command(None, os.environ)}
             return
         fd, path = tempfile.mkstemp(prefix="blpl-git-", suffix=".key")
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as fh:
                 fh.write(key if key.endswith("\n") else key + "\n")
-            yield {**(env or {}), "GIT_SSH_COMMAND": (
-                f"ssh -i {path} -o IdentitiesOnly=yes -o BatchMode=yes "
-                "-o StrictHostKeyChecking=accept-new")}
+            yield {**env, "GIT_SSH_COMMAND": ssh_command(path, os.environ)}
         finally:
             try:
                 os.unlink(path)

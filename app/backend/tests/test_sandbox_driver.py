@@ -499,3 +499,10 @@ def test_docker_retry_refuses_a_foreign_container_under_the_runs_name():
     with pytest.raises(NotOurs):
         run(driver_for(daemon).run_container(rs, ["x"]))
     assert rs.key.container_name() in daemon.containers
+
+
+def test_extra_hosts_come_from_config_and_reach_the_body():
+    cfg = DockerConfig.from_env({"BLPL_SANDBOX_EXTRA_HOSTS": "squid:10.9.0.2 clamav:10.9.0.3"})
+    assert cfg.extra_hosts == ("squid:10.9.0.2", "clamav:10.9.0.3")
+    assert build_create_body(spec(), cfg)["HostConfig"]["ExtraHosts"] == list(cfg.extra_hosts)
+    assert "ExtraHosts" not in build_create_body(spec(), DockerConfig())["HostConfig"]

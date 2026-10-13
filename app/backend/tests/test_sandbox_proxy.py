@@ -488,3 +488,31 @@ def test_logs_are_ours_only_and_read_only():
     refused("GET", "/containers/blpl-backend/logs", match="not managed")
     refused("GET", f"/containers/{CID}/logs", query={"since": "0"}, match="not permitted")
     refused("POST", f"/containers/{CID}/logs", match="not permitted")
+
+
+def test_hosts_entries_are_the_deployments_own_only():
+    """A workspace names squid, clamav and ollama through /etc/hosts entries,
+    because Docker's DNS answers nothing under gVisor. An entry can point a
+    trusted name anywhere, so only the configured ones pass."""
+    from dataclasses import replace as _r
+
+    policy = _r(POLICY, extra_hosts=frozenset({"squid:172.31.250.2"}))
+    good = build_create_body(_spec(), DockerConfig(network="blpl-egress", runtime="runsc",
+                                                   extra_hosts=("squid:172.31.250.2",)))
+    assert good["HostConfig"]["ExtraHosts"] == ["squid:172.31.250.2"]
+    proxy = DockerProxy(policy, FakeUpstream())
+    req = lambda b: Request("POST", "/containers/create", {"name": KEY.container_name()},  # noqa: E731
+                            json.dumps(b).encode())
+    assert json.loads(asyncio.run(proxy.decide(req(good))).body) == good
+    bad = copy.deepcopy(good)
+    bad["HostConfig"]["ExtraHosts"] = ["squid:203.0.113.9"]  # the proxy's name, elsewhere
+    with pytest.raises(Refused, match="not permitted"):
+        asyncio.run(proxy.decide(req(bad)))
+
+
+def _spec():
+    return WorkspaceSpec(
+        key=KEY, image=IMAGE,
+        storage=Mount(kind="volume", source=KEY.volume_name(), target="/workspace"),
+        libraries=(Mount(kind="bind", source=f"{LIBROOT}/kicad-symbols",
+                         target="/app/kicad-symbols", read_only=True),))
