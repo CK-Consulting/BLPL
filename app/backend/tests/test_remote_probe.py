@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -434,3 +435,24 @@ def test_a_failure_after_the_first_push_cleans_up_and_says_the_branch_is_publish
     refs = subprocess.run(["git", "for-each-ref", "--format=%(refname)"], cwd=repo,
                           capture_output=True, text=True).stdout.split()
     assert refs == ["refs/heads/main"]
+
+
+@pytest.mark.parametrize("policy", ["auto", "manual"])
+def test_a_failed_creation_leaves_no_open_workspace_behind(unlocked, monkeypatch, policy):
+    # The workspace is registered as open — path and project key, in process
+    # memory — before the last steps of creation. A failure after that removed
+    # the directory but left the registry naming it.
+    import app.main as main
+    from fastapi import HTTPException
+
+    def boom(*a, **kw):
+        assert main.workspaces.is_open("p"), "the failure is injected after registration"
+        raise HTTPException(status_code=400, detail="injected")
+
+    monkeypatch.setattr(main, "_record_policy", boom)
+    r = unlocked.post("/api/projects/init", json=init_body("p", push_policy=policy))
+    assert r.status_code == 400
+    assert not (main.PROJECTS_ROOT / "p").exists()
+    assert not main.workspaces.is_open("p")
+    assert main.workspaces.key_for("p") is None
+    assert all(Path(w.path).name != "p" for w in main.workspaces.all_open())

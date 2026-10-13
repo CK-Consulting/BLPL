@@ -2254,6 +2254,13 @@ def init_project(
             autopush.record(session, project.id, user.id, None)
     except Exception as exc:  # noqa: BLE001 — cleaned up, then reported
         shutil.rmtree(dest, ignore_errors=True)
+        # The open-workspace registry is process memory, holding the path and
+        # the project key: the request's rollback cannot reach it. Left, it
+        # named a directory that no longer exists, kept the key, and the idle
+        # sweeper would later try to seal nothing. The database side — the
+        # project row, its grants, the open-workspace row — goes with the
+        # rollback.
+        workspaces.forget(body.name)
         if policy != "auto":
             raise
         reason = exc.detail if isinstance(exc, HTTPException) else "an internal error"
