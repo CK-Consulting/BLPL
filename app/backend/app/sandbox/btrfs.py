@@ -209,10 +209,24 @@ class StorageHelper:
             return {"ok": False, "error": str(exc)}
 
 
+HELPER_TIMEOUT_S = 30.0
+
+
 def serve_helper(socket_path: str, helper: StorageHelper) -> socketserver.UnixStreamServer:
     class Handler(socketserver.StreamRequestHandler):
+        # One JSON line, at most 64 KiB, within this time: a client that
+        # trickles or never finishes holds one thread this long and no more.
+        timeout = HELPER_TIMEOUT_S
+
         def handle(self) -> None:
-            line = self.rfile.readline(64 * 1024)
+            try:
+                line = self.rfile.readline(64 * 1024)
+            except OSError:
+                return
+            if not line.endswith(b"\n"):
+                # Over the cap, or cut short: not a request, and not parsed.
+                self.wfile.write(b'{"ok": false, "error": "one JSON line of at most 64 KiB"}\n')
+                return
             try:
                 request = json.loads(line or b"{}")
                 if not isinstance(request, dict):

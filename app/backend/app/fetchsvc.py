@@ -47,6 +47,9 @@ logger = logging.getLogger("blpl.fetch")
 MAX_BYTES = int(os.environ.get("BLPL_FETCH_MAX_MB", "50")) * 1024 * 1024
 TIMEOUT_S = 30.0
 MAX_REDIRECTS = 5
+# A fetch request is a URL in a small JSON object.
+MAX_REQUEST_BYTES = 64 * 1024
+REQUEST_TIMEOUT_S = 30.0
 _PORTS = {"http": 80, "https": 443}
 
 
@@ -192,6 +195,8 @@ def make_handler(authenticate: Authenticate, held_root: Path, *,
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "blpl-fetch"
+        # A request that trickles in holds one thread for this long at most.
+        timeout = REQUEST_TIMEOUT_S
 
         def _answer(self, status: int, payload: dict | None = None, body: bytes = b"",
                     ctype: str = "application/json") -> None:
@@ -208,11 +213,18 @@ def make_handler(authenticate: Authenticate, held_root: Path, *,
             project = self._project()
             if project is None:
                 return self._answer(401, {"error": "this run's credential was not accepted"})
+            from .sandbox.agent import AgentError, read_body
+
             try:
-                length = int(self.headers.get("Content-Length") or 0)
-                request = json.loads(self.rfile.read(min(length, 65536)) or b"{}")
+                # min(-1, cap) was -1, and read(-1) reads until the peer
+                # closes (Codex, PR #20): the length is checked first.
+                raw = read_body(self, MAX_REQUEST_BYTES, required=True)
+            except AgentError as exc:
+                return self._answer(exc.status, {"error": str(exc)})
+            try:
+                request = json.loads(raw or b"{}")
                 url = str(request.get("url") or "")
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 return self._answer(400, {"error": "a JSON body with a url is required"})
             try:
                 got = download(url, resolve=resolve, connections=connections)
