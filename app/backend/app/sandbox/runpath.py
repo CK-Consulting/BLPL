@@ -43,6 +43,7 @@ RUN_ENV_ALLOW = frozenset({
     "BLPL_CLAMD_HOST",              # quarantine's scanner
     "BLPL_CLAMD_PORT",
     "BLPL_QUARANTINE_REQUIRE_SCAN",
+    "BLPL_EXTRACT_MAX_TOKENS",      # datasheet extraction's output budget
     "TZ", "LANG", "LC_ALL",         # timestamps and decoding in reports
 })
 
