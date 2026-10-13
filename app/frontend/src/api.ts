@@ -330,6 +330,22 @@ export type Settings = {
   known_tasks: string[];
   vision_tasks: string[];
   secrets: SecretMeta[];
+  /** Shows Settings → Admin. The admin routes check for themselves. */
+  is_admin?: boolean;
+};
+
+/** Settings → Admin → Network access (GET /api/admin/egress). */
+export type AdminEgress = {
+  /** Whether runs go through the egress proxy at all. */
+  enforced: boolean;
+  /** Shipped with BLPL: every run may reach these over HTTPS. Read only. */
+  defaults: string[];
+  /** Shipped: git over ssh (port 22). Read only. */
+  git_ssh_hosts: string[];
+  /** Added by administrators, for every run. */
+  hosts: { host: string; added_by: string; added_at: string }[];
+  /** Who added or removed what, newest first. */
+  events: { host: string; action: "added" | "removed"; by: string; at: string }[];
 };
 
 export type FabReadiness = {
