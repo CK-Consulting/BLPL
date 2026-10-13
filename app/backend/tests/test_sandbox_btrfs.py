@@ -3,8 +3,8 @@
 The btrfs commands are checked against a fake runner that keeps a model of
 subvolumes, so the sequence and the paths are exact without needing root. A
 real-filesystem test runs only where BLPL_TEST_BTRFS_ROOT names a btrfs path
-with quotas enabled that this process may manage. This host has quotas off,
-and the test says so.
+with quotas enabled that this process may manage. Elsewhere it skips and
+says why.
 """
 
 from __future__ import annotations
@@ -181,8 +181,8 @@ def _btrfs_root_or_reason() -> str | None:
     root = os.environ.get("BLPL_TEST_BTRFS_ROOT")
     if not root:
         return ("no BLPL_TEST_BTRFS_ROOT: a real test needs a btrfs path with quotas "
-                "enabled that this process may manage (CAP_SYS_ADMIN). This host's btrfs "
-                "has quotas off, and the suite does not use sudo.")
+                "enabled that this process may manage (CAP_SYS_ADMIN). The suite does not "
+                "use sudo to make one.")
     try:
         btrfs.run_btrfs(["btrfs", "qgroup", "show", root])
     except StorageError as exc:

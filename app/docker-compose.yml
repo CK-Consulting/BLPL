@@ -729,8 +729,8 @@ services:
       - BLPL_PROXY_INSTANCE=${BLPL_SANDBOX_INSTANCE:-blpl}
       - BLPL_PROXY_IMAGES=blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}
       - BLPL_PROXY_NETWORKS=blpl-egress
-      # runsc (gVisor) is installed on this host. Set both to make it
-      # mandatory: BLPL_SANDBOX_RUNTIME=runsc and BLPL_PROXY_REQUIRE_RUNTIME=1.
+      # Where runsc (gVisor) is installed, set both to make it mandatory:
+      # BLPL_SANDBOX_RUNTIME=runsc and BLPL_PROXY_REQUIRE_RUNTIME=1.
       - BLPL_PROXY_RUNTIMES=${BLPL_SANDBOX_RUNTIME:-}
       - BLPL_PROXY_REQUIRE_RUNTIME=${BLPL_PROXY_REQUIRE_RUNTIME:-0}
       - BLPL_PROXY_RO_BIND_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules}

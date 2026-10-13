@@ -304,7 +304,7 @@ def test_an_upload_refuses_a_linked_quarantine_directory(ag, projects):
 def gvisor_open(monkeypatch):
     """Emulate runsc: open() with O_DIRECTORY | O_NOFOLLOW follows a symlink
     (to a directory it opens the target; dangling, it fails ENOENT), where
-    Linux refuses with ENOTDIR. Measured on this host, 2026-10-12."""
+    Linux refuses with ENOTDIR. Measured on 2026-10-12."""
     real = os.open
 
     def gvisor(path, flags, mode=0o777, *, dir_fd=None):

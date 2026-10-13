@@ -19,8 +19,8 @@ The control plane reaches it through ``HelperStorage``, which implements
 Every btrfs command goes through one ``Runner``, so tests check the exact
 commands against a fake, and so the code never shells out by any other
 route. A real-filesystem test runs where ``BLPL_TEST_BTRFS_ROOT`` points at a
-btrfs path with quotas enabled and the helper's privilege; this host has
-neither by default, and the test says so rather than pretending.
+btrfs path with quotas enabled and the helper's privilege. Without one the
+test skips and says so, rather than pretending.
 """
 
 from __future__ import annotations
