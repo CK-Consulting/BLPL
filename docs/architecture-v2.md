@@ -363,10 +363,20 @@ and file contents keep the UNTRUSTED framing they have today.
   goes in that command's environment. An ssh key, which the control plane
   leased as a file, is sent as content; the agent writes it to its tmpfs at
   0600 and deletes it after the command.
-- **Runs** start in their own session and process group. A cancel sends
-  `SIGTERM` to the group and `SIGKILL` after 10 s, so a stage's children die
-  with it. Logs are kept in the workspace's `/tmp` and read by offset, so a
-  restart of the follower loses nothing.
+- **Runs: superseded.** As first built, the agent started runs in its own
+  container, each in its own process group, keyed by the database run's id
+  so a retry follows the same process. Round 3 of the PR #20 review showed
+  why that cannot stand. A run shares the agent's uid and its read-write
+  `/run/blpl`, so it can rename `agent.sock` and listen in its place, and
+  then receive the control plane's bearer token and the credentials sent
+  with a push.
+  - The agent cannot run a child as another uid: no capabilities, and
+    no-new-privileges.
+  - Authenticating the listener does not help either, since an impostor can
+    relay any challenge to the real agent it can still reach.
+  - So the agent now refuses runs unless started with `BLPL_AGENT_RUNS=1`,
+    which no deployment sets. With the agent in use, the worker always runs
+    stages in run containers (phase 4), which do not mount `/run/blpl`.
 - **Writes during a run are refused** (409), except under `.blpl/`, where the
   chat's files live and which no stage reads.
 - **`.git` for runs.** It is not made read-only in phase 3. Every run gets
@@ -633,9 +643,9 @@ behaviour.
     pushes;
   - git status, diff, pull and push.
 
-  The worker starts and follows runs through the agent instead of
-  `docker exec`. The idle sweep asks the agent how long it has been idle, so
-  the backend's requests keep a workspace alive too.
+  Runs go in run containers of their own whenever the agent is in use (see
+  "Runs: superseded" above). The idle sweep asks the agent how long it has
+  been idle, so the backend's requests keep a workspace alive too.
 - **Tested** three ways:
   - the agent in-process, covering confinement, tokens, git, runs and
     cancellation of a process group;
@@ -697,6 +707,29 @@ sealing in a container, storage with limits.**
 - Cancel stops the container, so every process in it dies.
 - The worker marks the run on the workspace's agent, so writes still wait for
   it.
+
+*Hardened in review (PR #20):*
+- **Reclaimed runs are followed, not restarted.** A worker that dies leaves its
+  run container running, and the run is requeued under the same id. The retry
+  finds the container by name and labels. With the same command, it follows
+  it from the top of its output to its exit code. Only a stale container
+  under the run's name is killed. A retry whose first attempt exists does not
+  snapshot again, and an existing `pre-<run>` snapshot that is ours is reused.
+- **Bind sources are checked on the disk** (`sandbox/realpath.py`). A stage in
+  a phase 2 or 3 workspace could replace its member worktree with a symlink.
+  The name passes every lexical rule, and Docker follows links when it
+  mounts, so the run container would get wherever the link points, writable.
+  Every component from the trusted root down is `lstat`ed, opened
+  `O_NOFOLLOW`, and matched by inode:
+  - by the worker, when it builds the mounts;
+  - by the socket proxy, through a read-only view of the checkout at the
+    same host paths (`BLPL_PROXY_VERIFY_PATHS`), for every bind it forwards:
+    project and worktree directories, `.git` overlays, agent directories and
+    library paths.
+
+  The remaining window lies between the proxy's check and the daemon's own
+  open of the path. It cannot be closed from outside the daemon; both checks
+  narrow it.
 
 *Step 3: sealing in a sealer container.*
 - With the agent on, every seal and unseal stops and removes the project's
