@@ -1913,6 +1913,10 @@ _PROBE_SENTENCES = {
     "ok": "Connected.",
     "auth_failed": "The remote refused the credential — check the token and its permissions.",
     "not_found": "No repository was found at that URL, or the credential cannot see it.",
+    "read_only": (
+        "The credential can read this repository but not write to it — the token needs "
+        "write access (GitHub: Contents: Read and write; GitLab: write_repository)."
+    ),
     "error": "The remote could not be reached.",
 }
 

@@ -459,7 +459,7 @@ export type GitStatus = {
 };
 
 export type RemoteCheck = {
-  status: "ok" | "auth_failed" | "not_found" | "error";
+  status: "ok" | "auth_failed" | "not_found" | "read_only" | "error";
   ok: boolean;
   /** Only meaningful when ok. A new project needs an empty repository. */
   empty: boolean | null;

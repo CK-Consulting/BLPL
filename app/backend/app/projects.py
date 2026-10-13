@@ -31,7 +31,9 @@ import contextlib
 import fcntl
 import os
 import re
+import secrets
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1101,22 +1103,73 @@ class Projects:
         is a claim about today's git.
         """
         url = check_remote_url(url)
-        proc = subprocess.run(
-            ["git", "ls-remote", "--", url],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-            env={**os.environ, **_net_env(env), "GIT_TERMINAL_PROMPT": "0"},
-        )
+        net = {**os.environ, **_net_env(env), "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            proc = subprocess.run(
+                ["git", "ls-remote", "--", url],
+                capture_output=True, text=True, check=False, timeout=self.PROBE_TIMEOUT, env=net,
+            )
+        except subprocess.TimeoutExpired:
+            # A structured answer, not an exception: uncaught, this was a 500
+            # from Test connection and from creation (Codex, PR #19).
+            return RemoteProbe("error", empty=False, message=_PROBE_TIMED_OUT)
+        if proc.returncode != 0:
+            err = _redact_text(proc.stderr.strip())
+            low = err.lower()
+            if any(s in low for s in _AUTH_FAILURES):
+                return RemoteProbe("auth_failed", empty=False, message=err)
+            if any(s in low for s in _NOT_FOUND):
+                return RemoteProbe("not_found", empty=False, message=err)
+            return RemoteProbe("error", empty=False, message=err)
+        empty = not proc.stdout.strip()
+        refused = self._probe_write(url, net)
+        if refused is not None:
+            return refused
+        return RemoteProbe("ok", empty=empty, message="")
+
+    #: How long either probe waits for the remote before saying it did not answer.
+    PROBE_TIMEOUT = 60
+
+    def _probe_write(self, url: str, net: dict[str, str]) -> RemoteProbe | None:
+        """None if the credential may push to ``url``, else why not.
+
+        ls-remote talks to upload-pack, the read side, so a token that can see
+        an empty private repository but not write to it passed Test connection,
+        was saved, and the project's first push then failed (Codex, PR #19).
+        A push talks to receive-pack, and the server checks write access when
+        that service is first asked for — before any objects are sent. So this
+        is a real push, with the same environment a real push gets, run with
+        --dry-run so nothing is sent: from a throwaway repository holding only
+        the empty tree (no commit, so no identity needed), to a ref name
+        nobody uses (refs/blpl-write-probe/<random>), so that even a server
+        that took a dry run for a real one would create nothing anyone sees.
+        """
+        with tempfile.TemporaryDirectory(prefix="blpl-write-probe-") as tmp:
+            try:
+                subprocess.run(["git", "init", "-q", tmp], capture_output=True, check=True, timeout=30)
+                tree = subprocess.run(
+                    ["git", "hash-object", "-t", "tree", "-w", "--stdin"], cwd=tmp, input="",
+                    capture_output=True, text=True, check=True, timeout=30,
+                ).stdout.strip()
+                ref = f"refs/blpl-write-probe/{secrets.token_hex(8)}"
+                proc = subprocess.run(
+                    ["git", "push", "--dry-run", "--porcelain", "--", url, f"{tree}:{ref}"],
+                    cwd=tmp, capture_output=True, text=True, check=False,
+                    timeout=self.PROBE_TIMEOUT, env=net,
+                )
+            except subprocess.TimeoutExpired:
+                return RemoteProbe("error", empty=False, message=_PROBE_TIMED_OUT)
+            except subprocess.CalledProcessError as exc:
+                return RemoteProbe(
+                    "error", empty=False,
+                    message=_redact_text(f"could not prepare the write check: {exc.stderr or exc}"),
+                )
         if proc.returncode == 0:
-            return RemoteProbe("ok", empty=not proc.stdout.strip(), message="")
-        err = _redact_text(proc.stderr.strip())
+            return None
+        err = _redact_text((proc.stderr or proc.stdout).strip())
         low = err.lower()
-        if any(s in low for s in _AUTH_FAILURES):
-            return RemoteProbe("auth_failed", empty=False, message=err)
-        if any(s in low for s in _NOT_FOUND):
-            return RemoteProbe("not_found", empty=False, message=err)
+        if any(s in low for s in _AUTH_FAILURES + _WRITE_REFUSALS):
+            return RemoteProbe("read_only", empty=False, message=err)
         return RemoteProbe("error", empty=False, message=err)
 
     def _require(self, name: str) -> Path:
@@ -1203,9 +1256,25 @@ def _no_identity() -> str:
     return NO_IDENTITY
 
 
+_PROBE_TIMED_OUT = "the remote did not answer within 60 seconds"
+
+# What a server says, lowercased, when it lets a credential read but not push:
+# a 403 on receive-pack over HTTPS, a service it will not run for this user,
+# a provider's own "denied". Checked alongside _AUTH_FAILURES.
+_WRITE_REFUSALS = (
+    "returned error: 403",
+    "service not enabled",
+    "not allowed to push",
+    "denied",
+    "write access",
+    "read-only",
+    "read only",
+)
+
+
 @dataclass(frozen=True)
 class RemoteProbe:
-    #: ok | auth_failed | not_found | error
+    #: ok | auth_failed | not_found | read_only | error
     status: str
     #: The remote holds no refs at all. Only meaningful when status is ok.
     empty: bool
