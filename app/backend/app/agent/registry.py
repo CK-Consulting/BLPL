@@ -1401,7 +1401,10 @@ async def _bulk_route(ctx: ToolContext, args: dict) -> str:
     from .kicad_bridge import snapshot
 
     if not ctx.extras.get("kicad_snapshot"):
-        commit = await _to_thread(snapshot, ctx.project_dir)
+        # With the turn's user's identity: snapshot() refuses to make a commit
+        # without one, and called without it here, every autoroute ran with no
+        # undo anchor at all (Codex, PR #19).
+        commit = await _to_thread(snapshot, ctx.project_dir, ctx.git_identity)
         ctx.extras["kicad_snapshot"] = commit or "none"
         ctx.note("snapshotted the board before routing" if commit else "no git snapshot available")
 

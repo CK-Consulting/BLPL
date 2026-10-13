@@ -209,3 +209,53 @@ def test_no_identity_means_no_snapshot_not_someone_elses(git_project) -> None:
         ["git", "for-each-ref", "refs/blpl/"], cwd=git_project, capture_output=True, text=True
     ).stdout
     assert refs.strip() == ""
+
+
+def test_a_bulk_autoroute_is_anchored_with_the_users_identity_and_can_be_reverted(
+    git_project, monkeypatch
+) -> None:
+    # Codex P1 on #19: the bulk router called snapshot() without the turn's
+    # identity, which since the no-identity guard meant no anchor at all —
+    # the largest change anything makes to a board, with nothing to revert to.
+    import asyncio
+
+    from blpl.core import autoroute
+
+    from app.agent.registry import _bulk_route
+    from app.agent.toolspec import ToolContext
+    from app.references import FilesystemSandbox, ReferenceManifest
+
+    pcb = git_project / "board.kicad_pcb"
+
+    class Routed:
+        def to_dict(self):
+            return {"ok": True}
+
+    def route(path, passes=10):
+        path.write_text("(kicad_pcb routed by the autorouter)\n", encoding="utf-8")
+        return Routed()
+
+    monkeypatch.setattr(autoroute, "available", lambda: (True, ""))
+    monkeypatch.setattr(autoroute, "route", route)
+    ctx = ToolContext(
+        project_id="board",
+        project_dir=git_project,
+        sandbox=FilesystemSandbox(
+            manifest=ReferenceManifest.empty(project_id="board", workspace_root=git_project)
+        ),
+        git_identity=WHO,
+    )
+    asyncio.run(_bulk_route(ctx, {}))
+
+    anchor = ctx.extras["kicad_snapshot"]
+    assert anchor and anchor != "none"
+    who = subprocess.run(
+        ["git", "log", "-1", "--format=%an <%ae>", anchor],
+        cwd=git_project, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert who == "Board Editor <editor@example.com>"
+    assert pcb.read_text() == "(kicad_pcb routed by the autorouter)\n"
+
+    ok, detail = kb.restore(git_project)
+    assert ok, detail
+    assert pcb.read_text() == "(kicad_pcb original)\n"

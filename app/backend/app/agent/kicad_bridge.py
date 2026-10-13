@@ -129,7 +129,7 @@ def probe(url: str) -> tuple[BridgeStatus, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def snapshot(project_dir: Path, identity=None) -> str | None:
+def snapshot(project_dir: Path, identity) -> str | None:
     """Commit the working tree to a ref, without touching HEAD or the index.
 
     ``commit-tree`` on a written index gives a commit nobody's branch points at,
@@ -144,6 +144,9 @@ def snapshot(project_dir: Path, identity=None) -> str | None:
     repo-local identity somebody set for themselves, say — authoring the
     anchor as a person who did not make it (Codex, PR #19). The caller then
     reports that there is no undo anchor, which is the truth.
+
+    ``identity`` has no default on purpose: a caller that forgot it (the bulk
+    router did) silently got no anchor. Now forgetting it is a TypeError.
     """
     if identity is None:
         return None
