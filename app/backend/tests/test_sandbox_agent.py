@@ -345,3 +345,47 @@ def test_a_write_never_truncates_through_a_link(gvisor_open, ag, projects):
         c.write(B(projects), "leak.md", b"")
     assert e.value.status == 403
     assert (projects / "victim" / "secret.md").read_text() == "another project's plaintext\n"
+
+
+def test_a_held_push_keeps_the_origin_lock_until_released(ag, projects, tmp_path):
+    """Project setup records a push's outcome under the origin lock. Through the
+    agent the lock is in the workspace, so a held push answers and keeps it;
+    nothing else can take it until the control plane releases the lease."""
+    _, c, sock = ag
+    board = projects / "board"
+    _git(board, "init", "-q", "-b", "main")
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+    _git(board, "remote", "add", "origin", f"file://{remote}")
+    c.write(B(projects), "design.md", b"# b\n")
+    c.git_commit(B(projects), "first", {"name": "Ada", "email": "ada@example.com"})
+
+    held = c.git_push_held(B(projects), f"file://{remote}", None)
+    assert held["error"] is None and held["lease"]
+    order: list[str] = []
+    other = AgentClient(sock, TOKEN)
+
+    def second() -> None:
+        r = other.git_hold(B(projects))  # waits for the lock
+        order.append("second has the lock")
+        other.git_release(r["lease"])
+
+    t = threading.Thread(target=second)
+    t.start()
+    time.sleep(0.5)
+    order.append("first recorded")  # what the control plane does while holding
+    c.git_release(held["lease"])
+    t.join(timeout=20)
+    other.close()
+    assert order == ["first recorded", "second has the lock"]
+    assert "first" in subprocess.run(["git", "-C", str(remote), "log", "--format=%s"],
+                                     capture_output=True, text=True).stdout
+
+
+def test_a_held_push_that_fails_still_holds_and_reports(ag, projects):
+    _, c, _ = ag
+    board = projects / "board"
+    _git(board, "init", "-q", "-b", "main")
+    r = c.git_push_held(B(projects), "file:///nowhere.git", None)
+    assert r["lease"] and "no remote" in r["error"]
+    c.git_release(r["lease"])
