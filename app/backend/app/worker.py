@@ -312,6 +312,13 @@ async def main() -> None:
     except OSError:
         logger.exception("could not create worktree directories")
 
+    # Documents for runs in workspaces, fetched here (fetchsvc.py) on the
+    # workspaces' network, since a workspace has no general internet.
+    if (listen := os.environ.get("BLPL_FETCH_LISTEN")) and sandbox_jobs.enabled():
+        from . import fetchsvc
+
+        fetchsvc.serve(listen, _DATA / "fetch-held")
+
     workspaces = None
     if sandbox_jobs.enabled():
         try:
