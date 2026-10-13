@@ -450,42 +450,108 @@ The `blpl-egress` network is `internal: true`, so it has no route out. Its only
 other member is the egress proxy, Squid (the `ubuntu/squid` image, config in
 the repo). Squid is attached to `blpl-egress` and to an outbound network, and
 workspaces get `HTTPS_PROXY`/`HTTP_PROXY` pointing at it. Squid allows `CONNECT`
-on 443 only to a domain allowlist: the configured LLM providers' API hosts,
-DigiKey/Mouser/LCSC, `github.com` and `codeload.github.com`, plus the
-operator's own git hosts. It also allows `CONNECT` on 22 to the same git hosts,
-for ssh remotes through `ProxyCommand nc -X connect`. Everything else is
+on 443 only to the hosts the control plane allows for the request's
+credential (below): the LLM providers' API hosts, the distributor APIs,
+`github.com` and its download hosts, the administrators' hosts, and the run's
+own endpoints. It also allows `CONNECT` on 22 to the git hosts, for ssh
+remotes. Everything else is
 denied, including RFC 1918, loopback, link-local (the cloud metadata address)
 and the control plane's own addresses. An Ollama on the host is reached by a
 named allowlist entry, not by opening the private ranges. Squid's access log is
 the egress audit record.
 
-**Who decides the allowlist, and how the app uses it (review, PR #20).** A
-member's LLM endpoint on a host Squid does not allow failed mid-run. Opening
-egress to whatever host a member types would let any member send a project
-anywhere, so the list stays the operator's:
-- `app/egress/allowlist.txt` ships the defaults: every remote host the
-  provider catalog names (`providers.catalog_hosts()`, Anthropic, OpenAI,
-  OpenRouter, Together, Fireworks, DeepInfra, plus Gemini), the distributors
-  and the git hosts. A test keeps it in step with the catalog.
-- `app/data/egress/allowlist.txt` holds the operator's additions, outside git,
-  in the same syntax (a leading dot covers subdomains).
-  `app/fix-data-ownership.sh` creates it. Squid reads both files. After an
-  edit, run `docker compose exec squid squid -k reconfigure`.
-- The backend reads the same two files on every check (`egress.py`). With
-  `BLPL_RUNS_IN_WORKSPACE=1` it refuses an endpoint whose host is on neither,
-  or that is not HTTPS on 443. It checks when the endpoint is saved
-  (settings, onboarding) and again when a run is queued, with "`<host>` is not
-  on this server's egress allowlist — ask the operator to add it". Hosts the
-  workspace reaches directly (its `NO_PROXY`: Ollama, clamd) pass.
-  `GET /api/settings/egress` returns the effective list. With runs in the
-  worker, nothing is checked.
+**Per-run access, decided by the control plane (review, PR #20).** A static
+list in a file broke a member's own LLM endpoint (Together, Fireworks, a
+custom base URL) part way through a run, and the only fix was an operator
+editing the file. Opening egress to any host a member types would let any
+member send a project anywhere. So every request through Squid carries a
+credential for one operation, and the control plane decides each host for
+that credential:
+
+- **Grants** (`egress.py`, table `egress_grant`). The worker issues one per
+  run, before the run starts: a proxy username and a random token, of which
+  only the SHA-256 is stored. Its extra hosts are the hosts of the LLM
+  endpoints in that run's own chain (`HDM_LLM_CHAIN(S)`). The credential goes
+  into that run's environment only (`HTTPS_PROXY=http://g-…:…@squid:3128`,
+  through `extra_inject`). The workspace container's own environment carries
+  the proxy address without a credential. The grant is revoked when the run
+  ends and expires after 24 hours regardless. Each network git operation the
+  agent makes gets a 15-minute grant with no extra hosts, sent with the
+  request and revoked when it returns.
+- **Squid** authenticates every request (`auth_param basic`); no credential,
+  or an unknown or expired one, is a 407. An `external_acl_type` then asks,
+  for the authenticated name and the destination, whether this grant may reach
+  this host on this port. Both questions go through
+  `app/egress/blpl-egress-helper.pl` (Perl, which is what the Squid image
+  has) to a Unix socket the backend serves (`egress_server.py`, in
+  `app/data/egress`, which only the backend and Squid mount). Any error, at
+  either end, is a refusal. Answers are cached for 30 seconds, and refusals
+  for 5.
+- **The answer** is the shipped defaults (`app/egress/allowlist.txt`: the LLM
+  providers the catalog names, the distributor APIs kicad-happy calls,
+  github.com; `git-hosts.txt` for port 22), plus the hosts administrators
+  added, plus the grant's own hosts. Only port 443, and port 22 for the git
+  hosts. A member's endpoint is therefore reachable from that member's runs
+  and from no one else's. Private, loopback and link-local addresses stay
+  refused on the resolved address, before any of this.
+- **Nothing is reloaded.** Squid asks per host, so an administrator's change
+  or a new run's grant applies within the cache time. The operator's
+  allowlist file and `squid -k reconfigure` from the previous round are gone,
+  not kept as a bootstrap: one place to look is easier to audit.
+- **What is still checked when an endpoint is saved**, and again when a run is
+  queued: what Squid would refuse for anyone. That is anything but HTTPS on
+  443, and a host that is, or resolves only to, a private, loopback or
+  link-local address. The point is to say so when the endpoint is saved, not
+  to fail mid-run. Hosts the workspace reaches directly (its `NO_PROXY`:
+  Ollama, clamd, the fetch service) pass. With runs in the worker, nothing is
+  checked.
+- **Tested** against the real Squid image with this config and helper
+  (`tests/test_egress_squid.py`). A's host is reachable with A's credential
+  and refused (403) with B's. No credential, or a wrong one, gets 407. A
+  failing decision is a 403, and a failing authentication is a 407.
+
+**Administrators and the server-wide list.** An administrator is a signed-in
+account whose email, as Clerk's signed session token carries it, is in
+`BLPL_ADMIN_EMAILS` (deployment configuration, passed by compose). The UI
+cannot make anyone an administrator. Settings → Admin → Network access shows
+the shipped defaults read-only, and lists, adds and removes server-wide hosts
+(`/api/admin/egress`, 404 for anyone else). An entry is a hostname or a domain
+with one leading dot. IP addresses, wildcards, single labels and
+`.local`/`.internal`-style names are refused. Each change is recorded with who
+and when (`egress_host`, and the append-only `egress_host_event`).
+
+**Documents come from the control plane (`fetchsvc.py`).** A datasheet lives
+on whatever host its manufacturer chose, and allowing all of them would be
+general egress. Inside a workspace, `blpl.core.fetcher` takes over the
+download:
+- kicad-happy's resolver scripts still resolve the part through the
+  distributor APIs. The document itself is requested from the worker's fetch
+  service, on the worker's fixed address on `blpl-egress` (`blpl-fetch`),
+  with the run's own grant.
+- The service refuses anything but http(s) on ports 80 and 443. It refuses
+  any host that resolves to a private, loopback, link-local, multicast or
+  reserved address, on the first request and on every redirect, and connects
+  to the address it checked.
+- It caps size (`BLPL_FETCH_MAX_MB`, 50) and time, requires a PDF, and runs
+  quarantine's own decision with this deployment's scanner.
+- Only an accepted file goes back. The run then files it through the
+  project's quarantine, so the ledger reads as for any download.
+- A held file stays with the control plane (`data/fetch-held/<project>/`).
+  The project's ledger records it as held there, with its reasons and no
+  bytes.
+
+Standalone core (the CLI, the plugin, a host run) has no `BLPL_FETCH_SERVICE`,
+and the scripts download directly as before. The chat agent's tools run in
+the backend and already fetch from the control plane.
 
 **Two things the build found (2026-10-13):**
 - **git over ssh goes through Squid too.** OpenSSH ignores `HTTP_PROXY`, and
   a workspace has no other route out, so the agent sets `GIT_SSH_COMMAND` on
-  every pull and push to `ssh … -o ProxyCommand='nc -X connect -x <proxy> %h
-  %p'`. That is OpenBSD netcat, installed in the workspace image for this. The
-  connection then reaches the remote only through Squid's CONNECT on port 22,
+  every pull and push to `ssh … -o ProxyCommand='python
+  /opt/blpl/wsagent/agent.py --connect %h %p'`. That mode of the agent speaks
+  CONNECT with the operation's credential, which it reads from the
+  `HTTPS_PROXY` it inherits through git and ssh. OpenBSD netcat, used first,
+  can only prompt for a proxy password. The connection then reaches the remote only through Squid's CONNECT on port 22,
   for the hosts in `git-hosts.txt`, with or without a leased key. Because
   `GIT_SSH_COMMAND` outranks `core.sshCommand`, a repository's own ssh wrapper
   never runs.
@@ -798,8 +864,20 @@ sealing in a container, storage with limits.**
   `projects/.sealed`, so a sealed project vanished from the list and `/open`
   answered `already_open` without unsealing. Blobs moved to `data/sealed/`,
   with a migration (above, "Running the backend without the project mount").
-- **LLM endpoints are checked against the egress allowlist** (section 8),
-  instead of a run failing at Squid.
+- **Egress is decided per run** (section 8). A member's own LLM endpoint is
+  reachable from their runs only. Administrators keep a server-wide list in
+  Settings. Documents are fetched by the control plane. The Squid config had
+  never started in its image (`access_log stdio:/dev/stdout` cannot be opened
+  by Squid's `proxy` user), and it is now run in that image by a test.
+- **A failed monitor stops its run.** A run container whose mark renewal or
+  poll raised was left running, unmarked, while the row said it had ended.
+  Every exit from the run, workspace-run and agent-run monitors now stops the
+  run and waits for it before returning.
+- **A mountless backend builds workspace specs from names.** It used to create
+  `.worktrees/<P>` and check bind sources on the read-only mask. The worker
+  creates those directories at its start, an unseal recreates them, and the
+  socket proxy checks every bind source on the disk. Tested end to end with
+  the backend's view an empty read-only directory.
 - **The mountless flag is checked against the mounts.** Compose passed
   `BLPL_PROJECT_MOUNT` nowhere and bound all of `./data` regardless.
   `docker-compose.mountless.yml` removes the projects from the backend's
