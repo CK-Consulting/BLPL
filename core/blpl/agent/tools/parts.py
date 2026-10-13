@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ...core import fetcher as fetcher_mod
 from ...core import quarantine
 from ..kicad_happy import DISTRIBUTORS, CredResolver, run_script, script_path
 
@@ -96,6 +97,7 @@ def search_parts(
     distributors: list[str] | None = None,
     timeout: int = 60,
     project_dir: Path | None = None,
+    fetcher: "fetcher_mod.Fetcher | None | str" = "default",
 ) -> PartSearch:
     """Resolve an MPN across distributors. Never raises for a missing part.
 
@@ -109,6 +111,8 @@ def search_parts(
     """
     creds = creds or CredResolver()
     result = PartSearch(query=mpn)
+    if fetcher == "default":
+        fetcher = fetcher_mod.get_fetcher()
 
     for dist in distributors or list(DISTRIBUTORS):
         missing = creds.missing_for(dist)
@@ -127,7 +131,10 @@ def search_parts(
         try:
             # --search resolves the part without downloading the PDF; the
             # download is a separate, explicitly-approved step.
-            with _download_target(project_dir) as target:
+            # With a fetcher (in a workspace), the script only resolves the
+            # part, and the document comes from the fetcher; otherwise the
+            # script downloads it, as it always has.
+            with _download_target(None if fetcher else project_dir) as target:
                 res = run_script(
                     path,
                     ["--search", mpn, "--json", "-o", str(target)],
@@ -135,6 +142,11 @@ def search_parts(
                     timeout=timeout,
                 )
                 kept = _keep(target, project_dir, mpn=mpn, distributor=dist)
+            got = res.data if isinstance(res.data, dict) else {}
+            if fetcher and project_dir is not None and got.get("datasheet_url"):
+                kept = fetcher_mod.retrieve_into(
+                    fetcher, str(got["datasheet_url"]), project_dir, mpn=mpn,
+                    distributor=dist)
         except Exception as exc:  # subprocess/timeout
             result.skipped[dist] = f"{type(exc).__name__}: {exc}"
             continue
@@ -268,6 +280,7 @@ def fetch_datasheet(
     distributors: list[str] | None = None,
     timeout: int = 180,
     project_dir: Path | None = None,
+    fetcher: "fetcher_mod.Fetcher | None | str" = "default",
 ) -> DatasheetFetch:
     """Download one datasheet, trying distributors in order.
 
@@ -299,6 +312,8 @@ def fetch_datasheet(
             ok=True, mpn=mpn, path=str(out), distributor="cache", detail="already downloaded"
         )
 
+    if fetcher == "default":
+        fetcher = fetcher_mod.get_fetcher()
     tried: list[str] = []
     reasons: list[str] = []
     manual: dict[str, str] = {}
@@ -313,7 +328,7 @@ def fetch_datasheet(
         if not path.exists():
             continue
         tried.append(dist)
-        with _download_target(project_dir) as target:
+        with _download_target(None if fetcher else project_dir) as target:
             res = run_script(
                 path,
                 ["--search", mpn, "--json", "-o", str(target)],
@@ -326,6 +341,15 @@ def fetch_datasheet(
                 source_url=str(data.get("datasheet_url") or ""),
                 dest=out,
             )
+        if fetcher and data.get("datasheet_url"):
+            # In a workspace: the script resolved the part, and the control
+            # plane fetches the document (blpl.core.fetcher).
+            record = fetcher_mod.retrieve_into(
+                fetcher, str(data["datasheet_url"]), project_dir, mpn=mpn, distributor=dist,
+                as_name=out.name, dest_dirname=out.parent.relative_to(project_dir).as_posix())
+            if record is None:
+                reasons.append(f"{dist}: the control plane could not fetch "
+                               f"{data['datasheet_url']}")
         if url := str(data.get("manual_url") or ""):
             manual[dist] = url
         if reason := str(data.get("error") or "").strip():

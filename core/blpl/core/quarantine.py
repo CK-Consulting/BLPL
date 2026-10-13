@@ -581,6 +581,39 @@ def accept_and_release(
     return rec
 
 
+# Where a file held by another quarantine is kept, as its ledger row says.
+HELD_ELSEWHERE = "control-plane"
+
+
+def note_held_elsewhere(
+    project_dir: str | Path,
+    *,
+    sha256: str,
+    size: int,
+    reasons: list[str],
+    inspection: dict | None = None,
+    scan: dict | None = None,
+    mpn: str = "",
+    distributor: str = "",
+    source_url: str = "",
+) -> Record:
+    """Record a file that another quarantine held, without its bytes.
+
+    A fetch made for a workspace goes through the control plane's quarantine
+    (blpl.core.fetcher). A file it holds never reaches the workspace, so there
+    is nothing to put in ``retrieved/``; the ledger still says it was fetched
+    and why it was held, so "no entry" keeps meaning "never fetched". The
+    evidence stays where it was held."""
+    rec = Record(
+        sha256=sha256, filename="", bytes=size, mpn=mpn, distributor=distributor,
+        source_url=source_url, state=HELD, inspection=dict(inspection or {}),
+        scan=dict(scan or {}), reasons=list(reasons) or ["held by the control plane"],
+        released_to=HELD_ELSEWHERE,
+    )
+    _upsert(project_dir, rec)
+    return rec
+
+
 def _upload_suffix(original_name: str) -> str:
     """The extension the uploader's filename claims, made safe to put on disk."""
     suffix = Path(original_name or "").suffix.lower()
