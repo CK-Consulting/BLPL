@@ -82,6 +82,12 @@ def current_token(agent_dir: Path, server_key: bytes, container: str) -> str | N
     return derive_token(server_key, container, nonce)
 
 
+# A push or pull waits up to Projects.NETWORK_LOCK_WAIT (330 s) for the origin
+# lock, then for the network. The client's own wait for an automatic push is
+# autopush.PUSH_WAIT_SECONDS (690 s); a call through the agent gets the same.
+NETWORK_TIMEOUT_S = 690.0
+
+
 class AgentClient:
     """Synchronous: the backend's file and git routes are plain functions."""
 
@@ -107,8 +113,10 @@ class AgentClient:
                 raise AgentCallError(r.status_code, r.text) from None
         return r
 
-    def call(self, path: str, body: dict[str, Any] | None = None) -> Any:
-        return self._check(self._http.post(path, content=json.dumps(body or {}))).json()
+    def call(self, path: str, body: dict[str, Any] | None = None, *,
+             timeout: float | None = None) -> Any:
+        kw = {} if timeout is None else {"timeout": httpx.Timeout(timeout, connect=5.0)}
+        return self._check(self._http.post(path, content=json.dumps(body or {}), **kw)).json()
 
     def health(self) -> dict:
         return self._check(self._http.get("/health")).json()
@@ -173,11 +181,24 @@ class AgentClient:
 
     def git_pull(self, checkout: str, url: str, credential: dict | None) -> str:
         return self.call("/git/pull", {"checkout": checkout, "url": url,
-                                       **(credential or {})})["output"]
+                                       **(credential or {})}, timeout=NETWORK_TIMEOUT_S)["output"]
 
     def git_push(self, checkout: str, url: str, credential: dict | None) -> str:
         return self.call("/git/push", {"checkout": checkout, "url": url,
-                                       **(credential or {})})["output"]
+                                       **(credential or {})}, timeout=NETWORK_TIMEOUT_S)["output"]
+
+    def git_push_held(self, checkout: str, url: str, credential: dict | None) -> dict:
+        """Push, and keep the origin lock until git_release(lease): the
+        outcome is {"output", "error", "lease"}; lease is None when the lock
+        itself could not be had (nothing is held, nothing was pushed)."""
+        return self.call("/git/push", {"checkout": checkout, "url": url, "hold": True,
+                                       **(credential or {})}, timeout=NETWORK_TIMEOUT_S)
+
+    def git_hold(self, checkout: str) -> dict:
+        return self.call("/git/hold", {"checkout": checkout}, timeout=NETWORK_TIMEOUT_S)
+
+    def git_release(self, lease: str) -> None:
+        self.call("/git/release", {"lease": lease})
 
     # runs
     def run_start(self, argv: list[str], env: dict[str, str], cwd: str | None) -> str:

@@ -294,91 +294,92 @@ def remote_of(checkout: Path, operation: str) -> str:
             raise
 
 
-def _remote_op(checkout: Path, op: str, url: str, env: dict[str, str] | None) -> str:
+def pull(checkout: Path, url: str, env: dict[str, str] | None) -> str:
     with agent(checkout) as c:
         try:
-            fn = c.git_pull if op == "pull" else c.git_push
-            return fn(str(checkout), url, _cred(env))
+            return c.git_pull(str(checkout), url, _cred(env))
         except AgentCallError as exc:
             if exc.kind == "project":
                 raise ProjectError(str(exc)) from exc
             raise
-
-
-def pull(checkout: Path, url: str, env: dict[str, str] | None) -> str:
-    return _remote_op(checkout, "pull", url, env)
-
-
-def push(checkout: Path, url: str, env: dict[str, str] | None) -> str:
-    return _remote_op(checkout, "push", url, env)
 
 
 class _AgentProjects:
-    """What autopush.push_now calls ``projects.push`` on, routed to the agent."""
+    """The part of Projects that pushes and records, routed to the agent.
 
-    def push(self, name: str, *, env: dict[str, str] | None, checkout: Path, url: str) -> str:
+    Project setup records a push's outcome while the origin lock is held
+    (``Projects.push(after=...)``, ``Projects.under_remote_lock``), so that
+    overlapping pushes record in the order they ran. The lock is in the
+    project's git directory and the agent takes it. A held push answers with
+    the outcome while still holding it; ``after`` runs here, recording in the
+    control plane's database, and only then is the lease released. The order
+    guarantee is the same as with the mount.
+    """
+
+    @staticmethod
+    def _client(checkout: Path) -> AgentClient:
         try:
-            return push(checkout, url, env)
+            return _connect(checkout)
         except HTTPException as exc:
             raise ProjectError(str(exc.detail)) from exc
 
+    def push(self, name: str, *, env: dict[str, str] | None = None,
+             checkout: Path, url: str | None = None, after=None) -> str:
+        c = self._client(checkout)
+        try:
+            try:
+                r = c.git_push_held(str(checkout), url or "", _cred(env))
+            except AgentCallError as exc:
+                raise ProjectError(str(exc)) from exc
+            exc = ProjectError(r["error"]) if r.get("error") is not None else None
+            lease = r.get("lease")
+            if lease is None:
+                # The lock was never had, so nothing ran and nothing is
+                # recorded under it, exactly as Projects.push raising busy.
+                raise exc or ProjectError("the origin lock could not be taken")
+            try:
+                if after is not None:
+                    after(exc)
+            finally:
+                c.git_release(lease)
+            if exc is not None:
+                raise exc
+            return r["output"]
+        finally:
+            c.close()
 
-def commit_as(session, user, project, checkout: Path, message: str,
-              master_key: bytes | None) -> str | None:
-    """main._commit_as, with the commit made by the agent."""
-    from . import gitidentity
+    def under_remote_lock(self, checkout: Path, fn):
+        c = self._client(checkout)
+        try:
+            r = c.git_hold(str(checkout))
+            if r.get("lease") is None:
+                raise ProjectError(r.get("error") or "the origin lock could not be taken")
+            try:
+                return fn()
+            finally:
+                c.git_release(r["lease"])
+        finally:
+            c.close()
 
-    identity = gitidentity.resolve(session, user, project)
+
+AGENT_PROJECTS = _AgentProjects()
+
+
+def push(checkout: Path, url: str, env: dict[str, str] | None, *, after=None) -> str:
+    """main.git_push's push, through the agent, recording under the lock."""
+    return AGENT_PROJECTS.push("", env=env, checkout=checkout, url=url, after=after)
+
+
+def commit_checkout(checkout: Path, message: str, identity) -> str | None:
+    """projects.commit_checkout, made by the agent: the member's identity rides
+    that one git command, which the agent's copy of Projects._git requires of
+    every commit, exactly as the backend's does."""
     with agent(checkout) as c:
         try:
-            out = c.git_commit(str(checkout), message,
-                               identity.as_json() if identity is not None else None)
+            return c.git_commit(str(checkout), message,
+                                identity.as_json() if identity is not None else None)
         except AgentCallError as exc:
             if exc.kind == "project":
                 raise ProjectError(str(exc)) from exc
             raise
-    if out is not None:
-        _schedule_autopush(session, user, project, checkout, master_key)
-    return out
 
-
-def _schedule_autopush(session, user, project, checkout: Path, master_key: bytes | None) -> None:
-    """main._schedule_autopush, resolving the remote and pushing through the agent."""
-    if project.push_policy != "auto":
-        return
-    from . import autopush, gitstore
-    from . import main as m
-
-    project_id, user_id, name = project.id, user.id, project.name
-    try:
-        url = remote_of(checkout, "push")
-        if not url:
-            raise ProjectError(
-                "pushing is automatic for this project, but it has no remote; "
-                "add one in Project settings → Git"
-            )
-        cred = autopush.snapshot(gitstore.for_remote(session, user, url))
-    except (ProjectError, gitstore.GitStoreError, HTTPException) as exc:
-        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        autopush.record(session, project_id, user_id, autopush.scrub(str(detail), []))
-        return
-
-    def job() -> None:
-        error = autopush.push_now(_AgentProjects(), name, checkout, url, cred, master_key)
-        try:
-            with m.SessionFactory() as s:
-                autopush.record(s, project_id, user_id, error)
-                s.commit()
-        except Exception:  # noqa: BLE001
-            m.logger.exception("could not record the automatic push of %s", name)
-
-    submitted = False
-
-    def submit(*_args) -> None:
-        nonlocal submitted
-        if not submitted:
-            submitted = True
-            m.AUTOPUSH.submit(job)
-
-    m.sa_event.listen(session, "after_commit", submit, once=True)
-    m.sa_event.listen(session, "after_rollback", submit, once=True)

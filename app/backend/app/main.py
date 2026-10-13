@@ -3194,7 +3194,7 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
         dest = (workspace_files.remote_of(checkout, "push") if via
                 else projects.remote_of(project_id, operation="push", checkout=checkout))
         with _git_credentials(session, master_key, user, dest) as env:
-            out = (workspace_files.push(checkout, dest, env) if via
+            out = (workspace_files.push(checkout, dest, env, after=after) if via
                    else projects.push(project_id, env=env, checkout=checkout, url=dest,
                                       after=after))
     except ProjectError as exc:
@@ -4370,11 +4370,13 @@ def _commit_and_push(
     push the same commit a second time. What it returns for that is the
     push's number (None when none was scheduled), which the client waits for
     in the member's push status."""
-    if workspace_files.enabled():
-        return workspace_files.commit_as(
-            session, user, project, checkout, message, master_key), None
     identity = gitidentity.resolve(session, user, project)
-    out = projects.commit_checkout(checkout, message, identity=identity)
+    if workspace_files.enabled():
+        # Made by the workspace's agent, with this identity on the command;
+        # the numbering and scheduling below are the same either way.
+        out = workspace_files.commit_checkout(checkout, message, identity)
+    else:
+        out = projects.commit_checkout(checkout, message, identity=identity)
     seq = None
     if out is not None:
         seq = _schedule_autopush(session, user, project, checkout, master_key)
@@ -4416,22 +4418,28 @@ def _schedule_autopush(
     def record(error: str | None) -> None:
         autopush.record_now(project_id, user_id, error, seq=numbered["seq"])
 
+    # With workspaces behind the agent, the remote is read and the push made
+    # there; push_now records under the origin lock the agent holds for it.
+    via = workspace_files.enabled()
+    pusher = workspace_files.AGENT_PROJECTS if via else projects
     try:
-        url = projects.remote_of(name, operation="push", checkout=checkout)
+        url = (workspace_files.remote_of(checkout, "push") if via
+               else projects.remote_of(name, operation="push", checkout=checkout))
         if not url:
             raise ProjectError(
                 "pushing is automatic for this project, but it has no remote; "
                 "add one in Project settings → Git"
             )
         cred = autopush.snapshot(gitstore.for_remote(session, user, url))
-    except (ProjectError, gitstore.GitStoreError) as exc:
-        autopush.record(session, project_id, user_id, autopush.scrub(str(exc), []), seq=seq)
+    except (ProjectError, gitstore.GitStoreError, HTTPException) as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        autopush.record(session, project_id, user_id, autopush.scrub(str(detail), []), seq=seq)
         return seq
 
     def job() -> None:
         # The outcome is recorded inside push_now, under the origin lock, so
         # overlapping pushes record in the order they ran.
-        error = autopush.push_now(projects, name, checkout, url, cred, master_key, record)
+        error = autopush.push_now(pusher, name, checkout, url, cred, master_key, record)
         if error:
             logger.warning("automatic push of %s for user %s failed: %s", name, user_id, error)
 
