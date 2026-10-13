@@ -536,3 +536,18 @@ def test_the_worker_gives_every_project_its_worktrees_directory(tmp_path):
     assert jobs.ensure_worktree_dirs(root) == ["a"]
     assert (root / ".worktrees" / "a").is_dir()
     assert not (root / ".worktrees" / "link").exists()
+
+
+def test_a_run_containers_egress_credential_reaches_that_run_only(tmp_path):
+    d = FakeDriver(script=lambda call: (0, []))
+
+    async def poll():
+        return "running"
+
+    grant = {"HTTPS_PROXY": "http://g-1:t@squid:3128", "BLPL_FETCH_AUTH": "g-1:t"}
+    asyncio.run(jobs.run_job_in_container(
+        d, cfg(tmp_path), project_name="pathfinder", run_id="r", cmd=["x"], env={},
+        log=lambda s: None, poll=poll, extra_inject=grant))
+    assert {k: d.calls[0].env[k] for k in grant} == grant
+    # The workspace container itself carries no credential.
+    assert "g-1" not in json.dumps(dict(jobs.spec_for(cfg(tmp_path), "pathfinder").env))

@@ -86,3 +86,46 @@ def test_misconfigured_isolation_refuses_to_start_rather_than_falling_back(monke
     monkeypatch.setattr(worker_mod.signal, "signal", lambda *a: None)
     with pytest.raises(SystemExit):
         asyncio.run(worker_mod.main())
+
+
+def test_a_run_gets_its_own_egress_credential_and_it_is_revoked_after(monkeypatch, tmp_path):
+    """The grant names the run, carries the hosts of its own chain, reaches
+    the run's environment only, and is revoked when the run ends."""
+    import json
+
+    from app import egress
+
+    class S(_S):
+        def get(self, model, key):
+            return None
+
+    issued, revoked = [], []
+
+    def issue(session, **kw):
+        issued.append(kw)
+        return "g-run", "tok"
+
+    monkeypatch.setattr(worker_mod, "_LOGS", tmp_path / "runs")
+    monkeypatch.setattr(worker_mod, "SessionFactory", S)
+    monkeypatch.setattr(worker_mod.runqueue, "heartbeat", lambda s, r: runqueue.RUNNING)
+    monkeypatch.setattr(egress, "issue", issue)
+    monkeypatch.setattr(egress, "revoke", lambda session, name: revoked.append(name))
+    monkeypatch.setenv("BLPL_SANDBOX_HTTP_PROXY", "http://squid:3128")
+    monkeypatch.setenv("BLPL_FETCH_SERVICE_URL", "http://blpl-fetch:8001")
+    chain = [{"provider": "openai-compatible", "endpoint": "mine",
+              "base_url": "https://llm.alice.example/v1", "key_env": ""}]
+    d = FakeDriver(script=lambda call: (0, []))
+    job = runqueue.Claimed(run_id="run_eg", project_name="pathfinder",
+                           cmd=[sys.executable, "-m", "blpl.core.cli", "stage1"],
+                           env={"HDM_LLM_CHAIN": json.dumps(chain)})
+
+    assert asyncio.run(_workspaces(tmp_path, d).run(job)) == 0
+
+    (kw,) = issued
+    assert kw["kind"] == "run" and kw["run_id"] == "run_eg" and kw["project"] == "pathfinder"
+    assert kw["hosts"] == ["llm.alice.example"]
+    env = d.calls[0].env
+    assert env["HTTPS_PROXY"] == "http://g-run:tok@squid:3128"
+    assert env["BLPL_FETCH_SERVICE"] == "http://blpl-fetch:8001"
+    assert env["BLPL_FETCH_AUTH"] == "g-run:tok"
+    assert revoked == ["g-run"]

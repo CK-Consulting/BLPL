@@ -155,7 +155,50 @@ class _Workspaces:
             self.access = workspaces.Access.from_env(
                 server_key, lambda: DockerDriver(DockerConfig.from_env()))
 
+    def _grant(self, job: runqueue.Claimed) -> tuple[dict[str, str], str | None]:
+        """This run's egress credential and fetch-service access (egress.py).
+
+        The grant reaches the defaults, the administrators' hosts, and the
+        hosts of the LLM endpoints in this run's own chain; another member's
+        run gets its own. Nothing without an egress proxy."""
+        from . import egress
+        from .models import Run
+
+        if not os.environ.get("BLPL_SANDBOX_HTTP_PROXY"):
+            return {}, None
+        with SessionFactory() as session:
+            row = session.get(Run, job.run_id)
+            name, token = egress.issue(
+                session, kind="run", project=job.project_name, run_id=job.run_id,
+                user_id=row.user_id if row is not None else None,
+                hosts=egress.run_hosts(job.env))
+            session.commit()
+        env = egress.proxy_env(name, token)
+        service = os.environ.get("BLPL_FETCH_SERVICE_URL", "")
+        if service:
+            env.update(BLPL_FETCH_SERVICE=service, BLPL_FETCH_AUTH=f"{name}:{token}")
+        return env, name
+
+    def _revoke(self, name: str | None) -> None:
+        if name is None:
+            return
+        from . import egress
+
+        try:
+            with SessionFactory() as session:
+                egress.revoke(session, name)
+                session.commit()
+        except Exception:  # noqa: BLE001 - it expires on its own
+            logger.exception("could not revoke egress grant %s", name)
+
     async def run(self, job: runqueue.Claimed) -> int:
+        grant_env, grant = self._grant(job)
+        try:
+            return await self._run(job, grant_env)
+        finally:
+            self._revoke(grant)
+
+    async def _run(self, job: runqueue.Claimed, grant_env: dict[str, str]) -> int:
         _LOGS.mkdir(parents=True, exist_ok=True)
         path = runqueue.log_path(_LOGS, job.run_id)
         logger.info("running %s in workspace for %s (%s)", job.run_id, job.project_name,
@@ -197,12 +240,12 @@ class _Workspaces:
                         self.driver, self.cfg, project_name=job.project_name,
                         run_id=job.run_id, cmd=job.cmd, env=job.env, log=log.write,
                         poll=poll, mark=mark, poll_every=_HEARTBEAT_EVERY,
-                        snapshot=snapshot,
+                        snapshot=snapshot, extra_inject=grant_env,
                     )
                 return await sandbox_jobs.run_job(
                     self.driver, self.cfg, project_name=job.project_name,
                     cmd=job.cmd, env=job.env, log=log.write, poll=poll,
-                    poll_every=_HEARTBEAT_EVERY, tracker=self.tracker,
+                    poll_every=_HEARTBEAT_EVERY, tracker=self.tracker, extra_inject=grant_env,
                 )
             except Exception as exc:  # noqa: BLE001 - recorded in the run's own log
                 # The member reads this log, so say what failed in the

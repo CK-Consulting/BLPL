@@ -179,20 +179,27 @@ class AgentClient:
         paths = self.call("/git/recoverable", {"checkout": checkout})["paths"]
         return None if paths is None else set(paths)
 
-    def git_pull(self, checkout: str, url: str, credential: dict | None) -> str:
-        return self.call("/git/pull", {"checkout": checkout, "url": url,
+    # ``proxy`` is the egress proxy's variables with the credential the
+    # control plane issued for this one operation (egress.py); the agent sets
+    # them for the git command and nothing else.
+    def git_pull(self, checkout: str, url: str, credential: dict | None,
+                 proxy: dict | None = None) -> str:
+        return self.call("/git/pull", {"checkout": checkout, "url": url, "proxy": proxy or {},
                                        **(credential or {})}, timeout=NETWORK_TIMEOUT_S)["output"]
 
-    def git_push(self, checkout: str, url: str, credential: dict | None) -> str:
-        return self.call("/git/push", {"checkout": checkout, "url": url,
+    def git_push(self, checkout: str, url: str, credential: dict | None,
+                 proxy: dict | None = None) -> str:
+        return self.call("/git/push", {"checkout": checkout, "url": url, "proxy": proxy or {},
                                        **(credential or {})}, timeout=NETWORK_TIMEOUT_S)["output"]
 
-    def git_push_held(self, checkout: str, url: str, credential: dict | None) -> dict:
+    def git_push_held(self, checkout: str, url: str, credential: dict | None,
+                      proxy: dict | None = None) -> dict:
         """Push, and keep the origin lock until git_release(lease): the
         outcome is {"output", "error", "lease"}; lease is None when the lock
         itself could not be had (nothing is held, nothing was pushed)."""
         return self.call("/git/push", {"checkout": checkout, "url": url, "hold": True,
-                                       **(credential or {})}, timeout=NETWORK_TIMEOUT_S)
+                                       "proxy": proxy or {}, **(credential or {})},
+                         timeout=NETWORK_TIMEOUT_S)
 
     def git_hold(self, checkout: str) -> dict:
         return self.call("/git/hold", {"checkout": checkout}, timeout=NETWORK_TIMEOUT_S)

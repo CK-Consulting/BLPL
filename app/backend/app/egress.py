@@ -1,64 +1,73 @@
-"""The hosts a run in a workspace may reach, as the app sees them.
+"""Which hosts a run or a git operation in a workspace may reach.
 
-Runs in workspaces leave blpl-egress only through Squid, which allows HTTPS by
-CONNECT on port 443 to a host on its allowlist and nothing else
-(app/egress/squid.conf). An LLM endpoint on any other host therefore failed
-part way through a run, with a refused CONNECT in Squid's log and nothing in
-the app to say why (Codex, PR #20).
+Workspaces sit on blpl-egress, an internal network whose only way out is
+Squid. Squid authenticates every request with a credential issued for one
+operation (an ``EgressGrant``), and for each new host asks the control plane,
+through app/egress_server.py and a small helper in the Squid container,
+whether that grant may reach it. The answer is:
 
-Opening egress to whatever host a member types would fix that and undo the
-point of the allowlist: any member could send a project to a host of their
-choosing. So the list stays the operator's, and the app reads the same two
-files Squid reads and checks against them, when an endpoint is saved and
-again when a run is queued:
+* the shipped defaults: ``app/egress/allowlist.txt`` (the LLM providers the
+  catalog names, the distributor APIs kicad-happy calls, git hosts over
+  HTTPS) and ``app/egress/git-hosts.txt`` (git over ssh, port 22);
+* the hosts an administrator added in Settings (``EgressHost``);
+* for a run, the hosts of the LLM endpoints in that run's own chain.
 
-* the shipped defaults, ``app/egress/allowlist.txt`` (every host the built-in
-  provider catalog names, the distributors, the git hosts);
-* the operator's additions, ``app/data/egress/allowlist.txt``, outside git.
+So a member's own endpoint is reachable from their runs and from nobody
+else's, without anyone editing a file or reloading Squid, and a member cannot
+open the sandbox to an arbitrary host for anyone but themselves. Datasheets
+and other documents do not come through here at all: the control plane
+fetches them (app/fetchsvc.py), so the workspace keeps no general egress.
 
-Both use Squid's ``dstdomain`` syntax: a name matches itself, and a leading
-dot also matches every subdomain. The app reads them on every check, so an
-added host passes here at once; Squid needs ``squid -k reconfigure``.
-
-Enforced only with ``BLPL_RUNS_IN_WORKSPACE=1``. With runs in the worker
-container nothing goes through Squid, and nothing here refuses anything.
+With workspaces off nothing here is consulted, and nothing is refused.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import ipaddress
+import json
 import os
+import re
+import secrets
+import socket
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Mapping
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING, Iterable, Mapping
+from urllib.parse import quote, urlsplit
+
+if TYPE_CHECKING:  # pragma: no cover
+    from sqlalchemy.orm import Session
+
+    from .models import User
 
 # The host an endpoint of a kind reaches when it names no base URL. Mirrors
 # the SDK defaults blpl.core.llm_chat uses.
 DEFAULT_HOST = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
 
+RUN_GRANT_TTL = timedelta(hours=24)
+GIT_GRANT_TTL = timedelta(minutes=15)
+
 
 class EgressRefused(ValueError):
-    """An endpoint a run in a workspace could not reach."""
+    """An endpoint a run in a workspace could not use."""
 
 
 def enforced(env: Mapping[str, str] | None = None) -> bool:
+    """Whether runs go through Squid at all."""
     env = os.environ if env is None else env
     return env.get("BLPL_RUNS_IN_WORKSPACE", "") == "1"
 
 
-def _shipped_default() -> Path:
-    in_image = Path("/app/egress/allowlist.txt")
-    if in_image.is_file():
+# -- the shipped defaults --------------------------------------------------------------
+
+
+def _egress_dir() -> Path:
+    in_image = Path("/app/egress")
+    if (in_image / "allowlist.txt").is_file():
         return in_image
-    return Path(__file__).resolve().parents[2] / "egress" / "allowlist.txt"
-
-
-def allowlist_files(env: Mapping[str, str] | None = None) -> list[Path]:
-    env = os.environ if env is None else env
-    shipped = env.get("BLPL_EGRESS_ALLOWLIST") or str(_shipped_default())
-    data = Path(env.get("BLPL_DATA_ROOT", "/app/data"))
-    local = env.get("BLPL_EGRESS_LOCAL_ALLOWLIST") or str(data / "egress" / "allowlist.txt")
-    return [Path(shipped), Path(local)]
+    return Path(__file__).resolve().parents[2] / "egress"
 
 
 def read(path: Path) -> list[str]:
@@ -74,25 +83,19 @@ def read(path: Path) -> list[str]:
     return out
 
 
-def allowlist(env: Mapping[str, str] | None = None) -> list[str]:
-    """The effective list: shipped defaults and the operator's additions."""
-    seen: list[str] = []
-    for path in allowlist_files(env):
-        for entry in read(path):
-            if entry not in seen:
-                seen.append(entry)
-    return seen
+def defaults() -> list[str]:
+    """Hosts every grant may reach over HTTPS (port 443)."""
+    return read(_egress_dir() / "allowlist.txt")
 
 
-def _direct(env: Mapping[str, str]) -> set[str]:
-    """Hosts a workspace reaches without Squid: what its NO_PROXY names."""
-    from .sandbox.jobs import workspace_env
-
-    no_proxy = workspace_env(env).get("NO_PROXY", "")
-    return {h.strip().lower() for h in no_proxy.split(",") if h.strip()}
+def git_ssh_hosts() -> list[str]:
+    """Hosts every grant may reach on port 22, for git over ssh."""
+    return read(_egress_dir() / "git-hosts.txt")
 
 
 def matches(host: str, entries: Iterable[str]) -> bool:
+    """Squid's dstdomain rule: a name matches itself; a leading dot also
+    matches every subdomain."""
     host = host.lower().rstrip(".")
     for entry in entries:
         if entry.startswith("."):
@@ -103,6 +106,190 @@ def matches(host: str, entries: Iterable[str]) -> bool:
     return False
 
 
+# -- the administrators' list ----------------------------------------------------------
+
+_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def normalise_entry(raw: str) -> str:
+    """A server-wide entry: a hostname, or a domain with one leading dot.
+
+    Refused: IP addresses (Squid refuses private addresses on the resolved
+    address anyway, and a literal here would be a statement of intent to
+    reach one), wildcards other than the leading dot, single labels, and the
+    names that mean this machine or this network."""
+    entry = (raw or "").strip().lower().rstrip(".")
+    if not entry:
+        raise ValueError("enter a hostname, such as api.example.com")
+    if "*" in entry:
+        raise ValueError("use a leading dot for a domain and its subdomains (.example.com), "
+                         "not a wildcard")
+    name = entry[1:] if entry.startswith(".") else entry
+    is_ip = True
+    try:
+        ipaddress.ip_address(name.strip("[]"))
+    except ValueError:
+        is_ip = False
+    if is_ip:
+        raise ValueError("enter a hostname, not an IP address")
+    if any(c in entry for c in "/: @"):
+        raise ValueError("enter a hostname only, without a scheme, port or path")
+    labels = name.split(".")
+    if len(name) > 253 or not all(_LABEL.fullmatch(lbl) for lbl in labels):
+        raise ValueError(f"{raw.strip()!r} is not a valid hostname")
+    if len(labels) < 2:
+        raise ValueError("enter a full hostname, such as api.example.com")
+    if name.split(".")[-1] in ("localhost", "local", "internal", "invalid", "lan", "home"):
+        raise ValueError(f"{name} is not a public host")
+    return entry
+
+
+def admin_hosts(session: "Session") -> list[str]:
+    from sqlalchemy import select
+
+    from .models import EgressHost
+
+    return [h for (h,) in session.execute(select(EgressHost.host).order_by(EgressHost.host))]
+
+
+def add_host(session: "Session", user: "User", raw: str) -> str:
+    from sqlalchemy import select
+
+    from .models import EgressHost, EgressHostEvent
+
+    entry = normalise_entry(raw)
+    if session.scalar(select(EgressHost).where(EgressHost.host == entry)) is None:
+        session.add(EgressHost(host=entry, added_by=user.id))
+        session.add(EgressHostEvent(host=entry, action="added", user_id=user.id,
+                                    email=user.email or ""))
+        session.flush()
+    return entry
+
+
+def remove_host(session: "Session", user: "User", raw: str) -> bool:
+    from sqlalchemy import select
+
+    from .models import EgressHost, EgressHostEvent
+
+    entry = (raw or "").strip().lower().rstrip(".")
+    row = session.scalar(select(EgressHost).where(EgressHost.host == entry))
+    if row is None:
+        return False
+    session.delete(row)
+    session.add(EgressHostEvent(host=entry, action="removed", user_id=user.id,
+                                email=user.email or ""))
+    session.flush()
+    return True
+
+
+def is_admin(user: "User | None", env: Mapping[str, str] | None = None) -> bool:
+    """A signed-in account whose email is in BLPL_ADMIN_EMAILS.
+
+    The email is the one Clerk's signed session token carried at sign-in
+    (users.get_or_create keeps it current); a placeholder row for an address
+    that was only ever invited is never an administrator."""
+    env = os.environ if env is None else env
+    if user is None or user.clerk_user_id is None or not user.email:
+        return False
+    admins = {a.strip().lower() for a in re.split(r"[\s,]+", env.get("BLPL_ADMIN_EMAILS", ""))
+              if a.strip()}
+    return user.email.strip().lower() in admins
+
+
+# -- grants ------------------------------------------------------------------------------
+
+
+def _hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def issue(session: "Session", *, kind: str, project: str, hosts: Iterable[str] = (),
+          run_id: str | None = None, user_id: int | None = None,
+          ttl: timedelta = RUN_GRANT_TTL) -> tuple[str, str]:
+    """A new proxy credential: (username, password). Expired grants are
+    removed on the way."""
+    from sqlalchemy import delete
+
+    from .models import EgressGrant
+
+    now = datetime.now(timezone.utc)
+    session.execute(delete(EgressGrant).where(EgressGrant.expires_at < now))
+    name = "g-" + secrets.token_hex(12)
+    token = secrets.token_urlsafe(32)
+    session.add(EgressGrant(
+        id=name, token_sha256=_hash(token), kind=kind, project=project, run_id=run_id,
+        user_id=user_id, hosts=sorted({h.lower() for h in hosts if h}),
+        created_at=now, expires_at=now + ttl))
+    session.flush()
+    return name, token
+
+
+def revoke(session: "Session", name: str) -> None:
+    from sqlalchemy import delete
+
+    from .models import EgressGrant
+
+    session.execute(delete(EgressGrant).where(EgressGrant.id == name))
+
+
+def grant(session: "Session", name: str):
+    """The live grant under this proxy username, or None."""
+    from .models import EgressGrant
+
+    g = session.get(EgressGrant, name)
+    if g is None:
+        return None
+    exp = g.expires_at if g.expires_at.tzinfo else g.expires_at.replace(tzinfo=timezone.utc)
+    return g if exp > datetime.now(timezone.utc) else None
+
+
+def authenticate(session: "Session", name: str, token: str) -> bool:
+    g = grant(session, name)
+    return g is not None and hmac.compare_digest(g.token_sha256, _hash(token or ""))
+
+
+def may_reach(session: "Session", name: str, host: str, port: int) -> bool:
+    """Squid's question: may this grant CONNECT to host:port?"""
+    g = grant(session, name)
+    if g is None:
+        return False
+    host = (host or "").lower().rstrip(".")
+    if port == 22:
+        return matches(host, git_ssh_hosts())
+    if port != 443:
+        return False
+    return matches(host, [*defaults(), *admin_hosts(session), *(g.hosts or [])])
+
+
+def decide(session: "Session", request: Mapping) -> bool:
+    """One question from the Squid helper, answered. Anything malformed is no."""
+    op = request.get("op")
+    user = str(request.get("user") or "")
+    if op == "auth":
+        return authenticate(session, user, str(request.get("password") or ""))
+    if op == "acl":
+        try:
+            port = int(request.get("port") or 0)
+        except (TypeError, ValueError):
+            return False
+        return may_reach(session, user, str(request.get("host") or ""), port)
+    return False
+
+
+def proxy_env(name: str, token: str, env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The proxy variables, carrying this grant's credential, for one operation."""
+    env = os.environ if env is None else env
+    proxy = env.get("BLPL_SANDBOX_HTTP_PROXY", "")
+    if not proxy:
+        return {}
+    parts = urlsplit(proxy)
+    url = f"{parts.scheme}://{quote(name, safe='')}:{quote(token, safe='')}@{parts.netloc}"
+    return {"HTTPS_PROXY": url, "HTTP_PROXY": url, "https_proxy": url, "http_proxy": url}
+
+
+# -- the hosts of a run's chain --------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class Target:
     name: str
@@ -110,50 +297,8 @@ class Target:
     base_url: str = ""
 
 
-def _problem(t: Target, env: Mapping[str, str], entries: list[str]) -> str | None:
-    if t.base_url:
-        url = t.base_url.strip()
-        parts = urlsplit(url if "//" in url else f"//{url}")
-        host, scheme = (parts.hostname or ""), (parts.scheme or "https")
-        try:
-            port = parts.port
-        except ValueError:
-            return f"endpoint {t.name!r} has a base URL with no usable port"
-    elif t.kind == "ollama":
-        parts = urlsplit(env.get("OLLAMA_HOST", "http://ollama:11434"))
-        host, scheme, port = parts.hostname or "", parts.scheme, parts.port
-    else:
-        host, scheme, port = DEFAULT_HOST.get(t.kind, ""), "https", None
-    if not host:
-        return None  # nothing to check; the endpoint fails its own validation
-    host = host.lower()
-    if host in _direct(env):
-        return None
-    if not matches(host, entries):
-        return (f"{host} is not on this server's egress allowlist — ask the operator "
-                f"to add it (endpoint {t.name!r})")
-    if scheme != "https" or port not in (None, 443):
-        return (f"endpoint {t.name!r}: runs in workspaces reach {host} only over HTTPS "
-                f"on port 443, not {scheme}://…:{port or ''}")
-    return None
-
-
-def check(targets: Iterable[Target], env: Mapping[str, str] | None = None) -> None:
-    """Raise EgressRefused for the first endpoint a workspace run could not reach."""
-    env = os.environ if env is None else env
-    if not enforced(env):
-        return
-    entries = allowlist(env)
-    for t in targets:
-        problem = _problem(t, env, entries)
-        if problem:
-            raise EgressRefused(problem)
-
-
 def targets_in_run_env(env: Mapping[str, str]) -> list[Target]:
     """The endpoints a queued run's chains will call (HDM_LLM_CHAIN(S))."""
-    import json
-
     chains: list = []
     for name in ("HDM_LLM_CHAIN", "HDM_LLM_CHAINS"):
         raw = env.get(name)
@@ -172,3 +317,85 @@ def targets_in_run_env(env: Mapping[str, str]) -> list[Target]:
                                   kind=str(entry.get("provider") or ""),
                                   base_url=str(entry.get("base_url") or "")))
     return out
+
+
+def host_of(t: Target) -> str:
+    if t.base_url:
+        url = t.base_url.strip()
+        return (urlsplit(url if "//" in url else f"//{url}").hostname or "").lower()
+    return DEFAULT_HOST.get(t.kind, "")
+
+
+def run_hosts(env: Mapping[str, str]) -> list[str]:
+    """What a run's grant adds to the defaults: its own endpoints' hosts."""
+    return sorted({h for h in (host_of(t) for t in targets_in_run_env(env)) if h})
+
+
+# -- what is still checked when an endpoint is saved ----------------------------------
+
+
+def _direct(env: Mapping[str, str]) -> set[str]:
+    """Hosts a workspace reaches without Squid: what its NO_PROXY names."""
+    from .sandbox.jobs import workspace_env
+
+    no_proxy = workspace_env(env).get("NO_PROXY", "")
+    return {h.strip().lower() for h in no_proxy.split(",") if h.strip()}
+
+
+def _private(addr: str) -> bool:
+    ip = ipaddress.ip_address(addr)
+    return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+            or ip.is_reserved or ip.is_unspecified)
+
+
+def _problem(t: Target, env: Mapping[str, str], resolve) -> str | None:
+    if not t.base_url:
+        return None  # a provider's own host, on the defaults
+    url = t.base_url.strip()
+    parts = urlsplit(url if "//" in url else f"//{url}")
+    host = (parts.hostname or "").lower()
+    if not host or host in _direct(env):
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return f"endpoint {t.name!r} has a base URL with no usable port"
+    if (parts.scheme or "https") != "https" or port not in (None, 443):
+        return (f"endpoint {t.name!r}: runs reach {host} through this server's egress "
+                f"proxy, which carries HTTPS on port 443 only")
+    try:
+        literal: bool | None = _private(host)
+    except ValueError:
+        literal = None
+    if literal or host == "localhost" or host.endswith(".localhost"):
+        return (f"endpoint {t.name!r}: {host} is a private or local address, which runs "
+                f"cannot reach through this server's egress proxy")
+    if literal is None:
+        try:
+            addrs = {ai[4][0] for ai in resolve(host)}
+        except OSError:
+            addrs = set()  # unresolvable now; Squid decides when it is used
+        if addrs and all(_private(a) for a in addrs):
+            return (f"endpoint {t.name!r}: {host} resolves to a private address, which "
+                    f"runs cannot reach through this server's egress proxy")
+    return None
+
+
+def check(targets: Iterable[Target], env: Mapping[str, str] | None = None,
+          resolve=None) -> None:
+    """Refuse an endpoint that no run could reach, whoever saves it.
+
+    Not a host allowlist: a member's own host is allowed for their runs by
+    their grant. What is kept is what Squid refuses for anyone, so it is said
+    at save rather than discovered mid-run: anything but HTTPS on 443, and a
+    private, loopback or link-local address, which Squid refuses on the
+    resolved address so that a workspace cannot reach the control plane, the
+    host or the cloud metadata service through it."""
+    env = os.environ if env is None else env
+    if not enforced(env):
+        return
+    resolve = resolve or (lambda h: socket.getaddrinfo(h, 443, proto=socket.IPPROTO_TCP))
+    for t in targets:
+        problem = _problem(t, env, resolve)
+        if problem:
+            raise EgressRefused(problem)

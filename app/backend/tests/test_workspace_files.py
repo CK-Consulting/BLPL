@@ -430,3 +430,41 @@ def test_without_the_project_mount_a_sealed_project_is_listed_and_opened(client,
     # Open now, and still listed, with what cannot be read reported as unknown.
     (listed,) = [p for p in client.get("/api/projects").json() if p["id"] == "scratch"]
     assert listed["sealed"] is False and listed["markdown_files"] is None
+
+
+def test_a_push_through_the_agent_carries_its_own_egress_credential(client, via_agent,
+                                                                      monkeypatch):
+    """Each network git operation gets a git grant for its project, sent to
+    the agent with the request and revoked when the push is done."""
+    from app import egress
+    from app.sandbox import agent as agent_mod
+
+    issued, revoked, seen = [], [], []
+    real_issue = egress.issue
+
+    def issue(session, **kw):
+        issued.append(kw)
+        return real_issue(session, **kw)
+
+    real_credential = agent_mod.Agent._credential
+
+    def credential(self, b):
+        seen.append(dict(b.get("proxy") or {}))
+        return real_credential(self, b)
+
+    monkeypatch.setattr(egress, "issue", issue)
+    monkeypatch.setattr(egress, "revoke",
+                        lambda session, name: revoked.append(name))
+    monkeypatch.setattr(agent_mod.Agent, "_credential", credential)
+    monkeypatch.setenv("BLPL_SANDBOX_HTTP_PROXY", "http://squid:3128")
+    monkeypatch.setenv("no_proxy", "*")  # the test's own file:// remote needs no proxy
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    client.put("/api/projects/scratch/files/design.md", json={"content": "# d\n"})
+    issued.clear(), revoked.clear(), seen.clear()
+    assert client.post("/api/projects/scratch/git/push").status_code == 200
+    (kw,) = issued
+    assert kw["kind"] == "git" and kw["project"] == "scratch" and not kw.get("hosts")
+    assert seen and seen[-1]["HTTPS_PROXY"].startswith("http://g-")
+    assert seen[-1]["HTTPS_PROXY"].endswith("@squid:3128")
+    assert len(revoked) == 1

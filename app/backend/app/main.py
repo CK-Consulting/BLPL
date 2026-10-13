@@ -142,6 +142,15 @@ async def _lifespan(_app: FastAPI):
         logger.warning("PROJECT MOUNT: %s", mount_warning)
         logger.warning("!" * 72)
     _migrate_sealed_blobs()
+    # Squid's questions about workspace egress (egress_server.py), when the
+    # deployment runs workspaces behind it.
+    egress_decisions = None
+    sock = os.environ.get("BLPL_EGRESS_SOCKET")
+    if sock and (egress.enforced() or workspace_files.enabled()):
+        from . import egress_server
+
+        Path(sock).parent.mkdir(parents=True, exist_ok=True)
+        egress_decisions = egress_server.serve(sock, egress_server.db_decide)
     key_path = serverkey.key_path(_DATA)
     existed = serverkey.load(_DATA) is not None
     serverkey.load_or_create(_DATA)
@@ -159,6 +168,9 @@ async def _lifespan(_app: FastAPI):
         yield
     finally:
         sweeper.cancel()
+        if egress_decisions is not None:
+            egress_decisions.shutdown()
+            egress_decisions.server_close()
 
 
 def _migrate_sealed_blobs() -> None:
@@ -1061,6 +1073,8 @@ def get_settings(
             {"provider": m.endpoint, "updated_at": m.updated_at}
             for m in keystore.list_meta(session, user)
         ],
+        # Shows Settings -> Admin; every admin route checks for itself.
+        "is_admin": egress.is_admin(user),
     }
 
 
@@ -1417,10 +1431,63 @@ def _check_egress(targets: list) -> None:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.get("/api/settings/egress")
-def get_egress(user: User = Depends(require_onboarded)) -> dict:
-    """The hosts a run may reach, so the settings screen can say so up front."""
-    return {"enforced": egress.enforced(), "allowlist": egress.allowlist()}
+def require_admin(user: User = Depends(require_onboarded)) -> User:
+    """An administrator: BLPL_ADMIN_EMAILS names their verified email.
+
+    404 for anyone else, as for a route that does not exist: the admin
+    surface is not something an ordinary account needs to learn about."""
+    if not egress.is_admin(user):
+        raise HTTPException(status_code=404, detail="Not Found")
+    return user
+
+
+@app.get("/api/admin/egress")
+def get_admin_egress(user: User = Depends(require_admin),
+                     session: Session = Depends(session_scope)) -> dict:
+    """Network access for runs in workspaces: the shipped defaults (read
+    only), the server-wide hosts administrators added, and who did what."""
+    from .models import EgressHost, EgressHostEvent
+
+    by_id = {u.id: u.email for u in session.scalars(select(User))}
+    hosts = session.scalars(select(EgressHost).order_by(EgressHost.host)).all()
+    events = session.scalars(
+        select(EgressHostEvent).order_by(EgressHostEvent.at.desc(),
+                                     EgressHostEvent.id.desc()).limit(50)).all()
+    return {
+        "enforced": egress.enforced(),
+        "defaults": egress.defaults(),
+        "git_ssh_hosts": egress.git_ssh_hosts(),
+        "hosts": [{"host": h.host, "added_by": by_id.get(h.added_by, ""),
+                   "added_at": h.added_at} for h in hosts],
+        "events": [{"host": e.host, "action": e.action, "by": e.email, "at": e.at}
+                   for e in events],
+    }
+
+
+class EgressHostBody(BaseModel):
+    host: str
+
+
+@app.post("/api/admin/egress/hosts")
+def add_admin_egress_host(body: EgressHostBody, user: User = Depends(require_admin),
+                          session: Session = Depends(session_scope)) -> dict:
+    """Allow a host for every run, from the next new connection: Squid asks
+    the control plane per host, so nothing is reloaded."""
+    try:
+        host = egress.add_host(session, user, body.host)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    logger.info("egress: %s added %s", user.email, host)
+    return {"ok": True, "host": host}
+
+
+@app.delete("/api/admin/egress/hosts/{host}")
+def remove_admin_egress_host(host: str, user: User = Depends(require_admin),
+                             session: Session = Depends(session_scope)) -> dict:
+    if not egress.remove_host(session, user, host):
+        raise HTTPException(status_code=404, detail=f"{host} is not on the server-wide list")
+    logger.info("egress: %s removed %s", user.email, host)
+    return {"ok": True}
 
 
 @app.put("/api/settings/secrets/{provider}")

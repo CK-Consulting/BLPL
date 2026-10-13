@@ -990,6 +990,10 @@ def serve(c):
         head += d
     line = head.split(b"\r\n")[0].decode()
     log.write(line + "\n")
+    import base64
+    for h in head.split(b"\r\n")[1:]:
+        if h.lower().startswith(b"proxy-authorization: basic "):
+            log.write("auth=" + base64.b64decode(h[27:]).decode().split(":")[0] + "\n")
     verb, target, _ = line.split(" ", 2)
     host, port = target.rsplit(":", 1)
     if verb != "CONNECT" or port != "22":
@@ -1078,15 +1082,18 @@ def test_ssh_from_a_workspace_goes_through_the_connect_proxy(env):
                                                           member="ssh-probe"),
                                    image=WORKSPACE_IMAGE, command=())
                     results = {}
-                    for label, cmd in (
-                        ("proxied", ssh_command(None, {"HTTPS_PROXY": f"http://{proxy}:3128"})),
-                        ("direct", ssh_command(None, {})),
+                    # The operation's own proxy credential, as the agent's
+                    # git command inherits it (egress.py).
+                    granted = {"HTTPS_PROXY": f"http://g-run:tok@{proxy}:3128"}
+                    for label, cmd, run_env in (
+                        ("proxied", ssh_command(None, granted), granted),
+                        ("direct", ssh_command(None, {}), {}),
                     ):
                         out: list[bytes] = []
                         res = await driver.run_container(
                             spec, ["sh", "-c",
                                    f"{cmd} -o ConnectTimeout=5 git@{target} true 2>&1; echo rc=$?"],
-                            on_output=lambda s, b: out.append(b))
+                            env=run_env, on_output=lambda s, b: out.append(b))
                         results[label] = (res.exit_code, b"".join(out).decode(errors="replace"))
                     return results
                 finally:
@@ -1103,6 +1110,7 @@ def test_ssh_from_a_workspace_goes_through_the_connect_proxy(env):
     proxy_log = (logs / "proxy.log").read_text() if (logs / "proxy.log").exists() else ""
     target_log = (logs / "target.log").read_text() if (logs / "target.log").exists() else ""
     assert f"CONNECT {target}:22" in proxy_log, (proxy_log, proxied_text)
+    assert "auth=g-run" in proxy_log, proxy_log  # the credential, from the environment
     assert target_log.startswith("SSH-2.0-OpenSSH"), (target_log, proxied_text)
     # The control: with no proxy command, the remote is not even reachable.
     assert "rc=0" not in results["direct"][1]
