@@ -91,13 +91,106 @@ def test_a_remote_that_can_be_read_but_not_written_is_not_ready(unlocked, http_r
     assert "not write" in body["message"]
 
 
-def test_creation_over_a_read_only_remote_is_refused(unlocked, http_remote):
+def test_automatic_creation_over_a_read_only_remote_is_refused(unlocked, http_remote):
     import app.main as main
 
     url, _ = http_remote
-    r = unlocked.post("/api/projects/init", json=init_body("p", remote=url))
+    r = unlocked.post("/api/projects/init", json=init_body("p", remote=url, push_policy="auto"))
     assert r.status_code == 400 and "not write" in r.json()["detail"]
     assert not (main.PROJECTS_ROOT / "p").exists()
+
+
+def test_manual_creation_over_a_read_only_remote_goes_ahead_with_a_warning(unlocked, http_remote):
+    url, repo = http_remote
+    r = unlocked.post("/api/projects/init", json=init_body("p", remote=url))
+    assert r.status_code == 200, r.text
+    assert "pushes will fail" in r.json()["warning"]
+    # Manual: nothing was pushed.
+    assert subprocess.run(["git", "for-each-ref"], cwd=repo, capture_output=True, text=True).stdout == ""
+
+
+def _protect(repo, branch="main"):
+    """Accept pushes over http, but reject any update to ``branch`` in a
+    pre-receive hook — branch protection as a server enforces it: on the
+    update itself, which a dry run never sends."""
+    subprocess.run(["git", "config", "http.receivepack", "true"], cwd=repo, check=True)
+    hook = repo / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "while read old new ref; do\n"
+        f'  if [ "$ref" = "refs/heads/{branch}" ]; then\n'
+        f'    echo "GH006: Protected branch update failed for refs/heads/{branch}." >&2; exit 1\n'
+        "  fi\n"
+        "done\n"
+    )
+    hook.chmod(0o755)
+
+
+def test_the_probe_targets_the_branch_but_cannot_see_its_protection(unlocked, http_remote):
+    # Stated as a test so the limitation is not forgotten: the dry run passes
+    # a protected branch, because protection acts on the update it never sends.
+    url, repo = http_remote
+    _protect(repo)
+    body = unlocked.post("/api/projects/check-remote", json={"url": url}).json()
+    assert body["status"] == "ok"
+
+
+def test_automatic_creation_into_a_protected_branch_is_refused_and_rolled_back(
+    unlocked, http_remote
+):
+    # Codex P1 on #19: the probe passed and the first real push was rejected.
+    # Creation now makes that first push itself, and a rejection undoes it.
+    import app.main as main
+
+    url, repo = http_remote
+    _protect(repo)
+    r = unlocked.post("/api/projects/init", json=init_body("p", remote=url, push_policy="auto"))
+    assert r.status_code == 400, r.text
+    assert "refused the project's first push" in r.json()["detail"]
+    assert "Protected branch" in r.json()["detail"]
+    assert not (main.PROJECTS_ROOT / "p").exists()
+    assert unlocked.get("/api/projects").json() == []
+    assert subprocess.run(["git", "for-each-ref"], cwd=repo, capture_output=True, text=True).stdout == ""
+
+
+def test_a_rejected_first_push_does_not_keep_a_new_token(unlocked, monkeypatch):
+    # The same rollback, for the token: tokens are https-only, so the remote
+    # here is an https URL whose probe passes and whose first push is refused.
+    import app.main as main
+    from app.projects import ProjectError, RemoteProbe
+
+    monkeypatch.setattr(main.projects, "probe_remote", lambda url, env=None, branch="main": RemoteProbe("ok", True, ""))
+
+    def push(name, *, env=None, checkout=None, url=None, after=None):
+        assert env and env.get("GIT_HTTP_TOKEN") == "tok-SECRET-123", "pushed with the probed credential"
+        raise ProjectError("git push failed (1): remote: GH006: Protected branch update failed")
+
+    monkeypatch.setattr(main.projects, "push", push)
+    r = unlocked.post(
+        "/api/projects/init",
+        json=init_body("p", remote="https://git.example.org/o/p.git", push_policy="auto",
+                       token="tok-SECRET-123", token_username="u"),
+    )
+    assert r.status_code == 400 and "Protected branch" in r.json()["detail"]
+    assert "tok-SECRET-123" not in r.text
+    assert not (main.PROJECTS_ROOT / "p").exists()
+    assert unlocked.get("/api/settings/git").json()["endpoints"] == []
+
+
+def test_automatic_creation_pushes_exactly_the_first_commits(unlocked, http_remote):
+    import app.main as main
+
+    url, repo = http_remote
+    subprocess.run(["git", "config", "http.receivepack", "true"], cwd=repo, check=True)
+    r = unlocked.post("/api/projects/init", json=init_body("p", remote=url, push_policy="auto"))
+    assert r.status_code == 200, r.text
+    local = main.PROJECTS_ROOT / "p"
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=local, capture_output=True, text=True).stdout.strip()
+    refs = subprocess.run(["git", "for-each-ref", "--format=%(refname) %(objectname)"], cwd=repo,
+                          capture_output=True, text=True).stdout.split("\n")
+    assert [r for r in refs if r] == [f"refs/heads/main {head}"]
+    st = unlocked.get("/api/projects/p/git/status").json()
+    assert st["last_push"]["ok"] is True and st["ahead"] == 0
 
 
 def test_a_writable_remote_passes_and_the_check_writes_nothing(unlocked, http_remote):
@@ -200,6 +293,35 @@ def test_an_automatic_clone_over_a_writable_remote_is_accepted(unlocked, http_re
     assert refs == ["refs/heads/main"]
 
 
+def test_a_clone_into_a_protected_branch_records_the_first_rejected_push(
+    unlocked, http_remote, monkeypatch
+):
+    # A clone cannot push for real to find out without changing the branch,
+    # so the dry run (which passes protection) is all it gets; the first real
+    # push is then rejected, and that is recorded as a failed push.
+    import app.main as main
+
+    url, repo = http_remote
+    _seed(repo)
+    _protect(repo)
+    held = []
+
+    class Deferred:
+        def submit(self, fn):
+            held.append(fn)
+
+    monkeypatch.setattr(main, "AUTOPUSH", Deferred())
+    r = unlocked.post("/api/projects/clone", json=_clone_body(url, "auto"))
+    assert r.status_code == 200 and r.json()["warning"] == ""
+
+    unlocked.put("/api/projects/c/files/design.md", json={"content": "# mine\n"})
+    assert len(held) == 1
+    held[0]()
+    st = unlocked.get("/api/projects/c/git/status").json()
+    assert st["last_push"]["ok"] is False
+    assert "Protected branch" in st["last_push"]["error"]
+
+
 def test_an_automatic_clone_refuses_a_remote_that_does_not_answer(unlocked, monkeypatch, tmp_path):
     import app.main as main
     import app.projects as projects_mod
@@ -217,3 +339,27 @@ def test_an_automatic_clone_refuses_a_remote_that_does_not_answer(unlocked, monk
     r = unlocked.post("/api/projects/clone", json=_clone_body(remote, "auto"))
     assert r.status_code == 400 and "did not answer" in r.json()["detail"]
     assert not (main.PROJECTS_ROOT / "c").exists()
+
+
+@pytest.mark.parametrize("branch", ["main", "dev"])
+def test_the_write_check_aims_at_the_branch_that_will_be_pushed(tmp_path, monkeypatch, branch):
+    # Codex P1 on #19: it aimed at a side ref nobody protects, while the real
+    # push updates refs/heads/<branch>, where providers scope permissions.
+    import app.projects as projects_mod
+
+    seen = []
+    real = subprocess.run
+
+    def run(argv, *a, **kw):
+        if argv[:2] == ["git", "push"]:
+            seen.append(argv)
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(projects_mod.subprocess, "run", run)
+    remote = bare_remote()
+    assert projects_mod.Projects(tmp_path).probe_write(remote, branch=branch) is None
+    (argv,) = seen
+    assert "--dry-run" in argv
+    assert argv[-1].endswith(f":refs/heads/{branch}")
+    # And still writes nothing.
+    assert real(["git", "for-each-ref"], cwd=remote, capture_output=True, text=True).stdout == ""

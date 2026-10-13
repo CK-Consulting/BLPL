@@ -31,7 +31,6 @@ import contextlib
 import fcntl
 import os
 import re
-import secrets
 import subprocess
 import tempfile
 import time
@@ -1087,7 +1086,9 @@ class Projects:
             self._git_allow_fail(d, "config", "--local", "--unset-all", "user.name")
         return True
 
-    def probe_remote(self, url: str, *, env: dict[str, str] | None = None) -> RemoteProbe:
+    def probe_remote(
+        self, url: str, *, env: dict[str, str] | None = None, branch: str = "main"
+    ) -> RemoteProbe:
         """Whether ``url`` can be reached with ``env``'s credential, and whether
         it is empty. For the new-project dialog's Test connection, and for
         creation itself, which refuses a remote that already has history.
@@ -1122,7 +1123,7 @@ class Projects:
                 return RemoteProbe("not_found", empty=False, message=err)
             return RemoteProbe("error", empty=False, message=err)
         empty = not proc.stdout.strip()
-        refused = self._probe_write(url, net)
+        refused = self._probe_write(url, net, branch)
         if refused is not None:
             return refused
         return RemoteProbe("ok", empty=empty, message="")
@@ -1130,28 +1131,48 @@ class Projects:
     #: How long either probe waits for the remote before saying it did not answer.
     PROBE_TIMEOUT = 60
 
-    def probe_write(self, url: str, *, env: dict[str, str] | None = None) -> RemoteProbe | None:
+    def probe_write(
+        self, url: str, *, env: dict[str, str] | None = None, branch: str = "main"
+    ) -> RemoteProbe | None:
         """The write half of probe_remote on its own: None if ``env``'s
-        credential may push to ``url``, else why not. For a clone, whose
-        remote already has history (so the read half's emptiness is moot)
-        and whose clone itself proves it can be read."""
+        credential may push ``branch`` to ``url``, else why not. For a clone,
+        whose remote already has history (so the read half's emptiness is
+        moot) and whose clone itself proves it can be read."""
         url = check_remote_url(url)
-        return self._probe_write(url, {**os.environ, **_net_env(env), "GIT_TERMINAL_PROMPT": "0"})
+        net = {**os.environ, **_net_env(env), "GIT_TERMINAL_PROMPT": "0"}
+        return self._probe_write(url, net, branch)
 
-    def _probe_write(self, url: str, net: dict[str, str]) -> RemoteProbe | None:
-        """None if the credential may push to ``url``, else why not.
+    def _probe_write(self, url: str, net: dict[str, str], branch: str) -> RemoteProbe | None:
+        """None if the credential may push ``branch`` to ``url``, else why not.
 
         ls-remote talks to upload-pack, the read side, so a token that can see
         an empty private repository but not write to it passed Test connection,
         was saved, and the project's first push then failed (Codex, PR #19).
         A push talks to receive-pack, and the server checks write access when
         that service is first asked for — before any objects are sent. So this
-        is a real push, with the same environment a real push gets, run with
-        --dry-run so nothing is sent: from a throwaway repository holding only
-        the empty tree (no commit, so no identity needed), to a ref name
-        nobody uses (refs/blpl-write-probe/<random>), so that even a server
-        that took a dry run for a real one would create nothing anyone sees.
+        is a push, with the same environment a real push gets, to the ref the
+        project's pushes will update (refs/heads/<branch>, not a side ref:
+        providers scope permissions to branch names), run with --dry-run so
+        nothing is sent. It goes from a throwaway repository holding only the
+        empty tree, so no commit and no identity are involved; --force only
+        stops the client refusing on its own that the remote has commits it
+        lacks, which is a local fast-forward check and says nothing about
+        permission. A dry run sends no update and no pack, so the remote's
+        branch is never moved.
+
+        What this cannot prove. Branch protection — GitHub's protected branches
+        and rulesets, a GitLab protected branch, any pre-receive or update hook
+        — is enforced when the server receives the update and the pack, which
+        is exactly what a dry run never sends. So a credential that may write
+        the repository but not this branch passes here. That is why creating a
+        project with automatic pushing does not stop at this check: it pushes
+        the project's first commit for real and refuses creation if that is
+        rejected (see main.init_project). A clone cannot do that without
+        changing the branch, so for a clone this is the best check there is,
+        and a later rejection is recorded as a failed push like any other.
         """
+        if branch.startswith("-") or not branch:
+            return RemoteProbe("error", empty=False, message=f"{branch!r} is not a branch name")
         with tempfile.TemporaryDirectory(prefix="blpl-write-probe-") as tmp:
             try:
                 subprocess.run(["git", "init", "-q", tmp], capture_output=True, check=True, timeout=30)
@@ -1159,9 +1180,10 @@ class Projects:
                     ["git", "hash-object", "-t", "tree", "-w", "--stdin"], cwd=tmp, input="",
                     capture_output=True, text=True, check=True, timeout=30,
                 ).stdout.strip()
-                ref = f"refs/blpl-write-probe/{secrets.token_hex(8)}"
+                ref = f"refs/heads/{branch}"
                 proc = subprocess.run(
-                    ["git", "push", "--dry-run", "--porcelain", "--", url, f"{tree}:{ref}"],
+                    # --dry-run and --force together, always: see the docstring.
+                    ["git", "push", "--dry-run", "--force", "--porcelain", "--", url, f"{tree}:{ref}"],
                     cwd=tmp, capture_output=True, text=True, check=False,
                     timeout=self.PROBE_TIMEOUT, env=net,
                 )

@@ -245,7 +245,9 @@ def test_automatic_pushing_publishes_the_first_commits_and_every_save(unlocked, 
     r = unlocked.post("/api/projects/init", json=init_body("p", remote=remote, push_policy="auto"))
     assert r.status_code == 200, r.text
     repo = main.PROJECTS_ROOT / "p"
-    assert pushes.run() == 1
+    # The first push is part of creation itself, not a background job: it is
+    # the one real check that the branch accepts pushes (see init_project).
+    assert pushes.jobs == []
     assert _git(remote, "rev-parse", "main") == _git(repo, "rev-parse", "HEAD")
 
     unlocked.put("/api/projects/p/files/design.md", json={"content": "# board\n"})

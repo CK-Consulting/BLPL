@@ -40,7 +40,7 @@ import subprocess
 import sys
 import logging
 from collections.abc import Sequence
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1820,7 +1820,7 @@ def clone_project(
             # so a read-only token cloned fine and an automatic policy then
             # recorded a failure after every commit (Codex, PR #19). Asked
             # before git clone runs, so a refusal leaves nothing behind.
-            refused = projects.probe_write(body.remote, env=env)
+            refused = projects.probe_write(body.remote, env=env, branch=body.branch)
             if refused is not None and policy == "auto":
                 raise HTTPException(
                     status_code=400,
@@ -1894,7 +1894,9 @@ def _remote_probe(
     token: str | None, token_username: str | None,
 ):
     """Try ``url`` with the token given, or the user's saved credential for its
-    host. Returns (probe, credential name or None, the secret to scrub).
+    host. Returns (probe, credential name or None, the secret to scrub, the
+    credential row — saved or transient — or None), the row so that a real
+    push can be made with exactly the credential that was probed.
 
     The URL is validated first, before any credential is chosen for it — the
     same order clone keeps. A token is only for HTTPS: over SSH the credential
@@ -1923,10 +1925,10 @@ def _remote_probe(
             raise ProjectError(str(exc)) from exc
         name = row.name if row is not None else None
     if row is None:
-        return projects.probe_remote(url), None, None
+        return projects.probe_remote(url), None, None, None
     with gitstore.lease(master_key, row) as cred:
         probe = projects.probe_remote(url, env=cred.env)
-    return probe, name, token
+    return probe, name, token, row
 
 
 _PROBE_SENTENCES = {
@@ -1961,7 +1963,7 @@ def check_remote(
     any part of the answer — git's message is redacted and the literal secret
     scrubbed from it besides."""
     try:
-        probe, name, secret = _remote_probe(
+        probe, name, secret, _ = _remote_probe(
             session, master_key, user, body.url, body.token, body.token_username
         )
     except ProjectError as exc:
@@ -2114,18 +2116,28 @@ def init_project(
         raise HTTPException(status_code=400, detail=str(exc))
 
     try:
-        probe, _, secret = _remote_probe(
+        probe, _, secret, cred_row = _remote_probe(
             session, master_key, user, remote, body.token, body.token_username
         )
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=autopush.scrub(str(exc), [body.token or ""]))
-    if probe.status != "ok":
+    warning = ""
+    if probe.status == "read_only" and policy == "manual":
+        # Manual pushing over a credential that cannot write is allowed — the
+        # owner may fix the token before the first push — and said, as for a
+        # manual clone. The probe is a dry run and cannot see branch
+        # protection anyway (see Projects._probe_write).
+        warning = (
+            "This credential can read the repository but not write to it, so pushes "
+            "will fail until it has write access."
+        )
+    elif probe.status != "ok":
         detail = autopush.scrub(probe.message, [secret or ""])
         raise HTTPException(
             status_code=400,
             detail=f"{_PROBE_SENTENCES[probe.status]} {detail}".strip(),
         )
-    if not probe.empty:
+    if probe.status == "ok" and not probe.empty:
         raise HTTPException(status_code=409, detail=_NOT_EMPTY)
 
     token = (body.token or "").strip()
@@ -2157,6 +2169,31 @@ def init_project(
         shutil.rmtree(dest, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(exc))
 
+    if policy == "auto":
+        # The real check. The probe above is a dry run, and a dry run cannot
+        # see branch protection (a protected branch, a ruleset, a pre-receive
+        # hook): those act on the update and the pack, which a dry run never
+        # sends. So with automatic pushing the project's first push — its
+        # genuine first commit, by the creator, which they asked to have
+        # pushed — is made now, with the credential that was probed, and a
+        # rejection refuses creation: the directory is removed, and raising
+        # rolls back this request's session, so no project row and no newly
+        # entered token are kept. Codex, PR #19.
+        try:
+            lease = gitstore.lease(master_key, cred_row) if cred_row is not None else nullcontext(None)
+            with lease as leased:
+                projects.push(
+                    body.name, env=leased.env if leased is not None else None,
+                    checkout=dest, url=remote,
+                )
+        except ProjectError as exc:
+            shutil.rmtree(dest, ignore_errors=True)
+            raise HTTPException(
+                status_code=400,
+                detail="the remote refused the project's first push, so the project was not "
+                f"created: {autopush.scrub(str(exc), [secret or ''])}",
+            )
+
     project = projectacl.create(session, user, body.name, remote=remote)
     project.push_policy = policy
     gitidentity.set_for_project(session, user, project, identity)
@@ -2169,10 +2206,10 @@ def init_project(
     )
     _record_policy(session, project, body, actor_id=user.id)
     activity.record(session, project, user, activity.IMPORTED, "created empty")
-    # The first commits go out now when pushing is automatic, so the remote
-    # holds the project from its first minute rather than from its first save.
-    _schedule_autopush(session, user, project, dest, master_key)
-    return {"ok": True, "id": body.name}
+    if policy == "auto":
+        # Pushed above; recorded now that the member row exists.
+        autopush.record(session, project.id, user.id, None)
+    return {"ok": True, "id": body.name, "warning": warning}
 
 
 class ShareBody(BaseModel):
