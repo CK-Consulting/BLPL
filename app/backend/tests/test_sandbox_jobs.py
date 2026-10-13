@@ -502,3 +502,37 @@ def test_an_agent_run_is_cancelled_when_following_it_fails():
         asyncio.run(jobs.run_job_via_agent(connect, cmd=["x"], env={}, log=lambda s: None,
                                            poll=poll, run_id="r1"))
     assert calls == [("cancel", "r1"), ("close",)]
+
+
+# -- a backend without the project mount builds specs from names (Codex, PR #20) -------
+
+
+def test_without_the_mount_a_spec_is_built_without_touching_the_mask(tmp_path):
+    mask = tmp_path / "masked"
+    mask.mkdir()
+    mask.chmod(0o555)  # what the mountless layout's read-only tmpfs is
+    try:
+        c = jobs.WorkspaceRunConfig.from_env({
+            "BLPL_SANDBOX_HOST_PROJECTS": HOST, "BLPL_PROJECTS_ROOT": str(mask),
+            "BLPL_PROJECT_MOUNT": "absent"})
+        assert c.sees_projects is False
+        spec = jobs.spec_for(c, "pathfinder")
+    finally:
+        mask.chmod(0o755)
+    assert list(mask.iterdir()) == []
+    assert (spec.storage.source, spec.storage.target) == (f"{HOST}/pathfinder", f"{mask}/pathfinder")
+    (wt,) = spec.extra_storage
+    assert wt.source == f"{HOST}/.worktrees/pathfinder"
+    # With the mount, the same call still creates and checks.
+    assert jobs.WorkspaceRunConfig.from_env({"BLPL_SANDBOX_HOST_PROJECTS": HOST}).sees_projects
+
+
+def test_the_worker_gives_every_project_its_worktrees_directory(tmp_path):
+    root = tmp_path / "projects"
+    for name in ("a", "b", ".sealed", ".worktrees"):
+        (root / name).mkdir(parents=True)
+    (root / ".worktrees" / "b").mkdir()
+    (root / "link").symlink_to(root / "a")
+    assert jobs.ensure_worktree_dirs(root) == ["a"]
+    assert (root / ".worktrees" / "a").is_dir()
+    assert not (root / ".worktrees" / "link").exists()

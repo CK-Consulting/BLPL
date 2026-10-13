@@ -554,6 +554,9 @@ def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
                 _remove_plaintext(dest)
             os.replace(staging / "worktrees", dest)
         os.replace(staging / "repo", repo)
+        # A workspace binds .worktrees/<P> as well, and a backend without the
+        # project mount cannot create it (sandbox.jobs.spec_for).
+        (root / ".worktrees" / project).mkdir(parents=True, exist_ok=True)
     finally:
         _remove_plaintext(staging)
 

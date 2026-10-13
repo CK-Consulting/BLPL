@@ -1210,3 +1210,98 @@ def test_phase4_a_symlinked_member_worktree_never_reaches_a_run_container(env):
 
     asyncio.run(scenario())
     assert (target / "precious").read_text() == "not the project's\n"
+
+
+def test_phase4_a_backend_without_the_mount_reaches_a_project_through_its_workspace(env):
+    """The mountless layout end to end (Codex, PR #20). The backend's view of
+    the projects is an empty read-only directory, as the tmpfs mask is; the
+    real tree is where the worker and the proxy see it. Starting the
+    workspace, a member's worktree, listing, reading and writing a file, an
+    upload, a commit and a push all go through the agent, and the backend's
+    view is never touched."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    if RUNTIME == "runsc" and (why := _runsc_host_uds()):
+        pytest.skip(why)
+    import secrets
+    import subprocess
+
+    from app.sandbox import jobs as jobs_mod
+    from app.sandbox import workspaces
+    from app.sandbox.jobs import WorkspaceRunConfig
+
+    real = env.tmp / "projects"           # the host tree: worker and proxy
+    mask = env.tmp / "backend-view"       # what the backend sees
+    agents = env.tmp / "agents"
+    project = f"itest-{env.tag}-ml"
+    proj = real / project
+    proj.mkdir(parents=True)
+    mask.mkdir()
+    agents.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(proj)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(proj / ".remote.git")],
+                   check=True)
+    assert jobs_mod.ensure_worktree_dirs(real) == [project]  # the worker, at its start
+    for d in (env.tmp, real, proj, real / ".worktrees", real / ".worktrees" / project, agents):
+        os.chmod(d, 0o755)
+    os.chmod(mask, 0o555)
+
+    psock = str(env.tmp / "proxy.sock")
+    policy = ProxyPolicy(
+        verify_paths=True,
+        instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
+        ro_bind_roots=(str(env.lib),), project_bind_roots=(str(real),),
+        agent_dir_roots=(str(agents),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
+    )
+    access = workspaces.Access(
+        run_cfg=WorkspaceRunConfig(
+            image=WORKSPACE_IMAGE, projects_root=mask, host_projects_root=str(real),
+            sees_projects=False, env={"BLPL_GIT_ALLOWED_PROTOCOLS": "file"},
+            resources=Resources(memory_bytes=1024**3, nano_cpus=1_000_000_000, pids=256,
+                                tmp_bytes=256 * 1024**2)),
+        agent_root=agents, host_agent_root=str(agents),
+        server_key=secrets.token_bytes(32),
+        driver_factory=lambda: DockerDriver(env.config(f"unix://{psock}")),
+        ready_timeout_s=60,
+    )
+    ident = {"name": "Ada Lovelace", "email": "ada@example.com"}
+    co = f"{mask}/{project}"   # the backend's path for the checkout
+
+    async def scenario():
+        upstream = UnixUpstream(SOCK)
+        server = await serve(DockerProxy(policy, upstream), psock)
+        try:
+            c = await access.ensure(project)
+            try:
+                c.write(co, "design.md", b"# Board\n")
+                assert c.read(co, "design.md") == b"# Board\n"
+                assert "design.md" in json.dumps(c.list(co))
+                up = c.accept_upload(co, b"vendor notes\n", original_name="notes.txt",
+                                     kind="reference", uploaded_by="ada@example.com",
+                                     mpn="", llm_ignore=False)
+                assert up["state"] == "released", up
+                assert c.git_commit(co, "edit", ident) is not None
+                c.git_set_remote(co, f"file://{co}/.remote.git")
+                c.git_push(co, f"file://{co}/.remote.git", None)
+                member = c.worktree_ensure(project, 2, False)
+                assert member["exists"], member
+            finally:
+                c.close()
+        finally:
+            d = DockerDriver(env.config(f"unix://{psock}"))
+            await d.remove(access.spec(project).key)
+            await d.aclose()
+            await upstream.aclose()
+            server.close()
+
+    asyncio.run(scenario())
+    os.chmod(mask, 0o755)
+    assert list(mask.iterdir()) == []   # the backend's view was never written
+    assert (proj / "design.md").read_bytes() == b"# Board\n"
+    assert (proj / "references" / "notes.txt").is_file()
+    log = subprocess.run(["git", "--git-dir", str(proj / ".remote.git"), "log", "-1",
+                          "--format=%an"], capture_output=True, text=True).stdout
+    assert log.strip() == "Ada Lovelace"
+    assert (real / ".worktrees" / project / "u2").is_dir()

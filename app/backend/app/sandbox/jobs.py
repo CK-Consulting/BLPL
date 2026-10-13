@@ -204,6 +204,12 @@ class WorkspaceRunConfig:
     env: Mapping[str, str] = field(default_factory=dict)
     resources: Resources = Resources()
     idle_after_s: float = 15 * 60
+    # Whether this process sees the projects at projects_root. A backend run
+    # without the project mount (BLPL_PROJECT_MOUNT=absent) sees an empty,
+    # read-only tmpfs there, so it builds specs from names alone: the worker,
+    # which keeps the mount, creates the directories, and the socket proxy
+    # checks every bind source on the disk (BLPL_PROXY_VERIFY_PATHS).
+    sees_projects: bool = True
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "WorkspaceRunConfig":
@@ -228,6 +234,7 @@ class WorkspaceRunConfig:
             libraries=libs,
             env=ws_env,
             idle_after_s=float(env.get("BLPL_SANDBOX_IDLE_S", 15 * 60)),
+            sees_projects=env.get("BLPL_PROJECT_MOUNT", "") != "absent",
         )
 
 
@@ -266,31 +273,43 @@ def _real(cfg: "WorkspaceRunConfig", rel: str, final: str = "dir") -> None:
         raise ValueError(f"refusing to mount {rel}: {exc}") from None
 
 
-def _real(cfg: "WorkspaceRunConfig", rel: str, final: str = "dir") -> None:
-    """Refuse a bind source that is, or passes through, a symlink on disk.
+def ensure_worktree_dir(projects_root: Path, project_name: str) -> None:
+    (Path(projects_root) / ".worktrees" / project_name).mkdir(parents=True, exist_ok=True)
 
-    Docker follows links in a bind source, so a member's worktree replaced by
-    a link would be mounted wherever it points, writable (Codex, PR #20).
-    Checked here, where the mounts are built, and again by the socket proxy."""
-    from .realpath import NotReal, verify_beneath
 
-    try:
-        verify_beneath(str(cfg.projects_root), str(cfg.projects_root / rel), final=final)  # type: ignore[arg-type]
-    except NotReal as exc:
-        raise ValueError(f"refusing to mount {rel}: {exc}") from None
+def ensure_worktree_dirs(projects_root: Path) -> list[str]:
+    """Give every project its .worktrees/<P>, for workspaces whose spec is
+    built by a backend that cannot create it. Run by the worker at start."""
+    root = Path(projects_root)
+    made = []
+    if not root.is_dir():
+        return made
+    for d in sorted(root.iterdir()):
+        if d.name.startswith(".") or not d.is_dir() or d.is_symlink() or not _NAME.fullmatch(d.name):
+            continue
+        if not (root / ".worktrees" / d.name).exists():
+            ensure_worktree_dir(root, d.name)
+            made.append(d.name)
+    return made
 
 
 def spec_for(cfg: WorkspaceRunConfig, project_name: str) -> WorkspaceSpec:
     if not _NAME.fullmatch(project_name):
         raise ValueError(f"project name {project_name!r} cannot name a workspace")
-    if (cfg.projects_root / ".worktrees").exists() or (cfg.projects_root / ".worktrees").is_symlink():
-        _real(cfg, ".worktrees")
-    # The worktrees directory may not exist yet for a project nobody else has
-    # joined. A bind of a missing source is an error, so create it. It is empty,
-    # in the project's own tree, and owned by the same uid as everything else.
-    (cfg.projects_root / ".worktrees" / project_name).mkdir(parents=True, exist_ok=True)
-    _real(cfg, project_name)
-    _real(cfg, f".worktrees/{project_name}")
+    if cfg.sees_projects:
+        if (cfg.projects_root / ".worktrees").exists() or (cfg.projects_root / ".worktrees").is_symlink():
+            _real(cfg, ".worktrees")
+        # The worktrees directory may not exist yet for a project nobody else
+        # has joined. A bind of a missing source is an error, so create it. It
+        # is empty, in the project's own tree, and owned by the same uid as
+        # everything else. Without the mount, the worker does this at its
+        # start (ensure_worktree_dirs) and an unseal does it on restore.
+        ensure_worktree_dir(cfg.projects_root, project_name)
+        _real(cfg, project_name)
+        _real(cfg, f".worktrees/{project_name}")
+    # Otherwise nothing here touches the disk: what it would read is the mask
+    # (Codex, PR #20). The proxy refuses a bind source that is missing or not
+    # real on the host.
     root = str(cfg.projects_root)
     return WorkspaceSpec(
         key=WorkspaceKey(project=project_name),
