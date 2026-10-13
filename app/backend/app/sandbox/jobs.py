@@ -184,13 +184,31 @@ class WorkspaceRunConfig:
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
 
+def _real(cfg: "WorkspaceRunConfig", rel: str, final: str = "dir") -> None:
+    """Refuse a bind source that is, or passes through, a symlink on disk.
+
+    Docker follows links in a bind source, so a member's worktree replaced by
+    a link would be mounted wherever it points, writable (Codex, PR #20).
+    Checked here, where the mounts are built, and again by the socket proxy."""
+    from .realpath import NotReal, verify_beneath
+
+    try:
+        verify_beneath(str(cfg.projects_root), str(cfg.projects_root / rel), final=final)  # type: ignore[arg-type]
+    except NotReal as exc:
+        raise ValueError(f"refusing to mount {rel}: {exc}") from None
+
+
 def spec_for(cfg: WorkspaceRunConfig, project_name: str) -> WorkspaceSpec:
     if not _NAME.fullmatch(project_name):
         raise ValueError(f"project name {project_name!r} cannot name a workspace")
+    if (cfg.projects_root / ".worktrees").exists() or (cfg.projects_root / ".worktrees").is_symlink():
+        _real(cfg, ".worktrees")
     # The worktrees directory may not exist yet for a project nobody else has
     # joined. A bind of a missing source is an error, so create it. It is empty,
     # in the project's own tree, and owned by the same uid as everything else.
     (cfg.projects_root / ".worktrees" / project_name).mkdir(parents=True, exist_ok=True)
+    _real(cfg, project_name)
+    _real(cfg, f".worktrees/{project_name}")
     root = str(cfg.projects_root)
     return WorkspaceSpec(
         key=WorkspaceKey(project=project_name),
@@ -340,17 +358,28 @@ def run_spec_for(cfg: WorkspaceRunConfig, project_name: str, run_id: str) -> Wor
     base = spec_for(cfg, project_name)
     root, host = str(cfg.projects_root), cfg.host_projects_root
     overlays: list[Mount] = []
-    if (cfg.projects_root / project_name / ".git").is_dir():
+    git = cfg.projects_root / project_name / ".git"
+    if git.is_symlink():
+        raise ValueError(f"refusing to mount {project_name}/.git: it is a symlink")
+    if git.is_dir():
+        _real(cfg, f"{project_name}/.git")
         overlays.append(Mount(kind="bind", source=f"{host}/{project_name}/.git",
                               target=f"{root}/{project_name}/.git", read_only=True))
     worktrees: list[Mount] = []
     wt_root = cfg.projects_root / ".worktrees" / project_name
     for member in sorted(p.name for p in wt_root.iterdir()) if wt_root.is_dir() else []:
+        rel = f".worktrees/{project_name}/{member}"
         if not _NAME.fullmatch(member):
             continue
-        rel = f".worktrees/{project_name}/{member}"
+        # A link here is a stage's doing: refuse the run rather than skip the
+        # entry, so it is seen.
+        _real(cfg, rel)
         worktrees.append(Mount(kind="bind", source=f"{host}/{rel}", target=f"{root}/{rel}"))
-        if (wt_root / member / ".git").is_file():
+        gitfile = wt_root / member / ".git"
+        if gitfile.is_symlink():
+            raise ValueError(f"refusing to mount {rel}/.git: it is a symlink")
+        if gitfile.is_file():
+            _real(cfg, f"{rel}/.git", "file")
             overlays.append(Mount(kind="bind", source=f"{host}/{rel}/.git",
                                   target=f"{root}/{rel}/.git", read_only=True))
     return replace(base, key=WorkspaceKey(project=project_name, role="run", member=run_id),

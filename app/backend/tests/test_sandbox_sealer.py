@@ -21,6 +21,7 @@ KEY = bytes(range(32))
 
 
 def cfg(tmp_path):
+    (tmp_path / "projects" / "board").mkdir(parents=True, exist_ok=True)
     return WorkspaceRunConfig(image="blpl-workspace:dev", projects_root=tmp_path / "projects",
                               host_projects_root=HOST)
 

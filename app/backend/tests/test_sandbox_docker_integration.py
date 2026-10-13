@@ -196,6 +196,7 @@ def test_driver_against_the_daemon(env):
 def test_driver_through_the_proxy_and_what_the_proxy_refuses(env):
     psock = str(env.tmp / "proxy.sock")
     policy = ProxyPolicy(
+        verify_paths=True,
         instance=env.instance, images=frozenset({IMAGE}), networks=frozenset({"none"}),
         ro_bind_roots=(str(env.lib),),
         runtimes=frozenset({RUNTIME} if RUNTIME else set()),
@@ -388,6 +389,7 @@ def test_phase2_a_queued_stage_runs_in_its_workspace_through_the_proxy(env):
         os.chmod(d, 0o755)
     psock = str(env.tmp / "proxy.sock")
     policy = ProxyPolicy(
+        verify_paths=True,
         instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
         ro_bind_roots=(str(env.lib),), project_bind_roots=(str(projects),),
         runtimes=frozenset({RUNTIME} if RUNTIME else set()),
@@ -501,6 +503,7 @@ def test_phase3_the_agent_in_a_real_workspace(env):
 
     psock = str(env.tmp / "proxy.sock")
     policy = ProxyPolicy(
+        verify_paths=True,
         instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
         ro_bind_roots=(str(env.lib),), project_bind_roots=(str(projects),),
         agent_dir_roots=(str(agents),),
@@ -667,6 +670,7 @@ def test_phase4_a_run_container_cannot_write_git_and_cancel_kills_it(env):
 
     psock = str(env.tmp / "proxy.sock")
     policy = ProxyPolicy(
+        verify_paths=True,
         instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
         project_bind_roots=(str(projects),),
         runtimes=frozenset({RUNTIME} if RUNTIME else set()),
@@ -760,6 +764,7 @@ def test_phase4_sealing_in_a_sealer_container_leaves_no_plaintext(env):
 
     psock = str(env.tmp / "proxy.sock")
     policy = ProxyPolicy(
+        verify_paths=True,
         instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
         project_bind_roots=(str(projects),),
         runtimes=frozenset({RUNTIME} if RUNTIME else set()),
@@ -895,6 +900,7 @@ def test_phase4_worktree_gitfiles_are_safe_from_stages_and_hooks_never_run(env):
 
     psock = str(env.tmp / "proxy.sock")
     policy = ProxyPolicy(
+        verify_paths=True,
         instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
         project_bind_roots=(str(projects),), agent_dir_roots=(str(agents),),
         runtimes=frozenset({RUNTIME} if RUNTIME else set()),
@@ -1134,3 +1140,66 @@ def test_phase4_a_retried_run_follows_its_first_attempt_instead_of_starting_agai
 
     asyncio.run(scenario())
 
+
+def test_phase4_a_symlinked_member_worktree_never_reaches_a_run_container(env):
+    """Codex, PR #20: a member worktree a stage swapped for a link to a host
+    directory. The worker refuses to build the run, and the proxy, checking
+    the disk itself, refuses the mount if it is asked anyway."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    from app.sandbox import jobs
+    from app.sandbox.docker import build_create_body
+    from app.sandbox.jobs import WorkspaceRunConfig
+
+    projects = env.tmp / "projects"
+    project = f"itest-{env.tag}-link"
+    (projects / project).mkdir(parents=True)
+    member = projects / ".worktrees" / project / "u9"
+    member.mkdir(parents=True)
+    target = env.tmp / "elsewhere"
+    target.mkdir()
+    (target / "precious").write_text("not the project's\n")
+    for d in (env.tmp, projects):
+        os.chmod(d, 0o755)
+    cfg = WorkspaceRunConfig(image=WORKSPACE_IMAGE, projects_root=projects,
+                             host_projects_root=str(projects))
+    real_body = build_create_body(jobs.run_spec_for(cfg, project, "run-l"),
+                                  env.config(""))
+    member.rmdir()
+    member.symlink_to(target)
+
+    psock = str(env.tmp / "proxy.sock")
+    policy = ProxyPolicy(
+        verify_paths=True,
+        instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
+        project_bind_roots=(str(projects),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
+    )
+
+    async def poll():
+        return "running"
+
+    async def scenario():
+        upstream = UnixUpstream(SOCK)
+        server = await serve(DockerProxy(policy, upstream), psock)
+        driver = DockerDriver(env.config(f"unix://{psock}"))
+        raw = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=psock),
+                                base_url="http://d/v1.44", timeout=30)
+        try:
+            with pytest.raises(ValueError, match="symlink"):
+                await jobs.run_job_in_container(
+                    driver, cfg, project_name=project, run_id="run-l", cmd=["true"], env={},
+                    log=lambda s: None, poll=poll)
+            name = f"blpl-run-x-{env.tag}"
+            r = await raw.post("/containers/create", params={"name": name}, json=real_body)
+            # Built while the worktree was real, sent after the swap.
+            assert r.status_code == 403 and "symlink" in r.text, r.text
+        finally:
+            await raw.aclose()
+            await driver.aclose()
+            await upstream.aclose()
+            server.close()
+
+    asyncio.run(scenario())
+    assert (target / "precious").read_text() == "not the project's\n"

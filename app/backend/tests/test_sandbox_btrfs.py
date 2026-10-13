@@ -154,6 +154,7 @@ def test_the_helper_takes_a_name_and_a_verb_over_its_socket(store):
 
 
 def test_a_run_is_preceded_by_a_snapshot_and_does_not_start_without_one(tmp_path):
+    (tmp_path / "p" / "board").mkdir(parents=True)
     cfg = jobs.WorkspaceRunConfig(image="i", projects_root=tmp_path / "p",
                                   host_projects_root="/srv/p")
     order: list[str] = []

@@ -41,6 +41,8 @@ QUEUED_ENV = {
 
 
 def cfg(tmp_path) -> jobs.WorkspaceRunConfig:
+    # A real project directory: the mounts are checked against the disk.
+    (tmp_path / "projects" / "pathfinder").mkdir(parents=True, exist_ok=True)
     return jobs.WorkspaceRunConfig.from_env({
         "BLPL_SANDBOX_HOST_PROJECTS": HOST,
         "BLPL_PROJECTS_ROOT": str(tmp_path / "projects"),
@@ -339,6 +341,7 @@ def test_proxy_refuses_other_worktree_mounts(tmp_path, source, ro):
                                          "ReadOnly": ro})
     with pytest.raises(Refused):
         _create_named(body, spec.key.container_name())
+
 
 
 def test_a_reclaimed_run_container_is_followed_and_not_snapshotted_again(tmp_path):

@@ -32,6 +32,7 @@ class _S:
 
 
 def _workspaces(tmp_path, driver) -> worker_mod._Workspaces:
+    (tmp_path / "projects" / "pathfinder").mkdir(parents=True, exist_ok=True)
     ws = object.__new__(worker_mod._Workspaces)
     ws.cfg = jobs.WorkspaceRunConfig.from_env({
         "BLPL_SANDBOX_HOST_PROJECTS": "/srv/blpl/app/data/projects",

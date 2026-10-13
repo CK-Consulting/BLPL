@@ -734,6 +734,7 @@ services:
       - BLPL_PROXY_IMAGES=blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}
       - BLPL_PROXY_NETWORKS=blpl-egress
       # The /etc/hosts entries a workspace may carry: exactly the worker's.
+      - BLPL_PROXY_VERIFY_PATHS=1
       - BLPL_PROXY_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4}
       # Where runsc (gVisor) is installed, set both to make it mandatory:
       # BLPL_SANDBOX_RUNTIME=runsc and BLPL_PROXY_REQUIRE_RUNTIME=1.
@@ -747,6 +748,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - blpl-docker-proxy:/run/blpl-docker-proxy
+      # The checkout, read-only, at its own host path: bind sources are host
+      # paths, and the proxy checks each one on the disk for symlinks
+      # (BLPL_PROXY_VERIFY_PATHS) rather than only by its spelling.
+      - ..:${BLPL_HOST_REPO_DIR:-/blpl-host-repo-dir-unset}:ro
 
   # Per-project btrfs storage (phase 4, step 4): subvolumes, quotas and
   # snapshots. The one container with CAP_SYS_ADMIN, because btrfs needs it for
