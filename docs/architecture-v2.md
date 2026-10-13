@@ -405,6 +405,42 @@ environment, so a name nobody listed (`BLPL_DATABASE_URL`, `SMTP_PASS`, or one
 added next year) never crosses. `PATH`, `HOME` and the interpreter's variables
 come from the workspace image.
 
+**What crosses into a workspace (audited in review, PR #20).** Three
+containers run project code: the workspace (the agent: files, git,
+quarantine), a run container (pipeline stages, kicad-happy, the LLM layer)
+and the sealer. Each gets an environment built from a list, so a setting the
+control plane reads and the code in the container also reads has to be on
+that list, or the container quietly runs with the default. An upload accepted
+by the agent did exactly that: `BLPL_QUARANTINE_REQUIRE_SCAN=1` and the
+scanner's address stayed behind, the agent's quarantine found no scanner and
+released the file unscanned.
+
+| setting | read in the container by | workspace | run | sealer |
+|---|---|---|---|---|
+| `BLPL_CLAMD_HOST`, `BLPL_CLAMD_PORT` | `av` (agent uploads, Stage 8 fetches) | `scan_policy` | `scan_policy` | not read |
+| `BLPL_QUARANTINE_REQUIRE_SCAN` | `quarantine` | `scan_policy`, and per upload | `scan_policy` | not read |
+| `BLPL_CLAMD_SOCKET` | `av` | never: a control-plane socket; forces the requirement on | same | not read |
+| `BLPL_GIT_ALLOWED_PROTOCOLS` | `projects` (remote checks, `GIT_ALLOW_PROTOCOL`) | copied | not read | not read |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | git, SDKs, kicad-happy | from `BLPL_SANDBOX_*`; `NO_PROXY` always names clamd's and Ollama's hosts | inherited from the container | none (no network use) |
+| `BLPL_MODULES_ROOT`, `BLPL_KICAD_HAPPY`, `BLPL_KICAD_PLUGIN_DIR`, `FREEROUTING_JAR`, `OLLAMA_HOST`, `BLPL_EXTRACT_MAX_TOKENS`, `TZ`, `LANG`, `LC_ALL` | stages | not read | `RUN_ENV_ALLOW` | not read |
+| `BLPL_CONFIG` | `blpl serve` only | not read | forwarded, unread by stages | not read |
+| `HDM_LLM_CHAIN(S)`, `_PROVIDER`, `_MODEL`, each chain's `key_env`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | `llm_adapter`, `dispatch` | not read | injected per run (`operation_inject`) | not read |
+| `DIGIKEY_*`, `MOUSER_*`, `ELEMENT14_*` | kicad-happy via `CredResolver` | not read | injected for Stage 8 only | not read |
+| `HDM_KICAD_PYTHON`, `SPICE_SIMULATOR`, `*_PATH` (kicad-happy) | autoroute, spice | not read | image default; set nowhere in compose | not read |
+| `BLPL_AGENT_DIR`, `BLPL_AGENT_ROOTS`, `BLPL_AGENT_RUNS` | the agent | set by `Access.spec` (runs stay off) | stripped | not read |
+| `BLPL_SEAL_KEY` | the sealer | never | never | one per operation, popped on read |
+
+`runpath.scan_policy` is the rule for the scanner settings. A scanner the
+container can reach (`BLPL_CLAMD_HOST`, not a loopback name) crosses with its
+port. The requirement crosses as `1` when the control plane requires a scan,
+and also whenever the control plane relies on a scanner the container cannot
+reach (a socket, or its own loopback). There the container's `av` reports
+`unscanned` and the file is held instead of released. Separately, the backend
+sends `require_scan=1` with every upload while its own policy requires one,
+and `quarantine.accept_upload(insist_on_scan=True)` holds an unscanned file
+whatever the agent's environment says. A workspace created before this change
+keeps the environment it started with, and the per-request flag covers it.
+
 ### 8. Egress
 
 **Decided (2026-10-12):** Squid with a domain allowlist, as below. It is built
@@ -690,7 +726,9 @@ sealing in a container, storage with limits.**
 - `BLPL_PROJECT_MOUNT=absent` runs the backend with no project mount. The
   routes above and phase 3's pass `agent_ready` to `_project_dir`; every other
   route answers 503, naming the missing mount, instead of reading an empty
-  directory.
+  directory. The mount itself is removed by `docker-compose.mountless.yml`,
+  and the backend will not start if the flag and its mounts disagree:
+  "Running the backend without the project mount", below.
 - **Proven:** an audit hook records every open, listing, change or subprocess
   the backend's own threads make under the projects root. A control step shows
   it catches a route that still reads the mount. 18 calls across the migrated
@@ -730,6 +768,16 @@ sealing in a container, storage with limits.**
   The remaining window lies between the proxy's check and the daemon's own
   open of the path. It cannot be closed from outside the daemon; both checks
   narrow it.
+- **Policy crosses with the work.** The quarantine policy did not reach the
+  agent, so an upload in a workspace was scanned by nothing and released.
+  Every setting that code in a workspace, run or sealer container reads is
+  now accounted for (section 7, "What crosses into a workspace"). The idle
+  timeout now reaches the backend, which runs the sweep once the agent is on.
+- **The mountless flag is checked against the mounts.** Compose passed
+  `BLPL_PROJECT_MOUNT` nowhere and bound all of `./data` regardless.
+  `docker-compose.mountless.yml` removes the projects from the backend's
+  view, and the backend refuses to start when the flag and its mount table
+  disagree.
 
 *Step 3: sealing in a sealer container.*
 - With the agent on, every seal and unseal stops and removes the project's
@@ -797,6 +845,59 @@ What enabling full qgroups costs on a busy filesystem:
 **Do not set `BLPL_STORAGE=btrfs` yet.** Existing projects are plain
 directories. The helper refuses to take one over, and a snapshot of a plain
 directory fails, so runs would be refused. Enabling quotas alone is harmless.
+
+**Running the backend without the project mount**
+
+`BLPL_PROJECT_MOUNT=absent` only does something when the mount really is gone.
+The base `app/docker-compose.yml` binds all of `./data` into the backend,
+which includes `data/projects`. Setting the flag there and nothing else used to
+leave the backend reading every project while it believed it could not. Now
+the flag is passed to the backend, and the backend checks it against its own
+mount table when it starts.
+
+To turn it on, in `app/.env`:
+
+```bash
+COMPOSE_FILE=docker-compose.yml:docker-compose.mountless.yml
+COMPOSE_PROFILES=workspaces
+BLPL_RUNS_IN_WORKSPACE=1
+BLPL_FILES_VIA_WORKSPACE=1
+BLPL_HOST_REPO_DIR=/absolute/path/of/the/checkout
+```
+
+Then `docker compose up -d` from `app/` as usual. To try it without editing
+`.env`, pass `-f docker-compose.yml -f docker-compose.mountless.yml` on every
+command instead. Check the layout before starting with:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.mountless.yml config \
+  | grep -A4 'target: /app/data/projects'
+```
+
+`docker-compose.mountless.yml` sets `BLPL_PROJECT_MOUNT=absent` and covers
+`/app/data/projects` with an empty, read-only tmpfs. That hides the owner's
+checkouts, `.worktrees` and `.sealed`. The rest of `./data` stays bound: the
+server key, `blpl.toml`, `runs.db` and the run logs, components, modules,
+agent directories and ssh. Docker mounts the deeper target last, so the tmpfs
+sits over the bind. The backend runs as `BLPL_UID` with no capability to
+unmount it. The worker keeps the full mount, because it creates worktree
+directories and checks bind sources on disk before it asks for a workspace.
+
+What the backend does at startup (`workspace_files.check_project_mount`):
+- `absent`, and `/app/data/projects` is visible: refuses to start, naming the
+  override file. "Visible" means anything in the directory, or an empty
+  directory on any mount other than a fresh tmpfs mounted on it (the mask) or
+  the image's own layer. A host data directory that happens to be a tmpfs
+  still counts as visible: the mask is a tmpfs mounted from its own root, a
+  bind is not.
+- `absent` without `BLPL_FILES_VIA_WORKSPACE=1`: refuses to start. Nothing
+  could reach a project.
+- not `absent`, and the directory is hidden: starts, and logs a banner warning
+  that every route still on the mount will find empty projects.
+
+Known limits of this layout. The sealed check is a stat under the projects
+root, so a mountless backend sees every project as unsealed (see "What is left
+after phase 4"). The routes listed there answer 503.
 
 **What is left after phase 4**
 - **Migration into subvolumes:** a sealed project unsealed into a fresh
