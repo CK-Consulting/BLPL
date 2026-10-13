@@ -1,8 +1,8 @@
 """Where a project's files live, behind one interface.
 
 The architecture wants each project on storage of its own with a hard size
-limit, so one project filling the disk cannot stop every other. On this host
-that is a btrfs subvolume per project with a qgroup limit; on XFS or ext4 it is a
+limit, so one project filling the disk cannot stop every other. On btrfs
+that is a subvolume per project with a qgroup limit; on XFS or ext4 it is a
 project quota on a directory, on ZFS a dataset with a quota. All of them need
 privilege the control plane must not have, so the enforcing implementation is
 a separate single-purpose helper (docs/architecture-v2.md, "Storage") and lands
