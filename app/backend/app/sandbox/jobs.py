@@ -234,6 +234,38 @@ class WorkspaceRunConfig:
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
 
+async def _stop(task: "asyncio.Task") -> None:
+    """Cancel a run's task and wait until it has finished stopping.
+
+    Every exit from a monitor loop goes through here, not only a cancel. A
+    renewal or a poll that raised used to leave by ``finally`` with the task
+    still running: the run was recorded as interrupted and its project could
+    be claimed again while the first run's container kept writing, unmarked
+    (Codex, PR #20). Awaiting the task is what waits for run_container to stop
+    and remove the container."""
+    if task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except BaseException:  # noqa: BLE001 - its own cancel, or the failure that ended it
+        pass
+
+
+def _real(cfg: "WorkspaceRunConfig", rel: str, final: str = "dir") -> None:
+    """Refuse a bind source that is, or passes through, a symlink on disk.
+
+    Docker follows links in a bind source, so a member's worktree replaced by
+    a link would be mounted wherever it points, writable (Codex, PR #20).
+    Checked here, where the mounts are built, and again by the socket proxy."""
+    from .realpath import NotReal, verify_beneath
+
+    try:
+        verify_beneath(str(cfg.projects_root), str(cfg.projects_root / rel), final=final)  # type: ignore[arg-type]
+    except NotReal as exc:
+        raise ValueError(f"refusing to mount {rel}: {exc}") from None
+
+
 def _real(cfg: "WorkspaceRunConfig", rel: str, final: str = "dir") -> None:
     """Refuse a bind source that is, or passes through, a symlink on disk.
 
@@ -298,18 +330,17 @@ async def run_job(
         driver, spec, cmd, env=env, inject=operation_inject(cmd, env),
         log=log, tracker=tracker,
     ))
-    while True:
-        done, _ = await asyncio.wait({task}, timeout=poll_every)
-        if done:
-            return task.result()
-        if await poll() == CANCELLING:
-            log("blpl: run cancelled; stopping it in the workspace\n")
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            return CANCELLED_EXIT
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=poll_every)
+            if done:
+                return task.result()
+            if await poll() == CANCELLING:
+                log("blpl: run cancelled; stopping it in the workspace\n")
+                await _stop(task)
+                return CANCELLED_EXIT
+    finally:
+        await _stop(task)
 
 
 async def run_job_via_agent(
@@ -346,6 +377,7 @@ async def run_job_via_agent(
     busy = tracker.busy(key) if (tracker is not None and key is not None) else None
     if busy is not None:
         busy.__enter__()
+    rid, finished = None, False
     try:
         # Keyed by the database run's id: a retry after the first worker died
         # follows the run that worker started, from the top of its log,
@@ -363,6 +395,7 @@ async def run_job_via_agent(
                 if text:
                     log(text)
             elif done:
+                finished = True
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     log(tail)
@@ -376,6 +409,13 @@ async def run_job_via_agent(
             if not data:
                 await asyncio.sleep(read_every)
     finally:
+        if rid is not None and not finished:
+            # Following failed, so the run must not outlive its follower: the
+            # row is about to say it ended.
+            try:
+                await asyncio.to_thread(client.run_cancel, rid)
+            except Exception:  # noqa: BLE001 - the agent may be the thing that failed
+                pass
         if busy is not None:
             busy.__exit__(None, None, None)
         client.close()
@@ -504,13 +544,12 @@ async def run_job_in_container(
                 await mark(True, ttl)
             if await poll() == CANCELLING:
                 log("blpl: run cancelled; stopping its container\n")
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                await _stop(task)
                 return CANCELLED_EXIT
     finally:
+        # The container goes before the mark does: writes through the agent
+        # must keep waiting until nothing is left running.
+        await _stop(task)
         if mark is not None:
             try:
                 await mark(False, 0)
