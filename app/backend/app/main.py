@@ -1958,6 +1958,46 @@ def check_remote(
     }
 
 
+class CredentialForBody(BaseModel):
+    url: str
+
+
+@app.post("/api/projects/credential-for")
+def credential_for_remote(
+    body: CredentialForBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """Which of the caller's saved credentials a push to ``url`` would use.
+
+    Asked of the server rather than worked out in the browser. The dialog
+    used to compare its own parse of the URL's host with each row's stored
+    spelling, while gitstore.for_remote normalises both — a legacy row saved
+    as ``git.example:443``, or ``[2001:db8::1]:8443`` against the browser's
+    unbracketed form, matched here and not there, and the dialog demanded a
+    token the push would never have used (Codex, PR #19). One matcher now
+    answers both. A URL that does not parse yet (it is being typed) is an
+    empty answer, not an error. Names and hosts only, never a secret.
+    """
+    from . import gitstore
+
+    try:
+        url = check_remote_url(body.url)
+    except ProjectError:
+        return {"credential": None, "host": None, "https": False, "problem": ""}
+    try:
+        row = gitstore.for_remote(session, user, url)
+    except gitstore.GitStoreError as exc:
+        return {"credential": None, "host": gitstore.authority_of(url), "https": False,
+                "problem": str(exc)}
+    return {
+        "credential": row.name if row is not None else None,
+        "host": gitstore.authority_of(url),
+        "https": url.lower().startswith("https://"),
+        "problem": "",
+    }
+
+
 @app.get("/api/projects/new/defaults")
 def new_project_defaults(
     user: User = Depends(require_onboarded),

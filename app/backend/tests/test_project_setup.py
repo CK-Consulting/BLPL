@@ -512,3 +512,37 @@ def test_overlapping_pushes_record_in_the_order_they_ran(unlocked, pushes, monke
     st = unlocked.get("/api/projects/p/git/status").json()
     assert st["last_push"]["ok"] is False, "a stale success overwrote the newer failure"
     assert "second push failed" in st["last_push"]["error"]
+
+
+@pytest.mark.parametrize(
+    "stored_host,method,url",
+    [
+        # Saved before hosts were normalised: the default port spelled out.
+        ("git.example:443", "https_token", "https://git.example/o/p.git"),
+        # IPv6 with a port, bracketed as stored; the browser parses it bare.
+        ("[2001:db8::1]:8443", "https_token", "https://[2001:db8::1]:8443/o/p.git"),
+        ("2001:db8::1", "https_token", "https://[2001:db8::1]/o/p.git"),
+    ],
+)
+def test_the_credential_for_a_remote_is_matched_the_way_a_push_matches_it(
+    unlocked, stored_host, method, url
+):
+    # Codex P2 on #19: the dialog matched hosts itself, by exact spelling, and
+    # asked for a new token where the push would have used the saved one.
+    import app.db
+    from sqlalchemy import select
+
+    from app.models import GitEndpoint, User
+
+    with app.db.SessionFactory() as s:
+        user = s.scalar(select(User).where(User.clerk_user_id == "user_test"))
+        s.add(GitEndpoint(user_id=user.id, name="legacy", host=stored_host, method=method,
+                          username="git", nonce=b"0" * 12, ciphertext=b"x"))
+        s.commit()
+    got = unlocked.post("/api/projects/credential-for", json={"url": url}).json()
+    assert got["credential"] == "legacy" and got["https"] is True
+
+
+def test_a_half_typed_url_has_no_credential_and_no_error(unlocked):
+    r = unlocked.post("/api/projects/credential-for", json={"url": "https://"})
+    assert r.status_code == 200 and r.json()["credential"] is None

@@ -12,7 +12,7 @@ function json(body: unknown, status = 200) {
 }
 
 /** The server as the dialog sees it, recording every request. */
-function server(over: { check?: unknown; init?: [number, unknown]; saved?: unknown[] } = {}) {
+function server(over: { check?: unknown; init?: [number, unknown]; credentialFor?: Record<string, string> } = {}) {
   const calls: { method: string; url: string; body: any }[] = [];
   vi.stubGlobal(
     "fetch",
@@ -26,7 +26,10 @@ function server(over: { check?: unknown; init?: [number, unknown]; saved?: unkno
           manual_push_warning: `${WARNING} If the server suffers a catastrophic failure before you push, unpushed work could be lost. The chance is small, but it is not zero.`,
         });
       }
-      if (url.includes("/api/settings/git")) return json({ endpoints: over.saved ?? [], presets: [], methods: [] });
+      if (url.includes("/api/projects/credential-for")) {
+        const asked = JSON.parse(String(init?.body)).url as string;
+        return json({ credential: over.credentialFor?.[asked] ?? null, host: null, https: true, problem: "" });
+      }
       if (url.includes("/api/library-policy")) {
         return json({
           defaults: { contribute: "never", consume: "ask", unique_components: "never_contribute" },
@@ -169,14 +172,12 @@ describe("the new-project dialog", () => {
 
   it("uses a saved credential for the host instead of asking for a token", async () => {
     const user = userEvent.setup();
-    const calls = server({
-      saved: [{ name: "github", host: "github.com", method: "https_token", username: "git", updated_at: "" }],
-    });
+    const calls = server({ credentialFor: { "https://github.com/o/board.git": "github" } });
     render(<NewProject onCreated={() => {}} onClose={() => {}} />);
     await screen.findByDisplayValue("Ada Lovelace");
     await user.type(screen.getByLabelText("Project name"), "p");
     await user.type(screen.getByLabelText("Remote repository URL"), "https://github.com/o/board.git");
-    expect(screen.getByText(/Use my saved credential/)).toBeInTheDocument();
+    expect(await screen.findByText(/Use my saved credential/)).toBeInTheDocument();
     expect(screen.queryByLabelText("Access token")).toBeNull();
     await user.click(screen.getByLabelText("I'll push manually"));
     await user.click(screen.getByRole("button", { name: "Create" }));
@@ -298,5 +299,28 @@ describe("the clone tab", () => {
     await user.click(screen.getByRole("button", { name: "Import files" }));
     expect(screen.queryByLabelText("I'll push manually")).toBeNull();
     expect(screen.queryByLabelText("Commit name")).toBeNull();
+  });
+});
+
+describe("matching a saved credential", () => {
+  // Codex P2 on #19: the dialog compared host spellings itself, so a legacy
+  // row stored as `git.example:443`, or an IPv6 authority stored bracketed,
+  // was missed and a new token demanded. The server's matcher decides now;
+  // these stand in for its answers to exactly those two shapes.
+  it.each([
+    ["the default port spelled out", "https://git.example/o/p.git"],
+    ["an IPv6 authority with a port", "https://[2001:db8::1]:8443/o/p.git"],
+  ])("follows the server for %s", async (_label, url) => {
+    const user = userEvent.setup();
+    const calls = server({ credentialFor: { [url]: "legacy" } });
+    render(<NewProject onCreated={() => {}} onClose={() => {}} />);
+    await screen.findByDisplayValue("Ada Lovelace");
+    // user-event reads [ and { as key syntax; doubled, they are typed as-is.
+    await user.type(screen.getByLabelText("Remote repository URL"), url.replace(/[[{]/g, "$&$&"));
+    expect(await screen.findByText(/Use my saved credential/)).toHaveTextContent("legacy");
+    expect(screen.queryByLabelText("Access token")).toBeNull();
+    // Asked about the URL as typed, not a host the browser derived from it.
+    const asks = calls.filter((c) => c.url.includes("credential-for"));
+    expect(asks[asks.length - 1].body).toEqual({ url });
   });
 });

@@ -1,7 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  GitEndpointMeta,
-  GitEndpoints,
   GitStatus,
   ImportResult,
   NewProjectDefaults,
@@ -23,7 +21,6 @@ import {
   PushPolicyChoice,
   SetupHelp,
   defaultTokenUser,
-  hostOf,
 } from "./GitSetup";
 import { ProjectRoutingPanel } from "./ProjectRoutingPanel";
 
@@ -248,7 +245,14 @@ export function NewProject({
   const [identity, setIdentity] = useState<Identity>({ name: "", email: "" });
   const [saveDefault, setSaveDefault] = useState(false);
   const [pushPolicy, setPushPolicy] = useState<PushPolicy | null>(null);
-  const [saved, setSaved] = useState<GitEndpointMeta[]>([]);
+  // Which saved credential the server would use for the URL as typed —
+  // asked of the server, whose matcher normalises hosts and ports, rather
+  // than worked out here by comparing spellings (Codex, PR #19: a legacy
+  // `host:443` row, or an IPv6 authority, matched there and not here, and the
+  // dialog demanded a token the push would never have used).
+  const [match, setMatch] = useState<{ url: string; credential: string | null; host: string | null } | null>(
+    null,
+  );
   const [useSaved, setUseSaved] = useState(true);
   // The token lives in this input and in the one request that carries it, and
   // nowhere else: never rendered back, never put in an error, cleared when the
@@ -267,14 +271,30 @@ export function NewProject({
       .catch(() => {
         /* the fields stay empty and the server says what is missing */
       });
-    getJSON<GitEndpoints>("/api/settings/git")
-      .then((g) => setSaved(g?.endpoints ?? []))
-      .catch(() => setSaved([]));
   }, []);
 
-  const host = hostOf(remote);
+  useEffect(() => {
+    const url = remote.trim();
+    if (mode !== "init" || !url.toLowerCase().startsWith("https://")) return;
+    let live = true;
+    // A short pause so a URL being typed is not asked about per keystroke;
+    // `live` drops an answer for a URL that has since changed.
+    const t = setTimeout(() => {
+      postJSON<{ credential: string | null; host: string | null }>("/api/projects/credential-for", { url })
+        .then((r) => live && setMatch({ url, credential: r?.credential ?? null, host: r?.host ?? null }))
+        .catch(() => live && setMatch({ url, credential: null, host: null }));
+    }, 200);
+    return () => {
+      live = false;
+      clearTimeout(t);
+    };
+  }, [remote, mode]);
+
   const https = remote.trim().toLowerCase().startsWith("https://");
-  const savedFor = host ? saved.find((e) => e.host === host) ?? null : null;
+  const savedFor =
+    match && match.url === remote.trim() && match.credential
+      ? { name: match.credential, host: match.host ?? "" }
+      : null;
   // A new token is asked for over HTTPS when nothing saved answers for the
   // host, or when the user chose to replace what is saved.
   const wantsToken = mode === "init" && https && (!savedFor || !useSaved);
