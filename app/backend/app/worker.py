@@ -246,6 +246,20 @@ async def main() -> None:
         )
         sys.exit(1)
 
+    # The worker always has the project mount, so it is where blobs written by
+    # older versions into projects/.sealed are moved to the blob directory a
+    # mountless backend reads (workspace.migrate_sealed; idempotent).
+    try:
+        from . import workspace
+
+        moved = workspace.migrate_sealed(
+            Path(os.environ.get("BLPL_PROJECTS_ROOT", str(_DATA / "projects"))))
+        if moved.moved or moved.conflicts:
+            logger.info("sealed blobs: moved %s; conflicts kept in place %s",
+                        moved.moved, moved.conflicts)
+    except Exception:  # noqa: BLE001 - never a reason not to run stages
+        logger.exception("could not move sealed blobs")
+
     workspaces = None
     if sandbox_jobs.enabled():
         try:

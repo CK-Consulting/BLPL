@@ -196,6 +196,10 @@ class WorkspaceRunConfig:
     # told the host path; it cannot discover it from inside its container.
     projects_root: Path
     host_projects_root: str
+    # The blob directory (workspace.sealed_root) as the daemon's host sees it,
+    # for the sealer. Defaults to `sealed` beside the host projects root, which
+    # is where the control plane's default puts it too.
+    host_sealed_root: str = ""
     libraries: tuple[Mount, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
     resources: Resources = Resources()
@@ -219,6 +223,8 @@ class WorkspaceRunConfig:
             image=env.get("BLPL_WORKSPACE_IMAGE", "blpl-workspace:dev"),
             projects_root=Path(env.get("BLPL_PROJECTS_ROOT", "/app/data/projects")),
             host_projects_root=host.rstrip("/"),
+            host_sealed_root=(env.get("BLPL_SANDBOX_HOST_SEALED", "").rstrip("/")
+                              or host.rstrip("/").rsplit("/", 1)[0] + "/sealed"),
             libraries=libs,
             env=ws_env,
             idle_after_s=float(env.get("BLPL_SANDBOX_IDLE_S", 15 * 60)),

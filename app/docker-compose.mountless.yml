@@ -11,9 +11,14 @@
 # or name both files with -f on every docker compose command.
 #
 # The backend still needs the rest of ./data (server.key, blpl.toml, runs.db
-# and run logs, components, modules, agents, ssh), so ./data stays bound and
-# data/projects is covered by an empty, read-only tmpfs. Everything under it
-# goes: the owner's checkouts, .worktrees and .sealed. Compose merges mounts by
+# and run logs, components, modules, agents, ssh, egress, and sealed/, where
+# sealed projects' blobs are kept so it can still tell a sealed project from
+# a missing one), so ./data stays bound and data/projects is covered by an
+# empty, read-only tmpfs. Everything under it goes: the owner's checkouts,
+# .worktrees, and the locks and restore staging in .sealed. Blobs an older
+# version left in projects/.sealed are moved to sealed/ by the worker at its
+# start, or by `python -m app.workspace migrate-sealed` run in the worker
+# before switching to this layout. Compose merges mounts by
 # target, and Docker mounts the deeper target last, so the tmpfs sits over the
 # bind. Nothing in the backend can lift it: it runs as BLPL_UID, with no
 # capability to unmount.

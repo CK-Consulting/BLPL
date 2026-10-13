@@ -13,7 +13,15 @@ untouched — they are not aware any of this happened.
 
     projects/baseboard/              the repository and the owner's checkout
     projects/.worktrees/baseboard/   every member's checkout
-    projects/.sealed/baseboard.blob  both of the above, sealed, when nobody is in
+    sealed/baseboard.blob            both of the above, sealed, when nobody is in
+
+The blobs live beside the projects directory, not inside it. They are
+ciphertext, and a backend running without the project mount (phase 4) must
+still be able to tell a sealed project from one that is not there; under the
+mount it could not (Codex, PR #20). ``projects/.sealed/`` keeps only what has
+to be on the projects filesystem: the per-project locks, and the staging
+directories a restore renames into place. Blobs that older versions wrote
+there are moved by ``migrate_sealed`` and read from there until they are.
 
 The unit is the **project and all its worktrees together**, and that is forced
 rather than chosen. A git worktree is not a copy: it holds a `.git` *file*
@@ -185,12 +193,99 @@ class Registry:
         return list(self._open.values())
 
 
+def sealed_root(projects_root: Path) -> Path:
+    """Where blobs are kept: BLPL_SEALED_ROOT, else ``sealed`` beside the
+    projects directory (``data/sealed`` in the compose layout)."""
+    configured = os.environ.get("BLPL_SEALED_ROOT", "").strip()
+    return Path(configured) if configured else Path(projects_root).parent / "sealed"
+
+
 def sealed_path(projects_root: Path, workspace: str) -> Path:
+    """Where this project's blob is written."""
+    return sealed_root(projects_root) / f"{workspace}.blob"
+
+
+def legacy_sealed_path(projects_root: Path, workspace: str) -> Path:
+    """Where versions before the move wrote it, inside the projects directory."""
     return Path(projects_root) / SEALED_DIR / f"{workspace}.blob"
 
 
+def _blob_for(projects_root: Path, workspace: str) -> Path | None:
+    """The blob this project is sealed in, wherever it is, or None."""
+    for path in (sealed_path(projects_root, workspace),
+                 legacy_sealed_path(projects_root, workspace)):
+        if path.is_file():
+            return path
+    return None
+
+
 def is_sealed(projects_root: Path, workspace: str) -> bool:
-    return sealed_path(projects_root, workspace).exists()
+    """The one test of whether a project is sealed, for every caller.
+
+    Reads the blob directory, which a backend sees with or without the
+    project mount, and falls back to the old location for a blob not yet
+    migrated (which only a backend with the mount can see)."""
+    return _blob_for(projects_root, workspace) is not None
+
+
+@dataclass
+class Migration:
+    moved: list[str] = field(default_factory=list)
+    already_there: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+
+
+def migrate_sealed(projects_root: Path) -> Migration:
+    """Move blobs from ``projects/.sealed/`` to the blob directory.
+
+    Idempotent, and safe at every startup and from several processes: each
+    project moves under its own seal lock. A blob is never lost or left in
+    two places that disagree:
+
+    * nothing at the destination: renamed there, or on another filesystem,
+      copied to a temporary name, flushed, renamed into place and compared,
+      and only then is the old one removed. A crash leaves the old one, or
+      two identical copies;
+    * an identical blob already there (that crash): the old copy is removed;
+    * a different blob already there: both are kept and reported. The new
+      location wins for every read, and an operator decides about the other.
+    """
+    root = Path(projects_root)
+    out = Migration()
+    legacy = root / SEALED_DIR
+    if not legacy.is_dir():
+        return out
+    for old in sorted(legacy.glob("*.blob")):
+        if old.is_symlink() or not old.is_file():
+            continue
+        project = old.name[: -len(".blob")]
+        with _project_lock(root, project):
+            if not old.is_file():
+                continue  # another process moved it while this one waited
+            new = sealed_path(root, project)
+            new.parent.mkdir(parents=True, exist_ok=True)
+            if new.exists():
+                if new.read_bytes() == old.read_bytes():
+                    old.unlink()
+                    out.already_there.append(project)
+                else:
+                    out.conflicts.append(project)
+                continue
+            try:
+                os.rename(old, new)
+            except OSError:
+                tmp = new.with_suffix(".blob.migrating")
+                data = old.read_bytes()
+                with open(tmp, "wb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, new)
+                if new.read_bytes() != data:
+                    raise WorkspaceError(f"copy of {old} to {new} does not match; kept both")
+                old.unlink()
+            out.moved.append(project)
+    return out
 
 
 def parts_of(projects_root: Path, project: str) -> list[tuple[str, Path]]:
@@ -321,7 +416,7 @@ def seal(projects_root: Path, project: str, key: bytes) -> int:
                 for _name, path in parts_of(root, project):
                     if path.is_dir():
                         _remove_plaintext(path)
-                return sealed_path(root, project).stat().st_size
+                return _blob_for(root, project).stat().st_size  # type: ignore[union-attr]
             _reap_restores(root, project)
             return _seal(root, project, key)
         except OSError as exc:
@@ -362,6 +457,10 @@ def _seal(projects_root: Path, project: str, key: bytes) -> int:
     tmp = target.with_suffix(".blob.tmp")
     tmp.write_bytes(blob)
     os.replace(tmp, target)
+    # An unmigrated blob of this project is older than the one just written;
+    # left there, it would be a second copy that disagrees.
+    with contextlib.suppress(FileNotFoundError):
+        legacy_sealed_path(root, project).unlink()
 
     # The blob is complete, so the plaintext can go — repository first, and by
     # an atomic rename rather than an rmtree. Unsealing treats "the repository
@@ -402,11 +501,11 @@ def unseal(projects_root: Path, project: str, key: bytes) -> Path:
 def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
     root = Path(projects_root)
     repo = root / project
-    if repo.exists() and not sealed_path(root, project).exists():
+    blob_path = _blob_for(root, project)
+    if repo.exists() and blob_path is None:
         return repo
-    blob_path = sealed_path(root, project)
-    if not blob_path.exists():
-        raise WorkspaceError(f"nothing sealed at {blob_path}")
+    if blob_path is None:
+        raise WorkspaceError(f"nothing sealed at {sealed_path(root, project)}")
 
     blob = blob_path.read_bytes()
     nonce, ciphertext = blob[:_NONCE_LEN], blob[_NONCE_LEN:]
@@ -464,3 +563,20 @@ def _unseal(projects_root: Path, project: str, key: bytes) -> Path:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def main(argv: list[str] | None = None) -> int:  # pragma: no cover - operator entry point
+    """``python -m app.workspace migrate-sealed [PROJECTS_ROOT]``"""
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] != "migrate-sealed":
+        print("usage: python -m app.workspace migrate-sealed [PROJECTS_ROOT]", file=sys.stderr)
+        return 2
+    root = Path(argv[1] if len(argv) > 1 else os.environ.get("BLPL_PROJECTS_ROOT", "/app/data/projects"))
+    m = migrate_sealed(root)
+    print(f"moved {len(m.moved)}, already there {len(m.already_there)}, "
+          f"conflicts {len(m.conflicts)}{': ' + ', '.join(m.conflicts) if m.conflicts else ''}")
+    return 1 if m.conflicts else 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

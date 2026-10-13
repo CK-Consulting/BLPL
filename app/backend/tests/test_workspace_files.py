@@ -383,3 +383,50 @@ def test_an_upload_through_the_agent_carries_the_control_planes_scan_requirement
     assert r.status_code == 200, r.text
     (res,) = r.json()["results"]
     assert res["state"] == "held" and res["path"] is None
+
+
+def test_without_the_project_mount_a_sealed_project_is_listed_and_opened(client, monkeypatch):
+    """The mountless layout hides everything under data/projects, the old
+    .sealed included. A sealed project must still be listed as sealed, and
+    /open must unseal it through the sealer rather than answer already_open
+    (Codex, PR #20)."""
+    import app.main as main
+    import app.workspace_files as wf
+    from app import workspace
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    client.put("/api/projects/scratch/files/design.md", json={"content": "# d\n"})
+    root = main.PROJECTS_ROOT
+    # Where the sealer works: the real projects directory, which the backend
+    # below no longer sees. Its blob directory is the one beside data/projects.
+    host = root.parent / "projects-host"
+    calls = []
+
+    def sealer(op):
+        def run(project, key):
+            calls.append((op, project))
+            where = host if host.exists() else root
+            if op == "seal":
+                return workspace.seal(where, project, key)
+            workspace.unseal(where, project, key)
+        return run
+
+    monkeypatch.setattr(wf, "seal", sealer("seal"))
+    monkeypatch.setattr(wf, "unseal", sealer("unseal"))
+    assert client.post("/api/projects/scratch/seal").json()["sealed"] is True
+
+    # The mask: data/projects is an empty directory from here on.
+    root.rename(host)
+    root.mkdir()
+    monkeypatch.setenv("BLPL_PROJECT_MOUNT", "absent")
+
+    (listed,) = [p for p in client.get("/api/projects").json() if p["id"] == "scratch"]
+    assert listed["sealed"] is True
+    r = client.post("/api/projects/scratch/open")
+    assert r.status_code == 200 and r.json() == {"ok": True, "already_open": False}
+    assert calls[-1] == ("unseal", "scratch")
+    assert (host / "scratch" / "design.md").read_text() == "# d\n"
+    # Open now, and still listed, with what cannot be read reported as unknown.
+    (listed,) = [p for p in client.get("/api/projects").json() if p["id"] == "scratch"]
+    assert listed["sealed"] is False and listed["markdown_files"] is None

@@ -220,6 +220,8 @@ services:
       - BLPL_SANDBOX_USER=${BLPL_UID}:${BLPL_GID}
       - BLPL_WORKSPACE_IMAGE=blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}
       - BLPL_SANDBOX_HOST_PROJECTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/projects}
+      # Sealed projects' blobs, beside the projects; the sealer mounts both.
+      - BLPL_SANDBOX_HOST_SEALED=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/sealed}
       - BLPL_SANDBOX_LIBRARIES=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols:/app/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints:/app/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D:/usr/share/kicad/3dmodels ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source:/usr/share/kicad/3dmodels-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates:/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules:/app/data/modules}
       - BLPL_SANDBOX_HTTP_PROXY=http://squid:3128
       - BLPL_SANDBOX_EXTRA_HOSTS=squid:${BLPL_EGRESS_SQUID_IP:-172.31.250.2} clamav:${BLPL_EGRESS_CLAMAV_IP:-172.31.250.3} ollama:${BLPL_EGRESS_OLLAMA_IP:-172.31.250.4}
@@ -400,6 +402,8 @@ services:
       - BLPL_SANDBOX_USER=${BLPL_UID}:${BLPL_GID}
       - BLPL_WORKSPACE_IMAGE=blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}
       - BLPL_SANDBOX_HOST_PROJECTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/projects}
+      # Sealed projects' blobs, beside the projects; the sealer mounts both.
+      - BLPL_SANDBOX_HOST_SEALED=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/sealed}
       # Read-only, at the paths a run already uses, so stage commands and
       # BLPL_MODULES_ROOT need no rewriting. kicad-happy is not here: the
       # workspace image carries its own copy.
@@ -750,6 +754,8 @@ services:
       - BLPL_PROXY_REQUIRE_RUNTIME=${BLPL_PROXY_REQUIRE_RUNTIME:-0}
       - BLPL_PROXY_RO_BIND_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/core/kicad-symbols ${BLPL_HOST_REPO_DIR}/core/kicad-footprints ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D ${BLPL_HOST_REPO_DIR}/app/kicad-packages3D-source ${BLPL_HOST_REPO_DIR}/app/kicad-templates ${BLPL_HOST_REPO_DIR}/app/data/modules}
       - BLPL_PROXY_PROJECT_BIND_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/projects}
+      # A sealer, and only a sealer, may bind this at /sealed.
+      - BLPL_PROXY_SEALED_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/sealed}
       # Phase 3: each workspace may bind <this>/<its own container name> at
       # /run/blpl for its agent, and no other.
       - BLPL_PROXY_AGENT_DIR_ROOTS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/agents}

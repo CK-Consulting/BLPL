@@ -392,7 +392,8 @@ def test_a_failed_restore_leaves_no_plaintext_behind(tmp_path, monkeypatch):
 
     # The blob and its lock file, and no decrypted file anywhere beside them.
     left = {f.name for f in (root / workspace.SEALED_DIR).rglob("*") if f.is_file()}
-    assert left == {"p.blob", ".p.lock"}, left
+    assert left == {".p.lock"}, left
+    assert workspace.sealed_path(root, "p").is_file()
     assert not (root / "p").exists()
     assert workspace.unseal(root, "p", key) == root / "p"
 
@@ -640,3 +641,97 @@ def test_a_leftover_worktree_with_a_read_only_folder_does_not_block_opening(tmp_
     workspace.unseal(root, "p", key)
     assert note.read_text() == "alice's uncommitted work"
     assert not stale.exists()
+
+
+# ---------------------------------------------------------------- where blobs live
+
+
+def _sealed_project(tmp_path, name="p"):
+    root = tmp_path / "data" / "projects"
+    _repo(root, name)
+    key = os.urandom(32)
+    workspace.seal(root, name, key)
+    return root, key
+
+
+def _repo(root: Path, name: str) -> None:
+    d = root / name
+    d.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(d)], check=True)
+    (d / "design.md").write_text("# d\n")
+
+
+def test_blobs_are_kept_beside_the_projects_directory_not_in_it(tmp_path):
+    root, key = _sealed_project(tmp_path)
+    assert workspace.sealed_path(root, "p") == tmp_path / "data" / "sealed" / "p.blob"
+    assert workspace.sealed_path(root, "p").is_file()
+    assert not workspace.legacy_sealed_path(root, "p").exists()
+    assert workspace.is_sealed(root, "p")
+
+
+def test_an_unmigrated_blob_is_still_read_where_it_was(tmp_path):
+    root, key = _sealed_project(tmp_path)
+    legacy = workspace.legacy_sealed_path(root, "p")
+    os.replace(workspace.sealed_path(root, "p"), legacy)
+    assert workspace.is_sealed(root, "p")
+    workspace.unseal(root, "p", key)
+    assert (root / "p" / "design.md").read_text() == "# d\n"
+    assert not legacy.exists() and not workspace.is_sealed(root, "p")
+    # Sealed again, it goes to the new place.
+    workspace.seal(root, "p", key)
+    assert workspace.sealed_path(root, "p").is_file() and not legacy.exists()
+
+
+def test_migration_moves_each_blob_once_and_is_idempotent(tmp_path):
+    root, key = _sealed_project(tmp_path)
+    blob = workspace.sealed_path(root, "p")
+    data = blob.read_bytes()
+    legacy = workspace.legacy_sealed_path(root, "p")
+    os.replace(blob, legacy)
+
+    m = workspace.migrate_sealed(root)
+    assert m.moved == ["p"] and not m.conflicts
+    assert blob.read_bytes() == data and not legacy.exists()
+    assert workspace.migrate_sealed(root) == workspace.Migration()  # nothing left to do
+    workspace.unseal(root, "p", key)
+    assert (root / "p" / "design.md").read_text() == "# d\n"
+
+
+def test_migration_across_filesystems_copies_then_removes(tmp_path, monkeypatch):
+    root, _ = _sealed_project(tmp_path)
+    blob = workspace.sealed_path(root, "p")
+    data = blob.read_bytes()
+    os.replace(blob, workspace.legacy_sealed_path(root, "p"))
+
+    def exdev(*_a, **_k):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(workspace.os, "rename", exdev)
+    assert workspace.migrate_sealed(root).moved == ["p"]
+    assert blob.read_bytes() == data
+    assert not workspace.legacy_sealed_path(root, "p").exists()
+    assert not list(blob.parent.glob("*.migrating"))
+
+
+def test_migration_after_a_crash_removes_only_an_identical_copy(tmp_path):
+    root, _ = _sealed_project(tmp_path)
+    blob = workspace.sealed_path(root, "p")
+    legacy = workspace.legacy_sealed_path(root, "p")
+    # A copy that finished and an old blob that was not yet removed.
+    legacy.write_bytes(blob.read_bytes())
+    m = workspace.migrate_sealed(root)
+    assert m.already_there == ["p"] and not legacy.exists() and blob.is_file()
+
+    # Two different blobs: neither is touched, and the new one is read.
+    legacy.write_bytes(b"something else")
+    before = blob.read_bytes()
+    m = workspace.migrate_sealed(root)
+    assert m.conflicts == ["p"]
+    assert legacy.read_bytes() == b"something else" and blob.read_bytes() == before
+
+
+def test_the_blob_directory_can_be_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLPL_SEALED_ROOT", str(tmp_path / "elsewhere"))
+    root, key = _sealed_project(tmp_path)
+    assert (tmp_path / "elsewhere" / "p.blob").is_file()
+    assert workspace.is_sealed(root, "p")

@@ -85,6 +85,9 @@ class ProxyPolicy:
     # container may bind exactly <root>/<its own name>, read-write, at
     # /run/blpl, and so reach no other workspace's socket or token.
     agent_dir_roots: tuple[str, ...] = ()
+    # The sealed-blob directories (workspace.sealed_root, on the host). A
+    # sealer, and nothing else, may bind one of these exactly, at /sealed.
+    sealed_roots: tuple[str, ...] = ()
     # "name:ip" /etc/hosts entries a container may carry: the egress proxy
     # and its network's services, so a gVisor workspace can name them.
     extra_hosts: frozenset[str] = frozenset()
@@ -120,6 +123,7 @@ class ProxyPolicy:
             ro_bind_roots=tuple(words("BLPL_PROXY_RO_BIND_ROOTS")),
             project_bind_roots=tuple(words("BLPL_PROXY_PROJECT_BIND_ROOTS")),
             agent_dir_roots=tuple(words("BLPL_PROXY_AGENT_DIR_ROOTS")),
+            sealed_roots=tuple(words("BLPL_PROXY_SEALED_ROOTS")),
             extra_hosts=frozenset(words("BLPL_PROXY_EXTRA_HOSTS")),
             verify_paths=env.get("BLPL_PROXY_VERIFY_PATHS", "") == "1",
         )
@@ -364,6 +368,7 @@ def _agent_dirs(policy: ProxyPolicy, container: str) -> set[str]:
 
 
 SEALER_TARGET = "/projects"
+SEALED_TARGET = "/sealed"
 
 
 def _root_of(path: str, roots: tuple[str, ...]) -> str:
@@ -438,6 +443,9 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
             elif role == "sealer" and got["Target"] == SEALER_TARGET and src in {
                     r.rstrip("/") for r in policy.project_bind_roots if r.rstrip("/")}:
                 pass  # the projects root itself, for a sealer and nothing else
+            elif role == "sealer" and got["Target"] == SEALED_TARGET and src in {
+                    r.rstrip("/") for r in policy.sealed_roots if r.rstrip("/")}:
+                pass  # the blob directory, which holds ciphertext only
             elif src in _agent_dirs(policy, container):
                 if got["Target"] != AGENT_DIR:
                     raise Refused(f"{w}: an agent directory is mounted at {AGENT_DIR} only")
