@@ -424,10 +424,42 @@ def remote_of(checkout: Path, operation: str) -> str:
             raise
 
 
+def _project_of(checkout: Path) -> str:
+    from . import main as m
+
+    rel = Path(checkout).relative_to(m.PROJECTS_ROOT).parts
+    return rel[1] if rel[0] == ".worktrees" else rel[0]
+
+
+@contextmanager
+def _git_proxy(checkout: Path) -> Iterator[dict[str, str]]:
+    """The egress proxy's credential for one git operation (egress.py): the
+    shipped defaults and the administrators' hosts, nothing user-specific,
+    revoked when the operation ends. Nothing without an egress proxy."""
+    import os
+
+    from . import egress
+    from .db import SessionFactory
+
+    if not os.environ.get("BLPL_SANDBOX_HTTP_PROXY"):
+        yield {}
+        return
+    with SessionFactory() as session:
+        name, token = egress.issue(session, kind="git", project=_project_of(checkout),
+                                   ttl=egress.GIT_GRANT_TTL)
+        session.commit()
+    try:
+        yield egress.proxy_env(name, token)
+    finally:
+        with SessionFactory() as session:
+            egress.revoke(session, name)
+            session.commit()
+
+
 def pull(checkout: Path, url: str, env: dict[str, str] | None) -> str:
-    with agent(checkout) as c:
+    with agent(checkout) as c, _git_proxy(checkout) as proxy:
         try:
-            return c.git_pull(str(checkout), url, _cred(env))
+            return c.git_pull(str(checkout), url, _cred(env), proxy)
         except AgentCallError as exc:
             if exc.kind == "project":
                 raise ProjectError(str(exc)) from exc
@@ -458,7 +490,8 @@ class _AgentProjects:
         c = self._client(checkout)
         try:
             try:
-                r = c.git_push_held(str(checkout), url or "", _cred(env))
+                with _git_proxy(checkout) as proxy:
+                    r = c.git_push_held(str(checkout), url or "", _cred(env), proxy)
             except AgentCallError as exc:
                 raise ProjectError(str(exc)) from exc
             exc = ProjectError(r["error"]) if r.get("error") is not None else None

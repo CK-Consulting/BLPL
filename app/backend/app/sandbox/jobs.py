@@ -336,6 +336,7 @@ async def run_job(
     poll: Callable[[], Awaitable[str]],
     poll_every: float = 20.0,
     tracker: IdleTracker | None = None,
+    extra_inject: Mapping[str, str] | None = None,
 ) -> int:
     """Execute one claimed run in its workspace; return the exit code to record.
 
@@ -346,7 +347,7 @@ async def run_job(
     """
     spec = spec_for(cfg, project_name)
     task = asyncio.create_task(execute_run(
-        driver, spec, cmd, env=env, inject=operation_inject(cmd, env),
+        driver, spec, cmd, env=env, inject={**operation_inject(cmd, env), **(extra_inject or {})},
         log=log, tracker=tracker,
     ))
     try:
@@ -508,6 +509,7 @@ async def run_job_in_container(
     mark: Callable[[bool, float], Awaitable[None]] | None = None,
     poll_every: float = 20.0,
     snapshot: Callable[[str], Awaitable[object]] | None = None,
+    extra_inject: Mapping[str, str] | None = None,
 ) -> int:
     """Phase 4: one run, one container, removed when it ends.
 
@@ -549,7 +551,9 @@ async def run_job_in_container(
     if mark is not None:
         await mark(True, ttl)
     task = asyncio.create_task(driver.run_container(
-        spec, list(cmd), env=run_env(env, operation_inject(cmd, env)), on_output=sink))
+        spec, list(cmd),
+        env=run_env(env, {**operation_inject(cmd, env), **(extra_inject or {})}),
+        on_output=sink))
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=poll_every)

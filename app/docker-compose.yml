@@ -211,10 +211,14 @@ services:
       # With the agent on, the backend is what stops and seals idle
       # workspaces, so it reads this rather than the worker.
       - BLPL_SANDBOX_IDLE_S=${BLPL_SANDBOX_IDLE_S:-900}
-      # Whether runs leave through Squid. The backend reads it to refuse an
-      # LLM endpoint whose host is not on the egress allowlist, at save and
-      # at queue (app/backend/app/egress.py), instead of a run failing at it.
+      # Whether runs leave through Squid. The backend then answers Squid's
+      # per-run egress questions on BLPL_EGRESS_SOCKET, and refuses at save an
+      # LLM endpoint no run could reach (plain http, a private address).
       - BLPL_RUNS_IN_WORKSPACE=${BLPL_RUNS_IN_WORKSPACE:-0}
+      - BLPL_EGRESS_SOCKET=/app/data/egress/decide.sock
+      # Who sees Settings -> Admin (network access): verified emails, comma
+      # separated. Nobody when empty.
+      - BLPL_ADMIN_EMAILS=${BLPL_ADMIN_EMAILS:-}
       - BLPL_AGENT_DIR_ROOT=/app/data/agents
       - BLPL_SANDBOX_HOST_AGENT_DIRS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/agents}
       - BLPL_SANDBOX_DOCKER=unix:///run/blpl-docker-proxy/docker.sock
@@ -259,8 +263,8 @@ services:
       # The socket proxy, for starting workspaces in phase 3. Empty and unused
       # with the flag off.
       - blpl-docker-proxy:/run/blpl-docker-proxy
-      # The shipped egress allowlist, the same file Squid reads; the
-      # operator's additions are under ./data/egress.
+      # The shipped egress defaults (allowlist.txt, git-hosts.txt), which the
+      # backend adds to every grant's answer.
       - ./egress:/app/egress:ro
 
   # The container with KiCad in it, and the only thing that executes a stage.
@@ -808,11 +812,13 @@ services:
       - ./data/projects:/storage
       - blpl-storage-helper:/run/blpl-storage
 
-  # The one way out of blpl-egress. CONNECT to an allowlisted host on 443, or
-  # a git host on 22, and nothing else; private addresses are refused even
-  # for allowlisted names. The access log is the egress audit record. Tag
-  # chosen but not yet pulled or parse-checked here: run
-  # `docker compose --profile workspaces run --rm squid squid -k parse` once.
+  # The one way out of blpl-egress. CONNECT to 443 or, for git hosts, 22,
+  # with a credential issued for one run or one git operation; the backend
+  # decides each host for that credential (app/backend/app/egress.py), so
+  # nothing here is edited or reloaded when the list changes. Private
+  # addresses are refused whatever the decision. The access log is the egress
+  # audit record. Run with this config in this image by
+  # app/backend/tests/test_egress_squid.py.
   squid:
     profiles: ["workspaces"]
     image: ubuntu/squid:6.10-24.10_beta
@@ -826,11 +832,10 @@ services:
       - no-new-privileges:true
     volumes:
       - ./egress/squid.conf:/etc/squid/squid.conf:ro
-      - ./egress/allowlist.txt:/etc/squid/allowlist.txt:ro
-      - ./egress/git-hosts.txt:/etc/squid/git-hosts.txt:ro
-      # The operator's additions, outside git. A directory, not the file, so
-      # an editor that replaces the file is seen after a reconfigure.
-      - ./data/egress:/etc/squid/local:ro
+      # The helper Squid runs for authentication and the per-host decision.
+      - ./egress:/etc/squid/blpl:ro
+      # The backend's decision socket. Read-only is enough to connect to it.
+      - ./data/egress:/run/blpl-egress:ro
 
 networks:
   blpl:

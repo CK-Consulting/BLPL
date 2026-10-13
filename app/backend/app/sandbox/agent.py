@@ -354,8 +354,10 @@ def ssh_command(key_path: str | None, environ) -> str:
     A workspace sits on an internal network whose one way out is the egress
     proxy, and OpenSSH ignores HTTP_PROXY. So ssh is told to reach the
     remote through the proxy itself: CONNECT host:22, which Squid allows for
-    the allowlisted git hosts only (app/egress). OpenBSD netcat
-    (`nc -X connect`) speaks CONNECT, and the image installs it for this.
+    the git hosts only (app/egress). Squid also wants the operation's proxy
+    credential, which OpenBSD netcat can only prompt for, so the proxy
+    command is this file's own ``--connect`` mode: it reads the credential
+    from the HTTPS_PROXY it inherits through git and ssh, never from argv.
 
     Always set for a pull or push, with or without a leased key. GIT_SSH_COMMAND
     outranks core.sshCommand, so whatever ssh wrapper the repository's config
@@ -369,8 +371,74 @@ def ssh_command(key_path: str | None, environ) -> str:
     proxy = _connect_proxy(environ)
     if proxy is not None:
         host, port = proxy
-        parts += ["-o", shlex.quote(f"ProxyCommand=nc -X connect -x {host}:{port} %h %p")]
+        parts += ["-o", shlex.quote(f"ProxyCommand=python {AGENT_PATH} --connect %h %p")]
     return " ".join(parts)
+
+
+# Where the workspace image puts this file (app/workspace/Dockerfile).
+AGENT_PATH = "/opt/blpl/wsagent/agent.py"
+_PROXY_VARS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
+
+
+def connect_main(host: str, port: str, environ=os.environ) -> int:
+    """ssh's ProxyCommand: CONNECT host:port through the egress proxy,
+    authenticating with the credential in HTTPS_PROXY, then relay stdin and
+    stdout to the tunnel until either side closes."""
+    import base64
+    import selectors
+    import socket
+    from urllib.parse import unquote, urlsplit
+
+    raw = next((environ[v] for v in _PROXY_VARS if environ.get(v)), "")
+    parts = urlsplit(raw if "://" in raw else "http://" + raw)
+    if not parts.hostname:
+        print("blpl connect: no proxy configured", file=sys.stderr)
+        return 2
+    s = socket.create_connection((parts.hostname, parts.port or 3128), timeout=30)
+    head = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+    if parts.username:
+        pair = f"{unquote(parts.username)}:{unquote(parts.password or '')}".encode()
+        head.append("Proxy-Authorization: Basic " + base64.b64encode(pair).decode())
+    s.sendall(("\r\n".join(head) + "\r\n\r\n").encode())
+    reply = b""
+    while b"\r\n\r\n" not in reply:
+        chunk = s.recv(4096)
+        if not chunk or len(reply) > 16384:
+            print("blpl connect: the proxy closed the connection", file=sys.stderr)
+            return 1
+        reply += chunk
+    status, _, rest = reply.partition(b"\r\n\r\n")
+    code = status.split(b" ", 2)[1:2]
+    if code != [b"200"]:
+        print(f"blpl connect: the proxy refused {host}:{port}: "
+              f"{status.splitlines()[0].decode('latin-1')}", file=sys.stderr)
+        return 1
+    s.settimeout(None)
+    out = sys.stdout.buffer
+    if rest:
+        out.write(rest)
+        out.flush()
+    sel = selectors.DefaultSelector()
+    sel.register(sys.stdin.buffer, selectors.EVENT_READ, "in")
+    sel.register(s, selectors.EVENT_READ, "net")
+    while True:
+        for key, _ in sel.select():
+            if key.data == "in":
+                data = os.read(sys.stdin.fileno(), 65536)
+                if not data:
+                    try:
+                        s.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    sel.unregister(sys.stdin.buffer)
+                    continue
+                s.sendall(data)
+            else:
+                data = s.recv(65536)
+                if not data:
+                    return 0
+                out.write(data)
+                out.flush()
 
 
 def harden_git_environment(environ) -> None:
@@ -900,9 +968,12 @@ class Agent:
 
     @contextmanager
     def _credential(self, b: dict) -> Iterator[dict[str, str] | None]:
-        """The operation's credential, for this one git command, then gone."""
+        """The operation's credentials, for this one git command, then gone:
+        the remote's (env, ssh_key), and the egress proxy's (proxy), which the
+        control plane issues for this one operation."""
         env = b.get("env")
         key = b.get("ssh_key")
+        proxy = {k: str(v) for k, v in (b.get("proxy") or {}).items() if k in _PROXY_VARS}
         if not env:
             # No credential: still clear any credential.helper the repository
             # configures (a program it would run), as a leased credential's
@@ -910,17 +981,19 @@ class Agent:
             # is read after GIT_CONFIG_COUNT and would clear a lease's helper.
             env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper",
                    "GIT_CONFIG_VALUE_0": "", "GIT_TERMINAL_PROMPT": "0"}
+        env = {**env, **proxy}
+        seen = {**os.environ, **proxy}
         if key is None:
             # ssh remotes go through the egress proxy even without a key
             # (a public repository, or a host key the operator mounted).
-            yield {**env, "GIT_SSH_COMMAND": ssh_command(None, os.environ)}
+            yield {**env, "GIT_SSH_COMMAND": ssh_command(None, seen)}
             return
         fd, path = tempfile.mkstemp(prefix="blpl-git-", suffix=".key")
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as fh:
                 fh.write(key if key.endswith("\n") else key + "\n")
-            yield {**env, "GIT_SSH_COMMAND": ssh_command(path, os.environ)}
+            yield {**env, "GIT_SSH_COMMAND": ssh_command(path, seen)}
         finally:
             try:
                 os.unlink(path)
@@ -1164,6 +1237,8 @@ def serve(socket_path: str, agent: Agent) -> Server:
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["--connect"] and len(sys.argv) == 4:
+        sys.exit(connect_main(sys.argv[2], sys.argv[3]))
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s")
     run_dir = Path(os.environ.get("BLPL_AGENT_DIR", "/run/blpl"))

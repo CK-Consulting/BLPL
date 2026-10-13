@@ -86,8 +86,8 @@ COPY app/backend/app /app/app
 COPY app/backend/alembic.ini /app/alembic.ini
 COPY app/backend/alembic /app/alembic
 COPY app/backend/entrypoint.sh /app/entrypoint.sh
-# The shipped egress allowlist, for egress.py when ./egress is not mounted.
-COPY app/egress/allowlist.txt /app/egress/allowlist.txt
+# The shipped egress defaults, for egress.py when ./egress is not mounted.
+COPY app/egress/allowlist.txt app/egress/git-hosts.txt /app/egress/
 RUN chmod +x /app/entrypoint.sh
 
 ENV BLPL_PROJECTS_ROOT=/app/projects \

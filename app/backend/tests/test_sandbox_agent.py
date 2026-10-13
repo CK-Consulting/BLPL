@@ -533,14 +533,15 @@ def test_ssh_is_sent_through_the_egress_proxy_with_or_without_a_key():
     env = {"HTTPS_PROXY": "http://squid:3128"}
     keyless = shlex.split(agent_mod.ssh_command(None, env))
     assert keyless[0] == "ssh" and "-i" not in keyless
-    assert "ProxyCommand=nc -X connect -x squid:3128 %h %p" in keyless
+    proxy_cmd = "ProxyCommand=python /opt/blpl/wsagent/agent.py --connect %h %p"
+    assert proxy_cmd in keyless
     assert "BatchMode=yes" in keyless
     keyed = shlex.split(agent_mod.ssh_command("/tmp/blpl-git-x.key", env))
     assert keyed[keyed.index("-i") + 1] == "/tmp/blpl-git-x.key"
-    assert "ProxyCommand=nc -X connect -x squid:3128 %h %p" in keyed
+    assert proxy_cmd in keyed
     # No proxy configured (tests, a host run): plain ssh, nothing invented.
     assert "ProxyCommand" not in agent_mod.ssh_command(None, {})
-    assert "-x proxy:8080" in agent_mod.ssh_command(None, {"http_proxy": "proxy:8080"})
+    assert "--connect" in agent_mod.ssh_command(None, {"http_proxy": "proxy:8080"})
 
 
 def test_every_network_git_command_gets_the_proxied_ssh(ag, monkeypatch):
@@ -548,7 +549,73 @@ def test_every_network_git_command_gets_the_proxied_ssh(ag, monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://squid:3128")
     for cred in ({}, {"env": {"GIT_HTTP_TOKEN": "t"}}, {"ssh_key": "KEY"}):
         with agent._credential(cred) as env:
-            assert "ProxyCommand=nc -X connect -x squid:3128" in env["GIT_SSH_COMMAND"], cred
+            assert "--connect %h %p" in env["GIT_SSH_COMMAND"], cred
+
+
+def test_a_git_operation_carries_its_own_proxy_credential(ag, monkeypatch):
+    """The workspace's HTTPS_PROXY has no credential; each network git command
+    gets the one the control plane issued for it, and nothing else does."""
+    agent, _, _ = ag
+    monkeypatch.setenv("HTTPS_PROXY", "http://squid:3128")
+    issued = "http://g-abc:s3cret@squid:3128"
+    with agent._credential({"proxy": {"HTTPS_PROXY": issued, "PATH": "/evil"}}) as env:
+        assert env["HTTPS_PROXY"] == issued and "PATH" not in env
+        assert env["GIT_CONFIG_VALUE_0"] == ""  # still no credential helper
+        assert "s3cret" not in env["GIT_SSH_COMMAND"]
+    with agent._credential({}) as env:
+        assert "HTTPS_PROXY" not in env
+
+
+def test_the_connect_helper_authenticates_and_relays(monkeypatch):
+    """ssh's proxy command speaks CONNECT with the grant's credential, which
+    it takes from the environment, and then relays bytes both ways."""
+    import base64
+    import io
+    import socket
+    import threading
+
+    seen = {}
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def proxy():
+        conn, _ = srv.accept()
+        data = b""
+        while b"\r\n\r\n" not in data:
+            data += conn.recv(4096)
+        seen["head"] = data.decode()
+        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\nSSH-2.0-test\r\n")
+        seen["sent"] = conn.recv(4096)
+        conn.close()
+
+    t = threading.Thread(target=proxy, daemon=True)
+    t.start()
+    port = srv.getsockname()[1]
+    r, w = os.pipe()
+    os.write(w, b"client-hello\n")
+    os.close(w)
+    out = io.BytesIO()
+
+    class Std:
+        def __init__(self, fd=None, buf=None):
+            self._fd, self.buffer = fd, buf
+
+        def fileno(self):
+            return self._fd
+
+    stdin = os.fdopen(r, "rb")
+    monkeypatch.setattr(agent_mod.sys, "stdin", Std(stdin.fileno(), stdin))
+    monkeypatch.setattr(agent_mod.sys, "stdout", Std(None, out))
+    code = agent_mod.connect_main("github.com", "22",
+                                  {"HTTPS_PROXY": f"http://g-abc:s%40cret@127.0.0.1:{port}"})
+    t.join(5)
+    assert code == 0
+    assert seen["head"].startswith("CONNECT github.com:22 HTTP/1.1")
+    assert ("Proxy-Authorization: Basic " + base64.b64encode(b"g-abc:s@cret").decode()) \
+        in seen["head"]
+    assert seen["sent"] == b"client-hello\n"
+    assert out.getvalue() == b"SSH-2.0-test\r\n"
 
 
 # -- runs and the agent's socket (Codex, PR #20) -----------------------------------------

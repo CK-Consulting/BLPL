@@ -800,3 +800,70 @@ class PdfVerdict(Base):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class EgressGrant(Base):
+    """A proxy credential for one run or one git operation in a workspace.
+
+    Squid authenticates every request a workspace sends (app/egress/squid.conf)
+    and asks the control plane, through app/egress_server.py, whether this
+    grant may reach that host. The answer is the shipped defaults, the
+    administrators' list, and ``hosts``: the hosts of the LLM endpoints in the
+    run's own chain. A member's own endpoint is reachable from their runs and
+    from nobody else's (egress.py).
+
+    The password is never stored, only its SHA-256: it is random, 32 bytes,
+    and lives only in the environment of the one operation it was issued for.
+    Revoked when that operation ends, and expired regardless.
+    """
+
+    __tablename__ = "egress_grant"
+
+    # The proxy username, "g-" and 24 hex characters.
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    token_sha256: Mapped[str] = mapped_column(String(64))
+    # run | git
+    kind: Mapped[str] = mapped_column(String(8))
+    project: Mapped[str] = mapped_column(String(128), default="")
+    run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    hosts: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class EgressHost(Base):
+    """A host the administrators allow every workspace to reach.
+
+    Added to the shipped defaults (app/egress/allowlist.txt) for every grant.
+    Changes take effect within the helper's cache time, without a restart or
+    a Squid reload, because Squid asks the control plane on every new host.
+    """
+
+    __tablename__ = "egress_host"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # A hostname, or a domain with a leading dot (Squid's dstdomain syntax).
+    host: Mapped[str] = mapped_column(String(253), unique=True)
+    added_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class EgressHostEvent(Base):
+    """Who added or removed a server-wide host, and when. Append-only."""
+
+    __tablename__ = "egress_host_event"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    host: Mapped[str] = mapped_column(String(253))
+    # added | removed
+    action: Mapped[str] = mapped_column(String(8))
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    email: Mapped[str] = mapped_column(String(320), default="")
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
