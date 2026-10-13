@@ -198,3 +198,79 @@ def test_a_cancel_seen_by_the_poll_stops_the_run_even_when_it_is_silent(tmp_path
     assert asyncio.run(go()) == jobs.CANCELLED_EXIT
     assert len(polls) == 2
     assert d.calls[0].cancelled
+
+
+# -- phase 4: a container per run ---------------------------------------------------------
+
+
+def test_a_run_container_gets_the_projects_git_read_only(tmp_path):
+    c = cfg(tmp_path)
+    (tmp_path / "projects" / "pathfinder" / ".git").mkdir(parents=True)
+    spec = jobs.run_spec_for(c, "pathfinder", "run_abc")
+    assert spec.key.role == "run" and spec.key.container_name().startswith("blpl-run-")
+    (git,) = spec.overlays
+    assert git.read_only and git.source == f"{HOST}/pathfinder/.git"
+    assert git.target == f"{tmp_path / 'projects'}/pathfinder/.git"
+    body = build_create_body(spec, DockerConfig(network="blpl-egress"))
+    assert json.loads(_create_named(body, spec.key.container_name()).body) == body
+
+
+def _create_named(body, name):
+    req = Request("POST", "/containers/create", {"name": name}, json.dumps(body).encode())
+    return asyncio.run(DockerProxy(_policy(), _Upstream()).decide(req))
+
+
+@pytest.mark.parametrize("source, ro", [
+    (f"{HOST}/victim/.git", True),        # another project's history
+    (f"{HOST}/pathfinder/.git", False),   # its own, but writable
+    (f"{HOST}/pathfinder/design", True),  # read-only, but not .git: not on the list
+    (f"{HOST}/.worktrees/pathfinder/.git", True),
+])
+def test_proxy_refuses_any_other_overlay(tmp_path, source, ro):
+    c = cfg(tmp_path)
+    (tmp_path / "projects" / "pathfinder" / ".git").mkdir(parents=True)
+    spec = jobs.run_spec_for(c, "pathfinder", "r1")
+    body = build_create_body(spec, DockerConfig(network="blpl-egress"))
+    body["HostConfig"]["Mounts"].append({"Type": "bind", "Source": source, "Target": "/x",
+                                         "ReadOnly": ro})
+    with pytest.raises(Refused):
+        _create_named(body, spec.key.container_name())
+
+
+def test_a_run_in_a_container_marks_the_workspace_and_filters_its_env(tmp_path):
+    d = FakeDriver(script=lambda call: (2, [("stdout", b"done\n")]))
+    marks: list[tuple[bool, float]] = []
+
+    async def mark(active, ttl):
+        marks.append((active, ttl))
+
+    async def poll():
+        return "running"
+
+    lines: list[str] = []
+    code = asyncio.run(jobs.run_job_in_container(
+        d, cfg(tmp_path), project_name="pathfinder", run_id="run_1", cmd=[PY, "-m", "x"],
+        env=QUEUED_ENV, log=lines.append, poll=poll, mark=mark))
+    assert code == 2 and lines == ["done\n"]
+    assert marks[0][0] is True and marks[-1] == (False, 0)
+    (spec,) = d.run_specs
+    assert spec.key.role == "run"
+    assert "BLPL_DATABASE_URL" not in d.calls[0].env and "BLPL_LLM_KEY__MAIN" in d.calls[0].env
+
+
+def test_cancelling_a_run_container_stops_it(tmp_path):
+    async def forever(call):
+        await asyncio.Event().wait()
+
+    d = FakeDriver(script=forever)
+    polls: list[int] = []
+
+    async def poll():
+        polls.append(1)
+        return "cancelling"
+
+    code = asyncio.run(asyncio.wait_for(jobs.run_job_in_container(
+        d, cfg(tmp_path), project_name="pathfinder", run_id="r", cmd=["x"], env={},
+        log=lambda s: None, poll=poll, poll_every=0.05), timeout=5))
+    assert code == jobs.CANCELLED_EXIT
+    assert d.calls[0].cancelled and ("stop", d.run_specs[0].key) in d.ops

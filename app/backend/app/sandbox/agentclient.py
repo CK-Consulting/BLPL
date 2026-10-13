@@ -236,3 +236,6 @@ class AgentClient:
     def worktree_ensure(self, project: str, user_id: int, is_owner: bool) -> dict:
         return self.call("/worktree/ensure", {"project": project, "user_id": user_id,
                                               "is_owner": is_owner})
+
+    def run_mark(self, rid: str, active: bool, ttl: float = 60.0) -> None:
+        self.call("/runs/mark", {"id": rid, "active": active, "ttl": ttl})

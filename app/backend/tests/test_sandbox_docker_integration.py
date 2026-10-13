@@ -617,3 +617,93 @@ async def _agent_log(c, rid: str, timeout: float = 120) -> str:
             return out.decode()
         await asyncio.sleep(0.1)
     raise AssertionError("run did not finish")
+
+
+def test_phase4_a_run_container_cannot_write_git_and_cancel_kills_it(env):
+    """A container per run with .git read-only: a stage can write the
+    project's files but not its history or index, and cancelling the run
+    removes every process with the container."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    import subprocess
+
+    from app.sandbox import jobs
+    from app.sandbox.jobs import WorkspaceRunConfig
+
+    projects = env.tmp / "projects"
+    project = f"itest-{env.tag}-p4"
+    proj = projects / project
+    proj.mkdir(parents=True)
+    gitenv = {**os.environ, "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@b",
+              "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@b"}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(proj)], check=True)
+    (proj / "design.md").write_text("# Board\n")
+    subprocess.run(["git", "-C", str(proj), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-qm", "init"], check=True, env=gitenv)
+    (proj / "design.md").write_text("# Board, edited\n")  # dirty: status would refresh
+    for d in (env.tmp, projects, proj):
+        os.chmod(d, 0o755)
+    index = proj / ".git" / "index"
+    before = (index.stat().st_mtime_ns, index.read_bytes())
+
+    psock = str(env.tmp / "proxy.sock")
+    policy = ProxyPolicy(
+        instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
+        project_bind_roots=(str(projects),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
+    )
+    cfg = WorkspaceRunConfig(
+        image=WORKSPACE_IMAGE, projects_root=projects, host_projects_root=str(projects),
+        resources=Resources(memory_bytes=1024**3, nano_cpus=1_000_000_000, pids=256,
+                            tmp_bytes=256 * 1024**2))
+
+    async def poll_running():
+        return "running"
+
+    async def scenario():
+        upstream = UnixUpstream(SOCK)
+        server = await serve(DockerProxy(policy, upstream), psock)
+        driver = DockerDriver(env.config(f"unix://{psock}"))
+        try:
+            out: list[str] = []
+            script = (
+                "cd " + str(proj) + "; "
+                "git status --porcelain; "
+                "git add -A 2>/dev/null; echo add=$?; "
+                "touch .git/hooks/pre-commit 2>/dev/null; echo hook=$?; "
+                "echo generated > out.txt; echo write=$?"
+            )
+            code = await jobs.run_job_in_container(
+                driver, cfg, project_name=project, run_id="run-git", cmd=["sh", "-c", script],
+                env={}, log=out.append, poll=poll_running, poll_every=5)
+            text = "".join(out)
+            assert code == 0, text
+            assert "M design.md" in text          # git can read
+            assert "add=0" not in text and "hook=0" not in text, text  # but not write
+            assert "write=0" in text and (proj / "out.txt").read_text() == "generated\n"
+            assert (index.stat().st_mtime_ns, index.read_bytes()) == before, "the index changed"
+
+            # Cancel: the run and its child both go, with the container.
+            polls = {"n": 0}
+
+            async def poll_cancel():
+                polls["n"] += 1
+                return "cancelling" if polls["n"] >= 2 else "running"
+
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            code = await jobs.run_job_in_container(
+                driver, cfg, project_name=project, run_id="run-cancel",
+                cmd=["sh", "-c", "sleep 300 & sleep 300; wait"], env={}, log=lambda s: None,
+                poll=poll_cancel, poll_every=0.5)
+            assert code == jobs.CANCELLED_EXIT
+            assert loop.time() - t0 < 30
+            key = jobs.run_spec_for(cfg, project, "run-cancel").key
+            assert (await driver.status(key)).state is State.ABSENT
+        finally:
+            await driver.aclose()
+            await upstream.aclose()
+            server.close()
+
+    asyncio.run(scenario())
