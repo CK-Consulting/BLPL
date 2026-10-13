@@ -1823,6 +1823,11 @@ def clone_project(
             # so a read-only token cloned fine and an automatic policy then
             # recorded a failure after every commit (Codex, PR #19). Asked
             # before git clone runs, so a refusal leaves nothing behind.
+            # A branch, not a tag: cloned, a tag is a detached HEAD that no
+            # push can update (Codex, PR #19).
+            problem = projects.branch_problem(body.remote, body.branch, env=env)
+            if problem:
+                raise HTTPException(status_code=400, detail=problem)
             refused = projects.probe_write(body.remote, env=env, branch=body.branch)
             if refused is not None and policy == "auto":
                 raise HTTPException(

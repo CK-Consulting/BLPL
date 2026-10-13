@@ -456,3 +456,43 @@ def test_a_failed_creation_leaves_no_open_workspace_behind(unlocked, monkeypatch
     assert not main.workspaces.is_open("p")
     assert main.workspaces.key_for("p") is None
     assert all(Path(w.path).name != "p" for w in main.workspaces.all_open())
+
+
+def _remote_with_a_tag() -> str:
+    remote = bare_remote()
+    _seed(remote)
+    subprocess.run(["git", "tag", "v1.0", "main"], cwd=remote, check=True)
+    subprocess.run(["git", "tag", "-a", "-m", "release", "rel-2", "main"], cwd=remote, check=True,
+                   env={**os.environ, "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"})
+    return remote
+
+
+@pytest.mark.parametrize("tag", ["v1.0", "rel-2"])
+@pytest.mark.parametrize("policy", ["auto", "manual"])
+def test_a_tag_is_refused_as_the_branch_to_clone(unlocked, tag, policy):
+    # Codex P2 on #19: clone --branch <tag> gave a detached HEAD, and every
+    # automatic push from it failed.
+    import app.main as main
+    from conftest import clone_body
+
+    remote = _remote_with_a_tag()
+    r = unlocked.post("/api/projects/clone", json=clone_body("c", remote, branch=tag, push_policy=policy))
+    assert r.status_code == 400 and f"'{tag}' is a tag, not a branch" in r.json()["detail"]
+    assert not (main.PROJECTS_ROOT / "c").exists()
+
+
+def test_a_branch_that_is_not_there_is_named_with_the_ones_that_are(unlocked):
+    from conftest import clone_body
+
+    remote = _remote_with_a_tag()
+    r = unlocked.post("/api/projects/clone", json=clone_body("c", remote, branch="develop"))
+    assert r.status_code == 400 and "no branch 'develop'" in r.json()["detail"]
+    assert "main" in r.json()["detail"]
+
+
+def test_the_branch_beside_the_tag_still_clones(unlocked):
+    from conftest import clone_body
+
+    remote = _remote_with_a_tag()
+    r = unlocked.post("/api/projects/clone", json=clone_body("c", remote, branch="main", push_policy="auto"))
+    assert r.status_code == 200, r.text

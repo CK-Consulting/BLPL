@@ -1135,6 +1135,40 @@ class Projects:
     #: How long either probe waits for the remote before saying it did not answer.
     PROBE_TIMEOUT = 60
 
+    def branch_problem(
+        self, url: str, branch: str, *, env: dict[str, str] | None = None
+    ) -> str | None:
+        """Why ``branch`` cannot be cloned and pushed as a branch of ``url``,
+        or None when refs/heads/<branch> exists there.
+
+        `git clone --branch` accepts a tag as readily as a branch and leaves a
+        detached HEAD, so a clone of a tag looked fine and every push from it
+        then failed — automatic ones after every commit — while the write
+        check tested a refs/heads/<tag> that does not exist (Codex, PR #19).
+        Asked of the remote's own ref list, before anything is cloned.
+        """
+        url = check_remote_url(url)
+        if not branch or branch.startswith("-"):
+            return f"{branch!r} is not a branch name"
+        try:
+            proc = subprocess.run(
+                ["git", "ls-remote", "--heads", "--tags", "--", url],
+                capture_output=True, text=True, check=False, timeout=self.PROBE_TIMEOUT,
+                env={**os.environ, **_net_env(env), "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except subprocess.TimeoutExpired:
+            return _PROBE_TIMED_OUT
+        if proc.returncode != 0:
+            return _redact_text(f"could not list the remote's branches: {proc.stderr.strip()}")
+        refs = {line.split("\t", 1)[1] for line in proc.stdout.splitlines() if "\t" in line}
+        if f"refs/heads/{branch}" in refs:
+            return None
+        if f"refs/tags/{branch}" in refs or f"refs/tags/{branch}^{{}}" in refs:
+            return f"{branch!r} is a tag, not a branch — clone a branch"
+        heads = sorted(r[len("refs/heads/"):] for r in refs if r.startswith("refs/heads/"))
+        listed = f" (it has: {', '.join(heads[:5])}{', …' if len(heads) > 5 else ''})" if heads else ""
+        return f"the remote has no branch {branch!r}{listed}"
+
     def probe_write(
         self, url: str, *, env: dict[str, str] | None = None, branch: str = "main"
     ) -> RemoteProbe | None:
