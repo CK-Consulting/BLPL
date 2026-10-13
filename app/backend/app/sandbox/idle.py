@@ -93,6 +93,11 @@ async def sweep(
         key = st.key
         if st.state is not State.RUNNING:
             continue
+        if key.role != "workspace":
+            # Run and sealer containers end on their own, and a run is busy for
+            # as long as it lasts, however quiet. Stopping one for being idle
+            # would kill a long autoroute that this process never touched.
+            continue
         if not tracker.seen(key):
             tracker.touch(key)  # first sight: start its clock, do not stop it
             continue

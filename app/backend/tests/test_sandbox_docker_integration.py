@@ -785,3 +785,54 @@ def test_phase4_sealing_in_a_sealer_container_leaves_no_plaintext(env):
             server.close()
 
     asyncio.run(scenario())
+
+
+def test_phase4_a_retried_run_kills_the_orphan_a_dead_worker_left(env):
+    """A worker died mid-run: its run container is still running and still
+    writing the project. reclaim_stale requeues the same run id, so the retry
+    derives the same container name. It must kill that orphan and proceed, not
+    fail on the name and leave the orphan writing."""
+    from dataclasses import replace
+
+    from app.sandbox.docker import build_create_body
+
+    projects = env.tmp / "projects"
+    proj = projects / f"itest-{env.tag}-orphan"
+    proj.mkdir(parents=True)
+    os.chmod(env.tmp, 0o755)
+    os.chmod(projects, 0o755)
+    os.chmod(proj, 0o777)
+    base = env.spec("orphan")
+    spec = replace(base, key=WorkspaceKey(base.key.project, role="run", member="run_77"),
+                   storage=Mount(kind="bind", source=str(proj), target="/workspace"),
+                   command=())
+    log = proj / "orphan.log"
+
+    async def scenario():
+        driver = DockerDriver(env.config(f"unix://{SOCK}"))
+        try:
+            # The orphan, as the dead worker left it: created and started
+            # under the run's name and labels, and nobody following it.
+            body = build_create_body(replace(spec, command=(
+                "sh", "-c", "while true; do date >> /workspace/orphan.log; sleep 0.2; done")),
+                driver.cfg)
+            name = spec.key.container_name()
+            await driver._req("POST", "/containers/create", params={"name": name},
+                              json=body, ok=(201,))
+            await driver._req("POST", f"/containers/{name}/start", ok=(204,))
+            await asyncio.sleep(1.0)
+            assert log.exists() and log.stat().st_size > 0, "the orphan is not running"
+
+            out: list[bytes] = []
+            res = await driver.run_container(spec, ["sh", "-c", "echo retried"],
+                                             on_output=lambda s, b: out.append(b))
+            assert res.exit_code == 0 and b"retried" in b"".join(out)
+            size = log.stat().st_size
+            await asyncio.sleep(1.0)
+            assert log.stat().st_size == size, "the orphan is still writing"
+            assert (await driver.status(spec.key)).state is State.ABSENT
+        finally:
+            await driver.aclose()
+
+    asyncio.run(scenario())
+

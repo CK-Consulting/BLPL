@@ -32,7 +32,6 @@ import base64
 import json
 import os
 import sys
-import uuid
 from dataclasses import replace
 from typing import Callable
 
@@ -93,7 +92,12 @@ async def run_sealer(driver, cfg, project: str, key: bytes, op: str) -> dict:
     base = spec_for(cfg, project)
     spec = replace(
         base,
-        key=WorkspaceKey(project=project, role="sealer", member=uuid.uuid4().hex[:12]),
+        # One name per project, not per call: a sealer left running by a
+        # control plane that died is found under it and killed before the next
+        # seal starts (run_container), rather than racing it. workspace.seal is
+        # written to survive being killed at any point, and gVisor would not
+        # share the seal's flock between two sealer sandboxes.
+        key=WorkspaceKey(project=project, role="sealer", member="seal"),
         storage=Mount(kind="bind", source=cfg.host_projects_root, target=SEALER_ROOT),
         extra_storage=(), libraries=(), overlays=(), agent_dir=None,
         env={},

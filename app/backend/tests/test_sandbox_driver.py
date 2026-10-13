@@ -418,3 +418,84 @@ def test_sweep_keeps_a_workspace_the_agent_saw_used_recently():
 
     assert run(idle.sweep(d, tracker, idle_after_s=60, activity=recent)) == []
     assert run(idle.sweep(d, tracker, idle_after_s=60, activity=unknown)) == [KEY]
+
+
+# -- orphans of a dead worker -----------------------------------------------------------
+
+
+def _run_spec(run_id="run_1"):
+    from dataclasses import replace as _replace
+    return _replace(spec(), key=WorkspaceKey("pathfinder", role="run", member=run_id))
+
+
+def test_a_retried_run_kills_the_orphan_of_its_first_attempt():
+    d = FakeDriver(script=lambda call: (0, []))
+    orphan = _run_spec()
+    d.boxes[orphan.key] = __import__("app.sandbox.fake", fromlist=["_Box"])._Box(
+        orphan, State.RUNNING, "orphan")
+    assert run(d.run_container(_run_spec(), ["x"])).exit_code == 0
+    assert d.ops[:2] == [("remove_orphan", orphan.key), ("run_container", orphan.key)]
+    assert orphan.key not in d.boxes
+
+
+def test_a_name_held_by_something_not_ours_is_refused_and_left_alone():
+    d = FakeDriver()
+    d.foreign.add(_run_spec().key)
+    with pytest.raises(NotOurs):
+        run(d.run_container(_run_spec(), ["x"]))
+    assert d.calls == []
+
+
+def test_the_idle_sweep_never_stops_a_run_or_sealer_container():
+    clock, d = Clock(), FakeDriver()
+    tracker = idle.IdleTracker(clock)
+    import app.sandbox.fake as fake_mod
+    for k in (WorkspaceKey("p", role="run", member="r1"),
+              WorkspaceKey("p", role="sealer", member="seal")):
+        d.boxes[k] = fake_mod._Box(spec(), State.RUNNING, k.member)
+    run(idle.sweep(d, tracker, idle_after_s=1))
+    clock.t += 10_000
+    assert run(idle.sweep(d, tracker, idle_after_s=1)) == []
+
+
+def test_docker_retry_removes_the_labelled_orphan_before_creating():
+    daemon = MockDaemon()
+    d = driver_for(daemon)
+    rs = _run_spec("run_9")
+    body = build_create_body(rs, DockerConfig())
+    daemon.containers[rs.key.container_name()] = {
+        "Id": "o" * 64, "Config": {"Labels": body["Labels"]}, "State": {"Status": "running"}}
+    calls = []
+    orig = daemon.handler
+
+    def handler(request):
+        calls.append((request.method, request.url.path.split("/", 2)[2]))
+        if request.url.path.endswith("/logs"):
+            return httpx.Response(200, stream=httpx.ByteStream(b""))
+        if request.method == "GET" and "containers/" in request.url.path and request.url.path.endswith("/json"):
+            name = request.url.path.split("/")[-2]
+            box = daemon.containers.get(name)
+            if box is not None:
+                box = {**box, "State": {"Running": False, "ExitCode": 0, "Status": "exited"}}
+                return httpx.Response(200, json=box)
+        return orig(request)
+
+    d = DockerDriver(DockerConfig(), transport=httpx.MockTransport(handler))
+    assert run(d.run_container(rs, ["x"])).exit_code == 0
+    deletes = [c for c in calls if c[0] == "DELETE"]
+    creates = [i for i, c in enumerate(calls) if c == ("POST", "containers/create")]
+    assert deletes and calls.index(deletes[0]) < creates[0]
+    assert deletes[0][1] == "containers/" + "o" * 64
+
+
+def test_docker_retry_refuses_a_foreign_container_under_the_runs_name():
+    daemon = MockDaemon()
+    rs = _run_spec("run_9")
+    daemon.containers[rs.key.container_name()] = {
+        "Id": "f" * 64, "Config": {"Labels": {"blpl.managed": "true", "blpl.instance": "blpl",
+                                              "blpl.role": "run", "blpl.project": "pathfinder",
+                                              "blpl.member": "run_OTHER"}},
+        "State": {"Status": "running"}}
+    with pytest.raises(NotOurs):
+        run(driver_for(daemon).run_container(rs, ["x"]))
+    assert rs.key.container_name() in daemon.containers
