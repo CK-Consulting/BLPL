@@ -5,7 +5,8 @@ This package has two entry surfaces:
 1. **ActionPlugin** — loaded automatically by the KiCad PCB editor when the
    plugin folder is on KiCad's plugin search path (e.g. symlinked under
    ``~/Documents/KiCad/10.0/3rdparty/plugins/``). Adds a Tools-menu entry
-   that prompts for an HDM YAML file and builds the PCB from it.
+   that prompts for an HDM file (JSON, or YAML when pyyaml is available) and
+   builds the PCB from it.
 2. **Standalone CLI** — ``python3 -m build_pcb --hdm <path> --out <path>`` run
    under KiCad's bundled Python interpreter. Same translation logic, no GUI.
 

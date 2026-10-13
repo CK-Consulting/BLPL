@@ -22,29 +22,18 @@ from pathlib import Path
 
 
 def _load_hdm(path: Path) -> dict:
-    """Load an HDM file. Accepts JSON directly; YAML only if pyyaml is installed.
+    """Load an HDM file: JSON always, YAML only if pyyaml is installed.
 
-    KiCad's bundled Python does not ship with pyyaml. The pipeline CLI
-    (``hdm-pipeline stage6-plugin``) pre-converts hdm.yaml to hdm.json before
-    invoking this entry point, so the common path goes through the stdlib
-    ``json`` module and never needs pyyaml.
+    The pipeline CLI (``blpl stage6-plugin``) pre-converts hdm.yaml to JSON
+    before invoking this entry point, so the common path never needs pyyaml.
+    See hdm_io for why both entry points share one reader.
     """
-    suffix = path.suffix.lower()
-    if suffix == ".json":
-        import json
+    from .hdm_io import HdmLoadError, load_hdm
 
-        with path.open() as f:
-            return json.load(f) or {}
     try:
-        import yaml  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError(
-            f"Cannot read {path}: pyyaml is not installed in this Python. "
-            f"Either convert to JSON (hdm.json) or run "
-            f"`{Path(__import__('sys').executable)} -m pip install pyyaml`."
-        ) from exc
-    with path.open() as f:
-        return yaml.safe_load(f) or {}
+        return load_hdm(path)
+    except HdmLoadError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _resolve_footprints_root(cli_value: str | None) -> Path:
@@ -78,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="build_pcb",
         description="Build a .kicad_pcb from an HDM YAML using the pcbnew Python API.",
     )
-    parser.add_argument("--hdm", required=True, help="Path to hdm.yaml.")
+    parser.add_argument("--hdm", required=True, help="HDM file: JSON, or YAML if pyyaml is installed.")
     parser.add_argument("--out", required=True, help="Output .kicad_pcb path.")
     parser.add_argument(
         "--footprints-root",
