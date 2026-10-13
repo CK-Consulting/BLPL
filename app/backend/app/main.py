@@ -234,7 +234,9 @@ def _restore_open_workspaces() -> None:
     """
     try:
         with SessionFactory() as session:
-            restored = openstate.restore(session, _server_key(), PROJECTS_ROOT)
+            restored = openstate.restore(
+                session, _server_key(), PROJECTS_ROOT,
+                sees_projects=not workspace_files.mount_absent())
             for name, path, key, touched, holders in restored:
                 workspaces.adopt(name, path, key, touched, holders)
             session.commit()
@@ -578,11 +580,18 @@ def authz_gate(
             # is not a member.
             _project_dir(session, user, project_id)
         else:
-            try:
-                mounted = {d.name for d in PROJECTS_ROOT.iterdir() if d.is_dir()}
-            except FileNotFoundError:
-                mounted = set()
             known = set(session.execute(select(Project.name)).scalars())
+            if workspace_files.mount_absent():
+                # The desktop mounts the projects this backend cannot see, so
+                # what is mounted is unknowable here: assume every project is,
+                # rather than reading the empty mask as "none" and letting
+                # anyone in (Codex, PR #20).
+                mounted = set(known)
+            else:
+                try:
+                    mounted = {d.name for d in PROJECTS_ROOT.iterdir() if d.is_dir()}
+                except FileNotFoundError:
+                    mounted = set()
             mine = {p.name for p in projectacl.visible(session, user)}
             # Checked against `visible`, not `require_member` in a loop: one
             # query, and a sealed project does not become a 423 that would deny
@@ -2454,6 +2463,19 @@ def open_project(
     """
     project = _project_or_404(session, user, project_id)
     if not workspace.is_sealed(PROJECTS_ROOT, project_id):
+        if workspace_files.enabled() and workspaces.key_for(project_id) is None:
+            # Open, but this process holds no key to seal it with: its row was
+            # lost, or never written. Take this member's copy now, so the idle
+            # sweep can seal the project again (Codex, PR #20). With the agent
+            # path only: on the mount, a restart drops a row only when the
+            # directory is really gone.
+            try:
+                key = grants.project_key_for(session, project, user, master_key)
+            except grants.NoGrant:
+                key = None
+            if key is not None:
+                _note_workspace_open(session, project_id, PROJECTS_ROOT / project_id, key,
+                                     user.id)
         _touch_workspace(session, project_id, user.id)
         _drop_placeholder_identity(project_id)
         return {"ok": True, "already_open": True}

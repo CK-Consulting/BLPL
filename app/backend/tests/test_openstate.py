@@ -167,3 +167,14 @@ def test_touch_writes_once_the_throttle_has_passed(session, tmp_path):
     openstate.touch(session, "proj", holder=1)
     session.commit()
     assert session.get(OpenWorkspaceRow, "proj").last_touched > before
+
+
+def test_without_the_project_mount_a_row_is_restored_not_dropped(session, tmp_path):
+    """Through the mask every directory looks absent. Dropping on that lost
+    the only server-side key of an open project (Codex, PR #20)."""
+    d = _open(session, tmp_path)
+    d.rmdir()  # what the backend sees through the empty tmpfs
+    restored = openstate.restore(session, SERVER_KEY, tmp_path, sees_projects=False)
+    session.commit()
+    assert [(n, k) for n, _, k, _, _ in restored] == [("proj", PROJECT_KEY)]
+    assert session.get(OpenWorkspaceRow, "proj") is not None
