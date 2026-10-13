@@ -124,6 +124,30 @@ CATALOG: tuple[ProviderInfo, ...] = (
 
 BY_ID = {p.id: p for p in CATALOG}
 
+# The OpenAI-compatible services the catalog names ("OpenRouter, Together,
+# Fireworks, DeepInfra"), with the base URL each one documents. Offered as
+# suggestions, and the reason their hosts are on the shipped egress
+# allowlist: a provider the app names should not fail a run in a workspace
+# at Squid (app/egress/allowlist.txt, egress.py).
+OPENAI_COMPATIBLE_SERVICES: dict[str, str] = {
+    "OpenRouter": "https://openrouter.ai/api/v1",
+    "Together": "https://api.together.xyz/v1",
+    "Fireworks": "https://api.fireworks.ai/inference/v1",
+    "DeepInfra": "https://api.deepinfra.com/v1/openai",
+}
+
+
+def catalog_hosts() -> list[str]:
+    """Every remote host the catalog names: what the egress allowlist must hold.
+
+    Ollama's localhost default is not one: a workspace reaches the Ollama
+    service directly on blpl-egress, not through Squid."""
+    from urllib.parse import urlsplit
+
+    urls = [p.base_url for p in CATALOG if p.kind != "ollama"]
+    urls += list(OPENAI_COMPATIBLE_SERVICES.values())
+    return sorted({urlsplit(u).hostname for u in urls if u and urlsplit(u).hostname})
+
 
 def get(provider_id: str) -> ProviderInfo | None:
     return BY_ID.get(provider_id)

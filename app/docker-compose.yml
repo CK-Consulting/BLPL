@@ -211,6 +211,10 @@ services:
       # With the agent on, the backend is what stops and seals idle
       # workspaces, so it reads this rather than the worker.
       - BLPL_SANDBOX_IDLE_S=${BLPL_SANDBOX_IDLE_S:-900}
+      # Whether runs leave through Squid. The backend reads it to refuse an
+      # LLM endpoint whose host is not on the egress allowlist, at save and
+      # at queue (app/backend/app/egress.py), instead of a run failing at it.
+      - BLPL_RUNS_IN_WORKSPACE=${BLPL_RUNS_IN_WORKSPACE:-0}
       - BLPL_AGENT_DIR_ROOT=/app/data/agents
       - BLPL_SANDBOX_HOST_AGENT_DIRS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/agents}
       - BLPL_SANDBOX_DOCKER=unix:///run/blpl-docker-proxy/docker.sock
@@ -255,6 +259,9 @@ services:
       # The socket proxy, for starting workspaces in phase 3. Empty and unused
       # with the flag off.
       - blpl-docker-proxy:/run/blpl-docker-proxy
+      # The shipped egress allowlist, the same file Squid reads; the
+      # operator's additions are under ./data/egress.
+      - ./egress:/app/egress:ro
 
   # The container with KiCad in it, and the only thing that executes a stage.
   #
@@ -821,6 +828,9 @@ services:
       - ./egress/squid.conf:/etc/squid/squid.conf:ro
       - ./egress/allowlist.txt:/etc/squid/allowlist.txt:ro
       - ./egress/git-hosts.txt:/etc/squid/git-hosts.txt:ro
+      # The operator's additions, outside git. A directory, not the file, so
+      # an editor that replaces the file is seen after a reconfigure.
+      - ./data/egress:/etc/squid/local:ro
 
 networks:
   blpl:
