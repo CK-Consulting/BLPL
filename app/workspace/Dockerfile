@@ -71,7 +71,11 @@ FROM kicad-base AS workspace
 
 # btrfs-progs, for the storage helper's subvolumes, quotas and snapshots
 # (phase 4). Inert in a workspace: without CAP_SYS_ADMIN it can change nothing.
-RUN apt-get update && apt-get install -y --no-install-recommends btrfs-progs \
+#
+# netcat-openbsd, for git over ssh: a workspace's only way out is the egress
+# proxy, OpenSSH ignores HTTP_PROXY, and `nc -X connect` is what the agent's
+# ssh ProxyCommand uses to reach Squid's CONNECT on port 22.
+RUN apt-get update && apt-get install -y --no-install-recommends btrfs-progs netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # Same uid handling as the backend, for the same reasons: files the workspace

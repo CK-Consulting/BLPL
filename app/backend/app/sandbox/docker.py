@@ -20,6 +20,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import struct
 import uuid
 from dataclasses import dataclass, replace
@@ -70,6 +71,13 @@ class DockerConfig:
     user: str = "1000:1000"
     # SIGTERM-to-SIGKILL grace when a run is cancelled.
     cancel_grace_s: float = 10.0
+    # "name:ip" entries for the workspace's /etc/hosts: the egress proxy and
+    # the other services on its network. Docker's embedded DNS (127.0.0.11)
+    # does not answer inside a gVisor sandbox (measured: no container name
+    # resolves under runsc, on internal or ordinary networks), so a workspace
+    # reaches them by these entries, which work under both runtimes. Compose
+    # gives those services fixed addresses for this.
+    extra_hosts: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "DockerConfig":
@@ -82,6 +90,8 @@ class DockerConfig:
             network=env.get("BLPL_SANDBOX_NETWORK", d.network),
             runtime=env.get("BLPL_SANDBOX_RUNTIME") or None,
             user=env.get("BLPL_SANDBOX_USER", d.user),
+            extra_hosts=tuple(h for h in re.split(r"[\s,]+",
+                                                  env.get("BLPL_SANDBOX_EXTRA_HOSTS", "")) if h),
         )
 
 
@@ -159,6 +169,8 @@ def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig) -> dict[str, Any]:
     }
     if cfg.runtime:
         host["Runtime"] = cfg.runtime
+    if cfg.extra_hosts:
+        host["ExtraHosts"] = list(cfg.extra_hosts)
 
     body: dict[str, Any] = {
         "Image": spec.image,

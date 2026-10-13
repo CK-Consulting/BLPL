@@ -85,6 +85,9 @@ class ProxyPolicy:
     # container may bind exactly <root>/<its own name>, read-write, at
     # /run/blpl, and so reach no other workspace's socket or token.
     agent_dir_roots: tuple[str, ...] = ()
+    # "name:ip" /etc/hosts entries a container may carry: the egress proxy
+    # and its network's services, so a gVisor workspace can name them.
+    extra_hosts: frozenset[str] = frozenset()
     # "run" (phase 4) is a container per pipeline run, confined exactly as a
     # workspace is, with the project's .git read-only.
     # "sealer" (phase 4) seals or unseals one project and exits; it alone may
@@ -114,6 +117,7 @@ class ProxyPolicy:
             ro_bind_roots=tuple(words("BLPL_PROXY_RO_BIND_ROOTS")),
             project_bind_roots=tuple(words("BLPL_PROXY_PROJECT_BIND_ROOTS")),
             agent_dir_roots=tuple(words("BLPL_PROXY_AGENT_DIR_ROOTS")),
+            extra_hosts=frozenset(words("BLPL_PROXY_EXTRA_HOSTS")),
         )
 
 
@@ -430,6 +434,16 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
 _NO_NEW_PRIVS = {"no-new-privileges", "no-new-privileges:true", "no-new-privileges=true"}
 
 
+def _extra_hosts(policy: ProxyPolicy, v: Any, where: str) -> Any:
+    got = _str_list(v, where)
+    for entry in [] if got is _DROP else got:
+        if entry not in policy.extra_hosts:
+            # A host entry can point a name the workspace trusts (the egress
+            # proxy) anywhere, so only the deployment's own are allowed.
+            raise Refused(f"{where} entry {entry!r} is not permitted")
+    return got
+
+
 def _security_opt(v: Any, where: str) -> Any:
     got = _str_list(v, where)
     if got is _DROP or not any(x in _NO_NEW_PRIVS for x in got):
@@ -476,6 +490,7 @@ def check_create(policy: ProxyPolicy, query: Mapping[str, str], obj: Any) -> Cre
         "Runtime": lambda v, w: _DROP if v in ("", None) else _one_of(policy.runtimes)(v, w),
         "RestartPolicy": lambda v, w: _pick(v, {"Name": _one_of({"no", ""})}, w),
         "AutoRemove": _bool,
+        "ExtraHosts": lambda v, w: _extra_hosts(policy, v, w),
         "LogConfig": lambda v, w: _pick(v, {
             "Type": _one_of({"json-file", "local"}), "Config": _str_map,
         }, w),

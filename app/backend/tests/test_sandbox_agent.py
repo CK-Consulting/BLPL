@@ -522,3 +522,30 @@ def test_without_a_credential_a_repository_credential_helper_is_cleared(ag):
     assert "'core.sshCommand'='ssh'" in hardened["GIT_CONFIG_PARAMETERS"]
     agent_mod.harden_git_environment(hardened)  # idempotent
     assert hardened["GIT_CONFIG_PARAMETERS"].count("hooksPath") == 1
+
+
+# -- ssh through the egress proxy (Codex, PR #20) --------------------------------------------
+
+
+def test_ssh_is_sent_through_the_egress_proxy_with_or_without_a_key():
+    import shlex
+
+    env = {"HTTPS_PROXY": "http://squid:3128"}
+    keyless = shlex.split(agent_mod.ssh_command(None, env))
+    assert keyless[0] == "ssh" and "-i" not in keyless
+    assert "ProxyCommand=nc -X connect -x squid:3128 %h %p" in keyless
+    assert "BatchMode=yes" in keyless
+    keyed = shlex.split(agent_mod.ssh_command("/tmp/blpl-git-x.key", env))
+    assert keyed[keyed.index("-i") + 1] == "/tmp/blpl-git-x.key"
+    assert "ProxyCommand=nc -X connect -x squid:3128 %h %p" in keyed
+    # No proxy configured (tests, a host run): plain ssh, nothing invented.
+    assert "ProxyCommand" not in agent_mod.ssh_command(None, {})
+    assert "-x proxy:8080" in agent_mod.ssh_command(None, {"http_proxy": "proxy:8080"})
+
+
+def test_every_network_git_command_gets_the_proxied_ssh(ag, monkeypatch):
+    agent, _, _ = ag
+    monkeypatch.setenv("HTTPS_PROXY", "http://squid:3128")
+    for cred in ({}, {"env": {"GIT_HTTP_TOKEN": "t"}}, {"ssh_key": "KEY"}):
+        with agent._credential(cred) as env:
+            assert "ProxyCommand=nc -X connect -x squid:3128" in env["GIT_SSH_COMMAND"], cred

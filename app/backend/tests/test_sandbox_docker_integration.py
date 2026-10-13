@@ -935,3 +935,143 @@ def test_phase4_worktree_gitfiles_are_safe_from_stages_and_hooks_never_run(env):
             server.close()
 
     asyncio.run(scenario())
+
+
+_CONNECT_PROXY = r'''
+import socket, sys, threading
+log = open("/logs/proxy.log", "a", buffering=1)
+def pipe(a, b):
+    try:
+        while (d := a.recv(65536)):
+            b.sendall(d)
+    except OSError:
+        pass
+    finally:
+        for s in (a, b):
+            try: s.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+def serve(c):
+    head = b""
+    while b"\r\n\r\n" not in head:
+        d = c.recv(4096)
+        if not d: return
+        head += d
+    line = head.split(b"\r\n")[0].decode()
+    log.write(line + "\n")
+    verb, target, _ = line.split(" ", 2)
+    host, port = target.rsplit(":", 1)
+    if verb != "CONNECT" or port != "22":
+        c.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n"); c.close(); return
+    u = socket.create_connection((host, int(port)), timeout=10)
+    c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    threading.Thread(target=pipe, args=(c, u), daemon=True).start()
+    pipe(u, c)
+srv = socket.create_server(("0.0.0.0", 3128))
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+'''
+
+_SSH_BANNER = r'''
+import socket
+log = open("/logs/target.log", "a", buffering=1)
+srv = socket.create_server(("0.0.0.0", 22))
+while True:
+    c, _ = srv.accept()
+    c.sendall(b"SSH-2.0-blpl_test\r\n")
+    log.write(c.recv(256).split(b"\r\n")[0].decode(errors="replace") + "\n")
+    c.close()
+'''
+
+
+def test_ssh_from_a_workspace_goes_through_the_connect_proxy(env):
+    """Codex, PR #20: on an internal network, plain ssh has no route out and
+    ignores HTTP_PROXY. The agent's ssh command reaches a remote only through
+    the proxy's CONNECT on port 22. The "remote" here sits on a second network
+    that only the proxy joins, and sends an SSH banner and logs the client's.
+    Without the proxy command, ssh cannot even resolve it."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    import time
+
+    from app.sandbox.agent import ssh_command
+
+    logs = env.tmp / "logs"
+    logs.mkdir()
+    os.chmod(env.tmp, 0o755)
+    os.chmod(logs, 0o777)
+    (env.tmp / "proxy.py").write_text(_CONNECT_PROXY)
+    (env.tmp / "banner.py").write_text(_SSH_BANNER)
+    inner, outer = f"blpl-test-ws-{env.tag}", f"blpl-test-out-{env.tag}"
+    proxy, target = f"blpl-test-proxy-{env.tag}", f"blpl-test-ssh-{env.tag}"
+
+    with httpx.Client(transport=httpx.HTTPTransport(uds=SOCK), base_url="http://d/v1.44",
+                      timeout=60) as c:
+        def helper(name, script, networks, port_user="0:0"):
+            r = c.post("/containers/create", params={"name": name}, json={
+                "Image": WORKSPACE_IMAGE, "User": port_user,
+                "Cmd": ["python", f"/scripts/{script}"], "Labels": env.labels(),
+                "HostConfig": {"NetworkMode": networks[0], "Binds": [
+                    f"{env.tmp}:/scripts:ro", f"{logs}:/logs"]}})
+            assert r.status_code == 201, r.text
+            for extra in networks[1:]:
+                assert c.post(f"/networks/{extra}/connect",
+                              json={"Container": name}).status_code == 200
+            assert c.post(f"/containers/{name}/start").status_code == 204
+
+        nets = []
+        try:
+            for n in (inner, outer):
+                r = c.post("/networks/create", json={"Name": n, "Internal": True,
+                                                     "Labels": env.labels()})
+                assert r.status_code == 201, r.text
+                nets.append(n)
+            helper(target, "banner.py", [outer])
+            helper(proxy, "proxy.py", [inner, outer], port_user="1000:1000")
+            time.sleep(1.5)
+            # The proxy by address, as compose's fixed addresses give it: under
+            # gVisor, Docker's embedded DNS answers nothing.
+            proxy_ip = c.get(f"/containers/{proxy}/json").json()[
+                "NetworkSettings"]["Networks"][inner]["IPAddress"]
+
+            async def scenario():
+                driver = DockerDriver(DockerConfig(endpoint=f"unix://{SOCK}",
+                                                   instance=env.instance, network=inner,
+                                                   runtime=RUNTIME,
+                                                   extra_hosts=(f"{proxy}:{proxy_ip}",)))
+                try:
+                    spec = env.spec("ssh")
+                    from dataclasses import replace
+                    spec = replace(spec, key=WorkspaceKey(spec.key.project, role="run",
+                                                          member="ssh-probe"),
+                                   image=WORKSPACE_IMAGE, command=())
+                    results = {}
+                    for label, cmd in (
+                        ("proxied", ssh_command(None, {"HTTPS_PROXY": f"http://{proxy}:3128"})),
+                        ("direct", ssh_command(None, {})),
+                    ):
+                        out: list[bytes] = []
+                        res = await driver.run_container(
+                            spec, ["sh", "-c",
+                                   f"{cmd} -o ConnectTimeout=5 git@{target} true 2>&1; echo rc=$?"],
+                            on_output=lambda s, b: out.append(b))
+                        results[label] = (res.exit_code, b"".join(out).decode(errors="replace"))
+                    return results
+                finally:
+                    await driver.aclose()
+
+            results = asyncio.run(scenario())
+        finally:
+            for name in (proxy, target):
+                c.delete(f"/containers/{name}", params={"force": "1"})
+            for n in nets:
+                c.delete(f"/networks/{n}")
+
+    proxied_text = results["proxied"][1]
+    proxy_log = (logs / "proxy.log").read_text() if (logs / "proxy.log").exists() else ""
+    target_log = (logs / "target.log").read_text() if (logs / "target.log").exists() else ""
+    assert f"CONNECT {target}:22" in proxy_log, (proxy_log, proxied_text)
+    assert target_log.startswith("SSH-2.0-OpenSSH"), (target_log, proxied_text)
+    # The control: with no proxy command, the remote is not even reachable.
+    assert "rc=0" not in results["direct"][1]
+    assert proxy_log.count("CONNECT") == 1, proxy_log  # only the proxied attempt
