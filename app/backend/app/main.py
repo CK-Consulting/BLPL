@@ -3965,10 +3965,19 @@ def _schedule_autopush(
 
     # Numbered now, in the request's transaction, so the response can hand
     # the number to the client, which waits for the result recorded with it.
+    # The number is durable exactly when the response carrying it is sent:
+    # both depend on this transaction committing. If it rolls back instead
+    # (the commit on disk happened anyway, so the push still runs), the
+    # number goes with it and the push is renumbered below, in a transaction
+    # of its own — recording it under the rolled-back number set
+    # last_push_seq ahead of push_requested, the next save was handed the
+    # same number, and its wait was satisfied by this old result (Codex,
+    # PR #19).
     seq = autopush.request(session, project_id, user_id)
+    numbered = {"seq": seq}
 
     def record(error: str | None) -> None:
-        autopush.record_now(project_id, user_id, error, seq=seq)
+        autopush.record_now(project_id, user_id, error, seq=numbered["seq"])
 
     try:
         url = projects.remote_of(name, operation="push", checkout=checkout)
@@ -4004,8 +4013,22 @@ def _schedule_autopush(
             submitted = True
             AUTOPUSH.submit(job)
 
+    def submit_after_rollback(*_args) -> None:
+        if submitted:
+            return
+        # A number nobody else can hold: drawn and committed on its own, now
+        # that the rolled-back transaction (and, on SQLite, its lock) is gone.
+        # No client was told the old one — the request failed — so nothing
+        # waits for it.
+        try:
+            numbered["seq"] = autopush.request_now(project_id, user_id)
+        except Exception:  # noqa: BLE001 — the push still runs, unnumbered
+            logger.exception("could not renumber the automatic push of %s", name)
+            numbered["seq"] = None
+        submit()
+
     sa_event.listen(session, "after_commit", submit, once=True)
-    sa_event.listen(session, "after_rollback", submit, once=True)
+    sa_event.listen(session, "after_rollback", submit_after_rollback, once=True)
     return seq
 
 

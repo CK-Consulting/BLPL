@@ -733,3 +733,40 @@ def test_last_push_seq_never_moves_backwards(unlocked):
         s.commit()
         s.refresh(m)
         assert m.last_push_seq == 4
+
+
+def test_a_rolled_back_requests_push_never_shares_a_number_with_the_next(unlocked, pushes):
+    """Codex P2 on #19. The tree was committed but the request's transaction
+    rolled back: its push still ran, recorded under the number drawn inside
+    the rolled-back transaction, so last_push_seq ran ahead of
+    push_requested, the next save was handed that same number, and the
+    client's wait for it was satisfied by the old result."""
+    import app.db
+    import app.main as main
+    from sqlalchemy import select
+
+    from app.models import Project, User
+
+    unlocked.post("/api/projects/init", json=init_body("p", remote=bare_remote(), push_policy="auto"))
+    checkout = main.PROJECTS_ROOT / "p"
+
+    # A request that schedules its push and then fails, as a route that
+    # raised after committing would.
+    s = app.db.SessionFactory()
+    user = s.scalar(select(User).where(User.clerk_user_id == "user_test"))
+    project = s.scalar(select(Project).where(Project.name == "p"))
+    drawn = main._schedule_autopush(s, user, project, checkout, None)
+    s.rollback()
+    s.close()
+    assert len(pushes.jobs) == 1, "the commit on disk still gets its push"
+    pushes.run()
+    landed = unlocked.get("/api/projects/p/git/status").json()["last_push"]
+    assert landed["ok"] is True and landed["seq"] >= 1
+
+    nxt = unlocked.put("/api/projects/p/files/next.md", json={"content": "n\n"}).json()["push_seq"]
+    assert nxt > landed["seq"], "the next save was handed a number already answered for"
+    # So the client's wait for it is not satisfied until its own push lands.
+    assert unlocked.get("/api/projects/p/git/status").json()["last_push"]["seq"] < nxt
+    pushes.run()
+    assert unlocked.get("/api/projects/p/git/status").json()["last_push"]["seq"] >= nxt
+    del drawn

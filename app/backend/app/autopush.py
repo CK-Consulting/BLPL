@@ -188,6 +188,17 @@ def request(session: Session, project_id: int, user_id: int) -> int | None:
     return seq
 
 
+def request_now(project_id: int, user_id: int) -> int | None:
+    """``request`` in a transaction of its own, committed at once — a number
+    that is durable whatever happens to any request around it."""
+    from .db import SessionFactory
+
+    with SessionFactory() as s:
+        seq = request(s, project_id, user_id)
+        s.commit()
+        return seq
+
+
 def _expire_member(session: Session, project_id: int, user_id: int) -> None:
     """A membership this session has already loaded must not keep the values
     from before an UPDATE made behind the ORM's back (status reads it)."""
