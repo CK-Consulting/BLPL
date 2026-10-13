@@ -35,6 +35,9 @@ import sys
 from typing import Callable
 
 SEALER_ROOT = "/projects"
+# The blob directory, mounted beside the projects root: blobs no longer live
+# inside it (workspace.sealed_root).
+SEALED_TARGET = "/sealed"
 _KEY_ENV = "BLPL_SEAL_KEY"
 
 
@@ -47,6 +50,7 @@ def _container_main(argv: list[str]) -> int:
         print("usage: sealer.py seal|unseal <project>", file=sys.stderr)
         return 2
     op, project = argv[1], argv[2]
+    os.environ["BLPL_SEALED_ROOT"] = SEALED_TARGET
     raw = os.environ.pop(_KEY_ENV, "")
     try:
         key = base64.urlsafe_b64decode(raw)
@@ -87,6 +91,14 @@ async def run_sealer(driver, cfg, project: str, key: bytes, op: str) -> dict:
     await driver.stop(ws)
     await driver.remove(ws)
 
+    # The blob directory must exist before it is bound: the daemon refuses a
+    # missing bind source. The control plane sees it in both layouts.
+    from .. import workspace
+
+    workspace.sealed_root(cfg.projects_root).mkdir(parents=True, exist_ok=True)
+    sealed_host = (cfg.host_sealed_root
+                   or cfg.host_projects_root.rstrip("/").rsplit("/", 1)[0] + "/sealed")
+
     # Not spec_for: the project's directory does not exist while it is
     # sealed, and the sealer mounts the projects root, not the project.
     spec = WorkspaceSpec(
@@ -98,6 +110,7 @@ async def run_sealer(driver, cfg, project: str, key: bytes, op: str) -> dict:
         # share the seal's flock between two sealer sandboxes.
         image=cfg.image,
         storage=Mount(kind="bind", source=cfg.host_projects_root, target=SEALER_ROOT),
+        extra_storage=(Mount(kind="bind", source=sealed_host, target=SEALED_TARGET),),
         resources=cfg.resources,
     )
     out: list[bytes] = []

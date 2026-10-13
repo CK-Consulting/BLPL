@@ -140,6 +140,7 @@ async def _lifespan(_app: FastAPI):
         logger.warning("!" * 72)
         logger.warning("PROJECT MOUNT: %s", mount_warning)
         logger.warning("!" * 72)
+    _migrate_sealed_blobs()
     key_path = serverkey.key_path(_DATA)
     existed = serverkey.load(_DATA) is not None
     serverkey.load_or_create(_DATA)
@@ -157,6 +158,27 @@ async def _lifespan(_app: FastAPI):
         yield
     finally:
         sweeper.cancel()
+
+
+def _migrate_sealed_blobs() -> None:
+    """Move blobs out of projects/.sealed, where a backend with the mount can.
+
+    A mountless backend cannot see the old location, so it leaves this to the
+    worker, which does the same at its start, or to an operator running
+    ``python -m app.workspace migrate-sealed`` before switching layouts."""
+    if workspace_files.mount_absent():
+        return
+    try:
+        m = workspace.migrate_sealed(PROJECTS_ROOT)
+    except (OSError, workspace.WorkspaceError):
+        logger.exception("could not move sealed projects to %s", workspace.sealed_root(PROJECTS_ROOT))
+        return
+    if m.moved:
+        logger.info("moved %d sealed project(s) to %s", len(m.moved), workspace.sealed_root(PROJECTS_ROOT))
+    for name in m.conflicts:
+        logger.error("sealed project %s has two different blobs; the one in %s is used, "
+                     "the other is kept in %s", name, workspace.sealed_root(PROJECTS_ROOT),
+                     PROJECTS_ROOT / workspace.SEALED_DIR)
 
 
 def _server_key() -> bytes:
@@ -1678,8 +1700,12 @@ def list_projects(
     for project in projectacl.visible(session, user):
         d = PROJECTS_ROOT / project.name
         sealed = workspace.is_sealed(PROJECTS_ROOT, project.name)
-        if not d.is_dir() and not sealed:
+        # Without the project mount nothing here can be read, so an unsealed
+        # project is listed with its details unknown rather than dropped.
+        unseen = not sealed and workspace_files.mount_absent()
+        if not d.is_dir() and not sealed and not unseen:
             continue  # registered but no working copy; not this endpoint's problem
+        unknown = sealed or unseen
         pipeline = d / ".pipeline"
         out.append(
             {
@@ -1690,11 +1716,11 @@ def list_projects(
                 # is reported as unknown rather than as absent: reading these
                 # would mean decrypting, which is exactly what has not happened.
                 "sealed": sealed,
-                "markdown_files": None if sealed else len(list(d.glob("*.md"))),
-                "has_schematic": None if sealed else _latest(pipeline, ".kicad_sch") is not None,
-                "has_pcb": None if sealed else _latest(pipeline, ".kicad_pcb") is not None,
-                "is_git": None if sealed else (d / ".git").is_dir(),
-                "fab": None if sealed else _fab_readiness(pipeline),
+                "markdown_files": None if unknown else len(list(d.glob("*.md"))),
+                "has_schematic": None if unknown else _latest(pipeline, ".kicad_sch") is not None,
+                "has_pcb": None if unknown else _latest(pipeline, ".kicad_pcb") is not None,
+                "is_git": None if unknown else (d / ".git").is_dir(),
+                "fab": None if unknown else _fab_readiness(pipeline),
                 "owned": project.owner_id == user.id,
                 "shared_with": len(project.members) - 1,
             }

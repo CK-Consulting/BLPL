@@ -138,7 +138,8 @@ def test_proxy_accepts_the_phase2_spec(tmp_path):
     f"{HOST}/.worktrees/victim",       # another project's worktrees
     HOST,                              # every project
     f"{HOST}/.worktrees",              # every member's worktree
-    f"{HOST}/.sealed",                 # the sealed blobs
+    f"{HOST}/.sealed",                 # the old blob directory
+    "/srv/blpl/app/data/sealed",       # the sealed blobs
     f"{HOST}/pathfinder/.git",         # a subdirectory, not the project
     "/srv/blpl/app/data",              # server.key's directory
     "/srv/blpl/app/data/modules",      # a library, writable

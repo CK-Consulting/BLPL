@@ -766,12 +766,14 @@ def test_phase4_sealing_in_a_sealer_container_leaves_no_plaintext(env):
     policy = ProxyPolicy(
         verify_paths=True,
         instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
-        project_bind_roots=(str(projects),),
+        project_bind_roots=(str(projects),), sealed_roots=(str(env.tmp / "sealed"),),
         runtimes=frozenset({RUNTIME} if RUNTIME else set()),
         allow_default_runtime=RUNTIME is None,
     )
     cfg = WorkspaceRunConfig(image=WORKSPACE_IMAGE, projects_root=projects,
                              host_projects_root=str(projects))
+    blob = env.tmp / "sealed" / f"{project}.blob"
+    legacy = projects / ".sealed" / f"{project}.blob"
 
     def plaintext_left() -> list[str]:
         hits = []
@@ -791,18 +793,23 @@ def test_phase4_sealing_in_a_sealer_container_leaves_no_plaintext(env):
             out = await sealer.run_sealer(driver, cfg, project, key, "seal")
             assert out["ok"] and out["sealed_bytes"] > 0
             assert (await driver.status(ws.key)).state is State.ABSENT  # workspace gone
-            assert (projects / ".sealed" / f"{project}.blob").is_file()
+            # Beside the projects directory, where a backend without the
+            # project mount can still see it; nothing in the old place.
+            assert blob.is_file() and not legacy.exists()
             assert not proj.exists() and not (projects / ".worktrees" / project).exists()
             assert plaintext_left() == [], plaintext_left()
 
             with pytest.raises(sealer.SealError):
                 await sealer.run_sealer(driver, cfg, project, secrets.token_bytes(32), "unseal")
-            assert (projects / ".sealed" / f"{project}.blob").is_file()  # untouched
+            assert blob.is_file()  # untouched
 
+            # A blob an older version left inside the projects directory is
+            # still opened from there until it is migrated.
+            os.replace(blob, legacy)
             await sealer.run_sealer(driver, cfg, project, key, "unseal")
             assert marker in (proj / "design.md").read_bytes()
             assert (projects / ".worktrees" / project / "u9" / "notes.md").read_bytes() == marker
-            assert not (projects / ".sealed" / f"{project}.blob").exists()
+            assert not blob.exists() and not legacy.exists()
         finally:
             await driver.aclose()
             await upstream.aclose()

@@ -17,6 +17,7 @@ from app.sandbox.policy import ProxyPolicy, Refused
 from app.sandbox.proxy import DockerProxy, Request
 
 HOST = "/srv/blpl/app/data/projects"
+SEALED = "/srv/blpl/app/data/sealed"
 KEY = bytes(range(32))
 
 
@@ -40,6 +41,10 @@ def test_the_workspace_goes_first_and_the_key_only_to_the_sealer(tmp_path):
     (spec,) = d.run_specs
     assert spec.key.role == "sealer" and spec.key.container_name().startswith("blpl-seal-")
     assert (spec.storage.source, spec.storage.target) == (HOST, "/projects")
+    # The blobs are beside the projects, not in them, and the sealer gets both.
+    assert [(m.source, m.target, m.read_only) for m in spec.extra_storage] == [
+        (HOST.rsplit("/", 1)[0] + "/sealed", "/sealed", False)]
+    assert (tmp_path / "sealed").is_dir()
     assert spec.libraries == () and spec.agent_dir is None and spec.env == {}
     call = d.calls[0]
     assert call.argv == ["python", "/opt/blpl/wsagent/sealer.py", "seal", "board"]
@@ -76,7 +81,8 @@ class _Up:
 
 def _decide(body, name):
     policy = ProxyPolicy(images=frozenset({"blpl-workspace:dev"}),
-                         networks=frozenset({"blpl-egress"}), project_bind_roots=(HOST,))
+                         networks=frozenset({"blpl-egress"}), project_bind_roots=(HOST,),
+                         sealed_roots=(SEALED,))
     return asyncio.run(DockerProxy(policy, _Up()).decide(
         Request("POST", "/containers/create", {"name": name}, json.dumps(body).encode())))
 
@@ -88,7 +94,8 @@ def _sealer_body(tmp_path):
     spec = replace(_ws_spec(tmp_path),
                    key=WorkspaceKey("board", role="sealer", member="s1"),
                    storage=Mount(kind="bind", source=HOST, target="/projects"),
-                   extra_storage=(), libraries=())
+                   extra_storage=(Mount(kind="bind", source=SEALED, target="/sealed"),),
+                   libraries=())
     return spec, build_create_body(spec, DockerConfig(network="blpl-egress"))
 
 
@@ -109,6 +116,23 @@ def test_only_a_sealer_may_mount_the_projects_root(tmp_path):
 def test_a_sealer_mounts_nothing_else_that_way(tmp_path, source, target):
     spec, body = _sealer_body(tmp_path)
     m = next(m for m in body["HostConfig"]["Mounts"] if m["Target"] == "/projects")
+    m["Source"], m["Target"] = source, target
+    with pytest.raises(Refused):
+        _decide(body, spec.key.container_name())
+
+
+def test_only_a_sealer_may_mount_the_blob_directory(tmp_path):
+    spec, body = _sealer_body(tmp_path)
+    body["Labels"]["blpl.role"] = "workspace"
+    with pytest.raises(Refused):
+        _decide(body, "blpl-ws-board-0123456789")
+
+
+@pytest.mark.parametrize("source, target", [(SEALED, "/elsewhere"), (SEALED + "/x", "/sealed"),
+                                            ("/srv/blpl/app/data", "/sealed")])
+def test_a_sealer_mounts_the_blob_directory_only_as_itself(tmp_path, source, target):
+    spec, body = _sealer_body(tmp_path)
+    m = next(m for m in body["HostConfig"]["Mounts"] if m["Target"] == "/sealed")
     m["Source"], m["Target"] = source, target
     with pytest.raises(Refused):
         _decide(body, spec.key.container_name())
