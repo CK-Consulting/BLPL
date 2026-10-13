@@ -418,3 +418,87 @@ def test_a_scanner_the_workspace_cannot_reach_makes_it_hold_rather_than_release(
 def test_the_remote_policy_reaches_the_agent_that_enforces_it():
     env = jobs.workspace_env({"BLPL_GIT_ALLOWED_PROTOCOLS": "https"})
     assert env["BLPL_GIT_ALLOWED_PROTOCOLS"] == "https"
+
+
+# -- a monitor that fails stops its run (Codex, PR #20) -------------------------------
+
+
+@pytest.mark.parametrize("failing", ["mark", "poll"])
+def test_a_run_container_is_stopped_when_monitoring_fails(tmp_path, failing):
+    """Mark renewal or a poll raising mid-run: the container is gone before
+    the call returns, and the mark is cleared only after that."""
+    async def forever(call):
+        await asyncio.Event().wait()
+
+    d = FakeDriver(script=forever)
+    events: list[str] = []
+    marks = {"n": 0}
+
+    async def mark(active, ttl):
+        if active:
+            marks["n"] += 1
+            if failing == "mark" and marks["n"] > 1:
+                raise RuntimeError("agent unreachable")
+        else:
+            events.append("unmark" + ("" if d.boxes else ":container-gone"))
+
+    async def poll():
+        if failing == "poll":
+            raise RuntimeError("database gone")
+        return "running"
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(asyncio.wait_for(jobs.run_job_in_container(
+            d, cfg(tmp_path), project_name="pathfinder", run_id="r", cmd=["x"], env={},
+            log=lambda s: None, poll=poll, mark=mark, poll_every=0.05), timeout=5))
+    assert d.calls[0].cancelled and ("stop", d.run_specs[0].key) in d.ops
+    assert d.boxes == {}
+    assert events == ["unmark:container-gone"]
+
+
+def test_a_workspace_run_is_stopped_when_polling_fails(tmp_path):
+    async def forever(call):
+        await asyncio.Event().wait()
+
+    d = FakeDriver(script=forever)
+
+    async def poll():
+        raise RuntimeError("database gone")
+
+    async def go():
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(jobs.run_job(
+                d, cfg(tmp_path), project_name="pathfinder", cmd=["x"], env={},
+                log=lambda s: None, poll=poll, poll_every=0.05), timeout=5)
+        # Before the loop shuts down, which would cancel a leftover anyway.
+        assert d.calls and d.calls[-1].cancelled
+
+    asyncio.run(go())
+
+
+def test_an_agent_run_is_cancelled_when_following_it_fails():
+    calls = []
+
+    class Client:
+        def run_start(self, cmd, env, workdir, run_id):
+            return "r1"
+
+        def run_read(self, rid, offset):
+            raise ConnectionError("agent went away")
+
+        def run_cancel(self, rid):
+            calls.append(("cancel", rid))
+
+        def close(self):
+            calls.append(("close",))
+
+    async def connect():
+        return Client()
+
+    async def poll():
+        return "running"
+
+    with pytest.raises(ConnectionError):
+        asyncio.run(jobs.run_job_via_agent(connect, cmd=["x"], env={}, log=lambda s: None,
+                                           poll=poll, run_id="r1"))
+    assert calls == [("cancel", "r1"), ("close",)]
