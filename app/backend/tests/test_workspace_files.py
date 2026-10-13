@@ -468,3 +468,62 @@ def test_a_push_through_the_agent_carries_its_own_egress_credential(client, via_
     assert seen and seen[-1]["HTTPS_PROXY"].startswith("http://g-")
     assert seen[-1]["HTTPS_PROXY"].endswith("@squid:3128")
     assert len(revoked) == 1
+
+
+@pytest.mark.parametrize("mountless", [True, False])
+def test_an_open_project_survives_a_restart_and_is_sealed_when_idle(client, monkeypatch,
+                                                                    mountless):
+    """The backend restarts with a project open. Its key comes back from the
+    database, with or without the project mount, and the idle sweep then
+    seals the project through the sealer (Codex, PR #20)."""
+    from datetime import timedelta
+
+    import app.main as main
+    import app.workspace_files as wf
+    from app import workspace
+    from app.db import SessionFactory
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    client.put("/api/projects/scratch/files/design.md", json={"content": "# d\n"})
+    key = main.workspaces.key_for("scratch")
+    assert key is not None
+    root = main.PROJECTS_ROOT
+    host = root.parent / "projects-host" if mountless else root
+    monkeypatch.setattr(wf, "seal", lambda project, k: workspace.seal(host, project, k))
+
+    # The restart: the in-memory registry is gone, and without the mount the
+    # backend's view of the projects is an empty directory.
+    main.workspaces.forget("scratch")
+    if mountless:
+        root.rename(host)
+        root.mkdir()
+        monkeypatch.setenv("BLPL_PROJECT_MOUNT", "absent")
+    main._restore_open_workspaces()
+    assert main.workspaces.key_for("scratch") == key
+
+    idle = [w.workspace for w in main.workspaces.idle(timedelta(0))]
+    assert idle == ["scratch"]
+    with SessionFactory() as session:
+        assert main._seal_workspace(session, "scratch") is True
+        session.commit()
+    assert workspace.is_sealed(host, "scratch") and not (host / "scratch").exists()
+
+
+def test_opening_an_open_project_gives_back_a_lost_key(client, monkeypatch):
+    """No key in this process and no row for an open project: /open takes the
+    member's own copy, so the project can be sealed again."""
+    import app.main as main
+    from app import openstate
+    from app.db import SessionFactory
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    key = main.workspaces.key_for("scratch")
+    main.workspaces.forget("scratch")
+    with SessionFactory() as session:
+        openstate.forget(session, "scratch")
+        session.commit()
+    r = client.post("/api/projects/scratch/open")
+    assert r.json() == {"ok": True, "already_open": True}
+    assert main.workspaces.key_for("scratch") == key

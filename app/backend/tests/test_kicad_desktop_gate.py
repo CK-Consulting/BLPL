@@ -140,3 +140,18 @@ def test_an_unfinished_profile_is_a_denial_not_a_server_error(client):
 
 def test_signed_out_is_401_so_nginx_sends_them_to_sign_in(client):
     assert client.get("/api/authz/gate").status_code == 401
+
+
+def test_without_the_project_mount_every_project_counts_as_mounted(unlocked, second_user,
+                                                                   monkeypatch):
+    """A backend without the project mount sees an empty directory where the
+    desktop sees every project. Reading that as "nothing mounted" let any
+    signed-in account in (Codex, PR #20)."""
+    _make(unlocked, "alpha")
+    root = main.PROJECTS_ROOT
+    root.rename(root.parent / "projects-host")
+    root.mkdir()  # the mask
+    monkeypatch.setenv("BLPL_FILES_VIA_WORKSPACE", "1")
+    monkeypatch.setenv("BLPL_PROJECT_MOUNT", "absent")
+    assert second_user.get("/api/authz/gate").status_code == 403
+    assert unlocked.get("/api/authz/gate").status_code == 204

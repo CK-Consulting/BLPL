@@ -133,12 +133,24 @@ def forget(session: Session, workspace: str) -> None:
     session.execute(delete(OpenWorkspaceRow).where(OpenWorkspaceRow.workspace == workspace))
 
 
-def restore(session: Session, server_key: bytes, projects_root: Path) -> list[tuple[str, Path, bytes, datetime, set[int]]]:
+def restore(
+    session: Session, server_key: bytes, projects_root: Path, *, sees_projects: bool = True,
+) -> list[tuple[str, Path, bytes, datetime, set[int]]]:
     """Every workspace that was open when the process last stopped.
 
     Rows whose directory is gone are dropped: the workspace was sealed, or
     removed, by something that never got to clear the row, and keeping it would
     have the sweeper try to seal a path that is not there.
+
+    That test needs the directory to be visible. A backend without the project
+    mount (``sees_projects`` false) sees every project as absent through the
+    mask, and dropping on that deleted the only server-side copy of an open
+    project's key: the project stayed plaintext and nothing could seal it
+    again (Codex, PR #20). So without the mount no row is dropped. Each is
+    restored, and the sweeper seals it through the sealer, which sees the
+    real tree. A seal of a project that turns out to be sealed already only
+    finishes what is there (workspace.seal), so restoring too much costs
+    nothing, and dropping too much loses a key.
 
     A row whose key will not unwrap is *kept* and reported as an error. It means
     the server key changed — restoring from a backup with the wrong key file, or
@@ -149,10 +161,15 @@ def restore(session: Session, server_key: bytes, projects_root: Path) -> list[tu
     out: list[tuple[str, Path, bytes, datetime, set[int]]] = []
     for row in session.scalars(select(OpenWorkspaceRow)).all():
         path = Path(row.path)
-        if not path.is_dir():
+        if sees_projects and not path.is_dir():
             logger.info("open workspace %s has no directory; dropping the row", row.workspace)
             session.delete(row)
             continue
+        if not sees_projects:
+            logger.warning(
+                "open workspace %s restored without checking its directory: this backend "
+                "runs without the project mount, so it is kept until the sweeper seals it",
+                row.workspace)
         try:
             key = unwrap(server_key, row.workspace, row.nonce, row.wrapped_key)
         except InvalidTag:
