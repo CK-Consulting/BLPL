@@ -30,6 +30,11 @@ of `core/`, `plugin/` and `app/`**, and a pull request should stay within one of
 them where it can. A change that needs two is two commits, and root files
 (docs, CI, this file) may ride along with either.
 
+That rule has to survive merging. A pull request inside one folder is
+squash-merged as usual. One whose commits span folders — each commit still
+within one — is **rebase-merged**, so the commits land on `main` as they are; a
+squash would fold them into one commit touching several projects.
+
 [docs/architecture.md](docs/architecture.md) and
 [docs/pipeline-stages.md](docs/pipeline-stages.md) are the map.
 

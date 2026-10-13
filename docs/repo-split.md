@@ -306,7 +306,9 @@ Two reasonable ends, to be chosen at the split:
   against exactly those pins. That is the place to answer "which core, plugin
   and app make up this release".
 
-One caution for landing this layout on `main`: the repository merges by squash.
-The split itself does not care — filter-repo selects by path, so each project
-gets its own slice of a squashed commit — but the per-folder commit history of
-the restructuring is only kept if the branch lands as-is.
+Landing on `main`: a pull request inside one folder is squash-merged; one whose
+commits span folders (each commit still within one) is rebase-merged, so the
+commits land as they are. The split itself would cope with a squashed commit —
+filter-repo selects by path, so each project gets its own slice — but the
+one-project-per-commit history, and so a clean split, is only kept this way.
+The `main` ruleset allows both methods for that reason.
