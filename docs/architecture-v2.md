@@ -1,8 +1,14 @@
 # Architecture v2: a control plane and per-project workspaces
 
-Status: **agreed shape; phases 1 to 3 built**. Phase 2 is behind
-`BLPL_RUNS_IN_WORKSPACE=1` and phase 3 behind `BLPL_FILES_VIA_WORKSPACE=1`, both
-off by default. The pipeline's own architecture (stages,
+Status: **agreed shape; phases 1 to 4 built, each behind a flag that is off
+by default**:
+- phase 2: `BLPL_RUNS_IN_WORKSPACE=1`;
+- phase 3: `BLPL_FILES_VIA_WORKSPACE=1`;
+- phase 4: `BLPL_PROJECT_MOUNT=absent`, `BLPL_RUNS_IN_CONTAINER=1`,
+  `BLPL_STORAGE=btrfs`.
+
+Per-project storage is built but cannot be switched on yet: it needs quotas
+enabled on the filesystem and a migration that is not written. The pipeline's own architecture (stages,
 schemas, package layout) is still [architecture.md](architecture.md). This
 document covers how the app is deployed around the pipeline and where the trust
 boundary sits. It supersedes the deployment parts of [terminal.md](terminal.md):
@@ -507,10 +513,10 @@ provides.
 | **Secrets in the run environment.** Runs get a copy of the backend's whole environment. | `run_env` allowlist in the worker | Phase 2: runs execute in a workspace whose container has no service secret. The run's environment is `runpath.run_env()` plus per-operation injection, and `/proc/<worker>/environ` and `server.key` are not in its mount namespace. |
 | **Symlink escape via pull.** A committed link makes a stage write into another project or `server.key`. | refuse links that leave the checkout after clone/pull | Phase 2 (built): a workspace mounts only its own project and its worktrees, plus `data/modules` read-only, so a link to a sibling project or `server.key` resolves to nothing. The integration test commits such a link and checks. Phase 3: the agent's file API opens with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`. |
 | **Uninspected PDFs served inline.** Any `.pdf` outside `retrieved/` is served `application/pdf`, inline. | trust by content hash (`pdf_verdict` table), not path | Phase 3 (built, part): blobs are read through the agent, so a link cannot make the route serve a file outside the checkout, and uploads are inspected and scanned in the workspace. Disposition is still decided by path and suffix, as before. The `pdf_verdict` table that decides by content hash is the phase 0 fix, and is not built. |
-| **Writes allowed during runs.** The editor, uploads, pull and agent tools write a checkout with a run in flight. | refuse in `worktree_write` while a run is in flight | Phase 3 (built): the agent knows when a run is active, and refuses every write it is asked for (files, uploads, commit, pull) except under `.blpl/` while one is, so a new route cannot forget the check. This covers writes that go through the agent. Delete, move and the chat agent's own tools still write through the backend's mount until phase 4 moves them. |
-| **Component commits sweep in unrelated changes.** `attach`/`update`/`detach` commit the whole index. | `git commit -- .gitmodules <path>`, and `snapshot` uses a temporary index | Not closed by phase 3: the component routes still run git on the backend's mount. Phase 4 moves them to an agent verb, `git_commit(paths=[...])`, which commits only the declared paths, so a bare commit is not expressible. |
-| **Detach removes the wrong module store.** `rmtree(<checkout>/.git/modules/…)` misses in a worktree and hits the shared store in the owner's checkout. | resolve via `git rev-parse --git-common-dir`, and remove only when no other worktree has the submodule initialised | Phase 4: the removal becomes an agent verb that does exactly that, inside the project's own storage, with a pre-operation btrfs snapshot that makes it undoable. Not moved in phase 3. |
-| **Provenance rewrites the index.** `git status` in a run refreshes `libraries/`'s index. | `--no-optional-locks` | Phase 3 (built): every run the agent starts has `GIT_OPTIONAL_LOCKS=0`, the environment form of `--no-optional-locks`, so no git reader in a run refreshes an index. A read-only `.git` for runs needs a container per run, which is phase 4. |
+| **Writes allowed during runs.** The editor, uploads, pull and agent tools write a checkout with a run in flight. | refuse in `worktree_write` while a run is in flight | Phases 3 and 4 (built): the agent refuses every write it is asked for (files, uploads, commit, pull, delete, move, ignore list) except under `.blpl/` while a run is active. That covers its own runs and, through `/runs/mark`, runs in containers of their own, whose marks expire if not renewed. The chat agent's tools and the component routes still write through the backend's mount (see what is left after phase 4). |
+| **Component commits sweep in unrelated changes.** `attach`/`update`/`detach` commit the whole index. | `git commit -- .gitmodules <path>` | Phase 4 (built, both modes): each commits with a pathspec of exactly what it changed. A test stages an unrelated file and shows it stays out, and fails against the previous code. |
+| **Detach removes the wrong module store.** `rmtree(<checkout>/.git/modules/…)` misses in a worktree. | resolve the store through git | Phase 4 (built, both modes): detach removes `<git-dir>/modules/<path>`, with the git dir from `rev-parse --absolute-git-dir`. The plan also feared the owner's store was shared with members. Measured with git 2.47 and 2.55, each worktree initialises its own (`.git/worktrees/<name>/modules`), so it is not shared, and the tests pin that. |
+| **Provenance rewrites the index.** `git status` in a run refreshes `libraries/`'s index. | `--no-optional-locks` | Phase 4 (built): with `BLPL_RUNS_IN_CONTAINER=1`, each run is a container of its own with the project's `.git` bind-mounted read-only. Tested in real containers under runc and runsc: a stage can read `git status`, but `git add` and writing a hook fail, and the index is byte-identical afterwards. Without the overlay the test fails. |
 
 ## Migration
 
@@ -629,20 +635,130 @@ behaviour.
 
   The backend keeps `data/projects` mounted until those move.
 
-**Phase 4: storage with limits, sealing at stop, and the rest of the mount.**
+**Phase 4 (built, behind flags): the rest of the mount, a container per run,
+sealing in a container, storage with limits.**
 
-- The `storage` helper and `BtrfsStorage`: one subvolume and qgroup per
-  project, migrated one project at a time while it is sealed (unseal into a new
-  subvolume, reseal). The helper also creates member worktrees, which is the
-  last reason `_project_dir` touches the disk.
-- `sweep`'s `on_stopped` hook seals, through a short-lived sealer container
-  given the project key for that one operation.
-- The routes still on the mount move to agent verbs (delete and move with
-  ledger-aware guards in the agent, artifacts, llm-ignore, the chat agent's
-  tools). Then the backend's `data/projects` mount is removed.
-- Runs move to a container per run, sharing the project's storage with `.git`
-  bind-mounted read-only, which closes the provenance issue fully.
-- Pre-run snapshots.
+*Step 1: routes onto agent verbs, and a backend without the project mount.*
+- Through the agent (`workspace_files.py`, `agent.py`):
+  - delete and move, with the quarantine-ledger refusal and the LLM-ignore
+    list's cover/finish/restore done beside the files (`llm_ignore.py` ships
+    in the image), and links out of the project refused;
+  - the ignore list, the ledger view, artifacts and board resolution;
+  - creating a member's worktree (`worktrees.py` ships in the image).
+- Changing a project's remote is done by the agent too (`/git/set_remote`).
+  The origin lock is a flock in the project's git directory, and gVisor keeps
+  file locks inside the sandbox. A remote change made on the host could
+  therefore race a push made through the agent under runsc. With every taker
+  of the lock inside the workspace, the lock means the same on both runtimes.
+  The 64 remote-URL tests pass unchanged through the agent.
+- `BLPL_PROJECT_MOUNT=absent` runs the backend with no project mount. The
+  routes above and phase 3's pass `agent_ready` to `_project_dir`; every other
+  route answers 503, naming the missing mount, instead of reading an empty
+  directory.
+- **Proven:** an audit hook records every open, listing, change or subprocess
+  the backend's own threads make under the projects root. A control step shows
+  it catches a route that still reads the mount. 18 calls across the migrated
+  routes then record nothing. A variant with one stray directory read is
+  caught.
+- Component attach and detach are fixed in both modes (the two live issues
+  below). They still run on the mount, because the user's component library
+  is not mounted into workspaces.
+
+*Step 2: a container per run* (`BLPL_RUNS_IN_CONTAINER=1`).
+- Each run is a fresh container (role `run`) with the workspace's storage and
+  libraries and the project's `.git` read-only. One overlay covers every
+  worktree, since their git directories live inside the project's.
+- Cancel stops the container, so every process in it dies.
+- The worker marks the run on the workspace's agent, so writes still wait for
+  it.
+
+*Step 3: sealing in a sealer container.*
+- With the agent on, every seal and unseal stops and removes the project's
+  workspace first, then runs `workspace.seal`/`unseal` (the backend's own
+  functions) in a sealer container that gets the key for one operation.
+- The backend runs the workspace idle sweep, because it holds the keys, and
+  seals what the sweep stops (`on_stopped`).
+- Tested in real containers: after a seal, a marker string from the project
+  and a member's worktree is in no file under the projects root, and the
+  workspace container is gone.
+- The sealer mounts the projects root, because sealing renames the project
+  directory. The proxy allows that for the sealer role only.
+
+*Step 4: per-project btrfs storage* (`sandbox/btrfs.py`), built and not
+enabled.
+- Projects get a subvolume each, with a qgroup limit, usage from the qgroup,
+  read-only snapshots (the last five kept) and restore by snapshot-and-swap.
+- All of it sits behind `StorageHelper`. That is a socket service in its own
+  container (compose profile `storage`), the only one with `CAP_SYS_ADMIN`.
+  It takes a project name and a verb and never a path.
+- With `BLPL_STORAGE=btrfs`, a run in a container is preceded by a snapshot,
+  and a run whose snapshot fails does not start.
+- Tested against a fake runner that models subvolumes. A real-filesystem test
+  runs where `BLPL_TEST_BTRFS_ROOT` points at a btrfs path with quotas on;
+  here it skips and says why.
+
+**Turning on per-project storage: what the user must decide and run**
+
+The filesystem holding `app/data` is `/home/shaun/devspace`: btrfs, subvolid 5,
+`compress=zstd:3`. Quotas are not enabled on it (kernel 7.2, btrfs-progs 7.1).
+Two commands, in this order, both needing root:
+
+```bash
+# 1. Quotas. "Simple" quotas (kernel ≥ 6.7) account each extent to the
+#    subvolume that wrote it and need no backref walks: much cheaper, at the
+#    price of not re-attributing shared extents (a snapshot's blocks stay
+#    charged to the original). Right for per-project limits.
+sudo btrfs quota enable --simple /home/shaun/devspace
+#    The alternative is full qgroups, which charge shared extents precisely
+#    but cost more (below):
+#    sudo btrfs quota enable /home/shaun/devspace && sudo btrfs quota rescan -w /home/shaun/devspace
+
+# 2. Later, once migration exists (not yet): bring up the helper.
+#    docker compose --profile storage up -d storage-helper   # and BLPL_STORAGE=btrfs in app/.env
+```
+
+What enabling full qgroups costs on a busy filesystem:
+- Enabling starts a rescan of every extent. On a large filesystem that is
+  minutes to hours of read I/O, and accounting is wrong until it finishes.
+- From then on, every transaction commit does qgroup accounting, and its cost
+  grows with the number of snapshots that share extents. Deleting a snapshot
+  and running balance become noticeably slower: this is btrfs's best-known
+  quota performance problem.
+- Simple quotas avoid the rescan and most of the per-commit work, which is why
+  they are recommended here. Either kind is undone with
+  `sudo btrfs quota disable /home/shaun/devspace`, which drops all accounting
+  and limits.
+
+**Do not set `BLPL_STORAGE=btrfs` yet.** Existing projects are plain
+directories. The helper refuses to take one over, and a snapshot of a plain
+directory fails, so runs would be refused. Enabling quotas alone is harmless.
+
+**What is left after phase 4**
+- **Migration into subvolumes:** a sealed project unsealed into a fresh
+  subvolume. `workspace._unseal` renames a staged directory into place, which
+  cannot replace a subvolume.
+- **Worktrees inside the project's quota:** `.worktrees/<P>` should be a second
+  subvolume grouped with the project's under one level-1 qgroup, or should move
+  inside the project directory. Today they sit outside the project subvolume.
+- **Creating new projects as subvolumes,** through the helper.
+- **Routes still on the mount**, which is why `BLPL_PROJECT_MOUNT=absent`
+  answers 503 for them:
+  - the design, preflight, boards and board config views;
+  - release (the zip and the latest manifest);
+  - modules and lifecycle;
+  - proposals and conversations, and the chat agent's tools
+    (`agent/registry.py`, `kicad_bridge`);
+  - components (they need the user's component library mounted read-only into
+    the workspace);
+  - KiCad open;
+  - project create, clone and import;
+  - members removal (worktree removal).
+- **The sealed state:** `.sealed/` lives under the projects root, so a
+  mountless backend's sealed check (a stat) cannot see it. The blobs, which
+  are ciphertext only, should move to a directory of their own that the
+  backend may mount.
+- **The PDF verdict table** (phase 0). Blob disposition still goes by path and
+  suffix.
 
 **Phase 5: terminal and desktops.**
 
