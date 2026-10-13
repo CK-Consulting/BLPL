@@ -10,6 +10,7 @@ import {
 } from "../api";
 import { PasskeyInfo, enrolPasskey, passkeysAvailable } from "../passkey";
 import { CommitIdentitySettings } from "./GitSetup";
+import { NetworkAccess } from "./NetworkAccess";
 
 /**
  * Where you declare *where* requests go and *which job* each endpoint serves.
@@ -25,7 +26,7 @@ import { CommitIdentitySettings } from "./GitSetup";
  * model, and datasheet extraction must be able to see."
  */
 
-type SectionId = "endpoints" | "routing" | "git" | "identity" | "security";
+type SectionId = "endpoints" | "routing" | "git" | "identity" | "security" | "admin";
 
 // Labels say what the section holds, not the mechanism inside it — "Data
 // security" rather than "Passkeys" because you go looking for where the lock
@@ -38,6 +39,11 @@ const SECTIONS: { id: SectionId; label: string }[] = [
   { id: "identity", label: "Commit identity" },
   { id: "security", label: "Data security" },
 ];
+
+const ADMIN_SECTION: { id: SectionId; label: string } = {
+  id: "admin",
+  label: "Admin — Network access",
+};
 
 export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const [data, setData] = useState<SettingsData | null>(null);
@@ -65,7 +71,9 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
               settings are looked up by name, and a name you cannot see is a
               feature you do not have. */}
           <div className="seg small settings-tabs">
-            {SECTIONS.map((s) => (
+            {/* Admin appears only for an administrator (BLPL_ADMIN_EMAILS).
+                Hiding it is presentation; the routes refuse anyone else. */}
+            {[...SECTIONS, ...(data.is_admin ? [ADMIN_SECTION] : [])].map((s) => (
               <button
                 key={s.id}
                 className={tab === s.id ? "on" : ""}
@@ -105,6 +113,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
           {tab === "git" && <GitEndpoints onError={setError} />}
           {tab === "identity" && <CommitIdentitySettings onError={setError} />}
           {tab === "security" && <Passkeys onError={setError} />}
+          {tab === "admin" && data.is_admin && <NetworkAccess onError={setError} />}
         </div>
       </div>
     </div>
