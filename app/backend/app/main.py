@@ -2350,14 +2350,13 @@ def open_project(
             status_code=409,
             detail="you have no key for this project; ask its owner to re-share it",
         )
+    sealer_errors = workspace_files.seal_errors() if workspace_files.enabled() else ()
     try:
         if workspace_files.enabled():
             workspace_files.unseal(project_id, project_key)
         else:
             workspace.unseal(PROJECTS_ROOT, project_id, project_key)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001 — WorkspaceError, or the sealer's
+    except (workspace.WorkspaceError, *sealer_errors) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
     _note_workspace_open(session, project_id, PROJECTS_ROOT / project_id, project_key, user.id)
@@ -2413,14 +2412,17 @@ def _seal_workspace(session: Session, project_id: str) -> bool:
         )
         if busy is not None:
             return False
+    # With workspaces behind the agent (phase 4), in a sealer container, after
+    # the workspace is stopped and removed, so no container is left holding the
+    # plaintext. Its failures are caught here as WorkspaceError's are; with the
+    # flag off nothing else is.
+    sealer_errors = workspace_files.seal_errors() if workspace_files.enabled() else ()
     try:
         if workspace_files.enabled():
-            # Phase 4: in a sealer container, after the workspace is stopped
-            # and removed, so no container is left holding the plaintext.
             size = workspace_files.seal(project_id, key)
         else:
             size = workspace.seal(PROJECTS_ROOT, project_id, key)
-    except Exception as exc:  # noqa: BLE001 — WorkspaceError, or the sealer's
+    except (workspace.WorkspaceError, *sealer_errors) as exc:
         logger.warning("could not seal %s: %s", project_id, exc)
         return False
     workspaces.forget(project_id)

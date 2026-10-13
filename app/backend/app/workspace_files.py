@@ -524,6 +524,16 @@ def read_artifact(checkout: Path, name: str) -> bytes | None:
 # -- phase 4: sealing in a sealer container ---------------------------------------
 
 
+def seal_errors() -> tuple[type[BaseException], ...]:
+    """What a seal or unseal through a sealer container can fail with, as the
+    routes treat a WorkspaceError: the sealer's own refusal, and the driver
+    failing to run it."""
+    from .sandbox.driver import DriverError
+    from .sandbox.sealer import SealError
+
+    return (SealError, DriverError)
+
+
 def seal(project: str, key: bytes) -> int:
     """workspace.seal, in a sealer container: the backend needs no mount."""
     from .sandbox.sealer import run_sealer
