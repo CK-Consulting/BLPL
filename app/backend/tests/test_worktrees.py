@@ -18,7 +18,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from conftest import sign_in
+from conftest import sign_in, init_body
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -36,7 +36,7 @@ def test_the_owner_keeps_the_repository_directory(unlocked, tmp_path):
     move every project already on disk. The owner's checkout stays put."""
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.put("/api/projects/mine/files/a.md", json={"content": "owner\n"})
 
     assert (main.PROJECTS_ROOT / "mine" / "a.md").read_text() == "owner\n"
@@ -45,7 +45,7 @@ def test_the_owner_keeps_the_repository_directory(unlocked, tmp_path):
 def test_a_member_gets_their_own_checkout(unlocked, second_user):
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _share(unlocked, second_user)
 
     second_user.get("/api/projects/mine/files")  # first touch creates it
@@ -57,7 +57,7 @@ def test_a_member_gets_their_own_checkout(unlocked, second_user):
 
 def test_edits_do_not_land_in_each_others_files(unlocked, second_user):
     """The property the lock was standing in for."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _share(unlocked, second_user)
 
     unlocked.put("/api/projects/mine/files/notes.md", json={"content": "mine\n"})
@@ -72,7 +72,7 @@ def test_two_members_can_both_have_a_run_in_flight(unlocked, second_user):
     directories now, so there is nothing to serialise."""
     from conftest import enqueue_only
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _share(unlocked, second_user)
 
     enqueue_only(unlocked, "/api/projects/mine/stages/doctor")
@@ -88,7 +88,7 @@ def test_one_person_still_cannot_race_themselves(unlocked):
     same .pipeline/ files."""
     from conftest import enqueue_only
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     enqueue_only(unlocked, "/api/projects/mine/stages/doctor")
 
     second = unlocked.post("/api/projects/mine/stages/stage2")
@@ -102,7 +102,7 @@ def test_losing_access_removes_the_checkout_but_keeps_the_branch(unlocked, secon
 
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _share(unlocked, second_user)
     second_user.put("/api/projects/mine/files/theirs.md", json={"content": "work\n"})
 
@@ -124,7 +124,7 @@ def test_losing_access_removes_the_checkout_but_keeps_the_branch(unlocked, secon
 def test_a_worktree_is_not_listed_as_a_project(unlocked, second_user):
     """They live under a dotted directory precisely so every listing that walks
     the projects root and skips dotfiles keeps working."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _share(unlocked, second_user)
     second_user.get("/api/projects/mine/files")
 
@@ -140,7 +140,7 @@ def test_a_new_project_has_a_commit_to_branch_from(unlocked):
 
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "fresh"})
+    unlocked.post("/api/projects/init", json=init_body("fresh"))
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=main.PROJECTS_ROOT / "fresh",
@@ -165,7 +165,7 @@ def test_a_members_save_is_committed_on_their_branch_not_the_owners(unlocked, se
     """
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _share(unlocked, second_user)
     owner_dir = main.PROJECTS_ROOT / "mine"
     (owner_dir / "owner-draft.md").write_text("not ready\n")
@@ -184,7 +184,7 @@ def test_a_members_save_is_committed_on_their_branch_not_the_owners(unlocked, se
 def test_the_commit_button_commits_the_callers_own_checkout(unlocked, second_user):
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _share(unlocked, second_user)
     second_user.get("/api/projects/mine/files")
     theirs = main.PROJECTS_ROOT / worktrees.WORKTREES_DIR / "mine" / "u2"
@@ -206,9 +206,8 @@ def test_commit_and_push_publishes_the_members_commit_not_the_owners_branch(unlo
 
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine", remote=str(remote)))
     owner_dir = main.PROJECTS_ROOT / "mine"
-    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=owner_dir, check=True)
     assert unlocked.post("/api/projects/mine/git/push").status_code == 200
     owner_branch = _git(owner_dir, "branch", "--show-current").strip()
     owner_head = _git(remote, "rev-parse", owner_branch).strip()
@@ -237,8 +236,7 @@ def test_pulling_a_branch_that_was_never_pushed_says_so(unlocked, second_user, t
 
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
-    unlocked.post("/api/projects/init", json={"name": "mine"})
-    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=main.PROJECTS_ROOT / "mine", check=True)
+    unlocked.post("/api/projects/init", json=init_body("mine", remote=str(remote)))
     _share(unlocked, second_user)
     r = second_user.post("/api/projects/mine/git/pull")
     assert r.status_code == 400 and "push to publish it there" in r.json()["detail"]

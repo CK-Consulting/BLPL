@@ -1,6 +1,6 @@
 import { type MutableRefObject, type ReactNode, useEffect, useRef, useState } from "react";
 import { encodePath, getJSON, putJSON } from "../api";
-import { announceCommitted } from "../commitEvents";
+import { announceCommitted, announcePushFrom } from "../commitEvents";
 import { Code, langOf } from "./Code";
 import { UnsavedChangesDialog } from "./Dialog";
 import { Diagram, isDiagramFile } from "./Diagram";
@@ -288,12 +288,15 @@ export function FileView({
     // A save that commits must not leave the last one's warning standing.
     setError(null);
     try {
-      const out = await putJSON<{ committed?: boolean; commit_error?: string }>(
+      const out = await putJSON<{ committed?: boolean; commit_error?: string; push_seq?: number }>(
         `/api/projects/${projectId}/files/${encodePath(path)}`,
         { content: sent },
       );
       // The commit happened in this save's project whatever the pane shows now.
       if (out?.committed) announceCommitted(projectId);
+      // And on a project that pushes by itself, a push of it is now running;
+      // the git strip waits for its result.
+      announcePushFrom(projectId, out);
       onSaved();
       // Codex, PR #17: the completion used to land on whatever the pane showed
       // by then. After a rename or a switch that is another path, whose

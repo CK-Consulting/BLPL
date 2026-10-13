@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import give_endpoint, sign_in, sign_in_only
+from conftest import give_endpoint, sign_in, sign_in_only, init_body
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -67,7 +67,7 @@ def _secret_of(invitation_id: int) -> str:
 def test_an_unknown_address_is_refused_until_confirmed(unlocked):
     """The owner is about to accept a weaker tradeoff — emailing a secret — so it
     has to be a decision rather than something that happens to them."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
 
     r = unlocked.post("/api/projects/mine/members", json={"email": "newcomer@example.com"})
     assert r.status_code == 404
@@ -75,7 +75,7 @@ def test_an_unknown_address_is_refused_until_confirmed(unlocked):
 
 
 def test_confirming_creates_a_placeholder_and_a_short_invitation(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     result = _invite_stranger(unlocked)
 
     assert result["new_account"] is True
@@ -98,7 +98,7 @@ def test_a_placeholder_holds_nothing(unlocked):
     import app.db
     from app.models import ProjectKeyGrant, User, UserMasterKey
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _invite_stranger(unlocked)
 
     with app.db.SessionFactory() as s:
@@ -122,7 +122,7 @@ def test_signing_up_with_the_invited_address_claims_the_placeholder(unlocked, cl
     import app.db
     from app.models import User
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _invite_stranger(unlocked)
 
     from starlette.testclient import TestClient
@@ -174,7 +174,7 @@ def test_the_link_is_not_a_bearer_token(unlocked):
     """Whoever finds a forwarded link cannot redeem it into an account of their
     own: the address it was sent to is still who it is for, and Clerk verified
     that address at sign-up."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     result = _invite_stranger(unlocked)
     secret = _secret_of(result["invitation_id"])
 
@@ -187,7 +187,7 @@ def test_the_link_is_not_a_bearer_token(unlocked):
 
 
 def test_a_wrong_secret_is_refused(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     result = _invite_stranger(unlocked)
     _secret_of(result["invitation_id"])
 
@@ -202,7 +202,7 @@ def test_a_wrong_secret_is_refused(unlocked):
 def test_redeeming_grants_access_and_burns_the_link(unlocked):
     """Single use: the secret-wrapped copy is destroyed once it has been
     re-sealed to the new account's own key."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     result = _invite_stranger(unlocked)
     secret = _secret_of(result["invitation_id"])
 
@@ -223,7 +223,7 @@ def test_redeeming_grants_access_and_burns_the_link(unlocked):
 def test_re_inviting_mints_a_fresh_secret_and_kills_the_old_link(unlocked):
     """Agreed behaviour: a 24-hour link that lapsed over a weekend gets re-sent,
     and the previous one must stop working the moment it does."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     result = _invite_stranger(unlocked)
     old_secret = _secret_of(result["invitation_id"])
 
@@ -241,7 +241,7 @@ def test_re_inviting_mints_a_fresh_secret_and_kills_the_old_link(unlocked):
 
 
 def test_an_expired_link_cannot_be_redeemed(unlocked, monkeypatch):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     result = _invite_stranger(unlocked)
     secret = _secret_of(result["invitation_id"])
 

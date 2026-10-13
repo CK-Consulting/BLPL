@@ -17,6 +17,10 @@ import pytest
 from app.agent import ToolContext, ToolExecutor, default_tools
 from app.projects import Projects
 from app.references import FilesystemSandbox, ReferenceManifest
+from app.gitidentity import GitIdentity  # noqa: E402
+
+# Every commit is somebody's now; these are the tests'.
+IDENT = GitIdentity("Test", "test@example.com")
 
 
 def _git(d: Path, *args: str) -> str:
@@ -28,11 +32,11 @@ def _git(d: Path, *args: str) -> str:
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / "overview.md").write_text("# Board\n\nPINMAP: PA0 = SCL\n", encoding="utf-8")
-    projects.commit_all("dev04", "first pinmap")
+    projects.commit_all("dev04", "first pinmap", identity=IDENT)
     (d / "overview.md").write_text("# Board\n\nPINMAP: PA0 = SDA\n", encoding="utf-8")
-    projects.commit_all("dev04", "second pinmap")
+    projects.commit_all("dev04", "second pinmap", identity=IDENT)
     return d
 
 
@@ -99,7 +103,7 @@ def test_a_conversation_does_not_count_as_unsaved_design_work(tmp_path: Path) ->
     """This is why the badge read as permanently on: the conversation log is
     appended to on every turn, so the tree is never clean."""
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / ".blpl" / "conversations").mkdir(parents=True)
     (d / ".blpl" / "conversations" / "a.jsonl").write_text("{}\n", encoding="utf-8")
     (d / ".blpl" / "llm_usage.jsonl").write_text("{}\n", encoding="utf-8")
@@ -110,7 +114,7 @@ def test_a_conversation_does_not_count_as_unsaved_design_work(tmp_path: Path) ->
 
 def test_an_edited_design_document_does_count(tmp_path: Path) -> None:
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / "overview.md").write_text("# Board\n", encoding="utf-8")
     assert projects.status("dev04").dirty is True
 
@@ -119,11 +123,11 @@ def test_bookkeeping_is_still_committed_even_though_it_is_not_flagged(tmp_path: 
     """Not flagged is not the same as not kept: the conversation holds the full
     text of every proposal, which is worth having in the history."""
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / ".blpl" / "conversations").mkdir(parents=True)
     (d / ".blpl" / "conversations" / "a.jsonl").write_text("{}\n", encoding="utf-8")
     (d / "overview.md").write_text("# Board\n", encoding="utf-8")
-    projects.commit_all("dev04", "both")
+    projects.commit_all("dev04", "both", identity=IDENT)
     tracked = _git(d, "ls-files").split()
     assert ".blpl/conversations/a.jsonl" in tracked
 
@@ -133,11 +137,11 @@ def test_bookkeeping_is_still_committed_even_though_it_is_not_flagged(tmp_path: 
 
 def test_a_new_project_ignores_its_own_output(tmp_path: Path) -> None:
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / ".pipeline").mkdir()
     (d / ".pipeline" / "bom.json").write_text("{}", encoding="utf-8")
     (d / "overview.md").write_text("# Board\n", encoding="utf-8")
-    projects.commit_all("dev04", "work")
+    projects.commit_all("dev04", "work", identity=IDENT)
     tracked = _git(d, "ls-files").split()
     assert "overview.md" in tracked
     assert not any(t.startswith(".pipeline/") for t in tracked)
@@ -149,11 +153,11 @@ def test_quarantined_downloads_stay_out_of_history_but_the_ledger_does_not(
     """An uncleared download is the one thing that should never reach permanent
     history. What it was and where it came from should."""
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / "retrieved").mkdir()
     (d / "retrieved" / "abc-part.pdf").write_bytes(b"%PDF-1.4")
     (d / "retrieved" / "quarantine.json").write_text("[]", encoding="utf-8")
-    projects.commit_all("dev04", "fetch")
+    projects.commit_all("dev04", "fetch", identity=IDENT)
     tracked = _git(d, "ls-files").split()
     assert "retrieved/quarantine.json" in tracked
     assert "retrieved/abc-part.pdf" not in tracked
@@ -165,14 +169,14 @@ def test_an_existing_project_is_cleaned_up_and_says_what_it_untracked(
     """Adding the file changes nothing on its own — git keeps tracking what it
     already tracks — so the untracking is the part that does the work."""
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / ".gitignore").unlink()
     (d / ".pipeline").mkdir()
     (d / ".pipeline" / "bom.json").write_text("{}", encoding="utf-8")
-    projects.commit_all("dev04", "before")
+    projects.commit_all("dev04", "before", identity=IDENT)
     assert ".pipeline/bom.json" in _git(d, "ls-files").split()
 
-    untracked = projects.apply_baseline_gitignore("dev04")
+    untracked = projects.apply_baseline_gitignore("dev04", identity=IDENT)
     assert untracked == [".pipeline/bom.json"]
     assert ".pipeline/bom.json" not in _git(d, "ls-files").split()
     # Untracked, never deleted: the next run expects to find its own artifacts.
@@ -184,19 +188,19 @@ def test_an_existing_project_is_cleaned_up_and_says_what_it_untracked(
 
 def test_applying_the_baseline_twice_changes_nothing_the_second_time(tmp_path: Path) -> None:
     projects = Projects(tmp_path / "root")
-    projects.init_local("dev04")
+    projects.init_local("dev04", identity=IDENT)
     d = projects.project_dir("dev04")
     before = _git(d, "rev-parse", "HEAD")
-    assert projects.apply_baseline_gitignore("dev04") == []
+    assert projects.apply_baseline_gitignore("dev04", identity=IDENT) == []
     assert _git(d, "rev-parse", "HEAD") == before
 
 
 def test_a_project_with_its_own_rules_keeps_them(tmp_path: Path) -> None:
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / ".gitignore").write_text("# mine\nscratch/\n", encoding="utf-8")
-    projects.commit_all("dev04", "my rules")
-    projects.apply_baseline_gitignore("dev04")
+    projects.commit_all("dev04", "my rules", identity=IDENT)
+    projects.apply_baseline_gitignore("dev04", identity=IDENT)
     rules = (d / ".gitignore").read_text(encoding="utf-8")
     assert "scratch/" in rules and ".pipeline/" in rules
 
@@ -207,14 +211,14 @@ def test_a_new_project_ignores_macos_artifacts(tmp_path: Path) -> None:
     operating system, macOS included — __MACOSX is a resource fork for a
     filesystem that stopped needing one in Mac OS 9."""
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / "datasheets").mkdir()
     (d / "datasheets" / ".DS_Store").write_bytes(b"\x00")
     (d / "datasheets" / "._nRF9151_spec.pdf").write_bytes(b"\x00")
     (d / "__MACOSX").mkdir()
     (d / "__MACOSX" / "._thing").write_bytes(b"\x00")
     (d / "overview.md").write_text("# Board\n", encoding="utf-8")
-    projects.commit_all("dev04", "work")
+    projects.commit_all("dev04", "work", identity=IDENT)
 
     tracked = _git(d, "ls-files").split()
     assert "overview.md" in tracked
@@ -224,6 +228,6 @@ def test_a_new_project_ignores_macos_artifacts(tmp_path: Path) -> None:
 def test_they_do_not_light_the_uncommitted_badge_either(tmp_path: Path) -> None:
     """Ignored, so they are not design work waiting to be saved."""
     projects = Projects(tmp_path / "root")
-    d = projects.init_local("dev04")
+    d = projects.init_local("dev04", identity=IDENT)
     (d / ".DS_Store").write_bytes(b"\x00")
     assert projects.status("dev04").dirty is False

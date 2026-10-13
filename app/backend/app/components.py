@@ -48,8 +48,12 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from blpl.agent.tools.datasheet_files import folder_name
+
+if TYPE_CHECKING:
+    from .gitidentity import GitIdentity
 
 # Where a project mounts a part's repository. Same shape the resolver already
 # prefers, so a submodule and a plain folder are found by the same rule and
@@ -97,14 +101,14 @@ def part_repo(data_root: Path, user_id: int, mpn: str) -> Path:
 
 
 def _git(cwd: Path, *args: str, allow_file: bool = False) -> str:
-    base = [
-        "git",
-        # Committing needs an identity, and the server has none of its own.
-        # Passed per call rather than written into a config, so nothing here
-        # depends on the container's global git state.
-        "-c", "user.name=BLPL",
-        "-c", "user.email=blpl@localhost",
-    ]
+    if args and args[0] == "commit":
+        # This helper used to add a fixed identity to every call, so a commit
+        # through it was signed by nobody in particular and nothing noticed.
+        # It adds none now, and a commit through it would take whatever the
+        # machine's git config happens to hold — or fail only where there is
+        # none. Commits go through _commit, which needs the person's identity.
+        raise ComponentError("internal: commit through components._commit, with an identity")
+    base = ["git"]
     if allow_file:
         base += ["-c", "protocol.file.allow=always"]
     proc = subprocess.run(
@@ -115,16 +119,46 @@ def _git(cwd: Path, *args: str, allow_file: bool = False) -> str:
     return proc.stdout
 
 
-def ensure_part(data_root: Path, user_id: int, mpn: str) -> Path:
+def _commit(cwd: Path, identity: GitIdentity | None, *args: str) -> str:
+    """``git commit *args`` as the person it is for.
+
+    This passed a fixed server identity on every call, so every part revision
+    and every attach in every project was signed by nobody in particular. The
+    identity is now the caller's, in the environment of this one invocation,
+    and a commit with none is refused before git is asked — the file may
+    already be on disk, and the error says why it is not committed.
+    """
+    if identity is None:
+        from .gitidentity import NO_IDENTITY
+
+        raise ComponentError(NO_IDENTITY)
+    proc = subprocess.run(
+        ["git", "commit", *args], cwd=str(cwd), capture_output=True, text=True,
+        check=False, timeout=300, env={**os.environ, **identity.env()},
+    )
+    if proc.returncode != 0:
+        raise ComponentError(f"git commit: {(proc.stderr or proc.stdout).strip()[:400]}")
+    return proc.stdout
+
+
+def ensure_part(
+    data_root: Path, user_id: int, mpn: str, *, identity: GitIdentity | None
+) -> Path:
     """The repository for one part, created if this is the first document."""
     d = part_repo(data_root, user_id, mpn)
     if (d / ".git").exists():
         return d
+    if identity is None:
+        # Before the directory exists: a part repository with no first commit
+        # cannot be referenced as a submodule, and would sit there half made.
+        from .gitidentity import NO_IDENTITY
+
+        raise ComponentError(NO_IDENTITY)
     d.mkdir(parents=True, exist_ok=True)
     _git(d, "init", "-b", "main")
     # An empty first commit, for the same reason projects get one: a submodule
     # cannot reference an unborn HEAD, and the failure surfaces far from here.
-    _git(d, "commit", "--allow-empty", "-m", f"Component {folder_name(mpn)}")
+    _commit(d, identity, "--allow-empty", "-m", f"Component {folder_name(mpn)}")
     return d
 
 
@@ -191,7 +225,10 @@ def _document_path(filename: str) -> str:
     return "/".join(parts_)
 
 
-def add_document(data_root: Path, user_id: int, mpn: str, filename: str, data: bytes) -> dict:
+def add_document(
+    data_root: Path, user_id: int, mpn: str, filename: str, data: bytes,
+    *, identity: GitIdentity | None,
+) -> dict:
     """Store a document for a part and commit it.
 
     Replacing a file that is already there is a *revision*, and lands as a
@@ -199,7 +236,7 @@ def add_document(data_root: Path, user_id: int, mpn: str, filename: str, data: b
     part being a repository. The previous text stays readable at its commit.
     """
     safe = _document_path(filename)
-    d = ensure_part(data_root, user_id, mpn)
+    d = ensure_part(data_root, user_id, mpn, identity=identity)
     target = (d / safe).resolve()
     if not target.is_relative_to(d.resolve()):
         raise ComponentError(f"{filename!r} would write outside the part")
@@ -207,9 +244,16 @@ def add_document(data_root: Path, user_id: int, mpn: str, filename: str, data: b
     replacing = target.is_file() and target.read_bytes() != data
     if target.is_file() and not replacing:
         return {"path": safe, "commit": head(d), "changed": False}
+    if identity is None:
+        # Refused before the write, unlike a project edit: nothing here is the
+        # user's work in progress, and a part revision on disk but not in the
+        # repository is exactly the silent overwrite this store exists to stop.
+        from .gitidentity import NO_IDENTITY
+
+        raise ComponentError(NO_IDENTITY)
     target.write_bytes(data)
     _git(d, "add", "--", safe)
-    _git(d, "commit", "-m", f"{'Revise' if replacing else 'Add'} {safe}")
+    _commit(d, identity, "-m", f"{'Revise' if replacing else 'Add'} {safe}")
     return {"path": safe, "commit": head(d), "changed": True}
 
 
@@ -365,7 +409,10 @@ def attached(project_dir: Path) -> dict[str, str]:
     return {p.split("/", 1)[-1]: u for p, u in out.items() if p.startswith(f"{MOUNT}/")}
 
 
-def attach(project_dir: Path, data_root: Path, user_id: int, mpn: str) -> dict:
+def attach(
+    project_dir: Path, data_root: Path, user_id: int, mpn: str,
+    *, identity: GitIdentity | None,
+) -> dict:
     """Reference a part's repository from this project, pinned at its HEAD."""
     src = part_repo(data_root, user_id, mpn)
     if not (src / ".git").exists():
@@ -387,27 +434,35 @@ def attach(project_dir: Path, data_root: Path, user_id: int, mpn: str) -> dict:
     # Absolute, because a relative submodule url is resolved against the
     # superproject's *remote* rather than the filesystem, and these projects
     # mostly have no remote at all.
+    if identity is None:
+        from .gitidentity import NO_IDENTITY
+
+        raise ComponentError(NO_IDENTITY)
     _git(project_dir, "submodule", "add", "--", str(src.resolve()), rel, allow_file=True)
-    _git(project_dir, "commit", "-m", f"Reference component {name}")
+    _commit(project_dir, identity, "-m", f"Reference component {name}")
     return {"mpn": name, "path": rel, "commit": head(src), "added": True}
 
 
-def detach(project_dir: Path, mpn: str) -> None:
+def detach(project_dir: Path, mpn: str, *, identity: GitIdentity | None) -> None:
     """Stop referencing a part. The library keeps it; this project does not."""
     name = folder_name(mpn)
     rel = f"{MOUNT}/{name}"
     project_dir = Path(project_dir)
     if name not in attached(project_dir):
         raise ComponentError(f"{name} is not referenced by this project")
+    if identity is None:
+        from .gitidentity import NO_IDENTITY
+
+        raise ComponentError(NO_IDENTITY)
     _git(project_dir, "submodule", "deinit", "-f", "--", rel)
     _git(project_dir, "rm", "-f", "--", rel)
     # deinit leaves the object store behind, which would make re-attaching a
     # different part at the same path fail with a stale gitdir.
     shutil.rmtree(project_dir / ".git" / "modules" / MOUNT / name, ignore_errors=True)
-    _git(project_dir, "commit", "-m", f"Stop referencing component {name}")
+    _commit(project_dir, identity, "-m", f"Stop referencing component {name}")
 
 
-def update(project_dir: Path, mpn: str) -> dict:
+def update(project_dir: Path, mpn: str, *, identity: GitIdentity | None) -> dict:
     """Move this project's pin forward to the library's current revision.
 
     Explicitly, never automatically. A submodule pins a commit, and that is the
@@ -421,13 +476,19 @@ def update(project_dir: Path, mpn: str) -> dict:
     project_dir = Path(project_dir)
     if name not in attached(project_dir):
         raise ComponentError(f"{name} is not referenced by this project")
+    if identity is None:
+        # Before the pin moves, not after: a moved pin with no commit behind it
+        # is the "happened while nobody was looking" this function refuses.
+        from .gitidentity import NO_IDENTITY
+
+        raise ComponentError(NO_IDENTITY)
     before = _git(project_dir, "rev-parse", f"HEAD:{rel}").strip()
     _git(project_dir, "submodule", "update", "--init", "--remote", "--", rel, allow_file=True)
     after = _git(project_dir / rel, "rev-parse", "HEAD").strip()
     if before == after:
         return {"mpn": name, "changed": False, "commit": after[:7]}
     _git(project_dir, "add", "--", rel)
-    _git(project_dir, "commit", "-m", f"Update component {name} to {after[:7]}")
+    _commit(project_dir, identity, "-m", f"Update component {name} to {after[:7]}")
     return {"mpn": name, "changed": True, "from": before[:7], "commit": after[:7]}
 
 
@@ -481,7 +542,9 @@ def _holds_findings(payload: object) -> bool:
     return True
 
 
-def prune_failed(data_root: Path, user_id: int) -> list[str]:
+def prune_failed(
+    data_root: Path, user_id: int, *, identity: GitIdentity | None
+) -> list[str]:
     """Drop library entries that record a failure instead of a result.
 
     Returns the parts cleaned. The file is removed with a commit rather than
@@ -502,15 +565,23 @@ def prune_failed(data_root: Path, user_id: int) -> list[str]:
             continue
         if _holds_findings(payload):
             continue
+        if identity is None:
+            from .gitidentity import NO_IDENTITY
+
+            raise ComponentError(NO_IDENTITY)
         f.unlink()
         _git(d, "rm", "--cached", "--quiet", "--", EXTRACTED)
-        _git(d, "commit", "-m", f"Drop failed extraction for {d.name}")
+        _commit(d, identity, "-m", f"Drop failed extraction for {d.name}")
         cleaned.append(d.name)
     return cleaned
 
 
-def save_extraction(data_root: Path, user_id: int, mpn: str, payload: dict) -> None:
+def save_extraction(
+    data_root: Path, user_id: int, mpn: str, payload: dict,
+    *, identity: GitIdentity | None,
+) -> None:
     add_document(
         data_root, user_id, mpn, EXTRACTED,
         json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"),
+        identity=identity,
     )

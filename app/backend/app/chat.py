@@ -1017,6 +1017,8 @@ class TurnRequest:
     # conversation's.
     endpoints_for: Callable[[str], list[Endpoint]] | None = None
     library: object | None = None
+    #: The identity a tool's commit carries (see ToolContext.git_identity).
+    git_identity: object | None = None
     # The chosen endpoint's context window, so the request can be sized to it.
     context: int = 0
     record_tool_call: Callable[[dict], None] | None = None
@@ -1092,6 +1094,7 @@ class ChatSessionManager:
             creds=req.creds or CredResolver(),
             endpoints_for=req.endpoints_for or (lambda _t: []),
             library=req.library,
+            git_identity=req.git_identity,
             on_progress=lambda m: live.publish({"type": "progress", "message": m}),
             # A tool whose whole effect is visual publishes straight to the
             # browser; highlighting the part under discussion beats describing

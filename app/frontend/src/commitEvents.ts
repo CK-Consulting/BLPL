@@ -20,3 +20,47 @@ export function onCommitted(projectId: string, handler: () => void): () => void 
   window.addEventListener(EVENT, listener);
   return () => window.removeEventListener(EVENT, listener);
 }
+
+/**
+ * "An automatic push of this project was just started, and is numbered
+ * `seq`", for the git strip, which waits for its result.
+ *
+ * The push runs on the server after the save's response has gone, so the
+ * strip's next status read still showed the previous push: a failed automatic
+ * push stayed invisible until a reload (Codex, PR #19). A save that started
+ * one announces its number here; the strip polls the member's push status
+ * until the recorded result answers for that number.
+ */
+const PUSH_EVENT = "blpl:push-pending";
+
+export function announcePushPending(projectId: string, seq: number, waitSeconds?: number): void {
+  window.dispatchEvent(new CustomEvent(PUSH_EVENT, { detail: { projectId, seq, waitSeconds } }));
+}
+
+export function onPushPending(
+  projectId: string,
+  handler: (seq: number, waitSeconds?: number) => void,
+): () => void {
+  const listener = (e: Event) => {
+    const d = (e as CustomEvent<{ projectId: string; seq: number; waitSeconds?: number }>).detail;
+    if (d?.projectId === projectId && typeof d.seq === "number") handler(d.seq, d.waitSeconds);
+  };
+  window.addEventListener(PUSH_EVENT, listener);
+  return () => window.removeEventListener(PUSH_EVENT, listener);
+}
+
+/**
+ * Announce the automatic push a write's response says it started, if any.
+ *
+ * Every route that commits on the user's behalf answers with `push_seq` when
+ * an automatic push followed — a save, an upload, a move or rename, a
+ * delete, a new file, an accepted proposal. Each call site hands its response
+ * here, so the strip waits for every push a user's action triggers rather
+ * than only the editor's.
+ */
+export function announcePushFrom(projectId: string, response: unknown): void {
+  const r = response as { push_seq?: unknown; push_wait_s?: unknown } | null | undefined;
+  if (typeof r?.push_seq === "number") {
+    announcePushPending(projectId, r.push_seq, typeof r.push_wait_s === "number" ? r.push_wait_s : undefined);
+  }
+}

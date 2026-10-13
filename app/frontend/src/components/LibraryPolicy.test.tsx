@@ -23,7 +23,7 @@ describe("the component-library declaration", () => {
     render(
       <PolicyFields value={CLOSED} onChange={() => {}} choices={CHOICES} consentText="I agree." />,
     );
-    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "The statement." })).toBeNull();
   });
 
   it("shows the exact consent wording once sharing is chosen", () => {
@@ -104,8 +104,10 @@ describe("a fresh declaration per project", () => {
     await screen.findByText(/Project permissions/);
 
     fireEvent.click(screen.getByLabelText(/Enrich existing parts only/, { exact: false }));
-    fireEvent.click(await screen.findByRole("checkbox"));
-    expect((screen.getByRole("checkbox") as HTMLInputElement).checked).toBe(true);
+    // By name: the dialog has other checkboxes now (the commit identity's
+    // "also use as my default"), and this is about the consent one.
+    fireEvent.click(await screen.findByRole("checkbox", { name: "The statement." }));
+    expect((screen.getByRole("checkbox", { name: "The statement." }) as HTMLInputElement).checked).toBe(true);
 
     fireEvent.click(screen.getByText("Close"));
     fireEvent.click(screen.getByText("+ Project"));
@@ -116,7 +118,7 @@ describe("a fresh declaration per project", () => {
         .checked,
     ).toBe(true);
     // Nothing shared means no consent statement on screen at all.
-    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "The statement." })).toBeNull();
   });
 
   it("the dialog is gone from the document once closed", async () => {

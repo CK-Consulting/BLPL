@@ -42,6 +42,36 @@ os.environ["BLPL_DATA_ROOT"] = str(_SESSION_DATA / "data")
 os.environ["BLPL_PROJECTS_ROOT"] = str(_SESSION_DATA / "data" / "projects")
 atexit.register(shutil.rmtree, _SESSION_DATA, True)
 
+# Git sees no configuration but what a test gives it. Every commit the app
+# makes must carry the identity of the person it is for; one that does not
+# has to fail here exactly as it fails in the container, which has no global
+# git config. Run on a workstation, the developer's ~/.gitconfig supplied an
+# email and hid three such commits until the suite ran in a container. The
+# global file is a scratch one with user.useConfigOnly set, which also stops
+# git inventing an address from the hostname; system config is off; and any
+# identity in the environment is cleared (see the autouse fixture below).
+_GIT_GLOBAL = _SESSION_DATA / "gitconfig"
+_GIT_GLOBAL.write_text("[user]\n\tuseConfigOnly = true\n", encoding="utf-8")
+_GIT_IDENTITY_ENV = (
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE", "EMAIL",
+)
+os.environ["GIT_CONFIG_GLOBAL"] = str(_GIT_GLOBAL)
+os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+for _var in _GIT_IDENTITY_ENV:
+    os.environ.pop(_var, None)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_git_identity(monkeypatch):
+    """Per test as well as per session, so a test that sets one of these
+    cannot lend it to the next."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(_GIT_GLOBAL))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for var in _GIT_IDENTITY_ENV:
+        monkeypatch.delenv(var, raising=False)
+
+
 # The suite's git fixtures are local bare repositories, reached over file://.
 # Deployments allow only https and ssh; tests that check that refusal set the
 # default back explicitly.
@@ -155,11 +185,64 @@ def sign_in(client, clerk_id: str = "user_test", email: str = "test@example.com"
 
         grants.ensure_keypair(s, user, master)
         profile_mod.mark_complete(s, user)
+        # And a commit identity, which every server-side commit now needs and
+        # nothing invents. Set here because nearly every test commits as a
+        # side effect of a save; the tests about having none clear it.
+        user.git_name = f"Test {clerk_id}"
+        user.git_email = email
         s.commit()
     # The stub verifier returns no claims, so there is no sid and the session key
     # is deterministic — see unlock.session_key_for.
     main.unlocked.put(unlock_mod.session_key_for(clerk_id, {}), master)
     return client
+
+
+def bare_remote() -> str:
+    """A fresh, empty bare repository to use as a project's remote.
+
+    Creating a project needs an empty remote it can reach. Local paths are
+    allowed only because the suite turns on the file transport (see
+    BLPL_GIT_ALLOWED_PROTOCOLS above); a deployment refuses them.
+    """
+    import subprocess
+
+    root = _SESSION_DATA / "remotes"
+    root.mkdir(parents=True, exist_ok=True)
+    d = Path(tempfile.mkdtemp(prefix="remote-", suffix=".git", dir=root))
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(d)], check=True)
+    return str(d)
+
+
+def init_body(name: str, **extra) -> dict:
+    """The body POST /api/projects/init needs for a project named ``name``.
+
+    A name used to be enough. Creating a project now also takes an empty
+    remote, a push policy chosen on purpose and the creator's commit identity,
+    so this supplies all three — manual pushing, so a test that does not care
+    about pushes sees none — and lets a test override any of them.
+    """
+    return {
+        "name": name,
+        "remote": bare_remote(),
+        "push_policy": "manual",
+        "git_name": "Test Creator",
+        "git_email": "creator@example.com",
+        **extra,
+    }
+
+
+def clone_body(name: str, remote: str, **extra) -> dict:
+    """The body POST /api/projects/clone needs: the remote and branch, plus the
+    push policy and commit identity cloning now asks for, as creation does."""
+    return {
+        "name": name,
+        "remote": remote,
+        "branch": "main",
+        "push_policy": "manual",
+        "git_name": "Test Cloner",
+        "git_email": "cloner@example.com",
+        **extra,
+    }
 
 
 def give_endpoint(

@@ -38,6 +38,7 @@ from blpl.agent.tools.bom import HOUSES as HOUSES_FOR_SCHEMA
 from blpl.agent.tools.parts import fetch_datasheet, search_parts
 
 from .. import llm_ignore
+from ..components import ComponentError
 from .toolspec import ToolContext, ToolDenied, ToolSpec
 
 # Design documents, matching the editor's rule so the assistant can never
@@ -703,6 +704,11 @@ async def _extract_datasheet(ctx: ToolContext, args: dict) -> str:
             # Never fatal: the extraction is on disk in the project either way.
             # Failing to file a copy is worth less than the result.
             pass
+        except ComponentError as exc:
+            # Said, though: filing is a commit, and a user with no commit
+            # identity set gets the sentence telling them where to set one
+            # rather than a library that quietly never fills.
+            ctx.note(f"{mpn}: not saved to your component library — {exc}")
     return json.dumps(run.to_dict(), indent=2)
 
 
@@ -1395,7 +1401,10 @@ async def _bulk_route(ctx: ToolContext, args: dict) -> str:
     from .kicad_bridge import snapshot
 
     if not ctx.extras.get("kicad_snapshot"):
-        commit = await _to_thread(snapshot, ctx.project_dir)
+        # With the turn's user's identity: snapshot() refuses to make a commit
+        # without one, and called without it here, every autoroute ran with no
+        # undo anchor at all (Codex, PR #19).
+        commit = await _to_thread(snapshot, ctx.project_dir, ctx.git_identity)
         ctx.extras["kicad_snapshot"] = commit or "none"
         ctx.note("snapshotted the board before routing" if commit else "no git snapshot available")
 

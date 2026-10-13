@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { postForm } from "../api";
-import { announceCommitted } from "../commitEvents";
+import { announceCommitted, announcePushFrom } from "../commitEvents";
 
 /**
  * Put files into a project, through quarantine.
@@ -83,6 +83,7 @@ export function UploadDialog({
       setRows([]);
       if (out.commit_error) setError(`Uploaded — ${out.commit_error}`);
       else if (out.committed) announceCommitted(projectId);
+      announcePushFrom(projectId, out);
       if (out.results.some((r) => r.state === "released")) onUploaded?.();
     } catch (e) {
       setError((e as Error).message);

@@ -86,6 +86,10 @@ class ToolContext:
     # request's user; tools never see a user id and cannot construct another
     # user's library path even by accident.
     library: Any | None = None
+    # Whose name goes on a commit a tool makes (gitidentity.GitIdentity), or
+    # None when this user has none — a tool that would commit then does
+    # without, and says so, rather than inventing one.
+    git_identity: Any | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def note(self, message: str) -> None:

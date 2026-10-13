@@ -19,6 +19,10 @@ Authentication to the remote is deliberately not handled here. On the deploy, gi
 uses whatever the environment gives it — an SSH deploy key mounted into the
 container, or a credential helper. Keeping auth out of this file means no token
 ever passes through application code or lands in a log line.
+
+Nor is identity. Every method that commits takes the identity of the person the
+commit is for (see gitidentity) and hands it to that one git invocation; none
+writes one into a repository's config, and none invents one when it is missing.
 """
 
 from __future__ import annotations
@@ -28,10 +32,15 @@ import fcntl
 import os
 import re
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from .gitidentity import GitIdentity
 
 
 class ProjectError(RuntimeError):
@@ -374,33 +383,35 @@ class Projects:
         self._git(
             self.root, "clone", "--branch", branch, "--", remote, dest.name, env=_net_env(env)
         )
-        self._ensure_identity(dest)
         return dest
 
-    def init_local(self, name: str) -> Path:
-        """Create a fresh git repo for a project that has no remote yet.
+    def init_local(self, name: str, *, identity: GitIdentity | None) -> Path:
+        """Create a fresh git repo for a project, its first commits by ``identity``.
 
-        A new design starts as a local working copy; a remote can be attached
-        later by adding it to blpl.toml and pushing. `git init` here means even a
-        local-only project has a history from its first commit.
+        `git init` here means a project has a history from its first commit; a
+        remote is attached by the caller. Refused before anything is created
+        when there is no identity: a repository whose first commit could not be
+        made would be a project with no HEAD, which is a worse thing to leave
+        behind than no project.
         """
         dest = self.project_dir(name)
         if dest.exists():
             raise ProjectError(f"project {name!r} already exists at {dest}")
+        if identity is None:
+            raise ProjectError(_no_identity())
         dest.mkdir(parents=True)
         self._git(dest, "init", "-b", "main")
-        self._ensure_identity(dest)
         # An empty initial commit, so HEAD exists from the start. `git init`
         # alone leaves an unborn HEAD, which reads as a repository right up until
         # something asks it for a commit — and a worktree cannot be branched from
         # a HEAD that points at nothing, so sharing a brand-new project failed
         # with a git error nobody would connect to "it has never been committed".
         # The docstring above always claimed this; now it is true.
-        self._git(dest, "commit", "--allow-empty", "-m", "Create project")
-        self.apply_baseline_gitignore(name)
+        self._git(dest, "commit", "--allow-empty", "-m", "Create project", env=identity.env())
+        self.apply_baseline_gitignore(name, identity=identity)
         return dest
 
-    def apply_baseline_gitignore(self, name: str) -> list[str]:
+    def apply_baseline_gitignore(self, name: str, *, identity: GitIdentity | None) -> list[str]:
         """Install the baseline ignore rules, and untrack anything they now cover.
 
         Idempotent, and safe to run on a project that already has history. The
@@ -439,6 +450,8 @@ class Projects:
         if changed or untracked:
             self._git(d, "add", "-A")
             if self._is_dirty(d):
+                if identity is None:
+                    raise ProjectError(_no_identity())
                 self._git(
                     d,
                     "commit",
@@ -446,6 +459,7 @@ class Projects:
                     "Stop tracking generated and quarantined files"
                     if untracked
                     else "Add baseline .gitignore",
+                    env=identity.env(),
                 )
         return untracked
 
@@ -470,6 +484,8 @@ class Projects:
     # gives up sooner, with a sentence, rather than hang the settings dialog
     # behind somebody's slow push.
     NETWORK_LOCK_WAIT = 330.0
+    #: git's own limit on any one command here (see _git).
+    GIT_TIMEOUT = 300
     SET_REMOTE_LOCK_WAIT = 30.0
 
     @contextlib.contextmanager
@@ -761,10 +777,13 @@ class Projects:
         self._track_origin(d, branch, dest, "fetch")
         return out
 
-    def commit_all(self, name: str, message: str) -> str | None:
-        """Stage everything and commit. Returns the commit output, or None if the
-        tree was clean (nothing to commit is not an error)."""
-        return self._commit(self._require(name), message)
+    def commit_all(
+        self, name: str, message: str, *, identity: GitIdentity | None
+    ) -> str | None:
+        """Stage everything and commit as ``identity``. Returns the commit
+        output, or None if the tree was clean (nothing to commit is not an
+        error, and needs no identity)."""
+        return self._commit(self._require(name), message, identity)
 
     def _checkout(self, name: str, checkout: Path | None) -> Path:
         """The directory a git operation runs in: the caller's own checkout when
@@ -782,7 +801,9 @@ class Projects:
             raise ProjectError(f"{d.name!r} is not a git checkout")
         return d
 
-    def commit_checkout(self, checkout: Path, message: str) -> str | None:
+    def commit_checkout(
+        self, checkout: Path, message: str, *, identity: GitIdentity | None
+    ) -> str | None:
         """``commit_all`` for a checkout the caller already resolved.
 
         A member's edits land in their own worktree, not in the repository
@@ -795,13 +816,22 @@ class Projects:
         A worktree's ``.git`` is a file pointing back at the repository, not a
         directory, which is why this cannot go through ``_require``.
         """
-        return self._commit(self._checkout("", checkout), message)
+        return self._commit(self._checkout("", checkout), message, identity)
 
-    def _commit(self, d: Path, message: str) -> str | None:
+    def _commit(self, d: Path, message: str, identity: GitIdentity | None) -> str | None:
         self._git(d, "add", "-A")
         if not self._is_dirty(d):
             return None
-        return self._git(d, "commit", "-m", message)
+        if identity is None:
+            # After the clean check, not before: a save that changed nothing
+            # needs no commit and so no identity, and refusing it would report
+            # a failure where nothing failed.
+            raise ProjectError(_no_identity())
+        # A repository opened before the placeholder was removed may still
+        # carry it. The environment below wins over config either way; this is
+        # for whoever runs git in the repository next, by hand.
+        self.drop_placeholder_identity(d)
+        return self._git(d, "commit", "-m", message, env=identity.env())
 
     def push(
         self,
@@ -810,12 +840,40 @@ class Projects:
         env: dict[str, str] | None = None,
         checkout: Path | None = None,
         url: str | None = None,
+        after=None,
     ) -> str:
+        """Push the checkout's branch. ``after``, when given, is called with
+        None or the ProjectError while the origin lock is still held.
+
+        That is how a push's outcome gets recorded. Written after the lock was
+        released, two overlapping pushes could record out of order: an earlier
+        success, descheduled between the lock and its write, landed after a
+        later failure and hid that the newest commit was unpublished (Codex,
+        PR #19). Under the lock, results are written in the order the pushes
+        ran, because the next push cannot start until this one has written.
+        """
         d = self._checkout(name, checkout)
         # Held across the push and the tracking-ref write after it, which is
         # what set_remote clears (see _remote_lock).
         with self._remote_lock(d, self.NETWORK_LOCK_WAIT, _BUSY):
-            return self._push_locked(d, url, env)
+            try:
+                out = self._push_locked(d, url, env)
+            except ProjectError as exc:
+                if after is not None:
+                    after(exc)
+                raise
+            if after is not None:
+                after(None)
+            return out
+
+    def under_remote_lock(self, checkout: Path, fn):
+        """Run ``fn`` holding the checkout's origin lock, as a push does.
+
+        For recording an outcome that never reached ``push`` — a credential
+        that could not be leased, a remote that could not be resolved — in the
+        same order as the outcomes that did."""
+        with self._remote_lock(Path(checkout), self.NETWORK_LOCK_WAIT, _BUSY):
+            return fn()
 
     def _push_locked(self, d: Path, url: str | None, env: dict[str, str] | None) -> str:
         if not self._primary_remote(d):
@@ -1003,17 +1061,186 @@ class Projects:
 
     # -- internals -----------------------------------------------------------
 
-    def _ensure_identity(self, project_dir: Path) -> None:
-        """Give the repo a committer identity if the environment has none.
+    def drop_placeholder_identity(self, checkout: Path) -> bool:
+        """Remove the stand-in identity older versions wrote into a repository.
 
-        ``git commit`` refuses to run without user.name/user.email, and the
-        deploy container has no global git config — so every server-side commit
-        would fail on a clean install. Set a repo-local identity only when
-        nothing resolves; a real configured identity (global or system) wins.
+        Earlier versions set repo-local user.name/user.email to a placeholder
+        whenever nothing else resolved, so that a commit could be made at all.
+        Every commit the server makes now carries the identity of the person it
+        is for, passed per invocation, so the placeholder does nothing for BLPL
+        — but it is still in the config, and anyone running git in that
+        repository by hand (from the host, the KiCad desktop) would commit as
+        it. Removed only when it is exactly the placeholder: a repo-local
+        identity somebody set on purpose is theirs. History is not rewritten.
+
+        Returns whether anything was removed. Shared config, so one call covers
+        every member's worktree.
         """
-        if not self._git_allow_fail(project_dir, "config", "user.email"):
-            self._git(project_dir, "config", "user.email", "blpl@localhost")
-            self._git(project_dir, "config", "user.name", "BLPL")
+        d = Path(checkout)
+        if not (d / ".git").exists():
+            return False
+        email = self._git_allow_fail(d, "config", "--local", "--get", "user.email")
+        if email != _PLACEHOLDER_EMAIL:
+            return False
+        self._git_allow_fail(d, "config", "--local", "--unset-all", "user.email")
+        name = self._git_allow_fail(d, "config", "--local", "--get", "user.name")
+        if name == _PLACEHOLDER_NAME:
+            self._git_allow_fail(d, "config", "--local", "--unset-all", "user.name")
+        return True
+
+    def probe_remote(
+        self, url: str, *, env: dict[str, str] | None = None, branch: str = "main"
+    ) -> RemoteProbe:
+        """Whether ``url`` can be reached with ``env``'s credential, and whether
+        it is empty. For the new-project dialog's Test connection, and for
+        creation itself, which refuses a remote that already has history.
+
+        ``git ls-remote`` rather than anything provider-specific: it is the
+        exact operation a push will need to succeed at, over the exact
+        transport, with the exact credential. Never raises for a remote that
+        answered badly — the answer is the result.
+
+        The message is git's own stderr, redacted. The credential rides the
+        environment (see gitstore.lease), so git has no way to quote it; the
+        caller scrubs the literal secret as well, because "git has no way to"
+        is a claim about today's git.
+        """
+        url = check_remote_url(url)
+        net = {**os.environ, **_net_env(env), "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            proc = subprocess.run(
+                ["git", "ls-remote", "--", url],
+                capture_output=True, text=True, check=False, timeout=self.PROBE_TIMEOUT, env=net,
+            )
+        except subprocess.TimeoutExpired:
+            # A structured answer, not an exception: uncaught, this was a 500
+            # from Test connection and from creation (Codex, PR #19).
+            return RemoteProbe("error", empty=False, message=_PROBE_TIMED_OUT)
+        if proc.returncode != 0:
+            err = _redact_text(proc.stderr.strip())
+            low = err.lower()
+            if any(s in low for s in _AUTH_FAILURES):
+                return RemoteProbe("auth_failed", empty=False, message=err)
+            if any(s in low for s in _NOT_FOUND):
+                return RemoteProbe("not_found", empty=False, message=err)
+            return RemoteProbe("error", empty=False, message=err)
+        empty = not proc.stdout.strip()
+        refused = self._probe_write(url, net, branch)
+        if refused is not None:
+            # The write result, with the read result kept beside it.
+            return RemoteProbe(
+                refused.status, empty=empty, message=refused.message,
+                readable=True, writable=False,
+            )
+        return RemoteProbe("ok", empty=empty, message="", readable=True, writable=True)
+
+    #: How long either probe waits for the remote before saying it did not answer.
+    PROBE_TIMEOUT = 60
+
+    def branch_problem(
+        self, url: str, branch: str, *, env: dict[str, str] | None = None
+    ) -> str | None:
+        """Why ``branch`` cannot be cloned and pushed as a branch of ``url``,
+        or None when refs/heads/<branch> exists there.
+
+        `git clone --branch` accepts a tag as readily as a branch and leaves a
+        detached HEAD, so a clone of a tag looked fine and every push from it
+        then failed — automatic ones after every commit — while the write
+        check tested a refs/heads/<tag> that does not exist (Codex, PR #19).
+        Asked of the remote's own ref list, before anything is cloned.
+        """
+        url = check_remote_url(url)
+        if not branch or branch.startswith("-"):
+            return f"{branch!r} is not a branch name"
+        try:
+            proc = subprocess.run(
+                ["git", "ls-remote", "--heads", "--tags", "--", url],
+                capture_output=True, text=True, check=False, timeout=self.PROBE_TIMEOUT,
+                env={**os.environ, **_net_env(env), "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except subprocess.TimeoutExpired:
+            return _PROBE_TIMED_OUT
+        if proc.returncode != 0:
+            return _redact_text(f"could not list the remote's branches: {proc.stderr.strip()}")
+        refs = {line.split("\t", 1)[1] for line in proc.stdout.splitlines() if "\t" in line}
+        if f"refs/heads/{branch}" in refs:
+            return None
+        if f"refs/tags/{branch}" in refs or f"refs/tags/{branch}^{{}}" in refs:
+            return f"{branch!r} is a tag, not a branch — clone a branch"
+        heads = sorted(r[len("refs/heads/"):] for r in refs if r.startswith("refs/heads/"))
+        listed = f" (it has: {', '.join(heads[:5])}{', …' if len(heads) > 5 else ''})" if heads else ""
+        return f"the remote has no branch {branch!r}{listed}"
+
+    def probe_write(
+        self, url: str, *, env: dict[str, str] | None = None, branch: str = "main"
+    ) -> RemoteProbe | None:
+        """The write half of probe_remote on its own: None if ``env``'s
+        credential may push ``branch`` to ``url``, else why not. For a clone,
+        whose remote already has history (so the read half's emptiness is
+        moot) and whose clone itself proves it can be read."""
+        url = check_remote_url(url)
+        net = {**os.environ, **_net_env(env), "GIT_TERMINAL_PROMPT": "0"}
+        return self._probe_write(url, net, branch)
+
+    def _probe_write(self, url: str, net: dict[str, str], branch: str) -> RemoteProbe | None:
+        """None if the credential may push ``branch`` to ``url``, else why not.
+
+        ls-remote talks to upload-pack, the read side, so a token that can see
+        an empty private repository but not write to it passed Test connection,
+        was saved, and the project's first push then failed (Codex, PR #19).
+        A push talks to receive-pack, and the server checks write access when
+        that service is first asked for — before any objects are sent. So this
+        is a push, with the same environment a real push gets, to the ref the
+        project's pushes will update (refs/heads/<branch>, not a side ref:
+        providers scope permissions to branch names), run with --dry-run so
+        nothing is sent. It goes from a throwaway repository holding only the
+        empty tree, so no commit and no identity are involved; --force only
+        stops the client refusing on its own that the remote has commits it
+        lacks, which is a local fast-forward check and says nothing about
+        permission. A dry run sends no update and no pack, so the remote's
+        branch is never moved.
+
+        What this cannot prove. Branch protection — GitHub's protected branches
+        and rulesets, a GitLab protected branch, any pre-receive or update hook
+        — is enforced when the server receives the update and the pack, which
+        is exactly what a dry run never sends. So a credential that may write
+        the repository but not this branch passes here. That is why creating a
+        project with automatic pushing does not stop at this check: it pushes
+        the project's first commit for real and refuses creation if that is
+        rejected (see main.init_project). A clone cannot do that without
+        changing the branch, so for a clone this is the best check there is,
+        and a later rejection is recorded as a failed push like any other.
+        """
+        if branch.startswith("-") or not branch:
+            return RemoteProbe("error", empty=False, message=f"{branch!r} is not a branch name")
+        with tempfile.TemporaryDirectory(prefix="blpl-write-probe-") as tmp:
+            try:
+                subprocess.run(["git", "init", "-q", tmp], capture_output=True, check=True, timeout=30)
+                tree = subprocess.run(
+                    ["git", "hash-object", "-t", "tree", "-w", "--stdin"], cwd=tmp, input="",
+                    capture_output=True, text=True, check=True, timeout=30,
+                ).stdout.strip()
+                ref = f"refs/heads/{branch}"
+                proc = subprocess.run(
+                    # --dry-run and --force together, always: see the docstring.
+                    ["git", "push", "--dry-run", "--force", "--porcelain", "--", url, f"{tree}:{ref}"],
+                    cwd=tmp, capture_output=True, text=True, check=False,
+                    timeout=self.PROBE_TIMEOUT, env=net,
+                )
+            except subprocess.TimeoutExpired:
+                return RemoteProbe("error", empty=False, message=_PROBE_TIMED_OUT)
+            except subprocess.CalledProcessError as exc:
+                return RemoteProbe(
+                    "error", empty=False,
+                    message=_redact_text(f"could not prepare the write check: {exc.stderr or exc}"),
+                )
+        if proc.returncode == 0:
+            return None
+        err = _redact_text((proc.stderr or proc.stdout).strip())
+        low = err.lower()
+        if any(s in low for s in _AUTH_FAILURES + _WRITE_REFUSALS):
+            return RemoteProbe("read_only", empty=False, message=err)
+        return RemoteProbe("error", empty=False, message=err)
 
     def _require(self, name: str) -> Path:
         d = self.project_dir(name)
@@ -1043,13 +1270,18 @@ class Projects:
         # `env` is extra environment for this one invocation — a leased
         # credential, never a stored one. Merged over the process environment
         # rather than replacing it, because git needs PATH and HOME too.
+        if args and args[0] == "commit" and not (env or {}).get("GIT_AUTHOR_EMAIL"):
+            # A commit with no identity of its own would take the machine's
+            # git config — a developer's on a workstation, nothing (and a
+            # failure) in the container. Refused the same way everywhere.
+            raise ProjectError(_no_identity())
         proc = subprocess.run(
             ["git", *args],
             cwd=str(cwd),
             capture_output=True,
             text=True,
             check=False,
-            timeout=300,
+            timeout=self.GIT_TIMEOUT,
             env={**os.environ, **env} if env else None,
         )
         if proc.returncode != 0:
@@ -1078,6 +1310,90 @@ class Projects:
             ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False, timeout=120
         )
         return proc.stdout
+
+
+# What earlier versions wrote into a repository's config when nothing else
+# resolved. Kept here only so it can be recognised and removed; nothing writes
+# it any more. test_commit_identity fails on the address anywhere in the
+# backend's source except this one line.
+_PLACEHOLDER_NAME = "BLPL"
+_PLACEHOLDER_EMAIL = "blpl@localhost"  # recognised, never written
+
+
+def _no_identity() -> str:
+    from .gitidentity import NO_IDENTITY
+
+    return NO_IDENTITY
+
+
+_PROBE_TIMED_OUT = "the remote did not answer within 60 seconds"
+
+# What a server says, lowercased, when it lets a credential read but not push:
+# a 403 on receive-pack over HTTPS, a service it will not run for this user,
+# a provider's own "denied". Checked alongside _AUTH_FAILURES.
+_WRITE_REFUSALS = (
+    "returned error: 403",
+    "service not enabled",
+    "not allowed to push",
+    "denied",
+    "write access",
+    "read-only",
+    "read only",
+)
+
+
+@dataclass(frozen=True)
+class RemoteProbe:
+    """What probing a remote found. Reading and writing are separate facts.
+
+    ``status`` is the one-word summary for the UI; ``readable`` and ``empty``
+    come from ls-remote and ``writable`` from the write check, each kept on
+    its own. They used to share ``status``, so a write refusal replaced the
+    read result: a non-empty repository the credential could only read came
+    back as ``read_only`` with ``empty`` unset, and creation — which checked
+    emptiness only for ``ok`` — made a project whose history diverged from
+    the remote's at once (Codex, PR #19).
+    """
+
+    #: ok | auth_failed | not_found | read_only | error
+    status: str
+    #: The remote holds no refs at all. Meaningful only when it was readable.
+    empty: bool
+    message: str
+    #: ls-remote succeeded. None means "not recorded" (results built by hand,
+    #: as some tests do), read as status == "ok".
+    readable: bool | None = None
+    #: The write check passed (True), refused (False), or did not run (None).
+    writable: bool | None = None
+
+    @property
+    def can_read(self) -> bool:
+        return self.readable if self.readable is not None else self.status == "ok"
+
+
+# Substrings of git's stderr, lowercased, that mean the credential was the
+# problem — over HTTPS (401/403, "authentication failed", a prompt git was told
+# not to show) and over SSH ("permission denied (publickey)"). A provider that
+# answers 404 for a private repository the token cannot see lands in not-found
+# below, which is also what it is from where the user stands.
+_AUTH_FAILURES = (
+    "authentication failed",
+    "could not read username",
+    "could not read password",
+    "terminal prompts disabled",
+    "permission denied",
+    "invalid username or password",
+    "http basic: access denied",
+    "the requested url returned error: 401",
+    "the requested url returned error: 403",
+)
+_NOT_FOUND = (
+    "repository not found",
+    "not found",
+    "does not appear to be a git repository",
+    "the requested url returned error: 404",
+    "no such file or directory",
+)
 
 
 def _porcelain_status(xy: str) -> str:

@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import enqueue_only, give_endpoint, queued_env, sign_in
+from conftest import enqueue_only, give_endpoint, queued_env, sign_in, init_body
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -55,7 +55,7 @@ def test_one_users_key_does_not_let_another_user_run(configured, second_user):
     than "you have no key". Both are refusals; the 404 is the better one,
     because it does not confirm the project exists."""
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-mine"})
-    configured.post("/api/projects/init", json={"name": "scratch"})
+    configured.post("/api/projects/init", json=init_body("scratch"))
 
     assert second_user.post("/api/projects/scratch/stages/stage1").status_code == 404
 
@@ -66,7 +66,7 @@ def test_the_servers_environment_is_not_a_fallback(configured, monkeypatch):
     not brought their own."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-operators-key")
     monkeypatch.setenv("BLPL_LLM_KEY__ANTHROPIC", "sk-operators-key")
-    configured.post("/api/projects/init", json={"name": "scratch"})
+    configured.post("/api/projects/init", json=init_body("scratch"))
 
     refused = configured.post("/api/projects/scratch/stages/stage1")
     assert refused.status_code == 400
@@ -79,7 +79,7 @@ def test_a_stored_key_reaches_the_stage_subprocess(configured, monkeypatch):
 
 
     configured.put("/api/settings/secrets/anthropic", json={"value": "sk-mine"})
-    configured.post("/api/projects/init", json={"name": "scratch"})
+    configured.post("/api/projects/init", json=init_body("scratch"))
 
     enqueue_only(configured, "/api/projects/scratch/stages/stage1")
 

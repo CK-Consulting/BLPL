@@ -6,6 +6,7 @@ import json
 import subprocess
 
 import pytest
+from conftest import init_body
 
 BENIGN = (
     b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
@@ -38,7 +39,7 @@ def _git(cwd, *args):
 def test_each_file_gets_its_own_verdict_and_lands_by_kind(unlocked):
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     r = _upload(unlocked, [
         ("ds.pdf", BENIGN, {"kind": "datasheet", "mpn": "TPS62840"}),
         ("guide.pdf", BENIGN + b"%guide\n", {"kind": "reference"}),
@@ -61,7 +62,7 @@ def test_each_file_gets_its_own_verdict_and_lands_by_kind(unlocked):
 
 
 def test_llm_ignore_at_upload_puts_the_file_on_the_list_and_the_tree_says_so(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     r = _upload(unlocked, [("drawing.pdf", BENIGN, {"kind": "reference", "llm_ignore": True})])
     assert r.json()["results"][0]["llm_ignore"] is True
 
@@ -72,7 +73,7 @@ def test_llm_ignore_at_upload_puts_the_file_on_the_list_and_the_tree_says_so(unl
 
 
 def test_the_ignore_list_can_be_changed_after_upload(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _upload(unlocked, [("drawing.pdf", BENIGN, {"kind": "reference"})])
 
     r = unlocked.put("/api/projects/mine/llm-ignore", json={"path": "references/drawing.pdf", "ignored": True})
@@ -83,13 +84,13 @@ def test_the_ignore_list_can_be_changed_after_upload(unlocked):
 
 
 def test_the_ignore_list_refuses_a_path_outside_the_project(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     r = unlocked.put("/api/projects/mine/llm-ignore", json={"path": "../../etc/passwd", "ignored": True})
     assert r.status_code in (400, 404)
 
 
 def test_the_ledger_records_who_uploaded_what(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     _upload(unlocked, [("evil.pdf", PHONES_HOME, {"kind": "reference"})])
     q = unlocked.get("/api/projects/mine/quarantine").json()
     assert q["summary"]["held"] == 1
@@ -102,7 +103,7 @@ def test_a_file_over_the_cap_is_rejected_and_the_rest_still_land(unlocked, monke
     import app.main as main
 
     monkeypatch.setattr(main, "UPLOAD_MAX_BYTES", 64)
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     r = _upload(unlocked, [
         ("big.bin", b"x" * 65, {"kind": "reference"}),
         ("small.txt", b"ok\n", {"kind": "reference"}),
@@ -113,7 +114,7 @@ def test_a_file_over_the_cap_is_rejected_and_the_rest_still_land(unlocked, monke
 
 
 def test_a_request_without_a_kind_per_file_is_refused(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     r = unlocked.post(
         "/api/projects/mine/uploads",
         files=[("files", ("a.txt", b"a", "text/plain"))],
@@ -132,7 +133,7 @@ def test_a_members_upload_lands_and_is_committed_in_their_own_worktree(unlocked,
     import app.main as main
     from app import worktrees
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
     inv = second_user.get("/api/invitations").json()[0]["id"]
     second_user.post(f"/api/invitations/{inv}/accept")
@@ -146,7 +147,7 @@ def test_a_members_upload_lands_and_is_committed_in_their_own_worktree(unlocked,
 
 
 def test_a_non_member_cannot_upload(unlocked, second_user):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     r = _upload(second_user, [("a.txt", b"a", {"kind": "reference"})])
     assert r.status_code == 404
 
@@ -154,7 +155,7 @@ def test_a_non_member_cannot_upload(unlocked, second_user):
 def test_an_uploaded_filename_cannot_escape_or_hide(unlocked):
     import app.main as main
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     r = _upload(unlocked, [
         ("../../../escape.md", b"a\n", {"kind": "reference"}),
         (".hidden.md", b"b\n", {"kind": "reference"}),
@@ -172,7 +173,7 @@ def test_an_uploaded_filename_cannot_escape_or_hide(unlocked):
 ])
 def test_an_uploaded_active_file_is_served_as_an_opaque_download(unlocked, name, data):
     """Inline on this origin, an uploaded HTML or SVG would run with the viewer's session."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     path = _upload(unlocked, [(name, data, {"kind": "reference"})]).json()["results"][0]["path"]
     r = unlocked.get("/api/projects/mine/blob", params={"path": path})
     assert r.status_code == 200
@@ -182,7 +183,7 @@ def test_an_uploaded_active_file_is_served_as_an_opaque_download(unlocked, name,
 
 
 def test_passive_files_still_display_inline(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     results = _upload(unlocked, [
         ("guide.pdf", BENIGN, {"kind": "reference"}),
         ("notes.md", b"# hi\n", {"kind": "reference"}),

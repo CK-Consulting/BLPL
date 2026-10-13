@@ -10,7 +10,7 @@ import { createPortal } from "react-dom";
  * nothing. Here the error lands inside the dialog and the dialog stays open
  * until the action behind it has actually worked.
  */
-function Modal({
+export function Modal({
   onClose,
   busy,
   children,

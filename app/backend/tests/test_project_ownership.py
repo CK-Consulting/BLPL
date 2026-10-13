@@ -13,11 +13,11 @@ not a secret from them.
 
 from __future__ import annotations
 
-from conftest import sign_in
+from conftest import sign_in, init_body
 
 
 def _make(client, name="mine"):
-    assert client.post("/api/projects/init", json={"name": name}).status_code == 200
+    assert client.post("/api/projects/init", json=init_body(name)).status_code == 200
 
 
 # -- isolation ---------------------------------------------------------------
@@ -60,7 +60,7 @@ def test_the_name_space_is_shared_even_though_projects_are_not(unlocked, second_
     it, or the 404 rule above would be undone by the error text."""
     _make(unlocked, "baseboard")
 
-    clash = second_user.post("/api/projects/init", json={"name": "baseboard"})
+    clash = second_user.post("/api/projects/init", json=init_body("baseboard"))
     assert clash.status_code == 409
     assert "baseboard" not in second_user.get("/api/projects").text
     detail = clash.json()["detail"].lower()

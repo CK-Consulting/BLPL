@@ -14,6 +14,10 @@ from pathlib import Path
 import pytest
 
 from app import components
+from app.gitidentity import GitIdentity  # noqa: E402
+
+# Every commit is somebody's now; these are the tests'.
+IDENT = GitIdentity("Test", "test@example.com")
 
 
 @pytest.fixture()
@@ -22,7 +26,7 @@ def data(tmp_path: Path) -> Path:
 
 
 def _add(data: Path, uid: int, mpn: str, name: str = "datasheet.pdf", body: bytes = b"PDF") -> None:
-    components.add_document(data, uid, mpn, name, body)
+    components.add_document(data, uid, mpn, name, body, identity=IDENT)
 
 
 # -- finding ------------------------------------------------------------------
@@ -79,7 +83,7 @@ def _legacy_part(data: Path, uid: int, mpn: str) -> None:
     d = components.root(data, uid) / mpn
     d.mkdir(parents=True)
     components._git(d, "init", "-b", "main")
-    components._git(d, "commit", "--allow-empty", "-m", f"Component {mpn}")
+    components._commit(d, IDENT, "--allow-empty", "-m", f"Component {mpn}")
 
 
 def test_colliding_exact_records_prefer_the_literal_spelling(data) -> None:
@@ -160,7 +164,7 @@ def test_reads_under_a_variant_spelling_find_the_stored_record(data) -> None:
     """find() matches fuzzily, and then the caller reads with its own spelling.
     extraction() and documents() have to land on the record find() matched, or
     the advertised reuse never happens and the part is extracted again."""
-    components.save_extraction(data, 1, "BQ27441DRZR-G1A", {"pinout": [{"pin": 1, "name": "VDD"}]})
+    components.save_extraction(data, 1, "BQ27441DRZR-G1A", {"pinout": [{"pin": 1, "name": "VDD"}]}, identity=IDENT)
     got = components.extraction(data, 1, "bq27441drzr g1a")
     assert got is not None and got["pinout"][0]["name"] == "VDD"
     names = [d["name"] for d in components.documents(data, 1, "bq27441drzr g1a")]
@@ -184,7 +188,7 @@ def test_extraction_stages_a_held_datasheet_instead_of_redownloading(data, tmp_p
     from app.references import FilesystemSandbox, ReferenceManifest
 
     _add(data, 1, "PART9", "PART9-datasheet.pdf", b"PDF BYTES")
-    components.add_document(data, 1, "PART9", "footprints/L.pretty/A.kicad_mod", b"(fp)")
+    components.add_document(data, 1, "PART9", "footprints/L.pretty/A.kicad_mod", b"(fp)", identity=IDENT)
 
     class Library:
         def documents(self, mpn):
@@ -221,15 +225,15 @@ def test_a_footprint_keeps_the_library_name_in_its_path(data) -> None:
     library, so the shape has to survive storage."""
     components.add_document(
         data, 1, "BQ27441DRZR-G1A",
-        "footprints/Package_SON.pretty/Texas_VSON-12.kicad_mod", b"(footprint)",
+        "footprints/Package_SON.pretty/Texas_VSON-12.kicad_mod", b"(footprint)", identity=IDENT,
     )
     names = [d["name"] for d in components.documents(data, 1, "BQ27441DRZR-G1A")]
     assert "footprints/Package_SON.pretty/Texas_VSON-12.kicad_mod" in names
 
 
 def test_symbols_and_models_are_held_too(data) -> None:
-    components.add_document(data, 1, "X1", "symbols/Lib.kicad_symdir/X.kicad_sym", b"(sym)")
-    components.add_document(data, 1, "X1", "models/X.step", b"solid")
+    components.add_document(data, 1, "X1", "symbols/Lib.kicad_symdir/X.kicad_sym", b"(sym)", identity=IDENT)
+    components.add_document(data, 1, "X1", "models/X.step", b"solid", identity=IDENT)
     names = {d["name"] for d in components.documents(data, 1, "X1")}
     assert names == {"symbols/Lib.kicad_symdir/X.kicad_sym", "models/X.step"}
 
@@ -241,7 +245,7 @@ def test_a_loose_datasheet_still_sits_at_the_top(data) -> None:
 
 def test_the_part_count_sees_documents_in_subdirectories(data) -> None:
     _add(data, 1, "X1", "ds.pdf")
-    components.add_document(data, 1, "X1", "footprints/L.pretty/A.kicad_mod", b"(fp)")
+    components.add_document(data, 1, "X1", "footprints/L.pretty/A.kicad_mod", b"(fp)", identity=IDENT)
     assert components.parts(data, 1)[0]["documents"] == 2
 
 
@@ -253,14 +257,14 @@ def test_the_part_count_sees_documents_in_subdirectories(data) -> None:
 ])
 def test_a_document_cannot_escape_its_part(data, name) -> None:
     with pytest.raises(components.ComponentError):
-        components.add_document(data, 1, "X1", name, b"x")
+        components.add_document(data, 1, "X1", name, b"x", identity=IDENT)
 
 
 def test_an_unlisted_subdirectory_is_refused(data) -> None:
     """A small allowlist, not arbitrary nesting: enough shape to hold what KiCad
     needs and nothing else."""
     with pytest.raises(components.ComponentError, match="bare filename or sit under"):
-        components.add_document(data, 1, "X1", "secrets/thing.pdf", b"x")
+        components.add_document(data, 1, "X1", "secrets/thing.pdf", b"x", identity=IDENT)
 
 
 @pytest.mark.parametrize("name", [
@@ -277,13 +281,13 @@ def test_a_path_kicad_cannot_resolve_is_refused(data, name) -> None:
     KiCad's Lib:Name lookup cannot see it — accepted-but-unresolvable is worse
     than refused."""
     with pytest.raises(components.ComponentError, match="asset shape"):
-        components.add_document(data, 1, "X1", name, b"x")
+        components.add_document(data, 1, "X1", name, b"x", identity=IDENT)
 
 
 def test_replacing_a_document_in_a_subdirectory_is_a_revision(data) -> None:
     """The point of a part being a repository — the previous bytes stay readable
     at their commit rather than being overwritten."""
     rel = "footprints/L.pretty/A.kicad_mod"
-    first = components.add_document(data, 1, "X1", rel, b"(fp v1)")
-    second = components.add_document(data, 1, "X1", rel, b"(fp v2)")
+    first = components.add_document(data, 1, "X1", rel, b"(fp v1)", identity=IDENT)
+    second = components.add_document(data, 1, "X1", rel, b"(fp v2)", identity=IDENT)
     assert first["commit"] != second["commit"] and second["changed"]

@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import sign_in
+from conftest import sign_in, init_body
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -91,7 +91,7 @@ def _key_rows(project_name: str):
 
 
 def test_creating_a_project_mints_a_key_granted_to_its_owner(unlocked):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
 
     rows = _key_rows("mine")
     assert len(rows) == 1
@@ -102,7 +102,7 @@ def test_creating_a_project_mints_a_key_granted_to_its_owner(unlocked):
 def test_inviting_wraps_the_key_before_acceptance(unlocked, second_user):
     """Sealed while the owner is unlocked and present, so acceptance needs
     nothing further from them."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
 
     # Two grants already, though the invitee is not yet a member.
@@ -119,7 +119,7 @@ def test_both_members_end_up_with_the_same_project_key(unlocked, second_user):
     from app import grants
     from app.models import Project, User
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
     inv = second_user.get("/api/invitations").json()[0]["id"]
     second_user.post(f"/api/invitations/{inv}/accept")
@@ -141,7 +141,7 @@ def test_both_members_end_up_with_the_same_project_key(unlocked, second_user):
 
 def test_declining_gives_the_key_back(unlocked, second_user):
     """Saying no should leave you with no more than before the offer arrived."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
     assert len(_key_rows("mine")) == 2
 
@@ -152,7 +152,7 @@ def test_declining_gives_the_key_back(unlocked, second_user):
 
 
 def test_withdrawing_an_invitation_takes_the_key_back(unlocked, second_user):
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
     inv = second_user.get("/api/invitations").json()[0]["id"]
 
@@ -165,7 +165,7 @@ def test_removing_a_member_takes_the_key_back(unlocked, second_user):
     """Stops them reading anything sealed from now on. It cannot unread what they
     already had — rotating the project key is the stronger answer, and is
     deliberately manual because it means rewriting every encrypted artefact."""
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     unlocked.post("/api/projects/mine/members", json={"email": "other@example.com"})
     inv = second_user.get("/api/invitations").json()[0]["id"]
     second_user.post(f"/api/invitations/{inv}/accept")
@@ -189,7 +189,7 @@ def test_a_private_key_cannot_be_moved_between_users(unlocked):
     import app.main as main
     import app.unlock as unlock_mod
 
-    unlocked.post("/api/projects/init", json={"name": "mine"})
+    unlocked.post("/api/projects/init", json=init_body("mine"))
     master = main.unlocked.get(unlock_mod.session_key_for("user_test", {}))
 
     with app.db.SessionFactory() as s:

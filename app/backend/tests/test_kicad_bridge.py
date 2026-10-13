@@ -15,6 +15,9 @@ import pytest
 
 from app.agent import kicad_bridge as kb
 from app.agent.mcp_client import MCPTool
+from app.gitidentity import GitIdentity
+
+WHO = GitIdentity("Board Editor", "editor@example.com")
 
 
 @pytest.fixture
@@ -129,7 +132,7 @@ def test_reads_are_free_and_writes_are_not(monkeypatch) -> None:
 
 
 def test_a_snapshot_survives_edits_and_restores_them(git_project) -> None:
-    commit = kb.snapshot(git_project)
+    commit = kb.snapshot(git_project, WHO)
     assert commit
 
     (git_project / "board.kicad_pcb").write_text("(kicad_pcb ruined by routing)\n", encoding="utf-8")
@@ -144,17 +147,30 @@ def test_the_snapshot_leaves_no_trace_in_history(git_project) -> None:
     before = subprocess.run(
         ["git", "log", "--oneline"], cwd=git_project, capture_output=True, text=True
     ).stdout
-    kb.snapshot(git_project)
+    kb.snapshot(git_project, WHO)
     after = subprocess.run(
         ["git", "log", "--oneline"], cwd=git_project, capture_output=True, text=True
     ).stdout
     assert before == after
 
 
+def test_the_snapshot_is_signed_by_the_user_whose_turn_made_it(git_project) -> None:
+    # It borrowed the placeholder identity BLPL used to write into every
+    # repository's config. That is gone; the turn's user signs it instead.
+    from app.gitidentity import GitIdentity
+
+    commit = kb.snapshot(git_project, GitIdentity("Board Editor", "editor@example.com"))
+    who = subprocess.run(
+        ["git", "log", "-1", "--format=%an <%ae>|%cn <%ce>", commit],
+        cwd=git_project, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert who == "Board Editor <editor@example.com>|Board Editor <editor@example.com>"
+
+
 def test_a_project_without_git_still_works_it_just_has_no_undo(tmp_path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
-    assert kb.snapshot(plain) is None
+    assert kb.snapshot(plain, WHO) is None
     ok, _ = kb.restore(plain)
     assert not ok
 
@@ -181,3 +197,65 @@ def test_highlight_needs_something_to_point_at(tmp_path) -> None:
 
     with pytest.raises(ToolDenied):
         asyncio.run(spec.handler(ctx, {}))
+
+
+def test_no_identity_means_no_snapshot_not_someone_elses(git_project) -> None:
+    # Codex P2 on #19. The fixture repository has a repo-local identity
+    # (t <t@t>). With no identity resolved for the user, commit-tree fell back
+    # to it and signed the anchor as that person. Now nothing is made.
+    commit = kb.snapshot(git_project, None)
+    assert commit is None
+    refs = subprocess.run(
+        ["git", "for-each-ref", "refs/blpl/"], cwd=git_project, capture_output=True, text=True
+    ).stdout
+    assert refs.strip() == ""
+
+
+def test_a_bulk_autoroute_is_anchored_with_the_users_identity_and_can_be_reverted(
+    git_project, monkeypatch
+) -> None:
+    # Codex P1 on #19: the bulk router called snapshot() without the turn's
+    # identity, which since the no-identity guard meant no anchor at all —
+    # the largest change anything makes to a board, with nothing to revert to.
+    import asyncio
+
+    from blpl.core import autoroute
+
+    from app.agent.registry import _bulk_route
+    from app.agent.toolspec import ToolContext
+    from app.references import FilesystemSandbox, ReferenceManifest
+
+    pcb = git_project / "board.kicad_pcb"
+
+    class Routed:
+        def to_dict(self):
+            return {"ok": True}
+
+    def route(path, passes=10):
+        path.write_text("(kicad_pcb routed by the autorouter)\n", encoding="utf-8")
+        return Routed()
+
+    monkeypatch.setattr(autoroute, "available", lambda: (True, ""))
+    monkeypatch.setattr(autoroute, "route", route)
+    ctx = ToolContext(
+        project_id="board",
+        project_dir=git_project,
+        sandbox=FilesystemSandbox(
+            manifest=ReferenceManifest.empty(project_id="board", workspace_root=git_project)
+        ),
+        git_identity=WHO,
+    )
+    asyncio.run(_bulk_route(ctx, {}))
+
+    anchor = ctx.extras["kicad_snapshot"]
+    assert anchor and anchor != "none"
+    who = subprocess.run(
+        ["git", "log", "-1", "--format=%an <%ae>", anchor],
+        cwd=git_project, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert who == "Board Editor <editor@example.com>"
+    assert pcb.read_text() == "(kicad_pcb routed by the autorouter)\n"
+
+    ok, detail = kb.restore(git_project)
+    assert ok, detail
+    assert pcb.read_text() == "(kicad_pcb original)\n"

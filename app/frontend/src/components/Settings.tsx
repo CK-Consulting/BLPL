@@ -9,6 +9,7 @@ import {
   putJSON,
 } from "../api";
 import { PasskeyInfo, enrolPasskey, passkeysAvailable } from "../passkey";
+import { CommitIdentitySettings } from "./GitSetup";
 
 /**
  * Where you declare *where* requests go and *which job* each endpoint serves.
@@ -24,7 +25,7 @@ import { PasskeyInfo, enrolPasskey, passkeysAvailable } from "../passkey";
  * model, and datasheet extraction must be able to see."
  */
 
-type SectionId = "endpoints" | "routing" | "git" | "security";
+type SectionId = "endpoints" | "routing" | "git" | "identity" | "security";
 
 // Labels say what the section holds, not the mechanism inside it — "Data
 // security" rather than "Passkeys" because you go looking for where the lock
@@ -34,6 +35,7 @@ const SECTIONS: { id: SectionId; label: string }[] = [
   { id: "endpoints", label: "AI model providers/endpoints" },
   { id: "routing", label: "Task routing" },
   { id: "git", label: "Git endpoints/accounts" },
+  { id: "identity", label: "Commit identity" },
   { id: "security", label: "Data security" },
 ];
 
@@ -101,6 +103,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
             <Routing data={data} onChanged={refresh} onError={setError} />
           )}
           {tab === "git" && <GitEndpoints onError={setError} />}
+          {tab === "identity" && <CommitIdentitySettings onError={setError} />}
           {tab === "security" && <Passkeys onError={setError} />}
         </div>
       </div>
