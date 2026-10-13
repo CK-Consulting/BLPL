@@ -1313,3 +1313,45 @@ def test_phase4_a_backend_without_the_mount_reaches_a_project_through_its_worksp
                           "--format=%an"], capture_output=True, text=True).stdout
     assert log.strip() == "Ada Lovelace"
     assert (real / ".worktrees" / project / "u2").is_dir()
+
+
+def test_phase4_a_never_started_first_attempt_is_run_not_reported(env):
+    """Codex, PR #20: the first worker died between create and start. Docker
+    reports that container as `created`, StartedAt at its zero time and
+    ExitCode 0. The retry must run the command, not follow nothing and record
+    a success."""
+    from dataclasses import replace
+
+    from app.sandbox.docker import build_create_body, has_started, observed_exit
+
+    projects = env.tmp / "projects"
+    proj = projects / f"itest-{env.tag}-created"
+    proj.mkdir(parents=True)
+    for d in (env.tmp, projects):
+        os.chmod(d, 0o755)
+    os.chmod(proj, 0o777)
+    base = env.spec("created")
+    spec = replace(base, key=WorkspaceKey(base.key.project, role="run", member="run_99"),
+                   storage=Mount(kind="bind", source=str(proj), target="/workspace"), command=())
+    argv = ["sh", "-c", "echo ran >> /workspace/runs; exit 3"]
+
+    async def scenario():
+        driver = DockerDriver(env.config(f"unix://{SOCK}"))
+        try:
+            body = build_create_body(replace(spec, command=tuple(argv)), driver.cfg)
+            name = spec.key.container_name()
+            await driver._req("POST", "/containers/create", params={"name": name},
+                              json=body, ok=(201,))
+            # The first worker "dies" here, before /start. What Docker says:
+            st = (await driver._req("GET", f"/containers/{name}/json")).json()["State"]
+            assert st["Status"] == "created" and st["StartedAt"].startswith("0001-01-01")
+            assert st["ExitCode"] == 0 and not has_started(st) and observed_exit(st) == -1
+            out: list[bytes] = []
+            res = await driver.run_container(spec, argv, on_output=lambda s, b: out.append(b))
+            assert res.exit_code == 3, "the run's own exit code, not Docker's default"
+            assert (proj / "runs").read_text() == "ran\n", "the command never ran"
+            assert (await driver.status(spec.key)).state is State.ABSENT
+        finally:
+            await driver.aclose()
+
+    asyncio.run(scenario())

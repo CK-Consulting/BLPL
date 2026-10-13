@@ -128,6 +128,35 @@ def labels_for(key: WorkspaceKey, cfg: DockerConfig) -> dict[str, str]:
     return labels
 
 
+# Container states a retry may follow rather than replace: it ran, and is
+# running or has finished. `created` never ran; `dead` and `removing` are
+# Docker failing to clean up, and say nothing reliable about the run.
+_FOLLOWABLE = ("running", "paused", "restarting", "exited")
+
+
+def _set(when: object) -> bool:
+    return isinstance(when, str) and bool(when) and not when.startswith("0001-01-01")
+
+
+def has_started(state: dict) -> bool:
+    """Whether Docker records this container as ever having started."""
+    return _set(state.get("StartedAt"))
+
+
+def observed_exit(state: dict) -> int:
+    """The exit code of a container that started and then exited, or -1.
+
+    Docker reports ExitCode 0 for a container that never ran, so the code is
+    trusted only with the evidence that it is one: the container started,
+    finished, and is `exited` without an error. Anything less is a failure,
+    never a success."""
+    if (state.get("Status") != "exited" or not has_started(state)
+            or not _set(state.get("FinishedAt")) or state.get("Error")
+            or not isinstance(state.get("ExitCode"), int)):
+        return -1
+    return int(state["ExitCode"])
+
+
 def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig) -> dict[str, Any]:
     """The exact ``POST /containers/create`` body for a workspace.
 
@@ -494,8 +523,17 @@ class DockerDriver:
         # the top of its output, rather than killed and started again, which
         # would redo its work and pay for its model calls twice. A different
         # command under this run's name is a stale container: it goes.
-        reattach = orphan is not None and list((orphan.get("Config") or {}).get("Cmd") or []) \
-            == list(argv)
+        #
+        # Only one that actually started (Codex, PR #20). A worker that died
+        # between create and start leaves a container that is `created`, with
+        # StartedAt at Docker's zero time and ExitCode 0 by default: following
+        # it read an empty log and recorded a run that never ran as a success.
+        # One that never started is removed and created afresh, with this
+        # attempt's environment.
+        reattach = (orphan is not None
+                    and list((orphan.get("Config") or {}).get("Cmd") or []) == list(argv)
+                    and has_started(orphan.get("State") or {})
+                    and (orphan.get("State") or {}).get("Status") in _FOLLOWABLE)
         if orphan is not None and not reattach:
             await self._req("DELETE", f"/containers/{orphan['Id']}",
                             params={"force": "true"}, ok=(204, 404))
@@ -529,7 +567,7 @@ class DockerDriver:
             for _ in range(100):
                 st = (await self._req("GET", f"/containers/{name}/json")).json()["State"]
                 if not st.get("Running"):
-                    return ExecResult(exit_code=int(st.get("ExitCode", -1)))
+                    return ExecResult(exit_code=observed_exit(st))
                 await asyncio.sleep(0.1)
             raise DriverError(f"{name} still running after its output ended")
         finally:

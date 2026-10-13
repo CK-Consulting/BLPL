@@ -551,3 +551,24 @@ def test_a_run_containers_egress_credential_reaches_that_run_only(tmp_path):
     assert {k: d.calls[0].env[k] for k in grant} == grant
     # The workspace container itself carries no credential.
     assert "g-1" not in json.dumps(dict(jobs.spec_for(cfg(tmp_path), "pathfinder").env))
+
+
+def test_a_first_attempt_that_never_started_is_run_again_not_followed(tmp_path):
+    """The fake driver models Docker's `created` as STARTING: the retry runs
+    the command and records its own result."""
+    from app.sandbox.driver import State
+    from app.sandbox.fake import _Box
+
+    d = FakeDriver(script=lambda call: (5, [("stdout", b"ran\n")]))
+    spec = jobs.run_spec_for(cfg(tmp_path), "pathfinder", "r")
+    d.boxes[spec.key] = _Box(spec, State.STARTING, "run-old", argv=["x"], outcome=(0, []))
+
+    async def poll():
+        return "running"
+
+    lines: list[str] = []
+    code = asyncio.run(jobs.run_job_in_container(
+        d, cfg(tmp_path), project_name="pathfinder", run_id="r", cmd=["x"], env={},
+        log=lines.append, poll=poll))
+    assert code == 5 and "ran\n" in "".join(lines)
+    assert ("remove_orphan", spec.key) in d.ops and ("reattach", spec.key) not in d.ops

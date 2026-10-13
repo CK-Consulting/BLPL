@@ -33,6 +33,14 @@ LIB = Mount(kind="bind", source="/srv/blpl/kicad-symbols", target="/app/kicad-sy
             read_only=True)
 
 
+
+# Container states as Docker reports them: a run that started, and one that
+# started and then exited.
+RUNNING = {"Status": "running", "Running": True, "StartedAt": "2026-10-13T10:00:00Z",
+           "FinishedAt": "0001-01-01T00:00:00Z"}
+EXITED = {"Status": "exited", "Running": False, "ExitCode": 0, "Error": "",
+          "StartedAt": "2026-10-13T10:00:00Z", "FinishedAt": "2026-10-13T10:00:05Z"}
+
 def spec(key: WorkspaceKey = KEY, **kw) -> WorkspaceSpec:
     kw.setdefault("image", "blpl-workspace:dev")
     kw.setdefault("libraries", (LIB,))
@@ -464,7 +472,7 @@ def test_docker_retry_removes_the_labelled_orphan_before_creating():
     rs = _run_spec("run_9")
     body = build_create_body(rs, DockerConfig())
     daemon.containers[rs.key.container_name()] = {
-        "Id": "o" * 64, "Config": {"Labels": body["Labels"]}, "State": {"Status": "running"}}
+        "Id": "o" * 64, "Config": {"Labels": body["Labels"]}, "State": RUNNING}
     calls = []
     orig = daemon.handler
 
@@ -476,7 +484,7 @@ def test_docker_retry_removes_the_labelled_orphan_before_creating():
             name = request.url.path.split("/")[-2]
             box = daemon.containers.get(name)
             if box is not None:
-                box = {**box, "State": {"Running": False, "ExitCode": 0, "Status": "exited"}}
+                box = {**box, "State": EXITED}
                 return httpx.Response(200, json=box)
         return orig(request)
 
@@ -495,7 +503,7 @@ def test_docker_retry_refuses_a_foreign_container_under_the_runs_name():
         "Id": "f" * 64, "Config": {"Labels": {"blpl.managed": "true", "blpl.instance": "blpl",
                                               "blpl.role": "run", "blpl.project": "pathfinder",
                                               "blpl.member": "run_OTHER"}},
-        "State": {"Status": "running"}}
+        "State": RUNNING}
     with pytest.raises(NotOurs):
         run(driver_for(daemon).run_container(rs, ["x"]))
     assert rs.key.container_name() in daemon.containers
@@ -515,7 +523,7 @@ def test_docker_retry_follows_a_same_command_orphan_instead_of_starting_again():
     body = build_create_body(rs, DockerConfig())
     daemon.containers[rs.key.container_name()] = {
         "Id": "a" * 64, "Config": {"Labels": body["Labels"], "Cmd": ["x"]},
-        "State": {"Status": "running"}}
+        "State": RUNNING}
     calls = []
     orig = daemon.handler
 
@@ -527,7 +535,7 @@ def test_docker_retry_follows_a_same_command_orphan_instead_of_starting_again():
         if request.method == "GET" and request.url.path.endswith("/json") and "containers/" in request.url.path:
             box = daemon.containers.get(request.url.path.split("/")[-2])
             if box is not None:
-                return httpx.Response(200, json={**box, "State": {"Running": False, "ExitCode": 0}})
+                return httpx.Response(200, json={**box, "State": EXITED})
         return orig(request)
 
     d = DockerDriver(DockerConfig(), transport=httpx.MockTransport(handler))
@@ -537,3 +545,22 @@ def test_docker_retry_follows_a_same_command_orphan_instead_of_starting_again():
     assert ("POST", "containers/create") not in calls
     assert not any(m == "DELETE" and "a" * 64 in p and i < len(calls) - 1
                    for i, (m, p) in enumerate(calls))
+
+
+# -- what counts as evidence that a container ran (Codex, PR #20) --------------------
+
+
+def test_only_a_container_that_started_and_finished_reports_its_exit_code():
+    from app.sandbox.docker import has_started, observed_exit
+
+    never = {"Status": "created", "Running": False, "ExitCode": 0, "Error": "",
+             "StartedAt": "0001-01-01T00:00:00Z", "FinishedAt": "0001-01-01T00:00:00Z"}
+    done = {"Status": "exited", "Running": False, "ExitCode": 0, "Error": "",
+            "StartedAt": "2026-10-13T10:00:00.1Z", "FinishedAt": "2026-10-13T10:00:05.2Z"}
+    assert not has_started(never) and observed_exit(never) == -1
+    assert has_started(done) and observed_exit(done) == 0
+    assert observed_exit({**done, "ExitCode": 3}) == 3
+    for broken in ({**done, "FinishedAt": "0001-01-01T00:00:00Z"}, {**done, "Status": "dead"},
+                   {**done, "Error": "OCI runtime create failed"}, {**done, "StartedAt": ""},
+                   {k: v for k, v in done.items() if k != "ExitCode"}):
+        assert observed_exit(broken) == -1, broken
