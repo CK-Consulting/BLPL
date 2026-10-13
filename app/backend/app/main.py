@@ -3026,10 +3026,14 @@ def git_commit(project_id: str, body: CommitBody, user: User = Depends(require_o
     project = _project_or_404(session, user, project_id)
     checkout = _project_dir(session, user, project_id)
     try:
-        out = _commit_as(session, user, project, checkout, body.message, master_key)
+        out, scheduled = _commit_and_push(session, user, project, checkout, body.message, master_key)
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return {"ok": True, "committed": out is not None}
+    # auto_push: an automatic push of this commit is on its way, so the
+    # client's Commit + Push must not push it again. A second push of the same
+    # commit could block the dialog behind the lock, and a transient failure of
+    # it would overwrite the automatic push's success (Codex, PR #19).
+    return {"ok": True, "committed": out is not None, "auto_push": scheduled}
 
 
 @app.get("/api/projects/{project_id}/git/diff")
@@ -3837,16 +3841,31 @@ def _commit_as(
     dirty tree with neither raises the ProjectError that says where to set
     one. A push follows only a commit that happened.
     """
+    return _commit_and_push(session, user, project, checkout, message, master_key)[0]
+
+
+def _commit_and_push(
+    session: Session,
+    user: User,
+    project: Project,
+    checkout: Path,
+    message: str,
+    master_key: bytes | None,
+) -> tuple[str | None, bool]:
+    """``_commit_as``, also saying whether an automatic push was scheduled —
+    so a caller that would otherwise push itself (Commit + Push) does not
+    push the same commit a second time."""
     identity = gitidentity.resolve(session, user, project)
     out = projects.commit_checkout(checkout, message, identity=identity)
+    scheduled = False
     if out is not None:
-        _schedule_autopush(session, user, project, checkout, master_key)
-    return out
+        scheduled = _schedule_autopush(session, user, project, checkout, master_key)
+    return out, scheduled
 
 
 def _schedule_autopush(
     session: Session, user: User, project: Project, checkout: Path, master_key: bytes | None
-) -> None:
+) -> bool:
     """Push in the background after a commit, when the project's policy is auto.
 
     Everything that needs the request — the destination, the credential row —
@@ -3858,7 +3877,7 @@ def _schedule_autopush(
     including the things that fail before any push is attempted.
     """
     if project.push_policy != "auto":
-        return
+        return False
     from . import gitstore
 
     project_id, user_id, name = project.id, user.id, project.name
@@ -3876,7 +3895,7 @@ def _schedule_autopush(
         cred = autopush.snapshot(gitstore.for_remote(session, user, url))
     except (ProjectError, gitstore.GitStoreError) as exc:
         autopush.record(session, project_id, user_id, autopush.scrub(str(exc), []))
-        return
+        return False
 
     def job() -> None:
         # The outcome is recorded inside push_now, under the origin lock, so
@@ -3902,6 +3921,7 @@ def _schedule_autopush(
 
     sa_event.listen(session, "after_commit", submit, once=True)
     sa_event.listen(session, "after_rollback", submit, once=True)
+    return True
 
 
 #: Where automatic pushes run. A module attribute so the tests can swap in an

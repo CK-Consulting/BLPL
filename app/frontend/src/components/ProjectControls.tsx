@@ -84,7 +84,21 @@ export function ProjectSync({
   const commitAndPush = async (target: string, message: string) => {
     if (currentRef.current !== target) throw new Error("The project changed; nothing was committed.");
     setNote(null);
-    await postJSON(`/api/projects/${target}/git/commit`, { message });
+    const res = await postJSON<{ committed?: boolean; auto_push?: boolean }>(
+      `/api/projects/${target}/git/commit`,
+      { message },
+    );
+    if (res?.auto_push) {
+      // The project pushes after every commit and this one is already on its
+      // way. Pushing it again here was a second push of the same commit: it
+      // could hold the dialog behind the first, and a transient failure of it
+      // overwrote the first one's success (Codex, PR #19). The strip's push
+      // status reports how the automatic push went.
+      setNote("committed; pushing automatically");
+      await refresh();
+      onChanged();
+      return;
+    }
     // Asked fresh, not read from `st`: the status this render captured can
     // predate a remote added since, and then the push was skipped.
     const now = await getJSON<GitStatus>(`/api/projects/${target}/git/status`);

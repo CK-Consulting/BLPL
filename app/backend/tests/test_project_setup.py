@@ -548,3 +548,20 @@ def test_the_credential_for_a_remote_is_matched_the_way_a_push_matches_it(
 def test_a_half_typed_url_has_no_credential_and_no_error(unlocked):
     r = unlocked.post("/api/projects/credential-for", json={"url": "https://"})
     assert r.status_code == 200 and r.json()["credential"] is None
+
+
+def test_the_commit_route_says_when_an_automatic_push_is_on_its_way(unlocked, pushes):
+    # Codex P2 on #19: Commit + Push pushed again after the automatic push
+    # was scheduled. The response now says so, and the client skips its own.
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json=init_body("a", remote=bare_remote(), push_policy="auto"))
+    (main.PROJECTS_ROOT / "a" / "x.md").write_text("x\n")
+    r = unlocked.post("/api/projects/a/git/commit", json={"message": "m"}).json()
+    assert r["committed"] is True and r["auto_push"] is True
+    assert len(pushes.jobs) == 1
+
+    unlocked.post("/api/projects/init", json=init_body("m", remote=bare_remote()))
+    (main.PROJECTS_ROOT / "m" / "x.md").write_text("x\n")
+    r = unlocked.post("/api/projects/m/git/commit", json={"message": "m"}).json()
+    assert r["committed"] is True and r["auto_push"] is False

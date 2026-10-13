@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectSync } from "./ProjectControls";
 
 /** Git status for any project, and a record of every other request. */
-function mockGit() {
+function mockGit(commitReply: Record<string, unknown> = {}) {
   const calls: { method: string; url: string; body: unknown }[] = [];
   vi.stubGlobal(
     "fetch",
@@ -18,7 +18,8 @@ function mockGit() {
         );
       }
       calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
-      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      const reply = url.endsWith("/git/commit") ? commitReply : {};
+      return new Response(JSON.stringify(reply), { status: 200, headers: { "content-type": "application/json" } });
     }),
   );
   return calls;
@@ -50,6 +51,32 @@ describe("the commit dialog belongs to one project", () => {
   it("commits and pushes the project it was opened for", async () => {
     const user = userEvent.setup();
     const calls = mockGit();
+    render(<ProjectSync projectId="a" onChanged={() => {}} />);
+    await user.click(await screen.findByRole("button", { name: "Commit + Push" }));
+    const dialog = screen.getByRole("dialog", { name: "Commit and push" });
+    await user.click(within(dialog).getByRole("button", { name: "Commit + Push" }));
+    await waitFor(() => expect(calls.length).toBe(2));
+    expect(calls.map((c) => c.url)).toEqual(["/api/projects/a/git/commit", "/api/projects/a/git/push"]);
+  });
+});
+
+describe("Commit + Push on a project that pushes by itself", () => {
+  it("does not push a second time when the commit's push is already on its way", async () => {
+    // Codex P2 on #19: the dialog pushed again after the server had
+    // scheduled the automatic push of the same commit.
+    const user = userEvent.setup();
+    const calls = mockGit({ ok: true, committed: true, auto_push: true });
+    render(<ProjectSync projectId="a" onChanged={() => {}} />);
+    await user.click(await screen.findByRole("button", { name: "Commit + Push" }));
+    const dialog = screen.getByRole("dialog", { name: "Commit and push" });
+    await user.click(within(dialog).getByRole("button", { name: "Commit + Push" }));
+    expect(await screen.findByText("committed; pushing automatically")).toBeInTheDocument();
+    expect(calls.map((c) => c.url)).toEqual(["/api/projects/a/git/commit"]);
+  });
+
+  it("still pushes when the project pushes manually", async () => {
+    const user = userEvent.setup();
+    const calls = mockGit({ ok: true, committed: true, auto_push: false });
     render(<ProjectSync projectId="a" onChanged={() => {}} />);
     await user.click(await screen.findByRole("button", { name: "Commit + Push" }));
     const dialog = screen.getByRole("dialog", { name: "Commit and push" });
