@@ -138,11 +138,16 @@ def snapshot(project_dir: Path, identity=None) -> str | None:
 
     Still a commit, so still somebody's: ``identity`` is the user whose turn is
     editing the board, passed to git for this one call. It used to borrow the
-    placeholder identity written into the repository's config; with none given
-    and none configured, commit-tree fails and the caller reports that there is
-    no undo anchor, which is the truth.
+    placeholder identity written into the repository's config. With no
+    identity resolved, no snapshot is made at all: left to git, commit-tree
+    would sign it with whatever config the repository or machine holds — a
+    repo-local identity somebody set for themselves, say — authoring the
+    anchor as a person who did not make it (Codex, PR #19). The caller then
+    reports that there is no undo anchor, which is the truth.
     """
-    env = {**os.environ, **identity.env()} if identity is not None else None
+    if identity is None:
+        return None
+    env = {**os.environ, **identity.env()}
 
     def git(*args: str) -> str:
         return subprocess.run(

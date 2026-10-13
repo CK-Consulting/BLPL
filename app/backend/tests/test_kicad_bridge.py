@@ -15,6 +15,9 @@ import pytest
 
 from app.agent import kicad_bridge as kb
 from app.agent.mcp_client import MCPTool
+from app.gitidentity import GitIdentity
+
+WHO = GitIdentity("Board Editor", "editor@example.com")
 
 
 @pytest.fixture
@@ -129,7 +132,7 @@ def test_reads_are_free_and_writes_are_not(monkeypatch) -> None:
 
 
 def test_a_snapshot_survives_edits_and_restores_them(git_project) -> None:
-    commit = kb.snapshot(git_project)
+    commit = kb.snapshot(git_project, WHO)
     assert commit
 
     (git_project / "board.kicad_pcb").write_text("(kicad_pcb ruined by routing)\n", encoding="utf-8")
@@ -144,7 +147,7 @@ def test_the_snapshot_leaves_no_trace_in_history(git_project) -> None:
     before = subprocess.run(
         ["git", "log", "--oneline"], cwd=git_project, capture_output=True, text=True
     ).stdout
-    kb.snapshot(git_project)
+    kb.snapshot(git_project, WHO)
     after = subprocess.run(
         ["git", "log", "--oneline"], cwd=git_project, capture_output=True, text=True
     ).stdout
@@ -167,7 +170,7 @@ def test_the_snapshot_is_signed_by_the_user_whose_turn_made_it(git_project) -> N
 def test_a_project_without_git_still_works_it_just_has_no_undo(tmp_path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
-    assert kb.snapshot(plain) is None
+    assert kb.snapshot(plain, WHO) is None
     ok, _ = kb.restore(plain)
     assert not ok
 
@@ -194,3 +197,15 @@ def test_highlight_needs_something_to_point_at(tmp_path) -> None:
 
     with pytest.raises(ToolDenied):
         asyncio.run(spec.handler(ctx, {}))
+
+
+def test_no_identity_means_no_snapshot_not_someone_elses(git_project) -> None:
+    # Codex P2 on #19. The fixture repository has a repo-local identity
+    # (t <t@t>). With no identity resolved for the user, commit-tree fell back
+    # to it and signed the anchor as that person. Now nothing is made.
+    commit = kb.snapshot(git_project, None)
+    assert commit is None
+    refs = subprocess.run(
+        ["git", "for-each-ref", "refs/blpl/"], cwd=git_project, capture_output=True, text=True
+    ).stdout
+    assert refs.strip() == ""
