@@ -437,3 +437,88 @@ def test_a_run_in_its_own_container_still_holds_writes(ag, projects):
     c.run_mark("run_y", True, ttl=1.0)
     time.sleep(1.2)
     c.write(B(projects), "design.md", b"y")
+
+
+# -- worktree gitfiles and repository-controlled programs (Codex, PR #20) --------------------
+
+_IDENT_ENV = {"GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@b",
+              "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@b"}
+
+
+def _repo_with_member(projects: Path) -> Path:
+    board = projects / "board"
+    _git(board, "init", "-q", "-b", "main")
+    subprocess.run(["git", "-C", str(board), "commit", "-q", "--allow-empty", "-m", "init"],
+                   check=True, env={**os.environ, **_IDENT_ENV})
+    member = projects / ".worktrees" / "board" / "u9"
+    _git(board, "worktree", "add", "-q", "-b", "user/9", str(member))
+    return member
+
+
+def test_a_members_real_gitfile_is_accepted(ag, projects):
+    _, c, _ = ag
+    member = _repo_with_member(projects)
+    assert c.git_status(str(member))["branch"] == "user/9"
+
+
+def test_a_gitfile_pointing_anywhere_else_is_refused(ag, projects, tmp_path):
+    _, c, _ = ag
+    member = _repo_with_member(projects)
+    # A stage's work: a writable git directory with a hook, and the member's
+    # pointer aimed at it.
+    evil = projects / ".worktrees" / "board" / "u9" / "evilgit"
+    subprocess.run(["git", "init", "-q", "--bare", str(evil)], check=True)
+    (evil / "hooks" / "pre-commit").write_text("#!/bin/sh\ntouch /tmp/blpl-pwned\n")
+    os.chmod(evil / "hooks" / "pre-commit", 0o755)
+    real = (member / ".git").read_text()
+    (member / ".git").write_text(f"gitdir: {evil}\n")
+    for call in (lambda: c.git_status(str(member)),
+                 lambda: c.git_commit(str(member), "m", {"name": "a", "email": "a@b"})):
+        with pytest.raises(AgentCallError) as e:
+            call()
+        assert e.value.status == 403 and "refusing" in str(e.value)
+    # Another worktree's entry: right place, wrong back-pointer.
+    (member / ".git").write_text(real.replace("u9", "u7"))
+    with pytest.raises(AgentCallError):
+        c.git_status(str(member))
+    # A .git directory where a worktree should have a pointer.
+    (member / ".git").unlink()
+    (member / ".git").mkdir()
+    with pytest.raises(AgentCallError) as e:
+        c.git_status(str(member))
+    assert e.value.status == 403
+
+
+def test_repository_hooks_and_fsmonitor_never_run_in_the_agents_git(ag, projects, tmp_path,
+                                                                     monkeypatch):
+    _, c, _ = ag
+    board = projects / "board"
+    _git(board, "init", "-q", "-b", "main")
+    marker = tmp_path / "hook-ran"
+    hook = board / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    os.chmod(hook, 0o755)
+    ident = {"name": "a", "email": "a@b"}
+    # Control: without the hardening the hook does run, so the test can tell.
+    c.write(B(projects), "a.md", b"a")
+    c.git_commit(B(projects), "one", ident)
+    assert marker.exists()
+    marker.unlink()
+    monkeypatch.delenv("GIT_CONFIG_PARAMETERS", raising=False)
+    env = dict(os.environ)
+    agent_mod.harden_git_environment(env)
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", env["GIT_CONFIG_PARAMETERS"])
+    c.write(B(projects), "b.md", b"b")
+    assert c.git_commit(B(projects), "two", ident) is not None
+    assert not marker.exists()
+
+
+def test_without_a_credential_a_repository_credential_helper_is_cleared(ag):
+    agent, _, _ = ag
+    with agent._credential({}) as env:
+        assert env["GIT_CONFIG_KEY_0"] == "credential.helper" and env["GIT_CONFIG_VALUE_0"] == ""
+    hardened: dict = {}
+    agent_mod.harden_git_environment(hardened)
+    assert "'core.sshCommand'='ssh'" in hardened["GIT_CONFIG_PARAMETERS"]
+    agent_mod.harden_git_environment(hardened)  # idempotent
+    assert hardened["GIT_CONFIG_PARAMETERS"].count("hooksPath") == 1

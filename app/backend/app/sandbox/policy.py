@@ -338,6 +338,19 @@ def _project_dirs(policy: ProxyPolicy, project: str) -> set[str]:
     return out
 
 
+def _member_dir(policy: ProxyPolicy, project: str, source: str) -> bool:
+    """Whether source is one member's worktree of project:
+    <root>/.worktrees/<project>/<member>. A run container mounts each one on
+    its own (jobs.run_spec_for)."""
+    if not _PROJECT_NAME.fullmatch(project):
+        return False
+    for root in policy.project_bind_roots:
+        prefix = f"{root.rstrip('/')}/.worktrees/{project}/"
+        if root.rstrip("/") and source.startswith(prefix):
+            return bool(_PROJECT_NAME.fullmatch(source[len(prefix):]))
+    return False
+
+
 def _agent_dirs(policy: ProxyPolicy, container: str) -> set[str]:
     return {f"{r.rstrip('/')}/{container}" for r in policy.agent_dir_roots if r.rstrip("/")}
 
@@ -377,8 +390,11 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
             if got["ReadOnly"]:
                 git_dirs = {d + "/.git" for d in _project_dirs(policy, project)
                             if "/.worktrees/" not in d}
-                if not (_under_root(got["Source"], policy.ro_bind_roots)
-                        or got["Source"] in git_dirs):
+                src = got["Source"]
+                member_gitfile = (src.endswith("/.git")
+                                  and _member_dir(policy, project, src[:-len("/.git")]))
+                if not (_under_root(src, policy.ro_bind_roots)
+                        or src in git_dirs or member_gitfile):
                     raise Refused(f"{w}.Source {got['Source']} is not a permitted library root")
             elif role == "sealer" and got["Target"] == SEALER_TARGET and got["Source"] in {
                     r.rstrip("/") for r in policy.project_bind_roots if r.rstrip("/")}:
@@ -386,7 +402,8 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
             elif got["Source"] in _agent_dirs(policy, container):
                 if got["Target"] != AGENT_DIR:
                     raise Refused(f"{w}: an agent directory is mounted at {AGENT_DIR} only")
-            elif got["Source"] not in _project_dirs(policy, project):
+            elif got["Source"] not in _project_dirs(policy, project) and not _member_dir(
+                    policy, project, got["Source"]):
                 # Writable binds are the project's own checkouts and nothing
                 # else: not a library, not a sibling project, not a parent.
                 raise Refused(f"{w}: a writable bind must be this project's own directory "

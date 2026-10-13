@@ -836,3 +836,102 @@ def test_phase4_a_retried_run_kills_the_orphan_a_dead_worker_left(env):
 
     asyncio.run(scenario())
 
+
+def test_phase4_worktree_gitfiles_are_safe_from_stages_and_hooks_never_run(env):
+    """Codex, PR #20: a stage must not be able to repoint a member's .git file
+    at a git directory of its own (hooks included), the agent must refuse a
+    pointer that was tampered with anyway, and no repository hook may run in
+    the agent's git."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    if RUNTIME == "runsc" and (why := _runsc_host_uds()):
+        pytest.skip(why)
+    import secrets
+    import subprocess
+
+    from app.sandbox import jobs, workspaces
+    from app.sandbox.agentclient import AgentCallError
+    from app.sandbox.jobs import WorkspaceRunConfig
+
+    projects, agents = env.tmp / "projects", env.tmp / "agents"
+    project = f"itest-{env.tag}-gf"
+    proj = projects / project
+    proj.mkdir(parents=True)
+    agents.mkdir()
+    gitenv = {**os.environ, "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@b",
+              "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@b"}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(proj)], check=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-q", "--allow-empty", "-m", "init"],
+                   check=True, env=gitenv)
+    member = projects / ".worktrees" / project / "u9"
+    subprocess.run(["git", "-C", str(proj), "worktree", "add", "-q", "-b", "user/9", str(member)],
+                   check=True)
+    gitfile = (member / ".git").read_text()
+    marker = proj / "hook-ran"
+    hook = proj / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    os.chmod(hook, 0o755)
+    for d in (env.tmp, projects, agents):
+        os.chmod(d, 0o755)
+
+    psock = str(env.tmp / "proxy.sock")
+    policy = ProxyPolicy(
+        instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
+        project_bind_roots=(str(projects),), agent_dir_roots=(str(agents),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
+    )
+    cfg = WorkspaceRunConfig(image=WORKSPACE_IMAGE, projects_root=projects,
+                             host_projects_root=str(projects))
+    access = workspaces.Access(
+        run_cfg=cfg, agent_root=agents, host_agent_root=str(agents),
+        server_key=secrets.token_bytes(32),
+        driver_factory=lambda: DockerDriver(env.config(f"unix://{psock}")), ready_timeout_s=60)
+
+    async def poll():
+        return "running"
+
+    async def scenario():
+        upstream = UnixUpstream(SOCK)
+        server = await serve(DockerProxy(policy, upstream), psock)
+        driver = DockerDriver(env.config(f"unix://{psock}"))
+        try:
+            out: list[str] = []
+            script = (
+                f"echo 'gitdir: /tmp/evil' > {member}/.git 2>/dev/null; echo pointer=$?; "
+                f"mv {member} {member}.aside 2>/dev/null; echo move=$?; "
+                f"echo work > {member}/work.txt; echo write=$?"
+            )
+            code = await jobs.run_job_in_container(
+                driver, cfg, project_name=project, run_id="run-gf", cmd=["sh", "-c", script],
+                env={}, log=out.append, poll=poll, poll_every=5)
+            text = "".join(out)
+            assert code == 0, text
+            assert "pointer=0" not in text and "move=0" not in text, text
+            assert "write=0" in text and (member / "work.txt").read_text() == "work\n"
+            assert (member / ".git").read_text() == gitfile
+
+            c = await access.ensure(project)
+            try:
+                assert c.git_status(str(member))["branch"] == "user/9"
+                # As if a stage had got there first: the agent refuses it.
+                (member / ".git").write_text(f"gitdir: {member}/evilgit\n")
+                with pytest.raises(AgentCallError) as e:
+                    c.git_status(str(member))
+                assert e.value.status == 403
+                (member / ".git").write_text(gitfile)
+                # The owner's pre-commit hook is in place and never runs.
+                c.write(str(proj), "design.md", b"# d\n")
+                assert c.git_commit(str(proj), "edit", {"name": "a", "email": "a@b"})
+                assert not marker.exists(), "a repository hook ran in the agent's git"
+            finally:
+                c.close()
+        finally:
+            d = DockerDriver(env.config(f"unix://{psock}"))
+            await d.remove(access.spec(project).key)
+            await d.aclose()
+            await driver.aclose()
+            await upstream.aclose()
+            server.close()
+
+    asyncio.run(scenario())
