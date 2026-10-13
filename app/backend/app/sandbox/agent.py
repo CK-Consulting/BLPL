@@ -799,6 +799,11 @@ class Agent:
                 data, checkout, original_name=q.get("original_name", "upload"),
                 kind=q.get("kind", ""), uploaded_by=by, mpn=q.get("mpn", ""),
                 llm_ignore=q.get("llm_ignore") == "True",
+                # The control plane's policy, per request, as well as this
+                # container's environment: a workspace created before the
+                # policy was forwarded keeps the environment it started with,
+                # and must still hold what nothing scanned (Codex, PR #20).
+                insist_on_scan=q.get("require_scan") == "1",
             )
         except ValueError as e:
             raise AgentError(400, str(e)) from None

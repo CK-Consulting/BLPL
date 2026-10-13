@@ -59,7 +59,7 @@ from test_app_api import (  # noqa: E402,F401
 from test_git_endpoints import *  # noqa: E402,F401,F403
 from test_remote_urls import *  # noqa: E402,F401,F403
 from test_uploads_api import *  # noqa: E402,F401,F403
-from test_uploads_api import _no_scanner  # noqa: E402,F401
+from test_uploads_api import _no_scanner, _upload  # noqa: E402,F401
 
 TOKEN = "w" * 64
 
@@ -364,3 +364,22 @@ def test_sealing_goes_to_the_sealer_not_the_mount(client, monkeypatch):
     r = client.post("/api/projects/scratch/seal")
     assert r.status_code == 200 and r.json()["sealed"] is True
     assert calls == [("scratch", 32)]
+
+
+def test_an_upload_through_the_agent_carries_the_control_planes_scan_requirement(
+        unlocked, monkeypatch):
+    """The agent's own environment says no scan is needed (a workspace created
+    before the policy was forwarded); the control plane's says one is, and the
+    scanner cannot be reached. The file is held (Codex, PR #20)."""
+    import blpl.core.quarantine as quarantine
+
+    monkeypatch.setenv("BLPL_QUARANTINE_REQUIRE_SCAN", "1")
+    monkeypatch.setenv("BLPL_CLAMD_HOST", "clamav.invalid")
+    monkeypatch.delenv("BLPL_CLAMD_SOCKET", raising=False)
+    # Only the agent's side reads this; the control plane asks runpath.
+    monkeypatch.setattr(quarantine, "require_scan", lambda: False)
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    r = _upload(unlocked, [("notes.txt", b"vendor notes\n", {"kind": "reference"})])
+    assert r.status_code == 200, r.text
+    (res,) = r.json()["results"]
+    assert res["state"] == "held" and res["path"] is None
