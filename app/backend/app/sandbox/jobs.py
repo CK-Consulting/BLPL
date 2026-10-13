@@ -60,27 +60,52 @@ def enabled(env: Mapping[str, str] | None = None) -> bool:
     return env.get("BLPL_RUNS_IN_WORKSPACE", "") == "1"
 
 
+def _chain_key_names(chain: object) -> set[str]:
+    """The key variables one chain names (its entries' key_env)."""
+    out: set[str] = set()
+    for entry in chain if isinstance(chain, list) else []:
+        key_env = entry.get("key_env") if isinstance(entry, dict) else None
+        if isinstance(key_env, str) and key_env:
+            out.add(key_env)
+    return out
+
+
 def operation_inject(cmd: Sequence[str], job_env: Mapping[str, str]) -> dict[str, str]:
     """The secrets this one run needs, picked by name out of what was queued.
 
     Built from what the run is, not from what the environment happens to hold.
-    An LLM key reaches a run that carries an LLM chain, and only the keys that
-    chain names. Distributor credentials reach a run that includes Stage 8.
+    An LLM key reaches a run that carries an LLM chain, and only the keys the
+    run's chains name: the primary chain (HDM_LLM_CHAIN) and, for a range of
+    stages, the chain of every task in HDM_LLM_CHAINS. A pipeline run may route
+    stage0 and stage1 to different providers on purpose
+    (main._inject_llm_env_for_tasks), and dropping the task map silently ran
+    stage1 on the primary model, or failed it for a key it was never given.
+    Distributor credentials reach a run that includes Stage 8.
     """
     out: dict[str, str] = {}
     chain_raw = job_env.get("HDM_LLM_CHAIN")
-    if chain_raw:
+    chains_raw = job_env.get("HDM_LLM_CHAINS")
+    if chain_raw or chains_raw:
         for name in _LLM_FIXED:
             if name in job_env:
                 out[name] = job_env[name]
-        try:
-            chain = json.loads(chain_raw)
-        except json.JSONDecodeError:
-            chain = []
-        for entry in chain if isinstance(chain, list) else []:
-            key_env = entry.get("key_env") if isinstance(entry, dict) else None
-            if key_env and key_env in job_env:
-                out[key_env] = job_env[key_env]
+        names: set[str] = set()
+        if chain_raw:
+            try:
+                names |= _chain_key_names(json.loads(chain_raw))
+            except json.JSONDecodeError:
+                pass
+        if chains_raw:
+            out["HDM_LLM_CHAINS"] = chains_raw
+            try:
+                chains = json.loads(chains_raw)
+            except json.JSONDecodeError:
+                chains = {}
+            for chain in (chains.values() if isinstance(chains, dict) else []):
+                names |= _chain_key_names(chain)
+        for name in names:
+            if name in job_env:
+                out[name] = job_env[name]
         for name in _LLM_MIRRORS:
             if name in job_env:
                 out[name] = job_env[name]

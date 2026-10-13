@@ -274,3 +274,33 @@ def test_cancelling_a_run_container_stops_it(tmp_path):
         log=lambda s: None, poll=poll, poll_every=0.05), timeout=5))
     assert code == jobs.CANCELLED_EXIT
     assert d.calls[0].cancelled and ("stop", d.run_specs[0].key) in d.ops
+
+
+def test_a_range_run_keeps_every_tasks_chain_and_exactly_their_keys():
+    """main._inject_llm_env_for_tasks for stage0..stage1 routed to two
+    providers: the task map and both keys reach the run, nothing else does."""
+    chains = {
+        "stage0": [{"provider": "ollama", "endpoint": "local", "model": "m0",
+                    "base_url": "http://ollama:11434", "key_env": ""}],
+        "stage1": [{"provider": "anthropic", "endpoint": "main", "model": "m1",
+                    "base_url": "", "key_env": "BLPL_LLM_KEY__MAIN"},
+                   {"provider": "openai", "endpoint": "backup", "model": "m2",
+                    "base_url": "", "key_env": "BLPL_LLM_KEY__BACKUP"}],
+    }
+    queued = {
+        "HDM_LLM_CHAIN": json.dumps(chains["stage0"]), "HDM_LLM_PROVIDER": "ollama",
+        "HDM_LLM_MODEL": "m0", "HDM_LLM_CHAINS": json.dumps(chains),
+        "BLPL_LLM_KEY__MAIN": "sk-main", "BLPL_LLM_KEY__BACKUP": "sk-backup",
+        "BLPL_LLM_KEY__UNRELATED": "sk-not-routed", "BLPL_SERVER_KEY": "k",
+    }
+    cmd = [PY, "-m", "blpl.core.cli", "run", "--from", "stage0", "--to", "stage1"]
+    got = jobs.operation_inject(cmd, queued)
+    assert json.loads(got["HDM_LLM_CHAINS"]) == chains
+    assert {k for k in got if k.startswith("BLPL_LLM_KEY__")} == {
+        "BLPL_LLM_KEY__MAIN", "BLPL_LLM_KEY__BACKUP"}
+    assert "BLPL_SERVER_KEY" not in got and "BLPL_LLM_KEY__UNRELATED" not in got
+    # And end to end through the run's environment.
+    from app.sandbox.runpath import run_env
+    env = run_env({**queued, "BLPL_EXTRACT_MAX_TOKENS": "32000"}, got)
+    assert env["HDM_LLM_CHAINS"] and env["BLPL_EXTRACT_MAX_TOKENS"] == "32000"
+
