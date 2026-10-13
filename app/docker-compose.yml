@@ -406,7 +406,16 @@ services:
       - BLPL_FILES_VIA_WORKSPACE=${BLPL_FILES_VIA_WORKSPACE:-0}
       - BLPL_AGENT_DIR_ROOT=/app/data/agents
       - BLPL_SANDBOX_HOST_AGENT_DIRS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/agents}
+      # Phase 4: a container per run, with the project's .git read-only.
+      - BLPL_RUNS_IN_CONTAINER=${BLPL_RUNS_IN_CONTAINER:-0}
+      # Phase 4: per-project btrfs storage. "btrfs" makes every run in a
+      # container start from a snapshot taken by the storage helper (the
+      # `storage` profile). Needs quotas enabled first: docs/architecture-v2.md.
+      - BLPL_STORAGE=${BLPL_STORAGE:-}
+      - BLPL_STORAGE_SOCKET=/run/blpl-storage/storage.sock
     volumes:
+      # The storage helper's socket (phase 4); empty without the profile.
+      - blpl-storage-helper:/run/blpl-storage
       # The socket proxy's listening socket. The only Docker access this
       # container has, and it is the proxy's policy, not the daemon's.
       - blpl-docker-proxy:/run/blpl-docker-proxy
@@ -733,6 +742,40 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - blpl-docker-proxy:/run/blpl-docker-proxy
 
+  # Per-project btrfs storage (phase 4, step 4): subvolumes, quotas and
+  # snapshots. The one container with CAP_SYS_ADMIN, because btrfs needs it for
+  # exactly those operations; nothing else is given to it. No network, no
+  # secrets, only the projects root. It takes a project name and a verb on a
+  # Unix socket, never a path. Do not start it until quotas are enabled on the
+  # filesystem (docs/architecture-v2.md, "Turning on per-project storage").
+  storage-helper:
+    profiles: ["storage"]
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: app/workspace/Dockerfile
+      args:
+        - BLPL_UID=${BLPL_UID:?set BLPL_UID in app/.env to the owner of app/data (id -u)}
+        - BLPL_GID=${BLPL_GID:?set BLPL_GID in app/.env to the owner of app/data (id -g)}
+    container_name: blpl-storage-helper
+    entrypoint: ["python", "-m", "app.sandbox.btrfs"]
+    command: []
+    working_dir: /opt/blpl/wsagent
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [SYS_ADMIN]
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+    read_only: true
+    restart: unless-stopped
+    environment:
+      - BLPL_STORAGE_ROOT=/storage
+      - BLPL_STORAGE_SOCKET=/run/blpl-storage/storage.sock
+    volumes:
+      - ./data/projects:/storage
+      - blpl-storage-helper:/run/blpl-storage
+
   # The one way out of blpl-egress. CONNECT to an allowlisted host on 443, or
   # a git host on 22, and nothing else; private addresses are refused even
   # for allowlisted names. The access log is the egress audit record. Tag
@@ -770,6 +813,9 @@ volumes:
   # the image's /run/blpl-docker-proxy, which is owned by BLPL_UID.
   blpl-docker-proxy:
     name: blpl-docker-proxy
+  # The storage helper's socket, shared with the worker (phase 4).
+  blpl-storage-helper:
+    name: blpl-storage-helper
   # No blpl-db here. One was declared for a long time and never used: the db
   # service binds ./blpl-db instead, so the named volume was dead config that
   # read as the live arrangement. The bind mount is deliberate — the same

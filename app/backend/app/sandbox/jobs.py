@@ -316,6 +316,7 @@ async def run_job_in_container(
     poll: Callable[[], Awaitable[str]],
     mark: Callable[[bool, float], Awaitable[None]] | None = None,
     poll_every: float = 20.0,
+    snapshot: Callable[[str], Awaitable[object]] | None = None,
 ) -> int:
     """Phase 4: one run, one container, removed when it ends.
 
@@ -335,6 +336,18 @@ async def run_job_in_container(
         if text:
             log(text)
 
+    if snapshot is not None:
+        # Before anything runs, so a run that wrecks the checkout can be
+        # undone to exactly this. A run that cannot have its snapshot does not
+        # start: running without the promised way back is not a degraded mode
+        # anyone chose.
+        label = "pre-" + re.sub(r"[^A-Za-z0-9_.-]", "-", run_id)[:59]
+        try:
+            await snapshot(label)
+        except Exception as exc:  # noqa: BLE001 - said in the run's log
+            log(f"blpl: could not snapshot the project before this run, so it did not start: {exc}\n")
+            return -1
+        log(f"blpl: snapshot {label} taken\n")
     ttl = poll_every * 3
     if mark is not None:
         await mark(True, ttl)
