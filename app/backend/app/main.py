@@ -222,6 +222,12 @@ async def _seal_idle_workspaces() -> None:
     while True:
         try:
             await asyncio.sleep(60)
+            if workspace_files.enabled():
+                # Workspaces the agent reports idle are stopped and sealed.
+                with SessionFactory() as session:
+                    await workspace_files.sweep_and_seal(
+                        lambda name: _seal_workspace(session, name))
+                    session.commit()
             idle = workspaces.idle()
             if not idle:
                 continue
@@ -2345,8 +2351,13 @@ def open_project(
             detail="you have no key for this project; ask its owner to re-share it",
         )
     try:
-        workspace.unseal(PROJECTS_ROOT, project_id, project_key)
-    except workspace.WorkspaceError as exc:
+        if workspace_files.enabled():
+            workspace_files.unseal(project_id, project_key)
+        else:
+            workspace.unseal(PROJECTS_ROOT, project_id, project_key)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — WorkspaceError, or the sealer's
         raise HTTPException(status_code=400, detail=str(exc))
 
     _note_workspace_open(session, project_id, PROJECTS_ROOT / project_id, project_key, user.id)
@@ -2403,8 +2414,13 @@ def _seal_workspace(session: Session, project_id: str) -> bool:
         if busy is not None:
             return False
     try:
-        size = workspace.seal(PROJECTS_ROOT, project_id, key)
-    except workspace.WorkspaceError as exc:
+        if workspace_files.enabled():
+            # Phase 4: in a sealer container, after the workspace is stopped
+            # and removed, so no container is left holding the plaintext.
+            size = workspace_files.seal(project_id, key)
+        else:
+            size = workspace.seal(PROJECTS_ROOT, project_id, key)
+    except Exception as exc:  # noqa: BLE001 — WorkspaceError, or the sealer's
         logger.warning("could not seal %s: %s", project_id, exc)
         return False
     workspaces.forget(project_id)

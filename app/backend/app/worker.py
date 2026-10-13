@@ -269,7 +269,9 @@ async def main() -> None:
                     logger.info("reclaimed %d stale run(s)", freed)
             except Exception:  # noqa: BLE001
                 logger.exception("could not reclaim stale runs")
-            if workspaces is not None:
+            if workspaces is not None and workspaces.access is None:
+                # With the agent (phase 3+) the backend sweeps, because only it
+                # holds the keys to seal what it stops.
                 await workspaces.sweep_if_due()
             await asyncio.sleep(_IDLE_POLL)
             continue

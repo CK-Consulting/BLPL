@@ -707,3 +707,81 @@ def test_phase4_a_run_container_cannot_write_git_and_cancel_kills_it(env):
             server.close()
 
     asyncio.run(scenario())
+
+
+def test_phase4_sealing_in_a_sealer_container_leaves_no_plaintext(env):
+    """Seal through a sealer container: the workspace is removed, the project
+    and its worktrees become one blob, and the plaintext is nowhere under the
+    projects root. Unseal brings it back; the wrong key leaves the blob."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    import secrets
+    import subprocess
+
+    from app.sandbox import sealer
+    from app.sandbox.jobs import WorkspaceRunConfig, spec_for
+
+    projects = env.tmp / "projects"
+    project = f"itest-{env.tag}-seal"
+    marker = f"PLAINTEXT-{env.tag}".encode()
+    proj = projects / project
+    proj.mkdir(parents=True)
+    gitenv = {**os.environ, "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@b",
+              "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@b"}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(proj)], check=True)
+    (proj / "design.md").write_bytes(b"# Board " + marker + b"\n")
+    subprocess.run(["git", "-C", str(proj), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-qm", "init"], check=True, env=gitenv)
+    subprocess.run(["git", "-C", str(proj), "worktree", "add", "-q", "-b", "user/9",
+                    str(projects / ".worktrees" / project / "u9")], check=True)
+    (projects / ".worktrees" / project / "u9" / "notes.md").write_bytes(marker)
+    for d in (env.tmp, projects):
+        os.chmod(d, 0o755)
+    key = secrets.token_bytes(32)
+
+    psock = str(env.tmp / "proxy.sock")
+    policy = ProxyPolicy(
+        instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
+        project_bind_roots=(str(projects),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
+    )
+    cfg = WorkspaceRunConfig(image=WORKSPACE_IMAGE, projects_root=projects,
+                             host_projects_root=str(projects))
+
+    def plaintext_left() -> list[str]:
+        hits = []
+        for p in projects.rglob("*"):
+            if p.is_file() and not p.is_symlink() and marker in p.read_bytes():
+                hits.append(str(p))
+        return hits
+
+    async def scenario():
+        upstream = UnixUpstream(SOCK)
+        server = await serve(DockerProxy(policy, upstream), psock)
+        driver = DockerDriver(env.config(f"unix://{psock}"))
+        try:
+            ws = spec_for(cfg, project)
+            await driver.ensure(ws)  # running, as an idle workspace would be
+            assert plaintext_left()  # the fixture is real
+            out = await sealer.run_sealer(driver, cfg, project, key, "seal")
+            assert out["ok"] and out["sealed_bytes"] > 0
+            assert (await driver.status(ws.key)).state is State.ABSENT  # workspace gone
+            assert (projects / ".sealed" / f"{project}.blob").is_file()
+            assert not proj.exists() and not (projects / ".worktrees" / project).exists()
+            assert plaintext_left() == [], plaintext_left()
+
+            with pytest.raises(sealer.SealError):
+                await sealer.run_sealer(driver, cfg, project, secrets.token_bytes(32), "unseal")
+            assert (projects / ".sealed" / f"{project}.blob").is_file()  # untouched
+
+            await sealer.run_sealer(driver, cfg, project, key, "unseal")
+            assert marker in (proj / "design.md").read_bytes()
+            assert (projects / ".worktrees" / project / "u9" / "notes.md").read_bytes() == marker
+            assert not (projects / ".sealed" / f"{project}.blob").exists()
+        finally:
+            await driver.aclose()
+            await upstream.aclose()
+            server.close()
+
+    asyncio.run(scenario())

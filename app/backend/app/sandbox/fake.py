@@ -140,8 +140,8 @@ class FakeDriver:
                             on_output: OutputSink | None = None,
                             stop_grace_s: int = 10) -> ExecResult:
         """A run container: exists only for the call, then is gone."""
-        if spec.key.role != "run":
-            raise ValueError("run_container takes a run key")
+        if spec.key.role not in ("run", "sealer"):
+            raise ValueError("run_container takes a run or sealer key")
         self.ops.append(("run_container", spec.key))
         self.run_specs.append(spec)
         call = ExecCall(spec.key, list(argv), dict(env or {}), None)

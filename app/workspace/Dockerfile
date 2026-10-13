@@ -113,6 +113,11 @@ COPY app/backend/app/sandbox/agent.py /opt/blpl/wsagent/agent.py
 COPY app/backend/app/projects.py /opt/blpl/wsagent/app/projects.py
 COPY app/backend/app/llm_ignore.py /opt/blpl/wsagent/app/llm_ignore.py
 COPY app/backend/app/worktrees.py /opt/blpl/wsagent/app/worktrees.py
+# The sealer (phase 4) runs workspace.seal/unseal, the backend's own, in a
+# container of its own for one operation; vault.py is what workspace imports.
+COPY app/backend/app/sandbox/sealer.py /opt/blpl/wsagent/sealer.py
+COPY app/backend/app/workspace.py /opt/blpl/wsagent/app/workspace.py
+COPY app/backend/app/vault.py /opt/blpl/wsagent/app/vault.py
 
 # The agent serves when the control plane gave it a directory and a token
 # (/run/blpl). Without them (a phase 2 workspace) it only holds the container

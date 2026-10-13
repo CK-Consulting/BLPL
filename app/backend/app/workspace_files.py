@@ -519,3 +519,54 @@ def read_artifact(checkout: Path, name: str) -> bytes | None:
             if exc.status in (403, 404):
                 return None
             raise
+
+
+# -- phase 4: sealing in a sealer container ---------------------------------------
+
+
+def seal(project: str, key: bytes) -> int:
+    """workspace.seal, in a sealer container: the backend needs no mount."""
+    from .sandbox.sealer import run_sealer
+
+    access = _access()
+    return _run(run_sealer(access.driver_factory(), access.run_cfg, project, key,
+                           "seal"))["sealed_bytes"]
+
+
+def unseal(project: str, key: bytes) -> None:
+    from .sandbox.sealer import run_sealer
+
+    access = _access()
+    _run(run_sealer(access.driver_factory(), access.run_cfg, project, key, "unseal"))
+
+
+_TRACKER = None
+
+
+async def sweep_and_seal(seal_project) -> list:
+    """The workspace idle sweep, run where the keys are, sealing what it stops.
+
+    The worker's sweep cannot seal: it has no project key. So with workspaces
+    behind the agent, the backend sweeps. A workspace the agent reports idle
+    (no request, no run) is stopped, and its project is sealed through the
+    on_stopped hook."""
+    from .sandbox import idle
+    from .sandbox.sealer import on_stopped_sealer
+
+    global _TRACKER
+    if _TRACKER is None:
+        _TRACKER = idle.IdleTracker()
+    access = _access()
+    driver = access.driver_factory()
+
+    async def activity(key):
+        return await access.agent_idle(key.container_name())
+
+    try:
+        return await idle.sweep(driver, _TRACKER, idle_after_s=access.run_cfg.idle_after_s,
+                                activity=activity,
+                                on_stopped=on_stopped_sealer(seal_project))
+    finally:
+        close = getattr(driver, "aclose", None)
+        if close is not None:
+            await close()
