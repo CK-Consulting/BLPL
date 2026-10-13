@@ -873,6 +873,22 @@ sealing in a container, storage with limits.**
   poll raised was left running, unmarked, while the row said it had ended.
   Every exit from the run, workspace-run and agent-run monitors now stops the
   run and waits for it before returning.
+- **Open workspaces survive a mountless restart.** `openstate.restore` dropped
+  every row whose directory it could not see, which through the mask was all
+  of them. It deleted the only server-side key of an open project, and that
+  project could never be sealed again. Without the mount, rows are now
+  restored unchecked and the sweeper seals through the sealer. `/open` on an
+  open project whose key this process lacks takes the member's copy. The
+  desktop gate treats every known project as mounted, rather than reading the
+  empty mask as "nothing mounted". The remaining existence checks on project
+  paths were audited:
+  - `_project_dir`, files, folders, delete, move, llm-ignore, artifacts and
+    the tree check on the mount only when the agent path is off. Otherwise
+    they ask the agent.
+  - Board config, lifecycle, design, release and preflight answer 503 without
+    the mount.
+  - The project list reports an unseen project as open, with unknown details.
+  - The dashboard's file counts are display only.
 - **A mountless backend builds workspace specs from names.** It used to create
   `.worktrees/<P>` and check bind sources on the read-only mask. The worker
   creates those directories at its start, an unseal recreates them, and the
