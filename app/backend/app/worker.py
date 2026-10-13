@@ -259,6 +259,15 @@ async def main() -> None:
                         moved.moved, moved.conflicts)
     except Exception:  # noqa: BLE001 - never a reason not to run stages
         logger.exception("could not move sealed blobs")
+    # A backend without the project mount cannot create these, and a
+    # workspace needs both of its bind sources to exist.
+    try:
+        made = sandbox_jobs.ensure_worktree_dirs(
+            Path(os.environ.get("BLPL_PROJECTS_ROOT", str(_DATA / "projects"))))
+        if made:
+            logger.info("created worktree directories for %s", made)
+    except OSError:
+        logger.exception("could not create worktree directories")
 
     workspaces = None
     if sandbox_jobs.enabled():
