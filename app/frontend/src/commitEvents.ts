@@ -33,14 +33,17 @@ export function onCommitted(projectId: string, handler: () => void): () => void 
  */
 const PUSH_EVENT = "blpl:push-pending";
 
-export function announcePushPending(projectId: string, seq: number): void {
-  window.dispatchEvent(new CustomEvent(PUSH_EVENT, { detail: { projectId, seq } }));
+export function announcePushPending(projectId: string, seq: number, waitSeconds?: number): void {
+  window.dispatchEvent(new CustomEvent(PUSH_EVENT, { detail: { projectId, seq, waitSeconds } }));
 }
 
-export function onPushPending(projectId: string, handler: (seq: number) => void): () => void {
+export function onPushPending(
+  projectId: string,
+  handler: (seq: number, waitSeconds?: number) => void,
+): () => void {
   const listener = (e: Event) => {
-    const d = (e as CustomEvent<{ projectId: string; seq: number }>).detail;
-    if (d?.projectId === projectId && typeof d.seq === "number") handler(d.seq);
+    const d = (e as CustomEvent<{ projectId: string; seq: number; waitSeconds?: number }>).detail;
+    if (d?.projectId === projectId && typeof d.seq === "number") handler(d.seq, d.waitSeconds);
   };
   window.addEventListener(PUSH_EVENT, listener);
   return () => window.removeEventListener(PUSH_EVENT, listener);
@@ -56,6 +59,8 @@ export function onPushPending(projectId: string, handler: (seq: number) => void)
  * than only the editor's.
  */
 export function announcePushFrom(projectId: string, response: unknown): void {
-  const seq = (response as { push_seq?: unknown } | null | undefined)?.push_seq;
-  if (typeof seq === "number") announcePushPending(projectId, seq);
+  const r = response as { push_seq?: unknown; push_wait_s?: unknown } | null | undefined;
+  if (typeof r?.push_seq === "number") {
+    announcePushPending(projectId, r.push_seq, typeof r.push_wait_s === "number" ? r.push_wait_s : undefined);
+  }
 }

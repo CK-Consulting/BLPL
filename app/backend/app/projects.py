@@ -484,6 +484,8 @@ class Projects:
     # gives up sooner, with a sentence, rather than hang the settings dialog
     # behind somebody's slow push.
     NETWORK_LOCK_WAIT = 330.0
+    #: git's own limit on any one command here (see _git).
+    GIT_TIMEOUT = 300
     SET_REMOTE_LOCK_WAIT = 30.0
 
     @contextlib.contextmanager
@@ -1279,7 +1281,7 @@ class Projects:
             capture_output=True,
             text=True,
             check=False,
-            timeout=300,
+            timeout=self.GIT_TIMEOUT,
             env={**os.environ, **env} if env else None,
         )
         if proc.returncode != 0:

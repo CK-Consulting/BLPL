@@ -202,6 +202,13 @@ def requested_now(project_id: int, user_id: int) -> int:
         ) or 0
 
 
+#: How long the server may take over one automatic push, worst case: waiting
+#: for the origin lock behind another push, then git's own limit, plus room
+#: for the credential lease and the record. Handed to the client with each
+#: push number so its wait cannot be shorter than the server's.
+PUSH_WAIT_SECONDS = int(Projects.NETWORK_LOCK_WAIT + Projects.GIT_TIMEOUT + 60)
+
+
 def request_now(project_id: int, user_id: int) -> int | None:
     """``request`` in a transaction of its own, committed at once — a number
     that is durable whatever happens to any request around it."""

@@ -31,10 +31,17 @@ import { ProjectRoutingPanel } from "./ProjectRoutingPanel";
 // where you left off": the board and markdown live in git on the server.
 
 /** How the strip polls for an automatic push's result: soon, then backing
- *  off, and giving up (with a pointer to the git panel) after two minutes. */
+ *  off. The window is the server's own worst case for one push — it sends
+ *  it as push_wait_s, so the two cannot drift; the default is that figure
+ *  for a server that predates it (a 330 s lock wait, git's 300 s, a margin).
+ *  Two minutes was shorter than a push can legitimately take, and a result
+ *  that landed later was never shown (Codex, PR #19). After the window the
+ *  strip says so and keeps a slow check going while the tab is visible, so
+ *  a late result still lands. */
 const PUSH_POLL_FIRST_MS = 1000;
 const PUSH_POLL_MAX_MS = 10_000;
-const PUSH_WAIT_LIMIT_MS = 120_000;
+const PUSH_WAIT_DEFAULT_S = 690;
+const PUSH_POLL_LATE_MS = 60_000;
 
 export function ProjectSync({
   projectId,
@@ -79,17 +86,24 @@ export function ProjectSync({
     if (waiting.current?.timer) clearTimeout(waiting.current.timer);
     waiting.current = null;
   };
-  const waitForPush = (target: string, seq: number) => {
+  const waitForPush = (target: string, seq: number, waitSeconds?: number) => {
     // A later push answers for an earlier one too, so only the newest is watched.
     if (waiting.current && waiting.current.seq >= seq) return;
     stopWaiting();
     const started = Date.now();
+    const limitMs = (waitSeconds && waitSeconds > 0 ? waitSeconds : PUSH_WAIT_DEFAULT_S) * 1000;
+    let late = false;
     let delay = PUSH_POLL_FIRST_MS;
     const state = { seq, timer: null as ReturnType<typeof setTimeout> | null };
     waiting.current = state;
     setNote("pushing automatically…");
     const tick = async () => {
       if (waiting.current !== state || currentRef.current !== target) return;
+      if (late && typeof document !== "undefined" && document.visibilityState === "hidden") {
+        // Nobody is looking: check again later rather than poll a hidden tab.
+        state.timer = setTimeout(tick, PUSH_POLL_LATE_MS);
+        return;
+      }
       let now: GitStatus | null = null;
       try {
         now = await getJSON<GitStatus>(`/api/projects/${target}/git/status`);
@@ -105,18 +119,17 @@ export function ProjectSync({
         onChanged();
         return;
       }
-      if (Date.now() - started >= PUSH_WAIT_LIMIT_MS) {
-        waiting.current = null;
+      if (!late && Date.now() - started >= limitMs) {
+        late = true;
         setNote("push still running — check the git panel");
-        return;
       }
-      delay = Math.min(delay * 2, PUSH_POLL_MAX_MS);
+      delay = late ? PUSH_POLL_LATE_MS : Math.min(delay * 2, PUSH_POLL_MAX_MS);
       state.timer = setTimeout(tick, delay);
     };
     state.timer = setTimeout(tick, delay);
   };
   useEffect(() => {
-    const off = onPushPending(projectId, (seq) => waitForPush(projectId, seq));
+    const off = onPushPending(projectId, (seq, waitSeconds) => waitForPush(projectId, seq, waitSeconds));
     return () => {
       off();
       stopWaiting();
@@ -145,7 +158,12 @@ export function ProjectSync({
   const commitAndPush = async (target: string, message: string) => {
     if (currentRef.current !== target) throw new Error("The project changed; nothing was committed.");
     setNote(null);
-    const res = await postJSON<{ committed?: boolean; auto_push?: boolean; push_seq?: number | null }>(
+    const res = await postJSON<{
+      committed?: boolean;
+      auto_push?: boolean;
+      push_seq?: number | null;
+      push_wait_s?: number | null;
+    }>(
       `/api/projects/${target}/git/commit`,
       { message },
     );
@@ -157,7 +175,7 @@ export function ProjectSync({
       // the automatic push and reports how it went.
       await refresh();
       onChanged();
-      if (typeof res.push_seq === "number") waitForPush(target, res.push_seq);
+      if (typeof res.push_seq === "number") waitForPush(target, res.push_seq, res.push_wait_s ?? undefined);
       else setNote("committed; pushing automatically");
       return;
     }

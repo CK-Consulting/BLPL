@@ -3112,6 +3112,9 @@ def git_commit(project_id: str, body: CommitBody, user: User = Depends(require_o
     return {
         "ok": True, "committed": out is not None,
         "auto_push": scheduled is not None, "push_seq": scheduled,
+        # How long the client should wait for that push before treating it
+        # as slow: the server's own worst case, so the two cannot drift.
+        "push_wait_s": autopush.PUSH_WAIT_SECONDS if scheduled is not None else None,
     }
 
 
@@ -4067,7 +4070,13 @@ def _commit_landed_write(
         out, seq = _commit_and_push(session, user, project, checkout, message, master_key)
         # push_seq: an automatic push of this write is on its way; the client
         # watches the member's push status until that push is recorded.
-        return {"committed": out is not None, **({"push_seq": seq} if seq is not None else {})}
+        return {
+            "committed": out is not None,
+            **(
+                {"push_seq": seq, "push_wait_s": autopush.PUSH_WAIT_SECONDS}
+                if seq is not None else {}
+            ),
+        }
     except ProjectError as exc:
         logger.warning("commit failed in %s (%s): %s", checkout, message, exc)
         return {

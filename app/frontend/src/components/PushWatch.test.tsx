@@ -40,7 +40,7 @@ function server(policy: "auto" | "manual" = "auto") {
       state.calls.push(`${method} ${url}`);
       if (url.endsWith("/git/commit")) {
         return json(policy === "auto"
-          ? { ok: true, committed: true, auto_push: true, push_seq: 3 }
+          ? { ok: true, committed: true, auto_push: true, push_seq: 3, push_wait_s: 690 }
           : { ok: true, committed: true, auto_push: false, push_seq: null });
       }
       return json({ ok: true });
@@ -96,14 +96,32 @@ describe("waiting for an automatic push", () => {
     expect(state.statusReads).toBe(reads);
   });
 
-  it("gives up after two minutes and says where to look", async () => {
+  it("still shows a result that lands after five minutes", async () => {
+    // Codex P2 on #19: the strip gave up at two minutes, though a push may
+    // wait 330 s for the lock and git another 300 s.
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    server();
+    const state = server();
     render(<ProjectSync projectId="p" onChanged={() => {}} />);
     await commitAndPush();
     await screen.findByText("pushing automatically…");
-    await act(() => vi.advanceTimersByTimeAsync(130_000));
+    await act(() => vi.advanceTimersByTimeAsync(5 * 60_000));
+    expect(screen.getByText("pushing automatically…")).toBeInTheDocument();
+    state.last_push = { at: "2026-10-12T00:06:00Z", ok: false, error: "slow and refused", seq: 3 };
+    await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(await screen.findByText("push failed: slow and refused")).toBeInTheDocument();
+  });
+
+  it("past the server's window says so, and keeps checking slowly until it lands", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const state = server();
+    render(<ProjectSync projectId="p" onChanged={() => {}} />);
+    await commitAndPush();
+    await screen.findByText("pushing automatically…");
+    await act(() => vi.advanceTimersByTimeAsync(700_000));  // past push_wait_s (690)
     expect(await screen.findByText("push still running — check the git panel")).toBeInTheDocument();
+    state.last_push = { at: "2026-10-12T00:20:00Z", ok: true, error: "", seq: 3 };
+    await act(() => vi.advanceTimersByTimeAsync(61_000));
+    expect(await screen.findByText("pushed")).toBeInTheDocument();
   });
 
   it("leaves a manual project alone: it pushes from the dialog and polls nothing", async () => {

@@ -812,3 +812,11 @@ def test_a_manual_push_does_not_answer_for_a_save_that_came_after_it_chose_its_c
     last = unlocked.get("/api/projects/p/git/status").json()["last_push"]
     assert last["ok"] is True
     assert last["seq"] < newer["seq"], "the manual push claimed a push it did not include"
+
+
+def test_a_save_says_how_long_its_push_may_take(unlocked, pushes):
+    from app import autopush
+
+    unlocked.post("/api/projects/init", json=init_body("p", remote=bare_remote(), push_policy="auto"))
+    out = unlocked.put("/api/projects/p/files/a.md", json={"content": "a\n"}).json()
+    assert out["push_wait_s"] == autopush.PUSH_WAIT_SECONDS >= 330 + 300
