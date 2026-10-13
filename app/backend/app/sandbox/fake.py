@@ -151,7 +151,9 @@ class FakeDriver:
         if spec.key in self.foreign:
             raise NotOurs(spec.key.container_name())
         orphan = self.boxes.get(spec.key)
-        if orphan is not None and orphan.argv == list(argv):
+        # As DockerDriver: an orphan that never started (STARTING, Docker's
+        # `created`) is replaced, not followed.
+        if orphan is not None and orphan.argv == list(argv) and orphan.state is not State.STARTING:
             # The first attempt, same command: followed, not run again.
             self.ops.append(("reattach", spec.key))
             self.boxes.pop(spec.key, None)
