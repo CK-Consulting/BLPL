@@ -3155,6 +3155,10 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
     project = _project_or_404(session, user, project_id)
     project_id_, user_id = project.id, user.id
     recorded = False
+    # What this push can answer for, counted before it chooses its commit
+    # (inside push, under the lock): a save that commits after that point
+    # draws a newer number and gets its own automatic push (see record).
+    answers_for = autopush.requested_now(project_id_, user_id)
 
     def after(exc: ProjectError | None) -> None:
         # Recorded as an automatic push's outcome is — under the origin lock,
@@ -3165,7 +3169,8 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
         nonlocal recorded
         recorded = True
         autopush.record_now(
-            project_id_, user_id, None if exc is None else autopush.scrub(str(exc), [])
+            project_id_, user_id, None if exc is None else autopush.scrub(str(exc), []),
+            seq=answers_for,
         )
 
     try:
@@ -3174,7 +3179,9 @@ def git_push(project_id: str, user: User = Depends(require_onboarded),
             out = projects.push(project_id, env=env, checkout=checkout, url=dest, after=after)
     except ProjectError as exc:
         if not recorded:
-            autopush.record_now(project_id_, user_id, autopush.scrub(str(exc), []))
+            autopush.record_now(
+                project_id_, user_id, autopush.scrub(str(exc), []), seq=answers_for
+            )
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "output": out}
 

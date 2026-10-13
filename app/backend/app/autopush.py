@@ -188,6 +188,20 @@ def request(session: Session, project_id: int, user_id: int) -> int | None:
     return seq
 
 
+def requested_now(project_id: int, user_id: int) -> int:
+    """How many automatic pushes this member has been handed numbers for, read
+    in a session of its own — so what is counted is what has committed, not
+    what some open transaction is about to. Taken by a push by hand before it
+    picks its commit; see ``record`` for why."""
+    from .db import SessionFactory
+    from sqlalchemy import select
+
+    with SessionFactory() as s:
+        return s.scalar(
+            select(func.coalesce(ProjectMember.push_requested, 0)).where(_member(project_id, user_id))
+        ) or 0
+
+
 def request_now(project_id: int, user_id: int) -> int | None:
     """``request`` in a transaction of its own, committed at once — a number
     that is durable whatever happens to any request around it."""
@@ -214,12 +228,15 @@ def record(
     """Store the outcome of one push of this member's checkout. A success
     clears whatever failure was there before.
 
-    ``seq`` is the number of the automatic push this outcome is for; a push
-    started any other way (by hand, or one that failed before it was numbered)
-    pushes everything committed so far, so it answers for every push asked
-    for until now. last_push_seq only moves forward: every push sends the
-    branch as it stands, so whichever is recorded last speaks for all the
-    commits before it.
+    ``seq`` is the highest push number this outcome answers for: an automatic
+    push's own number, or for a push by hand the count of pushes asked for
+    when it started (``requested_now``, taken before it chose what to send).
+    Not the count when it finished: a save that landed after the push picked
+    its commit drew a newer number, and marking that one answered told its
+    waiter "pushed" when only the older commit had reached the remote (Codex,
+    PR #19). None leaves last_push_seq alone. It only moves forward: every
+    push sends the branch as it stands, so whichever is recorded last speaks
+    for all the commits before it.
 
     One UPDATE, with the forward-only rule and the "everything asked for so
     far" both computed by the database from the row as it is when the write
@@ -227,17 +244,18 @@ def record(
     have moved on in between (Codex, PR #19). A member removed while the push
     ran matches no row, and there is nobody to show it to.
     """
-    answered = seq if seq is not None else func.coalesce(ProjectMember.push_requested, 0)
     current = func.coalesce(ProjectMember.last_push_seq, 0)
+    values = {
+        "last_push_at": datetime.now(timezone.utc),
+        "last_push_ok": error is None,
+        "last_push_error": error,
+    }
+    if seq is not None:
+        values["last_push_seq"] = case((current < seq, seq), else_=current)
     session.execute(
         update(ProjectMember)
         .where(_member(project_id, user_id))
-        .values(
-            last_push_at=datetime.now(timezone.utc),
-            last_push_ok=error is None,
-            last_push_error=error,
-            last_push_seq=case((current < answered, answered), else_=current),
-        )
+        .values(**values)
         .execution_options(synchronize_session=False)
     )
     _expire_member(session, project_id, user_id)

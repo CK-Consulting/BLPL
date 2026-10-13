@@ -727,9 +727,14 @@ def test_last_push_seq_never_moves_backwards(unlocked):
         s.commit()
         m = s.scalar(select(ProjectMember).where(ProjectMember.project_id == pid, ProjectMember.user_id == uid))
         assert m.last_push_seq == 3 and m.last_push_error == "late failure"
-        # A manual push answers for everything asked for so far.
+        # A manual push answers for what it was told it covers, no more.
         autopush.request(s, pid, uid)
-        autopush.record(s, pid, uid, None)
+        autopush.record(s, pid, uid, None, seq=4)
+        s.commit()
+        s.refresh(m)
+        assert m.last_push_seq == 4
+        # And an outcome with no number leaves the number alone.
+        autopush.record(s, pid, uid, "x")
         s.commit()
         s.refresh(m)
         assert m.last_push_seq == 4
@@ -770,3 +775,40 @@ def test_a_rolled_back_requests_push_never_shares_a_number_with_the_next(unlocke
     pushes.run()
     assert unlocked.get("/api/projects/p/git/status").json()["last_push"]["seq"] >= nxt
     del drawn
+
+
+
+def test_a_manual_push_does_not_answer_for_a_save_that_came_after_it_chose_its_commit(unlocked):
+    """Codex P2 on #19. The push picked its commit, then a save committed and
+    drew a newer automatic-push number before the manual push's result was
+    recorded; the record read the count at that moment and marked the newer
+    number answered, so that save's waiter said "pushed" while only the older
+    commit had reached the remote."""
+    import app.db
+    import app.main as main
+    from sqlalchemy import select
+
+    from app import autopush
+    from app.models import Project, User
+
+    unlocked.post("/api/projects/init", json=init_body("p", remote=bare_remote(), push_policy="auto"))
+    with app.db.SessionFactory() as s:
+        pid = s.scalar(select(Project.id).where(Project.name == "p"))
+        uid = s.scalar(select(User.id).where(User.clerk_user_id == "user_test"))
+
+    real = main.projects._push_locked
+    newer = {}
+
+    def push_locked(d, url, env):
+        out = real(d, url, env)  # the commit is chosen and sent
+        newer["seq"] = autopush.request_now(pid, uid)  # a save lands meanwhile
+        return out
+
+    main.projects._push_locked = push_locked
+    try:
+        assert unlocked.post("/api/projects/p/git/push").status_code == 200
+    finally:
+        main.projects._push_locked = real
+    last = unlocked.get("/api/projects/p/git/status").json()["last_push"]
+    assert last["ok"] is True
+    assert last["seq"] < newer["seq"], "the manual push claimed a push it did not include"
