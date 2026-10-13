@@ -459,6 +459,27 @@ and the control plane's own addresses. An Ollama on the host is reached by a
 named allowlist entry, not by opening the private ranges. Squid's access log is
 the egress audit record.
 
+**Who decides the allowlist, and how the app uses it (review, PR #20).** A
+member's LLM endpoint on a host Squid does not allow failed mid-run. Opening
+egress to whatever host a member types would let any member send a project
+anywhere, so the list stays the operator's:
+- `app/egress/allowlist.txt` ships the defaults: every remote host the
+  provider catalog names (`providers.catalog_hosts()`, Anthropic, OpenAI,
+  OpenRouter, Together, Fireworks, DeepInfra, plus Gemini), the distributors
+  and the git hosts. A test keeps it in step with the catalog.
+- `app/data/egress/allowlist.txt` holds the operator's additions, outside git,
+  in the same syntax (a leading dot covers subdomains).
+  `app/fix-data-ownership.sh` creates it. Squid reads both files. After an
+  edit, run `docker compose exec squid squid -k reconfigure`.
+- The backend reads the same two files on every check (`egress.py`). With
+  `BLPL_RUNS_IN_WORKSPACE=1` it refuses an endpoint whose host is on neither,
+  or that is not HTTPS on 443. It checks when the endpoint is saved
+  (settings, onboarding) and again when a run is queued, with "`<host>` is not
+  on this server's egress allowlist — ask the operator to add it". Hosts the
+  workspace reaches directly (its `NO_PROXY`: Ollama, clamd) pass.
+  `GET /api/settings/egress` returns the effective list. With runs in the
+  worker, nothing is checked.
+
 **Two things the build found (2026-10-13):**
 - **git over ssh goes through Squid too.** OpenSSH ignores `HTTP_PROXY`, and
   a workspace has no other route out, so the agent sets `GIT_SSH_COMMAND` on
@@ -773,6 +794,12 @@ sealing in a container, storage with limits.**
   Every setting that code in a workspace, run or sealer container reads is
   now accounted for (section 7, "What crosses into a workspace"). The idle
   timeout now reaches the backend, which runs the sweep once the agent is on.
+- **Sealed state survives the mountless layout.** The mask hid
+  `projects/.sealed`, so a sealed project vanished from the list and `/open`
+  answered `already_open` without unsealing. Blobs moved to `data/sealed/`,
+  with a migration (above, "Running the backend without the project mount").
+- **LLM endpoints are checked against the egress allowlist** (section 8),
+  instead of a run failing at Squid.
 - **The mountless flag is checked against the mounts.** Compose passed
   `BLPL_PROJECT_MOUNT` nowhere and bound all of `./data` regardless.
   `docker-compose.mountless.yml` removes the projects from the backend's
@@ -895,9 +922,33 @@ What the backend does at startup (`workspace_files.check_project_mount`):
 - not `absent`, and the directory is hidden: starts, and logs a banner warning
   that every route still on the mount will find empty projects.
 
-Known limits of this layout. The sealed check is a stat under the projects
-root, so a mountless backend sees every project as unsealed (see "What is left
-after phase 4"). The routes listed there answer 503.
+**Sealed projects in this layout.** Blobs live in `data/sealed/`
+(`workspace.sealed_root`; `BLPL_SEALED_ROOT` to move it), beside the projects
+rather than in them, so the backend sees which projects are sealed in both
+layouts. `workspace.is_sealed` is the one check every route uses: the list,
+`/open`, the 423 on file routes, seal and unseal. It reads `data/sealed/`
+first and falls back to the old `projects/.sealed/` for a blob not yet moved.
+The sealer gets both directories (`/projects` and `/sealed`), and the socket
+proxy lets only a sealer bind the blob directory (`BLPL_PROXY_SEALED_ROOTS`).
+`projects/.sealed/` keeps the per-project locks and the restore staging,
+which hold plaintext and must be on the projects filesystem so a restore can
+rename into place.
+
+Moving old blobs (`workspace.migrate_sealed`) runs at every start of the
+worker, and of a backend that has the mount. It can also be run on its own:
+`docker compose exec worker python -m app.workspace migrate-sealed`. It is
+idempotent and takes each project's seal lock. A blob is renamed into
+`data/sealed/`; across filesystems it is copied to a temporary name, flushed,
+renamed into place and compared, and only then is the old copy removed. An
+identical copy left by a crash is removed. Two different blobs for one project
+are both kept and reported, and the new location is the one read. A mountless
+backend cannot see the old location, so the worker must have run once (or the
+command above) before the switch; until then such a project is listed as
+unsealed with nothing in it.
+
+An unsealed project is listed in this layout with its details (files,
+schematic, board) unknown, since the backend cannot read them. The routes
+listed below answer 503.
 
 **What is left after phase 4**
 - **Migration into subvolumes:** a sealed project unsealed into a fresh
@@ -919,10 +970,6 @@ after phase 4"). The routes listed there answer 503.
   - KiCad open;
   - project create, clone and import;
   - members removal (worktree removal).
-- **The sealed state:** `.sealed/` lives under the projects root, so a
-  mountless backend's sealed check (a stat) cannot see it. The blobs, which
-  are ciphertext only, should move to a directory of their own that the
-  backend may mount.
 - **The PDF verdict table** (phase 0). Blob disposition still goes by path and
   suffix.
 
