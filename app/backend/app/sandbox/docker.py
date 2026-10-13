@@ -22,7 +22,7 @@ import json
 import os
 import struct
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 import httpx
@@ -139,6 +139,7 @@ def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig) -> dict[str, Any]:
     mounts += [_mount_body(m) for m in spec.extra_storage]
     if spec.agent_dir is not None:
         mounts.append(_mount_body(spec.agent_dir))
+    mounts += [_mount_body(m) for m in spec.overlays]
     mounts += [_mount_body(m) for m in spec.libraries]
     mounts.append(_mount_body(Mount(kind="tmpfs", target="/tmp", size_bytes=r.tmp_bytes)))
 
@@ -446,6 +447,59 @@ class DockerDriver:
         result = (await self._req("GET", f"/exec/{exec_id}/json")).json()
         code = result.get("ExitCode")
         return ExecResult(exit_code=-1 if code is None else int(code))
+
+    async def run_container(
+        self,
+        spec: WorkspaceSpec,
+        argv: Sequence[str],
+        *,
+        env: Mapping[str, str] | None = None,
+        on_output: OutputSink | None = None,
+        stop_grace_s: int = 10,
+    ) -> ExecResult:
+        if spec.key.role != "run":
+            raise ValueError("run_container takes a run key")
+        if not argv:
+            raise ValueError("nothing to run")
+        body = build_create_body(replace(spec, command=tuple(argv)), self.cfg)
+        # The run's own environment, on top of the spec's configuration. It
+        # lives in this container's config for the container's life, which is
+        # the run's, and the container is removed when the run ends.
+        body["Env"] = body["Env"] + [f"{k}={v}" for k, v in (env or {}).items()]
+        name = spec.key.container_name()
+        await self._req("POST", "/containers/create", params={"name": name}, json=body,
+                        ok=(201,))
+        try:
+            await self._req("POST", f"/containers/{name}/start", ok=(204, 304))
+            try:
+                async with self._http.stream("GET", f"/containers/{name}/logs", params={
+                        "follow": "1", "stdout": "1", "stderr": "1"}) as resp:
+                    if resp.status_code != 200:
+                        await resp.aread()
+                        raise DriverError(f"logs: {resp.status_code} {resp.text}")
+                    buf = bytearray()
+                    async for chunk in resp.aiter_raw():
+                        buf.extend(chunk)
+                        for stream, data in demux(buf):
+                            if on_output is not None:
+                                res = on_output(stream, data)
+                                if inspect.isawaitable(res):
+                                    await res
+            except asyncio.CancelledError:
+                await asyncio.shield(self._req(
+                    "POST", f"/containers/{name}/stop", params={"t": str(stop_grace_s)},
+                    ok=(204, 304, 404)))
+                raise
+            # The log stream ends when the container exits; the state may lag.
+            for _ in range(100):
+                st = (await self._req("GET", f"/containers/{name}/json")).json()["State"]
+                if not st.get("Running"):
+                    return ExecResult(exit_code=int(st.get("ExitCode", -1)))
+                await asyncio.sleep(0.1)
+            raise DriverError(f"{name} still running after its output ended")
+        finally:
+            await asyncio.shield(self._req("DELETE", f"/containers/{name}",
+                                           params={"force": "true"}, ok=(204, 404)))
 
     async def _terminate(self, cid: str, exec_id: str, pidfile: str) -> None:
         """SIGTERM the exec'd process, then SIGKILL it after the grace period."""

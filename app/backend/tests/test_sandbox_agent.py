@@ -413,6 +413,7 @@ def test_a_members_worktree_is_created_in_the_workspace(ag, projects):
 
 
 def test_moving_or_deleting_a_link_out_of_the_project_is_refused(ag, projects):
+    pytest.importorskip("blpl.core.quarantine")  # llm_ignore's, in the image
     _, c, _ = ag
     (projects / "board" / "out").symlink_to(projects / "victim")
     for call in (lambda: c.managed_delete(B(projects), "out"),
@@ -422,3 +423,17 @@ def test_moving_or_deleting_a_link_out_of_the_project_is_refused(ag, projects):
         assert e.value.status == 403
     assert (projects / "board" / "out").is_symlink()
     assert (projects / "victim" / "secret.md").exists()
+
+
+def test_a_run_in_its_own_container_still_holds_writes(ag, projects):
+    _, c, _ = ag
+    c.run_mark("run_x", True, ttl=1.5)
+    with pytest.raises(AgentCallError) as e:
+        c.write(B(projects), "design.md", b"x")
+    assert e.value.status == 409
+    c.run_mark("run_x", False)
+    c.write(B(projects), "design.md", b"x")
+    # A mark nobody renews lapses: a dead control plane cannot block writes.
+    c.run_mark("run_y", True, ttl=1.0)
+    time.sleep(1.2)
+    c.write(B(projects), "design.md", b"y")

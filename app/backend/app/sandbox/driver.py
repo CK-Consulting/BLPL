@@ -35,7 +35,8 @@ LABEL_MEMBER = "blpl.member"
 # next stopped rather than silently kept forever.
 LABEL_SPEC = "blpl.spec"
 
-Role = Literal["workspace", "desktop"]
+Role = Literal["workspace", "desktop", "run"]
+_PREFIX = {"workspace": "blpl-ws-", "desktop": "blpl-desk-", "run": "blpl-run-"}
 
 # Where a workspace sees its agent directory (socket, start token).
 AGENT_DIR = "/run/blpl"
@@ -90,13 +91,16 @@ class WorkspaceKey:
 
     project: str
     role: Role = "workspace"
+    # A desktop's member; for a run container (phase 4), the run's id.
     member: str | None = None
 
     def __post_init__(self) -> None:
         if not self.project:
             raise ValueError("a workspace needs a project")
-        if (self.role == "desktop") != (self.member is not None):
-            raise ValueError("a desktop needs a member, and only a desktop has one")
+        if self.role not in _PREFIX:
+            raise ValueError(f"unknown role {self.role!r}")
+        if (self.role != "workspace") != (self.member is not None):
+            raise ValueError("a desktop or run needs a member (or run id), and only they have one")
 
     @property
     def slug(self) -> str:
@@ -105,8 +109,7 @@ class WorkspaceKey:
         return _slug(f"{self.project}\0{self.member}")
 
     def container_name(self) -> str:
-        prefix = "blpl-ws-" if self.role == "workspace" else "blpl-desk-"
-        return prefix + self.slug
+        return _PREFIX[self.role] + self.slug
 
     def volume_name(self) -> str:
         # Per project, not per key: a member's desktop mounts the same storage
@@ -164,6 +167,10 @@ class WorkspaceSpec:
     # Phase 3: the host directory holding this workspace's agent socket and
     # start token, mounted read-write at AGENT_DIR. One per container.
     agent_dir: Mount | None = None
+    # Phase 4: read-only binds laid over the project's own storage. A run
+    # container gets the project's .git this way, so nothing a stage runs can
+    # write an index, a ref or a hook.
+    overlays: tuple[Mount, ...] = ()
     resources: Resources = Resources()
     # Configuration only — the egress proxy's address, library roots. Never a
     # secret: this is baked into the container and readable by anything in it
@@ -181,6 +188,9 @@ class WorkspaceSpec:
         if self.agent_dir is not None and (self.agent_dir.read_only
                                            or self.agent_dir.target != AGENT_DIR):
             raise ValueError(f"the agent directory is mounted read-write at {AGENT_DIR}")
+        for m in self.overlays:
+            if not m.read_only:
+                raise ValueError(f"overlay {m.target} must be read-only")
         for m in (self.storage, *self.extra_storage):
             if m.read_only:
                 raise ValueError("a project's own storage is mounted read-write")
@@ -264,6 +274,23 @@ class WorkspaceDriver(Protocol):
 
     async def remove(self, key: WorkspaceKey) -> None:
         """Delete the container. Its storage is not touched."""
+        ...
+
+    async def run_container(
+        self,
+        spec: "WorkspaceSpec",
+        argv: Sequence[str],
+        *,
+        env: Mapping[str, str] | None = None,
+        on_output: OutputSink | None = None,
+        stop_grace_s: int = 10,
+    ) -> ExecResult:
+        """Phase 4: run argv as the whole life of a fresh container built from
+        spec (role "run"), stream its output, remove it, return its exit code.
+
+        Cancelling the calling task stops the container: SIGTERM, then SIGKILL
+        to every process in it after the grace period, so nothing a stage
+        started outlives the cancel."""
         ...
 
     async def list(self) -> list[WorkspaceStatus]:

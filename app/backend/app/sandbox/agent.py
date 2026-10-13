@@ -205,12 +205,27 @@ class _Run:
 class Runs:
     def __init__(self) -> None:
         self._runs: dict[str, _Run] = {}
+        self._marks: dict[str, float] = {}
         self._lock = threading.Lock()
         RUN_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def active(self) -> int:
+        now = time.monotonic()
         with self._lock:
-            return sum(1 for r in self._runs.values() if r.proc.poll() is None)
+            own = sum(1 for r in self._runs.values() if r.proc.poll() is None)
+            self._marks = {k: t for k, t in self._marks.items() if t > now}
+            return own + len(self._marks)
+
+    def mark(self, rid: str, active: bool, ttl: float) -> None:
+        """A run in a container of its own (phase 4) counts as active here too,
+        so writes wait for it exactly as for a run this agent started. The mark
+        expires unless renewed, so a control plane that died mid-run cannot
+        leave the workspace refusing writes for ever."""
+        with self._lock:
+            if active:
+                self._marks[rid] = time.monotonic() + max(1.0, min(ttl, 600.0))
+            else:
+                self._marks.pop(rid, None)
 
     def start(self, argv: list[str], env: dict[str, str], cwd: str) -> str:
         rid = uuid.uuid4().hex[:16]
@@ -849,6 +864,10 @@ class Agent:
         cwd = self.fs.checkout(b.get("cwd")) if b.get("cwd") else "/tmp"
         return {"id": self.runs.start(argv, {str(k): str(v) for k, v in env.items()}, cwd)}
 
+    def run_mark(self, b: dict) -> dict:
+        self.runs.mark(str(b.get("id", "")), bool(b.get("active")), float(b.get("ttl", 60)))
+        return {"runs_active": self.runs.active()}
+
     def health(self) -> dict:
         return {"ok": True, "version": VERSION, "runs_active": self.runs.active(),
                 "idle_s": time.monotonic() - self._last}
@@ -865,7 +884,7 @@ _JSON_ROUTES = {
     "/managed/delete": Agent.managed_delete, "/managed/move": Agent.managed_move,
     "/ignore/entries": Agent.ignore_entries, "/ignore/set": Agent.ignore_set,
     "/quarantine/view": Agent.quarantine_view, "/project/boards": Agent.project_boards,
-    "/worktree/ensure": Agent.worktree_ensure,
+    "/worktree/ensure": Agent.worktree_ensure, "/runs/mark": Agent.run_mark,
 }
 
 

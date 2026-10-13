@@ -60,7 +60,7 @@ class Refused(Exception):
     """The request is outside policy. The message says which part."""
 
 
-ROLE_NAME_PREFIX = {"workspace": "blpl-ws-", "desktop": "blpl-desk-"}
+ROLE_NAME_PREFIX = {"workspace": "blpl-ws-", "desktop": "blpl-desk-", "run": "blpl-run-"}
 MIN_API_MINOR = 44
 
 
@@ -84,7 +84,9 @@ class ProxyPolicy:
     # container may bind exactly <root>/<its own name>, read-write, at
     # /run/blpl, and so reach no other workspace's socket or token.
     agent_dir_roots: tuple[str, ...] = ()
-    roles: frozenset[str] = frozenset({"workspace"})
+    # "run" (phase 4) is a container per pipeline run, confined exactly as a
+    # workspace is, with the project's .git read-only.
+    roles: frozenset[str] = frozenset({"workspace", "run"})
     volume_prefix: str = "blpl-ws-"
     max_memory: int = 16 * GiB
     max_nano_cpus: int = 8_000_000_000
@@ -367,7 +369,10 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
                 }, ww),
             }, w, required=("Source", "Target", "ReadOnly"))
             if got["ReadOnly"]:
-                if not _under_root(got["Source"], policy.ro_bind_roots):
+                git_dirs = {d + "/.git" for d in _project_dirs(policy, project)
+                            if "/.worktrees/" not in d}
+                if not (_under_root(got["Source"], policy.ro_bind_roots)
+                        or got["Source"] in git_dirs):
                     raise Refused(f"{w}.Source {got['Source']} is not a permitted library root")
             elif got["Source"] in _agent_dirs(policy, container):
                 if got["Target"] != AGENT_DIR:
@@ -562,6 +567,7 @@ _ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("POST", re.compile(r"/containers/create"), "create"),
     ("POST", re.compile(rf"/containers/{_ID}/(?P<op>start|stop|pause|unpause)"), "op"),
     ("GET", re.compile(rf"/containers/{_ID}/json"), "inspect"),
+    ("GET", re.compile(rf"/containers/{_ID}/logs"), "logs"),
     ("DELETE", re.compile(rf"/containers/{_ID}"), "remove"),
     ("POST", re.compile(rf"/containers/{_ID}/exec"), "exec_create"),
     ("POST", re.compile(rf"/exec/{_ID}/start"), "exec_start"),
@@ -612,6 +618,7 @@ def check_query(action: str, query: Mapping[str, str]) -> dict[str, str]:
                  "filters": lambda v, w: v},
         "op": {"t": _regex(r"\d{1,4}"), "signal": _regex(r"SIG[A-Z0-9]+")},
         "remove": {"force": flag, "v": off, "link": off},
+        "logs": {"follow": flag, "stdout": flag, "stderr": flag},
         "create": {"name": lambda v, w: v},
     }
     q = dict(query)

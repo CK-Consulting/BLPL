@@ -31,7 +31,7 @@ import asyncio
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Mapping, Sequence
 
@@ -276,3 +276,92 @@ async def run_job_via_agent(
         if busy is not None:
             busy.__exit__(None, None, None)
         client.close()
+
+
+# -- phase 4: a container per run, with .git read-only ---------------------------------
+
+
+def runs_in_containers(env: Mapping[str, str] | None = None) -> bool:
+    env = os.environ if env is None else env
+    return env.get("BLPL_RUNS_IN_CONTAINER", "") == "1"
+
+
+def run_spec_for(cfg: WorkspaceRunConfig, project_name: str, run_id: str) -> WorkspaceSpec:
+    """The workspace's spec, as a run container: same storage and libraries,
+    plus the project's .git bound read-only over it.
+
+    One overlay covers every checkout, because a member's worktree keeps its
+    git directory inside the project's (.git/worktrees/<name>). So no git
+    command a stage runs (provenance's `git status` among them) can rewrite an
+    index, move a ref or install a hook."""
+    base = spec_for(cfg, project_name)
+    root = str(cfg.projects_root)
+    overlays: tuple[Mount, ...] = ()
+    if (cfg.projects_root / project_name / ".git").is_dir():
+        overlays = (Mount(kind="bind", source=f"{cfg.host_projects_root}/{project_name}/.git",
+                          target=f"{root}/{project_name}/.git", read_only=True),)
+    return replace(base, key=WorkspaceKey(project=project_name, role="run", member=run_id),
+                   overlays=overlays)
+
+
+async def run_job_in_container(
+    driver: WorkspaceDriver,
+    cfg: WorkspaceRunConfig,
+    *,
+    project_name: str,
+    run_id: str,
+    cmd: Sequence[str],
+    env: Mapping[str, str],
+    log: Callable[[str], None],
+    poll: Callable[[], Awaitable[str]],
+    mark: Callable[[bool, float], Awaitable[None]] | None = None,
+    poll_every: float = 20.0,
+) -> int:
+    """Phase 4: one run, one container, removed when it ends.
+
+    ``mark`` tells the workspace's agent a run is active (renewed every poll,
+    expiring on its own), so writes through the agent still wait for a run
+    they cannot see. Cancel stops the container: every process in it, not
+    just the first."""
+    import codecs
+
+    from .runpath import run_env
+
+    spec = run_spec_for(cfg, project_name, re.sub(r"[^A-Za-z0-9_.-]", "-", run_id))
+    decoders = {s: codecs.getincrementaldecoder("utf-8")("replace") for s in ("stdout", "stderr")}
+
+    def sink(stream: str, data: bytes) -> None:
+        text = decoders[stream].decode(data)
+        if text:
+            log(text)
+
+    ttl = poll_every * 3
+    if mark is not None:
+        await mark(True, ttl)
+    task = asyncio.create_task(driver.run_container(
+        spec, list(cmd), env=run_env(env, operation_inject(cmd, env)), on_output=sink))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=poll_every)
+            if done:
+                for d in decoders.values():
+                    tail = d.decode(b"", final=True)
+                    if tail:
+                        log(tail)
+                return task.result().exit_code
+            if mark is not None:
+                await mark(True, ttl)
+            if await poll() == CANCELLING:
+                log("blpl: run cancelled; stopping its container\n")
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                return CANCELLED_EXIT
+    finally:
+        if mark is not None:
+            try:
+                await mark(False, 0)
+            except Exception:  # noqa: BLE001 - it expires on its own
+                pass

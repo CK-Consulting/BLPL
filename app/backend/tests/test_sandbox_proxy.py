@@ -278,7 +278,6 @@ def test_parser_differentials_are_refused():
     ("PUT", f"/v1.44/containers/{CID}/archive"),    # write files into it
     ("GET", f"/v1.44/containers/{CID}/archive"),
     ("GET", f"/v1.44/containers/{CID}/export"),
-    ("GET", f"/v1.44/containers/{CID}/logs"),
     ("POST", "/v1.44/commit"),
     ("POST", "/v1.44/networks/create"),
     ("POST", "/v1.44/networks/app_blpl/connect"),
@@ -479,3 +478,13 @@ def test_plumbing_refuses_without_contacting_the_daemon_and_streams_exec_output(
         asyncio.run(scenario())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_logs_are_ours_only_and_read_only():
+    """Phase 4 lists GET logs, for run containers' output; nothing else changes."""
+    fwd = decide("GET", f"/containers/{KEY.container_name()}/logs",
+                 query={"follow": "1", "stdout": "1", "stderr": "1"})
+    assert fwd.path == f"/v1.44/containers/{CID}/logs"
+    refused("GET", "/containers/blpl-backend/logs", match="not managed")
+    refused("GET", f"/containers/{CID}/logs", query={"since": "0"}, match="not permitted")
+    refused("POST", f"/containers/{CID}/logs", match="not permitted")

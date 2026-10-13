@@ -210,6 +210,9 @@ class DockerProxy:
         cid = await self._container(v, r.ident)
         if r.action == "inspect":
             return Forward("GET", f"/{v}/containers/{cid}/json", {})
+        if r.action == "logs":
+            # A run container's output (phase 4). Read-only, and only ours.
+            return Forward("GET", f"/{v}/containers/{cid}/logs", q)
         if r.action == "op":
             return Forward("POST", f"/{v}/containers/{cid}/{r.op}", q)
         if r.action == "remove":

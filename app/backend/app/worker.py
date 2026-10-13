@@ -159,6 +159,26 @@ class _Workspaces:
 
         with path.open("w", encoding="utf-8", buffering=1) as log:
             try:
+                if sandbox_jobs.runs_in_containers():
+                    # Phase 4: a container per run, .git read-only in it. The
+                    # workspace's agent, when there is one, is told a run is
+                    # active so writes through it wait.
+                    access = self.access
+
+                    async def mark(active: bool, ttl: float) -> None:
+                        if access is None:
+                            return
+                        client = await access.ensure(job.project_name)
+                        try:
+                            await asyncio.to_thread(client.run_mark, job.run_id, active, ttl)
+                        finally:
+                            client.close()
+
+                    return await sandbox_jobs.run_job_in_container(
+                        self.driver, self.cfg, project_name=job.project_name,
+                        run_id=job.run_id, cmd=job.cmd, env=job.env, log=log.write,
+                        poll=poll, mark=mark, poll_every=_HEARTBEAT_EVERY,
+                    )
                 if self.access is not None:
                     access = self.access
                     return await sandbox_jobs.run_job_via_agent(

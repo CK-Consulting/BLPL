@@ -55,6 +55,7 @@ class FakeDriver:
     boxes: dict[WorkspaceKey, _Box] = field(default_factory=dict)
     calls: list[ExecCall] = field(default_factory=list)
     ops: list[tuple[str, WorkspaceKey]] = field(default_factory=list)
+    run_specs: list[WorkspaceSpec] = field(default_factory=list)
     _n: int = 0
 
     def _status(self, key: WorkspaceKey) -> WorkspaceStatus:
@@ -125,6 +126,33 @@ class FakeDriver:
                 outcome = await outcome
         except asyncio.CancelledError:
             call.cancelled = True
+            raise
+        code, chunks = outcome
+        for stream, data in chunks:
+            if on_output is not None:
+                res = on_output(stream, data)
+                if inspect.isawaitable(res):
+                    await res
+        return ExecResult(exit_code=code)
+
+    async def run_container(self, spec: WorkspaceSpec, argv: Sequence[str], *,
+                            env: Mapping[str, str] | None = None,
+                            on_output: OutputSink | None = None,
+                            stop_grace_s: int = 10) -> ExecResult:
+        """A run container: exists only for the call, then is gone."""
+        if spec.key.role != "run":
+            raise ValueError("run_container takes a run key")
+        self.ops.append(("run_container", spec.key))
+        self.run_specs.append(spec)
+        call = ExecCall(spec.key, list(argv), dict(env or {}), None)
+        self.calls.append(call)
+        try:
+            outcome = self.script(call)
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+        except asyncio.CancelledError:
+            call.cancelled = True
+            self.ops.append(("stop", spec.key))
             raise
         code, chunks = outcome
         for stream, data in chunks:
