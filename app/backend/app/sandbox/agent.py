@@ -227,8 +227,21 @@ class Runs:
             else:
                 self._marks.pop(rid, None)
 
-    def start(self, argv: list[str], env: dict[str, str], cwd: str) -> str:
-        rid = uuid.uuid4().hex[:16]
+    def start(self, argv: list[str], env: dict[str, str], cwd: str,
+              rid: str | None = None) -> str:
+        """Start a run, or, for an id already known, return it unstarted.
+
+        The id is the caller's (the database run's), so a worker that retries
+        a reclaimed run after the first worker died finds the process the first
+        one started and follows it, instead of starting a second copy on the
+        same checkout and paying for its model calls twice (Codex, PR #20)."""
+        if rid is None:
+            rid = uuid.uuid4().hex[:16]
+        elif not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", rid):
+            raise AgentError(400, "invalid run id")
+        with self._lock:
+            if rid in self._runs:
+                return rid
         log = RUN_LOG_DIR / f"{rid}.log"
         base = {k: v for k, v in os.environ.items() if not k.startswith("BLPL_AGENT_")}
         # Readers in a run never take git's optional locks, so `git status` in
@@ -375,7 +388,8 @@ def _below_blpl(parts: list[str]) -> bool:
 
 
 class Agent:
-    def __init__(self, token: str, roots: list[str], *, projects_root: str | None = None):
+    def __init__(self, token: str, roots: list[str], *, projects_root: str | None = None,
+                 allow_runs: bool = False):
         if not token:
             raise ValueError("no token")
         self.token = token.encode()
@@ -385,6 +399,16 @@ class Agent:
         self._projects_root = projects_root or (
             os.path.dirname(self.fs.roots[0]) if self.fs.roots else "/")
         self.runs = Runs()
+        # Off unless asked for, and nothing in a deployment asks. A process
+        # this agent starts shares its container, its uid and the read-write
+        # /run/blpl that holds the socket: it could rename agent.sock and
+        # listen in its place, and the control plane would hand its bearer
+        # token, and with pushes a leased credential, to the impostor. The
+        # agent cannot run a stage as another uid (no CAP_SETUID, and
+        # no-new-privileges). So with the agent in use, the worker runs stages
+        # in run containers of their own, which do not mount /run/blpl
+        # (Codex, PR #20).
+        self.allow_runs = allow_runs
         self.git = _projects.Projects(Path(self.fs.roots[0]) if self.fs.roots else Path("/"))
         self._last = time.monotonic()
         self._holds: dict[str, threading.Event] = {}
@@ -981,12 +1005,16 @@ class Agent:
     # -- runs ------------------------------------------------------------------
 
     def run_start(self, b: dict) -> dict:
+        if not self.allow_runs:
+            raise _forbidden("this agent does not start runs; runs go in run containers")
         argv = b.get("argv")
         if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
             raise AgentError(400, "argv must be a non-empty list of strings")
         env = b.get("env") or {}
         cwd = self.fs.checkout(b.get("cwd")) if b.get("cwd") else "/tmp"
-        return {"id": self.runs.start(argv, {str(k): str(v) for k, v in env.items()}, cwd)}
+        rid = b.get("id")
+        return {"id": self.runs.start(argv, {str(k): str(v) for k, v in env.items()}, cwd,
+                                      str(rid) if rid else None)}
 
     def run_mark(self, b: dict) -> dict:
         self.runs.mark(str(b.get("id", "")), bool(b.get("active")), float(b.get("ttl", 60)))
@@ -1144,7 +1172,8 @@ def main() -> None:
         return
     _undumpable()
     harden_git_environment(os.environ)
-    agent = Agent(read_token(token_file), roots)
+    agent = Agent(read_token(token_file), roots,
+                  allow_runs=os.environ.get("BLPL_AGENT_RUNS") == "1")
     server = serve(str(run_dir / "agent.sock"), agent)
     signal.signal(signal.SIGTERM, lambda *a: threading.Thread(target=server.shutdown).start())
     logger.info("serving on %s for %s", run_dir / "agent.sock", roots)

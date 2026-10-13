@@ -552,13 +552,16 @@ def test_phase3_the_agent_in_a_real_workspace(env):
                 assert out.strip() == "Ada Lovelace"
                 assert c.git_status(co)["dirty"] is False
 
-                # A run: a real stage, then what a run can and cannot reach.
-                rid = c.run_start(["/opt/blpl-venv/bin/python", "-m", "blpl.core.cli",
-                                   "stage0-det", "--project-dir", co], {}, co)
-                code = await _agent_wait(c, rid)
-                assert code == 0
-                assert (proj / ".pipeline" / "design_artifact.deterministic.json").is_file()
+                # The agent starts no runs (Codex, PR #20): a process in its
+                # container could take over the socket. Stages run in run
+                # containers, which do not mount /run/blpl at all.
+                with pytest.raises(AgentCallError) as e:
+                    c.run_start(["true"], {}, co)
+                assert e.value.status == 403
 
+                # What is in the workspace container, looked at through the
+                # operator's door (docker exec), not through anything a stage
+                # gets: the token file is gone, the agent's environ unreadable.
                 probe = (
                     "import os, glob\n"
                     "print('token', os.path.exists('/run/blpl/agent.token'))\n"
@@ -573,22 +576,38 @@ def test_phase3_the_agent_in_a_real_workspace(env):
                     "                print('environ denied')\n"
                     "    except OSError:\n"
                     "        pass\n"
-                    "print('locks', os.environ.get('GIT_OPTIONAL_LOCKS'))\n"
                 )
-                rid = c.run_start(["python", "-c", probe], {}, co)
-                out = await _agent_log(c, rid)
+                d0 = DockerDriver(env.config(f"unix://{psock}"))
+                outb: list[bytes] = []
+                await d0.exec_run(access.spec(project).key, ["python", "-c", probe],
+                                  on_output=lambda s_, b: outb.append(b))
+                await d0.aclose()
+                out = b"".join(outb).decode()
                 assert "token False" in out
                 assert "environ denied" in out and "environ readable" not in out, out
-                assert "locks 0" in out
 
-                # Cancel takes the whole process group.
-                rid = c.run_start(["sh", "-c", "sleep 300 & sleep 300; wait"], {}, co)
-                await asyncio.sleep(1.0)
-                c.run_cancel(rid)
-                code = await _agent_wait(c, rid)
-                assert code is not None and code < 0
-                rid = c.run_start(["sh", "-c", "ps -eo args | grep -c '^sleep 300' || true"], {}, co)
-                assert (await _agent_log(c, rid)).strip() == "0"
+                # A stage, in its run container: a real stage runs, and the
+                # agent's directory is nowhere it can reach.
+                from app.sandbox import jobs as jobs_mod
+
+                async def poll():
+                    return "running"
+
+                lines: list[str] = []
+                d1 = DockerDriver(env.config(f"unix://{psock}"))
+                name = access.spec(project).key.container_name()
+                code = await jobs_mod.run_job_in_container(
+                    d1, access.run_cfg, project_name=project, run_id="run-p3",
+                    cmd=["sh", "-c",
+                         f"/opt/blpl-venv/bin/python -m blpl.core.cli stage0-det --project-dir {co}"
+                         f" >/dev/null && echo stage=0; ls /run/blpl 2>/dev/null; echo ls=$?;"
+                         f" test -e {agents}/{name}/agent.sock; echo sock=$?"],
+                    env={}, log=lines.append, poll=poll, poll_every=5)
+                await d1.aclose()
+                text = "".join(lines)
+                assert code == 0 and "stage=0" in text, text
+                assert "ls=0" not in text and "sock=0" not in text, text
+                assert (proj / ".pipeline" / "design_artifact.deterministic.json").is_file()
             finally:
                 c.close()
         finally:
@@ -1075,3 +1094,43 @@ def test_ssh_from_a_workspace_goes_through_the_connect_proxy(env):
     # The control: with no proxy command, the remote is not even reachable.
     assert "rc=0" not in results["direct"][1]
     assert proxy_log.count("CONNECT") == 1, proxy_log  # only the proxied attempt
+
+
+def test_phase4_a_retried_run_follows_its_first_attempt_instead_of_starting_again(env):
+    """Codex, PR #20: a reclaimed run's retry, with the same command, follows
+    the first attempt's container to its end. One start, one result, no
+    second copy on the checkout."""
+    from dataclasses import replace
+
+    from app.sandbox.docker import build_create_body
+
+    projects = env.tmp / "projects"
+    proj = projects / f"itest-{env.tag}-reattach"
+    proj.mkdir(parents=True)
+    for d in (env.tmp, projects):
+        os.chmod(d, 0o755)
+    os.chmod(proj, 0o777)
+    base = env.spec("reattach")
+    spec = replace(base, key=WorkspaceKey(base.key.project, role="run", member="run_88"),
+                   storage=Mount(kind="bind", source=str(proj), target="/workspace"), command=())
+    argv = ["sh", "-c", "echo start >> /workspace/starts; sleep 2; echo done"]
+
+    async def scenario():
+        driver = DockerDriver(env.config(f"unix://{SOCK}"))
+        try:
+            body = build_create_body(replace(spec, command=tuple(argv)), driver.cfg)
+            name = spec.key.container_name()
+            await driver._req("POST", "/containers/create", params={"name": name},
+                              json=body, ok=(201,))
+            await driver._req("POST", f"/containers/{name}/start", ok=(204,))
+            await asyncio.sleep(0.5)  # the first worker "dies" here
+            out: list[bytes] = []
+            res = await driver.run_container(spec, argv, on_output=lambda s, b: out.append(b))
+            assert res.exit_code == 0 and b"done" in b"".join(out)
+            assert (proj / "starts").read_text() == "start\n", "the run was started twice"
+            assert (await driver.status(spec.key)).state is State.ABSENT
+        finally:
+            await driver.aclose()
+
+    asyncio.run(scenario())
+

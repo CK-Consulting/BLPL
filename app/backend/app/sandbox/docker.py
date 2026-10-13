@@ -489,15 +489,23 @@ class DockerDriver:
         # if its labels say it is exactly this run of this project. Anything
         # else under the name raises NotOurs from _inspect and is left alone.
         orphan = await self._inspect(spec.key)
-        if orphan is not None:
+        # The same command (Codex, PR #20): the first attempt is still at
+        # work, or finished while nobody was watching. It is followed, from
+        # the top of its output, rather than killed and started again, which
+        # would redo its work and pay for its model calls twice. A different
+        # command under this run's name is a stale container: it goes.
+        reattach = orphan is not None and list((orphan.get("Config") or {}).get("Cmd") or []) \
+            == list(argv)
+        if orphan is not None and not reattach:
             await self._req("DELETE", f"/containers/{orphan['Id']}",
                             params={"force": "true"}, ok=(204, 404))
-        created = False
+        created = reattach
         try:
-            await self._req("POST", "/containers/create", params={"name": name}, json=body,
-                            ok=(201,))
-            created = True
-            await self._req("POST", f"/containers/{name}/start", ok=(204, 304))
+            if not reattach:
+                await self._req("POST", "/containers/create", params={"name": name},
+                                json=body, ok=(201,))
+                created = True
+                await self._req("POST", f"/containers/{name}/start", ok=(204, 304))
             try:
                 async with self._http.stream("GET", f"/containers/{name}/logs", params={
                         "follow": "1", "stdout": "1", "stderr": "1"}) as resp:

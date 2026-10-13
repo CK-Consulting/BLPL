@@ -339,3 +339,30 @@ def test_proxy_refuses_other_worktree_mounts(tmp_path, source, ro):
                                          "ReadOnly": ro})
     with pytest.raises(Refused):
         _create_named(body, spec.key.container_name())
+
+
+def test_a_reclaimed_run_container_is_followed_and_not_snapshotted_again(tmp_path):
+    """The first worker snapshotted, started the run container and died. The
+    retry must neither snapshot again nor start a second container: it follows
+    the first (Codex, PR #20)."""
+    import app.sandbox.fake as fake_mod
+
+    c = cfg(tmp_path)
+    spec = jobs.run_spec_for(c, "pathfinder", "run_3")
+    d = FakeDriver()
+    d.boxes[spec.key] = fake_mod._Box(spec, jobs.State.RUNNING, "first", argv=["x"],
+                                      outcome=(0, [("stdout", b"first attempt finished\n")]))
+    snaps: list[str] = []
+
+    async def snap(label):
+        snaps.append(label)
+
+    async def poll():
+        return "running"
+
+    lines: list[str] = []
+    code = asyncio.run(jobs.run_job_in_container(
+        d, c, project_name="pathfinder", run_id="run_3", cmd=["x"], env={},
+        log=lines.append, poll=poll, snapshot=snap))
+    assert code == 0 and "first attempt finished" in "".join(lines)
+    assert snaps == [] and ("reattach", spec.key) in d.ops and d.calls == []

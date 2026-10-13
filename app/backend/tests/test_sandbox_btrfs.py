@@ -31,6 +31,7 @@ class FakeBtrfs:
         self.calls: list[list[str]] = []
         self.subvolumes: set[str] = set()
         self.limits: dict[str, str] = {}
+        self.readonly: set[str] = set()
 
     def __call__(self, argv: list[str]) -> str:
         self.calls.append(argv)
@@ -47,6 +48,10 @@ class FakeBtrfs:
             src, dest = argv[-2], argv[-1]
             shutil.copytree(src, dest, symlinks=True)
             self.subvolumes.add(dest)
+            if "-r" in argv:
+                self.readonly.add(dest)
+        elif (sub, verb) == ("property", "get"):
+            return f"ro={'true' if argv[4] in self.readonly else 'false'}\n"
         elif (sub, verb) == ("subvolume", "delete"):
             shutil.rmtree(argv[3])
             self.subvolumes.discard(argv[3])
@@ -211,3 +216,19 @@ def test_on_a_real_btrfs_filesystem(tmp_path):  # pragma: no cover - needs the s
             except StorageError:
                 pass
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_retried_run_reuses_its_own_snapshot_and_refuses_a_stranger(store):
+    """Codex, PR #20: a worker took pre-<run> and died; the retry's snapshot
+    must not fail on it, or the retry fails before it can deal with the
+    first attempt's container."""
+    s, fake = store
+    s.root.mkdir()
+    s.create("board")
+    assert "existing" not in s.snapshot("board", "pre-run_5")
+    again = s.snapshot("board", "pre-run_5")
+    assert again["existing"] is True
+    assert sum(1 for c in fake.calls if c[1:3] == ["subvolume", "snapshot"]) == 1
+    (s.root / ".snapshots" / "board" / "pre-planted").mkdir()  # not a snapshot
+    with pytest.raises(StorageError, match="not this project's snapshot"):
+        s.snapshot("board", "pre-planted")

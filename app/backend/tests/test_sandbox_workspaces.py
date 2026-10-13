@@ -45,7 +45,7 @@ class AgentDriver(FakeDriver):
             token = agent_mod.read_token(d / agentclient.TOKEN_FILE)
             roots = spec.env["BLPL_AGENT_ROOTS"].split(":")
             server = agent_mod.serve(str(d / agentclient.SOCKET_FILE),
-                                     agent_mod.Agent(token, roots))
+                                     agent_mod.Agent(token, roots, allow_runs=True))
             threading.Thread(target=server.serve_forever, daemon=True).start()
             self.servers[spec.key] = server
         return st
@@ -236,3 +236,31 @@ def test_a_cancel_seen_by_the_poll_stops_the_agents_run(setup):
     code = asyncio.run(go())
     assert code is not None and code < 0
     assert len(polls) == 2
+
+
+def test_a_reclaimed_agent_run_is_followed_not_started_again(setup, tmp_path):
+    """The first worker started the run and died; the retry, with the same
+    database run id, follows that process to its end instead of starting a
+    second one on the same checkout."""
+    from app.sandbox import jobs
+
+    access, _, projects = setup
+    marker = tmp_path / "starts"
+    cmd = ["sh", "-c", f"echo x >> {marker}; sleep 1; echo finished"]
+
+    async def poll():
+        return "running"
+
+    async def scenario():
+        c = await access.ensure("board")
+        c.run_start(cmd, {}, str(projects / "board"), "run_dead")  # the first worker
+        c.close()
+        lines: list[str] = []
+        code = await jobs.run_job_via_agent(
+            lambda: access.ensure("board"), cmd=cmd, env={}, log=lines.append, poll=poll,
+            read_every=0.05, run_id="run_dead")
+        return code, "".join(lines)
+
+    code, text = asyncio.run(scenario())
+    assert code == 0 and "finished" in text
+    assert marker.read_text() == "x\n"

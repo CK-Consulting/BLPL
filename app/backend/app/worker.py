@@ -169,10 +169,11 @@ class _Workspaces:
 
         with path.open("w", encoding="utf-8", buffering=1) as log:
             try:
-                if sandbox_jobs.runs_in_containers():
-                    # Phase 4: a container per run, .git read-only in it. The
-                    # workspace's agent, when there is one, is told a run is
-                    # active so writes through it wait.
+                if sandbox_jobs.runs_in_containers() or self.access is not None:
+                    # A container per run, .git read-only in it. Always so with
+                    # the agent in use: a run inside the agent's own container
+                    # could take over its socket (Codex, PR #20). The agent is
+                    # told a run is active so writes through it wait.
                     access = self.access
 
                     async def mark(active: bool, ttl: float) -> None:
@@ -197,14 +198,6 @@ class _Workspaces:
                         run_id=job.run_id, cmd=job.cmd, env=job.env, log=log.write,
                         poll=poll, mark=mark, poll_every=_HEARTBEAT_EVERY,
                         snapshot=snapshot,
-                    )
-                if self.access is not None:
-                    access = self.access
-                    return await sandbox_jobs.run_job_via_agent(
-                        lambda: access.ensure(job.project_name), cmd=job.cmd, env=job.env,
-                        log=log.write, poll=poll, poll_every=_HEARTBEAT_EVERY,
-                        tracker=self.tracker,
-                        key=access.spec(job.project_name).key,
                     )
                 return await sandbox_jobs.run_job(
                     self.driver, self.cfg, project_name=job.project_name,

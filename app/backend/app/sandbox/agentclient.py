@@ -201,8 +201,9 @@ class AgentClient:
         self.call("/git/release", {"lease": lease})
 
     # runs
-    def run_start(self, argv: list[str], env: dict[str, str], cwd: str | None) -> str:
-        return self.call("/runs", {"argv": argv, "env": env, "cwd": cwd})["id"]
+    def run_start(self, argv: list[str], env: dict[str, str], cwd: str | None,
+                  rid: str | None = None) -> str:
+        return self.call("/runs", {"argv": argv, "env": env, "cwd": cwd, "id": rid})["id"]
 
     def run_read(self, rid: str, offset: int) -> tuple[bytes, int, bool, int | None]:
         r = self._check(self._http.get(f"/runs/{rid}", params={"offset": str(offset)}))

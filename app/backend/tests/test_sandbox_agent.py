@@ -32,7 +32,7 @@ def running_agent(roots: list[str], token: str = TOKEN):
     old = agent_mod.RUN_LOG_DIR
     agent_mod.RUN_LOG_DIR = tmp / "runs"
     try:
-        agent = agent_mod.Agent(token, roots)
+        agent = agent_mod.Agent(token, roots, allow_runs=True)
         server = agent_mod.serve(str(tmp / "agent.sock"), agent)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         client = AgentClient(tmp / "agent.sock", token)
@@ -549,3 +549,36 @@ def test_every_network_git_command_gets_the_proxied_ssh(ag, monkeypatch):
     for cred in ({}, {"env": {"GIT_HTTP_TOKEN": "t"}}, {"ssh_key": "KEY"}):
         with agent._credential(cred) as env:
             assert "ProxyCommand=nc -X connect -x squid:3128" in env["GIT_SSH_COMMAND"], cred
+
+
+# -- runs and the agent's socket (Codex, PR #20) -----------------------------------------
+
+
+def test_an_agent_starts_no_runs_unless_told_to(projects):
+    (projects / ".worktrees" / "board").mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="blpl-ag-"))
+    try:
+        agent = agent_mod.Agent(TOKEN, [str(projects / "board")])  # the deployed default
+        server = agent_mod.serve(str(tmp / "a.sock"), agent)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        c = AgentClient(tmp / "a.sock", TOKEN)
+        with pytest.raises(AgentCallError) as e:
+            c.run_start(["true"], {}, B(projects))
+        assert e.value.status == 403 and "run containers" in str(e.value)
+        c.close()
+        server.shutdown()
+        server.server_close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_a_second_start_for_the_same_run_id_follows_the_first(ag, projects, tmp_path):
+    agent, c, _ = ag
+    marker = tmp_path / "starts"
+    cmd = ["sh", "-c", f"echo x >> {marker}; sleep 2; echo done"]
+    first = c.run_start(cmd, {}, B(projects), "run_42")
+    second = c.run_start(cmd, {}, B(projects), "run_42")
+    assert first == second == "run_42"
+    out, code = _wait(c, "run_42")
+    assert code == 0 and out.strip().endswith(b"done")
+    assert marker.read_text() == "x\n", "the process was started twice"
