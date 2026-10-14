@@ -46,6 +46,13 @@ logger = logging.getLogger("blpl.fetch")
 
 MAX_BYTES = int(os.environ.get("BLPL_FETCH_MAX_MB", "50")) * 1024 * 1024
 TIMEOUT_S = 30.0
+# The whole fetch, redirects included, however the server paces its bytes. A
+# per-read socket timeout alone let a server trickle one byte per timeout
+# and keep a fetch going forever (Codex, PR #20).
+DEADLINE_S = float(os.environ.get("BLPL_FETCH_DEADLINE_S", "120"))
+# Fetches at once, across every run, and per run. Beyond either: 429.
+MAX_CONCURRENT = int(os.environ.get("BLPL_FETCH_MAX_CONCURRENT", "8"))
+MAX_PER_RUN = int(os.environ.get("BLPL_FETCH_MAX_PER_RUN", "2"))
 MAX_REDIRECTS = 5
 # A fetch request is a URL in a small JSON object.
 MAX_REQUEST_BYTES = 64 * 1024
@@ -132,12 +139,28 @@ class Download:
 
 
 def download(url: str, *, resolve: Resolve = _resolve, max_bytes: int = MAX_BYTES,
-             timeout: float = TIMEOUT_S, connections=None) -> Download:
-    """GET url, following redirects, each hop checked. Raises Refused."""
+             timeout: float = TIMEOUT_S, connections=None,
+             deadline_s: float | None = None) -> Download:
+    """GET url, following redirects, each hop checked. Raises Refused.
+
+    Streamed, with the size cap enforced as bytes arrive and one monotonic
+    deadline over the whole fetch: each read is given only what is left of
+    it."""
+    import time
+
     connections = connections or {"https": _PinnedHTTPS, "http": _PinnedHTTP}
+    limit = DEADLINE_S if deadline_s is None else deadline_s
+    deadline = time.monotonic() + limit
+
+    def left() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refused(f"the fetch took longer than {limit:g} s")
+        return remaining
+
     for _ in range(MAX_REDIRECTS + 1):
         scheme, host, port, path, address = _target(url, resolve)
-        conn = connections[scheme](host, port, address, timeout=timeout)
+        conn = connections[scheme](host, port, address, timeout=min(timeout, left()))
         try:
             conn.request("GET", path, headers={
                 "Host": host if port == _PORTS[scheme] else f"{host}:{port}",
@@ -154,10 +177,19 @@ def download(url: str, *, resolve: Resolve = _resolve, max_bytes: int = MAX_BYTE
             length = resp.getheader("Content-Length")
             if length and length.isdigit() and int(length) > max_bytes:
                 raise Refused(f"the file is larger than {max_bytes // (1024 * 1024)} MB")
-            data = resp.read(max_bytes + 1)
-            if len(data) > max_bytes:
-                raise Refused(f"the file is larger than {max_bytes // (1024 * 1024)} MB")
-            return Download(url=url, data=data)
+            data = bytearray()
+            while True:
+                sock = getattr(conn, "sock", None)
+                if sock is not None:
+                    sock.settimeout(min(timeout, left()))
+                chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > max_bytes:
+                    raise Refused(f"the file is larger than {max_bytes // (1024 * 1024)} MB")
+                left()
+            return Download(url=url, data=bytes(data))
         except (OSError, http.client.HTTPException) as exc:
             raise Refused(f"{host} could not be fetched: {exc}") from None
         finally:
@@ -188,15 +220,45 @@ def assess(project: str, got: Download, held_root: Path) -> tuple[int, dict, byt
 Authenticate = Callable[[str, str], "str | None"]
 
 
+class Slots:
+    """How many fetches may run at once, in all and per run. Taken without
+    waiting: a fetch beyond either limit is refused, not queued, so no thread
+    piles up behind a slow server."""
+
+    def __init__(self, total: int = MAX_CONCURRENT, per_run: int = MAX_PER_RUN):
+        self.total, self.per_run = total, per_run
+        self._lock = threading.Lock()
+        self._busy: dict[str, int] = {}
+
+    def take(self, run: str) -> bool:
+        with self._lock:
+            if sum(self._busy.values()) >= self.total or self._busy.get(run, 0) >= self.per_run:
+                return False
+            self._busy[run] = self._busy.get(run, 0) + 1
+            return True
+
+    def give(self, run: str) -> None:
+        with self._lock:
+            n = self._busy.get(run, 0) - 1
+            if n > 0:
+                self._busy[run] = n
+            else:
+                self._busy.pop(run, None)
+
+
 def make_handler(authenticate: Authenticate, held_root: Path, *,
-                 resolve: Resolve = _resolve, connections=None):
+                 resolve: Resolve = _resolve, connections=None, slots: Slots | None = None,
+                 deadline_s: float | None = None):
     """The request handler. authenticate(user, password) returns the grant's
     project, or None."""
+    slots = slots or Slots()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "blpl-fetch"
         # A request that trickles in holds one thread for this long at most.
         timeout = REQUEST_TIMEOUT_S
+
+        _user = ""
 
         def _answer(self, status: int, payload: dict | None = None, body: bytes = b"",
                     ctype: str = "application/json") -> None:
@@ -226,11 +288,17 @@ def make_handler(authenticate: Authenticate, held_root: Path, *,
                 url = str(request.get("url") or "")
             except (ValueError, TypeError, AttributeError):
                 return self._answer(400, {"error": "a JSON body with a url is required"})
+            run = self._user or project
+            if not slots.take(run):
+                return self._answer(429, {"error": "too many fetches at once; try again shortly"})
             try:
-                got = download(url, resolve=resolve, connections=connections)
+                got = download(url, resolve=resolve, connections=connections,
+                               deadline_s=deadline_s)
             except Refused as exc:
                 logger.info("refused fetch for %s: %s (%s)", project, exc, url)
                 return self._answer(400, {"error": str(exc)})
+            finally:
+                slots.give(run)
             status, verdict, data = assess(project, got, held_root)
             logger.info("fetch for %s: %s %s (%d bytes)", project,
                         "held" if status != 200 else "accepted", got.url, verdict["bytes"])
@@ -246,6 +314,7 @@ def make_handler(authenticate: Authenticate, held_root: Path, *,
                 user, _, password = base64.b64decode(raw[6:]).decode().partition(":")
             except (ValueError, UnicodeDecodeError):
                 return None
+            self._user = user
             try:
                 return authenticate(user, password)
             except Exception:  # noqa: BLE001 - fail closed

@@ -54,12 +54,15 @@ class FakeConn:
         class R:
             def __init__(self):
                 self.status = status
+                self.at = 0
 
             def getheader(self, name, default=None):
                 return headers.get(name, default)
 
             def read(self, n=-1):
-                return body if n < 0 else body[:n]
+                end = len(body) if n < 0 else self.at + n
+                out, self.at = body[self.at:end], min(end, len(body))
+                return out
 
         return R()
 
@@ -199,3 +202,109 @@ def test_a_workspace_reaches_the_fetch_service_directly_not_through_squid():
     env = jobs.workspace_env({"BLPL_SANDBOX_HTTP_PROXY": "http://squid:3128",
                               "BLPL_FETCH_SERVICE_URL": "http://blpl-fetch:8001"})
     assert "blpl-fetch" in env["NO_PROXY"].split(",")
+
+
+# -- a server that trickles, and too many at once (Codex, PR #20) ---------------------------
+
+
+def test_a_server_that_trickles_is_cut_off_at_the_deadline():
+    """One byte per read keeps every socket timeout happy; only the total
+    deadline stops it."""
+    import time
+
+    class Trickle(FakeConn):
+        def getresponse(self):
+            class R:
+                status = 200
+
+                def getheader(self, name, default=None):
+                    return default
+
+                def read(self, n=-1):
+                    time.sleep(0.05)
+                    return b"%"
+
+            return R()
+
+    t0 = time.monotonic()
+    with pytest.raises(fetchsvc.Refused, match="longer than"):
+        fetchsvc.download("https://vendor.example/ds.pdf", resolve=resolve,
+                          connections={"https": Trickle}, deadline_s=1.0)
+    assert time.monotonic() - t0 < 3
+
+
+def test_the_size_cap_is_enforced_while_streaming():
+    class Endless(FakeConn):
+        def getresponse(self):
+            class R:
+                status = 200
+
+                def getheader(self, name, default=None):
+                    return default
+
+                def read(self, n=-1):
+                    return b"x" * 65536
+
+            return R()
+
+    with pytest.raises(fetchsvc.Refused, match="larger than"):
+        fetchsvc.download("https://vendor.example/ds.pdf", resolve=resolve,
+                          connections={"https": Endless}, max_bytes=1024 * 1024)
+
+
+def test_fetches_beyond_the_limits_are_refused_not_queued():
+    s = fetchsvc.Slots(total=3, per_run=2)
+    assert s.take("a") and s.take("a")
+    assert not s.take("a"), "a third for one run"
+    assert s.take("b")
+    assert not s.take("c"), "a fourth in all"
+    s.give("a")
+    assert s.take("c")
+
+
+def test_the_service_answers_429_beyond_its_limit(tmp_path):
+    import base64
+    import json
+    import threading
+    import urllib.error
+    import urllib.request
+
+    release = threading.Event()
+
+    class Held(FakeConn):
+        def getresponse(self):
+            release.wait(10)
+            return super().getresponse()
+
+    SITES["vendor.example"] = (200, {}, BENIGN)
+    server = fetchsvc.serve("127.0.0.1:0", tmp_path / "held", authenticate=lambda u, p: "board",
+                            resolve=resolve, connections={"https": Held},
+                            slots=fetchsvc.Slots(total=8, per_run=1))
+
+    def post():
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/fetch", method="POST",
+            data=json.dumps({"url": "https://vendor.example/ds.pdf"}).encode(),
+            headers={"Authorization": "Basic " + base64.b64encode(b"g-run:t").decode(),
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req) as r:
+                return r.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    try:
+        first = []
+        t = threading.Thread(target=lambda: first.append(post()))
+        t.start()
+        import time
+        time.sleep(0.3)
+        assert post() == 429  # the same run's second, while its first is held
+        release.set()
+        t.join(10)
+        assert first == [200]
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+
