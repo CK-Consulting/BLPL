@@ -4587,7 +4587,9 @@ async def upload_files(
             # Checked before any file is read, so a typo in the library name
             # fails the request rather than half of it.
             try:
-                spec["library"] = library_upload.library_name(str(spec.get("library") or project_id))
+                spec["library"] = library_upload.check_library(
+                    str(spec.get("library") or project_id), proj, suggest=project_id
+                )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
 
@@ -4676,6 +4678,28 @@ async def upload_files(
         else {"committed": False}
     )
     return {"results": results, **commit}
+
+
+@app.get("/api/projects/{project_id}/uploads/library-names")
+def upload_library_names(
+    project_id: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """What the upload dialog needs to warn about a library name before sending.
+
+    ``reserved`` is every stock library name, lower-cased, and the generated
+    prefix; ``existing`` the project's own libraries, which stay usable whatever
+    they are called. The upload itself enforces the same rule; this only lets
+    the dialog say so while the name is being typed.
+    """
+    proj = _project_dir(session, user, project_id)
+    return {
+        "reserved": sorted(library_upload.stock_library_names()),
+        "reserved_prefix": library_upload.GENERATED_PREFIX,
+        "existing": sorted(library_upload.existing_project_libraries(proj)),
+    }
 
 
 @app.get("/api/projects/{project_id}/quarantine")
