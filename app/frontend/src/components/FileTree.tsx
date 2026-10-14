@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { type NodeApi, type NodeRendererProps, Tree, type TreeApi } from "react-arborist";
 import { delJSON, encodePath, getJSON, postJSON, putJSON } from "../api";
-import { ConfirmDialog, PromptDialog } from "./Dialog";
+import { ConfirmDialog, PromptDialog, RemoveSymbolDialog } from "./Dialog";
 import { announcePushFrom } from "../commitEvents";
 import { isSavable } from "./FileView";
 import { UploadDialog } from "./UploadDialog";
@@ -226,7 +226,14 @@ type MenuState = { item: Item; x: number; y: number };
  *  page is on now (Codex, PR #17). */
 type DialogState =
   | { kind: "new-file" | "new-folder"; dir: string; project: string }
-  | { kind: "delete"; item: Item; project: string };
+  | { kind: "delete"; item: Item; project: string }
+  | { kind: "remove-symbol"; library: string; project: string };
+
+/** The library a flat project symbol library file is, or null. */
+export function symbolLibraryOf(path: string): string | null {
+  const m = /^libraries\/symbols\/([^/]+)\.kicad_sym$/.exec(path);
+  return m ? m[1] : null;
+}
 
 // The row renderer is handed to arborist as a component type, so it has to be
 // stable across renders — defined inline it would remount every row on every
@@ -481,6 +488,15 @@ export function FileTree({
         run: () => setDialog({ kind: "new-folder", dir: item.dir, project: projectId }),
       });
     }
+    const library = item.kind === "file" ? symbolLibraryOf(item.path) : null;
+    if (library && !locked(item.path)) {
+      // One symbol, not the file: the file is the whole library.
+      out.push({
+        label: "Remove a symbol…",
+        run: () => setDialog({ kind: "remove-symbol", library, project: projectId }),
+        danger: true,
+      });
+    }
     if (item.kind !== "group" && !locked(item.path)) {
       out.push({ label: "Rename", run: () => void treeRef.current?.edit(item.id) });
       out.push({ label: "Delete…", run: () => askDelete(item), danger: true });
@@ -674,6 +690,32 @@ export function FileTree({
             await postJSON(`/api/projects/${live.project}/folders`, { path });
             if (!stillOn(live.project)) return;
             changed();
+          }}
+        />
+      )}
+      {live?.kind === "remove-symbol" && (
+        <RemoveSymbolDialog
+          library={live.library}
+          onClose={() => setDialog(null)}
+          load={async () =>
+            (
+              await getJSON<{ symbols: string[] }>(
+                `/api/projects/${live.project}/libraries/symbols/${encodeURIComponent(live.library)}`,
+              )
+            ).symbols
+          }
+          onRemove={async (symbol) => {
+            stillHere(live.project, "nothing was removed");
+            const r = await postJSON<{ committed?: boolean }>(
+              `/api/projects/${live.project}/libraries/symbols/${encodeURIComponent(live.library)}/remove`,
+              { symbol },
+            );
+            announcePushFrom(live.project, r);
+            if (!stillOn(live.project)) return;
+            changed();
+            if (r && r.committed === false) {
+              setError(`${symbol} was removed from ${live.library}, but the change was not committed.`);
+            }
           }}
         />
       )}
