@@ -17,7 +17,12 @@ import { announceCommitted, announcePushFrom } from "../commitEvents";
 
 export type UploadKind = "datasheet" | "reference";
 
-type Row = { file: File; kind: UploadKind | ""; mpn: string; llmIgnore: boolean };
+type Row = { id: number; file: File; kind: UploadKind | ""; mpn: string; llmIgnore: boolean };
+
+/** Whether a kind takes an MPN. Only a datasheet is named after its part. */
+const takesMpn = (kind: UploadKind | "") => kind === "datasheet";
+
+let nextRowId = 1;
 
 export type UploadResult = {
   name: string;
@@ -54,7 +59,13 @@ export function UploadDialog({
 
   const add = (files: FileList | File[] | null) => {
     if (!files) return;
-    const incoming = [...files].map((file) => ({ file, kind: "" as const, mpn: "", llmIgnore: false }));
+    const incoming = [...files].map((file) => ({
+      id: nextRowId++,
+      file,
+      kind: "" as const,
+      mpn: "",
+      llmIgnore: false,
+    }));
     setRows((rs) => [...rs, ...incoming]);
     setResults(null);
   };
@@ -70,7 +81,9 @@ export function UploadDialog({
     for (const r of rows) form.append("files", r.file, r.file.name);
     form.append(
       "meta",
-      JSON.stringify(rows.map((r) => ({ kind: r.kind, mpn: r.mpn.trim(), llm_ignore: r.llmIgnore }))),
+      JSON.stringify(
+        rows.map((r) => ({ kind: r.kind, mpn: takesMpn(r.kind) ? r.mpn.trim() : "", llm_ignore: r.llmIgnore })),
+      ),
     );
     setBusy(true);
     setError(null);
@@ -143,7 +156,7 @@ export function UploadDialog({
               </thead>
               <tbody>
                 {rows.map((r, i) => (
-                  <tr key={`${r.file.name}-${i}`}>
+                  <tr key={r.id}>
                     <td className="mono" title={r.file.name}>
                       {r.file.name} <span className="muted small">{size(r.file.size)}</span>
                     </td>
@@ -159,13 +172,24 @@ export function UploadDialog({
                       </select>
                     </td>
                     <td>
-                      <input
-                        aria-label={`MPN for ${r.file.name}`}
-                        placeholder={r.kind === "datasheet" ? "optional" : ""}
-                        disabled={r.kind !== "datasheet"}
-                        value={r.mpn}
-                        onChange={(e) => update(i, { mpn: e.target.value })}
-                      />
+                      {/* Rendered only where it means something. This was a
+                          disabled input for every other kind — and for a row
+                          with no kind chosen yet — styled exactly like an
+                          enabled one, so it looked like a text box that
+                          silently refused typing. */}
+                      {takesMpn(r.kind) ? (
+                        <input
+                          type="text"
+                          aria-label={`MPN for ${r.file.name}`}
+                          placeholder="optional"
+                          value={r.mpn}
+                          onChange={(e) => update(i, { mpn: e.target.value })}
+                        />
+                      ) : (
+                        <span className="muted small" title="Only a datasheet is named after its part number">
+                          {r.kind ? "—" : "choose a kind"}
+                        </span>
+                      )}
                     </td>
                     <td>
                       <input

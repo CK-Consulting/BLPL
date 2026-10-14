@@ -103,6 +103,9 @@ header .kicad { margin-left: 0; }
 .modal-body h3 { margin: 0; font-size: 14px; }
 .muted { color: #adb1b6; font-size: 13px; margin: 0; }
 .modal-body input { background: #0f1115; color: #e6e6e6; border: 1px solid #6b6f75; border-radius: 6px; padding: .4rem .55rem; font: inherit; }
+/* A disabled field has to look disabled. Without this one was drawn exactly like
+   an enabled text box, and the upload dialog's MPN field read as broken. */
+.modal-body input:disabled, .modal-body select:disabled { opacity: .5; cursor: not-allowed; }
 
 /* --- key rows --- */
 .key-row { display: grid; grid-template-columns: 130px 1fr auto auto; align-items: center; gap: .5rem; }
