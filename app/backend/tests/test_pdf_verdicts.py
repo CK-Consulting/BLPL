@@ -492,3 +492,110 @@ def test_bytes_changed_in_place_after_judging_are_not_what_is_sent(unlocked, mon
     r = _blob(unlocked, "a.pdf")
     assert _inline(r)
     assert r.content == BENIGN
+
+
+# -- byte ranges -----------------------------------------------------------------
+#
+# Codex, PR #21: streaming ignored Range and always sent 200 from byte 0, so a
+# PDF viewer seeking, or a resumed download, fetched the whole file again.
+
+
+def _ranged(client, path, value, **extra):
+    return client.get(
+        "/api/projects/scratch/blob", params={"path": path}, headers={"Range": value, **extra}
+    )
+
+
+def _security_headers_kept(r, *, pdf_inline=False):
+    assert r.headers["x-content-type-options"] == "nosniff"
+    if not pdf_inline:
+        assert "sandbox" in r.headers["content-security-policy"]
+
+
+ZIP = b"PK\x03\x04" + bytes(range(256)) * 40
+
+
+def test_a_range_of_a_non_pdf(unlocked):
+    proj = _project(unlocked)
+    (proj / "gerbers.zip").write_bytes(ZIP)
+    r = _ranged(unlocked, "gerbers.zip", "bytes=10-19")
+    assert r.status_code == 206
+    assert r.content == ZIP[10:20]
+    assert r.headers["content-range"] == f"bytes 10-19/{len(ZIP)}"
+    assert r.headers["content-length"] == "10"
+    assert r.headers["accept-ranges"] == "bytes"
+    assert r.headers["content-disposition"].startswith("attachment")
+    _security_headers_kept(r)
+
+
+def test_an_open_ended_and_a_suffix_range(unlocked):
+    proj = _project(unlocked)
+    (proj / "gerbers.zip").write_bytes(ZIP)
+    tail = _ranged(unlocked, "gerbers.zip", f"bytes={len(ZIP) - 5}-")
+    assert tail.status_code == 206 and tail.content == ZIP[-5:]
+    suffix = _ranged(unlocked, "gerbers.zip", "bytes=-7")
+    assert suffix.status_code == 206 and suffix.content == ZIP[-7:]
+    assert suffix.headers["content-range"] == f"bytes {len(ZIP) - 7}-{len(ZIP) - 1}/{len(ZIP)}"
+    # Past the end is clamped, not refused.
+    past = _ranged(unlocked, "gerbers.zip", f"bytes=0-{len(ZIP) * 2}")
+    assert past.status_code == 206 and past.content == ZIP
+
+
+def test_an_unsatisfiable_range_is_416_with_the_size(unlocked):
+    proj = _project(unlocked)
+    (proj / "gerbers.zip").write_bytes(ZIP)
+    r = _ranged(unlocked, "gerbers.zip", f"bytes={len(ZIP)}-")
+    assert r.status_code == 416
+    assert r.headers["content-range"] == f"bytes */{len(ZIP)}"
+    _security_headers_kept(r)
+
+
+@pytest.mark.parametrize("value", ["bytes=5-2", "bytes=abc", "items=0-4", "bytes=0-1,4-5", "bytes="])
+def test_a_malformed_or_multiple_range_gets_the_whole_file(unlocked, value):
+    """Multipart byteranges are not offered: a whole 200 is always a correct answer."""
+    proj = _project(unlocked)
+    (proj / "gerbers.zip").write_bytes(ZIP)
+    r = _ranged(unlocked, "gerbers.zip", value)
+    assert r.status_code == 200 and r.content == ZIP
+    assert r.headers["accept-ranges"] == "bytes"
+
+
+def test_a_range_of_an_inspected_pdf_is_inline_and_carries_its_etag(unlocked):
+    proj = _project(unlocked)
+    _commit(proj, "a.pdf", BENIGN)
+    unlocked.post("/api/projects/scratch/blob/inspect", json={"path": "a.pdf"})
+    whole = _blob(unlocked, "a.pdf")
+    assert _inline(whole) and whole.headers["accept-ranges"] == "bytes"
+    r = _ranged(unlocked, "a.pdf", "bytes=0-7")
+    assert r.status_code == 206 and r.content == BENIGN[:8]
+    assert r.headers["content-type"] == "application/pdf"
+    assert r.headers["content-disposition"].startswith("inline")
+    _security_headers_kept(r, pdf_inline=True)
+
+    # If-Range with the current validator honours the range; a stale one gets
+    # the whole, current file.
+    same = _ranged(unlocked, "a.pdf", "bytes=0-7", **{"If-Range": whole.headers["etag"]})
+    assert same.status_code == 206
+    stale = _ranged(unlocked, "a.pdf", "bytes=0-7", **{"If-Range": '"0000"'})
+    assert stale.status_code == 200 and stale.content == BENIGN
+
+
+def test_a_range_of_an_uninspected_pdf_is_still_an_attachment(unlocked):
+    """The verdict is decided on the whole file before any range is cut from it."""
+    proj = _project(unlocked)
+    _commit(proj, "a.pdf", BENIGN)
+    r = _ranged(unlocked, "a.pdf", "bytes=0-7")
+    assert r.status_code == 206 and r.content == BENIGN[:8]
+    assert _opaque(r)
+
+
+def test_a_range_of_a_chat_attachment(unlocked):
+    _project(unlocked)
+    conv = unlocked.post("/api/projects/scratch/conversations", json={"title": "t"}).json()["filename"]
+    att = unlocked.post(
+        f"/api/projects/scratch/conversations/{conv}/attachments",
+        files=[("files", ("a.pdf", BENIGN, "application/pdf"))],
+    ).json()[0]
+    r = unlocked.get(f"/api/projects/scratch/attachments/{att['id']}", headers={"Range": "bytes=-4"})
+    assert r.status_code == 206 and r.content == BENIGN[-4:]
+    assert r.headers["content-type"] == "application/pdf"
