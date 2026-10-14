@@ -161,7 +161,7 @@ def _guard_ignored(ctx: ToolContext, rel: str, args: dict) -> None:
 
 def _framed(ctx: ToolContext, rel: str, text: str) -> str:
     """Contents of a file from outside the project come back marked as data."""
-    return llm_ignore.frame(ctx.project_dir, rel, text) if llm_ignore.is_external(rel) else text
+    return llm_ignore.frame(ctx.project_dir, rel, text) if llm_ignore.from_outside(ctx.project_dir, rel) else text
 
 
 def _rel(ctx: ToolContext, target: Path) -> str:
@@ -816,7 +816,11 @@ async def _diff_file(ctx: ToolContext, args: dict) -> str:
         # the side door, nor an outside file's unmarked.
         argv += ["--", "."] + [
             f":(exclude){p}" for p in sorted(llm_ignore.paths(ctx.project_dir))
-        ] + [f":(exclude){d}" for d in llm_ignore.EXTERNAL_DIRS]
+        ] + [f":(exclude){d}" for d in llm_ignore.EXTERNAL_DIRS] + [
+            # Library files an upload was placed into: outside text, in a
+            # directory whose name does not say so.
+            f":(exclude){p}" for p in llm_ignore.released_outside_external_dirs(ctx.project_dir)
+        ]
     out = await _to_thread(_git, ctx.project_dir, *argv)
     if not out.strip():
         return f"no changes to {raw or 'the project'} between {since} and {until or 'the working tree'}"

@@ -997,6 +997,8 @@ header .kicad-launch { margin-left: .4rem; }
 .upload-rows input:not([type="checkbox"]) { width: 8rem; }
 .upload-footnote { margin: 0; }
 .upload-results { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: .35rem; font-size: 14px; }
+.upload-members { margin: .25rem 0 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: .2rem; font-size: 13px; }
+.upload-result.skipped { color: #adb1b6; }
 .upload-result.held, .upload-result.rejected { color: #ffc0c0; }
 .tree-badge { margin-left: .4rem; padding: 0 .3rem; border: 1px solid #6b6f75; border-radius: 4px; font-size: 11px; white-space: nowrap; }
 

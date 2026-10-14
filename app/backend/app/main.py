@@ -104,7 +104,7 @@ from blpl.core import schema as hdm_schema
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, ProjectPolicy, Run, User
-from blpl.core import limits, project_manifest, quarantine
+from blpl.core import library_upload, limits, project_manifest, quarantine
 from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects, check_remote_url
@@ -4566,10 +4566,13 @@ async def upload_files(
 ) -> dict:
     """Put files into a project, through quarantine.
 
-    ``meta`` is a JSON list aligned with ``files``: ``{"kind": "datasheet" |
-    "reference", "mpn": str, "llm_ignore": bool}`` per file. The uploader picks
-    the kind because only they know whether a PDF is a datasheet or a layout
-    guide, and the directory it lands in should say which.
+    ``meta`` is a JSON list aligned with ``files``: ``{"kind": str, "mpn": str,
+    "library": str, "llm_ignore": bool}`` per file, the kind one of
+    ``quarantine.UPLOAD_KINDS``. The uploader picks the kind because only they
+    know whether a PDF is a datasheet or a layout guide, and the directory it
+    lands in should say which. ``library`` names the project library a symbol,
+    footprint, 3D model or bundle goes into, and defaults to the project's name —
+    the library ``libraries/README.md`` and existing projects use.
 
     Each file gets its own verdict. A held file is a result, not an error: it
     stays in ``retrieved/`` as evidence and the response says why. Only a
@@ -4590,6 +4593,13 @@ async def upload_files(
                 status_code=400,
                 detail=f"each file needs a kind: one of {sorted(quarantine.UPLOAD_KINDS)}",
             )
+        if spec["kind"] in quarantine.LIBRARY_KINDS:
+            # Checked before any file is read, so a typo in the library name
+            # fails the request rather than half of it.
+            try:
+                spec["library"] = library_upload.library_name(str(spec.get("library") or project_id))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
 
     who = user.email or f"user {user.id}"
     project_row = _project_or_404(session, user, project_id)
@@ -4603,15 +4613,27 @@ async def upload_files(
                 "reasons": [f"larger than the {UPLOAD_MAX_BYTES // (1024 * 1024)} MB upload limit"],
             })
             continue
-        rec = quarantine.accept_upload(
-            data,
-            proj,
-            original_name=name,
-            kind=spec["kind"],
-            uploaded_by=who,
-            mpn=str(spec.get("mpn") or "").strip(),
-            llm_ignore=bool(spec.get("llm_ignore")),
-        )
+        def record_member(member: quarantine.Record) -> None:
+            # Every PDF `accept` inspects during this upload — a bundle's
+            # entries go through it one by one, each a file the blob route
+            # may be asked to render.
+            if (member.inspection or {}).get("state") != quarantine.NOT_INSPECTED:
+                pdf_verdicts.record_ledger_row(
+                    session, project_row.id, member.to_dict(),
+                    source=pdf_verdicts.UPLOAD, user_id=user.id,
+                )
+
+        with quarantine.recording_verdicts(record_member):
+            rec = quarantine.accept_upload(
+                data,
+                proj,
+                original_name=name,
+                kind=spec["kind"],
+                uploaded_by=who,
+                mpn=str(spec.get("mpn") or "").strip(),
+                llm_ignore=bool(spec.get("llm_ignore")),
+                library=str(spec.get("library") or ""),
+            )
         if quarantine.looks_like_pdf(data):
             # This backend just inspected these bytes, so its finding is the
             # verdict the blob route renders by, held or not.
@@ -4619,14 +4641,25 @@ async def upload_files(
                 session, project_row.id, rec.to_dict(),
                 source=pdf_verdicts.UPLOAD, user_id=user.id,
             )
-        path = f"{rec.released_to}/{rec.released_as}" if rec.state == quarantine.RELEASED else None
-        if path and rec.llm_ignore:
-            llm_ignore.set_ignored(proj, path, True, by=who)
+        released = rec.state == quarantine.RELEASED
+        # A bundle is not itself a file in the project; its entries are.
+        path = f"{rec.released_to}/{rec.released_as}" if released and rec.released_as else None
+        placed = sorted({
+            *(rec.placed or ([path] if path else [])),
+            *(p for m in rec.members for p in m.get("placed") or []),
+        }) if released else []
+        if rec.llm_ignore:
+            for p in placed:
+                llm_ignore.set_ignored(proj, p, True, by=who)
         results.append({
             "name": name,
             "state": rec.state,
             "kind": rec.kind,
             "path": path,
+            "placed": placed,
+            "library": rec.library,
+            "note": (rec.inspection or {}).get("placement", ""),
+            "members": rec.members,
             "reasons": rec.reasons,
             "inspection": (rec.inspection or {}).get("state", ""),
             "scan": (rec.scan or {}).get("state", ""),

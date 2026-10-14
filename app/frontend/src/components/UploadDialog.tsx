@@ -7,28 +7,62 @@ import { announceCommitted, announcePushFrom } from "../commitEvents";
  *
  * Each file needs a kind before anything is sent. Only the person uploading
  * knows whether a PDF is a datasheet or a layout guide, and the kind decides
- * the directory it lands in: `datasheets/`, where the extraction tools look,
- * or `references/` for everything else. No default, on purpose: a guessed
- * kind files a vendor app note as a datasheet and nobody notices.
+ * the directory it lands in: `datasheets/`, where the extraction tools look;
+ * `libraries/`, where the pipeline resolves symbols and footprints, for KiCad
+ * library files; or `references/` for everything else. No default, on
+ * purpose: a guessed kind files a vendor app note as a datasheet and nobody
+ * notices.
  *
  * Every file gets its own verdict. A held file is a result the dialog shows,
  * with the reason, not an error that fails the batch.
  */
 
-export type UploadKind = "datasheet" | "reference";
+export type UploadKind = "datasheet" | "reference" | "symbol" | "footprint" | "3d_model" | "kicad_bundle";
 
-type Row = { id: number; file: File; kind: UploadKind | ""; mpn: string; llmIgnore: boolean };
+/** Kinds offered, in the order a person reaches for them. */
+export const UPLOAD_KINDS: { value: UploadKind; label: string }[] = [
+  { value: "datasheet", label: "Datasheet" },
+  { value: "reference", label: "Reference" },
+  { value: "symbol", label: "KiCad symbol (.kicad_sym)" },
+  { value: "footprint", label: "KiCad footprint (.kicad_mod)" },
+  { value: "3d_model", label: "3D model (.step, .wrl)" },
+  { value: "kicad_bundle", label: "KiCad library bundle (.zip)" },
+];
+
+/** Kinds placed into a project library, and so needing one named. */
+const LIBRARY_KINDS: ReadonlySet<UploadKind | ""> = new Set(["symbol", "footprint", "3d_model", "kicad_bundle"]);
+const takesLibrary = (kind: UploadKind | "") => LIBRARY_KINDS.has(kind);
+
+// What the server accepts as a KiCad library nickname: it is a directory name
+// and the half of a lib_id before the colon.
+const LIBRARY_NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+
+type Row = { id: number; file: File; kind: UploadKind | ""; mpn: string; library: string; llmIgnore: boolean };
 
 /** Whether a kind takes an MPN. Only a datasheet is named after its part. */
 const takesMpn = (kind: UploadKind | "") => kind === "datasheet";
 
 let nextRowId = 1;
 
+export type BundleMember = {
+  name: string;
+  kind: string;
+  state: "released" | "held" | "skipped";
+  path: string | null;
+  reasons: string[];
+};
+
 export type UploadResult = {
   name: string;
   state: "released" | "held" | "rejected";
   kind?: UploadKind;
   path: string | null;
+  /** Every file it wrote — a bundle writes several, and has no path of its own. */
+  placed?: string[];
+  library?: string;
+  /** How a library file was placed: added to an existing library, already there… */
+  note?: string;
+  members?: BundleMember[];
   reasons: string[];
   inspection?: string;
   scan?: string;
@@ -64,6 +98,8 @@ export function UploadDialog({
       file,
       kind: "" as const,
       mpn: "",
+      // The library libraries/README.md and existing projects use.
+      library: projectId,
       llmIgnore: false,
     }));
     setRows((rs) => [...rs, ...incoming]);
@@ -73,7 +109,8 @@ export function UploadDialog({
     setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   const remove = (i: number) => setRows((rs) => rs.filter((_, j) => j !== i));
 
-  const ready = rows.length > 0 && rows.every((r) => r.kind !== "");
+  const libraryOk = (r: Row) => !takesLibrary(r.kind) || LIBRARY_NAME.test(r.library.trim());
+  const ready = rows.length > 0 && rows.every((r) => r.kind !== "" && libraryOk(r));
 
   const submit = async () => {
     if (!ready) return;
@@ -82,7 +119,14 @@ export function UploadDialog({
     form.append(
       "meta",
       JSON.stringify(
-        rows.map((r) => ({ kind: r.kind, mpn: takesMpn(r.kind) ? r.mpn.trim() : "", llm_ignore: r.llmIgnore })),
+        rows.map((r) => ({
+          kind: r.kind,
+          mpn: takesMpn(r.kind) ? r.mpn.trim() : "",
+          ...(takesLibrary(r.kind) ? { library: r.library.trim() } : {}),
+          // Not offered for library files: a symbol merged into the project's
+          // library would put that whole shared file on the list.
+          llm_ignore: takesLibrary(r.kind) ? false : r.llmIgnore,
+        })),
       ),
     );
     setBusy(true);
@@ -147,7 +191,7 @@ export function UploadDialog({
                 <tr>
                   <th>File</th>
                   <th>Kind</th>
-                  <th>MPN</th>
+                  <th>MPN / library</th>
                   <th>
                     LLM ignore<sup>*</sup>
                   </th>
@@ -167,8 +211,11 @@ export function UploadDialog({
                         onChange={(e) => update(i, { kind: e.target.value as UploadKind | "" })}
                       >
                         <option value="">Choose…</option>
-                        <option value="datasheet">Datasheet</option>
-                        <option value="reference">Reference</option>
+                        {UPLOAD_KINDS.map((k) => (
+                          <option key={k.value} value={k.value}>
+                            {k.label}
+                          </option>
+                        ))}
                       </select>
                     </td>
                     <td>
@@ -185,6 +232,15 @@ export function UploadDialog({
                           value={r.mpn}
                           onChange={(e) => update(i, { mpn: e.target.value })}
                         />
+                      ) : takesLibrary(r.kind) ? (
+                        <input
+                          type="text"
+                          aria-label={`Library for ${r.file.name}`}
+                          title="The project library it goes into"
+                          aria-invalid={!libraryOk(r)}
+                          value={r.library}
+                          onChange={(e) => update(i, { library: e.target.value })}
+                        />
                       ) : (
                         <span className="muted small" title="Only a datasheet is named after its part number">
                           {r.kind ? "—" : "choose a kind"}
@@ -192,12 +248,18 @@ export function UploadDialog({
                       )}
                     </td>
                     <td>
-                      <input
-                        type="checkbox"
-                        aria-label={`LLM ignore ${r.file.name}`}
-                        checked={r.llmIgnore}
-                        onChange={(e) => update(i, { llmIgnore: e.target.checked })}
-                      />
+                      {takesLibrary(r.kind) ? (
+                        <span className="muted small" title="Library files are used by the pipeline and read by the assistant as untrusted">
+                          —
+                        </span>
+                      ) : (
+                        <input
+                          type="checkbox"
+                          aria-label={`LLM ignore ${r.file.name}`}
+                          checked={r.llmIgnore}
+                          onChange={(e) => update(i, { llmIgnore: e.target.checked })}
+                        />
+                      )}
                     </td>
                     <td>
                       <button className="link" onClick={() => remove(i)} aria-label={`Remove ${r.file.name}`}>
@@ -221,9 +283,14 @@ export function UploadDialog({
           {rows.length > 0 && (
             <p className="muted small">
               Every file is checked before it joins the project. A datasheet goes to{" "}
-              <span className="mono">datasheets/</span> (named after its MPN, if you give one);
-              anything else goes to <span className="mono">references/</span>. A file that fails the
-              check is held in <span className="mono">retrieved/</span> and not added.
+              <span className="mono">datasheets/</span> (named after its MPN, if you give one); a
+              reference to <span className="mono">references/</span>. KiCad symbols, footprints and
+              3D models go into a project library under <span className="mono">libraries/</span>,
+              where the pipeline looks first; a bundle's library files go there and its documents
+              to <span className="mono">references/</span>. A KiCad file that does not parse, or
+              whose symbol or footprint name is already in that library, is not added — nothing in
+              a library is replaced. A file that fails a check is held in{" "}
+              <span className="mono">retrieved/</span>.
             </p>
           )}
 
@@ -232,7 +299,13 @@ export function UploadDialog({
               <button onClick={() => void submit()} disabled={!ready || busy}>
                 {busy ? "Uploading…" : `Upload ${rows.length} file${rows.length === 1 ? "" : "s"}`}
               </button>
-              {!ready && <span className="muted small"> Choose a kind for every file first.</span>}
+              {!ready && (
+                <span className="muted small">
+                  {rows.some((r) => r.kind === "")
+                    ? " Choose a kind for every file first."
+                    : " A library name is letters, digits, '.', '_', '+' and '-'."}
+                </span>
+              )}
             </div>
           )}
 
@@ -241,17 +314,43 @@ export function UploadDialog({
               {results.map((r, i) => (
                 <li key={`${r.name}-${i}`} className={`upload-result ${r.state}`}>
                   <span className="mono">{r.name}</span>{" "}
-                  {r.state === "released" ? (
+                  {r.state === "released" && r.members ? (
+                    <>
+                      unpacked:
+                      <ul className="upload-members">
+                        {r.members.map((m, j) => (
+                          <li key={`${m.name}-${j}`} className={`upload-result ${m.state}`}>
+                            <span className="mono">{m.name}</span>{" "}
+                            {m.state === "released" ? (
+                              <>
+                                → <span className="mono">{m.path}</span>
+                              </>
+                            ) : (
+                              <>
+                                {m.state === "held" ? "not added" : "left in the zip"}: {m.reasons.join("; ")}
+                              </>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : r.state === "released" ? (
                     <>
                       added as <span className="mono">{r.path}</span>
-                      {r.inspection === "not_inspected" && (
+                      {r.note && <span className="muted small"> ({r.note})</span>}
+                      {r.inspection === "not_inspected" && !r.library && (
                         <span className="muted small"> (stored; this file type is not inspected)</span>
                       )}
                       {r.llm_ignore && <span className="muted small"> · LLM ignore</span>}
                     </>
                   ) : (
                     <>
-                      {r.state === "held" ? "held in quarantine" : "not uploaded"}: {r.reasons.join("; ")}
+                      {r.state === "held"
+                        ? r.library
+                          ? "not added (kept in retrieved/)"
+                          : "held in quarantine"
+                        : "not uploaded"}
+                      : {r.reasons.join("; ")}
                     </>
                   )}
                 </li>
