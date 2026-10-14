@@ -1,11 +1,12 @@
-"""The seam the run path will call: one run, through a driver.
+"""What a run's environment is made of.
 
-Today the worker spawns ``job.cmd`` itself with ``job.env``, and ``job.env`` is a
+Without workspaces the worker spawns ``job.cmd`` itself with ``job.env``, a
 copy of the backend's whole environment — database URL, SMTP password and
 distributor keys included — with the member's provider keys on top. Every
-parser a stage starts inherits all of it. When the worker moves onto this
-function (phase 2), that is closed here, by construction rather than by a
-filter that has to know every secret's name:
+parser a stage starts inherits all of it. A run in a workspace's run
+container (jobs.run_job_in_container) gets ``run_env`` instead, which closes
+that by construction rather than by a filter that has to know every secret's
+name:
 
 * What the control plane's environment contributes is an **allowlist** of
   names whose value a deployment legitimately decides for every run: where the
@@ -25,11 +26,8 @@ workspace's ``/workspace`` is the caller's job and arrives with the wiring.
 
 from __future__ import annotations
 
-import codecs
-from typing import Callable, Mapping, Sequence
+from typing import Mapping
 
-from .driver import WorkspaceDriver, WorkspaceSpec
-from .idle import IdleTracker
 
 # Each name is here because a stage reads it and its value is the deployment's,
 # not the member's. A name nobody can point at does not belong on the list.
@@ -101,52 +99,3 @@ def run_env(
             raise ValueError(f"invalid environment name {name!r}")
         env[name] = value
     return env
-
-
-async def execute_run(
-    driver: WorkspaceDriver,
-    spec: WorkspaceSpec,
-    argv: Sequence[str],
-    *,
-    env: Mapping[str, str],
-    log: Callable[[str], None],
-    inject: Mapping[str, str] | None = None,
-    tracker: IdleTracker | None = None,
-    workdir: str | None = None,
-) -> int:
-    """Run argv in spec's workspace, starting it if need be; return the exit code.
-
-    ``log`` gets decoded output as it arrives, stdout and stderr interleaved as
-    the worker's log file has them today. The workspace is busy for the whole
-    run, so the idle sweep cannot stop it mid-run however quiet the run is.
-    Cancelling the calling task terminates the process in the workspace.
-    """
-    process_env = run_env(env, inject)
-    # One decoder per stream: a multi-byte character split across two chunks
-    # must not become two replacement characters.
-    decoders = {
-        s: codecs.getincrementaldecoder("utf-8")("replace") for s in ("stdout", "stderr")
-    }
-
-    def sink(stream: str, data: bytes) -> None:
-        if tracker is not None:
-            tracker.touch(spec.key)
-        text = decoders[stream].decode(data)
-        if text:
-            log(text)
-
-    async def go() -> int:
-        await driver.ensure(spec)
-        result = await driver.exec_run(
-            spec.key, argv, env=process_env, workdir=workdir, on_output=sink
-        )
-        for d in decoders.values():
-            tail = d.decode(b"", final=True)
-            if tail:
-                log(tail)
-        return result.exit_code
-
-    if tracker is None:
-        return await go()
-    with tracker.busy(spec.key):
-        return await go()

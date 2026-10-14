@@ -436,8 +436,10 @@ services:
       - BLPL_FILES_VIA_WORKSPACE=${BLPL_FILES_VIA_WORKSPACE:-0}
       - BLPL_AGENT_DIR_ROOT=/app/data/agents
       - BLPL_SANDBOX_HOST_AGENT_DIRS=${BLPL_HOST_REPO_DIR:+${BLPL_HOST_REPO_DIR}/app/data/agents}
-      # Phase 4: a container per run, with the project's .git read-only.
-      - BLPL_RUNS_IN_CONTAINER=${BLPL_RUNS_IN_CONTAINER:-0}
+      # Every run in a workspace is a container of its own, with only its
+      # invoker's checkout and the project's .git read-only. There is no
+      # other mode: BLPL_RUNS_IN_CONTAINER is no longer passed, and a value
+      # other than 1 makes the worker refuse to start.
       # Phase 4: per-project btrfs storage. "btrfs" makes every run in a
       # container start from a snapshot taken by the storage helper (the
       # `storage` profile). Needs quotas enabled first: docs/architecture-v2.md.

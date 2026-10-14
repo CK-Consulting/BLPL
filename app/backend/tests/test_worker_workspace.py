@@ -30,6 +30,9 @@ class _S:
     def commit(self):
         pass
 
+    def get(self, model, key):
+        return None  # no run row: the owner's checkout
+
 
 def _workspaces(tmp_path, driver) -> worker_mod._Workspaces:
     (tmp_path / "projects" / "pathfinder").mkdir(parents=True, exist_ok=True)
@@ -58,6 +61,8 @@ def test_a_run_goes_through_the_workspace_and_lands_in_the_log(monkeypatch, tmp_
     code = asyncio.run(_workspaces(tmp_path, d).run(job))
 
     assert code == 4
+    # In a run container of its own, never inside the workspace container.
+    assert d.calls[0].key.role == "run" and d.boxes == {}
     assert d.calls[0].env == {"BLPL_MODULES_ROOT": "/m"}
     log = runqueue.log_path(tmp_path / "runs", "run_ws").read_text()
     assert log == "emitted\n1 warning\n"
@@ -68,7 +73,7 @@ def test_a_failure_to_reach_the_workspace_is_written_to_the_run_log(monkeypatch,
     monkeypatch.setattr(worker_mod, "SessionFactory", _S)
 
     class Down(FakeDriver):
-        async def ensure(self, spec):
+        async def run_container(self, spec, argv, **kw):
             raise RuntimeError("proxy socket not found")
 
     job = runqueue.Claimed(run_id="run_down", project_name="pathfinder", cmd=["x"], env={})
@@ -86,6 +91,20 @@ def test_misconfigured_isolation_refuses_to_start_rather_than_falling_back(monke
     monkeypatch.setattr(worker_mod.signal, "signal", lambda *a: None)
     with pytest.raises(SystemExit):
         asyncio.run(worker_mod.main())
+
+
+def test_asking_for_runs_in_the_shared_workspace_container_refuses_to_start(monkeypatch,
+                                                                          caplog):
+    """That mode is gone (Codex, PR #20): a config that still asks for it does
+    not get the other mode silently, the worker does not start."""
+    monkeypatch.setenv("BLPL_RUNS_IN_WORKSPACE", "1")
+    monkeypatch.setenv("BLPL_SANDBOX_HOST_PROJECTS", "/srv/blpl/app/data/projects")
+    monkeypatch.setenv("BLPL_RUNS_IN_CONTAINER", "0")
+    monkeypatch.setattr(worker_mod.serverkey, "load", lambda d: b"k" * 32)
+    monkeypatch.setattr(worker_mod.signal, "signal", lambda *a: None)
+    with pytest.raises(SystemExit):
+        asyncio.run(worker_mod.main())
+    assert "shared workspace container" in caplog.text
 
 
 def test_a_run_gets_its_own_egress_credential_and_it_is_revoked_after(monkeypatch, tmp_path):

@@ -164,7 +164,7 @@ def test_a_project_label_that_is_not_a_name_gets_no_writable_bind(tmp_path):
 # -- running and cancelling ----------------------------------------------------------
 
 
-def test_a_claimed_run_executes_in_the_workspace_with_only_its_own_secrets(tmp_path):
+def test_a_claimed_run_executes_in_its_own_container_with_only_its_own_secrets(tmp_path):
     d = FakeDriver(script=lambda call: (0, [("stdout", b"stage1 ok\n")]))
     lines: list[str] = []
     cmd = [PY, "-m", "blpl.core.cli", "stage1", "--project-dir",
@@ -173,10 +173,12 @@ def test_a_claimed_run_executes_in_the_workspace_with_only_its_own_secrets(tmp_p
     async def poll():
         return "running"
 
-    code = asyncio.run(jobs.run_job(d, cfg(tmp_path), project_name="pathfinder", cmd=cmd,
-                                    env=QUEUED_ENV, log=lines.append, poll=poll))
+    code = asyncio.run(jobs.run_job_in_container(
+        d, cfg(tmp_path), project_name="pathfinder", run_id="r1", cmd=cmd,
+        env=QUEUED_ENV, log=lines.append, poll=poll))
     assert code == 0 and lines == ["stage1 ok\n"]
     (call,) = d.calls
+    assert call.key.role == "run"  # never the shared workspace container
     assert call.argv == cmd  # unchanged: same paths, same interpreter
     assert set(call.env) == {"BLPL_MODULES_ROOT", "HDM_LLM_CHAIN", "HDM_LLM_PROVIDER",
                              "BLPL_LLM_KEY__MAIN", "ANTHROPIC_API_KEY"}
@@ -194,13 +196,13 @@ def test_a_cancel_seen_by_the_poll_stops_the_run_even_when_it_is_silent(tmp_path
         return "cancelling" if len(polls) >= 2 else "running"
 
     async def go():
-        return await asyncio.wait_for(jobs.run_job(
-            d, cfg(tmp_path), project_name="pathfinder", cmd=[sys.executable],
+        return await asyncio.wait_for(jobs.run_job_in_container(
+            d, cfg(tmp_path), project_name="pathfinder", run_id="r1", cmd=[sys.executable],
             env={}, log=lambda s: None, poll=poll, poll_every=0.05), timeout=5)
 
     assert asyncio.run(go()) == jobs.CANCELLED_EXIT
     assert len(polls) == 2
-    assert d.calls[0].cancelled
+    assert d.calls[0].cancelled and d.boxes == {}
 
 
 # -- phase 4: a container per run ---------------------------------------------------------
@@ -502,7 +504,9 @@ def test_a_run_container_is_stopped_when_monitoring_fails(tmp_path, failing):
     assert events == ["unmark:container-gone"]
 
 
-def test_a_workspace_run_is_stopped_when_polling_fails(tmp_path):
+def test_a_silent_run_is_stopped_when_polling_fails(tmp_path):
+    """Without a mark (no agent), a poll that raises still stops the run's
+    container before the call returns."""
     async def forever(call):
         await asyncio.Event().wait()
 
@@ -513,8 +517,8 @@ def test_a_workspace_run_is_stopped_when_polling_fails(tmp_path):
 
     async def go():
         with pytest.raises(RuntimeError):
-            await asyncio.wait_for(jobs.run_job(
-                d, cfg(tmp_path), project_name="pathfinder", cmd=["x"], env={},
+            await asyncio.wait_for(jobs.run_job_in_container(
+                d, cfg(tmp_path), project_name="pathfinder", run_id="r1", cmd=["x"], env={},
                 log=lambda s: None, poll=poll, poll_every=0.05), timeout=5)
         # Before the loop shuts down, which would cancel a leftover anyway.
         assert d.calls and d.calls[-1].cancelled
@@ -618,3 +622,56 @@ def test_a_first_attempt_that_never_started_is_run_again_not_followed(tmp_path):
         log=lines.append, poll=poll))
     assert code == 5 and "ran\n" in "".join(lines)
     assert ("remove_orphan", spec.key) in d.ops and ("reattach", spec.key) not in d.ops
+
+
+# -- no stage runs in a shared container (Codex, PR #20) ----------------------------------
+
+
+def test_a_config_asking_for_the_shared_container_is_refused():
+    jobs.check_run_isolation({})
+    jobs.check_run_isolation({"BLPL_RUNS_IN_CONTAINER": "1"})  # the old opt-in, now a no-op
+    for value in ("0", "false", "no"):
+        with pytest.raises(ValueError, match="shared"):
+            jobs.check_run_isolation({"BLPL_RUNS_IN_CONTAINER": value})
+    assert not hasattr(jobs, "run_job"), "the shared-container run path is gone"
+
+
+def test_run_output_decodes_characters_split_across_chunks(tmp_path):
+    ohm = "Ω".encode()
+    d = FakeDriver(script=lambda call: (0, [("stdout", b"R1 10k" + ohm[:1]),
+                                            ("stdout", ohm[1:] + b"\n")]))
+    lines: list[str] = []
+
+    async def poll():
+        return "running"
+
+    asyncio.run(jobs.run_job_in_container(
+        d, cfg(tmp_path), project_name="pathfinder", run_id="r1", cmd=["x"], env={},
+        log=lines.append, poll=poll))
+    assert "".join(lines) == "R1 10kΩ\n"
+
+
+def test_cancelling_the_caller_stops_the_run_container(tmp_path):
+    started = asyncio.Event()
+
+    async def forever(call):
+        started.set()
+        await asyncio.Event().wait()
+
+    d = FakeDriver(script=forever)
+
+    async def poll():
+        return "running"
+
+    async def scenario():
+        task = asyncio.create_task(jobs.run_job_in_container(
+            d, cfg(tmp_path), project_name="pathfinder", run_id="r1",
+            cmd=["blpl", "autoroute"], env={}, log=lambda s: None, poll=poll))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert d.calls[0].cancelled and d.boxes == {}
+

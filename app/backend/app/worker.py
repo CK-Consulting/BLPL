@@ -132,6 +132,7 @@ class _Workspaces:
         from .sandbox import workspaces
         from .sandbox.docker import DockerConfig, DockerDriver
 
+        sandbox_jobs.check_run_isolation()
         self.cfg = sandbox_jobs.WorkspaceRunConfig.from_env()
         self.driver = DockerDriver(DockerConfig.from_env())
         self.tracker = sandbox_idle.IdleTracker()
@@ -227,41 +228,36 @@ class _Workspaces:
 
         with path.open("w", encoding="utf-8", buffering=1) as log:
             try:
-                if sandbox_jobs.runs_in_containers() or self.access is not None:
-                    # A container per run, .git read-only in it. Always so with
-                    # the agent in use: a run inside the agent's own container
-                    # could take over its socket (Codex, PR #20). The agent is
-                    # told a run is active so writes through it wait.
-                    access = self.access
+                # A container per run, .git read-only in it, and only the
+                # invoker's checkout. Never inside the workspace container:
+                # every member's worktree is mounted there, and the agent's
+                # socket (Codex, PR #20). The agent, when there is one, is
+                # told a run is active so writes through it wait.
+                access = self.access
 
-                    async def mark(active: bool, ttl: float) -> None:
-                        if access is None:
-                            return
-                        client = await access.ensure(job.project_name)
-                        try:
-                            await asyncio.to_thread(client.run_mark, job.run_id, active, ttl)
-                        finally:
-                            client.close()
+                async def mark(active: bool, ttl: float) -> None:
+                    if access is None:
+                        return
+                    client = await access.ensure(job.project_name)
+                    try:
+                        await asyncio.to_thread(client.run_mark, job.run_id, active, ttl)
+                    finally:
+                        client.close()
 
-                    snapshot = None
-                    if self.storage is not None:
-                        storage = self.storage
+                snapshot = None
+                if self.storage is not None:
+                    storage = self.storage
 
-                        async def snapshot(label: str) -> object:
-                            return await asyncio.to_thread(
-                                storage.snapshot, job.project_name, label)
+                    async def snapshot(label: str) -> object:
+                        return await asyncio.to_thread(
+                            storage.snapshot, job.project_name, label)
 
-                    return await sandbox_jobs.run_job_in_container(
-                        self.driver, self.cfg, project_name=job.project_name,
-                        run_id=job.run_id, cmd=job.cmd, env=job.env, log=log.write,
-                        poll=poll, mark=mark, poll_every=_HEARTBEAT_EVERY,
-                        snapshot=snapshot, extra_inject=grant_env,
-                        member=self._member(job),
-                    )
-                return await sandbox_jobs.run_job(
+                return await sandbox_jobs.run_job_in_container(
                     self.driver, self.cfg, project_name=job.project_name,
-                    cmd=job.cmd, env=job.env, log=log.write, poll=poll,
-                    poll_every=_HEARTBEAT_EVERY, tracker=self.tracker, extra_inject=grant_env,
+                    run_id=job.run_id, cmd=job.cmd, env=job.env, log=log.write,
+                    poll=poll, mark=mark, poll_every=_HEARTBEAT_EVERY,
+                    snapshot=snapshot, extra_inject=grant_env,
+                    member=self._member(job),
                 )
             except Exception as exc:  # noqa: BLE001 - recorded in the run's own log
                 # The member reads this log, so say what failed in the

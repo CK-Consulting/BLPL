@@ -1,7 +1,10 @@
 """Phase 2: a queued run, executed in its project's workspace.
 
 The worker claims runs exactly as before. With ``BLPL_RUNS_IN_WORKSPACE=1`` it
-hands each one to ``run_job`` here instead of spawning it itself. This module
+hands each one to ``run_job_in_container`` here instead of spawning it itself:
+a container of the run's own, removed when it ends, that mounts only the
+invoker's checkout. (A first version ran stages inside the project's shared
+workspace container; that mode is gone.) This module
 stays free of the database so it can be tested, and later moved, without one:
 the worker passes in a ``poll`` callable that heartbeats the run row and returns
 its status.
@@ -45,7 +48,6 @@ from .driver import (
     WorkspaceSpec,
 )
 from .idle import IdleTracker
-from .runpath import execute_run
 
 if TYPE_CHECKING:
     from .agentclient import AgentClient
@@ -336,44 +338,6 @@ def spec_for(cfg: WorkspaceRunConfig, project_name: str) -> WorkspaceSpec:
     )
 
 
-async def run_job(
-    driver: WorkspaceDriver,
-    cfg: WorkspaceRunConfig,
-    *,
-    project_name: str,
-    cmd: Sequence[str],
-    env: Mapping[str, str],
-    log: Callable[[str], None],
-    poll: Callable[[], Awaitable[str]],
-    poll_every: float = 20.0,
-    tracker: IdleTracker | None = None,
-    extra_inject: Mapping[str, str] | None = None,
-) -> int:
-    """Execute one claimed run in its workspace; return the exit code to record.
-
-    ``poll`` is called every ``poll_every`` seconds whatever the run is
-    printing. It heartbeats the row and returns its status, so a silent stage
-    still checks in and still sees a cancel, which is the wedge the old loop's
-    bounded read fixed.
-    """
-    spec = spec_for(cfg, project_name)
-    task = asyncio.create_task(execute_run(
-        driver, spec, cmd, env=env, inject={**operation_inject(cmd, env), **(extra_inject or {})},
-        log=log, tracker=tracker,
-    ))
-    try:
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=poll_every)
-            if done:
-                return task.result()
-            if await poll() == CANCELLING:
-                log("blpl: run cancelled; stopping it in the workspace\n")
-                await _stop(task)
-                return CANCELLED_EXIT
-    finally:
-        await _stop(task)
-
-
 async def run_job_via_agent(
     connect: Callable[[], Awaitable["AgentClient"]],
     *,
@@ -455,9 +419,23 @@ async def run_job_via_agent(
 # -- phase 4: a container per run, with .git read-only ---------------------------------
 
 
-def runs_in_containers(env: Mapping[str, str] | None = None) -> bool:
+def check_run_isolation(env: Mapping[str, str] | None = None) -> None:
+    """Refuse a configuration that would run stages in a shared container.
+
+    Runs in workspaces are always a container per run, mounting only the
+    invoker's checkout. The mode that ran a stage inside the project's
+    long-lived workspace container, beside every member's worktree, is gone
+    (Codex, PR #20). BLPL_RUNS_IN_CONTAINER, which used to choose between
+    them, is kept as an alias: unset or 1 means what is now the only mode,
+    and anything else asks for the removed one, so the worker does not
+    start rather than quietly run stages differently from what was set."""
     env = os.environ if env is None else env
-    return env.get("BLPL_RUNS_IN_CONTAINER", "") == "1"
+    value = env.get("BLPL_RUNS_IN_CONTAINER")
+    if value not in (None, "", "1"):
+        raise ValueError(
+            f"BLPL_RUNS_IN_CONTAINER={value!r} asks for stages to run in the shared "
+            "workspace container, which is no longer supported; unset it (every run "
+            "now gets a container of its own)")
 
 
 _MEMBER = re.compile(r"u[0-9]{1,18}")

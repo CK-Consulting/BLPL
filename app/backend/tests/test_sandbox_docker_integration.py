@@ -367,12 +367,13 @@ def test_limits_are_enforced(env):
     asyncio.run(scenario())
 
 
-def test_phase2_a_queued_stage_runs_in_its_workspace_through_the_proxy(env):
-    """The phase-2 path end to end, against the real daemon, the real socket
-    proxy and the real workspace image: a stage the API would queue runs in the
-    project's workspace and writes into the project's own directory on the
-    host. The workspace sees no sibling project, and a committed symlink
-    pointing at one resolves to nothing."""
+def test_phase2_a_queued_stage_runs_in_a_container_of_its_own_through_the_proxy(env):
+    """The run path end to end, against the real daemon, the real socket proxy
+    and the real workspace image: a stage the API would queue runs in a
+    container of its own (never the shared workspace container, which is gone)
+    and writes into the project's own directory on the host. The run sees no
+    sibling project, and a committed symlink pointing at one resolves to
+    nothing."""
     if not _have_image(WORKSPACE_IMAGE):
         pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
     from app.sandbox import jobs
@@ -408,14 +409,15 @@ def test_phase2_a_queued_stage_runs_in_its_workspace_through_the_proxy(env):
         server = await serve(DockerProxy(policy, upstream), psock)
         driver = DockerDriver(env.config(f"unix://{psock}"))
         lines: list[str] = []
+        runs = iter(range(1000))
 
         async def poll():
             return "running"
 
         async def run(cmd, extra_env=None):
             lines.clear()
-            code = await jobs.run_job(
-                driver, cfg, project_name=project, cmd=cmd,
+            code = await jobs.run_job_in_container(
+                driver, cfg, project_name=project, run_id=f"p2-{next(runs)}", cmd=cmd,
                 env={"BLPL_MODULES_ROOT": "/app/data/modules", "BLPL_SERVER_KEY": "k" * 44,
                      **(extra_env or {})},
                 log=lines.append, poll=poll)
@@ -433,8 +435,8 @@ def test_phase2_a_queued_stage_runs_in_its_workspace_through_the_proxy(env):
             code, out = await run(["ls", "-A", "/app/data"])
             assert out.split() == ["modules"], out
             code, out = await run(["ls", "-A", str(projects)])
-            assert out.split() == [".worktrees", project], out
-            code, out = await run(["cat", "escape/secret.md"])
+            assert out.split() == [project], out  # the owner's run: no worktrees
+            code, out = await run(["cat", str(projects / project / "escape" / "secret.md")])
             assert code != 0 and "another project's plaintext" not in out
             code, out = await run(["sh", "-c", 'echo "[$BLPL_SERVER_KEY]"'])
             assert out.strip() == "[]"  # queued, but not on the allowlist
