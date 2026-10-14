@@ -212,13 +212,39 @@ class StorageHelper:
 HELPER_TIMEOUT_S = 30.0
 
 
-def serve_helper(socket_path: str, helper: StorageHelper) -> socketserver.UnixStreamServer:
+def _peer_uid(sock) -> int | None:
+    import socket as _socket
+    import struct
+
+    try:
+        raw = sock.getsockopt(_socket.SOL_SOCKET, _socket.SO_PEERCRED, struct.calcsize("3i"))
+    except OSError:
+        return None
+    _pid, uid, _gid = struct.unpack("3i", raw)
+    return uid
+
+
+def serve_helper(socket_path: str, helper: StorageHelper, *, client_uid: int,
+                 client_gid: int) -> socketserver.UnixStreamServer:
+    """Serve helper on socket_path for one client: the worker, as client_uid.
+
+    The helper runs as root and the worker as BLPL_UID:BLPL_GID with no other
+    group in common, so a root:root 0660 socket refused the worker and every
+    pre-run snapshot failed (Codex, PR #20). The socket is root:client_gid,
+    0660, nothing for anyone else; the helper container is given client_gid
+    as a supplementary group, which is what lets it chgrp the socket without
+    CAP_CHOWN. And each connection's peer is checked (SO_PEERCRED): only
+    client_uid is answered, whatever else shares the group.
+    """
     class Handler(socketserver.StreamRequestHandler):
         # One JSON line, at most 64 KiB, within this time: a client that
         # trickles or never finishes holds one thread this long and no more.
         timeout = HELPER_TIMEOUT_S
 
         def handle(self) -> None:
+            if _peer_uid(self.connection) != client_uid:
+                self.wfile.write(b'{"ok": false, "error": "not the worker"}\n')
+                return
             try:
                 line = self.rfile.readline(64 * 1024)
             except OSError:
@@ -242,6 +268,13 @@ def serve_helper(socket_path: str, helper: StorageHelper) -> socketserver.UnixSt
         p.unlink()
     server = socketserver.ThreadingUnixStreamServer(str(p), Handler)
     os.chmod(p, 0o660)
+    try:
+        os.chown(p, -1, client_gid)
+    except PermissionError as exc:
+        server.server_close()
+        raise RuntimeError(
+            f"cannot give {p} to group {client_gid}: the helper must run with that group "
+            f"(compose: group_add) ({exc})") from None
     return server
 
 
@@ -318,7 +351,13 @@ def main() -> None:  # pragma: no cover - the helper container's entry point
     logging.basicConfig(level=logging.INFO)
     root = Path(os.environ.get("BLPL_STORAGE_ROOT", "/storage"))
     sock = os.environ.get("BLPL_STORAGE_SOCKET", "/run/blpl-storage/storage.sock")
-    server = serve_helper(sock, StorageHelper(BtrfsStore(root)))
+    uid, gid = os.environ.get("BLPL_STORAGE_CLIENT_UID", ""), os.environ.get(
+        "BLPL_STORAGE_CLIENT_GID", "")
+    if not (uid.isdigit() and gid.isdigit()):
+        raise SystemExit("BLPL_STORAGE_CLIENT_UID and BLPL_STORAGE_CLIENT_GID must name the "
+                         "worker's uid and gid; refusing to start a socket nobody can use")
+    server = serve_helper(sock, StorageHelper(BtrfsStore(root)), client_uid=int(uid),
+                          client_gid=int(gid))
     logging.getLogger("blpl.storage").info("serving %s on %s", root, sock)
     server.serve_forever()
 

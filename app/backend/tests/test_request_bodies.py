@@ -10,6 +10,7 @@ promptly, without reading what the request did not promise.
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import tempfile
 import threading
@@ -268,7 +269,7 @@ def test_the_storage_helper_drops_a_line_that_never_ends_or_is_too_long(tmp_path
             raise AssertionError("parsed")
 
     path = str(tmp_path / "s.sock")
-    server = btrfs.serve_helper(path, Never())
+    server = btrfs.serve_helper(path, Never(), client_uid=os.getuid(), client_gid=os.getgid())
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         t0 = time.monotonic()

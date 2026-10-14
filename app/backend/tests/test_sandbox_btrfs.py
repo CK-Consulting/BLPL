@@ -134,7 +134,8 @@ def test_the_helper_takes_a_name_and_a_verb_over_its_socket(store):
     s, _ = store
     s.root.mkdir()
     sock = Path(tempfile.mkdtemp(prefix="blpl-st-")) / "s.sock"
-    server = btrfs.serve_helper(str(sock), StorageHelper(s))
+    server = btrfs.serve_helper(str(sock), StorageHelper(s), client_uid=os.getuid(),
+                                client_gid=os.getgid())
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         storage = HelperStorage(HelperClient(str(sock)), host_root="/srv/blpl/storage")
@@ -233,3 +234,37 @@ def test_a_retried_run_reuses_its_own_snapshot_and_refuses_a_stranger(store):
     (s.root / ".snapshots" / "board" / "pre-planted").mkdir()  # not a snapshot
     with pytest.raises(StorageError, match="not this project's snapshot"):
         s.snapshot("board", "pre-planted")
+
+
+def test_the_helpers_socket_is_the_workers_and_nobody_elses(store):
+    """Codex, PR #20: a root:root 0660 socket refused the worker, which runs as
+    BLPL_UID:BLPL_GID, and every pre-run snapshot failed. The socket is now in
+    the worker's group, 0660, and only the worker's uid is answered."""
+    import stat as _stat
+
+    s, _ = store
+    s.root.mkdir()
+    d = Path(tempfile.mkdtemp(prefix="blpl-st-"))
+    try:
+        mine = btrfs.serve_helper(str(d / "a.sock"), StorageHelper(s), client_uid=os.getuid(),
+                                  client_gid=os.getgid())
+        st = (d / "a.sock").stat()
+        assert _stat.S_IMODE(st.st_mode) == 0o660 and st.st_gid == os.getgid()
+        threading.Thread(target=mine.serve_forever, daemon=True).start()
+        with pytest.raises(StorageError, match="invalid project name"):
+            HelperClient(str(d / "a.sock")).call("create", "../x")  # answered: the worker
+        theirs = btrfs.serve_helper(str(d / "b.sock"), StorageHelper(s),
+                                    client_uid=os.getuid() + 1, client_gid=os.getgid())
+        threading.Thread(target=theirs.serve_forever, daemon=True).start()
+        with pytest.raises(StorageError, match="not the worker"):
+            HelperClient(str(d / "b.sock")).call("create", "board")
+        assert not (s.root / "board").exists()
+        mine.shutdown(), mine.server_close(), theirs.shutdown(), theirs.server_close()
+        if os.getuid() != 0:
+            # A group this process is not in: refused at start, not left unusable.
+            with pytest.raises(RuntimeError, match="must run with that group"):
+                btrfs.serve_helper(str(d / "c.sock"), StorageHelper(s),
+                                   client_uid=os.getuid(), client_gid=0)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
