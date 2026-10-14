@@ -84,6 +84,18 @@ NOT_INSPECTED = "not_inspected"
 HELD = "held"
 RELEASED = "released"
 
+# What the checks found, in one word, for anything that has to decide whether
+# the browser may render a file rather than only whether it may be released.
+# The two questions differ: an unscanned file may be released (see
+# `require_scan`), but "nothing known-bad was found" and "nobody looked" are
+# not the same claim, and only the first is `CLEAN`.
+CLEAN = "clean"            # inspected, nothing active, and a scanner said clean
+UNSCANNED = "unscanned"    # inspected, nothing active, but no scanner ran
+# HELD and NOT_INSPECTED, above, are the other two.
+
+# The inspector a verdict came from. See pdf_inspect.VERSION.
+INSPECTOR = f"pdf_inspect/{pdf_inspect.VERSION}"
+
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -128,9 +140,16 @@ class Record:
     original_name: str = ""
     kind: str = "datasheet"
     llm_ignore: bool = False
+    # Which inspector produced `inspection`. Empty on rows written before it
+    # was recorded, which is itself an answer: not this inspector.
+    inspector: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @property
+    def verdict(self) -> str:
+        return verdict_of(self.to_dict())
 
 
 def _load(ledger: Path) -> list[dict]:
@@ -167,6 +186,31 @@ def _upsert(project_dir: str | Path, rec: Record) -> None:
     rows.append(rec.to_dict())
     rows.sort(key=lambda r: (r.get("retrieved_at", ""), r.get("sha256", "")))
     _save(ledger, rows)
+
+
+def verdict(inspection_state: str, scan_state: str, reasons: list[str]) -> str:
+    """One of CLEAN, UNSCANNED, HELD or NOT_INSPECTED.
+
+    Any reason at all is HELD, whatever else is true. An inspection that did
+    not finish is never promoted to anything better than HELD, even with no
+    reasons recorded, because "could not tell" must not read as "fine".
+    """
+    if reasons:
+        return HELD
+    if inspection_state == NOT_INSPECTED:
+        return NOT_INSPECTED
+    if inspection_state != "inspected":
+        return HELD
+    return CLEAN if scan_state == "clean" else UNSCANNED
+
+
+def verdict_of(row: dict) -> str:
+    """The verdict a ledger row describes. See `verdict`."""
+    return verdict(
+        (row.get("inspection") or {}).get("state", ""),
+        (row.get("scan") or {}).get("state", ""),
+        list(row.get("reasons") or []),
+    )
 
 
 def require_scan() -> bool:
@@ -215,6 +259,11 @@ class Assessment:
     inspection: pdf_inspect.Inspection
     scan: av.ScanResult
     reasons: list[str]
+    inspector: str = INSPECTOR
+
+    @property
+    def verdict(self) -> str:
+        return verdict(self.inspection.state, self.scan.state, self.reasons)
 
 
 def assess(data: bytes, *, is_pdf: bool) -> Assessment:
@@ -233,12 +282,25 @@ def assess(data: bytes, *, is_pdf: bool) -> Assessment:
             state=NOT_INSPECTED, findings=[], reason="no inspector for this type"
         )
     scan = av.scan_bytes(data)
-    return Assessment(inspection=inspection, scan=scan, reasons=_decide(inspection, scan))
+    return Assessment(
+        inspection=inspection,
+        scan=scan,
+        reasons=_decide(inspection, scan),
+        inspector=INSPECTOR if inspection.state != NOT_INSPECTED else "",
+    )
 
 
-def _looks_like_pdf(data: bytes) -> bool:
-    # The spec allows junk before the header; readers look within the first 1 KB.
+def looks_like_pdf(data: bytes) -> bool:
+    """Whether a PDF reader would take these bytes for a PDF, whatever the name.
+
+    The spec allows junk before the header and readers look within the first
+    1 KB, so this does too: anything narrower would let a file with a byte of
+    padding in front be treated as "not a PDF" by us and as one by the viewer.
+    """
     return b"%PDF-" in data[:1024]
+
+
+_looks_like_pdf = looks_like_pdf
 
 
 def accept(
@@ -313,6 +375,7 @@ def accept(
         original_name=original_name,
         kind=kind,
         llm_ignore=llm_ignore,
+        inspector=INSPECTOR if inspection.state != NOT_INSPECTED else "",
     )
     _upsert(project_dir, rec)
     return rec

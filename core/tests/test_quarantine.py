@@ -1306,3 +1306,66 @@ def test_a_symlink_into_quarantine_is_not_a_datasheet(tmp_path):
 
     assert datasheet_files.resolve(proj, "LBAA0XV2DT-158").path is None
     assert datasheet_files.resolve(proj, "LBAA0XV2DT-158", file="LBAA0XV2DT-158.pdf").path is None
+
+
+# -- one word for what the checks found ----------------------------------------
+#
+# The app decides whether a browser may render a PDF from this word, keyed on
+# the file's content hash, so the cases where the answer is "no" matter more
+# than the one where it is "yes".
+
+
+def _clean_scanner(monkeypatch):
+    monkeypatch.setattr(
+        quarantine.av, "scan_bytes", lambda data: av.ScanResult(state="clean", scanner="test")
+    )
+
+
+def test_an_inert_pdf_a_scanner_passed_is_clean(monkeypatch):
+    _clean_scanner(monkeypatch)
+    a = quarantine.assess(BENIGN, is_pdf=True)
+    assert a.verdict == quarantine.CLEAN
+    assert a.inspector == f"pdf_inspect/{pdf_inspect.VERSION}"
+
+
+def test_nobody_scanning_is_not_clean(monkeypatch):
+    """Released, because the deployment allows it, but "nothing known-bad was
+    found" was never established, so the verdict must not say it was."""
+    _no_scanner(monkeypatch)
+    a = quarantine.assess(BENIGN, is_pdf=True)
+    assert a.reasons == []
+    assert a.verdict == quarantine.UNSCANNED
+
+
+def test_active_content_is_held_whatever_the_scanner_says(monkeypatch):
+    _clean_scanner(monkeypatch)
+    assert quarantine.assess(PHONES_HOME, is_pdf=True).verdict == quarantine.HELD
+
+
+def test_a_type_with_no_inspector_is_not_inspected_and_names_no_inspector(monkeypatch):
+    _clean_scanner(monkeypatch)
+    a = quarantine.assess(b"ISO-10303-21;\n", is_pdf=False)
+    assert a.verdict == quarantine.NOT_INSPECTED
+    assert a.inspector == ""
+
+
+def test_an_inspection_that_did_not_finish_is_never_better_than_held():
+    # No reasons recorded, but the inspector never reached "inspected": an old
+    # or hand-edited ledger row must not read as fine.
+    assert quarantine.verdict("cannot_inspect", "clean", []) == quarantine.HELD
+    assert quarantine.verdict("", "clean", []) == quarantine.HELD
+
+
+def test_the_ledger_row_says_which_inspector_and_what_it_found(tmp_path, monkeypatch):
+    _clean_scanner(monkeypatch)
+    rec = quarantine.accept(BENIGN, tmp_path, mpn="X")
+    row = quarantine.record_for(tmp_path, rec.sha256)
+    assert row["inspector"] == quarantine.INSPECTOR
+    assert quarantine.verdict_of(row) == rec.verdict == quarantine.CLEAN
+
+
+def test_a_padded_pdf_is_still_a_pdf():
+    """Readers find the header anywhere in the first kilobyte, so a check that
+    looks only at byte zero would call this "not a PDF" while a viewer opens it."""
+    assert quarantine.looks_like_pdf(b"\n\n junk " + BENIGN)
+    assert not quarantine.looks_like_pdf(b"x" * 1024 + BENIGN)
