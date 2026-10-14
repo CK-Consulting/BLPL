@@ -1147,6 +1147,8 @@ def test_phase4_a_retried_run_follows_its_first_attempt_instead_of_starting_agai
                               json=body, ok=(201,))
             await driver._req("POST", f"/containers/{name}/start", ok=(204,))
             await asyncio.sleep(0.5)  # the first worker "dies" here
+            assert await driver.will_follow(spec.key, argv)
+            assert not await driver.will_follow(spec.key, ["sh", "-c", "something else"])
             out: list[bytes] = []
             res = await driver.run_container(spec, argv, on_output=lambda s, b: out.append(b))
             assert res.exit_code == 0 and b"done" in b"".join(out)
@@ -1349,6 +1351,9 @@ def test_phase4_a_never_started_first_attempt_is_run_not_reported(env):
             st = (await driver._req("GET", f"/containers/{name}/json")).json()["State"]
             assert st["Status"] == "created" and st["StartedAt"].startswith("0001-01-01")
             assert st["ExitCode"] == 0 and not has_started(st) and observed_exit(st) == -1
+            # The rule the worker asks before deciding on a grant: not one
+            # it would follow, whatever status() makes of `created`.
+            assert not await driver.will_follow(spec.key, argv)
             out: list[bytes] = []
             res = await driver.run_container(spec, argv, on_output=lambda s, b: out.append(b))
             assert res.exit_code == 3, "the run's own exit code, not Docker's default"

@@ -297,6 +297,14 @@ class WorkspaceDriver(Protocol):
         started outlives the cancel."""
         ...
 
+    async def will_follow(self, key: WorkspaceKey, argv: Sequence[str]) -> bool:
+        """Whether run_container, given this key and argv now, would follow a
+        container already there rather than create one: the same command,
+        and a container that actually started. One rule for both, so a caller
+        deciding what a new container needs (an egress grant) cannot disagree
+        with what run_container then does (Codex, PR #20)."""
+        ...
+
     async def list(self) -> list[WorkspaceStatus]:
         """Every container this deployment manages, in any state."""
         ...

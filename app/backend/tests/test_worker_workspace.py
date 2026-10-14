@@ -147,7 +147,9 @@ def test_a_run_gets_its_own_egress_credential_and_it_is_revoked_after(monkeypatc
     assert env["HTTPS_PROXY"] == "http://g-run:tok@squid:3128"
     assert env["BLPL_FETCH_SERVICE"] == "http://blpl-fetch:8001"
     assert env["BLPL_FETCH_AUTH"] == "g-run:tok"
-    assert revoked == ["run_eg"]  # every grant of the run, by its id
+    # Every grant of the run, by its id: before the new one is issued (none
+    # here), and when the run ends.
+    assert revoked == ["run_eg", "run_eg"]
 
 
 def test_a_reattached_run_gets_no_new_grant_and_its_grants_are_all_revoked(monkeypatch,
@@ -184,4 +186,45 @@ def test_a_reattached_run_gets_no_new_grant_and_its_grants_are_all_revoked(monke
     assert asyncio.run(ws.run(job)) == 0
     assert ("reattach", spec.key) in ws.driver.ops
     assert issued == [] and revoked == ["run_re"]
+
+
+def test_a_never_started_first_attempt_is_recreated_with_a_grant(monkeypatch, tmp_path):
+    """Codex, PR #20: Docker's `created` reads as stopped, so the retry took
+    the never-started container for one it would follow and issued no grant,
+    then run_container recreated it with none. Now the decision is
+    run_container's own (will_follow): a fresh grant, the stale one revoked."""
+    import json
+
+    from app import egress
+    from app.sandbox.driver import State
+    from app.sandbox.fake import _Box
+
+    class S(_S):
+        def get(self, model, key):
+            return None
+
+    events: list = []
+    monkeypatch.setattr(worker_mod, "_LOGS", tmp_path / "runs")
+    monkeypatch.setattr(worker_mod, "SessionFactory", S)
+    monkeypatch.setattr(worker_mod.runqueue, "heartbeat", lambda s, r: runqueue.RUNNING)
+    monkeypatch.setattr(egress, "issue",
+                        lambda session, **kw: events.append(("issue", kw["run_id"])) or ("g-new", "t"))
+    monkeypatch.setattr(egress, "revoke_run",
+                        lambda session, run_id: events.append(("revoke", run_id)))
+    monkeypatch.setenv("BLPL_SANDBOX_HTTP_PROXY", "http://squid:3128")
+    cmd = [sys.executable, "-m", "blpl.core.cli", "stage1"]
+    d = FakeDriver(script=lambda call: (0, []))
+    ws = _workspaces(tmp_path, d)
+    spec = jobs.run_spec_for(ws.cfg, "pathfinder", "run_cr")
+    # Created, never started: what DockerDriver.status() reports as stopped.
+    d.boxes[spec.key] = _Box(spec, State.STOPPED, "run-old", argv=cmd, started=False)
+    job = runqueue.Claimed(run_id="run_cr", project_name="pathfinder", cmd=cmd,
+                           env={"HDM_LLM_CHAIN": json.dumps([])})
+
+    assert asyncio.run(ws.run(job)) == 0
+    assert ("remove_orphan", spec.key) in d.ops
+    assert d.calls[0].env["HTTPS_PROXY"] == "http://g-new:t@squid:3128"
+    # The stale grant goes before the new one is issued, and every grant of
+    # the run goes when it ends.
+    assert events == [("revoke", "run_cr"), ("issue", "run_cr"), ("revoke", "run_cr")]
 
