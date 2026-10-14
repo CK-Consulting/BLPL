@@ -201,6 +201,19 @@ PANEL --> TE      works — write the edge in the direction it flows
 A <--> B          works — when it genuinely goes both ways
 ```
 
+**A class goes on a node, never on a subgraph line.** `Node[...]:::mcu` is
+fine; `subgraph X["..."]:::subboard` is a parse error ("got
+'STYLE_SEPARATOR'") that takes the whole diagram with it. Give a subgraph a
+class with a separate statement, or leave it plain:
+
+```
+subgraph XIAO["U1: XIAO nRF54LM20A"]:::subboard      parse error
+subgraph XIAO["U1: XIAO nRF54LM20A"]                  works
+  ...
+end
+class XIAO subboard                                  works, if a class is wanted
+```
+
 One more thing worth knowing rather than discovering: the house classes are
 added to `flowchart` and `graph` only. `classDef` belongs to that grammar, and a
 `sequenceDiagram` or `gantt` refuses to parse with one attached — so those kinds
