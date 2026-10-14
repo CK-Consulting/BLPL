@@ -342,10 +342,12 @@ export type AdminEgress = {
   defaults: string[];
   /** Shipped: git over ssh (port 22). Read only. */
   git_ssh_hosts: string[];
-  /** Added by administrators, for every run. */
-  hosts: { host: string; added_by: string; added_at: string }[];
-  /** Who added or removed what, newest first. */
-  events: { host: string; action: "added" | "removed"; by: string; at: string }[];
+  /** Added by administrators, for every run: HTTPS always, and git over ssh
+   *  (port 22) only where `ssh` is set for that entry. */
+  hosts: { host: string; ssh: boolean; added_by: string; added_at: string }[];
+  /** Who added, removed or changed what, newest first. `ssh` is the entry's
+   *  setting after the change. */
+  events: { host: string; action: "added" | "removed" | "changed"; ssh: boolean; by: string; at: string }[];
 };
 
 export type FabReadiness = {
