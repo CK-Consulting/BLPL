@@ -41,6 +41,7 @@ export function hostProblem(raw: string): string | null {
 export function NetworkAccess({ onError }: { onError: (m: string) => void }) {
   const [data, setData] = useState<AdminEgress | null>(null);
   const [host, setHost] = useState("");
+  const [ssh, setSsh] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -60,13 +61,25 @@ export function NetworkAccess({ onError }: { onError: (m: string) => void }) {
     if (p) return;
     setBusy(true);
     try {
-      await postJSON("/api/admin/egress/hosts", { host });
+      await postJSON("/api/admin/egress/hosts", { host, ssh });
       setHost("");
+      setSsh(false);
       await refresh();
     } catch (e) {
       setProblem((e as Error).message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  // Port 22 is per entry and explicit: posting the host again with the
+  // other value changes only that.
+  const setSshFor = async (h: string, on: boolean) => {
+    try {
+      await postJSON("/api/admin/egress/hosts", { host: h, ssh: on });
+      await refresh();
+    } catch (e) {
+      onError((e as Error).message);
     }
   };
 
@@ -84,8 +97,10 @@ export function NetworkAccess({ onError }: { onError: (m: string) => void }) {
       <h3>Network access</h3>
       <p className="muted">
         Runs in project workspaces reach only the hosts below, over HTTPS. Each member's own AI
-        model endpoints are allowed automatically for that member's runs, so they do not belong
-        here. Add a host when every run needs it. Changes apply within seconds.
+        model endpoints are allowed automatically for that member's runs, and a project's own
+        git remote over ssh for that project's pushes and pulls, so they do not belong here. Add a
+        host when every run needs it, and tick git over ssh only if it is also reached on port 22.
+        Changes apply within seconds.
         {!data.enforced && " Runs are not in workspaces on this server, so nothing is restricted yet."}
       </p>
 
@@ -97,6 +112,7 @@ export function NetworkAccess({ onError }: { onError: (m: string) => void }) {
           <thead>
             <tr>
               <th>Host</th>
+              <th>Git over ssh</th>
               <th>Added by</th>
               <th />
             </tr>
@@ -105,6 +121,14 @@ export function NetworkAccess({ onError }: { onError: (m: string) => void }) {
             {data.hosts.map((h) => (
               <tr key={h.host}>
                 <td>{h.host}</td>
+                <td>
+                  <input
+                    type="checkbox"
+                    checked={h.ssh}
+                    onChange={(e) => setSshFor(h.host, e.target.checked)}
+                    aria-label={`Git over ssh to ${h.host}`}
+                  />
+                </td>
                 <td>
                   {h.added_by || "—"}
                   {h.added_at && <span className="muted"> · {new Date(h.added_at).toLocaleString()}</span>}
@@ -130,6 +154,10 @@ export function NetworkAccess({ onError }: { onError: (m: string) => void }) {
           }}
           onKeyDown={(e) => e.key === "Enter" && add()}
         />
+        <label className="small">
+          <input type="checkbox" checked={ssh} onChange={(e) => setSsh(e.target.checked)} /> Also git
+          over ssh (port 22)
+        </label>
         <button onClick={add} disabled={busy}>
           Add
         </button>
@@ -159,7 +187,9 @@ export function NetworkAccess({ onError }: { onError: (m: string) => void }) {
           <ul className="plain small">
             {data.events.map((e, i) => (
               <li key={i}>
-                {e.by || "someone"} {e.action} {e.host} · {new Date(e.at).toLocaleString()}
+                {e.by || "someone"} {e.action} {e.host}
+                {e.action !== "removed" && (e.ssh ? " (HTTPS and git over ssh)" : " (HTTPS only)")} ·{" "}
+                {new Date(e.at).toLocaleString()}
               </li>
             ))}
           </ul>

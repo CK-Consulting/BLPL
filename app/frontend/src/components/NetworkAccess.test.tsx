@@ -24,7 +24,7 @@ const SETTINGS = {
   secrets: [],
 };
 
-let hosts: { host: string; added_by: string; added_at: string }[] = [];
+let hosts: { host: string; ssh: boolean; added_by: string; added_at: string }[] = [];
 
 function view() {
   return {
@@ -66,9 +66,9 @@ describe("Settings → Admin", () => {
 
 describe("network access", () => {
   it("adds and removes a server-wide host", async () => {
-    api.postJSON.mockImplementation(async (_p: string, body: { host: string }) => {
-      hosts = [{ host: body.host, added_by: "admin@example.com", added_at: "" }];
-      return { ok: true, host: body.host };
+    api.postJSON.mockImplementation(async (_p: string, body: { host: string; ssh: boolean }) => {
+      hosts = [{ host: body.host, ssh: body.ssh, added_by: "admin@example.com", added_at: "" }];
+      return { ok: true, host: body.host, ssh: body.ssh };
     });
     api.del.mockImplementation(async () => {
       hosts = [];
@@ -81,12 +81,47 @@ describe("network access", () => {
     await screen.findByText("api.vendor.example");
     expect(api.postJSON).toHaveBeenCalledWith("/api/admin/egress/hosts", {
       host: "api.vendor.example",
+      ssh: false,
     });
     expect(screen.getByText("admin@example.com")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Remove api.vendor.example" }));
     await waitFor(() => expect(screen.queryByText("api.vendor.example")).toBeNull());
     expect(api.del).toHaveBeenCalledWith("/api/admin/egress/hosts/api.vendor.example");
+  });
+
+  it("allows git over ssh only when ticked, and changes it per entry", async () => {
+    api.postJSON.mockImplementation(async (_p: string, body: { host: string; ssh: boolean }) => {
+      hosts = [{ host: body.host, ssh: body.ssh, added_by: "admin@example.com", added_at: "" }];
+      return { ok: true, host: body.host, ssh: body.ssh };
+    });
+    render(<NetworkAccess onError={() => {}} />);
+    fireEvent.change(await screen.findByLabelText("Host to allow"), {
+      target: { value: "git.corp-example.net" },
+    });
+    fireEvent.click(screen.getByLabelText(/Also git over ssh/));
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    const box = (await screen.findByLabelText("Git over ssh to git.corp-example.net")) as HTMLInputElement;
+    expect(api.postJSON).toHaveBeenLastCalledWith("/api/admin/egress/hosts", {
+      host: "git.corp-example.net",
+      ssh: true,
+    });
+    expect(box.checked).toBe(true);
+    // The add form forgets the tick, so the next entry is HTTPS only unless asked.
+    expect((screen.getByLabelText(/Also git over ssh/) as HTMLInputElement).checked).toBe(false);
+
+    fireEvent.click(box);
+    await waitFor(() =>
+      expect(api.postJSON).toHaveBeenLastCalledWith("/api/admin/egress/hosts", {
+        host: "git.corp-example.net",
+        ssh: false,
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Git over ssh to git.corp-example.net") as HTMLInputElement).checked,
+      ).toBe(false),
+    );
   });
 
   it("explains a bad entry at the field and sends nothing", async () => {
