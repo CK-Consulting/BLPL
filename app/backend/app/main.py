@@ -3859,27 +3859,55 @@ def get_blob(
                 # nothing.
                 "Content-Security-Policy": _INERT_CSP,
             })
-        if size > UPLOAD_MAX_BYTES:
-            # Too big to judge, so never inline. An attachment is safe whatever
-            # the bytes turn out to be.
-            return _file_response(
-                request, fh, size, "application/octet-stream",
-                _opaque_headers(target.name, "too_large"),
-            )
-        spool, digest, total = _spool_and_hash(fh)
+    except BaseException:
+        fh.close()
+        raise
+
+    def verdict_for(digest: str):
+        project = _project_or_404(session, user, project_id)
+        return pdf_verdicts.lookup(session, project.id, digest, proj)
+
+    return _serve_pdf(request, fh, size, UPLOAD_MAX_BYTES, target.name, verdict_for)
+
+
+def _serve_pdf(request: Request, fh, size: int, limit: int, name: str, verdict_for) -> Response:
+    """Judge an open PDF on its whole content, then send it (or a range of it).
+
+    Takes ownership of ``fh``. Never inline unless every byte was read into
+    the spool, the count matches what fstat said, and that content's hash has
+    a clean verdict:
+
+    - over ``limit`` by fstat, or found to be over it while spooling (a file
+      someone is still appending to): too large, streamed as an attachment
+      from the descriptor with no verdict. The spool stops at ``limit + 1``
+      bytes, so a growing file cannot fill the temporary disk;
+    - a byte count that differs from fstat: the file changed while it was
+      read, so the spool (what was read) goes out as an attachment.
+    """
+    opaque = "application/octet-stream"
+    try:
+        if size > limit:
+            return _file_response(request, fh, size, opaque, _opaque_headers(name, "too_large"))
+        spool, digest, total = _spool_and_hash(fh, limit)
+        if total > limit:
+            spool.close()
+            fh.seek(0)
+            now = os.fstat(fh.fileno()).st_size
+            return _file_response(request, fh, now, opaque, _opaque_headers(name, "too_large"))
     except BaseException:
         fh.close()
         raise
     fh.close()
+    if total != size:
+        return _file_response(
+            request, spool, total, opaque, _opaque_headers(name, "changed"), etag=f'"{digest}"'
+        )
     try:
-        verdict = None
-        if total <= UPLOAD_MAX_BYTES:
-            project = _project_or_404(session, user, project_id)
-            verdict = pdf_verdicts.lookup(session, project.id, digest, proj)
+        verdict = verdict_for(digest)
     except BaseException:
         spool.close()
         raise
-    return _pdf_response(request, spool, total, digest, target.name, verdict)
+    return _pdf_response(request, spool, total, digest, name, verdict)
 
 
 def _pdf_response(request: Request, spool, total: int, digest: str, name: str, verdict) -> Response:
@@ -3975,7 +4003,7 @@ def _open_once(target: Path):
     return fh, info.st_size, head
 
 
-def _spool_and_hash(fh):
+def _spool_and_hash(fh, limit: int):
     """Copy the open file to a private spool, hashing as it goes.
 
     The spool, not the file, is what gets sent: a file rewritten in place
@@ -3991,7 +4019,9 @@ def _spool_and_hash(fh):
     digest = hashlib.sha256()
     total = 0
     try:
-        while chunk := fh.read(_CHUNK):
+        # At most limit + 1 bytes: one past is enough to know it is too large,
+        # and a file still being appended to is not followed to its end.
+        while total <= limit and (chunk := fh.read(min(_CHUNK, limit + 1 - total))):
             digest.update(chunk)
             spool.write(chunk)
             total += len(chunk)
@@ -4002,12 +4032,13 @@ def _spool_and_hash(fh):
     return spool, digest.hexdigest(), total
 
 
-def _hash_open_file(fh) -> tuple[str, int]:
+def _hash_open_file(fh, limit: int) -> tuple[str, int]:
+    """The hash and byte count of at most ``limit + 1`` bytes; see _spool_and_hash."""
     import hashlib
 
     digest = hashlib.sha256()
     total = 0
-    while chunk := fh.read(_CHUNK):
+    while total <= limit and (chunk := fh.read(min(_CHUNK, limit + 1 - total))):
         digest.update(chunk)
         total += len(chunk)
     return digest.hexdigest(), total
@@ -4110,15 +4141,22 @@ def _verdict_view(proj: Path, session: Session, user: User, project_id: str, pat
     with fh:
         pdf = quarantine.looks_like_pdf(head)
         # Only a PDF is hashed, in pieces; the hash is all this needs.
-        digest, total = _hash_open_file(fh) if pdf and size <= UPLOAD_MAX_BYTES else (None, size)
+        digest, total = (
+            _hash_open_file(fh, UPLOAD_MAX_BYTES) if pdf and size <= UPLOAD_MAX_BYTES else (None, size)
+        )
+    too_large = total > UPLOAD_MAX_BYTES
+    # Measured one size, read another: whatever was hashed is not settled as
+    # this file, so the view promises nothing (and the blob route agrees).
+    changed = pdf and not too_large and total != size
     out = {
         "path": path,
         "pdf": pdf,
         "quarantined": _is_quarantined(proj, target),
-        "too_large": total > UPLOAD_MAX_BYTES,
-        "sha256": digest if total <= UPLOAD_MAX_BYTES else None,
+        "too_large": too_large,
+        "changed": changed,
+        "sha256": digest if not too_large and not changed else None,
     }
-    if not out["pdf"] or out["too_large"]:
+    if not out["pdf"] or too_large or changed:
         return {**out, **pdf_verdicts.describe(None)}
     project = _project_or_404(session, user, project_id)
     row = pdf_verdicts.lookup(session, project.id, out["sha256"], proj)
@@ -4175,6 +4213,13 @@ def inspect_blob(
             body = fh.read(UPLOAD_MAX_BYTES + 1)
     if body is not None and len(body) > UPLOAD_MAX_BYTES:
         body = None
+    if body is not None and len(body) != size:
+        # A verdict recorded for bytes that were still changing would be a
+        # verdict about a file that never existed on disk.
+        raise HTTPException(
+            status_code=409,
+            detail=f"{payload.path} changed while it was being read; try again once it is written",
+        )
     if not quarantine.looks_like_pdf(head):
         raise HTTPException(
             status_code=400,
@@ -5917,17 +5962,13 @@ def get_attachment(
             "X-Content-Type-Options": "nosniff",
             "Content-Security-Policy": _INERT_CSP,
         })
-    try:
-        spool, digest, total = _spool_and_hash(fh)
-    finally:
-        fh.close()
-    try:
+    def verdict_for(digest: str):
         project = _project_or_404(session, user, project_id)
-        verdict = pdf_verdicts.find(session, project.id, digest)
-    except BaseException:
-        spool.close()
-        raise
-    return _pdf_response(request, spool, total, digest, attachments.name_of(path), verdict)
+        return pdf_verdicts.find(session, project.id, digest)
+
+    return _serve_pdf(
+        request, fh, size, attachments.MAX_DOCUMENT_BYTES, attachments.name_of(path), verdict_for
+    )
 
 
 class ChatInput(BaseModel):

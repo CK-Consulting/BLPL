@@ -599,3 +599,104 @@ def test_a_range_of_a_chat_attachment(unlocked):
     r = unlocked.get(f"/api/projects/scratch/attachments/{att['id']}", headers={"Range": "bytes=-4"})
     assert r.status_code == 206 and r.content == BENIGN[-4:]
     assert r.headers["content-type"] == "application/pdf"
+
+
+# -- a file that changes while it is being read ------------------------------------
+#
+# Codex, PR #21: the spool followed a growing file to EOF, past the limit, on
+# temporary disk with no bound; and a file whose size changed between fstat and
+# EOF could still be judged and rendered.
+
+
+def _grow_on_read(monkeypatch, path, appends: list[bytes]):
+    """Make every read of a file opened by os.fdopen append the next chunk to ``path``."""
+    import os as _os
+
+    real = _os.fdopen
+    pending = list(appends)
+
+    class Growing:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def read(self, n=-1):
+            out = self._fh.read(n)
+            if pending:
+                with open(path, "ab") as g:
+                    g.write(pending.pop(0))
+            return out
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._fh.close()
+
+    monkeypatch.setattr(_os, "fdopen", lambda fd, *a, **kw: Growing(real(fd, *a, **kw)))
+
+
+def test_a_pdf_that_grows_past_the_limit_while_spooled_is_too_large(unlocked, monkeypatch):
+    import app.main as main
+
+    proj = _project(unlocked)
+    _commit(proj, "grow.pdf", BENIGN)
+    monkeypatch.setattr(main, "UPLOAD_MAX_BYTES", 4096)
+    monkeypatch.setattr(main, "_CHUNK", 512)
+    spooled: list[int] = []
+    real_spool = main._spool_and_hash
+
+    def counting(fh, *a, **kw):
+        out = real_spool(fh, *a, **kw)
+        spooled.append(out[2])
+        return out
+
+    monkeypatch.setattr(main, "_spool_and_hash", counting)
+    _grow_on_read(monkeypatch, proj / "grow.pdf", [b"%" + b"x" * 1023 + b"\n"] * 12)
+    r = _blob(unlocked, "grow.pdf")
+    assert r.status_code == 200
+    assert _opaque(r)
+    assert r.headers["x-blpl-pdf-verdict"] == "too_large"
+    assert spooled and max(spooled) <= 4096 + 1, spooled
+
+
+def test_a_pdf_whose_size_changes_between_fstat_and_eof_is_never_inline(unlocked, monkeypatch):
+    """Even when the bytes that were read have a clean verdict: the file the
+    route measured is not the file it read, so nothing about it is settled."""
+    proj = _project(unlocked)
+    grown = BENIGN + b"%pad\n"
+    _commit(proj, "a.pdf", grown)
+    unlocked.post("/api/projects/scratch/blob/inspect", json={"path": "a.pdf"})
+    assert _inline(_blob(unlocked, "a.pdf"))
+
+    (proj / "a.pdf").write_bytes(BENIGN)
+    _grow_on_read(monkeypatch, proj / "a.pdf", [b"%pad\n"])
+    r = _blob(unlocked, "a.pdf")
+    assert _opaque(r)
+    assert r.headers["x-blpl-pdf-verdict"] == "changed"
+
+
+def test_the_verdict_view_says_so_when_the_file_changes_while_hashed(unlocked, monkeypatch):
+    proj = _project(unlocked)
+    grown = BENIGN + b"%pad\n"
+    _commit(proj, "a.pdf", grown)
+    unlocked.post("/api/projects/scratch/blob/inspect", json={"path": "a.pdf"})
+    (proj / "a.pdf").write_bytes(BENIGN)
+    _grow_on_read(monkeypatch, proj / "a.pdf", [b"%pad\n"])
+    v = unlocked.get("/api/projects/scratch/blob/verdict", params={"path": "a.pdf"}).json()
+    assert v["inline"] is False and v["sha256"] is None and v["changed"] is True
+
+
+def test_inspecting_a_file_that_changes_while_read_records_nothing(unlocked, monkeypatch):
+    proj = _project(unlocked)
+    _commit(proj, "a.pdf", BENIGN)
+    _grow_on_read(monkeypatch, proj / "a.pdf", [b"%pad\n"])
+    r = unlocked.post("/api/projects/scratch/blob/inspect", json={"path": "a.pdf"})
+    assert r.status_code == 409
+    import app.db
+    from app.models import PdfVerdict
+
+    with app.db.SessionFactory() as s:
+        assert s.query(PdfVerdict).count() == 0
