@@ -191,6 +191,21 @@ class _Workspaces:
         except Exception:  # noqa: BLE001 - it expires on its own
             logger.exception("could not revoke egress grant %s", name)
 
+    def _member(self, job: runqueue.Claimed) -> str | None:
+        """Whose checkout this run works in: None for the project's owner (or
+        a run nobody started), ``u<id>`` for a member's worktree. A run
+        container mounts that checkout and no other."""
+        from sqlalchemy import select
+
+        from .models import Project, Run
+
+        with SessionFactory() as session:
+            row = session.get(Run, job.run_id)
+            if row is None or row.user_id is None:
+                return None
+            owner = session.scalar(select(Project.owner_id).where(Project.id == row.project_id))
+            return None if owner == row.user_id else f"u{row.user_id}"
+
     async def run(self, job: runqueue.Claimed) -> int:
         grant_env, grant = self._grant(job)
         try:
@@ -241,6 +256,7 @@ class _Workspaces:
                         run_id=job.run_id, cmd=job.cmd, env=job.env, log=log.write,
                         poll=poll, mark=mark, poll_every=_HEARTBEAT_EVERY,
                         snapshot=snapshot, extra_inject=grant_env,
+                        member=self._member(job),
                     )
                 return await sandbox_jobs.run_job(
                     self.driver, self.cfg, project_name=job.project_name,
