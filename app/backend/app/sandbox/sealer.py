@@ -81,21 +81,37 @@ class SealError(RuntimeError):
 
 async def run_sealer(driver, cfg, project: str, key: bytes, op: str) -> dict:
     """Stop the project's workspace, then seal or unseal it in a sealer container."""
-    from .driver import Mount, WorkspaceKey, WorkspaceSpec
+    from .. import workspace
+    from . import gate
+    from .driver import WorkspaceKey
 
     if op not in ("seal", "unseal"):
         raise ValueError(op)
     ws = WorkspaceKey(project=project)
-    # Nothing may hold the directories while they move, and a stopped
-    # workspace keeps nothing of the project once its container is gone.
-    await driver.stop(ws)
-    await driver.remove(ws)
-
     # The blob directory must exist before it is bound: the daemon refuses a
     # missing bind source. The control plane sees it in both layouts.
-    from .. import workspace
-
     workspace.sealed_root(cfg.projects_root).mkdir(parents=True, exist_ok=True)
+    # The project's gate, exclusive, from before the workspace is stopped
+    # until the files are archived or restored. Without it a start could bring
+    # the workspace back after the stop and the sealer would archive and
+    # delete files its agent was writing (Codex, PR #20). A seal does not wait
+    # long for runs to finish: busy now is tried again by the next sweep.
+    try:
+        async with gate.held_async(cfg.projects_root, project, exclusive=True,
+                                   wait_s=gate.SEAL_WAIT_S if op == "seal"
+                                   else gate.START_WAIT_S):
+            # Nothing may hold the directories while they move, and a stopped
+            # workspace keeps nothing of the project once its container is gone.
+            await driver.stop(ws)
+            await driver.remove(ws)
+            return await _seal_now(driver, cfg, project, key, op)
+    except gate.GateBusy as exc:
+        raise SealError(str(exc)) from None
+
+
+async def _seal_now(driver, cfg, project: str, key: bytes, op: str) -> dict:
+    from .driver import Mount, WorkspaceKey, WorkspaceSpec
+
     sealed_host = (cfg.host_sealed_root
                    or cfg.host_projects_root.rstrip("/").rsplit("/", 1)[0] + "/sealed")
 

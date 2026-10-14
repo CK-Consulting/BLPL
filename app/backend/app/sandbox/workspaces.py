@@ -34,6 +34,10 @@ class WorkspaceUnavailable(RuntimeError):
     pass
 
 
+class WorkspaceSealed(WorkspaceUnavailable):
+    """The project was sealed, by a seal this start waited for."""
+
+
 @dataclass
 class Access:
     run_cfg: WorkspaceRunConfig
@@ -74,34 +78,55 @@ class Access:
         return self.agent_root / self.spec(project).key.container_name()
 
     async def ensure(self, project: str) -> agentclient.AgentClient:
-        spec = self.spec(project)
-        key, name = spec.key, spec.key.container_name()
-        d = self.agent_root / name
         driver = self.driver_factory()
         try:
-            with agentclient.locked(d):
-                st = await driver.status(key)
-                running = st.state in (State.RUNNING, State.PAUSED)
-                have_nonce = (d / agentclient.NONCE_FILE).exists()
-                if running and not have_nonce:
-                    # Started without an agent (a phase 2 container). Its
-                    # agent cannot be given a token after the fact, so it is
-                    # replaced. This happens once, at the switch to phase 3.
-                    await driver.stop(key)
-                    running = False
-                if not running:
-                    agentclient.prepare(d, self.server_key, name)
-                st = await driver.ensure(spec)
-                if st.stale:
-                    # Running from an older spec, so the agent mount may be
-                    # missing. Same remedy, under the same lock.
-                    await driver.stop(key)
-                    agentclient.prepare(d, self.server_key, name)
-                    await driver.ensure(spec)
+            # The project's gate, shared: a seal or unseal in progress holds it
+            # exclusively from before it stops the workspace until the files
+            # are archived or restored, so a start waits for it rather than
+            # bringing the workspace back under the sealer (Codex, PR #20).
+            from .. import workspace as _ws
+            from . import gate
+
+            async with gate.held_async(self.run_cfg.projects_root, project, exclusive=False,
+                                       wait_s=gate.START_WAIT_S):
+                if _ws.is_sealed(self.run_cfg.projects_root, project):
+                    raise WorkspaceSealed(f"project {project!r} is sealed; open it first")
+                # Built under the gate: before it, the project may be halfway
+                # through a seal, its directory already gone.
+                spec = self.spec(project)
+                key, name = spec.key, spec.key.container_name()
+                d = self.agent_root / name
+                await self._start(driver, spec, d, key, name)
+                # Still under the gate: a seal waits until the agent answers,
+                # rather than stopping a workspace it is still starting.
+                return await self._connect_agent(d, name)
         finally:
             close = getattr(driver, "aclose", None)
             if close is not None:
                 await close()
+
+    async def _start(self, driver, spec, d, key, name) -> None:
+        with agentclient.locked(d):
+            st = await driver.status(key)
+            running = st.state in (State.RUNNING, State.PAUSED)
+            have_nonce = (d / agentclient.NONCE_FILE).exists()
+            if running and not have_nonce:
+                # Started without an agent (a phase 2 container). Its
+                # agent cannot be given a token after the fact, so it is
+                # replaced. This happens once, at the switch to phase 3.
+                await driver.stop(key)
+                running = False
+            if not running:
+                agentclient.prepare(d, self.server_key, name)
+            st = await driver.ensure(spec)
+            if st.stale:
+                # Running from an older spec, so the agent mount may be
+                # missing. Same remedy, under the same lock.
+                await driver.stop(key)
+                agentclient.prepare(d, self.server_key, name)
+                await driver.ensure(spec)
+
+    async def _connect_agent(self, d, name) -> agentclient.AgentClient:
         token = agentclient.current_token(d, self.server_key, name)
         if token is None:
             raise WorkspaceUnavailable(f"{name} has no agent token")

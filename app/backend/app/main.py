@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import urllib.request
@@ -107,6 +108,7 @@ from blpl.core import schema as hdm_schema
 from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, ProjectPolicy, Run, User
+from .sandbox.gate import GateBusy as _GateBusy
 from blpl.core import library_upload, limits, project_manifest, quarantine
 from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
@@ -2494,7 +2496,10 @@ def open_project(
         if workspace_files.enabled():
             workspace_files.unseal(project_id, project_key)
         else:
-            workspace.unseal(PROJECTS_ROOT, project_id, project_key)
+            with _seal_gate(project_id, sealing=False):
+                workspace.unseal(PROJECTS_ROOT, project_id, project_key)
+    except _GateBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except (workspace.WorkspaceError, *sealer_errors) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -2531,6 +2536,24 @@ def seal_project(
     return {"ok": True, "sealed": _seal_workspace(session, project_id)}
 
 
+@contextlib.contextmanager
+def _seal_gate(project_id: str, *, sealing: bool):
+    """The project's gate (sandbox/gate.py), exclusive, around a seal or
+    unseal done on the mount, when runs execute in run containers: they hold
+    it shared for their whole run, so a seal waits for none of them and
+    cannot archive files a stage is writing. Without workspaces nothing
+    starts containers, and nothing is taken."""
+    from .sandbox import gate
+    from .sandbox import jobs as sandbox_jobs
+
+    if not sandbox_jobs.enabled():
+        yield
+        return
+    with gate.held(PROJECTS_ROOT, project_id, exclusive=True,
+                   wait_s=gate.SEAL_WAIT_S if sealing else gate.START_WAIT_S):
+        yield
+
+
 def _seal_workspace(session: Session, project_id: str) -> bool:
     """Seal one workspace, unless something is still using it.
 
@@ -2560,8 +2583,9 @@ def _seal_workspace(session: Session, project_id: str) -> bool:
         if workspace_files.enabled():
             size = workspace_files.seal(project_id, key)
         else:
-            size = workspace.seal(PROJECTS_ROOT, project_id, key)
-    except (workspace.WorkspaceError, *sealer_errors) as exc:
+            with _seal_gate(project_id, sealing=True):
+                size = workspace.seal(PROJECTS_ROOT, project_id, key)
+    except (workspace.WorkspaceError, *sealer_errors, _GateBusy) as exc:
         logger.warning("could not seal %s: %s", project_id, exc)
         return False
     workspaces.forget(project_id)
