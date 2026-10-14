@@ -757,3 +757,46 @@ class Run(Base):
 
     project: Mapped[Project] = relationship()
     user: Mapped["User | None"] = relationship()
+
+
+class PdfVerdict(Base):
+    """What this backend's own inspection found in one PDF, by content hash.
+
+    The browser renders a PDF inline only if the exact bytes being sent have a
+    clean verdict here. Before this table the decision went by path and suffix:
+    any ``.pdf`` outside ``retrieved/`` was served inline, and PDFs reach a
+    checkout by many doors that never pass quarantine — a commit pulled from a
+    remote, an import, a library part staged into ``datasheets/``, a pipeline
+    stage, the KiCad desktop. A path says where a file is, not what it is.
+
+    Keyed on (project, sha256), not sha256 alone, so one project's history
+    cannot vouch for, or cast doubt on, the same bytes in another.
+
+    Only the backend writes a row, from an assessment it ran itself: at upload,
+    at chat attach, or when a member asks for one ("Inspect now"). The in-tree
+    ledger, ``retrieved/quarantine.json``, is committed, so a pull can bring in
+    a row claiming any hash was released; it is imported only where it says
+    *held*, which can deny the browser a file and never grant one.
+    """
+
+    __tablename__ = "pdf_verdict"
+
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("project.id", ondelete="CASCADE"), primary_key=True
+    )
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # clean | unscanned | held | not_inspected (blpl.core.quarantine)
+    verdict: Mapped[str] = mapped_column(String(16))
+    # pdf_inspect/<VERSION>. A clean verdict from another inspector does not
+    # count: it answered a question this one would ask differently.
+    inspector: Mapped[str] = mapped_column(String(64), default="")
+    inspection_state: Mapped[str] = mapped_column(String(24), default="")
+    scanner: Mapped[str] = mapped_column(String(64), default="")
+    scan_state: Mapped[str] = mapped_column(String(16), default="")
+    reasons: Mapped[list] = mapped_column(JSON, default=list)
+    # upload | attachment | inspect | ledger
+    source: Mapped[str] = mapped_column(String(16))
+    decided_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

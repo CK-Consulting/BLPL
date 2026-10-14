@@ -182,7 +182,14 @@ def test_an_uploaded_active_file_is_served_as_an_opaque_download(unlocked, name,
     assert r.headers["x-content-type-options"] == "nosniff"
 
 
-def test_passive_files_still_display_inline(unlocked):
+def test_passive_files_still_display_inline(unlocked, monkeypatch):
+    # A PDF is inline only once a scanner has passed it as well; see
+    # test_pdf_verdicts.py for the cases where it is not.
+    from blpl.core import av, quarantine
+
+    monkeypatch.setattr(
+        quarantine.av, "scan_bytes", lambda data: av.ScanResult(state="clean", scanner="test")
+    )
     unlocked.post("/api/projects/init", json=init_body("mine"))
     results = _upload(unlocked, [
         ("guide.pdf", BENIGN, {"kind": "reference"}),

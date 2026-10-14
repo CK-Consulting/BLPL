@@ -1014,11 +1014,16 @@ def test_a_quarantined_file_is_never_served_as_a_pdf(client) -> None:
     assert r.headers["x-content-type-options"] == "nosniff"
 
 
-def test_a_released_datasheet_still_opens_in_the_browser(client) -> None:
-    """The restriction is on unverified files, not on datasheets. A passed one
-    is meant to be read."""
+def test_a_datasheet_opens_in_the_browser_once_inspected(client, monkeypatch) -> None:
+    """The restriction is on uninspected bytes, not on datasheets. One that
+    passed is meant to be read; one that merely sits in datasheets/ has passed
+    nothing, because a pull or an import can put a file there."""
     import app.main as main
+    from blpl.core import av, quarantine
 
+    monkeypatch.setattr(
+        quarantine.av, "scan_bytes", lambda data: av.ScanResult(state="clean", scanner="test")
+    )
     sign_in(client)
     client.post("/api/projects/init", json=init_body("scratch"))
     proj = main.PROJECTS_ROOT / "scratch"
@@ -1029,6 +1034,11 @@ def test_a_released_datasheet_still_opens_in_the_browser(client) -> None:
 
     r = client.get("/api/projects/scratch/blob", params={"path": "datasheets/TPS62840.pdf"})
     assert r.status_code == 200
+    assert r.headers["content-disposition"].startswith("attachment")
+
+    client.post("/api/projects/scratch/blob/inspect", json={"path": "datasheets/TPS62840.pdf"})
+    r = client.get("/api/projects/scratch/blob", params={"path": "datasheets/TPS62840.pdf"})
+    assert r.headers["content-type"] == "application/pdf"
     assert "attachment" not in r.headers.get("content-disposition", "")
 
 
