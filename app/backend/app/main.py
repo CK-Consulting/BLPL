@@ -5902,6 +5902,9 @@ async def start_chat_turn(
                 ),
                 kicad_url=_kicad_bridge_url(),
                 conversations_dir=conv_dir,
+                quarantine_sink=pdf_verdicts.sink(
+                    _project_or_404(session, user, project_id).id, user.id
+                ),
             )
         )
     except chat_mod.TurnInFlight as exc:
