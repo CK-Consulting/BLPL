@@ -14,6 +14,7 @@ import {
   humanSize,
   upload,
 } from "../attachments";
+import { ChatQueue, QueuedMessage, TurnEnd, queueKey } from "../chatQueue";
 
 /**
  * The design conversation, next to the project it is about.
@@ -50,8 +51,9 @@ const RECONNECT_BACKOFF_MS = [400, 1000, 2000, 4000];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** How a turn stopped being watchable. */
-type TurnOutcome = "ended" | "not_live";
+/** How a turn stopped being watchable. Everything but `ended` is a turn that
+ *  did not answer: it failed, was stopped, or the server no longer has it. */
+type TurnOutcome = "ended" | "not_live" | "error" | "cancelled";
 
 /** Why a question ended up with no answer — the two cases read differently. */
 type LostReason = "not_live" | "transient";
@@ -142,6 +144,10 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   // closure that reload replaces whatever you switched to with what you left.
   // Every state write from a turn is gated on this still naming its owner.
   const openRef = useRef<string | null>(null);
+  // The project, for the same reason: the panel is reused across projects, and
+  // a turn that ends after a switch must not act on the one switched to.
+  const projectRef = useRef(projectId);
+  projectRef.current = projectId;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [decided, setDecided] = useState<Record<string, string>>({});
@@ -182,6 +188,8 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     { name: string; model: string; capabilities: string[]; default: boolean }[]
   >([]);
   const [chosenEndpoint, setChosenEndpoint] = useState("");
+  const endpointRef = useRef(chosenEndpoint);
+  endpointRef.current = chosenEndpoint;
   const [showArchived, setShowArchived] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // A question the server was answering when it stopped existing. Held so the
@@ -196,6 +204,14 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   // changes identity whenever the conversation does, and depending on it would
   // re-run the effect mid-turn and reload the conversation underneath itself.
   const watchRef = useRef<((id: string) => Promise<void>) | null>(null);
+  // Messages waiting on an answer, and the send they go out through. The queue
+  // lives outside state so the end of a turn reads it as it is, not as it was.
+  const [, setQueueTick] = useState(0);
+  const [queue] = useState(() => new ChatQueue(() => setQueueTick((n) => n + 1)));
+  const postRef = useRef<
+    | ((text: string, sent: Attachment[], conversation: string, queued?: { key: string; item: QueuedMessage }) => Promise<void>)
+    | null
+  >(null);
   // Read inside the reconnect loop, which is a plain async loop and would
   // otherwise close over a stale copy of any state value.
   const cancelledRef = useRef(false);
@@ -455,6 +471,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
               if (event === "cancelled") {
                 sawEnd = true;
                 cancelledRef.current = true;
+                outcome = "cancelled";
                 return;
               }
               if (event === "error") {
@@ -462,6 +479,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
                 // is on screen — otherwise a turn the reader walked away from
                 // reconnects four times against a stream that is already over.
                 sawEnd = true;
+                outcome = "error";
                 if (mine()) {
                   setError(payload.detail);
                   // The server persists this same text into the conversation,
@@ -517,13 +535,13 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           // client may not watch it. Retrying cannot change either.
           if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
             if (mine()) setError(e.message);
-            return "ended";
+            return "error";
           }
         }
         // Stop was pressed. Whether the cancelled event arrived or the stream
         // died first, reattaching to a turn the user just ended is the one
         // thing they definitely did not ask for.
-        if (cancelledRef.current) return "ended";
+        if (cancelledRef.current) return "cancelled";
         attempt += 1;
         if (attempt > RECONNECT_ATTEMPTS) {
           if (mine())
@@ -531,7 +549,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
               "Lost the connection to this answer. It is still running on the server — " +
                 "reopen the project or reload to pick it back up.",
             );
-          return "ended";
+          return "error";
         }
         if (mine())
           setProgress(`Connection dropped — reattaching (${attempt}/${RECONNECT_ATTEMPTS})…`);
@@ -547,12 +565,16 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       // Whose turn this is. Every caller points openRef at the conversation
       // first, so reading it here needs no extra argument threaded through.
       const owner = openRef.current;
-      const mine = () => openRef.current === owner;
+      const project = projectRef.current;
+      const mine = () => openRef.current === owner && projectRef.current === project;
       setStreaming(true);
       let outcome: TurnOutcome = "ended";
       try {
         outcome = await follow(id, owner);
       } finally {
+        // Read now, before the awaits below: a turn that starts meanwhile
+        // resets both refs for itself.
+        const failed = outcome !== "ended" || persistedErrorRef.current;
         // The reader may have moved to another conversation while this ran. The
         // turn still finished, and its result is on disk — but none of the
         // reconciliation below belongs on a screen showing something else. The
@@ -606,31 +628,27 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           }
         }
 
-        // Whatever was typed while this turn ran goes now. Deliberately not
-        // after a turn that failed or was lost: the queued message was written
-        // in the belief that an answer was coming, and sending it on top of a
-        // failure buries the failure under a new question.
-        // Also only when this is still the open conversation: a message queued
-        // here was typed into *this* thread, and firing it after the reader has
-        // moved elsewhere would send it from a screen they are not looking at.
-        const next = mine() ? queued.current : null;
-        if (mine()) {
-          queued.current = null;
-          setQueuedNote(null);
-        }
-        if (next && outcome === "ended" && !persistedErrorRef.current) {
-          setInput(next.text);
-          setAttached(next.attached);
-          queueMicrotask(() => void sendRef.current?.());
-        } else if (next) {
-          // Put it back in the box rather than sending it into a broken state
-          // or dropping it. What they typed is theirs.
-          setInput(next.text);
-          setAttached(next.attached);
+        // Whatever was typed while this turn ran goes now, one message per
+        // answer — but only after a clean end, and only into the conversation
+        // it was typed in while the reader is still looking at it. Everything
+        // else holds the queue and says why; see ChatQueue.settle.
+        if (owner) {
+          const how: TurnEnd = !mine()
+            ? "away"
+            : outcome === "not_live"
+              ? "not_live"
+              : outcome === "cancelled"
+                ? "cancelled"
+                : failed
+                  ? "error"
+                  : "ended";
+          const key = queueKey(project, owner);
+          const next = queue.settle(key, id, how);
+          if (next) void postRef.current?.(next.text, next.attached, owner, { key, item: next });
         }
       }
     },
-    [follow, loadMessages, refreshProposals],
+    [follow, loadMessages, refreshProposals, queue],
   );
   watchRef.current = watch;
 
@@ -673,31 +691,25 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   // constraint, the thing you forgot — and the input simply refused clicks,
   // silently, with no explanation. Blocking it is defensible only because the
   // server allows one turn per conversation; making the person hold the thought
-  // is not.
-  const queued = useRef<{ text: string; attached: Attachment[] } | null>(null);
-  const [queuedNote, setQueuedNote] = useState<{ text: string; count: number } | null>(null);
+  // is not. Several may wait; they go in order, one per answer.
+  const openKey = filename ? queueKey(projectId, filename) : null;
+  const waiting = openKey ? queue.view(openKey) : { items: [], held: null };
 
-  const sendRef = useRef<(() => Promise<void>) | null>(null);
-
-  const send = async () => {
-    const text = input.trim();
-    // An attachment alone is a message: dropping in a datasheet and asking
-    // nothing is a normal opening move, and the server agrees.
-    if ((!text && attached.length === 0) || !filename) return;
-    if (streaming) {
-      // Hold it and clear the box, so it reads as sent rather than ignored.
-      // One queued message, not a backlog: a queue you cannot see the end of
-      // turns a conversation into a batch job, and the answer to the second
-      // message usually depends on the answer to the first.
-      queued.current = { text, attached };
-      setQueuedNote({ text, count: attached.length });
-      setInput("");
-      setAttached([]);
-      return;
-    }
-    const sent = attached;
-    setInput("");
-    setAttached([]);
+  /**
+   * Start a turn with this text in this conversation.
+   *
+   * Everything it needs is passed in or read from a ref, never from this
+   * render's state: it is also called from the end of a turn, where state is
+   * whatever it was when that turn began. Reading `input` from a stale render
+   * is exactly why a queued message used to land back in the box unsent.
+   */
+  const post = async (
+    text: string,
+    sent: Attachment[],
+    conversation: string,
+    queued?: { key: string; item: QueuedMessage },
+  ) => {
+    const project = projectRef.current;
     setError(null);
     setLost(null);
     // Show the question immediately; the server has already persisted it.
@@ -721,37 +733,71 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     let id: string;
     try {
       const started = await postJSON<{ turn_id: string; model: string }>(
-        `/api/projects/${projectId}/conversations/${filename}/chat`,
+        `/api/projects/${project}/conversations/${conversation}/chat`,
         {
           content: text,
           attachments: sent.map((a) => a.id),
-          endpoint: chosenEndpoint,
+          endpoint: endpointRef.current,
         },
       );
       setModel(started.model);
       id = started.turn_id;
     } catch (e) {
+      setMessages((m) => m.filter((x, i) => !(i === m.length - 1 && x.content === text)));
       // 409 means a turn is already running here — nearly always this tab's own,
       // whose stream died. The server names it, so the right move is to go and
       // watch it rather than report a collision the user cannot act on. The
-      // message was not persisted (the server checks before it writes), so put
-      // it back in the box instead of losing what they typed.
+      // message was not persisted (the server checks before it writes).
       const inFlight = turnInFlightId(e);
+      if (queued) {
+        // A queued message keeps its place at the head of the line: behind the
+        // turn that beat it, or held with the reason it could not start.
+        queue.unshift(
+          queued.key,
+          queued.item,
+          inFlight ? null : `Could not send: ${(e as Error).message}`,
+        );
+        if (inFlight) await watch(inFlight);
+        return;
+      }
+      // Put it back in the box instead of losing what they typed.
+      setInput(text);
+      setAttached(sent);
       if (inFlight) {
-        setMessages((m) => m.filter((x, i) => !(i === m.length - 1 && x.content === text)));
-        setInput(text);
-        setAttached(sent);
         setError(null);
         await watch(inFlight);
         return;
       }
-      setMessages((m) => m.filter((x, i) => !(i === m.length - 1 && x.content === text)));
-      setInput(text);
-      setAttached(sent);
       setError((e as Error).message);
       return;
     }
     await watch(id);
+  };
+  postRef.current = post;
+
+  const send = async () => {
+    const text = input.trim();
+    // An attachment alone is a message: dropping in a datasheet and asking
+    // nothing is a normal opening move, and the server agrees.
+    if ((!text && attached.length === 0) || !filename) return;
+    if (streaming) {
+      // Hold it and clear the box, so it reads as sent rather than ignored.
+      queue.push(queueKey(projectId, filename), text, attached);
+      setInput("");
+      setAttached([]);
+      return;
+    }
+    const sent = attached;
+    setInput("");
+    setAttached([]);
+    await post(text, sent, filename);
+  };
+
+  /** The person chose to send the held head of the queue. */
+  const sendQueuedNow = () => {
+    if (!openKey || !filename || streaming) return;
+    const item = queue.takeNow(openKey);
+    if (item) void post(item.text, item.attached, filename, { key: openKey, item });
   };
 
   const attach = useCallback(
@@ -798,8 +844,6 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       el.setSelectionRange(caret, caret);
     });
   };
-
-  sendRef.current = send;
 
   useEffect(() => {
     getJSON<{ endpoints: typeof endpoints }>(`/api/projects/${projectId}/chat/endpoints`)
@@ -1250,29 +1294,65 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         {slash.open && (
           <SlashPopover query={slash.query ?? ""} active={slash.active} onPick={applyCommand} />
         )}
-        {queuedNote && (
-          <div className="queued-note">
-            <span>
-              Queued — sends when this answer finishes
-              {queuedNote.count ? ` (with ${queuedNote.count} attachment${queuedNote.count > 1 ? "s" : ""})` : ""}:{" "}
-              <span className="queued-text">{queuedNote.text.slice(0, 90)}
-                {queuedNote.text.length > 90 ? "…" : ""}</span>
-            </span>
-            <button
-              className="link"
-              onClick={() => {
-                // Back into the box, not deleted. It is still what they wrote.
-                const held = queued.current;
-                queued.current = null;
-                setQueuedNote(null);
-                if (held) {
-                  setInput(held.text);
-                  setAttached(held.attached);
-                }
-              }}
-            >
-              edit
-            </button>
+        {openKey && waiting.items.length > 0 && (
+          <div className={`queued-note${waiting.held ? " held" : ""}`} role="status">
+            <div className="queued-head">
+              {waiting.held ? (
+                <strong>{waiting.held}</strong>
+              ) : (
+                <span>
+                  Queued — sends when this answer finishes
+                  {waiting.items.length > 1 ? ` (${waiting.items.length}, one per answer)` : ""}
+                </span>
+              )}
+              {waiting.held && (
+                <>
+                  <span className="spacer" />
+                  <button onClick={sendQueuedNow} disabled={streaming}>
+                    Send now
+                  </button>
+                  <button className="link" onClick={() => queue.clear(openKey)}>
+                    Discard
+                  </button>
+                </>
+              )}
+            </div>
+            <ol className="queued-list">
+              {waiting.items.map((item) => (
+                <li key={item.id}>
+                  <span className="queued-text">
+                    {item.text.slice(0, 90)}
+                    {item.text.length > 90 ? "…" : ""}
+                  </span>
+                  {item.attached.length > 0 && (
+                    <span className="muted small">
+                      {" "}
+                      (with {item.attached.length} attachment{item.attached.length > 1 ? "s" : ""})
+                    </span>
+                  )}
+                  <button
+                    className="link"
+                    aria-label="Edit queued message"
+                    onClick={() => {
+                      // Back into the box, not deleted. It is still what they wrote.
+                      const back = queue.remove(openKey, item.id);
+                      if (!back) return;
+                      setInput((cur) => (cur.trim() ? `${cur}\n${back.text}` : back.text));
+                      setAttached((cur) => [...cur, ...back.attached.filter((a) => !cur.some((c) => c.id === a.id))]);
+                    }}
+                  >
+                    edit
+                  </button>
+                  <button
+                    className="link"
+                    aria-label="Drop queued message"
+                    onClick={() => queue.remove(openKey, item.id)}
+                  >
+                    drop
+                  </button>
+                </li>
+              ))}
+            </ol>
           </div>
         )}
         <textarea

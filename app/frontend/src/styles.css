@@ -829,9 +829,15 @@ button.primary { background: #2b4a7e; border-color: #4f7fd0; color: #fff; }
 /* A message composed during a turn, waiting for it to end. Stated plainly
    because the alternative — an input that silently refuses clicks — made the
    app look broken at exactly the moment it was working hardest. */
-.queued-note { display: flex; align-items: center; gap: .5rem; padding: .35rem .5rem;
+.queued-note { display: flex; flex-direction: column; gap: .25rem; padding: .35rem .5rem;
   margin-bottom: .4rem; border: 1px dashed #6b6f75; border-radius: 6px;
   background: #171d27; color: #e6e6e6; font-size: 13px; }
+/* Held: the answer ahead of it did not finish cleanly, and the person decides.
+   Solid rather than dashed, so it does not read as still waiting. */
+.queued-note.held { border-style: solid; border-color: #b08a3e; }
+.queued-note .queued-head { display: flex; align-items: center; gap: .5rem; }
+.queued-note .queued-list { margin: 0; padding-left: 1.2rem; display: flex; flex-direction: column; gap: .15rem; }
+.queued-note .queued-list li button { margin-left: .4rem; }
 .queued-note .queued-text { color: #adb1b6; font-style: italic; }
 
 /* Line numbers — for finding the line a stage named ("…md:307").
