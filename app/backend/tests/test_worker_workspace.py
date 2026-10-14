@@ -128,7 +128,7 @@ def test_a_run_gets_its_own_egress_credential_and_it_is_revoked_after(monkeypatc
     monkeypatch.setattr(worker_mod, "SessionFactory", S)
     monkeypatch.setattr(worker_mod.runqueue, "heartbeat", lambda s, r: runqueue.RUNNING)
     monkeypatch.setattr(egress, "issue", issue)
-    monkeypatch.setattr(egress, "revoke", lambda session, name: revoked.append(name))
+    monkeypatch.setattr(egress, "revoke_run", lambda session, run_id: revoked.append(run_id))
     monkeypatch.setenv("BLPL_SANDBOX_HTTP_PROXY", "http://squid:3128")
     monkeypatch.setenv("BLPL_FETCH_SERVICE_URL", "http://blpl-fetch:8001")
     chain = [{"provider": "openai-compatible", "endpoint": "mine",
@@ -147,4 +147,41 @@ def test_a_run_gets_its_own_egress_credential_and_it_is_revoked_after(monkeypatc
     assert env["HTTPS_PROXY"] == "http://g-run:tok@squid:3128"
     assert env["BLPL_FETCH_SERVICE"] == "http://blpl-fetch:8001"
     assert env["BLPL_FETCH_AUTH"] == "g-run:tok"
-    assert revoked == ["g-run"]
+    assert revoked == ["run_eg"]  # every grant of the run, by its id
+
+
+def test_a_reattached_run_gets_no_new_grant_and_its_grants_are_all_revoked(monkeypatch,
+                                                                          tmp_path):
+    """Codex, PR #20: the retry of a run whose first worker died follows the
+    container that worker started, which holds the first grant. The retry
+    issues none, and when the run ends every grant of the run id goes."""
+    import json
+
+    from app import egress
+    from app.sandbox.driver import State
+    from app.sandbox.fake import _Box
+
+    class S(_S):
+        def get(self, model, key):
+            return None
+
+    issued, revoked = [], []
+    monkeypatch.setattr(worker_mod, "_LOGS", tmp_path / "runs")
+    monkeypatch.setattr(worker_mod, "SessionFactory", S)
+    monkeypatch.setattr(worker_mod.runqueue, "heartbeat", lambda s, r: runqueue.RUNNING)
+    monkeypatch.setattr(egress, "issue", lambda session, **kw: issued.append(kw) or ("g", "t"))
+    monkeypatch.setattr(egress, "revoke_run", lambda session, run_id: revoked.append(run_id))
+    monkeypatch.setenv("BLPL_SANDBOX_HTTP_PROXY", "http://squid:3128")
+    cmd = [sys.executable, "-m", "blpl.core.cli", "stage1"]
+    ws = _workspaces(tmp_path, FakeDriver())
+    spec = jobs.run_spec_for(ws.cfg, "pathfinder", "run_re")
+    # What the dead worker left: the run's container, started and running.
+    ws.driver.boxes[spec.key] = _Box(spec, State.RUNNING, "run-old", argv=cmd,
+                                     outcome=(0, [("stdout", b"done\n")]))
+    job = runqueue.Claimed(run_id="run_re", project_name="pathfinder", cmd=cmd,
+                           env={"HDM_LLM_CHAIN": json.dumps([])})
+
+    assert asyncio.run(ws.run(job)) == 0
+    assert ("reattach", spec.key) in ws.driver.ops
+    assert issued == [] and revoked == ["run_re"]
+

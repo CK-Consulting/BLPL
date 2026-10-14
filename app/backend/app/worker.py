@@ -26,6 +26,7 @@ from . import runqueue, serverkey
 from .db import SessionFactory
 from .sandbox import idle as sandbox_idle
 from .sandbox import jobs as sandbox_jobs
+from .sandbox.driver import State
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
@@ -156,17 +157,23 @@ class _Workspaces:
             self.access = workspaces.Access.from_env(
                 server_key, lambda: DockerDriver(DockerConfig.from_env()))
 
-    def _grant(self, job: runqueue.Claimed) -> tuple[dict[str, str], str | None]:
+    async def _grant(self, job: runqueue.Claimed) -> tuple[dict[str, str], str | None]:
         """This run's egress credential and fetch-service access (egress.py).
 
         The grant reaches the defaults, the administrators' hosts, and the
         hosts of the LLM endpoints in this run's own chain; another member's
-        run gets its own. Nothing without an egress proxy."""
+        run gets its own. Nothing without an egress proxy, and nothing for a
+        run whose container a dead worker already started: the retry follows
+        that container, which holds its own grant, so a new one would only
+        sit unused."""
         from . import egress
         from .models import Run
 
         if not os.environ.get("BLPL_SANDBOX_HTTP_PROXY"):
-            return {}, None
+            return {}, job.run_id
+        st = await self.driver.status(sandbox_jobs.run_key(job.project_name, job.run_id))
+        if st.state in (State.RUNNING, State.PAUSED, State.STOPPED):
+            return {}, job.run_id
         with SessionFactory() as session:
             row = session.get(Run, job.run_id)
             name, token = egress.issue(
@@ -178,19 +185,20 @@ class _Workspaces:
         service = os.environ.get("BLPL_FETCH_SERVICE_URL", "")
         if service:
             env.update(BLPL_FETCH_SERVICE=service, BLPL_FETCH_AUTH=f"{name}:{token}")
-        return env, name
+        return env, job.run_id
 
-    def _revoke(self, name: str | None) -> None:
-        if name is None:
+    def _revoke(self, run_id: str | None) -> None:
+        """Every grant this run was issued, the one it actually used included."""
+        if run_id is None:
             return
         from . import egress
 
         try:
             with SessionFactory() as session:
-                egress.revoke(session, name)
+                egress.revoke_run(session, run_id)
                 session.commit()
         except Exception:  # noqa: BLE001 - it expires on its own
-            logger.exception("could not revoke egress grant %s", name)
+            logger.exception("could not revoke egress grants of run %s", run_id)
 
     def _member(self, job: runqueue.Claimed) -> str | None:
         """Whose checkout this run works in: None for the project's owner (or
@@ -208,7 +216,7 @@ class _Workspaces:
             return None if owner == row.user_id else f"u{row.user_id}"
 
     async def run(self, job: runqueue.Claimed) -> int:
-        grant_env, grant = self._grant(job)
+        grant_env, grant = await self._grant(job)
         try:
             return await self._run(job, grant_env)
         finally:

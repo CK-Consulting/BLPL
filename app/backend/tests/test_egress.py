@@ -250,3 +250,12 @@ def test_saving_a_members_own_endpoint_needs_nobody_else(client, monkeypatch):
     r = client.put("/api/settings/llm", json=bad)
     assert r.status_code == 400 and "HTTPS on port 443" in r.json()["detail"]
     assert "ask the operator" not in r.text
+
+
+def test_every_grant_of_a_run_is_revoked_together(db):
+    first, t1 = egress.issue(db, kind="run", project="p", run_id="run_1")
+    retry, t2 = egress.issue(db, kind="run", project="p", run_id="run_1")
+    other, t3 = egress.issue(db, kind="run", project="p", run_id="run_2")
+    assert egress.revoke_run(db, "run_1") == 2
+    assert not egress.authenticate(db, first, t1) and not egress.authenticate(db, retry, t2)
+    assert egress.authenticate(db, other, t3)

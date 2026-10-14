@@ -441,6 +441,12 @@ def check_run_isolation(env: Mapping[str, str] | None = None) -> None:
 _MEMBER = re.compile(r"u[0-9]{1,18}")
 
 
+def run_key(project_name: str, run_id: str) -> WorkspaceKey:
+    """The run container's key, as run_spec_for and run_job_in_container name it."""
+    return WorkspaceKey(project=project_name, role="run",
+                        member=re.sub(r"[^A-Za-z0-9_.-]", "-", run_id))
+
+
 def run_spec_for(cfg: WorkspaceRunConfig, project_name: str, run_id: str,
                  member: str | None = None) -> WorkspaceSpec:
     """The spec for one run's container: the invoking member's checkout and
