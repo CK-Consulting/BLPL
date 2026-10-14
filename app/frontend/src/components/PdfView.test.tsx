@@ -123,3 +123,71 @@ describe("a PDF in the file pane", () => {
     nothingEmbedded(container);
   });
 });
+
+describe("answers that arrive after the pane has moved on", () => {
+  it("drops an inspection of the previous file instead of showing it for this one", async () => {
+    // Codex, PR #21: inspect A, select B before the POST returns, and A's
+    // clean verdict replaced B's, offering "Open PDF" for a file nobody had
+    // inspected.
+    let finishPost: (r: Response) => void = () => {};
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          finishPost = resolve;
+        });
+      }
+      const which = url.includes("B.pdf") ? "datasheets/B.pdf" : "datasheets/A.pdf";
+      return Promise.resolve(
+        new Response(JSON.stringify({ ...base, path: which }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { rerender, container } = render(<PdfView projectId="p" path="datasheets/A.pdf" />);
+    fireEvent.click(await screen.findByRole("button", { name: /inspect now/i }));
+
+    rerender(<PdfView projectId="p" path="datasheets/B.pdf" />);
+    await screen.findByText("datasheets/B.pdf");
+    await screen.findByRole("button", { name: /inspect now/i });
+
+    finishPost(
+      new Response(
+        JSON.stringify({ ...base, path: "datasheets/A.pdf", verdict: "clean", inspector: "pdf_inspect/1", inline: true }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    nothingEmbedded(container);
+    expect(screen.getByRole("button", { name: /inspect now/i })).toBeTruthy();
+  });
+
+  it("drops an inspection from another project with the same path", async () => {
+    let finishPost: (r: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: RequestInit) =>
+        init?.method === "POST"
+          ? new Promise<Response>((resolve) => {
+              finishPost = resolve;
+            })
+          : Promise.resolve(
+              new Response(JSON.stringify(base), { status: 200, headers: { "Content-Type": "application/json" } }),
+            ),
+      ),
+    );
+    const { rerender, container } = render(<PdfView projectId="p" path="datasheets/X.pdf" />);
+    fireEvent.click(await screen.findByRole("button", { name: /inspect now/i }));
+    rerender(<PdfView projectId="q" path="datasheets/X.pdf" />);
+    await screen.findByRole("button", { name: /inspect now/i });
+    finishPost(
+      new Response(JSON.stringify({ ...base, verdict: "clean", inspector: "pdf_inspect/1", inline: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    nothingEmbedded(container);
+  });
+});
