@@ -51,12 +51,14 @@ an entry whatever the outcome, so "no entry" means "never fetched" rather than
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
-import shutil
+import secrets
+import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -228,28 +230,182 @@ class Record:
         return verdict_of(self.to_dict())
 
 
-def _load(ledger: Path) -> list[dict]:
+# -- the file system, without following links -----------------------------------------
+#
+# A project directory may be a checkout a run can write to. A run that plants a
+# link at a name quarantine writes, `datasheets/LM317.pdf` say, or at a
+# directory on the way (`references` -> another member's worktree), would have
+# an upload or a fetched file written through it, wherever it pointed. So every
+# directory below the project root is opened by descriptor, one component at a
+# time, refusing a link; every file is read without following one; and every
+# write goes to a fresh name created exclusively in that directory and is then
+# renamed over a target checked not to be a link. A rename replaces a link
+# rather than writing through it, so a link planted between the check and the
+# rename is replaced, not followed (Codex, PR #20).
+
+
+class LinkRefused(ValueError):
+    """A link, or something that is not a plain file or directory, where
+    quarantine reads or writes. Refused, and nothing written."""
+
+
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_at(name: str, dirfd: int, flags: int, *, want_dir: bool, where: str) -> int:
+    """Open name in dirfd without following a link, whatever the kernel does.
+
+    Under gVisor (runsc), O_DIRECTORY | O_NOFOLLOW follows a link to a
+    directory, where Linux refuses it. So the decision is lstat's, which both
+    report alike, and the descriptor must be the inode lstat saw; a link
+    swapped in between is refused, not followed (as the workspace agent's
+    open_at). FileNotFoundError when nothing is there."""
+    before = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    if stat.S_ISLNK(before.st_mode) or want_dir != stat.S_ISDIR(before.st_mode) or \
+            (not want_dir and not stat.S_ISREG(before.st_mode)):
+        raise LinkRefused(f"{where}/{name} is a link or not a plain "
+                          f"{'directory' if want_dir else 'file'}; quarantine does not use it")
     try:
-        data = json.loads(ledger.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    return data.get("retrieved", []) if isinstance(data, dict) else []
-
-
-def _load_events(ledger: Path) -> list[dict]:
+        fd = os.open(name, flags | os.O_NOFOLLOW | _O_CLOEXEC |
+                     (os.O_DIRECTORY if want_dir else 0), dir_fd=dirfd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise LinkRefused(f"{where}/{name} is a link; quarantine does not use it") from None
+        raise
     try:
-        data = json.loads(ledger.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    events = data.get("events", []) if isinstance(data, dict) else []
-    return [e for e in events if isinstance(e, dict)]
+        after = os.fstat(fd)
+        now = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or \
+                (now.st_dev, now.st_ino) != (after.st_dev, after.st_ino):
+            raise LinkRefused(f"{where}/{name} changed while it was being opened")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
-def _save(ledger: Path, rows: list[dict], events: list[dict] | None = None) -> None:
-    ledger.parent.mkdir(parents=True, exist_ok=True)
+def _component(name: str) -> str:
+    if not name or name in (".", "..") or "/" in name or "\0" in name:
+        raise ValueError(f"{name!r} is not a single file or directory name")
+    return name
+
+
+@contextmanager
+def _dir(project_dir: str | Path, dirname: str, *, create: bool) -> Iterator[int | None]:
+    """A descriptor for ``project_dir/dirname``, each component opened without
+    following a link. None when it does not exist and ``create`` is false.
+
+    The project root itself is the caller's: it is opened as given."""
+    parts = [_component(p) for p in dirname.split("/") if p]
+    if create:
+        # The root is the caller's, created as before if it is not there yet.
+        os.makedirs(project_dir, exist_ok=True)
+    try:
+        fd = os.open(str(project_dir), os.O_RDONLY | os.O_DIRECTORY | _O_CLOEXEC)
+    except FileNotFoundError:
+        if create:
+            raise
+        yield None
+        return
+    try:
+        for part in parts:
+            if create:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            try:
+                nxt = _open_at(part, fd, os.O_RDONLY, want_dir=True, where=dirname)
+            except FileNotFoundError:
+                if create:
+                    raise
+                yield None
+                return
+            os.close(fd)
+            fd = nxt
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _kind(dirfd: int, name: str) -> int | None:
+    """The file type at name, not following a link; None when absent."""
+    try:
+        return stat.S_IFMT(os.stat(name, dir_fd=dirfd, follow_symlinks=False).st_mode)
+    except FileNotFoundError:
+        return None
+
+
+def _refuse_unless_plain(dirfd: int, name: str, where: str) -> bool:
+    """Whether a plain file is at name (False when nothing is); a link or
+    anything else there is refused."""
+    kind = _kind(dirfd, name)
+    if kind is None:
+        return False
+    if kind != stat.S_IFREG:
+        raise LinkRefused(f"{where}/{name} is a link or not a plain file; refusing to use it")
+    return True
+
+
+def _read(dirfd: int, name: str, where: str) -> bytes | None:
+    """A plain file's bytes, None when it is absent, refused when a link."""
+    try:
+        fd = _open_at(_component(name), dirfd, os.O_RDONLY, want_dir=False, where=where)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read()
+
+
+def _write(dirfd: int, name: str, data: bytes, where: str) -> None:
+    """Put data at name in dirfd: written to a fresh name created exclusively
+    there, then renamed over name, which must not be a link."""
+    _component(name)
+    _refuse_unless_plain(dirfd, name, where)
+    tmp = f".{name[:64]}.{secrets.token_hex(8)}.part"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _O_CLOEXEC,
+                 0o644, dir_fd=dirfd)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        _refuse_unless_plain(dirfd, name, where)
+        os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+
+
+def _load_doc(project_dir: str | Path) -> dict:
+    """The ledger document, read without following a link; {} when absent."""
+    with _dir(project_dir, QUARANTINE_DIRNAME, create=False) as qfd:
+        if qfd is None:
+            return {}
+        raw = _read(qfd, LEDGER_NAME, QUARANTINE_DIRNAME)
+    if raw is None:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load(project_dir: str | Path) -> list[dict]:
+    return _load_doc(project_dir).get("retrieved", [])
+
+
+def _load_events(project_dir: str | Path) -> list[dict]:
+    events = _load_doc(project_dir).get("events", [])
+    return [e for e in events if isinstance(e, dict)] if isinstance(events, list) else []
+
+
+def _save(project_dir: str | Path, rows: list[dict], events: list[dict] | None = None) -> None:
     # Events are appended, never rewritten: a row save carries them over as
     # they are on disk.
-    events = _load_events(ledger) if events is None else events
+    events = _load_events(project_dir) if events is None else events
     doc: dict = {"schema_version": 1, "updated": _now(), "retrieved": rows}
     if events:
         doc["events"] = events
@@ -257,13 +413,12 @@ def _save(ledger: Path, rows: list[dict], events: list[dict] | None = None) -> N
     # Write-then-move, as everywhere else here: a crash mid-write must not leave
     # a ledger that cannot be parsed, because an unreadable ledger reads as "no
     # files were ever retrieved".
-    tmp = ledger.with_name(ledger.name + ".tmp")
-    tmp.write_text(body + "\n", encoding="utf-8")
-    tmp.replace(ledger)
+    with _dir(project_dir, QUARANTINE_DIRNAME, create=True) as qfd:
+        _write(qfd, LEDGER_NAME, (body + "\n").encode("utf-8"), QUARANTINE_DIRNAME)
 
 
 def record_for(project_dir: str | Path, sha256: str) -> dict | None:
-    for row in _load(quarantine_dir(project_dir) / LEDGER_NAME):
+    for row in _load(project_dir):
         if row.get("sha256") == sha256:
             return row
     return None
@@ -300,8 +455,7 @@ def _upsert(project_dir: str | Path, rec: Record) -> None:
     untrusted vendor content. Every path the earlier row released is carried
     into the new one, as are the libraries it went into.
     """
-    ledger = quarantine_dir(project_dir) / LEDGER_NAME
-    rows = _load(ledger)
+    rows = _load(project_dir)
     for old in rows:
         if old.get("sha256") != rec.sha256:
             continue
@@ -321,7 +475,7 @@ def _upsert(project_dir: str | Path, rec: Record) -> None:
     rows = [r for r in rows if r.get("sha256") != rec.sha256]
     rows.append(rec.to_dict())
     rows.sort(key=lambda r: (r.get("retrieved_at", ""), r.get("sha256", "")))
-    _save(ledger, rows)
+    _save(project_dir, rows)
 
 
 def verdict(inspection_state: str, scan_state: str, reasons: list[str]) -> str:
@@ -475,8 +629,6 @@ def accept(
     ``not_inspected`` and may be released; a distributor fetch of one is held.
     """
     project_dir = Path(project_dir)
-    qdir = quarantine_dir(project_dir)
-    qdir.mkdir(parents=True, exist_ok=True)
 
     digest = hashlib.sha256(data).hexdigest()
     # Content-addressed, with the part number kept for a human reading the
@@ -484,14 +636,15 @@ def accept(
     # nothing here can be mistaken for a finished, trusted artifact.
     label = mpn or Path(original_name).stem
     name = f"{digest[:12]}-{_safe(label, 'retrieved')}{suffix}"
-    blob = qdir / name
-    if not blob.exists():
-        tmp = blob.with_name(blob.name + ".part")
-        tmp.write_bytes(data)
-        tmp.replace(blob)
+    with _dir(project_dir, QUARANTINE_DIRNAME, create=True) as qfd:
+        # Content-addressed: a plain file already at the name holds these bytes.
+        if not _refuse_unless_plain(qfd, name, QUARANTINE_DIRNAME):
+            _write(qfd, name, data, QUARANTINE_DIRNAME)
 
     if suffix.lower() == ".pdf" or _looks_like_pdf(data):
-        inspection = pdf_inspect.inspect(blob)
+        # The bytes in hand, not the name: a name in a run's checkout is the
+        # run's to replace.
+        inspection = pdf_inspect.inspect_bytes(data)
     elif origin == UPLOAD:
         inspection = pdf_inspect.Inspection(
             state=NOT_INSPECTED,
@@ -548,15 +701,24 @@ def release(
             f"{rec.filename} is held and cannot be released: " + "; ".join(rec.reasons)
         )
     project_dir = Path(project_dir)
-    dest_dir = project_dir / dest_dirname
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / (as_name or f"{_safe(rec.mpn, 'datasheet')}.pdf")
-    if dest.exists() and hashlib.sha256(dest.read_bytes()).hexdigest() != rec.sha256:
-        dest = dest.with_name(f"{dest.stem}-{rec.sha256[:8]}{dest.suffix}")
-    shutil.copy2(quarantine_dir(project_dir) / rec.filename, dest)
+    with _dir(project_dir, QUARANTINE_DIRNAME, create=False) as qfd:
+        data = _read(qfd, rec.filename, QUARANTINE_DIRNAME) if qfd is not None else None
+    if data is None:
+        raise ValueError(f"{rec.filename} is not in {QUARANTINE_DIRNAME}/")
+    if hashlib.sha256(data).hexdigest() != rec.sha256:
+        # Replaced since it was accepted: what was assessed is not this.
+        raise ValueError(f"{QUARANTINE_DIRNAME}/{rec.filename} changed since it was accepted")
+    name = _component(as_name or f"{_safe(rec.mpn, 'datasheet')}.pdf")
+    with _dir(project_dir, dest_dirname, create=True) as dfd:
+        existing = _read(dfd, name, dest_dirname)
+        if existing is not None and hashlib.sha256(existing).hexdigest() != rec.sha256:
+            stem, dot, ext = name.rpartition(".")
+            name = (f"{stem}-{rec.sha256[:8]}.{ext}" if dot and stem
+                    else f"{name}-{rec.sha256[:8]}")
+        _write(dfd, name, data, dest_dirname)
 
     rec.state = RELEASED
-    rec.released_as = dest.name
+    rec.released_as = name
     rec.released_to = dest_dirname
     _upsert(project_dir, rec)
     return rec
@@ -798,7 +960,7 @@ EVENT_SYMBOL_REMOVED = "symbol_removed"
 
 def events(project_dir: str | Path) -> list[dict]:
     """What happened to placed library files after they landed, oldest first."""
-    return _load_events(quarantine_dir(project_dir) / LEDGER_NAME)
+    return _load_events(project_dir)
 
 
 def _norm(rel: str) -> str:
@@ -841,8 +1003,7 @@ def _sync_released(row: dict) -> None:
 
 def _apply(project_dir: str | Path, change, new_events: list[dict]) -> list[str]:
     """Run ``change(row)`` over every library row; save rows and append events."""
-    path = quarantine_dir(project_dir) / LEDGER_NAME
-    rows = _load(path)
+    rows = _load(project_dir)
     touched = []
     for row in rows:
         if _is_library_row(row) and change(row):
@@ -850,7 +1011,7 @@ def _apply(project_dir: str | Path, change, new_events: list[dict]) -> list[str]
             touched.append(row.get("sha256", ""))
     for e in new_events:
         e["rows"] = touched
-    _save(path, rows, _load_events(path) + new_events)
+    _save(project_dir, rows, _load_events(project_dir) + new_events)
     return touched
 
 
@@ -927,16 +1088,16 @@ def remove_library_symbol(project_dir: str | Path, library: str, symbol: str, *,
 
 def ledger(project_dir: str | Path) -> list[dict]:
     """Every entry, oldest first, for anyone who wants the whole record."""
-    return _load(quarantine_dir(project_dir) / LEDGER_NAME)
+    return _load(project_dir)
 
 
 def held(project_dir: str | Path) -> list[dict]:
     """Everything currently held, for anyone who wants to know what came in."""
-    return [r for r in _load(quarantine_dir(project_dir) / LEDGER_NAME) if r.get("reasons")]
+    return [r for r in _load(project_dir) if r.get("reasons")]
 
 
 def summary(project_dir: str | Path) -> dict:
-    rows = _load(quarantine_dir(project_dir) / LEDGER_NAME)
+    rows = _load(project_dir)
     return {
         "retrieved": len(rows),
         "released": sum(1 for r in rows if r.get("state") == RELEASED),

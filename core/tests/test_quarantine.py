@@ -1013,6 +1013,157 @@ def test_an_unreadable_ledger_does_not_read_as_nothing_retrieved(tmp_path, monke
     assert quarantine.record_for(tmp_path, rec.sha256) is not None
 
 
+# -- links planted in a checkout (Codex, PR #20) ------------------------------
+#
+# A project directory may be a checkout a run writes to. A link at a name
+# quarantine writes, or at a directory on the way, must be refused, with
+# nothing written where it points.
+
+
+def _outside(tmp_path: Path) -> tuple[Path, Path]:
+    project = tmp_path / "project"
+    elsewhere = tmp_path / "elsewhere"
+    project.mkdir(parents=True)
+    elsewhere.mkdir()
+    return project, elsewhere
+
+
+def _nothing_in(d: Path) -> None:
+    assert sorted(p.name for p in d.iterdir()) == [], f"written through a link into {d}"
+
+
+def test_a_link_at_the_release_name_is_refused(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    project, elsewhere = _outside(tmp_path)
+    (project / "datasheets").mkdir()
+    (project / "datasheets" / "LM317.pdf").symlink_to(elsewhere / "LM317.pdf")
+    with pytest.raises(quarantine.LinkRefused):
+        quarantine.accept_upload(BENIGN, project, original_name="x.pdf", kind="datasheet",
+                                 uploaded_by="", mpn="LM317")
+    _nothing_in(elsewhere)
+    assert (project / "datasheets" / "LM317.pdf").is_symlink()
+
+
+def test_a_link_at_a_directory_on_the_way_is_refused(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    for dirname in ("references", "datasheets", "retrieved"):
+        project, elsewhere = _outside(tmp_path / dirname)
+        (project / dirname).symlink_to(elsewhere, target_is_directory=True)
+        kind = "datasheet" if dirname == "datasheets" else "reference"
+        with pytest.raises(quarantine.LinkRefused):
+            quarantine.accept_upload(BENIGN, project, original_name="note.pdf", kind=kind,
+                                     uploaded_by="")
+        _nothing_in(elsewhere)
+
+
+def test_a_link_at_a_nested_destination_component_is_refused(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    project, elsewhere = _outside(tmp_path)
+    (project / "vendor").mkdir()
+    (project / "vendor" / "docs").symlink_to(elsewhere, target_is_directory=True)
+    rec = quarantine.accept(BENIGN, project, mpn="TPS62840")
+    with pytest.raises(quarantine.LinkRefused):
+        quarantine.release(project, rec, dest_dirname="vendor/docs")
+    _nothing_in(elsewhere)
+
+
+def test_a_link_at_the_ledger_is_refused(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    project, elsewhere = _outside(tmp_path)
+    (project / "retrieved").mkdir()
+    target = elsewhere / "someone-elses.json"
+    target.write_text('{"retrieved": []}')
+    (project / "retrieved" / quarantine.LEDGER_NAME).symlink_to(target)
+    with pytest.raises(quarantine.LinkRefused):
+        quarantine.accept(BENIGN, project, mpn="TPS62840")
+    assert target.read_text() == '{"retrieved": []}'
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["someone-elses.json"]
+    with pytest.raises(quarantine.LinkRefused):
+        quarantine.ledger(project)
+
+
+def test_a_link_at_the_retrieved_name_is_refused(tmp_path, monkeypatch):
+    """The stored name is predictable: a hash of the bytes and the part."""
+    import hashlib
+
+    _no_scanner(monkeypatch)
+    project, elsewhere = _outside(tmp_path)
+    (project / "retrieved").mkdir()
+    name = f"{hashlib.sha256(BENIGN).hexdigest()[:12]}-TPS62840.pdf"
+    (project / "retrieved" / name).symlink_to(elsewhere / "x.pdf")
+    with pytest.raises(quarantine.LinkRefused):
+        quarantine.accept(BENIGN, project, mpn="TPS62840")
+    _nothing_in(elsewhere)
+
+
+def test_a_retrieved_file_swapped_for_a_link_is_not_released(tmp_path, monkeypatch):
+    """Between accept and release, the stored file is the run's to replace:
+    release reads it without following a link, and checks it is what was
+    assessed."""
+    _no_scanner(monkeypatch)
+    project, elsewhere = _outside(tmp_path)
+    rec = quarantine.accept(BENIGN, project, mpn="TPS62840")
+    blob = project / "retrieved" / rec.filename
+    secret = elsewhere / "secret.pdf"
+    secret.write_bytes(b"%PDF-1.4 someone else's\n")
+    blob.unlink()
+    blob.symlink_to(secret)
+    with pytest.raises(quarantine.LinkRefused):
+        quarantine.release(project, rec)
+    assert not (project / "datasheets" / "TPS62840.pdf").exists()
+    blob.unlink()
+    blob.write_bytes(b"%PDF-1.4 not what was assessed\n")
+    with pytest.raises(ValueError, match="changed since it was accepted"):
+        quarantine.release(project, rec)
+
+
+@pytest.fixture
+def gvisor_open(monkeypatch):
+    """Emulate runsc: open() with O_DIRECTORY | O_NOFOLLOW follows a link to a
+    directory, where Linux refuses it (measured 2026-10-12; the workspace
+    agent's tests emulate it the same way)."""
+    import os
+
+    real = os.open
+
+    def gvisor(path, flags, mode=0o777, *, dir_fd=None):
+        if flags & os.O_DIRECTORY:
+            flags &= ~os.O_NOFOLLOW
+        return real(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", gvisor)
+
+
+def test_a_directory_link_is_refused_where_o_nofollow_does_not_hold(tmp_path, monkeypatch,
+                                                                    gvisor_open):
+    _no_scanner(monkeypatch)
+    for dirname in ("references", "retrieved"):
+        project, elsewhere = _outside(tmp_path / dirname)
+        (project / dirname).symlink_to(elsewhere, target_is_directory=True)
+        with pytest.raises(quarantine.LinkRefused):
+            quarantine.accept_upload(BENIGN, project, original_name="note.pdf",
+                                     kind="reference", uploaded_by="")
+        _nothing_in(elsewhere)
+
+
+def test_accept_and_release_are_unchanged_without_links(tmp_path, monkeypatch):
+    _no_scanner(monkeypatch)
+    rec = quarantine.accept_and_release(BENIGN, tmp_path, mpn="TPS62840")
+    assert rec.state == quarantine.RELEASED and rec.released_as == "TPS62840.pdf"
+    assert (tmp_path / "datasheets" / "TPS62840.pdf").read_bytes() == BENIGN
+    # A different file already at the name keeps it, and the new one is suffixed.
+    other = BENIGN.replace(b"ti.com", b"ti.org")
+    rec2 = quarantine.accept_and_release(other, tmp_path, mpn="TPS62840")
+    assert rec2.released_as == f"TPS62840-{rec2.sha256[:8]}.pdf"
+    assert (tmp_path / "datasheets" / "TPS62840.pdf").read_bytes() == BENIGN
+    up = quarantine.accept_upload(b"notes\n", tmp_path, original_name="n.txt",
+                                  kind="reference", uploaded_by="u")
+    assert (tmp_path / "references" / up.released_as).read_bytes() == b"notes\n"
+    assert quarantine.summary(tmp_path)["released"] == 3
+    # No temporary names left behind.
+    assert not [p for p in tmp_path.rglob("*.part")]
+
+
 # -- the path a real download takes ------------------------------------------
 
 
