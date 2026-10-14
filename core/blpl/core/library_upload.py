@@ -82,6 +82,91 @@ def library_name(name: str) -> str:
     return name
 
 
+# The stock libraries the resolver falls back to, at the same place Stage 6 and
+# the CLI default to: beside the blpl package, as the core/ submodules or the
+# container's /app mounts of them.
+_CORE_ROOT = Path(__file__).resolve().parents[2]
+
+# Stage 3 names the symbol library it generates hdm_generated_<project>.
+GENERATED_PREFIX = "hdm_generated"
+
+
+def stock_roots() -> tuple[Path, Path]:
+    """Where the stock symbol and footprint libraries are, for the name guard."""
+    return _CORE_ROOT / "kicad-symbols", _CORE_ROOT / "kicad-footprints"
+
+
+def stock_library_names() -> dict[str, str]:
+    """Every stock library nickname, lower-cased, mapped to what it is."""
+    symbols, footprints = stock_roots()
+    out: dict[str, str] = {}
+    if footprints.is_dir():
+        for p in footprints.iterdir():
+            if p.suffix == ".pretty":
+                out[p.stem.lower()] = f"the stock footprint library {p.stem}"
+    if symbols.is_dir():
+        for p in symbols.iterdir():
+            if p.suffix in (".kicad_symdir", ".kicad_sym"):
+                out[p.stem.lower()] = f"the stock symbol library {p.stem}"
+    return out
+
+
+def existing_project_libraries(project_dir: str | Path) -> set[str]:
+    """Library names the project already has under libraries/, as spelled on disk."""
+    project_dir = Path(project_dir)
+    found: set[str] = set()
+    for sub, suffixes in (
+        (SYMBOLS_DIR, (".kicad_sym", ".kicad_symdir")),
+        (FOOTPRINTS_DIR, (".pretty",)),
+        (MODELS_DIR, (".3dshapes",)),
+    ):
+        root = project_dir / sub
+        if root.is_dir():
+            found.update(p.stem for p in root.iterdir() if p.suffix in suffixes)
+    return found
+
+
+def reserved_reason(name: str, project_dir: str | Path, *, suggest: str = "") -> str | None:
+    """Why ``name`` may not be chosen as a library for an upload, or None.
+
+    ``libraries/`` is searched before the stock libraries and the generated
+    ones, per item. A project library called ``Device`` holding a vendor ``R``
+    would quietly become every ``Device:R`` on the board — nobody chose that,
+    and nothing would say it happened. So a name that is a stock library's
+    (case-insensitively: KiCad runs on case-insensitive filesystems too) or the
+    generated library's is refused.
+
+    A project library that already exists under that name keeps working: the
+    guard is about choosing a name, and an existing library was chosen long
+    ago, with its own reasons.
+    """
+    if name in existing_project_libraries(project_dir):
+        return None
+    low = name.lower()
+    what = (
+        "the name the pipeline gives its generated symbol library"
+        if low.startswith(GENERATED_PREFIX)
+        else stock_library_names().get(low)
+    )
+    if not what:
+        return None
+    instead = f"the project's own library ({suggest}) or " if suggest and suggest.lower() != low else ""
+    return (
+        f"{name!r} is {what}. A project library of that name would take over that library's "
+        f"parts wherever their names match. Use {instead}a vendor-prefixed name such as "
+        f"'vendor_{name}'."
+    )
+
+
+def check_library(name: str, project_dir: str | Path, *, suggest: str = "") -> str:
+    """``library_name`` plus the reserved-name guard; ValueError says why not."""
+    name = library_name(name)
+    reason = reserved_reason(name, project_dir, suggest=suggest)
+    if reason:
+        raise ValueError(reason)
+    return name
+
+
 def _item_name(raw: str, what: str) -> str:
     name = sexpr.unquote(raw).strip()
     if not _ITEM_NAME.fullmatch(name) or name in {".", ".."} or name.startswith("."):
