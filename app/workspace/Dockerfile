@@ -122,14 +122,17 @@ COPY app/backend/app/sandbox/agent.py /opt/blpl/wsagent/agent.py
 COPY app/backend/app/projects.py /opt/blpl/wsagent/app/projects.py
 COPY app/backend/app/llm_ignore.py /opt/blpl/wsagent/app/llm_ignore.py
 COPY app/backend/app/worktrees.py /opt/blpl/wsagent/app/worktrees.py
+# serving.py: the request deadline and connection bound the agent and the
+# storage helper serve with. Standard library only.
+COPY app/backend/app/serving.py /opt/blpl/wsagent/app/serving.py
 # The sealer (phase 4) runs workspace.seal/unseal, the backend's own, in a
 # container of its own for one operation; vault.py is what workspace imports.
 COPY app/backend/app/sandbox/sealer.py /opt/blpl/wsagent/sealer.py
 COPY app/backend/app/workspace.py /opt/blpl/wsagent/app/workspace.py
 COPY app/backend/app/vault.py /opt/blpl/wsagent/app/vault.py
 # The storage helper (phase 4) runs `python -m app.sandbox.btrfs` from this
-# image as its own container, the one given CAP_SYS_ADMIN. These three files
-# are all it imports.
+# image as its own container, the one given CAP_SYS_ADMIN. These three files,
+# and serving.py above, are all it imports.
 COPY app/backend/app/sandbox/btrfs.py /opt/blpl/wsagent/app/sandbox/btrfs.py
 COPY app/backend/app/sandbox/storage.py /opt/blpl/wsagent/app/sandbox/storage.py
 COPY app/backend/app/sandbox/driver.py /opt/blpl/wsagent/app/sandbox/driver.py
