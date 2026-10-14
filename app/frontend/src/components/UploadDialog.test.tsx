@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -47,9 +47,57 @@ describe("choosing what each file is", () => {
     const user = userEvent.setup();
     render(<UploadDialog projectId="p" onClose={() => {}} />);
     await user.upload(screen.getByLabelText("Choose files"), [pdf("a.pdf")]);
-    expect(screen.getByLabelText("MPN for a.pdf")).toBeDisabled();
     await user.selectOptions(screen.getByLabelText("Kind for a.pdf"), "datasheet");
     expect(screen.getByLabelText("MPN for a.pdf")).toBeEnabled();
+  });
+
+  it("never shows an MPN box that refuses typing", async () => {
+    // The reported bug: a disabled MPN input, styled like an enabled one, on
+    // every row whose kind was not (yet) datasheet. It looked editable and
+    // took no input. Where an MPN does not apply there is no box at all.
+    const user = userEvent.setup();
+    render(<UploadDialog projectId="p" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [pdf("a.pdf"), pdf("b.pdf")]);
+    expect(screen.queryByLabelText("MPN for a.pdf")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("Kind for b.pdf"), "reference");
+    expect(screen.queryByLabelText("MPN for b.pdf")).toBeNull();
+    for (const box of screen.queryAllByRole("textbox")) expect(box).toBeEnabled();
+  });
+
+  it("keeps each file's MPN to itself and sends them all", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockUpload([]);
+    render(<UploadDialog projectId="p" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [pdf("a.pdf"), pdf("b.pdf"), pdf("c.pdf")]);
+    for (const n of ["a", "b", "c"]) await user.selectOptions(screen.getByLabelText(`Kind for ${n}.pdf`), "datasheet");
+    await user.type(screen.getByLabelText("MPN for b.pdf"), "LM3410");
+    await user.type(screen.getByLabelText("MPN for a.pdf"), "TPS62840");
+    await user.type(screen.getByLabelText("MPN for c.pdf"), "BQ51013");
+    expect(screen.getByLabelText("MPN for a.pdf")).toHaveValue("TPS62840");
+    expect(screen.getByLabelText("MPN for b.pdf")).toHaveValue("LM3410");
+    // Removing a row must not shift another row's MPN onto its neighbour.
+    await user.click(screen.getByRole("button", { name: "Remove a.pdf" }));
+    expect(screen.getByLabelText("MPN for b.pdf")).toHaveValue("LM3410");
+    expect(screen.getByLabelText("MPN for c.pdf")).toHaveValue("BQ51013");
+    await user.click(screen.getByRole("button", { name: /Upload 2 files/ }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const meta = JSON.parse((init.body as FormData).get("meta") as string);
+    expect(meta.map((m: { mpn: string }) => m.mpn)).toEqual(["LM3410", "BQ51013"]);
+  });
+
+  it("does not send an MPN typed before the kind changed away from datasheet", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockUpload([]);
+    render(<UploadDialog projectId="p" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [pdf("a.pdf")]);
+    await user.selectOptions(screen.getByLabelText("Kind for a.pdf"), "datasheet");
+    await user.type(screen.getByLabelText("MPN for a.pdf"), "X1");
+    await user.selectOptions(screen.getByLabelText("Kind for a.pdf"), "reference");
+    await user.click(screen.getByRole("button", { name: /Upload 1 file/ }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse((init.body as FormData).get("meta") as string)[0].mpn).toBe("");
   });
 });
 
