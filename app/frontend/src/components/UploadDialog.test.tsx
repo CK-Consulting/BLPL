@@ -4,15 +4,26 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { UploadDialog, type UploadResult } from "./UploadDialog";
 
-function mockUpload(results: UploadResult[]) {
-  const fetchMock = vi.fn(async () =>
-    new Response(JSON.stringify({ results, committed: true }), {
+type LibraryNames = { reserved: string[]; reserved_prefix: string; existing: string[] };
+const NO_NAMES: LibraryNames = { reserved: [], reserved_prefix: "hdm_generated", existing: [] };
+
+/** A server for the dialog: the library names it asks for, and the upload. */
+function mockUpload(results: UploadResult[], names: LibraryNames = NO_NAMES) {
+  const fetchMock = vi.fn(async (url: string) =>
+    new Response(JSON.stringify(String(url).endsWith("/library-names") ? names : { results, committed: true }), {
       status: 200,
       headers: { "content-type": "application/json" },
     }),
   );
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
+}
+
+/** The upload request itself, among everything the dialog fetched. */
+function postOf(fetchMock: ReturnType<typeof mockUpload>): [string, RequestInit] | undefined {
+  return (fetchMock.mock.calls as unknown as [string, RequestInit | undefined][]).find(
+    ([u, init]) => String(u).endsWith("/uploads") && init?.method === "POST",
+  ) as [string, RequestInit] | undefined;
 }
 
 const pdf = (name: string) => new File(["%PDF-1.4"], name, { type: "application/pdf" });
@@ -80,8 +91,8 @@ describe("choosing what each file is", () => {
     expect(screen.getByLabelText("MPN for b.pdf")).toHaveValue("LM3410");
     expect(screen.getByLabelText("MPN for c.pdf")).toHaveValue("BQ51013");
     await user.click(screen.getByRole("button", { name: /Upload 2 files/ }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    await waitFor(() => expect(postOf(fetchMock)).toBeDefined());
+    const [, init] = postOf(fetchMock)!;
     const meta = JSON.parse((init.body as FormData).get("meta") as string);
     expect(meta.map((m: { mpn: string }) => m.mpn)).toEqual(["LM3410", "BQ51013"]);
   });
@@ -95,8 +106,8 @@ describe("choosing what each file is", () => {
     await user.type(screen.getByLabelText("MPN for a.pdf"), "X1");
     await user.selectOptions(screen.getByLabelText("Kind for a.pdf"), "reference");
     await user.click(screen.getByRole("button", { name: /Upload 1 file/ }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    await waitFor(() => expect(postOf(fetchMock)).toBeDefined());
+    const [, init] = postOf(fetchMock)!;
     expect(JSON.parse((init.body as FormData).get("meta") as string)[0].mpn).toBe("");
   });
 });
@@ -122,7 +133,7 @@ describe("sending and the verdicts", () => {
     expect(within(results).getByText(/held in quarantine: it runs an action when opened/)).toBeInTheDocument();
     expect(onUploaded).toHaveBeenCalled();
 
-    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const [url, init] = postOf(fetchMock)!;
     expect(url).toContain("/api/projects/p/uploads");
     const meta = JSON.parse((init.body as FormData).get("meta") as string);
     expect(meta).toEqual([
@@ -199,8 +210,8 @@ describe("KiCad library files", () => {
     await user.clear(lib);
     await user.type(lib, "vendor_lib");
     await user.click(screen.getByRole("button", { name: /Upload 2 files/ }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    await waitFor(() => expect(postOf(fetchMock)).toBeDefined());
+    const [, init] = postOf(fetchMock)!;
     expect(JSON.parse((init.body as FormData).get("meta") as string)).toEqual([
       { kind: "footprint", mpn: "", library: "vendor_lib", llm_ignore: false },
       { kind: "kicad_bundle", mpn: "", library: "p", llm_ignore: false },
@@ -228,5 +239,46 @@ describe("KiCad library files", () => {
     expect(within(results).getByText("libraries/footprints/p.pretty/SW.kicad_mod")).toBeInTheDocument();
     expect(within(results).getByText(/not added: library p already has a different SW/)).toBeInTheDocument();
     expect(within(results).getByText(/left in the zip: not a KiCad library file/)).toBeInTheDocument();
+  });
+});
+
+describe("library names KiCad already uses", () => {
+  const fp = (name: string) => new File(["(footprint)"], name);
+  const names: LibraryNames = { reserved: ["device", "resistor_smd"], reserved_prefix: "hdm_generated", existing: ["Device"] };
+
+  it("refuses a stock library name, any case, and says what to use instead", async () => {
+    const user = userEvent.setup();
+    mockUpload([], { ...names, existing: [] });
+    render(<UploadDialog projectId="proj" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [fp("r.kicad_mod")]);
+    await user.selectOptions(screen.getByLabelText("Kind for r.kicad_mod"), "footprint");
+    const lib = screen.getByLabelText("Library for r.kicad_mod");
+    for (const name of ["Resistor_SMD", "DEVICE", "hdm_generated_x"]) {
+      await user.clear(lib);
+      await user.type(lib, name);
+      expect(await screen.findByRole("alert")).toHaveTextContent(/stock KiCad library|generated/);
+      expect(screen.getByRole("alert")).toHaveTextContent(`vendor_${name}`);
+      expect(screen.getByRole("alert")).toHaveTextContent("proj");
+      expect(screen.getByRole("button", { name: /Upload 1 file/ })).toBeDisabled();
+    }
+    await user.clear(lib);
+    await user.type(lib, "acme_resistors");
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("button", { name: /Upload 1 file/ })).toBeEnabled();
+  });
+
+  it("lets an existing project library keep its stock-looking name", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockUpload([], names);
+    render(<UploadDialog projectId="proj" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [fp("r.kicad_mod")]);
+    await user.selectOptions(screen.getByLabelText("Kind for r.kicad_mod"), "footprint");
+    const lib = screen.getByLabelText("Library for r.kicad_mod");
+    await user.clear(lib);
+    await user.type(lib, "Device");
+    await waitFor(() => expect(screen.getByRole("button", { name: /Upload 1 file/ })).toBeEnabled());
+    expect(screen.queryByRole("alert")).toBeNull();
+    await user.click(screen.getByRole("button", { name: /Upload 1 file/ }));
+    await waitFor(() => expect(postOf(fetchMock)).toBeDefined());
   });
 });

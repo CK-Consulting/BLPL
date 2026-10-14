@@ -347,3 +347,49 @@ def test_a_pdf_inside_a_bundle_records_its_own_verdict(unlocked):
         "/api/projects/mine/blob/verdict", params={"path": "references/PCM12SMTBR/datasheet.pdf"}
     ).json()
     assert v["verdict"] in ("clean", "unscanned") and v["source"] == "upload"
+@pytest.fixture
+def stock_libs(tmp_path, monkeypatch):
+    from blpl.core import library_upload
+
+    sym, fp = tmp_path / "stock-symbols", tmp_path / "stock-footprints"
+    (sym / "Device.kicad_symdir").mkdir(parents=True)
+    (fp / "Resistor_SMD.pretty").mkdir(parents=True)
+    monkeypatch.setattr(library_upload, "stock_roots", lambda: (sym, fp))
+
+
+def test_a_stock_library_name_is_refused_and_nothing_lands(unlocked, stock_libs):
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    for name in ("device", "Resistor_SMD", "hdm_generated_mine"):
+        r = _upload(unlocked, [
+            ("ok.txt", b"ok\n", {"kind": "reference"}),
+            ("fp.kicad_mod", FOOTPRINT, {"kind": "footprint", "library": name}),
+        ])
+        assert r.status_code == 400, r.text
+        detail = r.json()["detail"]
+        assert "the project's own library (mine)" in detail and f"vendor_{name}" in detail
+    assert not (main.PROJECTS_ROOT / "mine" / "references" / "ok.txt").exists()
+    assert not (main.PROJECTS_ROOT / "mine" / "libraries" / "footprints" / "device.pretty").exists()
+
+
+def test_an_existing_project_library_with_a_stock_name_still_takes_uploads(unlocked, stock_libs):
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    existing = main.PROJECTS_ROOT / "mine" / "libraries" / "footprints" / "Device.pretty"
+    existing.mkdir(parents=True)
+    r = _upload(unlocked, [("fp.kicad_mod", FOOTPRINT, {"kind": "footprint", "library": "Device"})])
+    assert r.status_code == 200, r.text
+    assert r.json()["results"][0]["path"] == "libraries/footprints/Device.pretty/PCM12SMTBR.kicad_mod"
+
+
+def test_the_dialog_can_ask_which_library_names_are_taken(unlocked, stock_libs):
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    (main.PROJECTS_ROOT / "mine" / "libraries" / "footprints" / "mine.pretty").mkdir(parents=True)
+    names = unlocked.get("/api/projects/mine/uploads/library-names").json()
+    assert names["reserved"] == ["device", "resistor_smd"]
+    assert names["reserved_prefix"] == "hdm_generated"
+    assert "mine" in names["existing"]

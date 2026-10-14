@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { postForm } from "../api";
+import { useEffect, useState } from "react";
+import { getJSON, postForm } from "../api";
 import { announceCommitted, announcePushFrom } from "../commitEvents";
 
 /**
@@ -36,6 +36,31 @@ const takesLibrary = (kind: UploadKind | "") => LIBRARY_KINDS.has(kind);
 // What the server accepts as a KiCad library nickname: it is a directory name
 // and the half of a lib_id before the colon.
 const LIBRARY_NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+
+/** Library names an upload may not choose; the server enforces the same rule. */
+type LibraryNames = { reserved: Set<string>; prefix: string; existing: Set<string> };
+
+/**
+ * Why a library name cannot be used, or null.
+ *
+ * `libraries/` is searched before KiCad's stock libraries, part by part, so a
+ * project library named after a stock one takes over that library's parts
+ * wherever a name matches. A library the project already has keeps its name.
+ */
+export function libraryProblem(name: string, projectId: string, names: LibraryNames | null): string | null {
+  const n = name.trim();
+  if (!LIBRARY_NAME.test(n)) return "A library name is letters, digits, '.', '_', '+' and '-'.";
+  if (!names || names.existing.has(n)) return null;
+  const low = n.toLowerCase();
+  const what = low.startsWith(names.prefix.toLowerCase())
+    ? "the name of the pipeline's generated library"
+    : names.reserved.has(low)
+      ? "a stock KiCad library name"
+      : null;
+  if (!what) return null;
+  const own = projectId.toLowerCase() !== low ? `the project's own library (${projectId}) or ` : "";
+  return `${n} is ${what}; a project library of that name would take over its parts. Use ${own}a vendor-prefixed name such as vendor_${n}.`;
+}
 
 type Row = { id: number; file: File; kind: UploadKind | ""; mpn: string; library: string; llmIgnore: boolean };
 
@@ -90,6 +115,28 @@ export function UploadDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [names, setNames] = useState<LibraryNames | null>(null);
+
+  // Best effort: without the list the dialog only checks the shape of a name,
+  // and the server still refuses a reserved one with the same message.
+  useEffect(() => {
+    let live = true;
+    getJSON<{ reserved?: string[]; reserved_prefix?: string; existing?: string[] }>(
+      `/api/projects/${projectId}/uploads/library-names`,
+    )
+      .then((r) => {
+        if (!live || !Array.isArray(r?.reserved)) return;
+        setNames({
+          reserved: new Set(r.reserved.map((x) => x.toLowerCase())),
+          prefix: r.reserved_prefix || "hdm_generated",
+          existing: new Set(r.existing ?? []),
+        });
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [projectId]);
 
   const add = (files: FileList | File[] | null) => {
     if (!files) return;
@@ -109,7 +156,8 @@ export function UploadDialog({
     setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   const remove = (i: number) => setRows((rs) => rs.filter((_, j) => j !== i));
 
-  const libraryOk = (r: Row) => !takesLibrary(r.kind) || LIBRARY_NAME.test(r.library.trim());
+  const problem = (r: Row) => (takesLibrary(r.kind) ? libraryProblem(r.library, projectId, names) : null);
+  const libraryOk = (r: Row) => problem(r) === null;
   const ready = rows.length > 0 && rows.every((r) => r.kind !== "" && libraryOk(r));
 
   const submit = async () => {
@@ -241,7 +289,13 @@ export function UploadDialog({
                           value={r.library}
                           onChange={(e) => update(i, { library: e.target.value })}
                         />
-                      ) : (
+                      ) : null}
+                      {takesLibrary(r.kind) && problem(r) && (
+                        <div className="upload-field-error small" role="alert">
+                          {problem(r)}
+                        </div>
+                      )}
+                      {takesMpn(r.kind) || takesLibrary(r.kind) ? null : (
                         <span className="muted small" title="Only a datasheet is named after its part number">
                           {r.kind ? "—" : "choose a kind"}
                         </span>
@@ -303,7 +357,7 @@ export function UploadDialog({
                 <span className="muted small">
                   {rows.some((r) => r.kind === "")
                     ? " Choose a kind for every file first."
-                    : " A library name is letters, digits, '.', '_', '+' and '-'."}
+                    : " Fix the library name above."}
                 </span>
               )}
             </div>
