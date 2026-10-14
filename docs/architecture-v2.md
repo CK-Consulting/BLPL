@@ -881,6 +881,37 @@ workspace).
   poll raised was left running, unmarked, while the row said it had ended.
   Every exit from the run, workspace-run and agent-run monitors now stops the
   run and waits for it before returning.
+- **Sealing and starting are serialised per project** (`sandbox/gate.py`).
+  - **The race:** `Access.ensure` could start a workspace again just after a
+    seal stopped it. The sealer then archived and deleted files the new agent
+    was using.
+  - **The gate:** an flock on `data/sealed/.gates/<project>.lock`. It is on the
+    control plane's side, which the backend and the worker both see through
+    bind mounts of one host directory. A lock taken inside a gVisor sandbox
+    would not be seen outside it.
+  - **Who takes it:** a seal or unseal holds it exclusively from before the
+    workspace stops until the files are archived or restored. A workspace start
+    holds it shared until its agent answers. A run holds it shared for its
+    whole length.
+  - **Waiting:** a start or run waits for a seal and then refuses a project it
+    finds sealed (423 for a request). A seal waits 5 s for runs and starts,
+    then reports busy, and the next sweep tries again.
+  - **Mount path:** with runs in workspaces, the seal and unseal on the mount
+    (agent path off) take it too.
+  - **Audit:** agent operations, member worktree creation included, run inside
+    a workspace that ensure started under the gate. A seal's stop ends them
+    before anything is archived, so the archive is of a stopped project.
+- **Every grant of a run is revoked when it ends.** A retry that follows a
+  first attempt's container issues no new grant (that container holds its
+  own), and the end of the run revokes every grant with its run id. Before,
+  only the retry's own unused grant was revoked, and the one in use stayed
+  valid for 24 hours.
+- **A fetch holds its slot through assessment.** The slot used to be
+  released after the download, before the PDF parse, the scan and the
+  evidence write, so a run could keep starting assessments. It is now held
+  until the answer is sent. A run has at most `BLPL_FETCH_MAX_PER_RUN`
+  fetches in flight, each at most `BLPL_FETCH_MAX_MB`. Held evidence is
+  capped per project (`BLPL_FETCH_HELD_MAX_MB`, 500).
 - **A run mounts only its invoker's checkout.** Every member's worktree went
   read-write into every run container, so one member's stage could read,
   rewrite or delete another member's uncommitted work.
