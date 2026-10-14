@@ -3801,6 +3801,7 @@ def post_lifecycle(
 def get_blob(
     project_id: str,
     path: str,
+    request: Request,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -3847,7 +3848,7 @@ def get_blob(
             # it was looked at, and the type sent is chosen by name from a list
             # with no PDF in it, so bytes rewritten mid-stream still cannot
             # reach the viewer.
-            return _stream_response(fh, media_type, {
+            return _file_response(request, fh, size, media_type, {
                 # Always: without it the browser may sniff a text file into HTML.
                 "X-Content-Type-Options": "nosniff",
                 "Content-Disposition": _disposition(
@@ -3861,8 +3862,9 @@ def get_blob(
         if size > UPLOAD_MAX_BYTES:
             # Too big to judge, so never inline. An attachment is safe whatever
             # the bytes turn out to be.
-            return _stream_response(
-                fh, "application/octet-stream", _opaque_headers(target.name, "too_large")
+            return _file_response(
+                request, fh, size, "application/octet-stream",
+                _opaque_headers(target.name, "too_large"),
             )
         spool, digest, total = _spool_and_hash(fh)
     except BaseException:
@@ -3877,23 +3879,28 @@ def get_blob(
     except BaseException:
         spool.close()
         raise
-    return _pdf_response(spool, total, target.name, verdict)
+    return _pdf_response(request, spool, total, digest, target.name, verdict)
 
 
-def _pdf_response(spool, total: int, name: str, verdict) -> Response:
-    """Send exactly the bytes that were hashed, inline only on a clean verdict."""
-    headers = {"Content-Length": str(total)}
+def _pdf_response(request: Request, spool, total: int, digest: str, name: str, verdict) -> Response:
+    """Send exactly the bytes that were hashed, inline only on a clean verdict.
+
+    The verdict is decided on the whole spool before this is called, so a
+    range is only ever a slice of bytes already judged, served under the
+    whole file's disposition. The hash is the ETag, which is what If-Range
+    compares against.
+    """
     if pdf_verdicts.renders_inline(verdict):
-        return _stream_response(spool, "application/pdf", {
-            **headers,
+        return _file_response(request, spool, total, "application/pdf", {
             "X-Content-Type-Options": "nosniff",
             "Content-Disposition": _disposition("inline", name),
             "X-BLPL-PDF-Verdict": verdict.verdict,
-        })
-    return _stream_response(spool, "application/octet-stream", {
-        **headers,
-        **_opaque_headers(name, verdict.verdict if verdict else "none"),
-    })
+        }, etag=f'"{digest}"')
+    return _file_response(
+        request, spool, total, "application/octet-stream",
+        _opaque_headers(name, verdict.verdict if verdict else "none"),
+        etag=f'"{digest}"',
+    )
 
 
 # For every response that is not a clean PDF. `sandbox` with no allowances
@@ -4006,17 +4013,91 @@ def _hash_open_file(fh) -> tuple[str, int]:
     return digest.hexdigest(), total
 
 
-def _stream_response(fh, media_type: str, headers: dict) -> StreamingResponse:
-    """Stream an already-open file in chunks, closing it when done or abandoned."""
+_UNSATISFIABLE = "unsatisfiable"
+
+
+def _parse_range(value: str | None, size: int):
+    """One byte range from a Range header: (first, last), None, or unsatisfiable.
+
+    None means "send the whole file", which is a correct answer to any Range
+    request, so it covers everything this does not serve: a malformed header,
+    a unit other than bytes, and several ranges at once (multipart/byteranges
+    is not implemented; viewers and download managers ask for one range).
+    """
+    if not value:
+        return None
+    unit, _, spec = value.strip().partition("=")
+    if unit.strip().lower() != "bytes" or "," in spec:
+        return None
+    first_s, dash, last_s = spec.strip().partition("-")
+    if not dash:
+        return None
+    first_s, last_s = first_s.strip(), last_s.strip()
+    if not (first_s.isdigit() or first_s == "") or not (last_s.isdigit() or last_s == ""):
+        return None
+    if first_s == "":
+        if last_s == "":
+            return None
+        n = int(last_s)
+        if n == 0 or size == 0:
+            return _UNSATISFIABLE
+        return max(0, size - n), size - 1
+    first = int(first_s)
+    if last_s and int(last_s) < first:
+        return None
+    if first >= size:
+        return _UNSATISFIABLE
+    last = int(last_s) if last_s else size - 1
+    return first, min(last, size - 1)
+
+
+def _file_response(
+    request: Request, fh, size: int, media_type: str, headers: dict, *, etag: str | None = None
+) -> Response:
+    """Stream an open file, or one range of it, closing it when done or abandoned.
+
+    Every header the caller chose (disposition, nosniff, CSP, verdict) goes on
+    a 200, a 206 and a 416 alike. If-Range is honoured against the ETag; a
+    response with no ETag has no validator to compare, so any If-Range sends
+    the whole file, which is always safe.
+    """
+    headers = {**headers, "Accept-Ranges": "bytes"}
+    if etag:
+        headers["ETag"] = etag
+    wanted = _parse_range(request.headers.get("range"), size)
+    if_range = request.headers.get("if-range")
+    if wanted is not None and if_range is not None and if_range.strip() != etag:
+        wanted = None
+    if wanted == _UNSATISFIABLE:
+        fh.close()
+        return Response(
+            status_code=416,
+            media_type=media_type,
+            headers={**headers, "Content-Range": f"bytes */{size}"},
+        )
+    first, last = (0, size - 1) if wanted is None else wanted
+    length = max(0, last - first + 1)
+    try:
+        if first:
+            fh.seek(first)
+    except BaseException:
+        fh.close()
+        raise
 
     def body():
         try:
-            while chunk := fh.read(_CHUNK):
+            left = length
+            while left > 0 and (chunk := fh.read(min(_CHUNK, left))):
+                left -= len(chunk)
                 yield chunk
         finally:
             fh.close()
 
-    return StreamingResponse(body(), media_type=media_type, headers=headers)
+    headers["Content-Length"] = str(length)
+    if wanted is None:
+        return StreamingResponse(body(), media_type=media_type, headers=headers)
+    headers["Content-Range"] = f"bytes {first}-{last}/{size}"
+    return StreamingResponse(body(), status_code=206, media_type=media_type, headers=headers)
 
 
 class BlobPath(BaseModel):
@@ -5810,6 +5891,7 @@ async def upload_attachments(
 @app.get("/api/projects/{project_id}/attachments/{attachment_id}")
 def get_attachment(
     project_id: str, attachment_id: str,
+    request: Request,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
@@ -5831,7 +5913,7 @@ def get_attachment(
         media_type = attachments.media_type_of(path)
         if media_type not in attachments.SUPPORTED_TYPES or media_type == "application/pdf":
             media_type = "application/octet-stream"
-        return _stream_response(fh, media_type, {
+        return _file_response(request, fh, size, media_type, {
             "X-Content-Type-Options": "nosniff",
             "Content-Security-Policy": _INERT_CSP,
         })
@@ -5845,7 +5927,7 @@ def get_attachment(
     except BaseException:
         spool.close()
         raise
-    return _pdf_response(spool, total, attachments.name_of(path), verdict)
+    return _pdf_response(request, spool, total, digest, attachments.name_of(path), verdict)
 
 
 class ChatInput(BaseModel):
