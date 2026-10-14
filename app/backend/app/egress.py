@@ -232,6 +232,18 @@ def revoke(session: "Session", name: str) -> None:
     session.execute(delete(EgressGrant).where(EgressGrant.id == name))
 
 
+def revoke_run(session: "Session", run_id: str) -> int:
+    """Every grant issued for this run, by whichever worker issued it. A run
+    reattached after its first worker died runs with the first worker's
+    grant; revoking only the retry's own left that one valid for its full
+    lifetime (Codex, PR #20)."""
+    from sqlalchemy import delete
+
+    from .models import EgressGrant
+
+    return session.execute(delete(EgressGrant).where(EgressGrant.run_id == run_id)).rowcount or 0
+
+
 def grant(session: "Session", name: str):
     """The live grant under this proxy username, or None."""
     from .models import EgressGrant
