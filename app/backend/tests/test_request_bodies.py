@@ -28,7 +28,13 @@ def _exchange(connect, request: bytes, *, then_wait: float = 0.0, limit: float =
     before the server closes it or `limit` passes."""
     s = connect()
     s.settimeout(limit)
-    s.sendall(request)
+    try:
+        s.sendall(request)
+    except (BrokenPipeError, ConnectionResetError):
+        # The server refused and closed before the client finished sending:
+        # that is the refusal working. What it said, if anything, is read
+        # below; a closed connection reads as no response.
+        pass
     if then_wait:
         time.sleep(then_wait)
     got = b""
@@ -45,7 +51,7 @@ def _exchange(connect, request: bytes, *, then_wait: float = 0.0, limit: float =
                 if len(body) >= n:
                     break
     except (TimeoutError, OSError):
-        pass
+        pass  # reset after a refusal included: whatever arrived first counts
     finally:
         s.close()
     return got
@@ -222,7 +228,9 @@ def test_the_socket_proxy_caps_a_chunked_body_and_times_out_a_slow_one(monkeypat
     endless = (b"POST /v1.44/containers/create HTTP/1.1\r\nHost: d\r\n"
                b"Transfer-Encoding: chunked\r\n\r\n" + chunk * 20)
     got, took = _proxy_exchange(endless, monkeypatch)
-    assert got == 413 and took < 5
+    # 413, or the connection closed on the client mid-send (the 413 lost to
+    # the reset): refused either way, and promptly. Never a forward.
+    assert got in (413, None) and took < 5
     slow = (b"POST /v1.44/containers/create HTTP/1.1\r\nHost: d\r\n"
             b"Content-Length: 100\r\n\r\n{")
     got, took = _proxy_exchange(slow, monkeypatch)
@@ -243,7 +251,8 @@ def test_the_egress_socket_drops_a_line_that_never_ends(tmp_path, monkeypatch):
         got = _exchange(_unix(path), b'{"op": "auth", "user": "')
         assert got in (b"", b"ERR\n") and time.monotonic() - t0 < 5
         got = _exchange(_unix(path), b"x" * 100_000 + b"\n")
-        assert got.startswith(b"ERR\n")
+        # ERR, or closed while the rest was still arriving: never parsed.
+        assert got.startswith(b"ERR\n") or got == b""
     finally:
         server.shutdown()
         server.server_close()
@@ -267,7 +276,7 @@ def test_the_storage_helper_drops_a_line_that_never_ends_or_is_too_long(tmp_path
         assert time.monotonic() - t0 < 5
         assert b'"ok": false' in got or got == b""
         got = _exchange(_unix(path), b"{" + b"x" * 100_000 + b"}\n")
-        assert b'"ok": false' in got
+        assert b'"ok": false' in got or got == b""
     finally:
         server.shutdown()
         server.server_close()
