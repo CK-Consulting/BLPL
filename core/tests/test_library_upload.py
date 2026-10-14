@@ -394,3 +394,60 @@ def test_a_bundle_symbol_that_collides_is_held_while_the_rest_lands(tmp_path):
     assert by["PART.kicad_sym"]["state"] == quarantine.HELD
     assert "already has a different PART" in by["PART.kicad_sym"]["reasons"][0]
     assert by["PART.kicad_mod"]["state"] == quarantine.RELEASED
+
+
+# ------------------------------------------------------------------ reserved names
+
+
+@pytest.fixture
+def stock(tmp_path, monkeypatch):
+    """Stock libraries where the guard looks, as the submodules lay them out."""
+    sym, fp = tmp_path / "kicad-symbols", tmp_path / "kicad-footprints"
+    (sym / "Device.kicad_symdir").mkdir(parents=True)
+    (sym / "Connector_Generic.kicad_sym").parent.mkdir(exist_ok=True)
+    (sym / "Connector_Generic.kicad_sym").write_text("(kicad_symbol_lib)")
+    (fp / "Resistor_SMD.pretty").mkdir(parents=True)
+    monkeypatch.setattr(library_upload, "stock_roots", lambda: (sym, fp))
+    project = tmp_path / "proj"
+    project.mkdir()
+    return project
+
+
+@pytest.mark.parametrize("name", ["Device", "device", "DEVICE", "Connector_Generic", "resistor_smd", "hdm_generated_proj"])
+def test_a_stock_or_generated_library_name_is_refused_for_an_upload(stock, name):
+    with pytest.raises(ValueError) as err:
+        _up(stock, _footprint("R_0402"), "footprint", "r.kicad_mod", library=name)
+    msg = str(err.value)
+    assert "vendor-prefixed" in msg and f"vendor_{name}" in msg
+    assert "the project's own library (proj)" in msg
+    assert not (stock / "libraries").exists()
+    assert not (stock / "retrieved").exists()
+
+
+def test_a_name_that_only_resembles_a_stock_library_is_fine(stock):
+    for name in ("Device_vendor", "acme_Device", "proj"):
+        rec = _up(stock, _footprint(f"FP_{name}"), "footprint", "x.kicad_mod", library=name)
+        assert rec.state == quarantine.RELEASED, rec.reasons
+
+
+def test_an_existing_project_library_with_a_stock_name_keeps_working(stock):
+    """The guard is about choosing a name; an existing library is not re-litigated."""
+    lib = stock / "libraries" / "symbols" / "Device.kicad_sym"
+    lib.parent.mkdir(parents=True)
+    lib.write_bytes(_symlib(_symbol("MY_R")))
+    rec = _up(stock, _symlib(_symbol("VENDOR_R")), "symbol", "v.kicad_sym", library="Device")
+    assert rec.state == quarantine.RELEASED, rec.reasons
+    # Resolution of what was already there is untouched.
+    assert sr.resolve("Device:MY_R", project_dir=stock, stock_root=stock.parent / "kicad-symbols").source == sr.CUSTOM
+    # The existing name is matched as spelled: "device" is still a new library.
+    with pytest.raises(ValueError):
+        _up(stock, _footprint("X"), "footprint", "x.kicad_mod", library="device")
+
+
+def test_stock_names_come_from_the_libraries_the_resolver_searches(stock):
+    names = library_upload.stock_library_names()
+    assert names == {
+        "device": "the stock symbol library Device",
+        "connector_generic": "the stock symbol library Connector_Generic",
+        "resistor_smd": "the stock footprint library Resistor_SMD",
+    }
