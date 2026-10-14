@@ -735,3 +735,56 @@ def test_every_agent_operation_holds_the_projects_gate(client, second_user, monk
         assert any(c.startswith(path) for c in calls), (path, sorted(set(calls)))
     assert "/quarantine/accept_upload" in calls
     assert held["n"] == 0
+
+
+def test_a_backend_without_the_mount_queues_every_kind_of_run(client, monkeypatch):
+    """Codex, PR #20: the stage, pipeline, review-panel and release routes
+    called _project_dir without agent_ready, so without the project mount they
+    answered 503 and no run could be queued, though runs execute in run
+    containers. Each now queues its run; the backend reads nothing under the
+    projects root to do it (the audit hook), and the worker does the rest."""
+    import app.main as main
+    from app.models import Run
+    from app.db import SessionFactory
+    from conftest import enqueue_only, give_endpoint
+
+    sign_in(client)
+    give_endpoint(tasks={"default": ["anthropic"], "review_panel": ["anthropic"]})
+    client.put("/api/settings/secrets/anthropic", json={"value": "sk-test"})
+    client.post("/api/projects/init", json=init_body("scratch"))
+    monkeypatch.setenv("BLPL_PROJECT_MOUNT", "absent")
+    root = str(main.PROJECTS_ROOT)
+    p = "/api/projects/scratch"
+    launches = [f"{p}/stages/stage5", f"{p}/pipeline?from_stage=stage5&to_stage=stage8",
+                f"{p}/review-panel", f"{p}/release"]
+    _WATCH.update(root=root, seen=[])
+    try:
+        for url in launches:
+            enqueue_only(client, url)
+            with SessionFactory() as s:
+                assert s.query(Run).count() == launches.index(url) + 1, url
+            # One run at a time per project: let the next one queue.
+            with SessionFactory() as s:
+                for run in s.query(Run).all():
+                    run.status = "done"
+                s.commit()
+        seen = list(_WATCH["seen"])
+    finally:
+        _WATCH["root"] = None
+    assert seen == [], f"the backend read the project mount: {seen[:5]}"
+    with SessionFactory() as s:
+        kinds = [r.kind for r in s.query(Run).order_by(Run.created_at)]
+        cmds = [r.cmd for r in s.query(Run).order_by(Run.created_at)]
+    assert kinds[0] == "stage5" and kinds[1].startswith("pipeline stage5")
+    assert kinds[2] == "review-panel" and kinds[3] == "release"
+    # Paths only, as the worker will see them; nothing was read to build them.
+    assert all(f"{root}/scratch" in c for c in cmds)
+
+
+def test_a_launch_without_the_mount_still_refuses_an_unknown_board(client, monkeypatch):
+    """Board resolution, now through the agent, still refuses what it refused."""
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    monkeypatch.setenv("BLPL_PROJECT_MOUNT", "absent")
+    r = client.post("/api/projects/scratch/stages/stage5?board=nope")
+    assert r.status_code == 400 and "single-board" in r.json()["detail"]
