@@ -8,6 +8,7 @@ separate, because they fail in different directions.
 
 from __future__ import annotations
 
+import hashlib
 import zlib
 from pathlib import Path
 
@@ -1369,3 +1370,41 @@ def test_a_padded_pdf_is_still_a_pdf():
     looks only at byte zero would call this "not a PDF" while a viewer opens it."""
     assert quarantine.looks_like_pdf(b"\n\n junk " + BENIGN)
     assert not quarantine.looks_like_pdf(b"x" * 1024 + BENIGN)
+
+
+# -- telling the app what was found, as it is found ----------------------------
+
+
+def test_a_recording_context_hears_every_accept_with_its_verdict(tmp_path, monkeypatch):
+    _clean_scanner(monkeypatch)
+    heard = []
+    with quarantine.recording_verdicts(heard.append):
+        rec = quarantine.accept_and_release(BENIGN, tmp_path, mpn="X", distributor="digikey")
+        quarantine.accept(PHONES_HOME, tmp_path, mpn="Y")
+    assert [(r.sha256, r.verdict) for r in heard] == [
+        (rec.sha256, quarantine.CLEAN),
+        (hashlib.sha256(PHONES_HOME).hexdigest(), quarantine.HELD),
+    ]
+    assert heard[0].inspector == quarantine.INSPECTOR
+
+
+def test_outside_a_recording_context_nothing_is_told(tmp_path, monkeypatch):
+    _clean_scanner(monkeypatch)
+    heard = []
+    with quarantine.recording_verdicts(heard.append):
+        pass
+    quarantine.accept(BENIGN, tmp_path, mpn="X")
+    assert heard == []
+
+
+def test_a_sink_that_fails_does_not_lose_the_file(tmp_path, monkeypatch):
+    """No verdict recorded is the safe state; losing the download is not."""
+    _clean_scanner(monkeypatch)
+
+    def broken(_rec):
+        raise RuntimeError("database down")
+
+    with quarantine.recording_verdicts(broken):
+        rec = quarantine.accept_and_release(BENIGN, tmp_path, mpn="X")
+    assert rec.state == quarantine.RELEASED
+    assert (tmp_path / "datasheets" / "X.pdf").is_file()
