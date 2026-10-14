@@ -889,12 +889,18 @@ function ContextMenu({
  * s-expression, technically displayed and of no use to anyone. It has a
  * renderer, so it goes there.
  *
- * Anything else the panel cannot render is handed to the browser, which knows
- * what to do with a PDF and will offer to save what it does not.
+ * A PDF goes to a pane that says, before anything opens, whether the server
+ * will let the browser render it: only bytes inspected clean are, wherever the
+ * file sits. The pane is chosen by name; what the server does is decided by
+ * the bytes, so a misnamed PDF still downloads rather than renders.
+ *
+ * Anything else the panel cannot render is handed to the browser, which will
+ * offer to save it.
  */
-export function destinationFor(node: TreeNode): "text" | "kicad" | "browser" {
+export function destinationFor(node: TreeNode): "text" | "kicad" | "pdf" | "browser" {
   const name = node.name.toLowerCase();
   if (/\.(kicad_pcb|kicad_sch)$/.test(name)) return "kicad";
+  if (name.endsWith(".pdf")) return "pdf";
   if (/\.(mmd|mermaid)$/.test(name)) return "text";
   if (/\.(md|markdown|ya?ml|toml|json|txt|csv|log|ini|cfg|net|nanorc|tb)$/.test(name)) return "text";
   // No extension and small enough to be a note rather than a blob: README,

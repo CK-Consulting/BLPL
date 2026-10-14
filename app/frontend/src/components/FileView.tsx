@@ -335,8 +335,9 @@ export function FileView({
   if (!path) {
     return (
       <div className="muted pad">
-        Pick a file in the tree on the left. Text opens here; a PDF or a gerber
-        opens in a new tab, and a KiCad file opens in the KiCad tab.
+        Pick a file in the tree on the left. Text opens here, a PDF opens here
+        with whether it has been inspected, a gerber downloads, and a KiCad
+        file opens in the KiCad tab.
       </div>
     );
   }
