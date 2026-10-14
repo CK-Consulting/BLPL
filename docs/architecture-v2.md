@@ -494,7 +494,11 @@ that credential:
   providers the catalog names, the distributor APIs kicad-happy calls,
   github.com; `git-hosts.txt` for port 22), plus the hosts administrators
   added, plus the grant's own hosts. Only port 443, and port 22 for the git
-  hosts. A member's endpoint is therefore reachable from that member's runs
+  hosts: the shipped ones, administrators' entries ticked for git over ssh
+  (an explicit per-entry flag; an HTTPS entry is not thereby an ssh
+  destination), and, on a pull or push's own git grant only, the host of the
+  project's ssh remote (`egress.ssh_remote_host`; ssh on another port stays
+  refused). A member's endpoint is therefore reachable from that member's runs
   and from no one else's. Private, loopback and link-local addresses stay
   refused on the resolved address, before any of this.
 - **Nothing is reloaded.** Squid asks per host, so an administrator's change
@@ -555,7 +559,8 @@ the backend and already fetch from the control plane.
   CONNECT with the operation's credential, which it reads from the
   `HTTPS_PROXY` it inherits through git and ssh. OpenBSD netcat, used first,
   can only prompt for a proxy password. The connection then reaches the remote only through Squid's CONNECT on port 22,
-  for the hosts in `git-hosts.txt`, with or without a leased key. Because
+  for the hosts in `git-hosts.txt`, administrators' ssh entries and the
+  operation's own remote, with or without a leased key. Because
   `GIT_SSH_COMMAND` outranks `core.sshCommand`, a repository's own ssh wrapper
   never runs.
   - Everything else in a workspace that talks to the network already honours
@@ -1007,10 +1012,25 @@ workspace).
 - **The fetch service has a deadline and a limit.** A fetch is streamed under
   one monotonic deadline (`BLPL_FETCH_DEADLINE_S`, 120 s) and the size cap is
   enforced as bytes arrive, so a server that trickles a byte per socket
-  timeout is cut off. At most `BLPL_FETCH_MAX_CONCURRENT` (8) fetches run at
+  timeout is cut off. The deadline covers the whole hop, not only the body:
+  a watchdog shuts the socket at the deadline, so connect, the TLS
+  handshake, the request and the response headers are bounded too (they
+  were per-operation timeouts only, and a server trickling its headers held
+  a slot forever). A cut socket reads as end of stream, so every read is
+  checked against the watchdog, and a cut fetch is never a short success.
+  At most `BLPL_FETCH_MAX_CONCURRENT` (8) fetches run at
   once, and at most `BLPL_FETCH_MAX_PER_RUN` (2) per run; beyond either, the
   answer is 429. It is the only outbound read the control plane makes on a
-  run's behalf. Model listing in Settings is the user's own request.
+  run's behalf. Model listing in Settings is the user's own request, with
+  per-operation timeouts as on main. The egress decision socket now requires
+  each question to arrive whole within its 5 s timeout, which was per recv;
+  the Docker socket proxy's upstream is the local daemon, and the storage
+  helper and agent are the control plane's own processes.
+- **Git over ssh to the project's own remote** (review, PR #20). Port 22 was
+  `git-hosts.txt` only, so a GitLab or self-hosted ssh remote the app accepts
+  was refused once workspaces were on. A pull or push's git grant now names
+  its remote's host for port 22, revoked with the grant, and administrators
+  can tick git over ssh per entry.
 - **Credentials and member removal without the mount.** The project
   credential routes read the remote through the agent, as pull and push do;
   they answered 503 without the mount. Removing a member removes their
