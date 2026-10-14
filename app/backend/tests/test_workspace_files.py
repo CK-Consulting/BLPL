@@ -11,6 +11,8 @@ behaviour is left out and the difference is tested below instead.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import shutil
 import subprocess
@@ -572,3 +574,164 @@ def test_a_removed_members_checkout_goes_through_the_agent(client, second_user, 
     r = client.delete(f"/api/projects/scratch/members/{other_id}")
     assert r.status_code == 200 and r.json()["removed"]
     assert not member[0].exists()
+
+
+# -- the project's gate through every agent operation (Codex, PR #20) ---------------------
+
+
+def _sealer_for(root, key):
+    """run_sealer with a driver whose sealer container seals the real tree."""
+    from app import workspace
+    from app.sandbox import jobs, sealer
+    from app.sandbox.fake import FakeDriver
+
+    def script(call):
+        workspace.seal(root, "scratch", key)
+        return 0, [("stdout", b'{"ok": true, "sealed_bytes": 1}\n')]
+
+    cfg = jobs.WorkspaceRunConfig(image="i", projects_root=root, host_projects_root="/h/projects")
+    return lambda: asyncio.run(sealer.run_sealer(FakeDriver(script=script), cfg, "scratch",
+                                                 key, "seal"))
+
+
+def test_a_seal_never_archives_an_operation_in_flight(client, monkeypatch):
+    """A slow write through the agent, with a git index.lock while it lasts,
+    holds the gate. A seal asked for meanwhile reports busy and changes
+    nothing; once the write is done, the seal archives the whole file and no
+    lock file."""
+    import threading as _threading
+
+    import app.main as main
+    from app import workspace
+    from app.sandbox import agent as agent_mod
+    from app.sandbox import gate, sealer
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    root = main.PROJECTS_ROOT
+    lock = root / "scratch" / ".git" / "index.lock"
+    started, finish = _threading.Event(), _threading.Event()
+    real_write = agent_mod.Agent.fs_write
+
+    def slow_write(self, q, data):
+        lock.write_text("")  # what a commit in progress leaves
+        (root / "scratch" / "design.md").write_bytes(data[: len(data) // 2])
+        started.set()
+        finish.wait(10)
+        try:
+            return real_write(self, q, data)
+        finally:
+            lock.unlink()
+
+    monkeypatch.setattr(agent_mod.Agent, "fs_write", slow_write)
+    monkeypatch.setattr(gate, "SEAL_WAIT_S", 0.3)
+    key = main.workspaces.key_for("scratch")
+    seal = _sealer_for(root, key)
+
+    body = "# a design long enough to be cut in half\n" * 20
+    done: list[int] = []
+    t = _threading.Thread(target=lambda: done.append(client.put(
+        "/api/projects/scratch/files/design.md", json={"content": body}).status_code))
+    t.start()
+    assert started.wait(5)
+    with pytest.raises(sealer.SealError, match="being started or run"):
+        seal()
+    assert not workspace.is_sealed(root, "scratch")
+    finish.set()
+    t.join(10)
+    assert done == [200]
+    assert seal()["ok"]
+    assert workspace.is_sealed(root, "scratch")
+    workspace.unseal(root, "scratch", key)
+    assert (root / "scratch" / "design.md").read_text() == body
+    assert not lock.exists()
+
+
+def test_the_seal_route_says_busy_rather_than_a_bare_false(client, monkeypatch):
+    import app.main as main
+    import app.workspace_files as wf
+    from app.sandbox import gate
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    monkeypatch.setattr(gate, "SEAL_WAIT_S", 0.2)
+    seal = _sealer_for(main.PROJECTS_ROOT, main.workspaces.key_for("scratch"))
+    monkeypatch.setattr(wf, "seal", lambda project, key: seal()["sealed_bytes"])
+    with gate.held(main.PROJECTS_ROOT, "scratch", exclusive=False, wait_s=1):
+        r = client.post("/api/projects/scratch/seal").json()
+    assert r["sealed"] is False and r["busy"] is True and "try again" in r["detail"]
+    assert client.post("/api/projects/scratch/seal").json()["sealed"] is True
+
+
+def test_every_agent_operation_holds_the_projects_gate(client, second_user, monkeypatch):
+    """Instrumented: each call the backend makes to an agent finds the
+    project's gate held, for every class of route that reaches one."""
+    import json as _json
+    import threading as _threading
+
+    from app.sandbox import agentclient, gate
+
+    held = {"n": 0}
+    lock = _threading.Lock()
+    real_held = gate.held
+
+    @contextlib.contextmanager
+    def counting(*a, **k):
+        with real_held(*a, **k):
+            with lock:
+                held["n"] += 1
+            try:
+                yield
+            finally:
+                with lock:
+                    held["n"] -= 1
+
+    # Every request a client makes is answered through _check, whatever the
+    # verb; the request's path says which operation it was.
+    calls: list[str] = []
+    real_check = agentclient.AgentClient._check
+
+    def check(self, r):
+        path = r.request.url.path
+        if path != "/health":
+            calls.append(path)
+            assert held["n"] > 0, f"{path} without the project's gate"
+        return real_check(self, r)
+
+    monkeypatch.setattr(gate, "held", counting)
+    monkeypatch.setattr(agentclient.AgentClient, "_check", check)
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    p = "/api/projects/scratch"
+    for method, url, kw in [
+        ("put", f"{p}/files/design.md", {"json": {"content": "# d\n"}}),          # files
+        ("get", f"{p}/files/design.md", {}),
+        ("get", f"{p}/tree", {}),                                                    # tree
+        ("post", f"{p}/folders", {"json": {"path": "notes"}}),
+        ("post", f"{p}/uploads", {"files": [("files", ("n.txt", b"n\n", "text/plain"))],
+                                   "data": {"meta": _json.dumps([{"kind": "reference"}])}}),
+        ("put", f"{p}/llm-ignore", {"json": {"path": "design.md", "ignored": True}}),
+        ("post", f"{p}/files/move", {"json": {"path": "notes", "to": "notes2"}}),
+        ("post", f"{p}/git/commit", {"json": {"message": "m"}}),                    # commit
+        ("post", f"{p}/git/push", {}),                                               # push
+        ("post", f"{p}/git/pull", {}),                                               # pull
+        ("get", f"{p}/git/credential", {}),                                          # credential
+        ("get", f"{p}/git/status", {}),
+    ]:
+        r = getattr(client, method)(url, **kw)
+        assert r.status_code < 500, (url, r.status_code, r.text[:200])
+    # A member's worktree is made through the agent, and removed through it.
+    client.post(f"{p}/members", json={"email": "other@example.com"})
+    inv = second_user.get("/api/invitations").json()[0]["id"]
+    second_user.post(f"/api/invitations/{inv}/accept")
+    second_user.get(f"{p}/tree")
+    import app.main as main
+
+    member = next(iter((main.PROJECTS_ROOT / ".worktrees" / "scratch").iterdir()))
+    client.delete(f"{p}/members/{member.name[1:]}")
+    for path in ("/fs/write", "/fs/read", "/fs/list", "/fs/mkdir", "/git/commit", "/git/push",
+                 "/git/pull", "/git/remote_of", "/worktree/ensure", "/worktree/remove"):
+        assert any(c.startswith(path) for c in calls), (path, sorted(set(calls)))
+    assert "/quarantine/accept_upload" in calls
+    assert held["n"] == 0

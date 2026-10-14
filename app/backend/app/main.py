@@ -2533,7 +2533,12 @@ def seal_project(
 ) -> dict:
     """Put a project back to sealed now, rather than waiting for the timeout."""
     _project_or_404(session, user, project_id)
-    return {"ok": True, "sealed": _seal_workspace(session, project_id)}
+    why: list[str] = []
+    sealed = _seal_workspace(session, project_id, why)
+    # Not sealed because something is using it is said, not left as a bare
+    # false: an operation in flight holds the project's gate, and the seal
+    # gives up after a few seconds rather than waiting it out.
+    return {"ok": True, "sealed": sealed, **({"busy": True, "detail": why[0]} if why else {})}
 
 
 @contextlib.contextmanager
@@ -2554,7 +2559,7 @@ def _seal_gate(project_id: str, *, sealing: bool):
         yield
 
 
-def _seal_workspace(session: Session, project_id: str) -> bool:
+def _seal_workspace(session: Session, project_id: str, why: list[str] | None = None) -> bool:
     """Seal one workspace, unless something is still using it.
 
     Refuses while a run is in flight, and that is not politeness: the worker is
@@ -2573,6 +2578,9 @@ def _seal_workspace(session: Session, project_id: str) -> bool:
             )
         )
         if busy is not None:
+            if why is not None:
+                why.append("a run is in progress in this project; seal it when the run "
+                           "has finished")
             return False
     # With workspaces behind the agent (phase 4), in a sealer container, after
     # the workspace is stopped and removed, so no container is left holding the
@@ -2587,6 +2595,8 @@ def _seal_workspace(session: Session, project_id: str) -> bool:
                 size = workspace.seal(PROJECTS_ROOT, project_id, key)
     except (workspace.WorkspaceError, *sealer_errors, _GateBusy) as exc:
         logger.warning("could not seal %s: %s", project_id, exc)
+        if why is not None:
+            why.append(f"the project is in use ({exc}); try again shortly")
         return False
     workspaces.forget(project_id)
     # The row and the wrapped key it carries exist only while the project is
