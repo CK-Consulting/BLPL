@@ -466,10 +466,11 @@ def _project_of(checkout: Path) -> str:
 
 
 @contextmanager
-def _git_proxy(checkout: Path) -> Iterator[dict[str, str]]:
+def _git_proxy(checkout: Path, remote: str | None = None) -> Iterator[dict[str, str]]:
     """The egress proxy's credential for one git operation (egress.py): the
-    shipped defaults and the administrators' hosts, nothing user-specific,
-    revoked when the operation ends. Nothing without an egress proxy."""
+    shipped defaults and the administrators' hosts, plus, on port 22, the host
+    of the remote this operation uses when it is an ssh one, revoked when the
+    operation ends. Nothing without an egress proxy."""
     import os
 
     from . import egress
@@ -478,8 +479,10 @@ def _git_proxy(checkout: Path) -> Iterator[dict[str, str]]:
     if not os.environ.get("BLPL_SANDBOX_HTTP_PROXY"):
         yield {}
         return
+    ssh_host = egress.ssh_remote_host(remote)
     with SessionFactory() as session:
         name, token = egress.issue(session, kind="git", project=_project_of(checkout),
+                                   ssh_hosts=[ssh_host] if ssh_host else (),
                                    ttl=egress.GIT_GRANT_TTL)
         session.commit()
     try:
@@ -490,8 +493,22 @@ def _git_proxy(checkout: Path) -> Iterator[dict[str, str]]:
             session.commit()
 
 
+def _remote(c: AgentClient, checkout: Path, url: str | None, operation: str) -> str | None:
+    """The remote this operation will use: the one passed, else the
+    project's configured one, read in the workspace. Only for the grant's
+    ssh host, so a remote that cannot be read is no ssh host, not an error."""
+    import os
+
+    if url or not os.environ.get("BLPL_SANDBOX_HTTP_PROXY"):
+        return url
+    try:
+        return c.git_remote_of(str(checkout), operation) or None
+    except AgentCallError:
+        return None
+
+
 def pull(checkout: Path, url: str, env: dict[str, str] | None) -> str:
-    with agent(checkout) as c, _git_proxy(checkout) as proxy:
+    with agent(checkout) as c, _git_proxy(checkout, _remote(c, checkout, url, "fetch")) as proxy:
         try:
             return c.git_pull(str(checkout), url, _cred(env), proxy)
         except AgentCallError as exc:
@@ -533,7 +550,7 @@ class _AgentProjects:
 
     def _push(self, c: AgentClient, checkout: Path, env, url, after) -> str:
         try:
-            with _git_proxy(checkout) as proxy:
+            with _git_proxy(checkout, _remote(c, checkout, url, "push")) as proxy:
                 r = c.git_push_held(str(checkout), url or "", _cred(env), proxy)
         except AgentCallError as exc:
             raise ProjectError(str(exc)) from exc

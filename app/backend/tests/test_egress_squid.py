@@ -49,11 +49,16 @@ class Decisions:
         self.down = False
         self.acl_broken = False
         self.asked: list[dict] = []
+        # The control plane's own answer (egress.decide) for grants not in
+        # the table above.
+        self.real = None
 
     def __call__(self, request):
         self.asked.append(dict(request))
         if self.down:
             raise RuntimeError("control plane unavailable")
+        if self.real is not None and request.get("user") not in GRANTS:
+            return self.real(request)
         g = GRANTS.get(request.get("user"))
         if g is None:
             return False
@@ -158,3 +163,47 @@ def test_a_failing_control_plane_is_a_refusal(squid):
         assert _connect(port, "llm.alice.example", 443, ("g-dave", "dave-secret"))[0] == 407
     finally:
         decisions.down = False
+
+
+def test_a_git_operations_ssh_remote_passes_squid_with_its_grant_only(squid, tmp_path):
+    """Codex, PR #20: a GitLab or self-hosted ssh remote was refused on port
+    22 because only git-hosts.txt counted. The git operation's grant names
+    its remote's host (egress.ssh_remote_host, workspace_files._git_proxy), and Squid, asking the
+    control plane's real decision, lets that grant through and no other."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app import egress, models
+
+    port, decisions = squid
+    engine = create_engine(f"sqlite:///{tmp_path / 'e.db'}")
+    models.Base.metadata.create_all(engine)
+    with sessionmaker(engine)() as db:
+        def real(request):
+            db.expire_all()
+            return egress.decide(db, request)
+
+        decisions.real = real
+        try:
+            grants = {}
+            for remote in ("git@gitlab.com:team/board.git",
+                           "ssh://git@git.board-vendor.example/team/board.git",
+                           "https://gitlab.com/team/board.git"):
+                host = egress.ssh_remote_host(remote)
+                grants[remote] = egress.issue(db, kind="git", project="p",
+                                              ssh_hosts=[host] if host else ())
+            db.commit()
+            gitlab = grants["git@gitlab.com:team/board.git"]
+            vendor = grants["ssh://git@git.board-vendor.example/team/board.git"]
+            https = grants["https://gitlab.com/team/board.git"]
+            assert _allowed(_connect(port, "gitlab.com", 22, gitlab)[0])
+            assert _allowed(_connect(port, "git.board-vendor.example", 22, vendor)[0])
+            assert _connect(port, "git.board-vendor.example", 22, gitlab)[0] == 403
+            assert _connect(port, "gitlab.com", 22, vendor)[0] == 403
+            assert _connect(port, "gitlab.com", 22, https)[0] == 403
+            # A private address stays refused whatever the grant says.
+            private = egress.issue(db, kind="git", project="p", ssh_hosts=["127.0.0.1"])
+            db.commit()
+            assert _connect(port, "127.0.0.1", 22, private)[0] == 403
+        finally:
+            decisions.real = None

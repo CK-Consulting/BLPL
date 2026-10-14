@@ -3,7 +3,9 @@
 Squid now authenticates every request a workspace makes with a credential
 issued for one run or one git operation, and asks the control plane whether
 that grant may reach the host: the shipped defaults, the hosts administrators
-added here, and the hosts of the LLM endpoints in the run's own chain. This
+added here, and the hosts of the LLM endpoints in the run's own chain. On
+port 22, the shipped git hosts, administrators' entries marked for ssh, and
+the project's own ssh remote for the one git operation that uses it. This
 replaces an allowlist file an operator edited and Squid had to be reloaded
 for.
 
@@ -33,6 +35,7 @@ def upgrade() -> None:
         sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id", ondelete="SET NULL"),
                   nullable=True),
         sa.Column("hosts", sa.JSON(), nullable=False),
+        sa.Column("ssh_hosts", sa.JSON(), nullable=False, server_default="[]"),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
     )
@@ -41,6 +44,7 @@ def upgrade() -> None:
         "egress_host",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("host", sa.String(253), nullable=False, unique=True),
+        sa.Column("ssh", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("added_by", sa.Integer(), sa.ForeignKey("users.id", ondelete="SET NULL"),
                   nullable=True),
         sa.Column("added_at", sa.DateTime(timezone=True), nullable=False),
@@ -50,6 +54,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("host", sa.String(253), nullable=False),
         sa.Column("action", sa.String(8), nullable=False),
+        sa.Column("ssh", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id", ondelete="SET NULL"),
                   nullable=True),
         sa.Column("email", sa.String(320), nullable=False, server_default=""),

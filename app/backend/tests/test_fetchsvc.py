@@ -377,3 +377,93 @@ def test_held_evidence_is_bounded_per_project(tmp_path, monkeypatch):
     s2, v2, _ = fetchsvc.assess("board", fetchsvc.Download("u", PHONES_HOME + b"%x\n"), held)
     assert s1 == s2 == 422 and v1["held"] and v2["held"]
     assert len(list((held / "board").glob("*.pdf"))) == 1  # the second was held, not kept
+
+
+def test_a_server_that_trickles_its_headers_is_cut_off_and_the_slot_returns(tmp_path,
+                                                                           monkeypatch):
+    """Codex, PR #20: the response headers were read before any deadline
+    check, each recv with its own socket timeout, so a server sending one
+    header byte at a time held a fetch, and its slot, forever. A real socket
+    here: the watchdog shuts it at the deadline."""
+    import socket as _socket
+    import threading
+    import time
+
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def trickle():
+        while not stop.is_set():
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+
+            def feed(c=c):
+                try:
+                    c.recv(4096)
+                    for b in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 10_000:
+                        if stop.is_set():
+                            break
+                        c.send(bytes([b]))
+                        time.sleep(0.05)  # well inside any per-recv timeout
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+            threading.Thread(target=feed, daemon=True).start()
+
+    threading.Thread(target=trickle, daemon=True).start()
+    monkeypatch.setattr(fetchsvc, "_public", lambda addr: True)
+
+    def to_server(host, port_, address, timeout=None):
+        return fetchsvc._PinnedHTTP(host, port, "127.0.0.1", timeout=timeout)
+
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(fetchsvc.Refused, match="longer than"):
+            fetchsvc.download("http://slow.example/ds.pdf",
+                              resolve=lambda h, p: ["127.0.0.1"],
+                              connections={"http": to_server}, deadline_s=1.0)
+        assert time.monotonic() - t0 < 3
+
+        # Through the service: the slot comes back once the fetch is cut off.
+        slots = fetchsvc.Slots(total=1, per_run=1)
+        server = fetchsvc.serve("127.0.0.1:0", tmp_path / "held", authenticate=lambda u, p: "b",
+                                resolve=lambda h, p: ["127.0.0.1"],
+                                connections={"http": to_server}, slots=slots, deadline_s=1.0)
+        try:
+            import base64
+            import json
+            import urllib.error
+            import urllib.request
+
+            def post():
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/fetch", method="POST",
+                    data=json.dumps({"url": "http://slow.example/ds.pdf"}).encode(),
+                    headers={"Authorization": "Basic " + base64.b64encode(b"g:t").decode(),
+                             "Content-Type": "application/json"})
+                try:
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req) as r:
+                        return r.status
+                except urllib.error.HTTPError as exc:
+                    return exc.code
+
+            assert post() == 400  # cut off, refused
+            # The answer is written before the handler's finally returns the
+            # slot, so allow it a moment.
+            end = time.monotonic() + 2
+            while not slots.take("g") and time.monotonic() < end:
+                time.sleep(0.02)
+            assert slots._busy == {"g": 1}, "the slot was not given back"
+        finally:
+            server.shutdown()
+            server.server_close()
+    finally:
+        stop.set()
+        srv.close()
