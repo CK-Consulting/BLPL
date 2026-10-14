@@ -287,7 +287,7 @@ class _Workspaces:
                     return await access.agent_idle(key.container_name())
             stopped = await sandbox_idle.sweep(
                 self.driver, self.tracker, idle_after_s=self.cfg.idle_after_s,
-                activity=activity,
+                activity=activity, gate_root=self.cfg.projects_root,
             )
             if stopped:
                 logger.info("stopped %d idle workspace(s)", len(stopped))

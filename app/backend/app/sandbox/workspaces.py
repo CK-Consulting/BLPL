@@ -15,6 +15,7 @@ the agent starts, the token. The control plane reaches the same directory at
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -23,6 +24,8 @@ from typing import Callable, Mapping
 from . import agentclient
 from .driver import AGENT_DIR, Mount, State, WorkspaceDriver, WorkspaceSpec
 from .jobs import WorkspaceRunConfig, spec_for
+
+logger = logging.getLogger("blpl.workspaces")
 
 
 def enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -111,20 +114,23 @@ class Access:
             running = st.state in (State.RUNNING, State.PAUSED)
             have_nonce = (d / agentclient.NONCE_FILE).exists()
             if running and not have_nonce:
-                # Started without an agent (a phase 2 container). Its
-                # agent cannot be given a token after the fact, so it is
-                # replaced. This happens once, at the switch to phase 3.
+                # Started without an agent (a phase 2 container). Its agent
+                # cannot be given a token after the fact, so it is replaced.
+                # Stopping it here, under the shared gate only, interrupts
+                # nothing: there is no agent in it to hold an operation, and
+                # no run executes in a workspace container any more.
                 await driver.stop(key)
                 running = False
             if not running:
                 agentclient.prepare(d, self.server_key, name)
             st = await driver.ensure(spec)
-            if st.stale:
-                # Running from an older spec, so the agent mount may be
-                # missing. Same remedy, under the same lock.
-                await driver.stop(key)
-                agentclient.prepare(d, self.server_key, name)
-                await driver.ensure(spec)
+            if st.stale and st.state is State.RUNNING:
+                # Running from an older spec. Not stopped here: other
+                # operations may be using its agent under the shared gate
+                # (Codex, PR #20). It keeps serving, and the idle sweep, which
+                # stops under the exclusive gate, retires it; the next start
+                # then creates it from the current spec.
+                logger.info("%s runs an older spec; it is replaced once idle", name)
 
     async def _connect_agent(self, d, name) -> agentclient.AgentClient:
         token = agentclient.current_token(d, self.server_key, name)
@@ -163,4 +169,6 @@ class Access:
             return None
         finally:
             client.close()
-        return 0.0 if h.get("runs_active") else float(h.get("idle_s", 0.0))
+        if h.get("runs_active") or h.get("requests_active"):
+            return 0.0  # something is in progress: not idle, however long it has taken
+        return float(h.get("idle_s", 0.0))

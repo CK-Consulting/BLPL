@@ -272,7 +272,8 @@ async def _seal_idle_workspaces() -> None:
                 # Workspaces the agent reports idle are stopped and sealed.
                 with SessionFactory() as session:
                     await workspace_files.sweep_and_seal(
-                        lambda name: _seal_workspace(session, name))
+                        lambda name, gate_held=False: _seal_workspace(
+                            session, name, gate_held=gate_held))
                     session.commit()
             idle = workspaces.idle()
             if not idle:
@@ -2559,7 +2560,8 @@ def _seal_gate(project_id: str, *, sealing: bool):
         yield
 
 
-def _seal_workspace(session: Session, project_id: str, why: list[str] | None = None) -> bool:
+def _seal_workspace(session: Session, project_id: str, why: list[str] | None = None, *,
+                    gate_held: bool = False) -> bool:
     """Seal one workspace, unless something is still using it.
 
     Refuses while a run is in flight, and that is not politeness: the worker is
@@ -2589,9 +2591,10 @@ def _seal_workspace(session: Session, project_id: str, why: list[str] | None = N
     sealer_errors = workspace_files.seal_errors() if workspace_files.enabled() else ()
     try:
         if workspace_files.enabled():
-            size = workspace_files.seal(project_id, key)
+            size = workspace_files.seal(project_id, key, gate_held=gate_held)
         else:
-            with _seal_gate(project_id, sealing=True):
+            with (contextlib.nullcontext() if gate_held
+                  else _seal_gate(project_id, sealing=True)):
                 size = workspace.seal(PROJECTS_ROOT, project_id, key)
     except (workspace.WorkspaceError, *sealer_errors, _GateBusy) as exc:
         logger.warning("could not seal %s: %s", project_id, exc)

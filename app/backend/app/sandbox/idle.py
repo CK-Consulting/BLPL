@@ -20,6 +20,7 @@ from __future__ import annotations
 import inspect
 import logging
 import time
+from pathlib import Path
 from contextlib import contextmanager
 from typing import Awaitable, Callable, Iterator
 
@@ -82,11 +83,20 @@ async def sweep(
     idle_after_s: float = DEFAULT_IDLE_AFTER_S,
     on_stopped: OnStopped | None = None,
     activity: Activity | None = None,
+    gate_root: Path | None = None,
 ) -> list[WorkspaceKey]:
     """Stop every running workspace idle longer than idle_after_s.
 
     Returns the keys it stopped. One workspace failing to stop is logged and
     skipped; it must not leave every other idle workspace running.
+
+    With ``gate_root``, the project's gate (gate.py) is taken exclusively
+    before the stop and held through ``on_stopped``, which is given the
+    workspace with the gate already held. An operation through the agent
+    holds the gate shared for as long as it lasts, so a workspace whose last
+    activity aged past the limit while a long push was still writing is not
+    stopped under it (Codex, PR #20): the gate is busy, and this round skips
+    it. ``on_stopped`` must not take the gate again.
     """
     stopped: list[WorkspaceKey] = []
     for st in await driver.list():
@@ -115,16 +125,33 @@ async def sweep(
                 continue
             if other is not None:
                 idle = min(idle, other)
-        try:
-            await driver.stop(key)
-        except DriverError:
-            logger.exception("could not stop idle workspace %s", key.container_name())
+        if gate_root is None:
+            if await _stop(driver, tracker, key, idle, on_stopped):
+                stopped.append(key)
             continue
-        tracker.forget(key)
-        stopped.append(key)
-        logger.info("stopped %s after %.0fs idle", key.container_name(), idle)
-        if on_stopped is not None:
-            res = on_stopped(key)
-            if inspect.isawaitable(res):
-                await res
+        from . import gate
+
+        try:
+            async with gate.held_async(gate_root, key.project, exclusive=True,
+                                       wait_s=gate.SEAL_WAIT_S):
+                if await _stop(driver, tracker, key, idle, on_stopped):
+                    stopped.append(key)
+        except gate.GateBusy:
+            logger.info("%s is in use; not stopped this round", key.container_name())
     return stopped
+
+
+async def _stop(driver: WorkspaceDriver, tracker: IdleTracker, key: WorkspaceKey, idle: float,
+                on_stopped: OnStopped | None) -> bool:
+    try:
+        await driver.stop(key)
+    except DriverError:
+        logger.exception("could not stop idle workspace %s", key.container_name())
+        return False
+    tracker.forget(key)
+    logger.info("stopped %s after %.0fs idle", key.container_name(), idle)
+    if on_stopped is not None:
+        res = on_stopped(key)
+        if inspect.isawaitable(res):
+            await res
+    return True

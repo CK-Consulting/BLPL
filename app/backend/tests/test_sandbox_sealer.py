@@ -65,10 +65,11 @@ def test_a_failed_seal_is_an_error_not_a_success(tmp_path):
 
 def test_the_hook_seals_only_workspaces():
     sealed = []
-    hook = sealer.on_stopped_sealer(sealed.append)
+    hook = sealer.on_stopped_sealer(lambda p, gate_held=False: sealed.append((p, gate_held)))
     hook(WorkspaceKey("a"))
     hook(WorkspaceKey("b", role="run", member="r1"))
-    assert sealed == ["a"]
+    # The sweep holds the gate already; the seal must not take it again.
+    assert sealed == [("a", True)]
 
 
 # -- the proxy's rule: the projects root, for a sealer only ----------------------------

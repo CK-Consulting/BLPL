@@ -360,7 +360,7 @@ def test_sealing_goes_to_the_sealer_not_the_mount(client, monkeypatch):
     sign_in(client)
     client.post("/api/projects/init", json=init_body("scratch"))
     calls = []
-    monkeypatch.setattr(wf, "seal", lambda project, key: calls.append((project, len(key))) or 7)
+    monkeypatch.setattr(wf, "seal", lambda project, key, **kw: calls.append((project, len(key))) or 7)
     monkeypatch.setattr(main.workspace, "seal",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("mount seal")))
     r = client.post("/api/projects/scratch/seal")
@@ -406,7 +406,7 @@ def test_without_the_project_mount_a_sealed_project_is_listed_and_opened(client,
     calls = []
 
     def sealer(op):
-        def run(project, key):
+        def run(project, key, **kw):
             calls.append((op, project))
             where = host if host.exists() else root
             if op == "seal":
@@ -492,7 +492,7 @@ def test_an_open_project_survives_a_restart_and_is_sealed_when_idle(client, monk
     assert key is not None
     root = main.PROJECTS_ROOT
     host = root.parent / "projects-host" if mountless else root
-    monkeypatch.setattr(wf, "seal", lambda project, k: workspace.seal(host, project, k))
+    monkeypatch.setattr(wf, "seal", lambda project, k, **kw: workspace.seal(host, project, k))
 
     # The restart: the in-memory registry is gone, and without the mount the
     # backend's view of the projects is an empty directory.
@@ -656,7 +656,7 @@ def test_the_seal_route_says_busy_rather_than_a_bare_false(client, monkeypatch):
     client.post("/api/projects/init", json=init_body("scratch"))
     monkeypatch.setattr(gate, "SEAL_WAIT_S", 0.2)
     seal = _sealer_for(main.PROJECTS_ROOT, main.workspaces.key_for("scratch"))
-    monkeypatch.setattr(wf, "seal", lambda project, key: seal()["sealed_bytes"])
+    monkeypatch.setattr(wf, "seal", lambda project, key, **kw: seal()["sealed_bytes"])
     with gate.held(main.PROJECTS_ROOT, "scratch", exclusive=False, wait_s=1):
         r = client.post("/api/projects/scratch/seal").json()
     assert r["sealed"] is False and r["busy"] is True and "try again" in r["detail"]

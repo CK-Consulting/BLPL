@@ -520,6 +520,12 @@ class Agent:
         self.allow_runs = allow_runs
         self.git = _projects.Projects(Path(self.fs.roots[0]) if self.fs.roots else Path("/"))
         self._last = time.monotonic()
+        # Requests being served now. Reported by /health, so the idle sweep
+        # never takes a workspace for idle while one is in progress, however
+        # long ago it started: a push of minutes touched only at its start
+        # aged past the idle limit mid-write (Codex, PR #20).
+        self._active = 0
+        self._active_lock = threading.Lock()
         self._holds: dict[str, threading.Event] = {}
         self._holds_lock = threading.Lock()
 
@@ -530,6 +536,16 @@ class Agent:
 
     def touch(self) -> None:
         self._last = time.monotonic()
+
+    def begin(self) -> None:
+        with self._active_lock:
+            self._active += 1
+        self.touch()
+
+    def end(self) -> None:
+        with self._active_lock:
+            self._active -= 1
+        self.touch()  # its end is activity too: the idle clock starts here
 
     def _no_run(self, parts: list[str]) -> None:
         if not _below_blpl(parts) and self.runs.active():
@@ -1154,8 +1170,11 @@ class Agent:
         return {"runs_active": self.runs.active()}
 
     def health(self) -> dict:
+        with self._active_lock:
+            active = self._active
         return {"ok": True, "version": VERSION, "runs_active": self.runs.active(),
-                "idle_s": time.monotonic() - self._last}
+                "requests_active": active,
+                "idle_s": 0.0 if active else time.monotonic() - self._last}
 
 
 _JSON_ROUTES = {
@@ -1252,11 +1271,20 @@ def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
                 logger.exception("request failed")
                 self._json(500, {"error": f"{type(e).__name__}: {e}", "kind": "error"})
 
+        def _counted(self, method: str) -> None:
+            if urlsplit(self.path).path == "/health":
+                return self._dispatch(method)
+            agent.begin()
+            try:
+                self._dispatch(method)
+            finally:
+                agent.end()
+
         def do_GET(self) -> None:  # noqa: N802
-            self._dispatch("GET")
+            self._counted("GET")
 
         def do_POST(self) -> None:  # noqa: N802
-            self._dispatch("POST")
+            self._counted("POST")
 
     return Handler
 

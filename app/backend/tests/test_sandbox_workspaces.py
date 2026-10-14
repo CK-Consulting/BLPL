@@ -328,3 +328,68 @@ def test_a_seal_does_not_wait_out_a_run_it_gives_up_and_retries(setup, monkeypat
     asyncio.run(scenario())
     assert (projects / "board").is_dir()
     assert not any(op == "run_container" for op, _ in driver.ops)
+
+
+def test_the_idle_sweep_does_not_stop_a_workspace_under_a_long_operation(setup, monkeypatch):
+    """Codex, PR #20: a long operation through the agent holds the project's
+    gate shared and touched the workspace only at its start; its age passed
+    the idle limit and the sweep stopped the container mid-write. Now the
+    agent reports the request in progress, and the sweep takes the gate
+    exclusively before it stops anything; either alone keeps it running."""
+    import time
+
+    from app.sandbox import agent as agent_mod
+    from app.sandbox import gate, idle
+
+    access, driver, projects = setup
+    monkeypatch.setattr(gate, "SEAL_WAIT_S", 0.2)
+    c = asyncio.run(access.ensure("board"))
+    key = access.spec("board").key
+    started, finish = threading.Event(), threading.Event()
+    real_write = agent_mod.Agent.fs_write
+
+    def slow_write(self, q, data):
+        started.set()
+        finish.wait(10)
+        return real_write(self, q, data)
+
+    monkeypatch.setattr(agent_mod.Agent, "fs_write", slow_write)
+    tracker = idle.IdleTracker()
+    tracker.touch(key)
+    stopped_with: list = []
+
+    def on_stopped(k):
+        # The seal runs with the gate still held: no operation can begin.
+        with pytest.raises(gate.GateBusy):
+            with gate.held(projects, "board", exclusive=False, wait_s=0.1):
+                pass
+        stopped_with.append(k)
+
+    async def activity(k):
+        return await access.agent_idle(k.container_name())
+
+    def write():
+        # What workspace_files.gated does for a route: the gate, shared,
+        # for the whole operation.
+        with gate.held(projects, "board", exclusive=False, wait_s=1):
+            c.write(str(projects / "board"), "design.md", b"# long\n")
+
+    t = threading.Thread(target=write)
+    t.start()
+    assert started.wait(5)
+    time.sleep(0.4)  # older than the limit below, and still writing
+    # The agent says it is busy...
+    assert asyncio.run(activity(key)) == 0.0
+    # ...and the gate is held: no stop either way, even with no witness.
+    for witness in (activity, None):
+        assert asyncio.run(idle.sweep(driver, tracker, idle_after_s=0.3, activity=witness,
+                                      gate_root=projects, on_stopped=on_stopped)) == []
+    assert (asyncio.run(driver.status(key))).state is State.RUNNING
+    finish.set()
+    t.join(5)
+    c.close()
+    time.sleep(0.4)
+    assert asyncio.run(idle.sweep(driver, tracker, idle_after_s=0.3, activity=activity,
+                                  gate_root=projects, on_stopped=on_stopped)) == [key]
+    assert stopped_with == [key]
+    assert (projects / "board" / "design.md").read_bytes() == b"# long\n"

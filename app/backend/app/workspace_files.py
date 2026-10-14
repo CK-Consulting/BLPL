@@ -722,13 +722,13 @@ def seal_errors() -> tuple[type[BaseException], ...]:
     return (SealError, DriverError)
 
 
-def seal(project: str, key: bytes) -> int:
+def seal(project: str, key: bytes, *, gate_held: bool = False) -> int:
     """workspace.seal, in a sealer container: the backend needs no mount."""
     from .sandbox.sealer import run_sealer
 
     access = _access()
     return _run(run_sealer(access.driver_factory(), access.run_cfg, project, key,
-                           "seal"))["sealed_bytes"]
+                           "seal", gate_held=gate_held))["sealed_bytes"]
 
 
 def unseal(project: str, key: bytes) -> None:
@@ -763,7 +763,8 @@ async def sweep_and_seal(seal_project) -> list:
     try:
         return await idle.sweep(driver, _TRACKER, idle_after_s=access.run_cfg.idle_after_s,
                                 activity=activity,
-                                on_stopped=on_stopped_sealer(seal_project))
+                                on_stopped=on_stopped_sealer(seal_project),
+                                gate_root=access.run_cfg.projects_root)
     finally:
         close = getattr(driver, "aclose", None)
         if close is not None:

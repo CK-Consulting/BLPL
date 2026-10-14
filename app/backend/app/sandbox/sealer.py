@@ -29,6 +29,7 @@ Run in the container as:  python /opt/blpl/wsagent/sealer.py seal|unseal <projec
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import sys
@@ -79,8 +80,12 @@ class SealError(RuntimeError):
     pass
 
 
-async def run_sealer(driver, cfg, project: str, key: bytes, op: str) -> dict:
-    """Stop the project's workspace, then seal or unseal it in a sealer container."""
+async def run_sealer(driver, cfg, project: str, key: bytes, op: str, *,
+                     gate_held: bool = False) -> dict:
+    """Stop the project's workspace, then seal or unseal it in a sealer container.
+
+    ``gate_held``: the caller holds the project's gate exclusively already
+    (the idle sweep, from before its own stop)."""
     from .. import workspace
     from . import gate
     from .driver import WorkspaceKey
@@ -96,10 +101,11 @@ async def run_sealer(driver, cfg, project: str, key: bytes, op: str) -> dict:
     # the workspace back after the stop and the sealer would archive and
     # delete files its agent was writing (Codex, PR #20). A seal does not wait
     # long for runs to finish: busy now is tried again by the next sweep.
+    held = (contextlib.nullcontext() if gate_held else
+            gate.held_async(cfg.projects_root, project, exclusive=True,
+                            wait_s=gate.SEAL_WAIT_S if op == "seal" else gate.START_WAIT_S))
     try:
-        async with gate.held_async(cfg.projects_root, project, exclusive=True,
-                                   wait_s=gate.SEAL_WAIT_S if op == "seal"
-                                   else gate.START_WAIT_S):
+        async with held:
             # Nothing may hold the directories while they move, and a stopped
             # workspace keeps nothing of the project once its container is gone.
             await driver.stop(ws)
@@ -145,11 +151,13 @@ async def _seal_now(driver, cfg, project: str, key: bytes, op: str) -> dict:
     return answer
 
 
-def on_stopped_sealer(seal: Callable[[str], object]):
-    """The idle sweep's on_stopped hook: seal the project whose workspace stopped."""
+def on_stopped_sealer(seal: Callable[..., object]):
+    """The idle sweep's on_stopped hook: seal the project whose workspace
+    stopped. The sweep holds the project's gate already (idle.sweep), so the
+    seal is told not to take it again."""
     def hook(key):
         if key.role == "workspace":
-            return seal(key.project)
+            return seal(key.project, gate_held=True)
         return None
     return hook
 
