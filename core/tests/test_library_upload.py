@@ -511,3 +511,95 @@ def test_a_footprint_naming_a_model_nobody_uploaded_is_written_as_is(tmp_path):
     data = _footprint("LONELY")
     _up(tmp_path, data, "footprint", "l.kicad_mod")
     assert (tmp_path / "libraries" / "footprints" / "myproj.pretty" / "LONELY.kicad_mod").read_bytes() == data
+
+
+# ------------------------------------------------- removing and moving placed files
+
+
+def _row(project: Path, original_name: str) -> dict:
+    return next(r for r in quarantine.ledger(project) if r["original_name"] == original_name)
+
+
+def test_a_placed_footprint_can_be_deleted_and_the_ledger_says_who_and_when(tmp_path):
+    _up(tmp_path, _footprint("FP"), "footprint", "fp.kicad_mod")
+    rel = "libraries/footprints/myproj.pretty/FP.kicad_mod"
+    assert quarantine.library_placements_under(tmp_path, "libraries") == [rel]
+    (tmp_path / rel).unlink()
+    touched = quarantine.record_library_removal(tmp_path, rel, by="a@example.com")
+    row = _row(tmp_path, "fp.kicad_mod")
+    assert touched == [row["sha256"]]
+    assert row["placed"] == [] and row["state"] == quarantine.REMOVED and row["released_as"] == ""
+    [event] = quarantine.events(tmp_path)
+    assert event["event"] == "removed" and event["path"] == rel
+    assert event["by"] == "a@example.com" and event["at"] and event["rows"] == [row["sha256"]]
+    # Events survive the next row write.
+    _up(tmp_path, _footprint("OTHER"), "footprint", "o.kicad_mod")
+    assert len(quarantine.events(tmp_path)) == 1
+
+
+def test_a_placed_model_can_be_moved_and_the_row_follows_it(tmp_path):
+    _up(tmp_path, STEP, "3d_model", "m.step")
+    src = "libraries/3dmodels/myproj.3dshapes/m.step"
+    dst = "libraries/3dmodels/vendor.3dshapes/m.step"
+    (tmp_path / dst).parent.mkdir(parents=True)
+    (tmp_path / src).rename(tmp_path / dst)
+    quarantine.record_library_move(tmp_path, src, dst, by="b@x")
+    row = _row(tmp_path, "m.step")
+    assert row["placed"] == [dst]
+    assert f"{row['released_to']}/{row['released_as']}" == dst
+    [event] = quarantine.events(tmp_path)
+    assert (event["event"], event["path"], event["to"], event["by"]) == ("moved", src, dst, "b@x")
+
+
+def test_one_symbol_comes_out_of_a_merged_library_and_the_rest_stay(tmp_path):
+    _up(tmp_path, _symlib(_symbol("MINE")), "symbol", "mine.kicad_sym")
+    _up(tmp_path, _symlib(_symbol("A"), _symbol("B")), "symbol", "ab.kicad_sym")
+    lib = tmp_path / "libraries" / "symbols" / "myproj.kicad_sym"
+
+    out = quarantine.remove_library_symbol(tmp_path, "myproj", "A", by="c@x")
+    assert out == {"path": "libraries/symbols/myproj.kicad_sym", "remaining": ["MINE", "B"], "file_removed": False}
+    parsed = sexpr.parse(lib.read_text(encoding="utf-8"))
+    assert [sexpr.unquote(s[1]) for s in sexpr.find_all(parsed, "symbol")] == ["MINE", "B"]
+    roots = [r for r, _ in sr.search_path(tmp_path, tmp_path / "stock")]
+    assert loaders.load_symbol_pins("myproj:B", roots)
+    row = _row(tmp_path, "ab.kicad_sym")
+    assert row["names"] == ["B"] and row["placed"] == ["libraries/symbols/myproj.kicad_sym"]
+    event = quarantine.events(tmp_path)[-1]
+    assert (event["event"], event["symbol"], event["library"], event["by"]) == ("symbol_removed", "A", "myproj", "c@x")
+
+    # Its last symbol gone, the upload no longer claims the shared file.
+    quarantine.remove_library_symbol(tmp_path, "myproj", "B", by="c@x")
+    row = _row(tmp_path, "ab.kicad_sym")
+    assert row["placed"] == [] and row["state"] == quarantine.REMOVED
+    assert _row(tmp_path, "mine.kicad_sym")["placed"] == ["libraries/symbols/myproj.kicad_sym"]
+
+
+def test_a_collision_is_resolved_by_removing_the_symbol_and_uploading_again(tmp_path):
+    _up(tmp_path, _symlib(_symbol("R", pin="1")), "symbol", "old.kicad_sym")
+    new = _symlib(_symbol("R", pin="2"))
+    held = _up(tmp_path, new, "symbol", "new.kicad_sym")
+    assert held.state == quarantine.HELD and "Remove a symbol" in held.reasons[0]
+    quarantine.remove_library_symbol(tmp_path, "myproj", "R", by="d@x")
+    assert not (tmp_path / "libraries" / "symbols" / "myproj.kicad_sym").exists()
+    again = _up(tmp_path, new, "symbol", "new.kicad_sym")
+    assert again.state == quarantine.RELEASED, again.reasons
+    assert [e["event"] for e in quarantine.events(tmp_path)] == ["symbol_removed"]
+
+
+def test_a_symbol_in_a_symdir_is_its_own_file_and_goes_with_it(tmp_path):
+    symdir = tmp_path / "libraries" / "symbols" / "myproj.kicad_symdir"
+    symdir.mkdir(parents=True)
+    (symdir / "KEEP.kicad_sym").write_bytes(_symlib(_symbol("KEEP")))
+    _up(tmp_path, _symlib(_symbol("GO")), "symbol", "go.kicad_sym")
+    out = quarantine.remove_library_symbol(tmp_path, "myproj", "GO", by="e@x")
+    assert out["file_removed"] and not (symdir / "GO.kicad_sym").exists()
+    assert (symdir / "KEEP.kicad_sym").exists()
+
+
+def test_a_symbol_another_one_extends_is_not_removed(tmp_path):
+    _up(tmp_path, _symlib(_symbol("PARENT"), _symbol("CHILD", extends="PARENT")), "symbol", "p.kicad_sym")
+    with pytest.raises(library_upload.Refused, match="CHILD in library myproj extends PARENT"):
+        quarantine.remove_library_symbol(tmp_path, "myproj", "PARENT", by="f@x")
+    with pytest.raises(library_upload.Refused, match="has no symbol NOPE"):
+        quarantine.remove_library_symbol(tmp_path, "myproj", "NOPE", by="f@x")
+    assert quarantine.events(tmp_path) == []

@@ -207,6 +207,9 @@ class Record:
     # a bundle writes several, a merged symbol writes into a shared file.
     library: str = ""
     placed: list[str] = field(default_factory=list)
+    # The symbol or footprint names it brought, so removing one by name can
+    # say which upload it came from.
+    names: list[str] = field(default_factory=list)
     # A bundle's verdict per entry: name, kind, state, path, reasons.
     members: list[dict] = field(default_factory=list)
 
@@ -226,11 +229,24 @@ def _load(ledger: Path) -> list[dict]:
     return data.get("retrieved", []) if isinstance(data, dict) else []
 
 
-def _save(ledger: Path, rows: list[dict]) -> None:
+def _load_events(ledger: Path) -> list[dict]:
+    try:
+        data = json.loads(ledger.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    events = data.get("events", []) if isinstance(data, dict) else []
+    return [e for e in events if isinstance(e, dict)]
+
+
+def _save(ledger: Path, rows: list[dict], events: list[dict] | None = None) -> None:
     ledger.parent.mkdir(parents=True, exist_ok=True)
-    body = json.dumps(
-        {"schema_version": 1, "updated": _now(), "retrieved": rows}, indent=2
-    )
+    # Events are appended, never rewritten: a row save carries them over as
+    # they are on disk.
+    events = _load_events(ledger) if events is None else events
+    doc: dict = {"schema_version": 1, "updated": _now(), "retrieved": rows}
+    if events:
+        doc["events"] = events
+    body = json.dumps(doc, indent=2)
     # Write-then-move, as everywhere else here: a crash mid-write must not leave
     # a ledger that cannot be parsed, because an unreadable ledger reads as "no
     # files were ever retrieved".
@@ -584,6 +600,7 @@ def _place(data: bytes, project_dir: str | Path, rec: Record, *, library: str) -
     rec.released_to = base
     rec.released_as = placed.paths[0][len(base) + 1:]
     rec.placed = placed.paths
+    rec.names = placed.names
     rec.state = RELEASED
     rec.reasons = []
     if placed.note:
@@ -658,6 +675,141 @@ def _unpack_bundle(data: bytes, project_dir: str | Path, rec: Record, *, library
         rec.reasons = []
     _upsert(project_dir, rec)
     return rec
+
+
+# ------------------------------------------------------- library files, afterwards
+#
+# A released datasheet or reference stays put: the ledger names it by path and
+# the datasheet resolver finds it by MPN. A file placed into a project library
+# is different. It is the project's library now, and a library is edited —
+# a symbol replaced, a footprint dropped, a library renamed — and the
+# collision rule tells people to remove what is there first. So a library
+# placement may be removed or moved, and the ledger follows it: the row's
+# `placed` is changed to say where its files now are, and an event saying who
+# did what, and when, is appended. Events are never rewritten.
+
+REMOVED = "removed"           # every file a library upload placed is gone
+EVENT_REMOVED = "removed"
+EVENT_MOVED = "moved"
+EVENT_SYMBOL_REMOVED = "symbol_removed"
+
+
+def events(project_dir: str | Path) -> list[dict]:
+    """What happened to placed library files after they landed, oldest first."""
+    return _load_events(quarantine_dir(project_dir) / LEDGER_NAME)
+
+
+def _norm(rel: str) -> str:
+    return "/".join(p for p in str(rel).replace("\\", "/").split("/") if p not in ("", "."))
+
+
+def _under(path: str, rel: str) -> bool:
+    return path == rel or path.startswith(rel + "/")
+
+
+def library_placements_under(project_dir: str | Path, rel: str) -> list[str]:
+    """Paths placed by library uploads at ``rel`` or below it."""
+    rel = _norm(rel)
+    return sorted({
+        p for row in ledger(project_dir) if row.get("library")
+        for p in row.get("placed") or [] if _under(p, rel)
+    })
+
+
+def _sync_released(row: dict) -> None:
+    """Keep released_to/released_as naming a file the row still has."""
+    base = row.get("released_to") or ""
+    placed = row.get("placed") or []
+    if placed:
+        first = placed[0]
+        if base and first.startswith(base + "/"):
+            row["released_as"] = first[len(base) + 1:]
+        else:
+            # Moved out of the kind's directory: name it from where it is now.
+            row["released_to"], _, row["released_as"] = first.rpartition("/")
+    else:
+        row["released_as"] = ""
+        if row.get("state") == RELEASED:
+            row["state"] = REMOVED
+
+
+def _apply(project_dir: str | Path, change, new_events: list[dict]) -> list[str]:
+    """Run ``change(row)`` over every library row; save rows and append events."""
+    path = quarantine_dir(project_dir) / LEDGER_NAME
+    rows = _load(path)
+    touched = []
+    for row in rows:
+        if row.get("library") and change(row):
+            _sync_released(row)
+            touched.append(row.get("sha256", ""))
+    for e in new_events:
+        e["rows"] = touched
+    _save(path, rows, _load_events(path) + new_events)
+    return touched
+
+
+def record_library_removal(project_dir: str | Path, rel: str, *, by: str) -> list[str]:
+    """``rel`` (a file, or a folder of them) was deleted: the rows stop claiming it."""
+    gone = set(library_placements_under(project_dir, rel))
+    if not gone:
+        return []
+
+    def change(row: dict) -> bool:
+        before = list(row.get("placed") or [])
+        row["placed"] = [p for p in before if p not in gone]
+        return row["placed"] != before
+
+    at = _now()
+    return _apply(project_dir, change, [
+        {"event": EVENT_REMOVED, "path": p, "by": by, "at": at} for p in sorted(gone)
+    ])
+
+
+def record_library_move(project_dir: str | Path, src: str, dst: str, *, by: str) -> list[str]:
+    """``src`` (a file or folder) was moved to ``dst``: the rows follow it."""
+    src, dst = _norm(src), _norm(dst)
+    moved = library_placements_under(project_dir, src)
+    if not moved:
+        return []
+    mapping = {p: dst + p[len(src):] for p in moved}
+
+    def change(row: dict) -> bool:
+        before = list(row.get("placed") or [])
+        row["placed"] = [mapping.get(p, p) for p in before]
+        return row["placed"] != before
+
+    at = _now()
+    return _apply(project_dir, change, [
+        {"event": EVENT_MOVED, "path": p, "to": mapping[p], "by": by, "at": at} for p in moved
+    ])
+
+
+def remove_library_symbol(project_dir: str | Path, library: str, symbol: str, *, by: str) -> dict:
+    """Take one symbol out of a project library, and record it.
+
+    Through the parser (see ``library_upload.remove_symbol``), never by cutting
+    text. The upload rows that brought it stop listing it, and stop claiming
+    the file once none of their symbols are left in it.
+    """
+    out = library_upload.remove_symbol(project_dir, library, symbol)
+    path = out["path"]
+
+    def change(row: dict) -> bool:
+        if row.get("library") != library or symbol not in (row.get("names") or []):
+            return False
+        if path not in (row.get("placed") or []):
+            return False
+        row["names"] = [n for n in row["names"] if n != symbol]
+        mine = set(row["names"]) & set(out["remaining"])
+        if out["file_removed"] or not mine:
+            row["placed"] = [p for p in row["placed"] if p != path]
+        return True
+
+    _apply(project_dir, change, [{
+        "event": EVENT_SYMBOL_REMOVED, "path": path, "library": library, "symbol": symbol,
+        "file_removed": out["file_removed"], "by": by, "at": _now(),
+    }])
+    return out
 
 
 def ledger(project_dir: str | Path) -> list[dict]:

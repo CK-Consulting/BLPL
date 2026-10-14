@@ -375,7 +375,8 @@ def place_symbols(data: bytes, project_dir: str | Path, library: str) -> Placed:
         where = "; ".join(f"{n} in {have[n][0]}" for n in clash)
         raise Refused(
             f"library {library} already has a different {where}. Nothing was replaced: "
-            "upload it to a different library, or remove the existing symbol first"
+            "upload it to a different library, or remove the existing symbol first "
+            "(Remove a symbol… on the library in the file tree)"
         )
     if len(same) == len(names):
         return Placed(
@@ -453,6 +454,62 @@ def _merge_flat(flat: Path, upload: list, incoming: list[list], names: list[str]
     )
 
 
+def library_symbols(project_dir: str | Path, library: str) -> dict:
+    """The symbols in a project library, for a person choosing one to remove."""
+    library = library_name(library)
+    have = existing_symbols(Path(project_dir), library)
+    if not have:
+        raise Refused(f"the project has no symbol library {library}")
+    return {"library": library, "symbols": sorted(have), "files": sorted({f for f, _ in have.values()})}
+
+
+def remove_symbol(project_dir: str | Path, library: str, name: str) -> dict:
+    """Take symbol ``name`` out of project library ``library``.
+
+    From a flat ``<Lib>.kicad_sym``: parse, drop that one top-level node, dump,
+    then read back and count — every other symbol still there, this one gone.
+    The file goes once its last symbol does. From a ``<Lib>.kicad_symdir`` the
+    symbol is its own file, which is deleted. A symbol another one extends is
+    refused: its child would load with no pins.
+
+    Returns {"path", "remaining", "file_removed"}.
+    """
+    project_dir = Path(project_dir)
+    library = library_name(library)
+    have = existing_symbols(project_dir, library)
+    if name not in have:
+        raise Refused(f"library {library} has no symbol {name}")
+    children = sorted(n for n, (_, node) in have.items() if node and _extends(node) == name)
+    if children:
+        raise Refused(f"{', '.join(children)} in library {library} extends {name}; remove those first")
+    rel, _ = have[name]
+    target = project_dir / rel
+    if target.suffix == ".kicad_sym" and target.parent.suffix == ".kicad_symdir":
+        target.unlink()
+        remaining = sorted(n for n in have if n != name)
+        return {"path": rel, "remaining": remaining, "file_removed": True}
+    parsed = sexpr.parse(target.read_text(encoding="utf-8"))
+    before = [sexpr.unquote(s[1]) for s in _symbols(parsed) if len(s) > 1 and isinstance(s[1], str)]
+    kept = [
+        c for c in parsed
+        if not (isinstance(c, list) and sexpr.head(c) == "symbol" and len(c) > 1
+                and isinstance(c[1], str) and sexpr.unquote(c[1]) == name)
+    ]
+    expected = [n for n in before if n != name]
+    if not expected:
+        target.unlink()
+        return {"path": rel, "remaining": [], "file_removed": True}
+    _write(target, sexpr.dump_top(kept))
+    after = [
+        sexpr.unquote(s[1])
+        for s in _symbols(sexpr.parse(target.read_text(encoding="utf-8")))
+        if len(s) > 1 and isinstance(s[1], str)
+    ]
+    if after != expected:
+        raise RuntimeError(f"removing {name} from {target} left {len(after)} symbols, expected {len(expected)}")
+    return {"path": rel, "remaining": expected, "file_removed": False}
+
+
 # ------------------------------------------------------------------------ footprints
 
 
@@ -484,7 +541,7 @@ def place_footprint(data: bytes, project_dir: str | Path, library: str) -> Place
             return Placed(paths=[rel], names=[name], note="already in the library, unchanged")
         raise Refused(
             f"library {library} already has a different footprint {name} ({rel}). "
-            "Nothing was replaced: upload it to a different library, or remove the existing one first"
+            "Nothing was replaced: upload it to a different library, or delete the existing one first"
         )
     _write(target, body)
     note = f"3D model linked: {', '.join(new.rsplit('/', 1)[-1] for _, new in changed)}" if changed else ""
