@@ -927,6 +927,23 @@ workspace).
       with an index.lock, which reports busy and later archives the whole
       file and no lock. Instrumentation checks that every agent request finds
       the gate held.
+- **Every Unix socket's owner matches its client** (audited in review,
+  PR #20). The storage helper ran as root and made its socket root:root
+  0660, and the worker, as `BLPL_UID:BLPL_GID`, could not connect, so every
+  pre-run snapshot failed. It is now root:`BLPL_GID`, 0660. The helper
+  container gets that group (`group_add`), and the helper answers only the
+  worker's uid (`SO_PEERCRED`). It refuses to start without
+  `BLPL_STORAGE_CLIENT_UID`/`GID`.
+
+  | socket | created by (uid) | owner, mode | clients |
+  |---|---|---|---|
+  | `data/agents/<ws>/agent.sock` | the agent, as `BLPL_SANDBOX_USER` (= `BLPL_UID:GID`) | `BLPL_UID`, 0600 | backend and worker, both `BLPL_UID`; a per-start token besides |
+  | `blpl-docker-proxy/docker.sock` | the socket proxy, as `BLPL_UID` (+ docker group) | `BLPL_UID:BLPL_GID`, 0660 | backend and worker, `BLPL_UID` |
+  | `blpl-storage-helper/storage.sock` | the storage helper, root (+ `BLPL_GID`) | `root:BLPL_GID`, 0660, peer uid checked | the worker, `BLPL_UID` |
+  | `data/egress/decide.sock` | the backend, `BLPL_UID` | `BLPL_UID`, 0666, in a directory only the backend and Squid mount | Squid's helper, as Squid's `proxy` user (uid 13). It shares no uid or group with the backend, and Squid drops supplementary groups when it changes user, so the directory, not the mode, limits who can ask. It carries no secret (see `egress_server.py`) |
+
+  The fetch service is TCP, on the worker's address on `blpl-egress`, and
+  authenticates each request with the run's grant.
 - **The idle sweep takes the gate before it stops a workspace.** A long
   operation touched the workspace only when it started. Its age passed the
   idle limit, and the sweep stopped the container mid-write. Two changes:
