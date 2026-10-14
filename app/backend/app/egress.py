@@ -144,25 +144,41 @@ def normalise_entry(raw: str) -> str:
     return entry
 
 
-def admin_hosts(session: "Session") -> list[str]:
+def admin_hosts(session: "Session", *, ssh: bool = False) -> list[str]:
+    """The administrators' entries: every one for HTTPS, or with ssh=True
+    only those marked for git over ssh."""
     from sqlalchemy import select
 
     from .models import EgressHost
 
-    return [h for (h,) in session.execute(select(EgressHost.host).order_by(EgressHost.host))]
+    q = select(EgressHost.host).order_by(EgressHost.host)
+    if ssh:
+        q = q.where(EgressHost.ssh.is_(True))
+    return [h for (h,) in session.execute(q)]
 
 
-def add_host(session: "Session", user: "User", raw: str) -> str:
+def add_host(session: "Session", user: "User", raw: str, *, ssh: bool = False) -> str:
+    """Add an entry, or change whether an existing one allows git over ssh.
+    Port 22 is explicit per entry: allowing a host for HTTPS does not make it
+    an ssh destination."""
     from sqlalchemy import select
 
     from .models import EgressHost, EgressHostEvent
 
     entry = normalise_entry(raw)
-    if session.scalar(select(EgressHost).where(EgressHost.host == entry)) is None:
-        session.add(EgressHost(host=entry, added_by=user.id))
-        session.add(EgressHostEvent(host=entry, action="added", user_id=user.id,
-                                    email=user.email or ""))
-        session.flush()
+    ssh = bool(ssh)
+    row = session.scalar(select(EgressHost).where(EgressHost.host == entry))
+    if row is None:
+        session.add(EgressHost(host=entry, ssh=ssh, added_by=user.id))
+        action = "added"
+    elif bool(row.ssh) != ssh:
+        row.ssh = ssh
+        action = "changed"
+    else:
+        return entry
+    session.add(EgressHostEvent(host=entry, action=action, ssh=ssh, user_id=user.id,
+                                email=user.email or ""))
+    session.flush()
     return entry
 
 
@@ -176,8 +192,8 @@ def remove_host(session: "Session", user: "User", raw: str) -> bool:
     if row is None:
         return False
     session.delete(row)
-    session.add(EgressHostEvent(host=entry, action="removed", user_id=user.id,
-                                email=user.email or ""))
+    session.add(EgressHostEvent(host=entry, action="removed", ssh=bool(row.ssh),
+                                user_id=user.id, email=user.email or ""))
     session.flush()
     return True
 
@@ -204,10 +220,11 @@ def _hash(token: str) -> str:
 
 
 def issue(session: "Session", *, kind: str, project: str, hosts: Iterable[str] = (),
-          run_id: str | None = None, user_id: int | None = None,
-          ttl: timedelta = RUN_GRANT_TTL) -> tuple[str, str]:
+          ssh_hosts: Iterable[str] = (), run_id: str | None = None,
+          user_id: int | None = None, ttl: timedelta = RUN_GRANT_TTL) -> tuple[str, str]:
     """A new proxy credential: (username, password). Expired grants are
-    removed on the way."""
+    removed on the way. hosts are reachable on 443, ssh_hosts on 22, both
+    for this grant only."""
     from sqlalchemy import delete
 
     from .models import EgressGrant
@@ -219,6 +236,7 @@ def issue(session: "Session", *, kind: str, project: str, hosts: Iterable[str] =
     session.add(EgressGrant(
         id=name, token_sha256=_hash(token), kind=kind, project=project, run_id=run_id,
         user_id=user_id, hosts=sorted({h.lower() for h in hosts if h}),
+        ssh_hosts=sorted({h.lower().rstrip(".") for h in ssh_hosts if h}),
         created_at=now, expires_at=now + ttl))
     session.flush()
     return name, token
@@ -260,6 +278,20 @@ def authenticate(session: "Session", name: str, token: str) -> bool:
     return g is not None and hmac.compare_digest(g.token_sha256, _hash(token or ""))
 
 
+def ssh_remote_host(remote: str | None) -> str | None:
+    """The host a git remote reaches on port 22, for a git operation's grant,
+    or None: an https remote, a local path, or ssh on another port (Squid
+    allows 22 and 443 only, so naming the host would open nothing)."""
+    from . import gitstore
+
+    if not remote or gitstore.method_for(remote) != "ssh_key":
+        return None
+    scope = gitstore.scope_of(remote)
+    if scope is None or scope[1] is not None:
+        return None
+    return scope[0]
+
+
 def may_reach(session: "Session", name: str, host: str, port: int) -> bool:
     """Squid's question: may this grant CONNECT to host:port?"""
     g = grant(session, name)
@@ -267,7 +299,12 @@ def may_reach(session: "Session", name: str, host: str, port: int) -> bool:
         return False
     host = (host or "").lower().rstrip(".")
     if port == 22:
-        return matches(host, git_ssh_hosts())
+        # The project's own ssh remote rides the git operation's grant only
+        # (workspace_files._git_proxy); a GitLab or self-hosted remote the app
+        # accepts was refused here when only git-hosts.txt counted (Codex,
+        # PR #20). Squid still refuses a private address whatever this says.
+        return matches(host, [*git_ssh_hosts(), *admin_hosts(session, ssh=True),
+                              *(g.ssh_hosts or [])])
     if port != 443:
         return False
     return matches(host, [*defaults(), *admin_hosts(session), *(g.hosts or [])])

@@ -472,6 +472,59 @@ def test_a_push_through_the_agent_carries_its_own_egress_credential(client, via_
     assert len(revoked) == 1
 
 
+@pytest.mark.parametrize("remote, ssh_hosts", [
+    ("git@gitlab.com:team/scratch.git", ["gitlab.com"]),
+    ("ssh://git@git.board-vendor.example/team/scratch.git", ["git.board-vendor.example"]),
+    ("https://gitlab.com/team/scratch.git", []),
+])
+def test_a_push_to_an_ssh_remote_is_granted_that_host_on_port_22(client, via_agent,
+                                                                  monkeypatch, remote,
+                                                                  ssh_hosts):
+    """Codex, PR #20: port 22 was github.com or nothing, so a GitLab or
+    self-hosted ssh remote the app accepts could not be pushed to once
+    workspaces were on. The push's own git grant names its remote's host,
+    and only that grant can reach it."""
+    import app.main as main
+    from app import egress
+    from app.db import SessionFactory
+
+    issued = []
+    real_issue = egress.issue
+
+    def issue(session, **kw):
+        name, token = real_issue(session, **kw)
+        issued.append((name, kw))
+        return name, token
+
+    reachable = []
+    real_revoke = egress.revoke
+
+    def revoke(session, name):
+        # Asked while the grant is still live: what this push could reach.
+        reachable.append({h: egress.may_reach(session, name, h, 22)
+                          for h in ("gitlab.com", "git.board-vendor.example")})
+        real_revoke(session, name)
+
+    monkeypatch.setattr(egress, "issue", issue)
+    monkeypatch.setattr(egress, "revoke", revoke)
+    monkeypatch.setenv("BLPL_SANDBOX_HTTP_PROXY", "http://squid.invalid:3128")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "false")  # no network: the push itself fails
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    monkeypatch.setattr(main.workspace_files, "remote_of", lambda checkout, op: remote)
+    issued.clear()
+    client.post("/api/projects/scratch/git/push")
+    ((name, kw),) = issued
+    assert kw["kind"] == "git" and list(kw.get("ssh_hosts") or []) == ssh_hosts
+    (could,) = reachable
+    assert could == {h: h in ssh_hosts for h in ("gitlab.com", "git.board-vendor.example")}
+    # Another git grant, for the same project, reaches neither.
+    with SessionFactory() as session:
+        other, _ = real_issue(session, kind="git", project="scratch")
+        assert not any(egress.may_reach(session, other, h, 22)
+                       for h in ("gitlab.com", "git.board-vendor.example"))
+
+
 @pytest.mark.parametrize("mountless", [True, False])
 def test_an_open_project_survives_a_restart_and_is_sealed_when_idle(client, monkeypatch,
                                                                     mountless):

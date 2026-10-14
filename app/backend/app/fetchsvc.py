@@ -122,6 +122,9 @@ class _PinnedHTTPS(http.client.HTTPSConnection):
 
     def connect(self) -> None:
         sock = socket.create_connection((self._address, self.port), self.timeout)
+        # Visible before the handshake, so the fetch's watchdog can cut a
+        # handshake that trickles too.
+        self.sock = sock
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
@@ -163,11 +166,38 @@ def download(url: str, *, resolve: Resolve = _resolve, max_bytes: int = MAX_BYTE
     for _ in range(MAX_REDIRECTS + 1):
         scheme, host, port, path, address = _target(url, resolve)
         conn = connections[scheme](host, port, address, timeout=min(timeout, left()))
+        # A watchdog over the whole hop: at the deadline it shuts the socket,
+        # which ends whatever is blocked on it. A per-read timeout alone let a
+        # server trickle its headers (getresponse) or a TLS handshake byte by
+        # byte and hold the slot forever (Codex, PR #20).
+        expired = threading.Event()
+
+        def cut(conn=conn) -> None:
+            expired.set()
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        def check() -> None:
+            # A shut socket reads as end-of-stream, which http.client takes
+            # for the end of the headers or the body: without this, a cut
+            # fetch would come back as a short success.
+            if expired.is_set():
+                raise Refused(f"the fetch took longer than {limit:g} s")
+            left()
+
+        watchdog = threading.Timer(left(), cut)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             conn.request("GET", path, headers={
                 "Host": host if port == _PORTS[scheme] else f"{host}:{port}",
                 "User-Agent": "BLPL datasheet fetcher", "Accept": "application/pdf,*/*"})
             resp = conn.getresponse()
+            check()
             if resp.status in (301, 302, 303, 307, 308):
                 location = resp.getheader("Location") or ""
                 if not location:
@@ -185,16 +215,19 @@ def download(url: str, *, resolve: Resolve = _resolve, max_bytes: int = MAX_BYTE
                 if sock is not None:
                     sock.settimeout(min(timeout, left()))
                 chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
+                check()
                 if not chunk:
                     break
                 data += chunk
                 if len(data) > max_bytes:
                     raise Refused(f"the file is larger than {max_bytes // (1024 * 1024)} MB")
-                left()
             return Download(url=url, data=bytes(data))
-        except (OSError, http.client.HTTPException) as exc:
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            if expired.is_set():
+                raise Refused(f"the fetch took longer than {limit:g} s") from None
             raise Refused(f"{host} could not be fetched: {exc}") from None
         finally:
+            watchdog.cancel()
             conn.close()
     raise Refused(f"more than {MAX_REDIRECTS} redirects")
 

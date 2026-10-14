@@ -130,6 +130,71 @@ def test_an_admin_host_reaches_every_run_and_removal_takes_it_away(db):
                       ("api.vendor.example", "removed", "admin@example.com")]
 
 
+def test_a_git_operations_ssh_remote_is_reachable_with_its_grant_only(db):
+    """Codex, PR #20: port 22 consulted only git-hosts.txt, so a GitLab or
+    self-hosted ssh remote the app accepts was refused once workspaces were
+    on. The git operation's grant now names its remote's host, for port 22."""
+    ours, _ = egress.issue(db, kind="git", project="p", ssh_hosts=["GitLab.com."])
+    custom, _ = egress.issue(db, kind="git", project="p", ssh_hosts=["git.board-vendor.example"])
+    other, _ = egress.issue(db, kind="git", project="q")
+    run, _ = egress.issue(db, kind="run", project="p")
+    assert egress.may_reach(db, ours, "gitlab.com", 22)
+    assert egress.may_reach(db, custom, "git.board-vendor.example", 22)
+    for g in (other, run):
+        assert not egress.may_reach(db, g, "gitlab.com", 22)
+        assert not egress.may_reach(db, g, "git.board-vendor.example", 22)
+    # Each grant its own host, port 22 only, and the shipped one for all.
+    assert not egress.may_reach(db, ours, "git.board-vendor.example", 22)
+    assert not egress.may_reach(db, custom, "git.board-vendor.example", 443)
+    assert not egress.may_reach(db, ours, "gitlab.com", 2222)
+    assert all(egress.may_reach(db, g, "github.com", 22) for g in (ours, other, run))
+    egress.revoke(db, ours)
+    assert not egress.may_reach(db, ours, "gitlab.com", 22)
+
+
+@pytest.mark.parametrize("remote, host", [
+    ("git@gitlab.com:team/board.git", "gitlab.com"),
+    ("ssh://git@Git.Board-Vendor.example/team/board.git", "git.board-vendor.example"),
+    ("ssh://git@git.board-vendor.example:22/team/board.git", "git.board-vendor.example"),
+    ("git+ssh://git@gitlab.com/team/board.git", "gitlab.com"),
+    # Not an ssh remote on port 22: nothing on port 22 to grant.
+    ("ssh://git@git.board-vendor.example:2222/team/board.git", None),
+    ("https://gitlab.com/team/board.git", None),
+    ("/srv/git/board.git", None),
+    ("", None),
+    (None, None),
+])
+def test_the_ssh_host_a_git_operation_is_granted(remote, host):
+    assert egress.ssh_remote_host(remote) == host
+
+
+def test_an_admin_entry_reaches_port_22_only_when_marked_for_ssh(db):
+    """Port 22 is explicit per entry: an HTTPS gateway is not thereby an ssh
+    destination. Re-adding an entry with the other setting changes it, and
+    the change is recorded."""
+    admin = _user(db)
+    g, _ = egress.issue(db, kind="run", project="p")
+    egress.add_host(db, admin, "api.vendor.example")
+    assert egress.may_reach(db, g, "api.vendor.example", 443)
+    assert not egress.may_reach(db, g, "api.vendor.example", 22)
+    egress.add_host(db, admin, ".git.corp-example.net", ssh=True)
+    assert egress.may_reach(db, g, "eu.git.corp-example.net", 22)
+    assert egress.may_reach(db, g, "eu.git.corp-example.net", 443)
+    egress.add_host(db, admin, "api.vendor.example", ssh=True)
+    assert egress.may_reach(db, g, "api.vendor.example", 22)
+    egress.add_host(db, admin, "api.vendor.example", ssh=True)  # no change, no event
+    egress.add_host(db, admin, "api.vendor.example", ssh=False)
+    assert not egress.may_reach(db, g, "api.vendor.example", 22)
+    assert egress.may_reach(db, g, "api.vendor.example", 443)
+    from app.models import EgressHostEvent
+
+    events = [(e.host, e.action, e.ssh) for e in db.query(EgressHostEvent).order_by("id")]
+    assert events == [("api.vendor.example", "added", False),
+                      (".git.corp-example.net", "added", True),
+                      ("api.vendor.example", "changed", True),
+                      ("api.vendor.example", "changed", False)]
+
+
 @pytest.mark.parametrize("raw, message", [
     ("10.0.0.5", "not an IP address"), ("::1", "not an IP address"),
     ("*.example.com", "leading dot"), ("https://api.example.com", "hostname only"),
@@ -178,6 +243,43 @@ def test_the_decision_socket_fails_closed(tmp_path):
         assert ask(b"not json\n") == b"ERR\n"
         assert ask(b'["a list"]\n') == b"ERR\n"
         assert ask(b'{"user":"' + b"x" * 5000 + b'"}\n') == b"ERR\n"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_question_trickled_in_is_cut_off(tmp_path, monkeypatch):
+    """Codex, PR #20: the decision socket's timeout was per recv, so a peer
+    sending a byte at a time held a thread forever. A whole question must now
+    arrive within the timeout."""
+    import time
+
+    from app import egress_server
+
+    monkeypatch.setattr(egress_server._Handler, "timeout", 0.5)
+    path = str(tmp_path / "decide.sock")
+    server = egress_server.serve(path, lambda q: True)
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(path)
+            s.settimeout(0.1)
+            t0 = time.monotonic()
+            closed = False
+            for b in b'{"op":"auth","user":"' + b"x" * 200:
+                try:
+                    s.send(bytes([b]))
+                    if s.recv(16) == b"":
+                        closed = True
+                        break
+                except socket.timeout:
+                    pass  # still open, no answer yet
+                except OSError:
+                    closed = True
+                    break
+                if time.monotonic() - t0 > 3:
+                    break
+            assert closed, "the server kept reading a trickled question"
+            assert time.monotonic() - t0 < 2
     finally:
         server.shutdown()
         server.server_close()

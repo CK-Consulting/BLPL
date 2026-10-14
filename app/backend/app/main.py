@@ -1469,15 +1469,18 @@ def get_admin_egress(user: User = Depends(require_admin),
         "enforced": egress.enforced(),
         "defaults": egress.defaults(),
         "git_ssh_hosts": egress.git_ssh_hosts(),
-        "hosts": [{"host": h.host, "added_by": by_id.get(h.added_by, ""),
+        "hosts": [{"host": h.host, "ssh": bool(h.ssh), "added_by": by_id.get(h.added_by, ""),
                    "added_at": h.added_at} for h in hosts],
-        "events": [{"host": e.host, "action": e.action, "by": e.email, "at": e.at}
-                   for e in events],
+        "events": [{"host": e.host, "action": e.action, "ssh": bool(e.ssh), "by": e.email,
+                    "at": e.at} for e in events],
     }
 
 
 class EgressHostBody(BaseModel):
     host: str
+    # Also git over ssh (port 22). Explicit per entry, never implied by HTTPS.
+    # Posting an existing host with a different value changes just this.
+    ssh: bool = False
 
 
 @app.post("/api/admin/egress/hosts")
@@ -1486,11 +1489,11 @@ def add_admin_egress_host(body: EgressHostBody, user: User = Depends(require_adm
     """Allow a host for every run, from the next new connection: Squid asks
     the control plane per host, so nothing is reloaded."""
     try:
-        host = egress.add_host(session, user, body.host)
+        host = egress.add_host(session, user, body.host, ssh=body.ssh)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    logger.info("egress: %s added %s", user.email, host)
-    return {"ok": True, "host": host}
+    logger.info("egress: %s set %s (ssh %s)", user.email, host, "on" if body.ssh else "off")
+    return {"ok": True, "host": host, "ssh": body.ssh}
 
 
 @app.delete("/api/admin/egress/hosts/{host}")

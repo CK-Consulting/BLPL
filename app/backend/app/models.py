@@ -830,6 +830,10 @@ class EgressGrant(Base):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     hosts: Mapped[list] = mapped_column(JSON, default=list)
+    # Port 22 for these hosts only: the project's own ssh remote, on the one
+    # git operation that needs it. Everything else on port 22 is the shipped
+    # git-hosts.txt and administrators' entries marked for ssh.
+    ssh_hosts: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
@@ -847,6 +851,10 @@ class EgressHost(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     # A hostname, or a domain with a leading dot (Squid's dstdomain syntax).
     host: Mapped[str] = mapped_column(String(253), unique=True)
+    # HTTPS (443) always; git over ssh (22) only when an administrator said
+    # so for this entry. A gateway allowed for HTTPS is not thereby an ssh
+    # destination.
+    ssh: Mapped[bool] = mapped_column(Boolean, default=False)
     added_by: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
@@ -860,8 +868,10 @@ class EgressHostEvent(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     host: Mapped[str] = mapped_column(String(253))
-    # added | removed
+    # added | removed | changed
     action: Mapped[str] = mapped_column(String(8))
+    # Whether the entry allows git over ssh after this change.
+    ssh: Mapped[bool] = mapped_column(Boolean, default=False)
     user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
