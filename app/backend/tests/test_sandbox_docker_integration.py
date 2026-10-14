@@ -1518,3 +1518,61 @@ def test_the_storage_helpers_socket_is_usable_by_the_worker_only(env):
         c.close()
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+def test_phase4_a_pipeline_queued_without_the_mount_runs_in_a_run_container(env):
+    """Codex, PR #20: a backend without the project mount now queues runs.
+    The command it queues for the pipeline route (blpl.core.cli run over a
+    range, --continue-on-error) names the checkout by path only; the worker,
+    which has the mount, builds the run container and the stage runs there,
+    writing into the project on the host."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    from app.sandbox import jobs
+
+    projects = env.tmp / "projects"
+    project = f"itest-{env.tag}-pl"
+    proj = projects / project
+    proj.mkdir(parents=True)
+    (proj / "design.md").write_text("# Board\n")
+    for d in (env.tmp, projects):
+        os.chmod(d, 0o755)
+    os.chmod(proj, 0o777)
+    psock = str(env.tmp / "proxy.sock")
+    policy = ProxyPolicy(
+        verify_paths=True,
+        instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
+        project_bind_roots=(str(projects),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
+    )
+    # The worker's view: it keeps the mount.
+    cfg = jobs.WorkspaceRunConfig(image=WORKSPACE_IMAGE, projects_root=projects,
+                                  host_projects_root=str(projects))
+    # As run_pipeline queues it, with the image's interpreter for sys.executable.
+    cmd = ["/opt/blpl-venv/bin/python", "-m", "blpl.core.cli", "run",
+           "--project-dir", str(proj), "--from", "stage0", "--to", "stage0",
+           "--continue-on-error"]
+
+    async def poll():
+        return "running"
+
+    async def scenario():
+        upstream = UnixUpstream(SOCK)
+        server = await serve(DockerProxy(policy, upstream), psock)
+        driver = DockerDriver(env.config(f"unix://{psock}"))
+        lines: list[str] = []
+        try:
+            code = await jobs.run_job_in_container(
+                driver, cfg, project_name=project, run_id="run-pl", cmd=cmd,
+                env={"BLPL_SERVER_KEY": "k" * 44}, log=lines.append, poll=poll)
+            return code, "".join(lines)
+        finally:
+            await driver.aclose()
+            await upstream.aclose()
+            server.close()
+
+    code, out = asyncio.run(scenario())
+    assert code == 0, out
+    assert "stage0-det" in out, out
+    assert (proj / ".pipeline" / "design_artifact.deterministic.json").is_file()

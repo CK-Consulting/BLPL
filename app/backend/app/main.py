@@ -7156,7 +7156,11 @@ async def run_stage(
     """Run a pipeline stage, streaming its output to the browser as it happens."""
     if stage_name not in VALID_STAGES:
         raise HTTPException(status_code=400, detail=f"unknown stage {stage_name!r}")
-    proj = _project_dir(session, user, project_id)
+    # A launch needs only the checkout's path and its board list, both had
+    # through the agent with the agent path on; the run itself executes in a
+    # run container, so a backend without the project mount can queue it
+    # (Codex, PR #20).
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     try:
         env = _stage_env(
             session, user, master_key, stage_name,
@@ -7194,7 +7198,8 @@ async def build_release(project_id: str, user: User = Depends(require_onboarded)
     exports are kicad-cli. A release that depended on a model being reachable
     would be a release you could not cut in a hurry.
     """
-    proj = _project_dir(session, user, project_id)
+    # Nothing is read here: the run reads the project, in its run container.
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     cmd = [sys.executable, "-m", "blpl.core.release", "--project-dir", str(proj)]
     return _start_run(session, user, project_id, "release", cmd, dict(os.environ))
 
@@ -7311,7 +7316,7 @@ async def run_review_panel(
     order": a panel of one is just a review, and the value comes from members
     with different blind spots disagreeing.
     """
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     # Which board, before which model: not saying which board is a malformed
     # request, while having no provider configured is a deployment that needs
     # setting up. Answering the second when the first is also true sends people
@@ -7367,7 +7372,7 @@ async def run_pipeline(
         raise HTTPException(status_code=400, detail="from/to must be stage0…stage8")
     if _PIPELINE_STAGES.index(from_stage) > _PIPELINE_STAGES.index(to_stage):
         raise HTTPException(status_code=400, detail="from stage is after to stage")
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     # Every stage in the range resolves a board, so the range needs one too.
     # Without it "run the pipeline" is the one control on a multi-board project
     # that cannot work, while each stage individually can. Asked before the
@@ -7380,7 +7385,8 @@ async def run_pipeline(
     every_board = False
     if board == "all":
         try:
-            man = project_manifest.discover(proj)
+            man = (workspace_files.manifest(proj) if workspace_files.enabled()
+                   else project_manifest.discover(proj))
         except project_manifest.ManifestError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if man.implicit:
