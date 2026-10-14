@@ -25,6 +25,13 @@ from app.sandbox.agentclient import AgentCallError, AgentClient
 
 TOKEN = "t" * 64
 
+# A plain PDF quarantine releases: a link, an annotation, nothing that runs.
+_BENIGN_PDF = (
+    b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"3 0 obj<</Type/Annot/Subtype/Link/A<</S/URI/URI(https://ti.com)>>>>endobj\n"
+    b"trailer<</Root 1 0 R>>\n%%EOF\n"
+)
+
 
 @contextmanager
 def running_agent(roots: list[str], token: str = TOKEN):
@@ -297,6 +304,28 @@ def test_an_upload_refuses_a_linked_quarantine_directory(ag, projects):
         c.accept_upload(B(projects), b"x", original_name="a.txt", kind="reference",
                         uploaded_by="", mpn="", llm_ignore=False)
     assert e.value.status == 403
+    assert sorted(p.name for p in (projects / "victim").iterdir()) == ["secret.md"]
+
+
+@pytest.mark.parametrize("plant", ["datasheets/LM317.pdf", "retrieved/quarantine.json"])
+def test_an_upload_refuses_a_link_planted_at_a_name_quarantine_writes(ag, projects,
+                                                                      monkeypatch, plant):
+    """Codex, PR #20: the verb checked only that the directories were real, so
+    a link at a predictable file name inside one carried the upload, or the
+    ledger, wherever it pointed. Quarantine now refuses the link itself."""
+    pytest.importorskip("blpl.core.quarantine")
+    monkeypatch.setenv("BLPL_QUARANTINE_REQUIRE_SCAN", "0")
+    monkeypatch.delenv("BLPL_CLAMD_HOST", raising=False)
+    _, c, _ = ag
+    board = projects / "board"
+    target = projects / "victim" / "planted"
+    (board / plant).parent.mkdir(parents=True, exist_ok=True)
+    (board / plant).symlink_to(target)
+    with pytest.raises(AgentCallError) as e:
+        c.accept_upload(B(projects), _BENIGN_PDF, original_name="x.pdf",
+                        kind="datasheet", uploaded_by="", mpn="LM317", llm_ignore=False)
+    assert e.value.status == 403 and "link" in str(e.value)
+    assert not target.exists()
     assert sorted(p.name for p in (projects / "victim").iterdir()) == ["secret.md"]
 
 

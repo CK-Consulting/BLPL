@@ -4915,17 +4915,23 @@ async def upload_files(
                     source=pdf_verdicts.UPLOAD, user_id=user.id,
                 )
 
-        with quarantine.recording_verdicts(record_member):
-            rec = quarantine.accept_upload(
-                data,
-                proj,
-                original_name=name,
-                kind=spec["kind"],
-                uploaded_by=who,
-                mpn=str(spec.get("mpn") or "").strip(),
-                llm_ignore=bool(spec.get("llm_ignore")),
-                library=str(spec.get("library") or ""),
-            )
+        try:
+            with quarantine.recording_verdicts(record_member):
+                rec = quarantine.accept_upload(
+                    data,
+                    proj,
+                    original_name=name,
+                    kind=spec["kind"],
+                    uploaded_by=who,
+                    mpn=str(spec.get("mpn") or "").strip(),
+                    llm_ignore=bool(spec.get("llm_ignore")),
+                    library=str(spec.get("library") or ""),
+                )
+        except quarantine.LinkRefused as exc:
+            # A link where quarantine would write: nothing was written.
+            results.append({"name": name, "state": "rejected", "path": None,
+                            "reasons": [str(exc)]})
+            continue
         if quarantine.looks_like_pdf(data):
             # This backend just inspected these bytes, so its finding is the
             # verdict the blob route renders by, held or not.
@@ -5064,7 +5070,11 @@ def get_quarantine(
     proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     if workspace_files.enabled():
         return workspace_files.quarantine_view(proj)
-    return {"summary": quarantine.summary(proj), "entries": list(reversed(quarantine.ledger(proj)))[:500]}
+    try:
+        return {"summary": quarantine.summary(proj),
+                "entries": list(reversed(quarantine.ledger(proj)))[:500]}
+    except quarantine.LinkRefused as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 class LlmIgnoreBody(BaseModel):

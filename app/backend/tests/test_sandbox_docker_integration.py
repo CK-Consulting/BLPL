@@ -33,6 +33,13 @@ IMAGE = os.environ.get("BLPL_TEST_DOCKER_IMAGE", "alpine:latest")
 # Run the whole file under gVisor with BLPL_SANDBOX_RUNTIME=runsc.
 RUNTIME = os.environ.get("BLPL_SANDBOX_RUNTIME") or None
 
+# A plain PDF quarantine releases: a link, an annotation, nothing that runs.
+_BENIGN_PDF = (
+    b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"3 0 obj<</Type/Annot/Subtype/Link/A<</S/URI/URI(https://ti.com)>>>>endobj\n"
+    b"trailer<</Root 1 0 R>>\n%%EOF\n"
+)
+
 
 def _daemon_ready() -> str | None:
     if not os.path.exists(SOCK):
@@ -1291,6 +1298,24 @@ def test_phase4_a_backend_without_the_mount_reaches_a_project_through_its_worksp
                 c.write(co, "design.md", b"# Board\n")
                 assert c.read(co, "design.md") == b"# Board\n"
                 assert "design.md" in json.dumps(c.list(co))
+                # Links a run could plant at names quarantine writes, each at
+                # the checkout's own design.md: refused, under this runtime,
+                # with nothing written through them (Codex, PR #20).
+                from app.sandbox.agentclient import AgentCallError
+
+                for planted, kind, mpn in (("datasheets/LM317.pdf", "datasheet", "LM317"),
+                                           ("retrieved/quarantine.json", "reference", "")):
+                    (proj / planted).parent.mkdir(exist_ok=True)
+                    # The ledger is there already: the refused release above
+                    # was recorded, as every retrieval is.
+                    (proj / planted).unlink(missing_ok=True)
+                    (proj / planted).symlink_to("../design.md")
+                    with pytest.raises(AgentCallError) as e:
+                        c.accept_upload(co, _BENIGN_PDF, original_name="x.pdf",
+                                        kind=kind, uploaded_by="", mpn=mpn, llm_ignore=False)
+                    assert e.value.status == 403, (planted, e.value)
+                    assert (proj / "design.md").read_bytes() == b"# Board\n", planted
+                    (proj / planted).unlink()
                 up = c.accept_upload(co, b"vendor notes\n", original_name="notes.txt",
                                      kind="reference", uploaded_by="ada@example.com",
                                      mpn="", llm_ignore=False)
