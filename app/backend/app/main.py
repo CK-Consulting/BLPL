@@ -3839,49 +3839,61 @@ def get_blob(
                 "X-BLPL-Quarantined": "1",
             },
         )
-    body, head = _read_once(target, UPLOAD_MAX_BYTES)
-    if quarantine.looks_like_pdf(head):
-        if body is None:
-            # Too big to hold and hash, so never judged and never inline. An
-            # attachment is safe whatever the bytes turn out to be.
-            return FileResponse(
-                target,
-                media_type="application/octet-stream",
-                headers=_opaque_headers(target.name, "too_large"),
+    fh, size, head = _open_once(target)
+    try:
+        if not quarantine.looks_like_pdf(head):
+            media_type, inline = _blob_disposition(target)
+            # Streamed from the descriptor that was classified. Not a PDF when
+            # it was looked at, and the type sent is chosen by name from a list
+            # with no PDF in it, so bytes rewritten mid-stream still cannot
+            # reach the viewer.
+            return _stream_response(fh, media_type, {
+                # Always: without it the browser may sniff a text file into HTML.
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": _disposition(
+                    "inline" if inline else "attachment", target.name
+                ),
+                # Nothing served from here is a page. Should a browser ever
+                # render one as a document anyway, it runs no script and loads
+                # nothing.
+                "Content-Security-Policy": _INERT_CSP,
+            })
+        if size > UPLOAD_MAX_BYTES:
+            # Too big to judge, so never inline. An attachment is safe whatever
+            # the bytes turn out to be.
+            return _stream_response(
+                fh, "application/octet-stream", _opaque_headers(target.name, "too_large")
             )
-        project = _project_or_404(session, user, project_id)
-        verdict = pdf_verdicts.lookup(session, project.id, _sha256(body), proj)
-        if pdf_verdicts.renders_inline(verdict):
-            return Response(
-                content=body,
-                media_type="application/pdf",
-                headers={
-                    "X-Content-Type-Options": "nosniff",
-                    "Content-Disposition": _disposition("inline", target.name),
-                    "X-BLPL-PDF-Verdict": verdict.verdict,
-                },
-            )
-        return Response(
-            content=body,
-            media_type="application/octet-stream",
-            headers=_opaque_headers(target.name, verdict.verdict if verdict else "none"),
-        )
+        spool, digest, total = _spool_and_hash(fh)
+    except BaseException:
+        fh.close()
+        raise
+    fh.close()
+    try:
+        verdict = None
+        if total <= UPLOAD_MAX_BYTES:
+            project = _project_or_404(session, user, project_id)
+            verdict = pdf_verdicts.lookup(session, project.id, digest, proj)
+    except BaseException:
+        spool.close()
+        raise
+    return _pdf_response(spool, total, target.name, verdict)
 
-    media_type, inline = _blob_disposition(target)
-    headers = {
-        # Always: without it the browser may sniff a text file into HTML.
-        "X-Content-Type-Options": "nosniff",
-        "Content-Disposition": _disposition("inline" if inline else "attachment", target.name),
-        # Nothing served from here is a page. Should a browser ever render one
-        # as a document anyway, it runs no script and loads nothing.
-        "Content-Security-Policy": _INERT_CSP,
-    }
-    if body is None:
-        # Not a PDF when it was looked at, and the type sent is chosen by name
-        # from a list with no PDF in it, so a file swapped in before the reopen
-        # still cannot reach the viewer.
-        return FileResponse(target, media_type=media_type, headers=headers)
-    return Response(content=body, media_type=media_type, headers=headers)
+
+def _pdf_response(spool, total: int, name: str, verdict) -> Response:
+    """Send exactly the bytes that were hashed, inline only on a clean verdict."""
+    headers = {"Content-Length": str(total)}
+    if pdf_verdicts.renders_inline(verdict):
+        return _stream_response(spool, "application/pdf", {
+            **headers,
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": _disposition("inline", name),
+            "X-BLPL-PDF-Verdict": verdict.verdict,
+        })
+    return _stream_response(spool, "application/octet-stream", {
+        **headers,
+        **_opaque_headers(name, verdict.verdict if verdict else "none"),
+    })
 
 
 # For every response that is not a clean PDF. `sandbox` with no allowances
@@ -3922,12 +3934,19 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _read_once(target: Path, cap: int) -> tuple[bytes | None, bytes]:
-    """The file's bytes (None if over ``cap``) and its first kilobyte.
+# How much of a file is read at a time, and how much of a PDF being judged is
+# held in memory before its copy moves to disk.
+_CHUNK = 256 * 1024
+_SPOOL_IN_MEMORY = 8 * 1024 * 1024
 
-    One descriptor, opened without following a link, checked to be a regular
-    file on that descriptor and read from it. The caller judges and sends the
-    buffer this returns, never the path again.
+
+def _open_once(target: Path):
+    """An open file, its size, and its first kilobyte, positioned at the start.
+
+    One descriptor, opened without following a link and checked to be a
+    regular file on that descriptor. Everything after this reads from it,
+    never from the path again. Nothing is read beyond the first kilobyte here:
+    whether the rest has to be hashed depends on what that kilobyte is.
     """
     import stat
 
@@ -3936,18 +3955,68 @@ def _read_once(target: Path, cap: int) -> tuple[bytes | None, bytes]:
         fd = os.open(target, flags)
     except OSError:
         raise HTTPException(status_code=404, detail=f"{target.name} is not a file in this project")
-    with os.fdopen(fd, "rb") as fh:
+    fh = os.fdopen(fd, "rb")
+    try:
         info = os.fstat(fh.fileno())
         if not stat.S_ISREG(info.st_mode):
             raise HTTPException(status_code=404, detail=f"{target.name} is not a file in this project")
-        if info.st_size > cap:
-            return None, fh.read(1024)
-        # One byte past the cap, so a file that grew since the fstat is
-        # caught rather than truncated into a different hash.
-        data = fh.read(cap + 1)
-    if len(data) > cap:
-        return None, data[:1024]
-    return data, data[:1024]
+        head = fh.read(1024)
+        fh.seek(0)
+    except BaseException:
+        fh.close()
+        raise
+    return fh, info.st_size, head
+
+
+def _spool_and_hash(fh):
+    """Copy the open file to a private spool, hashing as it goes.
+
+    The spool, not the file, is what gets sent: a file rewritten in place
+    after it was hashed would otherwise go out under the verdict of the bytes
+    it replaced. Small files stay in memory; larger ones move to a temporary
+    file of the backend's own, so a 100 MB PDF costs disk, not RAM. Returns the
+    spool (rewound), the hex digest and the byte count.
+    """
+    import hashlib
+    import tempfile
+
+    spool = tempfile.SpooledTemporaryFile(max_size=_SPOOL_IN_MEMORY)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        while chunk := fh.read(_CHUNK):
+            digest.update(chunk)
+            spool.write(chunk)
+            total += len(chunk)
+        spool.seek(0)
+    except BaseException:
+        spool.close()
+        raise
+    return spool, digest.hexdigest(), total
+
+
+def _hash_open_file(fh) -> tuple[str, int]:
+    import hashlib
+
+    digest = hashlib.sha256()
+    total = 0
+    while chunk := fh.read(_CHUNK):
+        digest.update(chunk)
+        total += len(chunk)
+    return digest.hexdigest(), total
+
+
+def _stream_response(fh, media_type: str, headers: dict) -> StreamingResponse:
+    """Stream an already-open file in chunks, closing it when done or abandoned."""
+
+    def body():
+        try:
+            while chunk := fh.read(_CHUNK):
+                yield chunk
+        finally:
+            fh.close()
+
+    return StreamingResponse(body(), media_type=media_type, headers=headers)
 
 
 class BlobPath(BaseModel):
@@ -3956,15 +4025,19 @@ class BlobPath(BaseModel):
 
 def _verdict_view(proj: Path, session: Session, user: User, project_id: str, path: str) -> dict:
     target = _tree_target(proj, path)
-    body, head = _read_once(target, UPLOAD_MAX_BYTES)
+    fh, size, head = _open_once(target)
+    with fh:
+        pdf = quarantine.looks_like_pdf(head)
+        # Only a PDF is hashed, in pieces; the hash is all this needs.
+        digest, total = _hash_open_file(fh) if pdf and size <= UPLOAD_MAX_BYTES else (None, size)
     out = {
         "path": path,
-        "pdf": quarantine.looks_like_pdf(head),
+        "pdf": pdf,
         "quarantined": _is_quarantined(proj, target),
-        "too_large": body is None,
-        "sha256": _sha256(body) if body is not None else None,
+        "too_large": total > UPLOAD_MAX_BYTES,
+        "sha256": digest if total <= UPLOAD_MAX_BYTES else None,
     }
-    if not out["pdf"] or body is None:
+    if not out["pdf"] or out["too_large"]:
         return {**out, **pdf_verdicts.describe(None)}
     project = _project_or_404(session, user, project_id)
     row = pdf_verdicts.lookup(session, project.id, out["sha256"], proj)
@@ -4011,7 +4084,16 @@ def inspect_blob(
     """
     proj = _project_dir(session, user, project_id)
     target = _tree_target(proj, payload.path)
-    body, head = _read_once(target, UPLOAD_MAX_BYTES)
+    fh, size, head = _open_once(target)
+    with fh:
+        # The whole file, because pdf_inspect and the scanner take bytes. Only
+        # for a PDF within the cap, on request, and read once from the same
+        # descriptor; one byte past the cap catches a file that grew.
+        body = None
+        if quarantine.looks_like_pdf(head) and size <= UPLOAD_MAX_BYTES:
+            body = fh.read(UPLOAD_MAX_BYTES + 1)
+    if body is not None and len(body) > UPLOAD_MAX_BYTES:
+        body = None
     if not quarantine.looks_like_pdf(head):
         raise HTTPException(
             status_code=400,
@@ -5744,39 +5826,26 @@ def get_attachment(
     # The same rule as the blob route: the bytes being sent decide, read once.
     # The store only ever wrote PNG, JPEG, GIF, WebP or PDF, but it sits in the
     # checkout's .blpl/, and its file names are not proof of what is in them.
-    body, head = _read_once(path, attachments.MAX_DOCUMENT_BYTES)
-    if body is None:
-        return FileResponse(path, media_type="application/octet-stream",
-                            headers=_opaque_headers(path.name, "too_large"))
-    if quarantine.looks_like_pdf(head):
-        project = _project_or_404(session, user, project_id)
-        verdict = pdf_verdicts.find(session, project.id, _sha256(body))
-        if pdf_verdicts.renders_inline(verdict):
-            return Response(
-                content=body,
-                media_type="application/pdf",
-                headers={
-                    "X-Content-Type-Options": "nosniff",
-                    "Content-Disposition": _disposition("inline", attachments.name_of(path)),
-                    "X-BLPL-PDF-Verdict": verdict.verdict,
-                },
-            )
-        return Response(
-            content=body,
-            media_type="application/octet-stream",
-            headers=_opaque_headers(attachments.name_of(path), verdict.verdict if verdict else "none"),
-        )
-    media_type = attachments.media_type_of(path)
-    if media_type not in attachments.SUPPORTED_TYPES or media_type == "application/pdf":
-        media_type = "application/octet-stream"
-    return Response(
-        content=body,
-        media_type=media_type,
-        headers={
+    fh, size, head = _open_once(path)
+    if not quarantine.looks_like_pdf(head):
+        media_type = attachments.media_type_of(path)
+        if media_type not in attachments.SUPPORTED_TYPES or media_type == "application/pdf":
+            media_type = "application/octet-stream"
+        return _stream_response(fh, media_type, {
             "X-Content-Type-Options": "nosniff",
             "Content-Security-Policy": _INERT_CSP,
-        },
-    )
+        })
+    try:
+        spool, digest, total = _spool_and_hash(fh)
+    finally:
+        fh.close()
+    try:
+        project = _project_or_404(session, user, project_id)
+        verdict = pdf_verdicts.find(session, project.id, digest)
+    except BaseException:
+        spool.close()
+        raise
+    return _pdf_response(spool, total, attachments.name_of(path), verdict)
 
 
 class ChatInput(BaseModel):

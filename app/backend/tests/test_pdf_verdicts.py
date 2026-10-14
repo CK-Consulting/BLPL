@@ -412,3 +412,83 @@ def test_one_no_scanner_looked_at_still_downloads(chat_client, monkeypatch, tmp_
     r = _blob(chat_client, rel)
     assert _opaque(r)
     assert r.headers["x-blpl-pdf-verdict"] == "unscanned"
+
+
+# -- what the route holds in memory ----------------------------------------------
+
+
+class _ReadSpy:
+    """Wraps every file object os.fdopen hands out and records each read size."""
+
+    def __init__(self, monkeypatch):
+        import os as _os
+
+        self.sizes: list[int] = []
+        real = _os.fdopen
+        spy = self
+
+        class Recording:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def read(self, n=-1):
+                spy.sizes.append(n)
+                return self._fh.read(n)
+
+            def __getattr__(self, name):
+                return getattr(self._fh, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._fh.close()
+
+        monkeypatch.setattr(_os, "fdopen", lambda fd, *a, **kw: Recording(real(fd, *a, **kw)))
+
+
+def test_a_large_non_pdf_is_streamed_not_read_whole(unlocked, monkeypatch):
+    """Codex, PR #21: every blob was read whole before it was classified, so a
+    90 MB archive sat in memory twice over. Only a PDF has to be hashed."""
+    proj = _project(unlocked)
+    big = b"PK\x03\x04" + b"\x00" * (3 * 1024 * 1024)
+    (proj / "gerbers.zip").write_bytes(big)
+    spy = _ReadSpy(monkeypatch)
+    r = _blob(unlocked, "gerbers.zip")
+    assert r.status_code == 200 and r.content == big
+    assert spy.sizes, "the route no longer reads through os.fdopen; this test measures nothing"
+    assert all(0 < n <= 1024 * 1024 for n in spy.sizes), spy.sizes
+
+
+def test_a_large_pdf_is_hashed_in_pieces_too(unlocked, monkeypatch):
+    proj = _project(unlocked)
+    big = BENIGN + b"%" + b"x" * (3 * 1024 * 1024) + b"\n"
+    _commit(proj, "big.pdf", big)
+    spy = _ReadSpy(monkeypatch)
+    r = _blob(unlocked, "big.pdf")
+    assert r.content == big and _opaque(r)
+    assert all(0 < n <= 1024 * 1024 for n in spy.sizes), spy.sizes
+
+
+def test_bytes_changed_in_place_after_judging_are_not_what_is_sent(unlocked, monkeypatch):
+    """The verdict is for the bytes that were hashed; those are the bytes sent,
+    even if the file is rewritten in place between the lookup and the send."""
+    import app.main as main
+
+    proj = _project(unlocked)
+    _commit(proj, "a.pdf", BENIGN)
+    unlocked.post("/api/projects/scratch/blob/inspect", json={"path": "a.pdf"})
+
+    real = main.pdf_verdicts.lookup
+    swapped = PHONES_HOME[: len(BENIGN)].ljust(len(BENIGN), b" ")
+
+    def lookup_then_overwrite(*a, **kw):
+        row = real(*a, **kw)
+        with open(proj / "a.pdf", "r+b") as fh:
+            fh.write(swapped)
+        return row
+
+    monkeypatch.setattr(main.pdf_verdicts, "lookup", lookup_then_overwrite)
+    r = _blob(unlocked, "a.pdf")
+    assert _inline(r)
+    assert r.content == BENIGN
