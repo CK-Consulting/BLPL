@@ -12,6 +12,7 @@ import { NewProject, ProjectSettings, ProjectSync } from "./components/ProjectCo
 import { FileView, type SaveHandle, useUnsavedGuard } from "./components/FileView";
 import { LaunchKicad } from "./components/LaunchKicad";
 import { KicadFileView } from "./components/KicadFileView";
+import { PdfView } from "./components/PdfView";
 import { Reports } from "./components/Reports";
 import { BomTable } from "./components/BomTable";
 import { LifecycleTable } from "./components/LifecycleTable";
@@ -298,6 +299,12 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                         } else if (where === "kicad") {
                           setOpenFile(n);
                           setTab("kicad");
+                        } else if (where === "pdf") {
+                          // Not window.open: whether it may render is the
+                          // server's call on the bytes, and the pane says
+                          // what that call was before anything opens.
+                          setOpenFile(n);
+                          setTab("edit");
                         } else {
                           window.open(
                             `/api/projects/${selected}/blob?path=${encodeURIComponent(n.path)}`,
@@ -364,7 +371,10 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
               {tab === "preflight" && (
                 <Preflight projectId={selected} board={board} reloadToken={reloadToken} />
               )}
-              {tab === "edit" && (
+              {tab === "edit" && openFile && destinationFor(openFile) === "pdf" && (
+                <PdfView projectId={selected} path={openFile.path} />
+              )}
+              {tab === "edit" && !(openFile && destinationFor(openFile) === "pdf") && (
                 <FileView
                   projectId={selected}
                   onSaved={refresh}

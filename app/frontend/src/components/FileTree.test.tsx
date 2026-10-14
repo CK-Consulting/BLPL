@@ -149,8 +149,14 @@ describe("where a click lands", () => {
   it("sends text to the pane and everything else to the browser", () => {
     expect(destinationFor(node("a.md"))).toBe("text");
     expect(destinationFor(node("a.json"))).toBe("text");
-    expect(destinationFor(node("a.pdf"))).toBe("browser");
     expect(destinationFor(node("a.step"))).toBe("browser");
+  });
+
+  it("sends a PDF to the pane that says whether it may open, never straight to the browser", () => {
+    // Straight to the browser was window.open on the raw file: a PDF nobody
+    // had inspected rendered, or downloaded, with no word about which or why.
+    expect(destinationFor(node("a.pdf"))).toBe("pdf");
+    expect(destinationFor(node("Datasheet.PDF"))).toBe("pdf");
   });
 
   it("treats a small extensionless file as text and a large one as a blob", () => {
