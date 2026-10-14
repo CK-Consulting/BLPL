@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getJSON, postJSON } from "../api";
 
 /**
@@ -38,11 +38,21 @@ export function PdfView({ projectId, path }: { projectId: string; path: string }
   const [verdict, setVerdict] = useState<BlobVerdict | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Which file the pane shows now, read when an answer lands. Codex, PR #21:
+  // inspecting A and then selecting B before the POST returned put A's clean
+  // verdict on B, offering "Open PDF" for a file nobody had inspected. The
+  // closure's `path` is A's, so it cannot answer "is this still current";
+  // only a ref read at arrival can.
+  const shown = useRef(`${projectId}\u0000${path}`);
+  shown.current = `${projectId}\u0000${path}`;
 
   useEffect(() => {
     let cancelled = false;
     setVerdict(null);
     setError(null);
+    // An inspection of the previous file may still be out; its button state
+    // is not this file's.
+    setBusy(false);
     getJSON<BlobVerdict>(
       `/api/projects/${projectId}/blob/verdict?path=${encodeURIComponent(path)}`,
     )
@@ -58,16 +68,19 @@ export function PdfView({ projectId, path }: { projectId: string; path: string }
   }, [projectId, path]);
 
   const inspect = async () => {
+    const asked = `${projectId}\u0000${path}`;
+    const current = () => shown.current === asked;
     setBusy(true);
     setError(null);
     try {
       const v = await postJSON<BlobVerdict>(`/api/projects/${projectId}/blob/inspect`, { path });
-      // The pane may be on another file by the time the answer lands.
-      if (v.path === path) setVerdict(v);
+      // Both checks: the pane must still show the file that was asked about,
+      // and the answer must be about that file.
+      if (current() && v.path === path) setVerdict(v);
     } catch (e) {
-      setError((e as Error).message);
+      if (current()) setError((e as Error).message);
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   };
 
