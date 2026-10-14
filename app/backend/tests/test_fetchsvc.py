@@ -308,3 +308,72 @@ def test_the_service_answers_429_beyond_its_limit(tmp_path):
         server.shutdown()
         server.server_close()
 
+
+
+def test_a_slot_is_held_through_assessment_not_only_the_download(tmp_path, monkeypatch):
+    """Codex, PR #20: the slot was given back when the download finished, so
+    a run could keep assessments (PDF parsing, a scan that can wait 30 s)
+    going without bound. Two of one run's fetches are being assessed; its
+    third is refused."""
+    import base64
+    import json
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+
+    release = threading.Event()
+    assessing = []
+    real = fetchsvc.assess
+
+    def slow_assess(project, got, held_root):
+        assessing.append(1)
+        release.wait(10)
+        return real(project, got, held_root)
+
+    monkeypatch.setattr(fetchsvc, "assess", slow_assess)
+    SITES["vendor.example"] = (200, {}, BENIGN)
+    server = fetchsvc.serve("127.0.0.1:0", tmp_path / "held", authenticate=lambda u, p: "board",
+                            resolve=resolve, connections=CONN,
+                            slots=fetchsvc.Slots(total=8, per_run=2))
+
+    def post():
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/fetch", method="POST",
+            data=json.dumps({"url": "https://vendor.example/ds.pdf"}).encode(),
+            headers={"Authorization": "Basic " + base64.b64encode(b"g-run:t").decode(),
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req) as r:
+                return r.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    try:
+        done: list[int] = []
+        threads = [threading.Thread(target=lambda: done.append(post())) for _ in range(2)]
+        for t in threads:
+            t.start()
+        deadline = time.monotonic() + 5
+        while len(assessing) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(assessing) == 2, "both fetches should be in assessment"
+        assert post() == 429
+        release.set()
+        for t in threads:
+            t.join(10)
+        assert done == [200, 200]
+        assert post() == 200  # slots come back once assessment is done
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_held_evidence_is_bounded_per_project(tmp_path, monkeypatch):
+    monkeypatch.setattr(fetchsvc, "HELD_MAX_BYTES", len(PHONES_HOME) + 10)
+    held = tmp_path / "held"
+    s1, v1, _ = fetchsvc.assess("board", fetchsvc.Download("u", PHONES_HOME), held)
+    s2, v2, _ = fetchsvc.assess("board", fetchsvc.Download("u", PHONES_HOME + b"%x\n"), held)
+    assert s1 == s2 == 422 and v1["held"] and v2["held"]
+    assert len(list((held / "board").glob("*.pdf"))) == 1  # the second was held, not kept
