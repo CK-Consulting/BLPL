@@ -873,6 +873,37 @@ sealing in a container, storage with limits.**
   poll raised was left running, unmarked, while the row said it had ended.
   Every exit from the run, workspace-run and agent-run monitors now stops the
   run and waits for it before returning.
+- **A run mounts only its invoker's checkout.** Every member's worktree went
+  read-write into every run container, so one member's stage could read,
+  rewrite or delete another member's uncommitted work.
+  - A run now mounts only the owner's checkout (for the owner's runs) or the
+    invoking member's worktree, plus the owner's `.git` and that member's
+    gitfile, both read-only.
+  - The worker derives the member from the run's row and the project's owner.
+  - The socket proxy enforces this from the container's `blpl.checkout` label.
+    A run may bind only that checkout read-write, and only that member's
+    gitfile.
+  - Audit of the other roles:
+    - The workspace container keeps every member's worktree, because its agent
+      serves every member. Since the agent was gated, no stage runs there, and
+      the agent refuses runs.
+    - The sealer mounts the projects root by design, holds only the key, and
+      runs only seal or unseal.
+    - Remaining: a phase-2 run without `BLPL_RUNS_IN_CONTAINER=1` and without
+      the agent still execs in the shared workspace container, with all its
+      mounts. Turn on run containers, which the agent path already forces.
+- **The fetch service has a deadline and a limit.** A fetch is streamed under
+  one monotonic deadline (`BLPL_FETCH_DEADLINE_S`, 120 s) and the size cap is
+  enforced as bytes arrive, so a server that trickles a byte per socket
+  timeout is cut off. At most `BLPL_FETCH_MAX_CONCURRENT` (8) fetches run at
+  once, and at most `BLPL_FETCH_MAX_PER_RUN` (2) per run; beyond either, the
+  answer is 429. It is the only outbound read the control plane makes on a
+  run's behalf. Model listing in Settings is the user's own request.
+- **Credentials and member removal without the mount.** The project
+  credential routes read the remote through the agent, as pull and push do;
+  they answered 503 without the mount. Removing a member removes their
+  worktree through the agent (`/worktree/remove`). It saw no checkout
+  through the mask, and left their uncommitted work on disk.
 - **A retry follows only a run that started.** A worker that died between
   create and start left a `created` container. Docker reports StartedAt at
   its zero time and ExitCode 0 for it, and the retry followed it and recorded
