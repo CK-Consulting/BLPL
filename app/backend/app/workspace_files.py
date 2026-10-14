@@ -226,14 +226,42 @@ def _connect(checkout: Path) -> AgentClient:
 
 
 @contextmanager
-def agent(checkout: Path) -> Iterator[AgentClient]:
-    client = _connect(checkout)
+def gated(checkout: Path) -> Iterator[None]:
+    """The project's gate (sandbox/gate.py), shared, for one whole operation
+    through the agent: the start, the call, and anything done under it.
+
+    Holding it only while the workspace started let a seal take the gate
+    between the start and the operation, stop the workspace and archive a
+    half-written file or a git index.lock (Codex, PR #20). A seal waits a few
+    seconds for operations in flight, then reports busy and is retried.
+
+    Taken again by the start inside (Access.ensure) on another descriptor:
+    flock grants a second shared lock while one is held, and a seal never
+    queues for the exclusive lock in the kernel (it polls), so a shared
+    holder is never stuck behind one. Nothing that holds it seals.
+    """
+    from . import main as m
+    from .sandbox import gate
+
     try:
-        yield client
-    except AgentCallError as exc:
-        raise HTTPException(status_code=_status(exc), detail=str(exc)) from exc
-    finally:
-        client.close()
+        with gate.held(m.PROJECTS_ROOT, project_of(checkout), exclusive=False,
+                       wait_s=gate.START_WAIT_S):
+            yield
+    except gate.GateBusy as exc:
+        raise HTTPException(status_code=503,
+                            detail=f"the project is being sealed or opened: {exc}") from exc
+
+
+@contextmanager
+def agent(checkout: Path) -> Iterator[AgentClient]:
+    with gated(checkout):
+        client = _connect(checkout)
+        try:
+            yield client
+        except AgentCallError as exc:
+            raise HTTPException(status_code=_status(exc), detail=str(exc)) from exc
+        finally:
+            client.close()
 
 
 def _status(exc: AgentCallError) -> int:
@@ -388,13 +416,13 @@ async def accept_upload(checkout: Path, data: bytes, **meta: Any) -> dict:
     # or one that cannot reach the scanner, then holds rather than releases.
     if requires_scan(os.environ):
         meta["require_scan"] = "1"
-    client = await asyncio.to_thread(_connect, checkout)
-    try:
-        return await asyncio.to_thread(client.accept_upload, str(checkout), data, **meta)
-    except AgentCallError as exc:
-        raise HTTPException(status_code=_status(exc), detail=str(exc)) from exc
-    finally:
-        client.close()
+    def upload() -> dict:
+        # In one thread, so the gate is held for the whole upload: an flock
+        # belongs to the descriptor, and the context opens and closes it here.
+        with agent(checkout) as c:
+            return c.accept_upload(str(checkout), data, **meta)
+
+    return await asyncio.to_thread(upload)
 
 
 # -- git ---------------------------------------------------------------------------
@@ -485,41 +513,47 @@ class _AgentProjects:
     """
 
     @staticmethod
-    def _client(checkout: Path) -> AgentClient:
+    @contextmanager
+    def _client(checkout: Path) -> Iterator[AgentClient]:
+        """A client, under the project's gate for the whole operation."""
         try:
-            return _connect(checkout)
+            with gated(checkout):
+                c = _connect(checkout)
+                try:
+                    yield c
+                finally:
+                    c.close()
         except HTTPException as exc:
             raise ProjectError(str(exc.detail)) from exc
 
     def push(self, name: str, *, env: dict[str, str] | None = None,
              checkout: Path, url: str | None = None, after=None) -> str:
-        c = self._client(checkout)
+        with self._client(checkout) as c:
+            return self._push(c, checkout, env, url, after)
+
+    def _push(self, c: AgentClient, checkout: Path, env, url, after) -> str:
         try:
-            try:
-                with _git_proxy(checkout) as proxy:
-                    r = c.git_push_held(str(checkout), url or "", _cred(env), proxy)
-            except AgentCallError as exc:
-                raise ProjectError(str(exc)) from exc
-            exc = ProjectError(r["error"]) if r.get("error") is not None else None
-            lease = r.get("lease")
-            if lease is None:
-                # The lock was never had, so nothing ran and nothing is
-                # recorded under it, exactly as Projects.push raising busy.
-                raise exc or ProjectError("the origin lock could not be taken")
-            try:
-                if after is not None:
-                    after(exc)
-            finally:
-                c.git_release(lease)
-            if exc is not None:
-                raise exc
-            return r["output"]
+            with _git_proxy(checkout) as proxy:
+                r = c.git_push_held(str(checkout), url or "", _cred(env), proxy)
+        except AgentCallError as exc:
+            raise ProjectError(str(exc)) from exc
+        exc = ProjectError(r["error"]) if r.get("error") is not None else None
+        lease = r.get("lease")
+        if lease is None:
+            # The lock was never had, so nothing ran and nothing is
+            # recorded under it, exactly as Projects.push raising busy.
+            raise exc or ProjectError("the origin lock could not be taken")
+        try:
+            if after is not None:
+                after(exc)
         finally:
-            c.close()
+            c.git_release(lease)
+        if exc is not None:
+            raise exc
+        return r["output"]
 
     def under_remote_lock(self, checkout: Path, fn):
-        c = self._client(checkout)
-        try:
+        with self._client(checkout) as c:
             r = c.git_hold(str(checkout))
             if r.get("lease") is None:
                 raise ProjectError(r.get("error") or "the origin lock could not be taken")
@@ -527,8 +561,6 @@ class _AgentProjects:
                 return fn()
             finally:
                 c.git_release(r["lease"])
-        finally:
-            c.close()
 
 
 AGENT_PROJECTS = _AgentProjects()
