@@ -14,9 +14,9 @@ generated symbols and KiCad's stock libraries:
 
 The first two are exactly what ``symbol_resolution`` and ``loaders`` search, and
 Stage 6 writes the lib tables from the same roots, so nothing here has to touch
-a ``sym-lib-table``. The third mirrors KiCad's own ``<Lib>.3dshapes`` layout;
-the pipeline references no model location, so a footprint's ``(model ...)`` path
-is left exactly as its vendor wrote it.
+a ``sym-lib-table``. The third mirrors KiCad's own ``<Lib>.3dshapes`` layout,
+and is connected to footprints by path rather than by a table: see
+``MODEL_PATH_PREFIX``.
 
 This module only places. It runs *after* quarantine has decided the bytes may
 be released, and it never weakens that: a file that does not parse, is the
@@ -219,6 +219,87 @@ class Placed:
     paths: list[str]
     names: list[str] = field(default_factory=list)
     note: str = ""
+    # Existing library files changed to point at what was placed.
+    relinked: list[str] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- 3D links
+
+# How a footprint names a model uploaded into this project. Stage 6 always
+# writes the .kicad_pro into <project>/.pipeline/, so ${KIPRJMOD} is that
+# directory in every place the board is opened — kicad-cli in the pipeline,
+# the KiCad desktop, a clone on someone's laptop — and one level up is the
+# project. A path variable of our own would have to be configured in each of
+# those separately, and a vendor's archive-relative "PCM12SMTBR.stp" resolves
+# in none of them.
+MODEL_PATH_PREFIX = "${KIPRJMOD}/../" + MODELS_DIR
+
+
+def _model_stem(path: str) -> str:
+    """The key a model is matched on: its file stem, sanitised the way a stored
+    model's name is, case-folded. The extension is not part of it, because
+    vendors pair a .wrl reference with a .step file as often as not."""
+    base = re.split(r"[\\/]", path)[-1]
+    return (re.sub(r"[^A-Za-z0-9._+-]+", "_", PurePosixPath(base).stem).strip("._-")[:96] or "model").lower()
+
+
+def _stored_models(project_dir: Path, library: str) -> dict[str, list[str]]:
+    """Models already in ``<Lib>.3dshapes``: stem key -> file names."""
+    shapes = project_dir / MODELS_DIR / f"{library}.3dshapes"
+    out: dict[str, list[str]] = {}
+    if shapes.is_dir():
+        for f in sorted(shapes.iterdir()):
+            if f.suffix.lower() in MODEL_SUFFIXES:
+                out.setdefault(_model_stem(f.name), []).append(f.name)
+    return out
+
+
+def _links_elsewhere(raw: str) -> bool:
+    """A model path that already resolves somewhere it was meant to: a KiCad
+    path variable (the stock models) or a project-relative one. Left alone."""
+    return raw.startswith(("${KICAD", "$(KICAD", "${KIPRJMOD}", "$(KIPRJMOD)"))
+
+
+def _relink(node: list, library: str, models: dict[str, list[str]]) -> list[tuple[str, str]]:
+    """Point this footprint's ``(model ...)`` children at uploaded models, in place.
+
+    Only a reference whose file is among ``models`` changes, and never one that
+    already goes through a path variable. Returns (old, new) per change.
+    """
+    changed = []
+    for child in sexpr.find_all(node, "model"):
+        if len(child) < 2 or not isinstance(child[1], str):
+            continue
+        raw = sexpr.unquote(child[1])
+        if _links_elsewhere(raw):
+            continue
+        names = models.get(_model_stem(raw))
+        if not names:
+            continue
+        want = PurePosixPath(raw).suffix.lower()
+        pick = next((n for n in names if n.lower().endswith(want)), None) or next(
+            (n for n in names if n.lower().endswith((".step", ".stp"))), names[0]
+        )
+        new = f"{MODEL_PATH_PREFIX}/{library}.3dshapes/{pick}"
+        if new != raw:
+            child[1] = sexpr.quote(new)
+            changed.append((raw, new))
+    return changed
+
+
+def _model_paths(node: list) -> list[str]:
+    return [sexpr.unquote(m[1]) for m in sexpr.find_all(node, "model") if len(m) > 1 and isinstance(m[1], str)]
+
+
+def _dump_relinked(node: list, changed: list[tuple[str, str]], what: str) -> str:
+    """The footprint with its links changed, verified by reading it back."""
+    text = sexpr.dump_top(node)
+    back = sexpr.parse(text)
+    if _model_paths(back) != _model_paths(node) or len(sexpr.find_all(back, "pad")) != len(
+        sexpr.find_all(node, "pad")
+    ):
+        raise RuntimeError(f"relinking the 3D models of {what} did not read back as written")
+    return text
 
 
 # --------------------------------------------------------------------------- symbols
@@ -393,15 +474,21 @@ def place_footprint(data: bytes, project_dir: str | Path, library: str) -> Place
     name = _item_name(raw.rpartition(":")[2], "footprint")
     target = project_dir / FOOTPRINTS_DIR / f"{library}.pretty" / f"{name}.kicad_mod"
     rel = target.relative_to(project_dir).as_posix()
+    # A model this project already holds for the library — uploaded earlier, or
+    # just now from the same bundle — is linked by a project-relative path, so
+    # the board shows it. Written as uploaded when nothing needed linking.
+    changed = _relink(node, library, _stored_models(project_dir, library))
+    body: bytes = _dump_relinked(node, changed, rel).encode() if changed else data
     if target.exists():
-        if target.read_bytes() == data:
+        if target.read_bytes() == body:
             return Placed(paths=[rel], names=[name], note="already in the library, unchanged")
         raise Refused(
             f"library {library} already has a different footprint {name} ({rel}). "
             "Nothing was replaced: upload it to a different library, or remove the existing one first"
         )
-    _write(target, data)
-    return Placed(paths=[rel], names=[name])
+    _write(target, body)
+    note = f"3D model linked: {', '.join(new.rsplit('/', 1)[-1] for _, new in changed)}" if changed else ""
+    return Placed(paths=[rel], names=[name], note=note)
 
 
 # ------------------------------------------------------------------------- 3D models
@@ -427,10 +514,27 @@ def place_model(data: bytes, project_dir: str | Path, library: str, original_nam
             return Placed(paths=[rel], names=[target.name], note="already in the library, unchanged")
         raise Refused(f"a different model is already at {rel}. Nothing was replaced")
     _write(target, data)
+    # Footprints already in the library that name this model but cannot reach
+    # it — an archive-relative "x.stp" — are linked to it now, so uploading the
+    # model after the footprint works as well as uploading it before.
+    relinked = []
+    pretty = project_dir / FOOTPRINTS_DIR / f"{library}.pretty"
+    if pretty.is_dir():
+        mine = {_model_stem(target.name): [target.name]}
+        for fp in sorted(pretty.glob("*.kicad_mod")):
+            try:
+                node = sexpr.parse(fp.read_text(encoding="utf-8"))
+            except (sexpr.ParseError, RecursionError, UnicodeDecodeError):
+                continue
+            changed = _relink(node, library, mine)
+            if changed:
+                _write(fp, _dump_relinked(node, changed, fp.name))
+                relinked.append(fp.relative_to(project_dir).as_posix())
     return Placed(
         paths=[rel],
         names=[target.name],
-        note="footprints are not rewritten to point at it; their (model ...) paths are as the vendor wrote them",
+        note=(f"linked from {', '.join(relinked)}" if relinked else "no footprint in the library names it yet"),
+        relinked=relinked,
     )
 
 

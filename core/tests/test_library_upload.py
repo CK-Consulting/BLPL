@@ -451,3 +451,63 @@ def test_stock_names_come_from_the_libraries_the_resolver_searches(stock):
         "connector_generic": "the stock symbol library Connector_Generic",
         "resistor_smd": "the stock footprint library Resistor_SMD",
     }
+
+
+# ------------------------------------------------------------------ 3D model links
+
+
+def _model_refs(path: Path) -> list[str]:
+    node = sexpr.parse(path.read_text(encoding="utf-8"))
+    return [sexpr.unquote(m[1]) for m in sexpr.find_all(node, "model")]
+
+
+def _resolves(project: Path, ref: str) -> Path:
+    """Where KiCad finds a model: ${KIPRJMOD} is the emitted project's directory."""
+    return Path(ref.replace("${KIPRJMOD}", str(project / ".pipeline"))).resolve()
+
+
+def test_a_bundle_footprint_is_linked_to_the_model_shipped_with_it(tmp_path):
+    bundle = _zip([
+        ("KiCad/PCM12SMTBR.kicad_mod", _footprint("PCM12SMTBR")),   # names "PCM12SMTBR.stp"
+        ("3D/PCM12SMTBR.stp", STEP),
+    ])
+    rec = _up(tmp_path, bundle, "kicad_bundle", "PCM12SMTBR.zip")
+    assert rec.state == quarantine.RELEASED, rec.reasons
+    fp = tmp_path / "libraries" / "footprints" / "myproj.pretty" / "PCM12SMTBR.kicad_mod"
+    [ref] = _model_refs(fp)
+    assert ref == "${KIPRJMOD}/../libraries/3dmodels/myproj.3dshapes/PCM12SMTBR.stp"
+    assert _resolves(tmp_path, ref).read_bytes() == STEP
+    # Everything but the link is the footprint as uploaded.
+    assert len(sexpr.find_all(sexpr.parse(fp.read_text()), "pad")) == 1
+    # And the same bundle again is already there, not a collision with itself.
+    again = _up(tmp_path, bundle, "kicad_bundle", "PCM12SMTBR.zip")
+    assert all(m["state"] == quarantine.RELEASED for m in again.members), again.members
+
+
+def test_a_model_uploaded_after_its_footprint_links_it(tmp_path):
+    _up(tmp_path, _footprint("PCM12SMTBR"), "footprint", "fp.kicad_mod")
+    fp = tmp_path / "libraries" / "footprints" / "myproj.pretty" / "PCM12SMTBR.kicad_mod"
+    assert _model_refs(fp) == ["PCM12SMTBR.stp"]
+    rec = _up(tmp_path, STEP, "3d_model", "PCM12SMTBR.STEP")
+    assert "linked from libraries/footprints/myproj.pretty/PCM12SMTBR.kicad_mod" in rec.inspection["placement"]
+    [ref] = _model_refs(fp)
+    assert _resolves(tmp_path, ref).name == "PCM12SMTBR.step"
+    assert _resolves(tmp_path, ref).is_file()
+
+
+def test_a_footprint_naming_a_stock_model_is_left_alone(tmp_path):
+    _up(tmp_path, STEP, "3d_model", "SW_Push.step")
+    data = (
+        b'(footprint "SW_Push" (layer "F.Cu")\n'
+        b'  (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))\n'
+        b'  (model "${KICAD9_3DMODEL_DIR}/Button_Switch_SMD.3dshapes/SW_Push.wrl")\n)\n'
+    )
+    rec = _up(tmp_path, data, "footprint", "sw.kicad_mod")
+    assert rec.state == quarantine.RELEASED
+    assert (tmp_path / "libraries" / "footprints" / "myproj.pretty" / "SW_Push.kicad_mod").read_bytes() == data
+
+
+def test_a_footprint_naming_a_model_nobody_uploaded_is_written_as_is(tmp_path):
+    data = _footprint("LONELY")
+    _up(tmp_path, data, "footprint", "l.kicad_mod")
+    assert (tmp_path / "libraries" / "footprints" / "myproj.pretty" / "LONELY.kicad_mod").read_bytes() == data
