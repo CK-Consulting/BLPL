@@ -13,6 +13,8 @@ rather than letting them quietly become project files.
         <sha256[:12]>-<mpn>.pdf
       datasheets/                ← only files that have passed live here
       references/                ← uploads that are not datasheets, once passed
+      libraries/                 ← uploaded KiCad symbols, footprints and 3D models,
+                                   once passed *and* parsed (see library_upload)
 
 The two-directory shape does the work. Code that reads ``datasheets/`` is
 reading files that were inspected and — where a scanner exists — scanned. Code
@@ -62,7 +64,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import av, pdf_inspect
+from . import av, library_upload, pdf_inspect
 
 QUARANTINE_DIRNAME = "retrieved"
 TRUSTED_DIRNAME = "datasheets"
@@ -71,8 +73,21 @@ LEDGER_NAME = "quarantine.json"
 
 # Where an upload of each kind lands once it passes. The uploader picks the
 # kind, so the directory name keeps saying what is in it: a datasheet goes where
-# the extraction tools already look, and anything else goes beside it.
-UPLOAD_KINDS = {"datasheet": TRUSTED_DIRNAME, "reference": REFERENCES_DIRNAME}
+# the extraction tools already look, KiCad library files go where the resolver
+# looks, and anything else goes beside them.
+UPLOAD_KINDS = {
+    "datasheet": TRUSTED_DIRNAME,
+    "reference": REFERENCES_DIRNAME,
+    "symbol": library_upload.SYMBOLS_DIR,
+    "footprint": library_upload.FOOTPRINTS_DIR,
+    "3d_model": library_upload.MODELS_DIR,
+    # A vendor zip: its library files go to the three above, its documents to
+    # references/<zip name>/, and anything else stays in the zip in retrieved/.
+    "kicad_bundle": library_upload.LIBRARIES_DIRNAME,
+}
+
+# The kinds that are placed into a project library and so need one named.
+LIBRARY_KINDS = frozenset({"symbol", "footprint", "3d_model", "kicad_bundle"})
 
 # How a file arrived. Recorded on every entry, because "who put this here" is
 # the first question anyone asks about an untrusted file.
@@ -188,6 +203,12 @@ class Record:
     # Which inspector produced `inspection`. Empty on rows written before it
     # was recorded, which is itself an answer: not this inspector.
     inspector: str = ""
+    # Library uploads: the library it went into, and every path it wrote —
+    # a bundle writes several, a merged symbol writes into a shared file.
+    library: str = ""
+    placed: list[str] = field(default_factory=list)
+    # A bundle's verdict per entry: name, kind, state, path, reasons.
+    members: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -493,15 +514,25 @@ def accept_upload(
     uploaded_by: str,
     mpn: str = "",
     llm_ignore: bool = False,
+    library: str = "",
 ) -> Record:
     """The whole path for a file a member uploads, in the order it has to happen.
 
     Released into the directory for its ``kind``: a datasheet with an MPN is
     named after the part, the way a fetched one is, so the resolver finds it;
-    anything else keeps the uploader's filename, made safe.
+    a KiCad library file is parsed and placed into project library ``library``
+    (see ``library_upload``); anything else keeps the uploader's filename, made
+    safe.
+
+    Library files pass the same inspection and scan as everything else first.
+    Placement is a second gate, not a replacement: a file that is clean but does
+    not parse, or would replace a symbol already in the library, is held with
+    that reason rather than released.
     """
     if kind not in UPLOAD_KINDS:
         raise ValueError(f"kind must be one of {sorted(UPLOAD_KINDS)}, not {kind!r}")
+    if kind in LIBRARY_KINDS:
+        library = library_upload.library_name(library)
     # Bytes that are a PDF are stored and released as one, whatever the name
     # claimed: the datasheet resolver looks for <MPN>.pdf and nothing else.
     suffix = ".pdf" if _looks_like_pdf(data) else _upload_suffix(original_name)
@@ -518,11 +549,111 @@ def accept_upload(
     )
     if rec.reasons:
         return rec
+    if kind == "kicad_bundle":
+        return _unpack_bundle(data, project_dir, rec, library=library)
+    if kind in LIBRARY_KINDS:
+        return _place(data, project_dir, rec, library=library)
     if kind == "datasheet" and mpn:
         as_name = f"{_safe(mpn, 'datasheet')}{suffix}"
     else:
         as_name = f"{_safe(Path(original_name).stem, 'upload')}{suffix}"
     return release(project_dir, rec, as_name=as_name, dest_dirname=UPLOAD_KINDS[kind])
+
+
+def _place(data: bytes, project_dir: str | Path, rec: Record, *, library: str) -> Record:
+    """Release a passed library file into the project library, or hold it with why not."""
+    project_dir = Path(project_dir)
+    rec.library = library
+    try:
+        if rec.kind == "symbol":
+            placed = library_upload.place_symbols(data, project_dir, library)
+        elif rec.kind == "footprint":
+            placed = library_upload.place_footprint(data, project_dir, library)
+        else:
+            placed = library_upload.place_model(data, project_dir, library, rec.original_name)
+    except library_upload.Refused as exc:
+        rec.reasons = [str(exc)]
+        rec.state = HELD
+        _upsert(project_dir, rec)
+        return rec
+    # released_to/released_as name the first file written, relative to the
+    # kind's directory — a symdir symbol is <Lib>.kicad_symdir/<Name>.kicad_sym
+    # under libraries/symbols — so the ledger points at what the resolver
+    # reads; `placed` lists everything.
+    base = UPLOAD_KINDS[rec.kind]
+    rec.released_to = base
+    rec.released_as = placed.paths[0][len(base) + 1:]
+    rec.placed = placed.paths
+    rec.state = RELEASED
+    rec.reasons = []
+    if placed.note:
+        rec.inspection = {**rec.inspection, "placement": placed.note}
+    _upsert(project_dir, rec)
+    return rec
+
+
+def _unpack_bundle(data: bytes, project_dir: str | Path, rec: Record, *, library: str) -> Record:
+    """Each usable entry of a passed zip through quarantine on its own, then placed.
+
+    Every entry gets its own ledger row, its own scan and — for a PDF — its own
+    inspection, exactly as if it had been uploaded alone: a clean archive says
+    nothing about what a reader will do with the files inside it. Entries that
+    are neither library files nor documents are not unpacked; they stay inside
+    the zip, which stays in ``retrieved/``.
+    """
+    project_dir = Path(project_dir)
+    rec.library = library
+    try:
+        members, skipped = library_upload.unpack_bundle(data)
+    except library_upload.Refused as exc:
+        rec.reasons = [str(exc)]
+        rec.state = HELD
+        _upsert(project_dir, rec)
+        return rec
+    zip_stem = _safe(Path(rec.original_name).stem, "bundle")
+    out: list[dict] = []
+    for member in members:
+        label = f"{rec.original_name}:{member.name}"
+        kind = member.route
+        if kind == "reference":
+            # Beside the bundle's other documents rather than loose in
+            # references/, so a vendor's readme.txt says whose readme it is.
+            suffix = ".pdf" if _looks_like_pdf(member.data) else _upload_suffix(member.name)
+            sub = accept(
+                member.data, project_dir, suffix=suffix, origin=UPLOAD,
+                uploaded_by=rec.uploaded_by, original_name=label, kind="reference",
+                llm_ignore=rec.llm_ignore,
+            )
+            if not sub.reasons:
+                sub = release(
+                    project_dir, sub,
+                    as_name=f"{_safe(Path(member.name).stem, 'file')}{suffix}",
+                    dest_dirname=f"{REFERENCES_DIRNAME}/{zip_stem}",
+                )
+        else:
+            sub = accept_upload(
+                member.data, project_dir, original_name=label, kind=kind,
+                uploaded_by=rec.uploaded_by, llm_ignore=rec.llm_ignore, library=library,
+            )
+        path = f"{sub.released_to}/{sub.released_as}" if sub.state == RELEASED else None
+        out.append({
+            "name": member.name, "kind": kind, "state": sub.state, "path": path,
+            "placed": sub.placed or ([path] if path else []), "reasons": sub.reasons,
+        })
+    for name, reason in skipped:
+        out.append({"name": name, "kind": "", "state": "skipped", "path": None, "placed": [], "reasons": [reason]})
+    rec.members = out
+    if not any(m["state"] == RELEASED for m in out):
+        rec.reasons = [
+            "nothing in it could be added"
+            + (": " + "; ".join(f"{m['name']}: {', '.join(m['reasons'])}" for m in out) if out else " (it is empty)")
+        ]
+        rec.state = HELD
+    else:
+        rec.state = RELEASED
+        rec.reasons = []
+    _upsert(project_dir, rec)
+    return rec
 
 
 def ledger(project_dir: str | Path) -> list[dict]:
