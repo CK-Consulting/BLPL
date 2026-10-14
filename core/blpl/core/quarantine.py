@@ -612,6 +612,10 @@ def _unpack_bundle(data: bytes, project_dir: str | Path, rec: Record, *, library
         return rec
     zip_stem = _safe(Path(rec.original_name).stem, "bundle")
     out: list[dict] = []
+    # Models first, so a footprint from the same zip finds the model it names
+    # already in the library and is linked to it as it is placed.
+    order = {"3d_model": 0, "footprint": 1, "symbol": 2}
+    members = sorted(members, key=lambda m: order.get(m.route, 3))
     for member in members:
         label = f"{rec.original_name}:{member.name}"
         kind = member.route
