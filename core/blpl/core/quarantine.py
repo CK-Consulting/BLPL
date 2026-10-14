@@ -51,9 +51,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,6 +101,47 @@ UNSCANNED = "unscanned"    # inspected, nothing active, but no scanner ran
 INSPECTOR = f"pdf_inspect/{pdf_inspect.VERSION}"
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+logger = logging.getLogger(__name__)
+
+# Who hears about a verdict the moment it is reached, in this process. The app
+# keeps verdicts in its database, keyed by content hash, and decides from them
+# whether a browser may render a file; the ledger beside the file is committed
+# project content that a pull can rewrite, so it cannot be the source. A sink
+# set here gets the record straight from the inspection that produced it.
+# A context variable rather than a module-level hook, so that it belongs to
+# the request or chat turn that set it (and to the threads it hands work to)
+# rather than to whichever project last set it.
+_verdict_sink: ContextVar[Callable[["Record"], None] | None] = ContextVar(
+    "quarantine_verdict_sink", default=None
+)
+
+
+@contextmanager
+def recording_verdicts(sink: Callable[["Record"], None] | None) -> Iterator[None]:
+    """Hand every record `accept` produces in this context to ``sink``.
+
+    ``None`` is allowed and records nothing, so a caller with no database can
+    pass what it has.
+    """
+    token = _verdict_sink.set(sink)
+    try:
+        yield
+    finally:
+        _verdict_sink.reset(token)
+
+
+def _tell_sink(rec: "Record") -> None:
+    sink = _verdict_sink.get()
+    if sink is None:
+        return
+    try:
+        sink(rec)
+    except Exception:  # noqa: BLE001
+        # Not raised. A verdict that failed to be recorded leaves the file
+        # without one, which is the safe state (it downloads rather than
+        # renders); failing the fetch over it would lose the file as well.
+        logger.exception("recording the verdict for %s failed", rec.sha256)
 
 
 def quarantine_dir(project_dir: str | Path) -> Path:
@@ -378,6 +423,7 @@ def accept(
         inspector=INSPECTOR if inspection.state != NOT_INSPECTED else "",
     )
     _upsert(project_dir, rec)
+    _tell_sink(rec)
     return rec
 
 
