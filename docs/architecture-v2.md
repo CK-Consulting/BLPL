@@ -898,9 +898,35 @@ workspace).
     then reports busy, and the next sweep tries again.
   - **Mount path:** with runs in workspaces, the seal and unseal on the mount
     (agent path off) take it too.
-  - **Audit:** agent operations, member worktree creation included, run inside
-    a workspace that ensure started under the gate. A seal's stop ends them
-    before anything is archived, so the archive is of a stopped project.
+  - **Held through each agent operation, not only the start.** Releasing it
+    once the client connected let a seal stop the workspace and archive a
+    half-written file or a git `index.lock` (Codex, PR #20).
+    `workspace_files.gated` now holds it shared from before the start until
+    the client closes, for every path that reaches an agent: files, tree,
+    folders, delete and move, uploads and quarantine, the ignore list, commit,
+    pull, push (and auto-push), the push lock, remote and credential lookups,
+    and creating or removing a member's worktree.
+    - A run holds it for its whole length.
+    - The idle sweep's health query is read-only and takes nothing. The stop
+      and seal it may lead to take the gate exclusively and wait for anything
+      in flight.
+    - The fetch service writes nothing into a project: the run files what it
+      is given, under the run's own hold.
+  - **Deadlocks:**
+    - A seal never queues in the kernel for the exclusive lock; it polls
+      `LOCK_NB`.
+    - A shared holder taking the gate again on another descriptor (a nested
+      agent call, the start inside an operation) is granted at once, even
+      while a seal is trying.
+    - Nothing that holds the gate shared asks for it exclusively: seal and
+      unseal are never called inside an agent operation.
+    - A long operation (a push can take minutes) makes a seal report busy
+      after 5 s, and the sweep retries. The seal route says so: `busy: true`
+      with a reason, not a bare `sealed: false`.
+    - Tested: a nested take while a seal waits, and a seal during a slow write
+      with an index.lock, which reports busy and later archives the whole
+      file and no lock. Instrumentation checks that every agent request finds
+      the gate held.
 - **Every grant of a run is revoked when it ends.** A retry that follows a
   first attempt's container issues no new grant (that container holds its
   own), and the end of the run revokes every grant with its run id. Before,
