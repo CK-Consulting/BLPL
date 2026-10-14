@@ -880,6 +880,20 @@ class Agent:
                              bool(b.get("is_owner")))
         return {"path": str(d), "exists": d.is_dir()}
 
+    def worktree_remove(self, b: dict) -> dict:
+        """worktrees.remove, for a member who lost access: their checkout
+        goes, their branch stays. Here because without the project mount the
+        control plane sees no checkout to remove (Codex, PR #20)."""
+        from app import worktrees
+
+        project = str(b.get("project", ""))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", project):
+            raise _forbidden("invalid project name")
+        repo = self.fs.checkout(os.path.join(self.projects_root(), project))
+        self._no_run(["(worktree)"])
+        return {"removed": worktrees.remove(Path(os.path.dirname(repo)), project,
+                                            int(b.get("user_id", 0)))}
+
     def projects_root(self) -> str:
         return self._projects_root
 
@@ -1156,7 +1170,8 @@ _JSON_ROUTES = {
     "/managed/delete": Agent.managed_delete, "/managed/move": Agent.managed_move,
     "/ignore/entries": Agent.ignore_entries, "/ignore/set": Agent.ignore_set,
     "/quarantine/view": Agent.quarantine_view, "/project/boards": Agent.project_boards,
-    "/worktree/ensure": Agent.worktree_ensure, "/runs/mark": Agent.run_mark,
+    "/worktree/ensure": Agent.worktree_ensure, "/worktree/remove": Agent.worktree_remove,
+    "/runs/mark": Agent.run_mark,
 }
 
 
