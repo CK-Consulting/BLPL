@@ -927,11 +927,41 @@ workspace).
       with an index.lock, which reports busy and later archives the whole
       file and no lock. Instrumentation checks that every agent request finds
       the gate held.
+- **The idle sweep takes the gate before it stops a workspace.** A long
+  operation touched the workspace only when it started. Its age passed the
+  idle limit, and the sweep stopped the container mid-write. Two changes:
+  - The agent counts requests in progress and reports them in `/health`.
+    While any is in progress the workspace is not idle, however long it has
+    taken.
+  - The sweep takes the project's gate exclusively (5 s, then busy and
+    skipped this round) before it stops anything, and holds it through the
+    seal. The seal is told so (`gate_held`) and does not take it again.
+
+  Audit of every path that stops or removes a container:
+  - **Idle sweep:** gated, as above, in the backend and in the worker.
+  - **Sealer:** stops and removes the workspace under the exclusive gate.
+  - **A start (`Access._start`):**
+    - It no longer stops a running workspace built from an older spec, since
+      other operations may be using its agent. It keeps serving, and the
+      sweep retires it when idle.
+    - It still replaces a running workspace that has no agent (one from
+      before phase 3). There is no agent in it to interrupt, and no run
+      executes in a workspace container.
+  - **A run container:** stopped only for its own run's cancel, under that
+    run's hold. A stale or never-started run container is removed only by the
+    retry of the same run id.
+  - **Member removal:** removes a worktree through the agent. It stops no
+    container.
 - **Every grant of a run is revoked when it ends.** A retry that follows a
   first attempt's container issues no new grant (that container holds its
   own), and the end of the run revokes every grant with its run id. Before,
   only the retry's own unused grant was revoked, and the one in use stayed
-  valid for 24 hours.
+  valid for 24 hours. Whether the retry follows a container is decided by
+  the driver's own `will_follow`, the rule `run_container` uses: Docker's
+  never-started `created` reads as stopped in `status()`, and the retry took
+  it for one to follow, issued no grant, and recreated it with none. A
+  container that is to be recreated gets a fresh grant, and any stale grant
+  is revoked first.
 - **A fetch holds its slot through assessment.** The slot used to be
   released after the download, before the PDF parse, the scan and the
   evidence write, so a run could keep starting assessments. It is now held
