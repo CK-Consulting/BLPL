@@ -38,6 +38,7 @@ import {
   FileTree,
   deleteRefusalForDraft,
   destinationFor,
+  openFromTree,
   moveRefusalForDraft,
   type TreeNode,
 } from "./components/FileTree";
@@ -282,36 +283,25 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                           f && (f.path === path || f.path.startsWith(`${path}/`)) ? null : f,
                         )
                       }
-                      onOpen={(n) => {
-                        // Three destinations, because there are three kinds of
-                        // file here. Text the panel can render goes to
-                        // View/Edit. A KiCad file has a renderer of its own —
-                        // it is plain text underneath, which is the trap:
-                        // "displayed" as forty thousand lines of s-expression
-                        // is technically true and no use to anyone. Everything
-                        // else goes to the browser, which knows what to do
-                        // with a PDF and will offer to save what it does not.
-                        const where = destinationFor(n);
-                        setRenamedFrom(null);
-                        if (where === "text") {
-                          setOpenFile(n);
-                          setTab("edit");
-                        } else if (where === "kicad") {
-                          setOpenFile(n);
-                          setTab("kicad");
-                        } else if (where === "pdf") {
-                          // Not window.open: whether it may render is the
-                          // server's call on the bytes, and the pane says
-                          // what that call was before anything opens.
-                          setOpenFile(n);
-                          setTab("edit");
-                        } else {
-                          window.open(
-                            `/api/projects/${selected}/blob?path=${encodeURIComponent(n.path)}`,
-                            "_blank",
-                          );
-                        }
-                      }}
+                      onOpen={(n) =>
+                        // Text and PDFs go to View/Edit (a PDF to the pane
+                        // that says whether the server will let it render),
+                        // a KiCad file to its renderer, anything else to the
+                        // browser. Each pane switch asks first if there are
+                        // unsaved edits; see openFromTree.
+                        openFromTree(n, openFile?.path ?? null, unsaved.guard, {
+                          pane: (node, where) => {
+                            setRenamedFrom(null);
+                            setOpenFile(node);
+                            setTab(where);
+                          },
+                          browser: (node) =>
+                            window.open(
+                              `/api/projects/${selected}/blob?path=${encodeURIComponent(node.path)}`,
+                              "_blank",
+                            ),
+                        })
+                      }
                     />
                   </Section>
                   <Section id="pipeline" title="Pipeline" defaultOpen={false}>

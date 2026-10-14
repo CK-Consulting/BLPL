@@ -910,6 +910,39 @@ export function destinationFor(node: TreeNode): "text" | "kicad" | "pdf" | "brow
 }
 
 /**
+ * Act on a click in the tree: open the file in a pane, or hand it to the
+ * browser.
+ *
+ * Every open that replaces what the central pane shows goes through `guard`,
+ * the unsaved-changes guard (Save / Discard / Cancel, and a save still in
+ * flight). Codex, PR #21: PDFs used to open in a new tab and left the editor
+ * alone; once they opened in the pane, clicking one swapped FileView out and
+ * destroyed an unsaved draft without a word. Text and KiCad files replaced the
+ * pane the same way and are guarded too. Clicking the file already open is
+ * not a switch and asks nothing. A file handed to the browser opens a new tab
+ * and touches no pane, so it is not guarded (and could not be: a popup opened
+ * after a dialog is one the browser blocks).
+ */
+export function openFromTree(
+  node: TreeNode,
+  openPath: string | null,
+  guard: (go: () => void, what: string) => void,
+  go: { pane: (node: TreeNode, tab: "edit" | "kicad") => void; browser: (node: TreeNode) => void },
+): void {
+  const where = destinationFor(node);
+  if (where === "browser") {
+    go.browser(node);
+    return;
+  }
+  const tab = where === "kicad" ? "kicad" : "edit";
+  if (node.path === openPath) {
+    go.pane(node, tab);
+    return;
+  }
+  guard(() => go.pane(node, tab), `opening ${node.name}`);
+}
+
+/**
  * Why nothing may move or delete `path` yet, or null: a save of the document
  * at `saving` (or of one inside a folder at `path`) has not come back.
  *
