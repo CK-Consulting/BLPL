@@ -155,3 +155,78 @@ describe("a commit that failed", () => {
     expect(await screen.findByText(/Uploaded — saved, but not committed to git/)).toBeInTheDocument();
   });
 });
+
+describe("KiCad library files", () => {
+  const sym = (name: string) => new File(["(kicad_symbol_lib)"], name);
+
+  it("offers the library kinds", async () => {
+    const user = userEvent.setup();
+    render(<UploadDialog projectId="p" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [sym("x.kicad_sym")]);
+    const options = within(screen.getByLabelText("Kind for x.kicad_sym"))
+      .getAllByRole("option")
+      .map((o) => (o as HTMLOptionElement).value);
+    expect(options).toEqual(["", "datasheet", "reference", "symbol", "footprint", "3d_model", "kicad_bundle"]);
+  });
+
+  it("asks for a library, not an MPN, and defaults it to the project's name", async () => {
+    const user = userEvent.setup();
+    render(<UploadDialog projectId="verdacor-ear-tag" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [sym("x.kicad_sym"), pdf("d.pdf")]);
+    await user.selectOptions(screen.getByLabelText("Kind for x.kicad_sym"), "symbol");
+    await user.selectOptions(screen.getByLabelText("Kind for d.pdf"), "datasheet");
+    expect(screen.getByLabelText("Library for x.kicad_sym")).toHaveValue("verdacor-ear-tag");
+    expect(screen.queryByLabelText("MPN for x.kicad_sym")).toBeNull();
+    expect(screen.queryByLabelText("Library for d.pdf")).toBeNull();
+    expect(screen.getByLabelText("MPN for d.pdf")).toBeEnabled();
+    // LLM ignore is a per-file choice; a symbol merged into a shared library
+    // file is not one file of its own.
+    expect(screen.queryByLabelText("LLM ignore x.kicad_sym")).toBeNull();
+    expect(screen.getByLabelText("LLM ignore d.pdf")).toBeInTheDocument();
+  });
+
+  it("sends the library per file and refuses a name KiCad could not use", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockUpload([]);
+    render(<UploadDialog projectId="p" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [sym("a.kicad_mod"), sym("b.zip")]);
+    await user.selectOptions(screen.getByLabelText("Kind for a.kicad_mod"), "footprint");
+    await user.selectOptions(screen.getByLabelText("Kind for b.zip"), "kicad_bundle");
+    const lib = screen.getByLabelText("Library for a.kicad_mod");
+    await user.clear(lib);
+    await user.type(lib, "Vendor:Lib");
+    expect(screen.getByRole("button", { name: /Upload 2 files/ })).toBeDisabled();
+    await user.clear(lib);
+    await user.type(lib, "vendor_lib");
+    await user.click(screen.getByRole("button", { name: /Upload 2 files/ }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse((init.body as FormData).get("meta") as string)).toEqual([
+      { kind: "footprint", mpn: "", library: "vendor_lib", llm_ignore: false },
+      { kind: "kicad_bundle", mpn: "", library: "p", llm_ignore: false },
+    ]);
+  });
+
+  it("shows where each entry of a bundle went, and why the rest did not", async () => {
+    const user = userEvent.setup();
+    mockUpload([
+      {
+        name: "part.zip", state: "released", kind: "kicad_bundle", path: null, library: "p", reasons: [],
+        placed: ["libraries/footprints/p.pretty/SW.kicad_mod"],
+        members: [
+          { name: "KiCad/SW.kicad_mod", kind: "footprint", state: "released", path: "libraries/footprints/p.pretty/SW.kicad_mod", reasons: [] },
+          { name: "KiCad/SW.kicad_sym", kind: "symbol", state: "held", path: null, reasons: ["library p already has a different SW"] },
+          { name: "Altium/SW.SchLib", kind: "", state: "skipped", path: null, reasons: ["not a KiCad library file or a document; left in the zip"] },
+        ],
+      },
+    ]);
+    render(<UploadDialog projectId="p" onClose={() => {}} />);
+    await user.upload(screen.getByLabelText("Choose files"), [sym("part.zip")]);
+    await user.selectOptions(screen.getByLabelText("Kind for part.zip"), "kicad_bundle");
+    await user.click(screen.getByRole("button", { name: /Upload 1 file/ }));
+    const results = await screen.findByRole("list", { name: "Upload results" });
+    expect(within(results).getByText("libraries/footprints/p.pretty/SW.kicad_mod")).toBeInTheDocument();
+    expect(within(results).getByText(/not added: library p already has a different SW/)).toBeInTheDocument();
+    expect(within(results).getByText(/left in the zip: not a KiCad library file/)).toBeInTheDocument();
+  });
+});

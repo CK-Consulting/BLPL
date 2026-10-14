@@ -254,18 +254,32 @@ def drop_entries(project_dir: Path, rel: str) -> bool:
     return True
 
 
+def _row_paths(row: dict) -> list[str]:
+    """Every path one ledger row says it released: its own, and for an upload
+    placed into a project library, each file it wrote there."""
+    out = [_norm(p) for p in row.get("placed") or [] if isinstance(p, str)]
+    if row.get("released_as"):
+        out.append(f"{row.get('released_to') or quarantine.TRUSTED_DIRNAME}/{row['released_as']}")
+    return out
+
+
 def released_under(project_dir: Path, rel: str) -> list[str]:
     """Paths the quarantine ledger records a file as released to, at ``rel`` or
     below it."""
     rel = _norm(rel)
     out = []
     for row in quarantine.ledger(project_dir):
-        if not row.get("released_as"):
-            continue
-        path = f"{row.get('released_to') or quarantine.TRUSTED_DIRNAME}/{row['released_as']}"
-        if _under(path, rel):
-            out.append(path)
+        out.extend(p for p in _row_paths(row) if _under(p, rel))
     return sorted(set(out))
+
+
+def released_outside_external_dirs(project_dir: Path) -> list[str]:
+    """Released paths that are not under an external directory — the library
+    files an upload was placed into. Their directory does not say they came
+    from outside, so only the ledger can."""
+    return sorted({
+        p for row in quarantine.ledger(project_dir) for p in _row_paths(row) if not is_external(p)
+    })
 
 
 def is_external(rel: str) -> bool:
@@ -273,12 +287,23 @@ def is_external(rel: str) -> bool:
     return bool(parts) and parts[0] in EXTERNAL_DIRS
 
 
+def from_outside(project_dir: Path, rel: str) -> bool:
+    """Whether a file's contents arrived from outside the project.
+
+    Everything under an external directory did, and so did any file an upload
+    was placed into elsewhere: a vendor symbol merged into
+    ``libraries/symbols/<Lib>.kicad_sym`` makes that whole file part vendor
+    text, and its property strings are as able to say "ignore previous
+    instructions" as a datasheet is. Framing the whole file errs the safe way.
+    """
+    return is_external(rel) or _norm(rel) in released_outside_external_dirs(project_dir)
+
+
 def origin_of(project_dir: Path, rel: str) -> str:
     """Where an external file came from, in words, from the quarantine ledger."""
     rel = _norm(rel)
     for row in reversed(quarantine.ledger(project_dir)):
-        released = f"{row.get('released_to') or quarantine.TRUSTED_DIRNAME}/{row.get('released_as', '')}"
-        if row.get("released_as") and released == rel:
+        if rel in _row_paths(row):
             if row.get("origin") == quarantine.UPLOAD:
                 who = row.get("uploaded_by") or "a project member"
                 name = row.get("original_name") or ""
