@@ -809,6 +809,12 @@ services:
     command: []
     working_dir: /opt/blpl/wsagent
     user: "0:0"
+    # The worker's group, so the helper can give it the socket (root:that
+    # group, 0660) without CAP_CHOWN; the helper answers only the worker's
+    # uid (SO_PEERCRED). Without both, the worker could not connect and
+    # every pre-run snapshot failed.
+    group_add:
+      - "${BLPL_GID}"
     cap_drop: [ALL]
     cap_add: [SYS_ADMIN]
     security_opt:
@@ -819,6 +825,8 @@ services:
     environment:
       - BLPL_STORAGE_ROOT=/storage
       - BLPL_STORAGE_SOCKET=/run/blpl-storage/storage.sock
+      - BLPL_STORAGE_CLIENT_UID=${BLPL_UID}
+      - BLPL_STORAGE_CLIENT_GID=${BLPL_GID}
     volumes:
       - ./data/projects:/storage
       - blpl-storage-helper:/run/blpl-storage

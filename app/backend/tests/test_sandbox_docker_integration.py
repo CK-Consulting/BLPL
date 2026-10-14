@@ -1453,3 +1453,68 @@ def test_phase4_a_members_run_sees_only_their_own_checkout(env):
 
     asyncio.run(scenario())
 
+
+
+def test_the_storage_helpers_socket_is_usable_by_the_worker_only(env):
+    """Codex, PR #20: the helper runs as root and the worker as BLPL_UID:GID.
+    Started as compose starts it (0:0, no capabilities but its own, the
+    worker's group added), the helper's socket admits the worker's uid, and
+    refuses another uid whether or not it shares the group."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    import socket as _socket
+    import subprocess
+    import time
+
+    uid, gid = os.getuid(), os.getgid()
+    sockdir = env.tmp / "storage-sock"
+    sockdir.mkdir()
+    os.chmod(env.tmp, 0o755)
+    os.chmod(sockdir, 0o777)  # compose uses a named volume the root helper owns
+    name = f"blpl-test-helper-{env.tag}"
+    subprocess.run([
+        "docker", "run", "-d", "--rm", "--name", name, "--label", f"blpl.test={env.tag}",
+        "--user", "0:0", "--group-add", str(gid), "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true", "--network", "none", "--read-only",
+        "-e", "BLPL_STORAGE_ROOT=/tmp", "-e", "BLPL_STORAGE_SOCKET=/s/storage.sock",
+        "-e", f"BLPL_STORAGE_CLIENT_UID={uid}", "-e", f"BLPL_STORAGE_CLIENT_GID={gid}",
+        "-v", f"{sockdir}:/s", "-w", "/opt/blpl/wsagent", "--entrypoint", "python",
+        WORKSPACE_IMAGE, "-m", "app.sandbox.btrfs"], check=True, capture_output=True)
+    sock = sockdir / "storage.sock"
+    try:
+        deadline = time.time() + 20
+        while not sock.exists() and time.time() < deadline:
+            time.sleep(0.2)
+        assert sock.exists(), subprocess.run(["docker", "logs", name], capture_output=True,
+                                             text=True).stderr
+        st = sock.stat()
+        assert (st.st_uid, st.st_gid, st.st_mode & 0o777) == (0, gid, 0o660)
+
+        def ask(user: str, group_add: bool) -> str:
+            cmd = ["docker", "run", "--rm", "--label", f"blpl.test={env.tag}", "--user", user,
+                   "--network", "none", "-v", f"{sockdir}:/s", "--entrypoint", "python"]
+            if group_add:
+                cmd += ["--group-add", str(gid)]
+            probe = ("import socket\n"
+                     "s = socket.socket(socket.AF_UNIX)\n"
+                     "try:\n"
+                     "    s.connect('/s/storage.sock')\n"
+                     "except OSError as e:\n"
+                     "    print('refused', e.errno); raise SystemExit\n"
+                     "s.sendall(b'{\"verb\": \"usage\", \"project\": \"../x\"}\\n')\n"
+                     "print(s.makefile().readline().strip())\n")
+            return subprocess.run(cmd + [WORKSPACE_IMAGE, "-c", probe], capture_output=True,
+                                  text=True, timeout=60).stdout.strip()
+
+        # The worker, as compose runs it.
+        assert "invalid project name" in ask(f"{uid}:{gid}", False)
+        # Another uid, outside the group: the socket's mode refuses it.
+        assert ask("4242:4242", False).startswith("refused")
+        # Another uid inside the group: the peer check refuses it.
+        assert "not the worker" in ask(f"4242:{gid}", False)
+        # And from the host, as the worker's uid.
+        c = _socket.socket(_socket.AF_UNIX)
+        c.connect(str(sock))
+        c.close()
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
