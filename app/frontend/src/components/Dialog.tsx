@@ -326,3 +326,99 @@ export function UnsavedChangesDialog({
     </Modal>
   );
 }
+
+/**
+ * Take one symbol out of a project symbol library.
+ *
+ * A flat `<Lib>.kicad_sym` holds the project's own symbols beside every
+ * uploaded one, so deleting the file to get rid of one symbol would take them
+ * all. This lists what is in it and removes the one chosen; the server does it
+ * through the parser and records it in the quarantine ledger.
+ */
+export function RemoveSymbolDialog({
+  library,
+  load,
+  onRemove,
+  onClose,
+}: {
+  library: string;
+  /** The symbols in the library. */
+  load: () => Promise<string[]>;
+  /** Throw to keep the dialog open with the error shown. */
+  onRemove: (symbol: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [symbols, setSymbols] = useState<string[] | null>(null);
+  const [chosen, setChosen] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    load()
+      .then((list) => live && setSymbols(list))
+      .catch((e) => live && setError((e as Error).message));
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const run = async () => {
+    if (!chosen) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await onRemove(chosen);
+      onClose();
+    } catch (err) {
+      setError((err as Error).message || "That did not work.");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal onClose={onClose} busy={busy}>
+      {(titleId) => (
+        <>
+          <div className="modal-head">
+            <h2 id={titleId}>Remove a symbol from {library}</h2>
+            <button type="button" className="link" aria-label="Close" onClick={onClose} disabled={busy}>
+              ✕
+            </button>
+          </div>
+          {error && (
+            <div className="modal-notice error" role="alert">
+              {error}
+            </div>
+          )}
+          <div className="modal-body">
+            <label className="dialog-field">
+              <span>Symbol</span>
+              <select value={chosen} onChange={(e) => setChosen(e.target.value)} disabled={!symbols || busy}>
+                <option value="">{symbols ? "Choose…" : "Loading…"}</option>
+                {(symbols ?? []).map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="muted small">
+              Only that symbol is removed; the rest of the library stays. The change is committed, so it
+              can be recovered from the project's history.
+            </div>
+            <div className="dialog-actions">
+              <button type="button" onClick={onClose} disabled={busy}>
+                Cancel
+              </button>
+              <button type="button" className="danger" onClick={() => void run()} disabled={busy || !chosen}>
+                Remove
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}

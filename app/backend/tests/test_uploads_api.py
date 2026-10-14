@@ -393,3 +393,78 @@ def test_the_dialog_can_ask_which_library_names_are_taken(unlocked, stock_libs):
     assert names["reserved"] == ["device", "resistor_smd"]
     assert names["reserved_prefix"] == "hdm_generated"
     assert "mine" in names["existing"]
+
+
+# ---------------------------------------------- library files are the project's to edit
+
+
+def test_a_placed_footprint_can_be_deleted_and_the_ledger_records_it(unlocked):
+    import app.main as main
+    from blpl.core import quarantine
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    _upload(unlocked, [("fp.kicad_mod", FOOTPRINT, {"kind": "footprint"})])
+    rel = "libraries/footprints/mine.pretty/PCM12SMTBR.kicad_mod"
+    r = unlocked.delete(f"/api/projects/mine/files/{rel}")
+    assert r.status_code == 200, r.text
+    assert r.json()["committed"] is True
+    proj = main.PROJECTS_ROOT / "mine"
+    assert not (proj / rel).exists()
+    [event] = quarantine.events(proj)
+    assert (event["event"], event["path"], event["by"]) == ("removed", rel, "test@example.com")
+    assert "retrieved/quarantine.json" in _git(proj, "show", "--name-only", "HEAD")
+
+
+def test_a_released_reference_is_still_kept_where_it_is(unlocked):
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    path = _upload(unlocked, [("guide.pdf", BENIGN, {"kind": "reference"})]).json()["results"][0]["path"]
+    assert unlocked.delete(f"/api/projects/mine/files/{path}").status_code == 409
+    # Within references/, so it is the ledger rule that answers, not the
+    # rule against moving outside text out of its directory.
+    r = unlocked.post("/api/projects/mine/files/move", json={"path": path, "to": "references/old/guide.pdf"})
+    assert r.status_code == 409 and "quarantine ledger" in r.json()["detail"]
+
+
+def test_a_placed_model_can_be_moved_and_the_row_follows(unlocked):
+    import app.main as main
+    from blpl.core import quarantine
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    _upload(unlocked, [("m.step", STEP, {"kind": "3d_model"})])
+    src = "libraries/3dmodels/mine.3dshapes/m.step"
+    dst = "libraries/3dmodels/vendor.3dshapes/m.step"
+    r = unlocked.post("/api/projects/mine/files/move", json={"path": src, "to": dst})
+    assert r.status_code == 200, r.text
+    proj = main.PROJECTS_ROOT / "mine"
+    row = next(x for x in quarantine.ledger(proj) if x["original_name"] == "m.step")
+    assert row["placed"] == [dst]
+    assert quarantine.events(proj)[-1]["to"] == dst
+
+
+def test_a_collision_is_cleared_by_removing_one_symbol_and_uploading_again(unlocked):
+    import app.main as main
+    from blpl.core import quarantine
+    from blpl.emitter import sexpr
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    other = SYMLIB.replace(b'"PCM12SMTBR"', b'"OTHER"').replace(b'"PCM12SMTBR_1_1"', b'"OTHER_1_1"')
+    _upload(unlocked, [("a.kicad_sym", SYMLIB, {"kind": "symbol"}), ("o.kicad_sym", other, {"kind": "symbol"})])
+    changed = SYMLIB.replace(b'(number "1"', b'(number "2"')
+    held = _upload(unlocked, [("b.kicad_sym", changed, {"kind": "symbol"})]).json()["results"][0]
+    assert held["state"] == "held" and "Remove a symbol" in held["reasons"][0]
+
+    listed = unlocked.get("/api/projects/mine/libraries/symbols/mine").json()
+    assert listed["symbols"] == ["OTHER", "PCM12SMTBR"]
+    r = unlocked.post("/api/projects/mine/libraries/symbols/mine/remove", json={"symbol": "PCM12SMTBR"})
+    assert r.status_code == 200, r.text
+    assert r.json()["remaining"] == ["OTHER"] and r.json()["committed"] is True
+    proj = main.PROJECTS_ROOT / "mine"
+    lib = sexpr.parse((proj / "libraries/symbols/mine.kicad_sym").read_text())
+    assert [sexpr.unquote(x[1]) for x in sexpr.find_all(lib, "symbol")] == ["OTHER"]
+    assert quarantine.events(proj)[-1]["event"] == "symbol_removed"
+
+    again = _upload(unlocked, [("b.kicad_sym", changed, {"kind": "symbol"})]).json()["results"][0]
+    assert again["state"] == "released", again["reasons"]
+
+    missing = unlocked.post("/api/projects/mine/libraries/symbols/mine/remove", json={"symbol": "NOPE"})
+    assert missing.status_code == 409

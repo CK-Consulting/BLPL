@@ -4712,6 +4712,57 @@ def upload_library_names(
     }
 
 
+@app.get("/api/projects/{project_id}/libraries/symbols/{library}")
+def list_library_symbols(
+    project_id: str,
+    library: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """The symbols in one project library, for choosing one to remove."""
+    proj = _project_dir(session, user, project_id)
+    try:
+        return library_upload.library_symbols(proj, library)
+    except ValueError as exc:  # Refused is a ValueError
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+class RemoveSymbolBody(BaseModel):
+    symbol: str
+
+
+@app.post("/api/projects/{project_id}/libraries/symbols/{library}/remove")
+def remove_library_symbol(
+    project_id: str,
+    library: str,
+    body: RemoveSymbolBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Take one symbol out of a project library, leaving the others.
+
+    The way out of an upload collision, and the reason it is offered per symbol:
+    a flat library holds the project's own symbols beside every uploaded one,
+    so deleting the file to get rid of one would take them all.
+    """
+    project = _project_or_404(session, user, project_id)
+    proj = _project_dir(session, user, project_id)
+    _refuse_while_running(session, user, project, "change its libraries")
+    try:
+        out = quarantine.remove_library_symbol(
+            proj, library, body.symbol, by=user.email or f"user {user.id}"
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    activity.record(session, project, user, activity.DELETED, f"{library}:{body.symbol}")
+    commit = _commit_landed_write(
+        session, user, project, proj, f"library: remove {library}:{body.symbol}", master_key
+    )
+    return {"ok": True, **out, **commit}
+
+
 @app.get("/api/projects/{project_id}/quarantine")
 def get_quarantine(
     project_id: str,
@@ -4903,7 +4954,10 @@ def delete_path(
     # The same rule as a move, for the same reason: the ledger names a released
     # file by its path and is never edited to keep up, so deleting one would
     # leave it recording a release of a file that is not there.
-    recorded = llm_ignore.released_under(checkout, rel)
+    # A file a library upload placed is the exception: it is the project's
+    # library now, so it may go, and the ledger records that it went.
+    library_files = set(quarantine.library_placements_under(checkout, rel))
+    recorded = [p for p in llm_ignore.released_under(checkout, rel) if p not in library_files]
     if recorded:
         raise HTTPException(
             status_code=409,
@@ -4919,6 +4973,8 @@ def delete_path(
     else:
         target.unlink()
         kind = "file"
+    if library_files:
+        quarantine.record_library_removal(checkout, rel, by=user.email or f"user {user.id}")
     # After the delete, unlike a move's list update, and safely so: should this
     # write fail, the file is already gone and the entry left behind can only
     # over-ignore a later file of the same name. Nothing becomes readable.
@@ -4992,7 +5048,10 @@ def move_path(
     # how its origin is shown and how a datasheet is found by MPN. Moving it
     # would leave the ledger describing a file that is not there, and the
     # ledger is never edited to keep up, so a released file stays put.
-    recorded = llm_ignore.released_under(checkout, src_rel)
+    # Except a library upload's files, which the ledger follows (see
+    # quarantine.record_library_move): a library is reorganised like any other.
+    library_files = set(quarantine.library_placements_under(checkout, src_rel))
+    recorded = [p for p in llm_ignore.released_under(checkout, src_rel) if p not in library_files]
     if recorded:
         raise HTTPException(
             status_code=409,
@@ -5027,6 +5086,8 @@ def move_path(
             except OSError:
                 pass
         raise HTTPException(status_code=500, detail=f"{src_rel} was not moved: {e}") from e
+    if library_files:
+        quarantine.record_library_move(checkout, src_rel, dst_rel, by=user.email or f"user {user.id}")
     ignore_list_updated = True
     if before is not None:
         try:

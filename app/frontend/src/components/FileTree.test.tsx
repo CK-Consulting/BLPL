@@ -957,3 +957,64 @@ describe("the same folder in two groups", () => {
     expect(calls).toContainEqual({ method: "DELETE", url: "/api/projects/p/files/shared", body: undefined });
   });
 });
+
+describe("a project symbol library", () => {
+  const LIB_NODES: TreeNode[] = [
+    node("overview.md", { role: "design" }),
+    node("libraries/symbols/mine.kicad_sym"),
+    node("libraries/footprints/mine.pretty/SW.kicad_mod"),
+  ];
+
+  function mockLibraryApi() {
+    const calls: { method: string; url: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        const json = (b: unknown) =>
+          new Response(JSON.stringify(b), { status: 200, headers: { "content-type": "application/json" } });
+        if (method === "GET" && url.endsWith("/tree")) return json({ nodes: LIB_NODES });
+        calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+        if (method === "GET" && url.endsWith("/libraries/symbols/mine")) {
+          return json({ library: "mine", symbols: ["OTHER", "PCM12SMTBR"] });
+        }
+        return json({ ok: true, committed: true, remaining: ["OTHER"] });
+      }),
+    );
+    return calls;
+  }
+
+  it("removes one symbol, not the whole library file", async () => {
+    const user = userEvent.setup();
+    const calls = mockLibraryApi();
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("overview.md");
+    await user.click(screen.getByRole("treeitem", { name: /Other/ }));
+    await user.click(screen.getByRole("treeitem", { name: /symbols\// }));
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("mine.kicad_sym") });
+    await user.click(screen.getByRole("menuitem", { name: "Remove a symbol…" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Remove a symbol from mine" });
+    const pick = within(dialog).getByRole("combobox");
+    await waitFor(() => expect(within(pick).getAllByRole("option")).toHaveLength(3));
+    await user.selectOptions(pick, "PCM12SMTBR");
+    await user.click(within(dialog).getByRole("button", { name: "Remove" }));
+
+    await waitFor(() =>
+      expect(calls).toContainEqual({
+        method: "POST",
+        url: "/api/projects/p/libraries/symbols/mine/remove",
+        body: { symbol: "PCM12SMTBR" },
+      }),
+    );
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+  });
+
+  it("is offered only on a symbol library file", async () => {
+    const user = userEvent.setup();
+    mockLibraryApi();
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} />);
+    await user.pointer({ keys: "[MouseRight]", target: await screen.findByText("overview.md") });
+    expect(screen.queryByRole("menuitem", { name: "Remove a symbol…" })).toBeNull();
+  });
+});
