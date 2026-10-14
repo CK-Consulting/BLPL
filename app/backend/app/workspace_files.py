@@ -214,6 +214,12 @@ def _connect(checkout: Path) -> AgentClient:
         return _run(_access().ensure(project_of(checkout)))
     except HTTPException:
         raise
+    except workspaces.WorkspaceSealed as exc:
+        # Sealed by a seal this request waited for: the same answer as a
+        # project that was sealed when the request arrived.
+        project = project_of(checkout)
+        raise HTTPException(status_code=423, detail=str(exc),
+                            headers={"X-BLPL-Sealed": project}) from exc
     except Exception as exc:  # noqa: BLE001 - said to the client, not lost
         raise HTTPException(status_code=503,
                             detail=f"the project's workspace is not available: {exc}") from exc

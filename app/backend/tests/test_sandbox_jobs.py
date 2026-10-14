@@ -675,3 +675,33 @@ def test_cancelling_the_caller_stops_the_run_container(tmp_path):
     asyncio.run(scenario())
     assert d.calls[0].cancelled and d.boxes == {}
 
+
+
+def test_a_run_waits_for_a_seal_in_progress_and_then_does_not_start(tmp_path):
+    """A seal holds the project's gate from stopping the workspace to the
+    archive; a run claimed meanwhile waits for it, finds the project sealed,
+    and starts no container (Codex, PR #20)."""
+    from app import workspace
+    from app.sandbox import gate
+
+    c = cfg(tmp_path)
+    d = FakeDriver(script=lambda call: (0, []))
+
+    async def poll():
+        return "running"
+
+    async def scenario():
+        async with gate.held_async(c.projects_root, "pathfinder", exclusive=True, wait_s=1):
+            run = asyncio.create_task(jobs.run_job_in_container(
+                d, c, project_name="pathfinder", run_id="r1", cmd=["x"], env={},
+                log=lambda s: None, poll=poll))
+            await asyncio.sleep(0.3)
+            assert not run.done(), "the run started in the middle of a seal"
+            blob = workspace.sealed_path(c.projects_root, "pathfinder")
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(b"sealed")
+        with pytest.raises(RuntimeError, match="sealed"):
+            await run
+
+    asyncio.run(scenario())
+    assert d.calls == [] and d.run_specs == []

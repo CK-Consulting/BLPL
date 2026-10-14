@@ -519,6 +519,25 @@ async def run_job_in_container(
     expiring on its own), so writes through the agent still wait for a run
     they cannot see. Cancel stops the container: every process in it, not
     just the first."""
+    from . import gate
+
+    # The project's gate, shared, for the whole run: a seal waits for the run
+    # to end instead of archiving files a stage is writing, and a run cannot
+    # start in the middle of a seal (Codex, PR #20).
+    async with gate.held_async(cfg.projects_root, project_name, exclusive=False,
+                               wait_s=gate.START_WAIT_S):
+        from .. import workspace as _ws
+
+        if _ws.is_sealed(cfg.projects_root, project_name):
+            raise RuntimeError(f"project {project_name!r} was sealed before this run started")
+        return await _run_in_container(
+            driver, cfg, project_name=project_name, run_id=run_id, cmd=cmd, env=env, log=log,
+            poll=poll, mark=mark, poll_every=poll_every, snapshot=snapshot,
+            extra_inject=extra_inject, member=member)
+
+
+async def _run_in_container(driver, cfg, *, project_name, run_id, cmd, env, log, poll, mark,
+                            poll_every, snapshot, extra_inject, member) -> int:
     import codecs
 
     from .runpath import run_env

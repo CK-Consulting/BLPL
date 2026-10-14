@@ -264,3 +264,67 @@ def test_a_reclaimed_agent_run_is_followed_not_started_again(setup, tmp_path):
     code, text = asyncio.run(scenario())
     assert code == 0 and "finished" in text
     assert marker.read_text() == "x\n"
+
+
+# -- a start waits for a seal in progress (Codex, PR #20) ----------------------------------
+
+
+def test_a_workspace_start_waits_for_a_seal_and_then_finds_the_project_sealed(setup):
+    """Interleaved deterministically: the seal has stopped the workspace and
+    is archiving when a request asks for the workspace. The start waits for
+    the seal to finish, then refuses because the project is sealed, and the
+    archive holds exactly what was written before the seal."""
+    from app import workspace
+    from app.sandbox import sealer
+
+    access, driver, projects = setup
+    c = asyncio.run(access.ensure("board"))
+    c.write(str(projects / "board"), "design.md", b"# before the seal\n")
+    c.close()
+
+    archiving = threading.Event()
+    finish = threading.Event()
+    key = b"k" * 32
+
+    async def script(call):
+        # The sealer container: archive and remove, but only when told to.
+        archiving.set()
+        await asyncio.to_thread(finish.wait, 10)
+        workspace.seal(projects, "board", key)
+        return 0, [("stdout", b'{"ok": true, "sealed_bytes": 1}\n')]
+
+    driver.script = script
+
+    async def scenario():
+        seal = asyncio.create_task(sealer.run_sealer(driver, access.run_cfg, "board", key, "seal"))
+        await asyncio.to_thread(archiving.wait, 5)
+        start = asyncio.create_task(access.ensure("board"))
+        await asyncio.sleep(0.5)
+        assert not start.done(), "the start went ahead in the middle of the seal"
+        finish.set()
+        assert (await seal)["ok"]
+        with pytest.raises(workspaces.WorkspaceSealed):
+            await start
+
+    asyncio.run(scenario())
+    assert workspace.is_sealed(projects, "board") and not (projects / "board").exists()
+    workspace.unseal(projects, "board", key)
+    assert (projects / "board" / "design.md").read_bytes() == b"# before the seal\n"
+
+
+def test_a_seal_does_not_wait_out_a_run_it_gives_up_and_retries(setup, monkeypatch):
+    """A run holds the gate shared for its whole length; a seal meanwhile is
+    busy, not blocked, and the project is left exactly as it was."""
+    from app.sandbox import gate, sealer
+
+    access, driver, projects = setup
+    monkeypatch.setattr(gate, "SEAL_WAIT_S", 0.3)
+
+    async def scenario():
+        async with gate.held_async(projects, "board", exclusive=False, wait_s=1):
+            with pytest.raises(sealer.SealError, match="being started or run"):
+                await sealer.run_sealer(driver, access.run_cfg, "board", b"k" * 32, "seal")
+
+    asyncio.run(scenario())
+    assert (projects / "board").is_dir()
+    assert not any(op == "run_container" for op, _ in driver.ops)
