@@ -70,6 +70,7 @@ from urllib.parse import parse_qs, urlsplit
 # quarantine). In the backend's tree they are the `app` package itself; in the
 # workspace image the same files sit in /opt/blpl/wsagent/app beside this one.
 from app import projects as _projects  # type: ignore[import-not-found]
+from app import serving as _serving  # type: ignore[import-not-found]
 
 logger = logging.getLogger("blpl.wsagent")
 
@@ -89,9 +90,13 @@ class AgentError(Exception):
         self.status, self.kind = status, kind
 
 
-# How long a connection may take to send its request. A body that trickles
-# in, or never ends, holds one thread for this long and no longer.
+# How long a connection may take to send its request, line, headers and body
+# together: an absolute deadline (serving.Deadline), not a per-recv timeout,
+# which a body trickled in a byte at a time never tripped (Codex, PR #20).
 REQUEST_TIMEOUT_S = 60.0
+# Connections handled at once; one more is closed unread at accept. The
+# control plane's own calls are few at a time; this is a ceiling on threads.
+MAX_CONNECTIONS = int(os.environ.get("BLPL_AGENT_MAX_CONNECTIONS", "32"))
 
 
 def read_body(handler: BaseHTTPRequestHandler, cap: int, *, required: bool) -> bytes:
@@ -102,7 +107,8 @@ def read_body(handler: BaseHTTPRequestHandler, cap: int, *, required: bool) -> b
     the length must be digits, within the cap, and present when a body is
     required; a chunked body is refused outright, since nothing here needs
     one. A refusal closes the connection: the unread body would otherwise be
-    parsed as the next request. The handler's socket timeout bounds a slow one.
+    parsed as the next request. The handler's request deadline (serving.py)
+    bounds a slow one, whole, and is disarmed once the body is in.
     """
     def refuse(status: int, message: str) -> AgentError:
         handler.close_connection = True
@@ -125,8 +131,14 @@ def read_body(handler: BaseHTTPRequestHandler, cap: int, *, required: bool) -> b
         data = handler.rfile.read(n) if n else b""
     except (TimeoutError, OSError):
         raise refuse(408, "the request body did not arrive in time") from None
+    if getattr(handler, "expired", False):
+        # Cut by the deadline: the short read is the cut, not the client's end.
+        raise refuse(408, "the request body did not arrive in time")
     if len(data) != n:
         raise refuse(400, "the request body ended early")
+    body_read = getattr(handler, "body_read", None)
+    if body_read is not None:
+        body_read()
     return data
 
 
@@ -1195,9 +1207,10 @@ _JSON_ROUTES = {
 
 
 def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(_serving.DeadlineHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = REQUEST_TIMEOUT_S
+        request_deadline_s = REQUEST_TIMEOUT_S
 
         def log_message(self, fmt: str, *args: Any) -> None:  # noqa: D401
             logger.info("%s", fmt % args)
@@ -1289,7 +1302,7 @@ def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class Server(_serving.Bounded, socketserver.UnixStreamServer):
     daemon_threads = True
 
 
@@ -1314,7 +1327,7 @@ def serve(socket_path: str, agent: Agent) -> Server:
     p = Path(socket_path)
     if p.exists() or p.is_symlink():
         p.unlink()
-    server = Server(str(p), make_handler(agent))
+    server = Server(str(p), make_handler(agent), max_connections=MAX_CONNECTIONS)
     os.chmod(p, 0o600)
     return server
 

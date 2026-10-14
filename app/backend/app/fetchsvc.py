@@ -37,10 +37,12 @@ import socket
 import ssl
 import threading
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import HTTPServer
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin, urlsplit
+
+from .serving import Bounded, DeadlineHTTPRequestHandler
 
 logger = logging.getLogger("blpl.fetch")
 
@@ -58,7 +60,13 @@ HELD_MAX_BYTES = int(os.environ.get("BLPL_FETCH_HELD_MAX_MB", "500")) * 1024 * 1
 MAX_REDIRECTS = 5
 # A fetch request is a URL in a small JSON object.
 MAX_REQUEST_BYTES = 64 * 1024
+# The whole request, line, headers and body, however it is paced
+# (serving.Deadline); a per-recv timeout let a client trickle one byte inside
+# it forever (Codex, PR #20).
 REQUEST_TIMEOUT_S = 30.0
+# Connections handled at once, before anything is read from them; one more is
+# closed at accept. Fetches themselves are bounded by MAX_CONCURRENT.
+MAX_CONNECTIONS = int(os.environ.get("BLPL_FETCH_MAX_CONNECTIONS", "32"))
 _PORTS = {"http": 80, "https": 443}
 
 
@@ -295,10 +303,12 @@ def make_handler(authenticate: Authenticate, held_root: Path, *,
     project, or None."""
     slots = slots or Slots()
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(DeadlineHTTPRequestHandler):
         server_version = "blpl-fetch"
-        # A request that trickles in holds one thread for this long at most.
+        # A request that trickles in holds one thread for this long at most:
+        # per recv, and for the whole request.
         timeout = REQUEST_TIMEOUT_S
+        request_deadline_s = REQUEST_TIMEOUT_S
 
         _user = ""
 
@@ -319,19 +329,13 @@ def make_handler(authenticate: Authenticate, held_root: Path, *,
                 return self._answer(401, {"error": "this run's credential was not accepted"})
             from .sandbox.agent import AgentError, read_body
 
-            try:
-                # min(-1, cap) was -1, and read(-1) reads until the peer
-                # closes (Codex, PR #20): the length is checked first.
-                raw = read_body(self, MAX_REQUEST_BYTES, required=True)
-            except AgentError as exc:
-                return self._answer(exc.status, {"error": str(exc)})
-            try:
-                request = json.loads(raw or b"{}")
-                url = str(request.get("url") or "")
-            except (ValueError, TypeError, AttributeError):
-                return self._answer(400, {"error": "a JSON body with a url is required"})
+            # The slot is taken before the body is read, so a run's slow
+            # bodies count against its own fetches; read first, a run could
+            # hold any number of threads in reads (Codex, PR #20). The body's
+            # read is bounded by the request deadline either way.
             run = self._user or project
             if not slots.take(run):
+                self.close_connection = True
                 return self._answer(429, {"error": "too many fetches at once; try again shortly"})
             # The slot covers the whole of the work, not only the download:
             # assessment parses the PDF, may wait on the scanner and writes
@@ -340,6 +344,17 @@ def make_handler(authenticate: Authenticate, held_root: Path, *,
             # one run holds at once are at most MAX_PER_RUN fetches of
             # MAX_BYTES each.
             try:
+                try:
+                    # min(-1, cap) was -1, and read(-1) reads until the peer
+                    # closes (Codex, PR #20): the length is checked first.
+                    raw = read_body(self, MAX_REQUEST_BYTES, required=True)
+                except AgentError as exc:
+                    return self._answer(exc.status, {"error": str(exc)})
+                try:
+                    request = json.loads(raw or b"{}")
+                    url = str(request.get("url") or "")
+                except (ValueError, TypeError, AttributeError):
+                    return self._answer(400, {"error": "a JSON body with a url is required"})
                 try:
                     got = download(url, resolve=resolve, connections=connections,
                                    deadline_s=deadline_s)
@@ -388,12 +403,16 @@ def db_authenticate(user: str, password: str) -> str | None:
         return g.project if g is not None and g.kind == "run" else None
 
 
+class _Server(Bounded, HTTPServer):
+    daemon_threads = True
+
+
 def serve(listen: str, held_root: Path, authenticate: Authenticate = db_authenticate,
-          **kw) -> ThreadingHTTPServer:
+          max_connections: int | None = None, **kw) -> HTTPServer:
     host, _, port = listen.rpartition(":")
-    server = ThreadingHTTPServer((host or "0.0.0.0", int(port)),
-                                 make_handler(authenticate, held_root, **kw))
-    server.daemon_threads = True
+    server = _Server((host or "0.0.0.0", int(port)), make_handler(authenticate, held_root, **kw),
+                     max_connections=MAX_CONNECTIONS if max_connections is None
+                     else max_connections)
     threading.Thread(target=server.serve_forever, daemon=True, name="fetch-service").start()
     logger.info("fetch service on %s", listen)
     return server

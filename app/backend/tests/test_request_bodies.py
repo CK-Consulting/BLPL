@@ -281,3 +281,235 @@ def test_the_storage_helper_drops_a_line_that_never_ends_or_is_too_long(tmp_path
     finally:
         server.shutdown()
         server.server_close()
+
+
+# -- an absolute deadline, and a bound on connections (Codex, PR #20) ----------------------
+#
+# The timeouts above are per recv. A client sending a byte just inside each one
+# was never cut off, and each such client held a thread; enough of them held
+# every thread. Each server now cuts a request that has not arrived whole by
+# its deadline, and closes a connection beyond its bound before reading it.
+
+
+def _trickle(connect, head: bytes, *, every: float = 0.2, give_up: float = 6.0):
+    """Send head, then a byte every `every` seconds, until the server closes
+    the connection or `give_up` passes. Returns (seconds until closed or
+    None, what the server said)."""
+    s = connect()
+    s.settimeout(every)
+    got = b""
+    t0 = time.monotonic()
+    try:
+        s.sendall(head)
+        while time.monotonic() - t0 < give_up:
+            try:
+                chunk = s.recv(65536)
+                if not chunk:
+                    return time.monotonic() - t0, got
+                got += chunk
+            except (TimeoutError, socket.timeout):
+                pass
+            try:
+                s.send(b"x")
+            except OSError:
+                return time.monotonic() - t0, got
+        return None, got
+    except OSError:
+        return time.monotonic() - t0, got
+    finally:
+        s.close()
+
+
+def _closed_at_once(connect, *, within: float = 0.5) -> bool:
+    """Whether a new connection is closed by the server without a byte sent."""
+    s = connect()
+    s.settimeout(within)
+    try:
+        return s.recv(1) == b""
+    except (TimeoutError, socket.timeout):
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
+def test_the_agent_cuts_off_a_trickled_body_at_its_deadline(agent_sock):
+    path, board = agent_sock
+    took, said = _trickle(_unix(path), _post(f"/fs/write?checkout={board}&path=a.md", "1000"))
+    assert took is not None and took < 3, "the trickled body held the connection"
+    assert _status(said) in (408, None)
+    assert not (board / "a.md").exists()
+
+
+def test_the_agent_cuts_off_trickled_headers_at_its_deadline(agent_sock):
+    path, _ = agent_sock
+    took, _ = _trickle(_unix(path), b"POST /fs/write HTTP/1.1\r\nX-Slow: ")
+    assert took is not None and took < 3
+
+
+def test_the_agent_serves_a_bounded_number_of_connections(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_mod, "MAX_CONNECTIONS", 2)
+    (tmp_path / "board").mkdir()
+    a = agent_mod.Agent(TOKEN, [str(tmp_path / "board")])
+    path = str(tmp_path / "agent.sock")
+    server = agent_mod.serve(path, a)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    held = []
+    try:
+        before = threading.active_count()
+        for _ in range(2):
+            held.append(_unix(path)())
+            time.sleep(0.05)
+        extra = [_unix(path)() for _ in range(20)]
+        assert _closed_at_once(_unix(path)), "a third connection was accepted"
+        for s in extra:
+            s.close()
+        assert server.refused >= 21
+        # Two handlers, and at most the one thread every deadline shares.
+        assert threading.active_count() <= before + 3
+        held.pop().close()
+        time.sleep(0.2)
+        s = _unix(path)()
+        s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                  + b"\r\n\r\n")
+        s.settimeout(5)
+        assert s.recv(65536).startswith(b"HTTP/1.1 200"), "a freed slot was not reused"
+        s.close()
+    finally:
+        for s in held:
+            s.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_fetch_service_takes_a_slot_before_reading_and_cuts_a_trickled_body(tmp_path,
+                                                                               monkeypatch):
+    from app import fetchsvc
+
+    monkeypatch.setattr(fetchsvc, "REQUEST_TIMEOUT_S", 1.0)
+    slots = fetchsvc.Slots(total=8, per_run=1)
+    server = fetchsvc.serve("127.0.0.1:0", tmp_path / "held", authenticate=lambda u, p: "board",
+                            slots=slots)
+    port = server.server_port
+    try:
+        result = {}
+        t = threading.Thread(target=lambda: result.update(
+            r=_trickle(_tcp(port), _fetch_post("500"))))
+        t.start()
+        time.sleep(0.3)
+        # The trickling request holds this run's one slot while its body is read.
+        assert _status(_exchange(_tcp(port), _fetch_post("2") + b"{}")) == 429
+        t.join()
+        took, said = result["r"]
+        assert took is not None and took < 3, "the trickled body held the connection"
+        assert _status(said) in (408, None)
+        end = time.monotonic() + 2
+        while slots._busy and time.monotonic() < end:
+            time.sleep(0.02)
+        assert slots._busy == {}, "the slot was not given back"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_fetch_service_serves_a_bounded_number_of_connections(tmp_path, monkeypatch):
+    from app import fetchsvc
+
+    monkeypatch.setattr(fetchsvc, "REQUEST_TIMEOUT_S", 5.0)
+    server = fetchsvc.serve("127.0.0.1:0", tmp_path / "held", authenticate=lambda u, p: None,
+                            max_connections=2)
+    port = server.server_port
+    held = []
+    try:
+        before = threading.active_count()
+        for _ in range(2):
+            held.append(_tcp(port)())
+            time.sleep(0.05)
+        assert _closed_at_once(_tcp(port)), "a third connection was accepted"
+        assert server.refused >= 1 and threading.active_count() <= before + 3
+    finally:
+        for s in held:
+            s.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_socket_proxy_cuts_off_a_trickled_body_and_bounds_connections(monkeypatch):
+    from app.sandbox import proxy as proxy_mod
+    from app.sandbox.policy import ProxyPolicy
+
+    monkeypatch.setattr(proxy_mod, "REQUEST_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(proxy_mod, "MAX_CONNECTIONS", 2)
+    path = str(Path(tempfile.mkdtemp(prefix="blpl-px-")) / "p.sock")
+    head = (b"POST /v1.44/containers/create HTTP/1.1\r\nHost: d\r\n"
+            b"Content-Length: 1000\r\n\r\n")
+
+    async def go():
+        proxy = proxy_mod.DockerProxy(ProxyPolicy(), _NoUpstream())
+        server = await proxy_mod.serve(proxy, path)
+        try:
+            took, said = await asyncio.to_thread(_trickle, _unix(path), head)
+            held = [await asyncio.to_thread(_unix(path)) for _ in range(2)]
+            await asyncio.sleep(0.1)
+            third = await asyncio.to_thread(_closed_at_once, _unix(path))
+            for s in held:
+                s.close()
+            return took, said, third, proxy.refused
+        finally:
+            server.close()
+
+    took, said, third, refused = asyncio.run(go())
+    assert took is not None and took < 3, "the trickled body held the connection"
+    assert _status(said) in (408, None)
+    assert third and refused >= 1
+
+
+def test_the_storage_helper_cuts_off_a_trickled_line_and_bounds_connections(tmp_path,
+                                                                           monkeypatch):
+    from app.sandbox import btrfs
+
+    monkeypatch.setattr(btrfs, "HELPER_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(btrfs, "HELPER_MAX_CONNECTIONS", 2)
+
+    class Never:
+        def handle(self, request):  # pragma: no cover - never reached
+            raise AssertionError("parsed")
+
+    path = str(tmp_path / "s.sock")
+    server = btrfs.serve_helper(path, Never(), client_uid=os.getuid(), client_gid=os.getgid())
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    held = []
+    try:
+        took, _ = _trickle(_unix(path), b'{"verb": "usage", "project": "')
+        assert took is not None and took < 3, "the trickled line held the connection"
+        for _ in range(2):
+            held.append(_unix(path)())
+            time.sleep(0.05)
+        assert _closed_at_once(_unix(path)), "a third connection was accepted"
+        assert server.refused >= 1
+    finally:
+        for s in held:
+            s.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_egress_socket_bounds_connections(tmp_path, monkeypatch):
+    from app import egress_server
+
+    monkeypatch.setattr(egress_server._Server, "max_connections", 2)
+    path = str(tmp_path / "d.sock")
+    server = egress_server.serve(path, lambda q: True)
+    held = []
+    try:
+        for _ in range(2):
+            held.append(_unix(path)())
+            time.sleep(0.05)
+        assert _closed_at_once(_unix(path)), "a third connection was accepted"
+        assert server.refused >= 1
+    finally:
+        for s in held:
+            s.close()
+        server.shutdown()
+        server.server_close()

@@ -18,10 +18,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import socket
 import socketserver
 import threading
 from typing import Callable, Mapping
+
+from .serving import Bounded, Deadline
 
 logger = logging.getLogger("blpl.egress")
 
@@ -32,28 +33,21 @@ _MAX_LINE = 4096
 class _Handler(socketserver.StreamRequestHandler):
     timeout = 5
 
-    def _cut(self) -> None:
-        try:
-            self.connection.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-
     def handle(self) -> None:
         decide: Decide = self.server.decide  # type: ignore[attr-defined]
         while True:
             # The timeout above is per recv, so a peer sending one byte every
             # few seconds held a thread for as long as it liked. Each question
             # must arrive whole within it (Codex, PR #20).
-            watchdog = threading.Timer(self.timeout, self._cut)
-            watchdog.daemon = True
-            watchdog.start()
+            deadline = Deadline(self.connection, self.timeout)
             try:
                 line = self.rfile.readline(_MAX_LINE + 1)
             except OSError:
                 return
             finally:
-                watchdog.cancel()
-            if not line or not line.endswith(b"\n") and len(line) <= _MAX_LINE:
+                deadline.cancel()
+            if deadline.expired.is_set() or not line or \
+                    not line.endswith(b"\n") and len(line) <= _MAX_LINE:
                 # Closed, or cut part way through a question: no answer.
                 return
             ok = False
@@ -71,9 +65,12 @@ class _Handler(socketserver.StreamRequestHandler):
                 return
 
 
-class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class _Server(Bounded, socketserver.UnixStreamServer):
+    # Squid runs at most ten helpers (squid.conf: five for auth, five for the
+    # ACL), each with one connection; more than this is not Squid.
     daemon_threads = True
     allow_reuse_address = True
+    max_connections = 32
 
 
 def serve(path: str, decide: Decide) -> _Server:

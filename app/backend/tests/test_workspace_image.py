@@ -64,7 +64,7 @@ def test_workspace_bakes_in_no_secret_and_no_control_plane():
     assert from_app == ["app/backend/app/llm_ignore.py", "app/backend/app/projects.py",
                         "app/backend/app/sandbox/agent.py", "app/backend/app/sandbox/btrfs.py",
                         "app/backend/app/sandbox/driver.py", "app/backend/app/sandbox/sealer.py",
-                        "app/backend/app/sandbox/storage.py",
+                        "app/backend/app/sandbox/storage.py", "app/backend/app/serving.py",
                         "app/backend/app/vault.py", "app/backend/app/workspace.py",
                         "app/backend/app/worktrees.py"]
     for ln in _instructions(text):

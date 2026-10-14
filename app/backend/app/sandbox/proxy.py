@@ -57,10 +57,15 @@ logger = logging.getLogger("blpl.sandbox.proxy")
 
 MAX_HEADER_BYTES = 64 * 1024
 MAX_BODY_BYTES = 1024 * 1024
-# How long a client may take to send one request. h11 already refuses a
-# malformed or negative Content-Length and the body is capped as it arrives;
-# this bounds a request that trickles in, or never ends.
+# How long a client may take to send one request, headers and body together.
+# h11 already refuses a malformed or negative Content-Length and the body is
+# capped as it arrives; this bounds a request that trickles in, or never ends.
+# Absolute: it was per read, which a byte inside each timeout never tripped
+# (Codex, PR #20).
 REQUEST_TIMEOUT_S = 30.0
+# Connections handled at once; one more is closed as it arrives, unread. The
+# backend and worker are the only clients, a few calls at a time.
+MAX_CONNECTIONS = int(os.environ.get("BLPL_PROXY_MAX_CONNECTIONS", "64"))
 _FULL_ID = re.compile(r"[0-9a-f]{64}")
 
 
@@ -137,6 +142,8 @@ class DockerProxy:
     def __init__(self, policy: ProxyPolicy, upstream: Upstream):
         self.policy = policy
         self.upstream = upstream
+        self.active = 0
+        self.refused = 0
 
     async def _container(self, v: str, ident: str) -> str:
         """Resolve a container reference to its full id, if it is ours."""
@@ -234,7 +241,7 @@ class DockerProxy:
         while True:
             event = conn.next_event()
             if event is h11.NEED_DATA:
-                data = await asyncio.wait_for(reader.read(65536), REQUEST_TIMEOUT_S)
+                data = await reader.read(65536)
                 conn.receive_data(data)
                 if not data and conn.their_state is not h11.DONE:
                     return None
@@ -270,11 +277,23 @@ class DockerProxy:
         await writer.drain()
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self.active >= MAX_CONNECTIONS:
+            self.refused += 1
+            writer.close()
+            return
+        self.active += 1
+        try:
+            await self._handle(reader, writer)
+        finally:
+            self.active -= 1
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         conn = h11.Connection(h11.SERVER, max_incomplete_event_size=MAX_HEADER_BYTES)
         up_writer = None
         try:
             try:
-                req = await self._read_request(conn, reader)
+                req = await asyncio.wait_for(self._read_request(conn, reader),
+                                             REQUEST_TIMEOUT_S)
             except h11.RemoteProtocolError as e:
                 await self._reply(conn, writer, 400, f"bad request: {e}")
                 return

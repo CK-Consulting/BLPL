@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
+from ..serving import Bounded, Deadline
 from .driver import Mount, WorkspaceKey
 from .storage import WORKSPACE_MOUNT
 
@@ -210,6 +211,13 @@ class StorageHelper:
 
 
 HELPER_TIMEOUT_S = 30.0
+# Connections answered at once. The worker's are a handful at a time; one
+# more is closed at accept, before its peer is even checked.
+HELPER_MAX_CONNECTIONS = 16
+
+
+class _HelperServer(Bounded, socketserver.UnixStreamServer):
+    daemon_threads = True
 
 
 def _peer_uid(sock) -> int | None:
@@ -237,17 +245,23 @@ def serve_helper(socket_path: str, helper: StorageHelper, *, client_uid: int,
     client_uid is answered, whatever else shares the group.
     """
     class Handler(socketserver.StreamRequestHandler):
-        # One JSON line, at most 64 KiB, within this time: a client that
-        # trickles or never finishes holds one thread this long and no more.
+        # One JSON line, at most 64 KiB, within this time, as a whole and not
+        # per recv (Codex, PR #20): a client that trickles or never finishes
+        # holds one thread this long and no more.
         timeout = HELPER_TIMEOUT_S
 
         def handle(self) -> None:
             if _peer_uid(self.connection) != client_uid:
                 self.wfile.write(b'{"ok": false, "error": "not the worker"}\n')
                 return
+            deadline = Deadline(self.connection, HELPER_TIMEOUT_S)
             try:
                 line = self.rfile.readline(64 * 1024)
             except OSError:
+                return
+            finally:
+                deadline.cancel()
+            if deadline.expired.is_set():
                 return
             if not line.endswith(b"\n"):
                 # Over the cap, or cut short: not a request, and not parsed.
@@ -266,7 +280,7 @@ def serve_helper(socket_path: str, helper: StorageHelper, *, client_uid: int,
     p = Path(socket_path)
     if p.exists() or p.is_symlink():
         p.unlink()
-    server = socketserver.ThreadingUnixStreamServer(str(p), Handler)
+    server = _HelperServer(str(p), Handler, max_connections=HELPER_MAX_CONNECTIONS)
     os.chmod(p, 0o660)
     try:
         os.chown(p, -1, client_gid)
