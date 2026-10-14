@@ -58,6 +58,13 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
+# Which inspector a recorded result came from. Stored beside every verdict the
+# app keeps by content hash, and a verdict counts only while it matches: a
+# "clean" from an inspector that has since learned to find something more is
+# an answer to a question nobody is asking any more. Bump it whenever a change
+# here can find something in a file that the previous version passed.
+VERSION = "1"
+
 # What each construct does, and — the part that decides policy — whether it
 # needs the reader to do anything. "active" means it can fire on open.
 #
