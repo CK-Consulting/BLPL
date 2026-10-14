@@ -1026,6 +1026,34 @@ workspace).
   each question to arrive whole within its 5 s timeout, which was per recv;
   the Docker socket proxy's upstream is the local daemon, and the storage
   helper and agent are the control plane's own processes.
+- **Every server reads a request under one deadline, and holds a bounded
+  number of connections** (review, PR #20). Their timeouts were per recv, so a
+  client sending a byte just inside each held a thread forever, and enough of
+  them held every thread before any authentication. `app/serving.py` gives
+  the agent, the fetch service, the egress decision socket and the storage
+  helper an absolute deadline over each request (line, headers and body,
+  disarmed once the body is in, so the work itself is not cut), kept by one
+  watchdog thread for the process, and a per-server bound on connections
+  taken at accept, before a byte is read: one more is closed unread. The
+  Docker socket proxy (asyncio) reads each request under one `wait_for` and
+  bounds its connections the same way. The fetch service takes the run's
+  slot before reading the body, so a run's slow bodies count against its own
+  fetches. Defaults: agent 32 (`BLPL_AGENT_MAX_CONNECTIONS`), fetch 32
+  (`BLPL_FETCH_MAX_CONNECTIONS`), proxy 64 (`BLPL_PROXY_MAX_CONNECTIONS`),
+  egress socket 32, storage helper 16.
+- **Quarantine never writes through a link** (review, PR #20). The upload
+  verb checked only that `datasheets/`, `references/` and `retrieved/` were
+  real directories, so a run could plant a link at a predictable file name
+  inside one (`datasheets/<MPN>.pdf`, the stored name, the ledger) and have
+  an upload written through it into another member's worktree. Quarantine
+  itself (`blpl.core.quarantine`) now opens every directory below the
+  project root by descriptor, a component at a time, deciding from lstat and
+  checking the descriptor is that inode (O_NOFOLLOW alone does not hold under
+  gVisor); reads files without following links; and writes to a fresh name
+  created exclusively in that directory, renamed over a target checked not to
+  be a link. Release reads the stored file the same way and checks it is the
+  file that was assessed. A link anywhere is `LinkRefused`, which the agent
+  answers 403 and the direct upload path reports as a rejected file.
 - **Git over ssh to the project's own remote** (review, PR #20). Port 22 was
   `git-hosts.txt` only, so a GitLab or self-hosted ssh remote the app accepts
   was refused once workspaces were on. A pull or push's git grant now names
