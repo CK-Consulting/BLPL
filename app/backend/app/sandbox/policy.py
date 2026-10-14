@@ -48,6 +48,7 @@ from typing import Any, Callable, Mapping
 
 from .driver import (
     AGENT_DIR,
+    LABEL_CHECKOUT,
     LABEL_INSTANCE,
     LABEL_MANAGED,
     LABEL_PROJECT,
@@ -397,10 +398,30 @@ def _real(policy: ProxyPolicy, where: str, root: str, path: str, final: str) -> 
         raise Refused(f"{where}.Source: {exc}") from None
 
 
+def _run_checkout(policy: ProxyPolicy, project: str, checkout: str) -> set[str]:
+    """The one checkout a run container may bind read-write: the owner's
+    repository directory, or the named member's worktree (Codex, PR #20)."""
+    if not _PROJECT_NAME.fullmatch(project):
+        return set()
+    out = set()
+    for root in policy.project_bind_roots:
+        root = root.rstrip("/")
+        if not root:
+            continue
+        if checkout == "owner":
+            out.add(f"{root}/{project}")
+        elif re.fullmatch(r"u[0-9]{1,18}", checkout or ""):
+            out.add(f"{root}/.worktrees/{project}/{checkout}")
+    return out
+
+
 def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
-            container: str = "", role: str = "") -> Any:
+            container: str = "", role: str = "", checkout: str = "") -> Any:
     if not isinstance(v, list):
         raise Refused(f"{where} must be a list")
+    # A run container gets its invoker's checkout and nothing else writable,
+    # and only that member's gitfile read-only.
+    own = _run_checkout(policy, project, checkout) if role == "run" else set()
     out, targets = [], set()
     for i, m in enumerate(v):
         w = f"{where}[{i}]"
@@ -431,7 +452,8 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
                 git_dirs = {d + "/.git" for d in _project_dirs(policy, project)
                             if "/.worktrees/" not in d}
                 member_gitfile = (src.endswith("/.git")
-                                  and _member_dir(policy, project, src[:-len("/.git")]))
+                                  and _member_dir(policy, project, src[:-len("/.git")])
+                                  and (role != "run" or src[:-len("/.git")] in own))
                 if _under_root(src, policy.ro_bind_roots):
                     _real(policy, w, _root_of(src, policy.ro_bind_roots), src, "any")
                 elif src in git_dirs:
@@ -450,6 +472,11 @@ def _mounts(policy: ProxyPolicy, v: Any, where: str, project: str = "",
                 if got["Target"] != AGENT_DIR:
                     raise Refused(f"{w}: an agent directory is mounted at {AGENT_DIR} only")
                 _real(policy, w, _root_of(src, policy.agent_dir_roots), src, "dir")
+            elif role == "run":
+                if src not in own:
+                    raise Refused(f"{w}: a run may bind only its invoker's checkout "
+                                  f"({checkout or 'unnamed'}), not {src}")
+                _real(policy, w, _root_of(src, policy.project_bind_roots), src, "dir")
             elif src in _project_dirs(policy, project) or _member_dir(policy, project, src):
                 _real(policy, w, _root_of(src, policy.project_bind_roots), src, "dir")
             else:
@@ -530,7 +557,7 @@ def check_create(policy: ProxyPolicy, query: Mapping[str, str], obj: Any) -> Cre
         "NanoCpus": _int_range(1, policy.max_nano_cpus),
         "PidsLimit": _int_range(1, policy.max_pids),
         "Mounts": lambda v, w: _mounts(policy, v, w, labels[LABEL_PROJECT], name,
-                                       labels[LABEL_ROLE]),
+                                       labels[LABEL_ROLE], labels.get(LABEL_CHECKOUT, "")),
         # Empty means the daemon's default runtime, decided below.
         "Runtime": lambda v, w: _DROP if v in ("", None) else _one_of(policy.runtimes)(v, w),
         "RestartPolicy": lambda v, w: _pick(v, {"Name": _one_of({"no", ""})}, w),

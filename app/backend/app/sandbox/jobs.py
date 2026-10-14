@@ -35,7 +35,15 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Mapping, Sequence
 
-from .driver import Mount, Resources, State, WorkspaceDriver, WorkspaceKey, WorkspaceSpec
+from .driver import (
+    LABEL_CHECKOUT,
+    Mount,
+    Resources,
+    State,
+    WorkspaceDriver,
+    WorkspaceKey,
+    WorkspaceSpec,
+)
 from .idle import IdleTracker
 from .runpath import execute_run
 
@@ -452,22 +460,35 @@ def runs_in_containers(env: Mapping[str, str] | None = None) -> bool:
     return env.get("BLPL_RUNS_IN_CONTAINER", "") == "1"
 
 
-def run_spec_for(cfg: WorkspaceRunConfig, project_name: str, run_id: str) -> WorkspaceSpec:
-    """The workspace's spec, as a run container: the same storage and
-    libraries, with every way into git history made read-only.
+_MEMBER = re.compile(r"u[0-9]{1,18}")
 
-    - The owner's ``.git`` directory is bound read-only. It holds every
-      member's git directory too (``.git/worktrees/<name>``), so no git command
-      a stage runs can rewrite an index, move a ref or install a hook.
-    - Each member's ``.git`` file is bound read-only. It only points at that git
+
+def run_spec_for(cfg: WorkspaceRunConfig, project_name: str, run_id: str,
+                 member: str | None = None) -> WorkspaceSpec:
+    """The spec for one run's container: the invoking member's checkout and
+    nothing else of theirs or anyone's, with every way into git history made
+    read-only.
+
+    - ``member`` is whose run it is: None for the owner, whose checkout is the
+      repository directory, or ``u<id>`` for a member's worktree. Only that
+      checkout is mounted, read-write. Every member's worktree went into every
+      run before, so one member's stage could read, rewrite or delete another
+      member's uncommitted work (Codex, PR #20). The proxy enforces the same
+      from the container's ``blpl.checkout`` label.
+    - The owner's ``.git`` directory is bound read-only, at its own path. It
+      holds the object store and every member's git directory
+      (``.git/worktrees/<name>``), which a member's gitfile points into; no git
+      command a stage runs can rewrite an index, move a ref or install a hook.
+      For a member's run it is the only part of the owner's checkout mounted.
+    - A member's ``.git`` file is bound read-only. It only points at that git
       directory, but a stage that could rewrite it could point it at a writable
       directory of its own, hooks included, which the agent's next commit in
       that worktree would use (Codex, PR #20).
-    - Each member's worktree is its own mount, instead of all of
-      ``.worktrees/<project>`` as one. A mount point cannot be renamed, so a
-      stage cannot move a worktree aside and put a fresh one, with a gitfile of
-      its choosing, in its place. It also cannot create a new one.
+    - A member's worktree is its own mount point, so a stage cannot rename it
+      aside and put a fresh one, with a gitfile of its choosing, in its place.
     """
+    if member is not None and not _MEMBER.fullmatch(member):
+        raise ValueError(f"{member!r} is not a member checkout")
     base = spec_for(cfg, project_name)
     root, host = str(cfg.projects_root), cfg.host_projects_root
     overlays: list[Mount] = []
@@ -478,17 +499,14 @@ def run_spec_for(cfg: WorkspaceRunConfig, project_name: str, run_id: str) -> Wor
         _real(cfg, f"{project_name}/.git")
         overlays.append(Mount(kind="bind", source=f"{host}/{project_name}/.git",
                               target=f"{root}/{project_name}/.git", read_only=True))
-    worktrees: list[Mount] = []
-    wt_root = cfg.projects_root / ".worktrees" / project_name
-    for member in sorted(p.name for p in wt_root.iterdir()) if wt_root.is_dir() else []:
+    if member is None:
+        storage = base.storage
+    else:
         rel = f".worktrees/{project_name}/{member}"
-        if not _NAME.fullmatch(member):
-            continue
-        # A link here is a stage's doing: refuse the run rather than skip the
-        # entry, so it is seen.
+        # A link here is a stage's doing: refuse the run rather than skip it.
         _real(cfg, rel)
-        worktrees.append(Mount(kind="bind", source=f"{host}/{rel}", target=f"{root}/{rel}"))
-        gitfile = wt_root / member / ".git"
+        storage = Mount(kind="bind", source=f"{host}/{rel}", target=f"{root}/{rel}")
+        gitfile = cfg.projects_root / rel / ".git"
         if gitfile.is_symlink():
             raise ValueError(f"refusing to mount {rel}/.git: it is a symlink")
         if gitfile.is_file():
@@ -496,7 +514,9 @@ def run_spec_for(cfg: WorkspaceRunConfig, project_name: str, run_id: str) -> Wor
             overlays.append(Mount(kind="bind", source=f"{host}/{rel}/.git",
                                   target=f"{root}/{rel}/.git", read_only=True))
     return replace(base, key=WorkspaceKey(project=project_name, role="run", member=run_id),
-                   extra_storage=tuple(worktrees), overlays=tuple(overlays))
+                   storage=storage, extra_storage=(), overlays=tuple(overlays),
+                   extra_labels={**base.extra_labels,
+                                 LABEL_CHECKOUT: member if member is not None else "owner"})
 
 
 async def run_job_in_container(
@@ -513,6 +533,7 @@ async def run_job_in_container(
     poll_every: float = 20.0,
     snapshot: Callable[[str], Awaitable[object]] | None = None,
     extra_inject: Mapping[str, str] | None = None,
+    member: str | None = None,
 ) -> int:
     """Phase 4: one run, one container, removed when it ends.
 
@@ -524,7 +545,7 @@ async def run_job_in_container(
 
     from .runpath import run_env
 
-    spec = run_spec_for(cfg, project_name, re.sub(r"[^A-Za-z0-9_.-]", "-", run_id))
+    spec = run_spec_for(cfg, project_name, re.sub(r"[^A-Za-z0-9_.-]", "-", run_id), member)
     decoders = {s: codecs.getincrementaldecoder("utf-8")("replace") for s in ("stdout", "stderr")}
 
     def sink(stream: str, data: bytes) -> None:

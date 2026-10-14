@@ -61,10 +61,10 @@ def _cfg(root: Path) -> jobs.WorkspaceRunConfig:
 
 def test_the_worker_refuses_a_symlinked_member_worktree(tree):
     root, member, outside = tree
-    jobs.run_spec_for(_cfg(root), "board", "r1")  # the real one is fine
+    jobs.run_spec_for(_cfg(root), "board", "r1", "u9")  # the real one is fine
     (root / ".worktrees" / "board" / "u7").symlink_to(outside)
     with pytest.raises(ValueError, match="symlink"):
-        jobs.run_spec_for(_cfg(root), "board", "r1")
+        jobs.run_spec_for(_cfg(root), "board", "r1", "u7")
 
 
 def test_the_worker_refuses_a_symlinked_gitfile(tree):
@@ -73,7 +73,7 @@ def test_the_worker_refuses_a_symlinked_gitfile(tree):
     (outside / "gitfile").write_text("gitdir: /elsewhere\n")
     (member / ".git").symlink_to(outside / "gitfile")
     with pytest.raises(ValueError, match="symlink"):
-        jobs.run_spec_for(_cfg(root), "board", "r1")
+        jobs.run_spec_for(_cfg(root), "board", "r1", "u9")
 
 
 class _Up:
@@ -90,7 +90,7 @@ def _decide(root: Path, body: dict, name: str, verify: bool = True):
 
 def test_the_proxy_refuses_a_symlinked_member_worktree_on_disk(tree):
     root, member, outside = tree
-    spec = jobs.run_spec_for(_cfg(root), "board", "r1")
+    spec = jobs.run_spec_for(_cfg(root), "board", "r1", "u9")
     body = build_create_body(spec, DockerConfig(network="blpl-egress"))
     _decide(root, body, spec.key.container_name())  # real: accepted
     # Built from the real tree, then the worktree swapped for a link before

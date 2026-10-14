@@ -936,7 +936,7 @@ def test_phase4_worktree_gitfiles_are_safe_from_stages_and_hooks_never_run(env):
             )
             code = await jobs.run_job_in_container(
                 driver, cfg, project_name=project, run_id="run-gf", cmd=["sh", "-c", script],
-                env={}, log=out.append, poll=poll, poll_every=5)
+                env={}, log=out.append, poll=poll, poll_every=5, member="u9")
             text = "".join(out)
             assert code == 0, text
             assert "pointer=0" not in text and "move=0" not in text, text
@@ -1178,7 +1178,8 @@ def test_phase4_a_symlinked_member_worktree_never_reaches_a_run_container(env):
         os.chmod(d, 0o755)
     cfg = WorkspaceRunConfig(image=WORKSPACE_IMAGE, projects_root=projects,
                              host_projects_root=str(projects))
-    real_body = build_create_body(jobs.run_spec_for(cfg, project, "run-l"),
+    # The member's own run: the only run that mounts this worktree now.
+    real_body = build_create_body(jobs.run_spec_for(cfg, project, "run-l", "u9"),
                                   env.config(""))
     member.rmdir()
     member.symlink_to(target)
@@ -1205,7 +1206,7 @@ def test_phase4_a_symlinked_member_worktree_never_reaches_a_run_container(env):
             with pytest.raises(ValueError, match="symlink"):
                 await jobs.run_job_in_container(
                     driver, cfg, project_name=project, run_id="run-l", cmd=["true"], env={},
-                    log=lambda s: None, poll=poll)
+                    log=lambda s: None, poll=poll, member="u9")
             name = f"blpl-run-x-{env.tag}"
             r = await raw.post("/containers/create", params={"name": name}, json=real_body)
             # Built while the worktree was real, sent after the swap.
@@ -1355,3 +1356,93 @@ def test_phase4_a_never_started_first_attempt_is_run_not_reported(env):
             await driver.aclose()
 
     asyncio.run(scenario())
+
+
+def test_phase4_a_members_run_sees_only_their_own_checkout(env):
+    """Codex, PR #20: a run used to mount every member's worktree read-write.
+    Member u7's run reads and writes u7's worktree and git data; it cannot see
+    u9's uncommitted work or the owner's working copy, and the proxy refuses
+    a spec that asks for them."""
+    if not _have_image(WORKSPACE_IMAGE):
+        pytest.skip(f"{WORKSPACE_IMAGE} has not been built")
+    import subprocess
+    from dataclasses import replace
+
+    from app.sandbox import jobs
+    from app.sandbox.driver import DriverError
+    from app.sandbox.jobs import WorkspaceRunConfig
+
+    projects = env.tmp / "projects"
+    project = f"itest-{env.tag}-own"
+    proj = projects / project
+    proj.mkdir(parents=True)
+    gitenv = {**os.environ, "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@b",
+              "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@b"}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(proj)], check=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-q", "--allow-empty", "-m", "init"],
+                   check=True, env=gitenv)
+    (proj / "owner-draft.md").write_text("the owner's uncommitted work\n")
+    members = {}
+    for m in ("u7", "u9"):
+        members[m] = projects / ".worktrees" / project / m
+        subprocess.run(["git", "-C", str(proj), "worktree", "add", "-q", "-b", f"user/{m}",
+                        str(members[m])], check=True)
+    (members["u9"] / "draft.md").write_text("u9's uncommitted work\n")
+    for d in (env.tmp, projects, projects / ".worktrees", projects / ".worktrees" / project):
+        os.chmod(d, 0o755)
+    for d in (proj, *members.values()):
+        os.chmod(d, 0o777)
+
+    psock = str(env.tmp / "proxy.sock")
+    policy = ProxyPolicy(
+        verify_paths=True,
+        instance=env.instance, images=frozenset({WORKSPACE_IMAGE}), networks=frozenset({"none"}),
+        project_bind_roots=(str(projects),),
+        runtimes=frozenset({RUNTIME} if RUNTIME else set()),
+        allow_default_runtime=RUNTIME is None,
+    )
+    cfg = WorkspaceRunConfig(image=WORKSPACE_IMAGE, projects_root=projects,
+                             host_projects_root=str(projects))
+    u7, u9 = members["u7"], members["u9"]
+
+    async def poll():
+        return "running"
+
+    async def scenario():
+        upstream = UnixUpstream(SOCK)
+        server = await serve(DockerProxy(policy, upstream), psock)
+        driver = DockerDriver(env.config(f"unix://{psock}"))
+        try:
+            out: list[str] = []
+            script = (
+                f"echo mine > {u7}/run.txt; echo write=$?; "
+                f"git -c safe.directory='*' -C {u7} rev-parse --abbrev-ref HEAD; "
+                f"cat {u9}/draft.md 2>/dev/null; echo other=$?; "
+                f"cat {proj}/owner-draft.md 2>/dev/null; echo owner=$?; "
+                f"rm -rf {u9} 2>/dev/null; echo wreck=$?"
+            )
+            code = await jobs.run_job_in_container(
+                driver, cfg, project_name=project, run_id="run-own", cmd=["sh", "-c", script],
+                env={}, log=out.append, poll=poll, poll_every=5, member="u7")
+            text = "".join(out)
+            assert code == 0, text
+            assert "write=0" in text and (u7 / "run.txt").read_text() == "mine\n", text
+            assert "user/u7" in text, text
+            assert "uncommitted" not in text and "other=0" not in text, text
+            assert "owner=0" not in text, text
+            assert (u9 / "draft.md").read_text() == "u9's uncommitted work\n"
+
+            # The proxy refuses a run spec that binds another member's
+            # worktree, even with the spelling of a member mount.
+            spec = jobs.run_spec_for(cfg, project, "run-own2", "u7")
+            spec = replace(spec, extra_storage=(Mount(
+                kind="bind", source=str(u9), target=str(u9)),))
+            with pytest.raises(DriverError, match="only its invoker"):
+                await driver.run_container(spec, ["true"])
+        finally:
+            await driver.aclose()
+            await upstream.aclose()
+            server.close()
+
+    asyncio.run(scenario())
+

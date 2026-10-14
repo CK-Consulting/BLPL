@@ -308,23 +308,69 @@ def test_a_range_run_keeps_every_tasks_chain_and_exactly_their_keys():
     assert env["HDM_LLM_CHAINS"] and env["BLPL_EXTRACT_MAX_TOKENS"] == "32000"
 
 
-def test_a_run_container_gets_each_worktree_on_its_own_and_its_gitfile_read_only(tmp_path):
-    c = cfg(tmp_path)
+def _two_members(tmp_path):
     root = tmp_path / "projects"
     (root / "pathfinder" / ".git").mkdir(parents=True)
     for m in ("u7", "u9"):
         (root / ".worktrees" / "pathfinder" / m).mkdir(parents=True)
         (root / ".worktrees" / "pathfinder" / m / ".git").write_text("gitdir: x\n")
-    spec = jobs.run_spec_for(c, "pathfinder", "r1")
-    assert [m.source for m in spec.extra_storage] == [
-        f"{HOST}/.worktrees/pathfinder/u7", f"{HOST}/.worktrees/pathfinder/u9"]
-    assert all(not m.read_only for m in spec.extra_storage)
+    return root
+
+
+def test_a_members_run_gets_only_their_own_worktree(tmp_path):
+    """Codex, PR #20: every member's worktree went into every run, so one
+    member's stage could read or wreck another's uncommitted work."""
+    c = cfg(tmp_path)
+    _two_members(tmp_path)
+    spec = jobs.run_spec_for(c, "pathfinder", "r1", "u7")
+    assert (spec.storage.source, spec.storage.read_only) == (
+        f"{HOST}/.worktrees/pathfinder/u7", False)
+    assert spec.extra_storage == ()
+    # Git data read-only: the shared object store, and this member's gitfile.
     assert {m.source for m in spec.overlays} == {
-        f"{HOST}/pathfinder/.git", f"{HOST}/.worktrees/pathfinder/u7/.git",
-        f"{HOST}/.worktrees/pathfinder/u9/.git"}
+        f"{HOST}/pathfinder/.git", f"{HOST}/.worktrees/pathfinder/u7/.git"}
     assert all(m.read_only for m in spec.overlays)
+    every = [m.source for m in (spec.storage, *spec.extra_storage, *spec.overlays)]
+    assert not any("u9" in s for s in every)
+    assert f"{HOST}/pathfinder" not in every  # the owner's working copy
+    assert spec.extra_labels["blpl.checkout"] == "u7"
     body = build_create_body(spec, DockerConfig(network="blpl-egress"))
     assert json.loads(_create_named(body, spec.key.container_name()).body) == body
+
+
+def test_the_owners_run_gets_only_the_owners_checkout(tmp_path):
+    c = cfg(tmp_path)
+    _two_members(tmp_path)
+    spec = jobs.run_spec_for(c, "pathfinder", "r1")
+    assert spec.storage.source == f"{HOST}/pathfinder" and spec.extra_storage == ()
+    assert {m.source for m in spec.overlays} == {f"{HOST}/pathfinder/.git"}
+    assert spec.extra_labels["blpl.checkout"] == "owner"
+    body = build_create_body(spec, DockerConfig(network="blpl-egress"))
+    assert json.loads(_create_named(body, spec.key.container_name()).body) == body
+    with pytest.raises(ValueError):
+        jobs.run_spec_for(c, "pathfinder", "r1", "../u9")
+
+
+@pytest.mark.parametrize("source, ro, label", [
+    (f"{HOST}/.worktrees/pathfinder/u9", False, "u7"),       # another member's worktree
+    (f"{HOST}/.worktrees/pathfinder/u9/.git", True, "u7"),   # another member's gitfile
+    (f"{HOST}/pathfinder", False, "u7"),                     # the owner's checkout
+    (f"{HOST}/.worktrees/pathfinder", False, "u7"),          # every member's
+    (f"{HOST}/.worktrees/pathfinder/u7", False, "owner"),    # a member's, in the owner's run
+    (f"{HOST}/pathfinder", False, ""),                       # a run naming nobody
+])
+def test_the_proxy_lets_a_run_bind_only_its_invokers_checkout(tmp_path, source, ro, label):
+    c = cfg(tmp_path)
+    _two_members(tmp_path)
+    spec = jobs.run_spec_for(c, "pathfinder", "r1", "u7")
+    body = build_create_body(spec, DockerConfig(network="blpl-egress"))
+    body["Labels"]["blpl.checkout"] = label
+    body["HostConfig"]["Mounts"] = [m for m in body["HostConfig"]["Mounts"]
+                                    if m["Target"].endswith("/.git") or m.get("ReadOnly")]
+    body["HostConfig"]["Mounts"].append({"Type": "bind", "Source": source, "Target": "/x",
+                                         "ReadOnly": ro})
+    with pytest.raises(Refused):
+        _create_named(body, spec.key.container_name())
 
 
 @pytest.mark.parametrize("source, ro", [

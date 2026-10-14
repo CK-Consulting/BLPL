@@ -30,6 +30,9 @@ LABEL_INSTANCE = "blpl.instance"
 LABEL_ROLE = "blpl.role"
 LABEL_PROJECT = "blpl.project"
 LABEL_MEMBER = "blpl.member"
+# For a run container: whose checkout it is ("owner", or "u<id>" for a
+# member's worktree). The proxy lets it bind that checkout and no other.
+LABEL_CHECKOUT = "blpl.checkout"
 # A digest of the create request, so a container built from an older spec (a new
 # image, a changed limit) is recognisably stale and can be recreated when it is
 # next stopped rather than silently kept forever.
