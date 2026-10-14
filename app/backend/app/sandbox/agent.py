@@ -882,8 +882,11 @@ class Agent:
 
         checkout = self.fs.checkout(b.get("checkout"))
         self._bookkeeping_dirs_are_real(checkout)
-        return {"summary": quarantine.summary(Path(checkout)),
-                "entries": list(reversed(quarantine.ledger(Path(checkout))))[:500]}
+        try:
+            return {"summary": quarantine.summary(Path(checkout)),
+                    "entries": list(reversed(quarantine.ledger(Path(checkout))))[:500]}
+        except quarantine.LinkRefused as e:
+            raise _forbidden(str(e)) from None
 
     def project_boards(self, b: dict) -> dict:
         from blpl.core import project_manifest
@@ -927,10 +930,13 @@ class Agent:
 
     # -- quarantine -----------------------------------------------------------
 
-    # The directories quarantine writes with ordinary paths. Each must be a
-    # real directory (or absent) in the checkout: a committed link named
-    # `datasheets` would otherwise carry an upload wherever it points.
-    _QUARANTINE_DIRS = ("datasheets", "references", "retrieved", ".blpl")
+    # Quarantine itself opens datasheets/, references/ and retrieved/ by
+    # descriptor, refusing a link at any directory or file it writes or reads
+    # (blpl.core.quarantine.LinkRefused), so a check here would only race it.
+    # .blpl/ is written by llm_ignore with ordinary paths, and must be a real
+    # directory (or absent): a committed link named `.blpl` would otherwise
+    # carry the ignore list wherever it points.
+    _QUARANTINE_DIRS = (".blpl",)
 
     def quarantine_accept(self, q: dict, data: bytes) -> dict:
         checkout = self.fs.checkout(q.get("checkout"))
@@ -956,6 +962,8 @@ class Agent:
                 # and must still hold what nothing scanned (Codex, PR #20).
                 insist_on_scan=q.get("require_scan") == "1",
             )
+        except quarantine.LinkRefused as e:
+            raise _forbidden(str(e)) from None
         except ValueError as e:
             raise AgentError(400, str(e)) from None
         path = (f"{rec.released_to}/{rec.released_as}"

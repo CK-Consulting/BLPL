@@ -263,12 +263,22 @@ def _row_paths(row: dict) -> list[str]:
     return out
 
 
+def _ledger(project_dir: Path) -> list[dict]:
+    """The quarantine ledger, or nothing when it is a link: quarantine refuses
+    to read through one (LinkRefused), and bookkeeping here must not stop a
+    move or a read over it. The ledger view says so; this only looks things up."""
+    try:
+        return quarantine.ledger(project_dir)
+    except quarantine.LinkRefused:
+        return []
+
+
 def released_under(project_dir: Path, rel: str) -> list[str]:
     """Paths the quarantine ledger records a file as released to, at ``rel`` or
     below it."""
     rel = _norm(rel)
     out = []
-    for row in quarantine.ledger(project_dir):
+    for row in _ledger(project_dir):
         out.extend(p for p in _row_paths(row) if _under(p, rel))
     return sorted(set(out))
 
@@ -278,7 +288,7 @@ def released_outside_external_dirs(project_dir: Path) -> list[str]:
     files an upload was placed into. Their directory does not say they came
     from outside, so only the ledger can."""
     return sorted({
-        p for row in quarantine.ledger(project_dir) for p in _row_paths(row) if not is_external(p)
+        p for row in _ledger(project_dir) for p in _row_paths(row) if not is_external(p)
     })
 
 
@@ -296,13 +306,23 @@ def from_outside(project_dir: Path, rel: str) -> bool:
     text, and its property strings are as able to say "ignore previous
     instructions" as a datasheet is. Framing the whole file errs the safe way.
     """
-    return is_external(rel) or _norm(rel) in released_outside_external_dirs(project_dir)
+    if is_external(rel):
+        return True
+    try:
+        rows = quarantine.ledger(project_dir)
+    except quarantine.LinkRefused:
+        # The ledger is a link, so it cannot say which library files are an
+        # upload's. Every one of them might be, and treating a file as the
+        # project's own text is the mistake that cannot be taken back once the
+        # assistant has read it. So all of libraries/ is framed until it can.
+        return Path(_norm(rel)).parts[:1] == ("libraries",)
+    return _norm(rel) in {p for row in rows for p in _row_paths(row) if not is_external(p)}
 
 
 def origin_of(project_dir: Path, rel: str) -> str:
     """Where an external file came from, in words, from the quarantine ledger."""
     rel = _norm(rel)
-    for row in reversed(quarantine.ledger(project_dir)):
+    for row in reversed(_ledger(project_dir)):
         if rel in _row_paths(row):
             if row.get("origin") == quarantine.UPLOAD:
                 who = row.get("uploaded_by") or "a project member"
