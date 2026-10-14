@@ -15,8 +15,11 @@ rendered inline only when the bytes about to be sent hash to a row that says
 ``clean`` and names the current inspector. Everything else is an attachment.
 
 **Where a verdict comes from.** Only from an assessment this backend ran:
-``accept_upload`` at upload, ``assess`` at chat attach, or ``assess`` when a
-member asks for one. The in-tree ledger is committed project content, so a
+``accept_upload`` at upload, ``accept`` when the chat agent fetches a
+datasheet (through `sink`, below), ``assess`` at chat attach, or ``assess``
+when a member asks for one. No pipeline stage fetches or quarantines a file
+today, so the worker has nothing to record; a stage that starts to must run
+inside `quarantine.recording_verdicts` too, or its files will wait for a click. The in-tree ledger is committed project content, so a
 pull can carry a row claiming any hash was released; it is read only for rows
 that say *held*, which can keep a file out of the viewer and never let one in.
 
@@ -39,6 +42,7 @@ from blpl.core import quarantine
 from .models import PdfVerdict
 
 UPLOAD = "upload"
+FETCH = "fetch"
 ATTACHMENT = "attachment"
 INSPECT = "inspect"
 LEDGER = "ledger"
@@ -200,3 +204,24 @@ def describe(row: PdfVerdict | None) -> dict:
         "decided_at": row.decided_at.isoformat() if row.decided_at else None,
     }
 
+
+def sink(project_id: int, user_id: int | None):
+    """A `quarantine.recording_verdicts` sink that writes rows for this project.
+
+    For work that outlives the request that started it (a chat turn runs as a
+    background task, its tools on worker threads), so it opens its own session
+    and commits each verdict as it arrives rather than borrowing the request's.
+    The record comes from the `accept` call that just inspected the bytes, in
+    this process, never from re-reading the ledger.
+    """
+    from .db import SessionFactory
+
+    def record_one(rec: quarantine.Record) -> None:
+        if (rec.inspection or {}).get("state") == quarantine.NOT_INSPECTED:
+            return  # not a PDF; the blob route never asks
+        source = UPLOAD if rec.origin == quarantine.UPLOAD else FETCH
+        with SessionFactory() as session:
+            record_ledger_row(session, project_id, rec.to_dict(), source=source, user_id=user_id)
+            session.commit()
+
+    return record_one

@@ -8,7 +8,9 @@ browser's viewer is exactly what an ``/OpenAction`` is written for.
 
 from __future__ import annotations
 
+import json
 import subprocess
+from pathlib import Path
 
 import pytest
 from conftest import init_body
@@ -337,3 +339,76 @@ def test_every_api_response_says_nosniff(unlocked):
     _project(unlocked)
     r = unlocked.get("/api/projects/scratch/tree")
     assert r.headers["x-content-type-options"] == "nosniff"
+
+
+# -- a datasheet the agent fetches is recorded as it is inspected ---------------
+
+from test_chat_api import (  # noqa: E402  (shared chat-turn scaffolding)
+    _drain,
+    _new_conversation,
+    _ready,
+    _script,
+    chat_client,  # noqa: F401  (fixture)
+)
+
+
+def _fake_distributor(monkeypatch, tmp_path, data: bytes):
+    """One configured distributor whose script "downloads" ``data``."""
+    from blpl.agent import kicad_happy
+    from blpl.agent.tools import parts
+
+    script = tmp_path / "fetch_datasheet_digikey.py"
+    script.write_text("# stands in for kicad-happy\n")
+    monkeypatch.setattr(parts, "DISTRIBUTORS", ("digikey",))
+    monkeypatch.setattr(parts, "script_path", lambda dist, name: script)
+    monkeypatch.setattr(kicad_happy.CredResolver, "missing_for", lambda self, dist: [])
+
+    def run_script(path, args, **kw):
+        out = Path(args[args.index("-o") + 1])
+        out.write_bytes(data)
+        return kicad_happy.ScriptResult(
+            ok=True, exit_code=0, data={"datasheet_url": "https://example.com/x.pdf"},
+            stdout="", stderr="",
+        )
+
+    monkeypatch.setattr(parts, "run_script", run_script)
+
+
+def _agent_fetches(chat_client, monkeypatch, mpn: str) -> str:
+    from blpl.core.llm_chat import Done, Msg, ToolCall, ToolUseBlock
+
+    call = ToolUseBlock(id="f1", name="fetch_datasheet", input={"mpn": mpn})
+    _script(monkeypatch, [
+        [ToolCall(id=call.id, name=call.name, input=call.input), Done("tool_use", Msg(role="assistant", content=[call]))],
+        [Done("end_turn", Msg.assistant("fetched"))],
+    ])
+    _ready(chat_client)
+    filename = _new_conversation(chat_client)
+    started = chat_client.post(f"/api/projects/scratch/conversations/{filename}/chat", json={"content": "go"})
+    _drain(chat_client, started.json()["turn_id"])
+    import app.main as main
+
+    proj = main.PROJECTS_ROOT / "scratch"
+    found = sorted(p.relative_to(proj).as_posix() for p in (proj / "datasheets").rglob("*.pdf"))
+    assert len(found) == 1, found
+    return found[0]
+
+
+def test_a_datasheet_the_agent_fetches_opens_without_a_click(chat_client, monkeypatch, tmp_path):
+    _fake_distributor(monkeypatch, tmp_path, BENIGN)
+    rel = _agent_fetches(chat_client, monkeypatch, "TPS62840")
+    r = _blob(chat_client, rel)
+    assert _inline(r), (r.headers, rel)
+    v = chat_client.get("/api/projects/scratch/blob/verdict", params={"path": rel}).json()
+    assert v["source"] == "fetch" and v["verdict"] == "clean"
+
+
+def test_one_no_scanner_looked_at_still_downloads(chat_client, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        quarantine.av, "scan_bytes", lambda data: av.ScanResult(state="unscanned", detail="none")
+    )
+    _fake_distributor(monkeypatch, tmp_path, BENIGN)
+    rel = _agent_fetches(chat_client, monkeypatch, "TPS62840")
+    r = _blob(chat_client, rel)
+    assert _opaque(r)
+    assert r.headers["x-blpl-pdf-verdict"] == "unscanned"

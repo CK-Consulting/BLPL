@@ -1027,6 +1027,10 @@ class TurnRequest:
     # The conversations directory, so attachments referenced in the transcript
     # can be read back into the provider's message list.
     conversations_dir: Path | None = None
+    # Told every verdict quarantine reaches while this turn's tools run, so a
+    # datasheet the agent fetches is recorded by content hash the moment it is
+    # inspected (see app/pdf_verdicts.py), not left for someone to inspect again.
+    quarantine_sink: Callable[[object], None] | None = None
 
 
 # Finished turns are kept briefly so a reader that arrives late still gets the
@@ -1080,8 +1084,16 @@ class ChatSessionManager:
         live = _LiveTurn(turn_id, req.conversation.path.name)
         self._turns[turn_id] = live
         self._prune()
-        live.task = asyncio.get_running_loop().create_task(self._run(live, req))
+        live.task = asyncio.get_running_loop().create_task(self._run_recording(live, req))
         return turn_id
+
+    async def _run_recording(self, live: _LiveTurn, req: TurnRequest) -> None:
+        # Set inside the task, so the sink is this turn's alone, and carried to
+        # the threads its tools run on (asyncio.to_thread copies the context).
+        from blpl.core import quarantine
+
+        with quarantine.recording_verdicts(req.quarantine_sink):
+            await self._run(live, req)
 
     async def _run(self, live: _LiveTurn, req: TurnRequest) -> None:
         from blpl.agent.kicad_happy import CredResolver

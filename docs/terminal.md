@@ -1430,6 +1430,11 @@ response from the blob route. See `app/backend/app/pdf_verdicts.py`.
   link or prefetch can cause.
 - **`unscanned` is not `clean`.** A file no scanner looked at may be
   released, but it is not rendered inline.
+- **Fetched and uploaded files are recorded as they are inspected.** The
+  process that runs `quarantine.accept` records the verdict directly:
+  the upload route, and the chat agent's `fetch_datasheet` through
+  `quarantine.recording_verdicts`. No pipeline stage fetches or quarantines a
+  file today, so the worker records nothing.
 
 The `released_active` state and the pdf.js route in the next section are not
 built.
