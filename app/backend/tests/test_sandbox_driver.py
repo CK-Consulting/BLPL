@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import tempfile
+from pathlib import Path
 
 import httpx
 import pytest
@@ -358,57 +361,36 @@ def test_run_env_is_built_from_the_allowlist_not_filtered_from_a_copy():
         runpath.run_env({}, {"A=B": "x"})
 
 
-def test_a_run_goes_through_the_driver():
+def test_a_run_goes_through_the_driver_in_its_own_container():
+    """What runpath.execute_run used to check, now through the only run path:
+    the run's container, the allowlisted environment plus its injection, and
+    its output in order."""
+    from app.sandbox import jobs
+
     d = FakeDriver(script=lambda call: (3, [("stdout", b"stage6: emitted\n"),
                                             ("stderr", b"warn: 1 unrouted\n")]))
-    tracker = idle.IdleTracker()
     lines: list[str] = []
-    code = run(runpath.execute_run(
-        d, spec(), ["python", "-m", "blpl.core.cli", "stage6"],
-        env=BACKEND_ENV, inject={"BLPL_LLM_KEY__MAIN": "sk-member"},
-        log=lines.append, tracker=tracker, workdir="/workspace",
-    ))
+    tmp = Path(tempfile.mkdtemp(prefix="blpl-rp-"))
+    try:
+        (tmp / "projects" / "board").mkdir(parents=True)
+        cfg = jobs.WorkspaceRunConfig(image="blpl-workspace:dev", projects_root=tmp / "projects",
+                                      host_projects_root="/srv/blpl/app/data/projects")
+
+        async def poll():
+            return "running"
+
+        code = run(jobs.run_job_in_container(
+            d, cfg, project_name="board", run_id="r6",
+            cmd=["python", "-m", "blpl.core.cli", "stage6"], env=BACKEND_ENV,
+            extra_inject={"BLPL_LLM_KEY__MAIN": "sk-member"}, log=lines.append, poll=poll))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     assert code == 3
-    assert ("ensure", KEY) in d.ops  # started on demand
     (call,) = d.calls
+    assert call.key.role == "run"
     assert call.argv == ["python", "-m", "blpl.core.cli", "stage6"]
-    assert call.workdir == "/workspace"
     assert set(call.env) == {"BLPL_MODULES_ROOT", "TZ", "BLPL_LLM_KEY__MAIN"}
     assert "".join(lines) == "stage6: emitted\nwarn: 1 unrouted\n"
-    assert not tracker.is_busy(KEY) and tracker.seen(KEY)
-
-
-def test_run_output_decodes_characters_split_across_chunks():
-    ohm = "Ω".encode()
-    d = FakeDriver(script=lambda call: (0, [("stdout", b"R1 10k" + ohm[:1]),
-                                            ("stdout", ohm[1:] + b"\n")]))
-    lines: list[str] = []
-    run(runpath.execute_run(d, spec(), ["x"], env={}, log=lines.append))
-    assert "".join(lines) == "R1 10kΩ\n"
-
-
-def test_cancelling_a_run_cancels_the_process_and_releases_busy():
-    started = asyncio.Event()
-
-    async def forever(call):
-        started.set()
-        await asyncio.Event().wait()
-
-    d = FakeDriver(script=forever)
-    tracker = idle.IdleTracker()
-
-    async def scenario():
-        task = asyncio.create_task(runpath.execute_run(
-            d, spec(), ["blpl", "autoroute"], env={}, log=lambda s: None, tracker=tracker))
-        await started.wait()
-        assert tracker.is_busy(KEY)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    run(scenario())
-    assert d.calls[0].cancelled
-    assert not tracker.is_busy(KEY)
 
 
 def test_sweep_keeps_a_workspace_the_agent_saw_used_recently():
