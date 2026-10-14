@@ -2,10 +2,13 @@
 
 Status: **agreed shape; phases 1 to 4 built, each behind a flag that is off
 by default**:
-- phase 2: `BLPL_RUNS_IN_WORKSPACE=1`;
+- phase 2: `BLPL_RUNS_IN_WORKSPACE=1`, which always means a container per
+  run (phase 4's run containers);
 - phase 3: `BLPL_FILES_VIA_WORKSPACE=1`;
-- phase 4: `BLPL_PROJECT_MOUNT=absent`, `BLPL_RUNS_IN_CONTAINER=1`,
-  `BLPL_STORAGE=btrfs`.
+- phase 4: `BLPL_PROJECT_MOUNT=absent`, `BLPL_STORAGE=btrfs`.
+  `BLPL_RUNS_IN_CONTAINER` is no longer a choice. Unset or `1` is accepted;
+  any other value makes the worker refuse to start, because it asks for the
+  removed shared-container mode.
 
 Per-project storage is built but cannot be switched on yet: it needs quotas
 enabled on the filesystem and a migration that is not written. The pipeline's own architecture (stages,
@@ -675,7 +678,7 @@ provides.
 | **Writes allowed during runs.** The editor, uploads, pull and agent tools write a checkout with a run in flight. | refuse in `worktree_write` while a run is in flight | Phases 3 and 4 (built): the agent refuses every write it is asked for (files, uploads, commit, pull, delete, move, ignore list) except under `.blpl/` while a run is active. That covers its own runs and, through `/runs/mark`, runs in containers of their own, whose marks expire if not renewed. The chat agent's tools and the component routes still write through the backend's mount (see what is left after phase 4). |
 | **Component commits sweep in unrelated changes.** `attach`/`update`/`detach` commit the whole index. | `git commit -- .gitmodules <path>` | Phase 4 (built, both modes): each commits with a pathspec of exactly what it changed. A test stages an unrelated file and shows it stays out, and fails against the previous code. |
 | **Detach removes the wrong module store.** `rmtree(<checkout>/.git/modules/…)` misses in a worktree. | resolve the store through git | Phase 4 (built, both modes): detach removes `<git-dir>/modules/<path>`, with the git dir from `rev-parse --absolute-git-dir`. The plan also feared the owner's store was shared with members. Measured with git 2.47 and 2.55, each worktree initialises its own (`.git/worktrees/<name>/modules`), so it is not shared, and the tests pin that. |
-| **Provenance rewrites the index.** `git status` in a run refreshes `libraries/`'s index. | `--no-optional-locks` | Phase 4 (built): with `BLPL_RUNS_IN_CONTAINER=1`, each run is a container of its own with the project's `.git` bind-mounted read-only. Tested in real containers under runc and runsc: a stage can read `git status`, but `git add` and writing a hook fail, and the index is byte-identical afterwards. Without the overlay the test fails. |
+| **Provenance rewrites the index.** `git status` in a run refreshes `libraries/`'s index. | `--no-optional-locks` | Phase 4 (built): each run is a container of its own with the project's `.git` bind-mounted read-only. Tested in real containers under runc and runsc: a stage can read `git status`, but `git add` and writing a hook fail, and the index is byte-identical afterwards. Without the overlay the test fails. |
 
 ## Migration
 
@@ -690,7 +693,7 @@ weeks away. They are independent of everything below.
 **Phase 1: the sandbox package (this branch).** It adds
 `app/backend/app/sandbox/`: the driver protocol, `FakeDriver`, `DockerDriver`,
 the socket proxy and its policy, `IdleTracker` and `sweep`, `VolumeStorage`, and
-the run seam `runpath.execute_run`. It also adds `app/workspace/Dockerfile`
+the run seam `runpath.execute_run` (since removed with the shared-container mode). It also adds `app/workspace/Dockerfile`
 (`kicad-base` and `workspace` stages). Nothing imports the package yet. It is
 tested by unit tests, a refusal matrix, and an integration test against the
 real daemon, both directly and through the proxy. Shipping it changes no
@@ -698,9 +701,13 @@ behaviour.
 
 **Phase 2: runs move into workspaces (built, behind a flag).**
 
-- `app/backend/app/sandbox/jobs.py` takes a claimed run through
-  `runpath.execute_run`. The worker uses it when `BLPL_RUNS_IN_WORKSPACE=1`
-  (`worker._Workspaces`). It claims, heartbeats every 20 s whatever the run
+- `app/backend/app/sandbox/jobs.py` takes a claimed run into a container of
+  its own (`run_job_in_container`; see phase 4). The worker uses it when
+  `BLPL_RUNS_IN_WORKSPACE=1` (`worker._Workspaces`). The first version of
+  this phase ran the stage inside the project's long-lived workspace
+  container (`runpath.execute_run`, `jobs.run_job`). That mode is removed: the
+  workspace container mounts every member's worktree, so a stage there could
+  reach all of them (Codex, PR #20). It claims, heartbeats every 20 s whatever the run
   prints, and turns `cancelling` into task cancellation, which terminates the
   process in the workspace. A misconfiguration makes the worker refuse to
   start. It never falls back to running stages in-process.
@@ -825,7 +832,8 @@ sealing in a container, storage with limits.**
   below). They still run on the mount, because the user's component library
   is not mounted into workspaces.
 
-*Step 2: a container per run* (`BLPL_RUNS_IN_CONTAINER=1`).
+*Step 2: a container per run* (now the only way a run executes in a
+workspace).
 - Each run is a fresh container (role `run`) with the workspace's storage and
   libraries and the project's `.git` read-only. One overlay covers every
   worktree, since their git directories live inside the project's.
@@ -889,9 +897,9 @@ sealing in a container, storage with limits.**
       the agent refuses runs.
     - The sealer mounts the projects root by design, holds only the key, and
       runs only seal or unseal.
-    - Remaining: a phase-2 run without `BLPL_RUNS_IN_CONTAINER=1` and without
-      the agent still execs in the shared workspace container, with all its
-      mounts. Turn on run containers, which the agent path already forces.
+    - The phase-2 mode that ran a stage inside the shared workspace container
+      is removed. Every run in a workspace is a run container, and a
+      configuration asking for the old mode refuses to start.
 - **The fetch service has a deadline and a limit.** A fetch is streamed under
   one monotonic deadline (`BLPL_FETCH_DEADLINE_S`, 120 s) and the size cap is
   enforced as bytes arrive, so a server that trickles a byte per socket
