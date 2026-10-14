@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -71,6 +71,9 @@ class Attachment:
     name: str          # what the user called it, for display only
     media_type: str
     bytes: int
+    # What quarantine's checks found, for the caller to record against the
+    # hash. Not part of to_dict: the client asks the verdict route instead.
+    assessment: object = field(default=None, compare=False, repr=False)
 
     @property
     def kind(self) -> str:
@@ -170,6 +173,7 @@ def save(conversations_dir: Path, name: str, data: bytes) -> Attachment:
         name=Path(name).name or "attachment",
         media_type=media_type,
         bytes=len(data),
+        assessment=verdict,
     )
 
 

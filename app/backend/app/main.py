@@ -82,6 +82,7 @@ from . import (
     keystore,
     llm_ignore,
     passkeys,
+    pdf_verdicts,
     llmconfig,
     llm_resolver,
     mailer,
@@ -261,6 +262,10 @@ async def _never_cache(request, call_next):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
+    # And nothing is ever sniffed into a type it was not sent as. Several
+    # routes return project text (artifacts, run logs, the release zip), and a
+    # browser that guessed HTML for one would run it on this origin.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
     return response
 
 
@@ -3799,15 +3804,25 @@ def get_blob(
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
-) -> FileResponse:
+) -> Response:
     """Serve any one file from the project, by its tree path.
 
-    A retrieved file is served as an opaque download rather than as what it
-    claims to be. A PDF handed to the browser inline goes straight into a
-    viewer, and a viewer is precisely the thing an `/OpenAction` is written to
-    talk to — so anything under ``retrieved/`` comes back as
-    ``application/octet-stream`` with an attachment disposition, and opening it
-    becomes a deliberate act on a file the user has been told is unverified.
+    A PDF — by its bytes, not its name — is handed to the browser's viewer only
+    if those exact bytes have a clean verdict from this backend's own
+    inspection (see app/pdf_verdicts.py). A viewer is precisely the thing an
+    `/OpenAction` is written to talk to, and the directory a PDF sits in proves
+    nothing about it: a pull, an import or a pipeline stage can put one
+    anywhere. Any other PDF is an opaque download, and the file pane offers to
+    inspect it.
+
+    The bytes are read once, hashed, and that buffer is what is sent. Hashing
+    the file and then handing the path to `FileResponse` would reopen it, and a
+    file swapped in between would go out under the verdict of the one it
+    replaced.
+
+    Anything under ``retrieved/`` is an opaque download whatever its verdict,
+    as before: it is the evidence directory, and opening a file there should be
+    a deliberate act on something the user has been told is unverified.
     """
     proj = _project_dir(session, user, project_id)
     target = _tree_target(proj, path)
@@ -3815,28 +3830,212 @@ def get_blob(
         return FileResponse(
             target,
             media_type="application/octet-stream",
-            filename=target.name,
             headers={
-                "Content-Disposition": f'attachment; filename="{target.name}"',
+                "Content-Disposition": _disposition("attachment", target.name),
                 # Without this the browser is free to sniff the bytes, decide it
                 # is a PDF after all, and render it — undoing the whole point.
                 "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": _INERT_CSP,
                 "X-BLPL-Quarantined": "1",
             },
         )
+    body, head = _read_once(target, UPLOAD_MAX_BYTES)
+    if quarantine.looks_like_pdf(head):
+        if body is None:
+            # Too big to hold and hash, so never judged and never inline. An
+            # attachment is safe whatever the bytes turn out to be.
+            return FileResponse(
+                target,
+                media_type="application/octet-stream",
+                headers=_opaque_headers(target.name, "too_large"),
+            )
+        project = _project_or_404(session, user, project_id)
+        verdict = pdf_verdicts.lookup(session, project.id, _sha256(body), proj)
+        if pdf_verdicts.renders_inline(verdict):
+            return Response(
+                content=body,
+                media_type="application/pdf",
+                headers={
+                    "X-Content-Type-Options": "nosniff",
+                    "Content-Disposition": _disposition("inline", target.name),
+                    "X-BLPL-PDF-Verdict": verdict.verdict,
+                },
+            )
+        return Response(
+            content=body,
+            media_type="application/octet-stream",
+            headers=_opaque_headers(target.name, verdict.verdict if verdict else "none"),
+        )
+
     media_type, inline = _blob_disposition(target)
     headers = {
         # Always: without it the browser may sniff a text file into HTML.
         "X-Content-Type-Options": "nosniff",
-        "Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{target.name}"',
+        "Content-Disposition": _disposition("inline" if inline else "attachment", target.name),
+        # Nothing served from here is a page. Should a browser ever render one
+        # as a document anyway, it runs no script and loads nothing.
+        "Content-Security-Policy": _INERT_CSP,
     }
-    return FileResponse(target, media_type=media_type, headers=headers)
+    if body is None:
+        # Not a PDF when it was looked at, and the type sent is chosen by name
+        # from a list with no PDF in it, so a file swapped in before the reopen
+        # still cannot reach the viewer.
+        return FileResponse(target, media_type=media_type, headers=headers)
+    return Response(content=body, media_type=media_type, headers=headers)
 
 
-# Types a browser displays without running anything. PDFs go to the browser's
-# own viewer, images to an <img>-equivalent renderer.
+# For every response that is not a clean PDF. `sandbox` with no allowances
+# gives a document a unique origin with scripts, forms and plugins off, so
+# even an HTML or SVG file rendered by mistake cannot reach this origin's API.
+# Not sent with a clean PDF: browsers refuse to run their PDF viewer in a
+# sandboxed document, and the verdict is what makes that one safe.
+_INERT_CSP = "default-src 'none'; sandbox"
+
+
+def _opaque_headers(name: str, verdict: str) -> dict:
+    return {
+        "Content-Disposition": _disposition("attachment", name),
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": _INERT_CSP,
+        "X-BLPL-PDF-Verdict": verdict,
+    }
+
+
+def _disposition(kind: str, name: str) -> str:
+    """A Content-Disposition header that a filename cannot break.
+
+    The name is the file's name in the tree, which a pull or an upload chose. A
+    quote or a newline in it written straight into ``filename="..."`` ends the
+    header early or starts a new one, so anything outside plain printable ASCII
+    goes as RFC 5987 ``filename*`` instead.
+    """
+    from urllib.parse import quote
+
+    if all(32 <= ord(c) < 127 for c in name) and '"' not in name and "\\" not in name:
+        return f'{kind}; filename="{name}"'
+    return f"{kind}; filename*=utf-8''{quote(name, safe='')}"
+
+
+def _sha256(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_once(target: Path, cap: int) -> tuple[bytes | None, bytes]:
+    """The file's bytes (None if over ``cap``) and its first kilobyte.
+
+    One descriptor, opened without following a link, checked to be a regular
+    file on that descriptor and read from it. The caller judges and sends the
+    buffer this returns, never the path again.
+    """
+    import stat
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(target, flags)
+    except OSError:
+        raise HTTPException(status_code=404, detail=f"{target.name} is not a file in this project")
+    with os.fdopen(fd, "rb") as fh:
+        info = os.fstat(fh.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise HTTPException(status_code=404, detail=f"{target.name} is not a file in this project")
+        if info.st_size > cap:
+            return None, fh.read(1024)
+        # One byte past the cap, so a file that grew since the fstat is
+        # caught rather than truncated into a different hash.
+        data = fh.read(cap + 1)
+    if len(data) > cap:
+        return None, data[:1024]
+    return data, data[:1024]
+
+
+class BlobPath(BaseModel):
+    path: str
+
+
+def _verdict_view(proj: Path, session: Session, user: User, project_id: str, path: str) -> dict:
+    target = _tree_target(proj, path)
+    body, head = _read_once(target, UPLOAD_MAX_BYTES)
+    out = {
+        "path": path,
+        "pdf": quarantine.looks_like_pdf(head),
+        "quarantined": _is_quarantined(proj, target),
+        "too_large": body is None,
+        "sha256": _sha256(body) if body is not None else None,
+    }
+    if not out["pdf"] or body is None:
+        return {**out, **pdf_verdicts.describe(None)}
+    project = _project_or_404(session, user, project_id)
+    row = pdf_verdicts.lookup(session, project.id, out["sha256"], proj)
+    view = pdf_verdicts.describe(row)
+    if out["quarantined"]:
+        # The blob route never renders from retrieved/, so neither may this say it will.
+        view["inline"] = False
+    return {**out, **view}
+
+
+@app.get("/api/projects/{project_id}/blob/verdict")
+def get_blob_verdict(
+    project_id: str,
+    path: str,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """What the blob route will do with this file, and why, before the browser asks.
+
+    The file pane reads this first, so a PDF that will download rather than
+    open says so — and says what was found, or that nothing has looked — before
+    anyone clicks.
+    """
+    proj = _project_dir(session, user, project_id)
+    return _verdict_view(proj, session, user, project_id, path)
+
+
+@app.post("/api/projects/{project_id}/blob/inspect")
+def inspect_blob(
+    project_id: str,
+    payload: BlobPath,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+    master_key: bytes = Depends(require_master_key),
+) -> dict:
+    """Run quarantine's checks on exactly these bytes and record the verdict.
+
+    The same `pdf_inspect` and scanner an upload goes through, on the buffer
+    read once from the file, recorded against that buffer's hash. If the file
+    changes afterwards it has a new hash and no verdict, so what was inspected
+    is the only thing the verdict can ever apply to. The file is not moved:
+    only how the browser may receive it changes.
+    """
+    proj = _project_dir(session, user, project_id)
+    target = _tree_target(proj, payload.path)
+    body, head = _read_once(target, UPLOAD_MAX_BYTES)
+    if not quarantine.looks_like_pdf(head):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{payload.path} is not a PDF; only PDFs are inspected before they are shown",
+        )
+    if body is None:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{payload.path} is over the {UPLOAD_MAX_BYTES // (1024 * 1024)} MB inspection "
+            "limit, so it is only ever downloaded",
+        )
+    project = _project_or_404(session, user, project_id)
+    assessment = quarantine.assess(body, is_pdf=True)
+    pdf_verdicts.record_assessment(
+        session, project.id, _sha256(body), assessment,
+        source=pdf_verdicts.INSPECT, user_id=user.id,
+    )
+    return _verdict_view(proj, session, user, project_id, payload.path)
+
+
+# Types a browser displays without running anything, chosen by name. A PDF is
+# not here: it is recognised by its bytes and goes through its verdict above,
+# and a file merely *named* .pdf is an attachment like any other unknown type.
 _INLINE_BINARY = {
-    ".pdf": "application/pdf",
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -3868,8 +4067,6 @@ def _blob_disposition(target: Path) -> tuple[str, bool]:
     if suffix in _INLINE_TEXT:
         return "text/plain; charset=utf-8", True
     return "application/octet-stream", False
-
-
 
 
 def _is_quarantined(proj: Path, target: Path) -> bool:
@@ -4187,6 +4384,7 @@ async def upload_files(
             )
 
     who = user.email or f"user {user.id}"
+    project_row = _project_or_404(session, user, project_id)
     results: list[dict] = []
     for upload, spec in zip(files, specs):
         name = upload.filename or "upload"
@@ -4206,6 +4404,13 @@ async def upload_files(
             mpn=str(spec.get("mpn") or "").strip(),
             llm_ignore=bool(spec.get("llm_ignore")),
         )
+        if quarantine.looks_like_pdf(data):
+            # This backend just inspected these bytes, so its finding is the
+            # verdict the blob route renders by, held or not.
+            pdf_verdicts.record_ledger_row(
+                session, project_row.id, rec.to_dict(),
+                source=pdf_verdicts.UPLOAD, user_id=user.id,
+            )
         path = f"{rec.released_to}/{rec.released_as}" if rec.state == quarantine.RELEASED else None
         if path and rec.llm_ignore:
             llm_ignore.set_ignored(proj, path, True, by=who)
@@ -5495,6 +5700,7 @@ async def upload_attachments(
             detail=f"{len(files)} files; at most {attachments.MAX_PER_MESSAGE} per message",
         )
 
+    project_row = _project_or_404(session, user, project_id)
     saved: list[dict] = []
     for upload in files:
         data = await upload.read()
@@ -5502,13 +5708,15 @@ async def upload_attachments(
             # In a worker thread: saving now inspects the PDF (inflating every
             # stream) and asks the scanner, which may take its full timeout.
             # On the event loop, ten such files blocked every other request.
-            saved.append(
-                (
-                    await asyncio.to_thread(
-                        attachments.save, conv_dir, upload.filename or "attachment", data
-                    )
-                ).to_dict()
+            att = await asyncio.to_thread(
+                attachments.save, conv_dir, upload.filename or "attachment", data
             )
+            if att.kind == "document" and att.assessment is not None:
+                pdf_verdicts.record_assessment(
+                    session, project_row.id, att.id, att.assessment,
+                    source=pdf_verdicts.ATTACHMENT, user_id=user.id,
+                )
+            saved.append(att.to_dict())
         except attachments.AttachmentRejected as exc:
             # One bad file fails the batch rather than half-attaching. The user
             # is standing there watching; a partial result they have to
@@ -5523,7 +5731,7 @@ def get_attachment(
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope),
     master_key: bytes = Depends(require_master_key),
-) -> FileResponse:
+) -> Response:
     """Serve stored bytes back so the transcript can show what was attached.
 
     Behind the same project authorisation as everything else — attachments are
@@ -5533,7 +5741,42 @@ def get_attachment(
     path = attachments.path_of(conv_dir, attachment_id)
     if path is None:
         raise HTTPException(status_code=404, detail="attachment not found")
-    return FileResponse(path)
+    # The same rule as the blob route: the bytes being sent decide, read once.
+    # The store only ever wrote PNG, JPEG, GIF, WebP or PDF, but it sits in the
+    # checkout's .blpl/, and its file names are not proof of what is in them.
+    body, head = _read_once(path, attachments.MAX_DOCUMENT_BYTES)
+    if body is None:
+        return FileResponse(path, media_type="application/octet-stream",
+                            headers=_opaque_headers(path.name, "too_large"))
+    if quarantine.looks_like_pdf(head):
+        project = _project_or_404(session, user, project_id)
+        verdict = pdf_verdicts.find(session, project.id, _sha256(body))
+        if pdf_verdicts.renders_inline(verdict):
+            return Response(
+                content=body,
+                media_type="application/pdf",
+                headers={
+                    "X-Content-Type-Options": "nosniff",
+                    "Content-Disposition": _disposition("inline", attachments.name_of(path)),
+                    "X-BLPL-PDF-Verdict": verdict.verdict,
+                },
+            )
+        return Response(
+            content=body,
+            media_type="application/octet-stream",
+            headers=_opaque_headers(attachments.name_of(path), verdict.verdict if verdict else "none"),
+        )
+    media_type = attachments.media_type_of(path)
+    if media_type not in attachments.SUPPORTED_TYPES or media_type == "application/pdf":
+        media_type = "application/octet-stream"
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": _INERT_CSP,
+        },
+    )
 
 
 class ChatInput(BaseModel):

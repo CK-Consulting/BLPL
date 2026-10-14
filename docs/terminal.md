@@ -263,11 +263,11 @@ session's cgroup. Nothing in the sandbox can leave it: `/sys` is not bound, and
   creates any missing one, empty, before starting the sandbox.
 
   Masking directories does not stop a shell writing `evil.pdf` at the root of
-  the checkout or in a board directory, and today the blob route would serve
-  that inline: `get_blob` sends every `.pdf` outside `retrieved/` as
-  `application/pdf`, inline, whatever directory it is in
-  (`_blob_disposition` decides by suffix alone). So the decision moves from
-  the directory to the bytes. See [Which PDFs the browser may
+  the checkout or in a board directory, and the blob route used to serve
+  that inline: `get_blob` sent every `.pdf` outside `retrieved/` as
+  `application/pdf`, inline, whatever directory it was in
+  (`_blob_disposition` decided by suffix alone). So the decision has moved
+  from the directory to the bytes. See [Which PDFs the browser may
   open](#which-pdfs-the-browser-may-open): a PDF is opened inline only if its
   content hash is one this backend inspected and released, wherever it sits.
 - **Commit author** comes from the member's account, not from the image's git
@@ -1411,10 +1411,33 @@ The terminal image is the backend image, so it has what the pipeline has:
 
 ## Which PDFs the browser may open
 
-**How it works today.** `get_blob` makes one test, `_is_quarantined`: a file
-under `retrieved/` is served as `application/octet-stream`, attachment,
-`nosniff`. Everything else goes to `_blob_disposition`, which decides by
-suffix alone, so every `.pdf` anywhere else in the checkout is served
+**Built, with two departures from the plan below.** `pdf_verdict` exists,
+keyed on (project, sha256), and `get_blob` and the chat attachment route read
+the file once, hash that buffer and send it, inline only if the hash has a
+`clean` verdict from the current `pdf_inspect` version. Anything else that is
+a PDF by its bytes is `application/octet-stream`, attachment, `nosniff`, with
+`Content-Security-Policy: default-src 'none'; sandbox`, as is every non-PDF
+response from the blob route. See `app/backend/app/pdf_verdicts.py`.
+
+- **No seeding from the ledger, and no inspection on first view.** The
+  ledger is committed, so accepting its released rows would have been a trust
+  decision about whatever the last pull brought. Only held rows are imported,
+  because they can only deny. A PDF with no verdict is offered for inspection
+  instead: the file pane shows the state and an *Inspect now* button
+  (`POST /blob/inspect`), which runs `quarantine.assess` on the bytes and
+  records the result with who asked. Inspection is the step that makes bytes
+  renderable, so it is a deliberate POST, not a side effect of a GET that any
+  link or prefetch can cause.
+- **`unscanned` is not `clean`.** A file no scanner looked at may be
+  released, but it is not rendered inline.
+
+The `released_active` state and the pdf.js route in the next section are not
+built.
+
+**How it worked before.** `get_blob` made one test, `_is_quarantined`: a file
+under `retrieved/` was served as `application/octet-stream`, attachment,
+`nosniff`. Everything else went to `_blob_disposition`, which decided by
+suffix alone, so every `.pdf` anywhere else in the checkout was served
 `application/pdf`, inline, into the browser's own viewer. The directory a file
 sits in was meant to say whether it passed quarantine, but nothing makes a
 file in the checkout prove that.
