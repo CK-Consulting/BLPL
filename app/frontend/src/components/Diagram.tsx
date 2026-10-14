@@ -190,6 +190,35 @@ export function repairLeftArrows(source: string): string {
     .join("\n");
 }
 
+/**
+ * Move a class off a subgraph's header line: `subgraph X["t"]:::c` becomes
+ * `subgraph X["t"]`, and `class X c` is added at the end.
+ *
+ * Nodes take the `:::class` shorthand and subgraphs do not, but a model that has
+ * just written a dozen `Node[...]:::mcu` lines writes the subgraph the same way,
+ * and that one line sinks the whole diagram with "got 'STYLE_SEPARATOR'". The
+ * `class` statement is how the grammar says the same thing, so the subgraph keeps
+ * its styling. Only flowcharts are touched, and the file itself is not changed.
+ */
+const SUBGRAPH_CLASS = /^(\s*subgraph\s+[\w.-]+.*?)\s*:::\s*([\w-]+)\s*;?\s*$/;
+
+export function repairSubgraphClasses(source: string): string {
+  const lines = source.replace(/\s+$/, "").split("\n");
+  const at = headerIndex(lines);
+  if (at < 0 || !STYLEABLE.test(lines[at])) return source;
+  const moved: string[] = [];
+  const out = lines.map((line, i) => {
+    if (i <= at) return line;
+    const m = SUBGRAPH_CLASS.exec(line);
+    if (!m) return line;
+    const id = /^\s*subgraph\s+([\w.-]+)/.exec(m[1])![1];
+    moved.push(`  class ${id} ${m[2]}`);
+    return m[1];
+  });
+  if (!moved.length) return source;
+  return [...out, ...moved].join("\n") + "\n";
+}
+
 /** Diagram kinds Mermaid understands, used to spot one by its content. */
 const KINDS =
   /^\s*(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram(-v2)?|erDiagram|journey|gantt|pie|quadrantChart|requirementDiagram|gitGraph|mindmap|timeline|C4Context|block-beta|architecture-beta)\b/;
@@ -232,7 +261,7 @@ export function Diagram({ source }: { source: string }) {
     (async () => {
       try {
         const mermaid = await mermaidOnce();
-        const { svg: out } = await mermaid.render(id, withHouseStyle(repairLeftArrows(source)));
+        const { svg: out } = await mermaid.render(id, withHouseStyle(repairSubgraphClasses(repairLeftArrows(source))));
         if (!cancelled) setSvg(out);
       } catch (e) {
         // A diagram that will not parse is shown as its source rather than as

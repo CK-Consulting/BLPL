@@ -7,6 +7,7 @@ import {
   isDiagramFile,
   looksLikeDiagram,
   repairLeftArrows,
+  repairSubgraphClasses,
   withHouseStyle,
 } from "./Diagram";
 import { splitDiagrams } from "./Markdown";
@@ -151,5 +152,47 @@ describe("left-pointing edges", () => {
   it("leaves other diagram kinds alone", () => {
     const seq = "sequenceDiagram\n  A <-- B";
     expect(repairLeftArrows(seq)).toBe(seq);
+  });
+});
+
+describe("a class on a subgraph's header line", () => {
+  // The diagram a model wrote that the app showed as "did not parse": the
+  // `:::subboard` on the subgraph line is the whole fault.
+  const src = [
+    "flowchart TB",
+    '  subgraph CARRIER["Carrier"]',
+    '    subgraph XIAO["U1: Seeed XIAO nRF54LM20A Sense"]:::subboard',
+    '      MCU["Nordic nRF54LM20A<br/>Host MCU & BLE"]:::mcu',
+    "    end",
+    '    subgraph WM1110["U2: Wio-WM1110"]:::rf',
+    '      LR["LR1110"]:::rf',
+    "    end",
+    "  end",
+    "  MCU <--|LR_BUSY / LR_IRQ| LR",
+  ].join("\n");
+
+  it("does not parse as written", async () => {
+    await expect(mermaid.parse(src)).rejects.toThrow();
+  });
+
+  it("is moved to a class statement, and then parses", async () => {
+    const out = repairSubgraphClasses(src);
+    const lines = out.split("\n");
+    expect(lines[2]).toBe('    subgraph XIAO["U1: Seeed XIAO nRF54LM20A Sense"]');
+    expect(lines[5]).toBe('    subgraph WM1110["U2: Wio-WM1110"]');
+    expect(out).toContain("  class XIAO subboard");
+    expect(out).toContain("  class WM1110 rf");
+    // Node shorthand is valid and stays where it is.
+    expect(lines[3]).toContain(":::mcu");
+    await expect(
+      mermaid.parse(withHouseStyle(repairSubgraphClasses(repairLeftArrows(src)))),
+    ).resolves.toBeTruthy();
+  });
+
+  it("leaves a diagram without one, and other kinds, alone", () => {
+    const plain = 'flowchart TB\n  subgraph A["a"]\n    X\n  end';
+    expect(repairSubgraphClasses(plain)).toBe(plain);
+    const seq = "sequenceDiagram\n  A->>B: hi";
+    expect(repairSubgraphClasses(seq)).toBe(seq);
   });
 });
