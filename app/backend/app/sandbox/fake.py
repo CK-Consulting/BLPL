@@ -51,6 +51,9 @@ class _Box:
     # For run containers: the command, and what reattaching to it yields.
     argv: list[str] = field(default_factory=list)
     outcome: tuple = (0, [])
+    # Whether it ever ran. Docker's never-started `created` container reads
+    # as stopped in status(), as DockerDriver maps it, but is not followed.
+    started: bool = True
 
 
 @dataclass
@@ -153,7 +156,7 @@ class FakeDriver:
         orphan = self.boxes.get(spec.key)
         # As DockerDriver: an orphan that never started (STARTING, Docker's
         # `created`) is replaced, not followed.
-        if orphan is not None and orphan.argv == list(argv) and orphan.state is not State.STARTING:
+        if await self.will_follow(spec.key, argv):
             # The first attempt, same command: followed, not run again.
             self.ops.append(("reattach", spec.key))
             self.boxes.pop(spec.key, None)
@@ -190,6 +193,11 @@ class FakeDriver:
                 if inspect.isawaitable(res):
                     await res
         return ExecResult(exit_code=code)
+
+    async def will_follow(self, key: WorkspaceKey, argv: Sequence[str]) -> bool:
+        box = self.boxes.get(key)
+        return (box is not None and box.argv == list(argv) and box.started
+                and box.state is not State.STARTING)
 
     async def remove(self, key: WorkspaceKey) -> None:
         self.ops.append(("remove", key))

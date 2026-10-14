@@ -143,6 +143,16 @@ def has_started(state: dict) -> bool:
     return _set(state.get("StartedAt"))
 
 
+def follows(info: dict | None, argv: Sequence[str]) -> bool:
+    """Whether a run container's inspect data is one a retry follows: the same
+    command, and Docker records it as started and running or finished."""
+    if info is None:
+        return False
+    state = info.get("State") or {}
+    return (list((info.get("Config") or {}).get("Cmd") or []) == list(argv)
+            and has_started(state) and state.get("Status") in _FOLLOWABLE)
+
+
 def observed_exit(state: dict) -> int:
     """The exit code of a container that started and then exited, or -1.
 
@@ -375,6 +385,9 @@ class DockerDriver:
             await self._req("POST", f"/containers/{cid}/start", ok=(204, 304))
         return self._status_from(key, await self._inspect(key), want)
 
+    async def will_follow(self, key: WorkspaceKey, argv: Sequence[str]) -> bool:
+        return follows(await self._inspect(key), argv)
+
     async def status(self, key: WorkspaceKey) -> WorkspaceStatus:
         return self._status_from(key, await self._inspect(key))
 
@@ -530,10 +543,7 @@ class DockerDriver:
         # it read an empty log and recorded a run that never ran as a success.
         # One that never started is removed and created afresh, with this
         # attempt's environment.
-        reattach = (orphan is not None
-                    and list((orphan.get("Config") or {}).get("Cmd") or []) == list(argv)
-                    and has_started(orphan.get("State") or {})
-                    and (orphan.get("State") or {}).get("Status") in _FOLLOWABLE)
+        reattach = follows(orphan, argv)
         if orphan is not None and not reattach:
             await self._req("DELETE", f"/containers/{orphan['Id']}",
                             params={"force": "true"}, ok=(204, 404))

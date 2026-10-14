@@ -26,7 +26,6 @@ from . import runqueue, serverkey
 from .db import SessionFactory
 from .sandbox import idle as sandbox_idle
 from .sandbox import jobs as sandbox_jobs
-from .sandbox.driver import State
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
@@ -171,11 +170,18 @@ class _Workspaces:
 
         if not os.environ.get("BLPL_SANDBOX_HTTP_PROXY"):
             return {}, job.run_id
-        st = await self.driver.status(sandbox_jobs.run_key(job.project_name, job.run_id))
-        if st.state in (State.RUNNING, State.PAUSED, State.STOPPED):
+        # Asked the way run_container decides, not from status(), which reads
+        # Docker's never-started `created` as stopped: the retry then went
+        # without a grant into the container it recreated (Codex, PR #20).
+        if await self.driver.will_follow(sandbox_jobs.run_key(job.project_name, job.run_id),
+                                         job.cmd):
             return {}, job.run_id
         with SessionFactory() as session:
             row = session.get(Run, job.run_id)
+            # A container about to be (re)created gets a fresh grant, and any
+            # grant an earlier attempt left for a container that never ran
+            # goes first.
+            egress.revoke_run(session, job.run_id)
             name, token = egress.issue(
                 session, kind="run", project=job.project_name, run_id=job.run_id,
                 user_id=row.user_id if row is not None else None,
