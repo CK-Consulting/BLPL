@@ -2767,8 +2767,14 @@ def remove_member(
         # Their checkout goes; their branch stays. Being removed from a project
         # should not also mean losing unmerged work.
         try:
-            worktrees.remove(PROJECTS_ROOT, project.name, user_id)
-        except ProjectError as exc:
+            if workspace_files.enabled():
+                # Through the agent: without the project mount, the checkout is
+                # not visible here, and "nothing to remove" left a removed
+                # member's uncommitted work on disk (Codex, PR #20).
+                workspace_files.remove_worktree(project.name, user_id)
+            else:
+                worktrees.remove(PROJECTS_ROOT, project.name, user_id)
+        except (ProjectError, HTTPException, workspace_files.AgentCallError) as exc:
             logger.warning("could not remove worktree for %s: %s", project.name, exc)
     except projectacl.NotTheOwner as exc:
         # Removing the owner would strand the project: nobody left who can
@@ -3188,9 +3194,14 @@ def get_project_credential(
     """
     from . import gitstore
 
-    checkout = _project_dir(session, user, project_id)
+    # Through the agent with the agent path on, as pull and push resolve it:
+    # with the mount absent, reading the remote from disk answered 503
+    # (Codex, PR #20).
+    via = workspace_files.enabled()
+    checkout = _project_dir(session, user, project_id, agent_ready=via)
     try:
-        url = projects.remote_of(project_id, operation="push", checkout=checkout)
+        url = (workspace_files.remote_of(checkout, "push") if via
+               else projects.remote_of(project_id, operation="push", checkout=checkout))
     except ProjectError as exc:
         return {"host": None, "credential": None, "method": None, "https": False, "problem": str(exc)}
     host = gitstore.authority_of(url) if url else None
@@ -3221,10 +3232,15 @@ def put_project_credential(
     there is one. Any member may, for themselves. Nothing is echoed back."""
     from . import gitstore
 
-    checkout = _project_dir(session, user, project_id)
+    # Through the agent with the agent path on, as pull and push resolve it:
+    # with the mount absent, reading the remote from disk answered 503
+    # (Codex, PR #20).
+    via = workspace_files.enabled()
+    checkout = _project_dir(session, user, project_id, agent_ready=via)
     token = body.token.strip()
     try:
-        url = projects.remote_of(project_id, operation="push", checkout=checkout)
+        url = (workspace_files.remote_of(checkout, "push") if via
+               else projects.remote_of(project_id, operation="push", checkout=checkout))
     except ProjectError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if not url:

@@ -527,3 +527,48 @@ def test_opening_an_open_project_gives_back_a_lost_key(client, monkeypatch):
     r = client.post("/api/projects/scratch/open")
     assert r.json() == {"ok": True, "already_open": True}
     assert main.workspaces.key_for("scratch") == key
+
+
+def test_the_projects_credential_routes_work_without_the_mount(client, monkeypatch):
+    """GET and PUT /git/credential read the remote through the agent, as pull
+    and push do; they answered 503 without the project mount (Codex, PR #20)."""
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    monkeypatch.setenv("BLPL_PROJECT_MOUNT", "absent")
+    r = client.get("/api/projects/scratch/git/credential")
+    assert r.status_code == 200, r.text
+    assert "problem" in r.json()
+    r = client.put("/api/projects/scratch/git/credential", json={"token": "t"})
+    # The test remote is a local path, not https: refused for that reason,
+    # not because the mount is absent.
+    assert r.status_code == 400 and "https://" in r.json()["detail"], r.text
+
+
+def test_a_removed_members_checkout_goes_through_the_agent(client, second_user, monkeypatch):
+    """Without the mount the backend sees no checkout, and 'nothing to
+    remove' left a removed member's uncommitted work on disk."""
+    import app.main as main
+    from app import worktrees
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    client.post("/api/projects/scratch/members", json={"email": "other@example.com"})
+    inv = second_user.get("/api/invitations").json()[0]["id"]
+    second_user.post(f"/api/invitations/{inv}/accept")
+    assert second_user.get("/api/projects/scratch/tree").status_code == 200
+    member = [d for d in (main.PROJECTS_ROOT / ".worktrees" / "scratch").iterdir()]
+    assert len(member) == 1 and member[0].is_dir()
+    other_id = int(member[0].name[1:])
+
+    class NotHere:
+        def __getattr__(self, name):
+            def refuse(*a, **k):
+                raise AssertionError("the backend removed a checkout itself")
+            return refuse if name == "remove" else getattr(worktrees, name)
+
+    # The backend's own reference only; the agent (in-process here) keeps
+    # the real module.
+    monkeypatch.setattr(main, "worktrees", NotHere())
+    r = client.delete(f"/api/projects/scratch/members/{other_id}")
+    assert r.status_code == 200 and r.json()["removed"]
+    assert not member[0].exists()

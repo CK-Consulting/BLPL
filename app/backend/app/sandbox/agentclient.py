@@ -241,6 +241,9 @@ class AgentClient:
     def project_boards(self, checkout: str) -> dict:
         return self.call("/project/boards", {"checkout": checkout})
 
+    def worktree_remove(self, project: str, user_id: int) -> dict:
+        return self.call("/worktree/remove", {"project": project, "user_id": user_id})
+
     def worktree_ensure(self, project: str, user_id: int, is_owner: bool) -> dict:
         return self.call("/worktree/ensure", {"project": project, "user_id": user_id,
                                               "is_owner": is_owner})

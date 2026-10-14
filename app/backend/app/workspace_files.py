@@ -571,6 +571,18 @@ def ensure_worktree(project_id: str, user_id: int, is_owner: bool) -> Path:
     return Path(r["path"])
 
 
+def remove_worktree(project_id: str, user_id: int) -> bool:
+    """main.remove_member's worktrees.remove, done in the project's workspace."""
+    from . import main as m
+
+    with agent(m.PROJECTS_ROOT / project_id) as c:
+        try:
+            return bool(c.worktree_remove(project_id, user_id)["removed"])
+        except AgentCallError as exc:
+            _project_errors(exc)
+            raise
+
+
 def managed_rel(name: str) -> str:
     """The lexical rules of main._managed_path. Whether a parent is a link
     is the agent's to refuse, and it refuses every link."""
