@@ -1215,6 +1215,10 @@ listed below answer 503.
   subvolume grouped with the project's under one level-1 qgroup, or should move
   inside the project directory. Today they sit outside the project subvolume.
 - **Creating new projects as subvolumes,** through the helper.
+- **Run launches work without the mount** (review, PR #20). Starting a stage,
+  the pipeline, the review panel or a release reads the checkout's path and
+  its board list, both through the agent, and queues the run. The worker,
+  which has the mount, executes it in a run container.
 - **Routes still on the mount**, which is why `BLPL_PROJECT_MOUNT=absent`
   answers 503 for them:
   - the design, preflight, boards and board config views;
