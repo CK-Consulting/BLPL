@@ -53,6 +53,8 @@ DEADLINE_S = float(os.environ.get("BLPL_FETCH_DEADLINE_S", "120"))
 # Fetches at once, across every run, and per run. Beyond either: 429.
 MAX_CONCURRENT = int(os.environ.get("BLPL_FETCH_MAX_CONCURRENT", "8"))
 MAX_PER_RUN = int(os.environ.get("BLPL_FETCH_MAX_PER_RUN", "2"))
+# Held files kept as evidence, per project.
+HELD_MAX_BYTES = int(os.environ.get("BLPL_FETCH_HELD_MAX_MB", "500")) * 1024 * 1024
 MAX_REDIRECTS = 5
 # A fetch request is a URL in a small JSON object.
 MAX_REQUEST_BYTES = 64 * 1024
@@ -211,7 +213,14 @@ def assess(project: str, got: Download, held_root: Path) -> tuple[int, dict, byt
     if a.reasons:
         where = held_root / project
         where.mkdir(parents=True, exist_ok=True)
-        (where / f"{sha}.pdf").write_bytes(data)
+        kept = sum(f.stat().st_size for f in where.glob("*.pdf") if f.is_file())
+        if kept + len(data) <= HELD_MAX_BYTES:
+            (where / f"{sha}.pdf").write_bytes(data)
+        else:
+            # Evidence is bounded per project as well: past the cap the file
+            # is still held and its verdict returned, but not kept here.
+            logger.warning("held fetch for %s not kept as evidence: %s is over %d MB",
+                           project, where, HELD_MAX_BYTES // (1024 * 1024))
         return 422, {"held": True, "sha256": sha, "bytes": len(data), "reasons": a.reasons,
                      "inspection": a.inspection.to_dict(), "scan": a.scan.to_dict()}, b""
     return 200, {"sha256": sha, "bytes": len(data)}, data
@@ -291,20 +300,27 @@ def make_handler(authenticate: Authenticate, held_root: Path, *,
             run = self._user or project
             if not slots.take(run):
                 return self._answer(429, {"error": "too many fetches at once; try again shortly"})
+            # The slot covers the whole of the work, not only the download:
+            # assessment parses the PDF, may wait on the scanner and writes
+            # evidence, and releasing the slot before it let a run keep
+            # starting assessments without bound (Codex, PR #20). So the bytes
+            # one run holds at once are at most MAX_PER_RUN fetches of
+            # MAX_BYTES each.
             try:
-                got = download(url, resolve=resolve, connections=connections,
-                               deadline_s=deadline_s)
-            except Refused as exc:
-                logger.info("refused fetch for %s: %s (%s)", project, exc, url)
-                return self._answer(400, {"error": str(exc)})
+                try:
+                    got = download(url, resolve=resolve, connections=connections,
+                                   deadline_s=deadline_s)
+                except Refused as exc:
+                    logger.info("refused fetch for %s: %s (%s)", project, exc, url)
+                    return self._answer(400, {"error": str(exc)})
+                status, verdict, data = assess(project, got, held_root)
+                logger.info("fetch for %s: %s %s (%d bytes)", project,
+                            "held" if status != 200 else "accepted", got.url, verdict["bytes"])
+                if status != 200:
+                    return self._answer(status, verdict)
+                return self._answer(200, None, data, "application/pdf")
             finally:
                 slots.give(run)
-            status, verdict, data = assess(project, got, held_root)
-            logger.info("fetch for %s: %s %s (%d bytes)", project,
-                        "held" if status != 200 else "accepted", got.url, verdict["bytes"])
-            if status != 200:
-                return self._answer(status, verdict)
-            return self._answer(200, None, data, "application/pdf")
 
         def _project(self) -> str | None:
             raw = self.headers.get("Authorization") or ""
