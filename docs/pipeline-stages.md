@@ -242,6 +242,9 @@ The rest follows from that:
   - **ZC-003**: a differential net has no pair partner.
   - **ZC-004**: a class is named for an impedance, like `RF_50Ohm`, but
     declares none.
+  - **ZC-005**: the two halves of a pair are on different classes. A half that
+    reaches a differential class on its own brings its partner with it, so this
+    only fires when the halves are put on two different classes.
 - `blpl release` writes `fab/impedance.md` for the board house. A package
   where any width reads `NOT SET` is not quotable.
 
