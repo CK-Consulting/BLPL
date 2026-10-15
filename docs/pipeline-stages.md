@@ -246,8 +246,11 @@ The rest follows from that:
     reaches a differential class on its own brings its partner with it, so this
     only fires when the halves are put on two different classes.
   - **ZC-006**: a coplanar class has no `coplanar_gap`, the gap to the ground
-    pour that sets its impedance alongside the width. `.kicad_pro` writes that
-    gap as the class clearance, which is how far KiCad keeps the pour away.
+    pour that sets its impedance alongside the width. KiCad keeps the pour the
+    class clearance from the trace, so `.kicad_pro` raises the clearance to a
+    larger gap, and never lowers it to a smaller one.
+  - **ZC-010**: a coplanar gap smaller than the class's own clearance. The
+    pour cannot come that close without breaking the project's clearance.
   - **ZC-007**: on a board with more than two copper layers, a class does not
     say which layer its width is for (`impedance.layers`).
   - **ZC-008**: a `controlled_impedance` tag matches no net, so its
