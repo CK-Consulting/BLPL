@@ -468,3 +468,56 @@ def test_a_collision_is_cleared_by_removing_one_symbol_and_uploading_again(unloc
 
     missing = unlocked.post("/api/projects/mine/libraries/symbols/mine/remove", json={"symbol": "NOPE"})
     assert missing.status_code == 409
+
+
+def test_a_library_upload_waits_for_a_run_in_flight_and_a_document_does_not(unlocked):
+    """A library upload merges into the libraries/ a running stage is reading;
+    the run would build from two library states. A datasheet lands where no
+    stage reads it mid-run."""
+    from sqlalchemy import select
+
+    import app.db
+    import app.main as main
+    from app import runqueue
+    from app.models import Project, Run, User
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    with app.db.SessionFactory() as s:
+        project = s.scalar(select(Project).where(Project.name == "mine"))
+        user = s.scalar(select(User))
+        s.add(Run(
+            id="run_inflight", project_id=project.id, user_id=user.id, kind="pipeline",
+            cmd=["blpl", "run"], status=runqueue.RUNNING,
+            env_nonce=b"x" * 12, env_ciphertext=b"sealed",
+        ))
+        s.commit()
+
+    r = _upload(unlocked, [("fp.kicad_mod", FOOTPRINT, {"kind": "footprint"})])
+    assert r.status_code == 409 and "in flight" in r.json()["detail"]
+    assert not (main.PROJECTS_ROOT / "mine" / "libraries" / "footprints" / "mine.pretty").exists()
+    r = _upload(unlocked, [("ds.pdf", BENIGN, {"kind": "datasheet", "mpn": "X"})])
+    assert r.status_code == 200, r.text
+
+
+def test_a_move_the_ledger_cannot_record_is_put_back(unlocked, monkeypatch):
+    """The ledger frames a vendor file as untrusted by its path. A move whose
+    ledger write failed left the file at a path no row names, read back as the
+    project's own text, while the request reported failure."""
+    import app.main as main
+    from blpl.core import quarantine
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    _upload(unlocked, [("m.step", STEP, {"kind": "3d_model"})])
+    src = "libraries/3dmodels/mine.3dshapes/m.step"
+    dst = "libraries/3dmodels/vendor.3dshapes/m.step"
+
+    def full(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(quarantine, "record_library_move", full)
+    r = unlocked.post("/api/projects/mine/files/move", json={"path": src, "to": dst})
+    assert r.status_code == 500 and "not moved" in r.json()["detail"]
+    proj = main.PROJECTS_ROOT / "mine"
+    assert (proj / src).is_file() and not (proj / dst).exists()
+    row = next(x for x in quarantine.ledger(proj) if x["original_name"] == "m.step")
+    assert row["placed"] == [src]

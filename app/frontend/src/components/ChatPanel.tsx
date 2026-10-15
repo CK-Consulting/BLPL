@@ -561,13 +561,17 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
 
   /** Run a turn to completion, then reconcile against what was persisted. */
   const watch = useCallback(
-    async (id: string) => {
-      // Whose turn this is. Every caller points openRef at the conversation
-      // first, so reading it here needs no extra argument threaded through.
-      const owner = openRef.current;
-      const project = projectRef.current;
+    async (id: string, bound?: { project: string; owner: string }) => {
+      // Whose turn this is. A caller that started the turn says so; the refs
+      // are what is open *now*, and a queued message posted at the end of an
+      // earlier turn can still be awaiting its POST when the reader switches
+      // conversations. Read from the refs then, the old conversation's turn
+      // was rendered, reconciled and queue-settled as the new one's (Codex,
+      // PR #23).
+      const owner = bound ? bound.owner : openRef.current;
+      const project = bound ? bound.project : projectRef.current;
       const mine = () => openRef.current === owner && projectRef.current === project;
-      setStreaming(true);
+      if (mine()) setStreaming(true);
       let outcome: TurnOutcome = "ended";
       try {
         outcome = await follow(id, owner);
@@ -710,10 +714,17 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
     queued?: { key: string; item: QueuedMessage },
   ) => {
     const project = projectRef.current;
-    setError(null);
-    setLost(null);
+    const bound = { project, owner: conversation };
+    // Whether the reader is still looking at this conversation. A queued
+    // message is sent at the end of the turn before it, by which time they
+    // may have moved; nothing about it belongs on another conversation's view.
+    const here = () => openRef.current === conversation && projectRef.current === project;
+    if (here()) {
+      setError(null);
+      setLost(null);
+    }
     // Show the question immediately; the server has already persisted it.
-    setMessages((m) => [
+    if (here()) setMessages((m) => [
       ...m,
       {
         role: "user",
@@ -740,10 +751,10 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           endpoint: endpointRef.current,
         },
       );
-      setModel(started.model);
+      if (here()) setModel(started.model);
       id = started.turn_id;
     } catch (e) {
-      setMessages((m) => m.filter((x, i) => !(i === m.length - 1 && x.content === text)));
+      if (here()) setMessages((m) => m.filter((x, i) => !(i === m.length - 1 && x.content === text)));
       // 409 means a turn is already running here — nearly always this tab's own,
       // whose stream died. The server names it, so the right move is to go and
       // watch it rather than report a collision the user cannot act on. The
@@ -757,7 +768,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           queued.item,
           inFlight ? null : `Could not send: ${(e as Error).message}`,
         );
-        if (inFlight) await watch(inFlight);
+        if (inFlight) await watch(inFlight, bound);
         return;
       }
       // Put it back in the box instead of losing what they typed.
@@ -765,13 +776,13 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       setAttached(sent);
       if (inFlight) {
         setError(null);
-        await watch(inFlight);
+        await watch(inFlight, bound);
         return;
       }
       setError((e as Error).message);
       return;
     }
-    await watch(id);
+    await watch(id, bound);
   };
   postRef.current = post;
 

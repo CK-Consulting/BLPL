@@ -234,4 +234,49 @@ describe("a message queued during an answer", () => {
     expect(server.posts).toEqual([{ conversation: "c1", content: "first" }]);
     expect(screen.queryByText("second")).toBeNull();
   });
+
+  it("stays with its own conversation when the reader switches while it is being sent", async () => {
+    // The queued message goes out when c1's answer ends; its POST is still
+    // waiting for the server when the reader opens c2. The turn it starts is
+    // c1's, and none of it may be drawn into c2.
+    const server = fakeServer(["c1", "c2"]);
+    let releasePost: () => void = () => {};
+    const gate = new Promise<void>((r) => (releasePost = r));
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      if (/\/conversations\/c1\/chat$/.test(String(url)) && String(init?.body ?? "").includes('"second"')) {
+        await gate;
+      }
+      return server.fetchMock(url, init);
+    });
+    const user = userEvent.setup();
+    render(<ChatPanel projectId="p" onApplied={() => {}} />);
+
+    await startTurn(user, "first");
+    const t1 = await server.stream("t1");
+    await queue(user, "second");
+    await act(async () => {
+      t1.push("done", { stop_reason: "end_turn" });
+      t1.end();
+    });
+
+    await user.click(screen.getByTitle("Conversations, order, archiving"));
+    await user.selectOptions(await screen.findByLabelText("Conversation"), "c2");
+    await act(async () => releasePost());
+    const t2 = await server.stream("t2");
+    await act(async () => {
+      t2.push("text_delta", { text: "an answer meant for c1" });
+    });
+
+    expect(server.posts).toEqual([
+      { conversation: "c1", content: "first" },
+      { conversation: "c1", content: "second" },
+    ]);
+    expect(screen.queryByText(/an answer meant for c1/)).toBeNull();
+    expect(screen.queryByText("second")).toBeNull();
+    expect(screen.getByRole("textbox")).not.toBeDisabled();
+    await act(async () => {
+      t2.push("done", { stop_reason: "end_turn" });
+      t2.end();
+    });
+  });
 });

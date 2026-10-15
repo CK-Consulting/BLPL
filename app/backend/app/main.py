@@ -4605,6 +4605,12 @@ async def upload_files(
 
     who = user.email or f"user {user.id}"
     project_row = _project_or_404(session, user, project_id)
+    if any(spec["kind"] in quarantine.LIBRARY_KINDS for spec in specs):
+        # A library upload merges into, or relinks, the libraries/ a running
+        # stage is reading, which would build from two library states at
+        # once. Documents land where no stage reads them mid-run, so they
+        # are not held up by this.
+        _refuse_while_running(session, user, project_row, "add to its libraries")
     results: list[dict] = []
     for upload, spec in zip(files, specs):
         name = upload.filename or "upload"
@@ -5087,7 +5093,26 @@ def move_path(
                 pass
         raise HTTPException(status_code=500, detail=f"{src_rel} was not moved: {e}") from e
     if library_files:
-        quarantine.record_library_move(checkout, src_rel, dst_rel, by=user.email or f"user {user.id}")
+        try:
+            quarantine.record_library_move(checkout, src_rel, dst_rel, by=user.email or f"user {user.id}")
+        except OSError as e:
+            # The ledger still names the old path, and it is what frames a
+            # vendor file as untrusted when the assistant reads it. Left moved,
+            # the file would be read as the project's own text. So it goes back
+            # where the ledger says it is, and the move is reported as failed.
+            try:
+                dst.rename(src)
+            except OSError:
+                pass
+            if before is not None:
+                try:
+                    llm_ignore.restore(checkout, before)
+                except OSError:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail=f"{src_rel} was not moved: the quarantine ledger could not be updated ({e})",
+            ) from e
     ignore_list_updated = True
     if before is not None:
         try:
