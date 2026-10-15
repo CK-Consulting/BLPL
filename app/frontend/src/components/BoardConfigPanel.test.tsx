@@ -256,6 +256,19 @@ describe("the board's shape", () => {
     expect(cut.points).toEqual([[45, 37.5], [55, 37.5], [55, 42.5], [45, 42.5]]);
   });
 
+  it("still opens a file whose boundaries are the wrong type, so it can be repaired", async () => {
+    // The GET hands back a broken file with its errors; crashing on it would
+    // take away the only form that can fix it.
+    stub({
+      valid: false,
+      errors: ["boundaries.keepouts: 'oops' is not of type 'array'"],
+      config: { ...CONFIG.config, boundaries: { cutouts: { x: 1 }, keepouts: "oops" } },
+    });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("boundaries.keepouts");
+    expect(screen.getByText("Add keepout")).toBeInTheDocument();
+  });
+
   it("adds cutouts and keepouts with what they forbid", async () => {
     const box = capture();
     render(<BoardConfigPanel projectId="p" board="core" />);

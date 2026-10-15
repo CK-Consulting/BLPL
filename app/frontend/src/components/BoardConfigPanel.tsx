@@ -105,14 +105,22 @@ export function BoardConfigPanel({
 
   const dims = draft.project?.dimensions ?? [0, 0];
   const stackup = draft.project?.stackup ?? {};
-  const boundaries: Boundaries = draft.boundaries ?? {};
-  const outline = boundaries.board_outline;
+  // The GET returns a broken file as it is, with its errors, so it can be
+  // repaired here. Anything of the wrong type is therefore read as absent for
+  // display — a `keepouts: oops` that crashed the panel would take away the
+  // only form that can fix it. Nothing is rewritten until a field is edited.
+  const isMap = (v: unknown): v is Record<string, unknown> =>
+    !!v && typeof v === "object" && !Array.isArray(v);
+  const boundaries: Boundaries = isMap(draft.boundaries) ? draft.boundaries : {};
+  const outline = isMap(boundaries.board_outline) ? boundaries.board_outline : undefined;
   // Only a mapping with `shape` is drawn. The legacy `type: rect` block that
   // `blpl init` writes was never read; dimensions decides for it.
-  const shaped = !!outline && typeof outline === "object" && "shape" in outline;
+  const shaped = !!outline && "shape" in outline;
   const legacy = !!outline && !shaped && outline.type !== undefined;
-  const cutouts = boundaries.cutouts ?? [];
-  const keepouts = boundaries.keepouts ?? [];
+  const features = (v: unknown): BoardFeature[] =>
+    Array.isArray(v) ? v.map((f) => (isMap(f) ? (f as BoardFeature) : {})) : [];
+  const cutouts = features(boundaries.cutouts);
+  const keepouts = features(boundaries.keepouts);
   const built = shaped
     ? tryBuild(outline as ShapeSpec, "board outline", "origin")
     : tryBuild({ shape: "rect", size: dims }, "dimensions", "origin");
