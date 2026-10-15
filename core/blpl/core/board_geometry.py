@@ -464,19 +464,24 @@ def shape(spec: Any, where: str, *, default: str = "center") -> Shape:
     )
 
 
-def transform(s: Shape, x: float, y: float, rot: float) -> Shape:
+def transform(s: Shape, x: float, y: float, rot: float, mirror: bool = False) -> Shape:
     """``s`` in a footprint's frame, as it lands on the board at (x, y, rot).
 
     The same mapping ``placement.rotated_geometry`` measured with pcbnew: a
     footprint orientation of +90 deg sends a local offset (dx, dy) to
     (dy, -dx). Arcs and circles are carried by their defining points, which
-    rotation and translation preserve.
+    rotation, translation and mirroring all preserve.
+
+    ``mirror`` is a bottom-side part: rotated as if on top, then turned over
+    left to right about its origin, which is what the emitter and the KiCad
+    plugin both do to the footprint itself.
     """
     a = math.radians(float(rot) % 360.0)
     c, sn = math.cos(a), math.sin(a)
+    m = -1.0 if mirror else 1.0
 
     def t(p: Point) -> Point:
-        return (x + p[0] * c + p[1] * sn, y - p[0] * sn + p[1] * c)
+        return (x + m * (p[0] * c + p[1] * sn), y - p[0] * sn + p[1] * c)
 
     segs = [Segment(seg.kind, tuple(t(p) for p in seg.points), seg.radius)
             for seg in s.segments]
@@ -767,24 +772,17 @@ def place_anchored(board: Board, ref: str, x: float, y: float, rot: float,
                    side: str = "top") -> list[Feature]:
     """Fix ``ref``'s anchored shapes at its placement, check them, and return them.
 
-    A bottom-side part is refused rather than mirrored. KiCad mirrors a
-    flipped footprint's frame, so mirroring is what an anchored shape *should*
-    do — but the emitter does not flip footprints yet (it relabels the
-    footprint B.Cu and leaves its pads unmirrored on F.Cu), and a mirrored
-    keepout beside an unmirrored part is on the wrong side of it either way.
-    Until the two agree, saying so beats drawing the antenna keepout over the
-    wrong end of the module.
+    A bottom-side part's shapes are mirrored with it. They used to be refused
+    instead, because the emitter only relabelled a flipped footprint B.Cu and
+    left its pads unmirrored on F.Cu, so a mirrored keepout would have been on
+    the wrong side of the part either way. The emitter now turns the footprint
+    over the way KiCad does, and the shape goes where the part's own geometry
+    goes: an antenna keepout stays over the antenna end of the module.
     """
-    if str(side).lower() == "bottom" and board.anchored_to(ref):
-        raise BoardGeometryError(
-            f"{ref} is on the bottom side and has anchored shapes "
-            f"({', '.join(f.where for f in board.anchored_to(ref))}); anchoring to a "
-            "bottom-side part is not supported yet, because the emitter does not mirror "
-            "flipped footprints. Draw the shape in board coordinates instead"
-        )
+    mirror = str(side).lower() == "bottom"
     placed = []
     for f in board.anchored_to(ref):
-        g = Feature(f.kind, transform(f.shape, x, y, rot), f.where, anchor=f.anchor,
+        g = Feature(f.kind, transform(f.shape, x, y, rot, mirror), f.where, anchor=f.anchor,
                     layers=f.layers, forbid=f.forbid, name=f.name)
         check_feature(board, g)
         board.features.append(g)

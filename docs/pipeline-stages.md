@@ -176,8 +176,9 @@ An anchored keepout is emitted inside its part's footprint, like the antenna
 keepout a stock RF module footprint ships with, because KiCad exempts only a
 rule area's own footprint from it. KiCad still checks that footprint's *pads*
 against it, so an anchored keepout that forbids pads must not cover them.
-A `side: bottom` part cannot carry anchored shapes yet: the emitter does not
-mirror flipped footprints.
+On a `side: bottom` part, anchored shapes are mirrored with the footprint, and
+an anchored keepout's `F.*`/`B.*` layers swap with it, as the footprint's own
+zones do.
 
 A stock module's own keepout reaches KiCad's DRC, but the placer does not
 model it. To keep parts clear of it while placing, declare it as an anchored
@@ -217,6 +218,14 @@ Three things Stage 5 adds that no BOM row asked for:
   and the schema rejects anything else rather than ignoring it. A hint is a
   constraint: `x`/`y` are honoured before anything else is placed, and `near`
   outranks both the netlist and the naming convention.
+
+  `side: bottom` with `rot: r` means the part as it would sit on top at `r`,
+  then turned over left to right about its origin — what pcbnew does when you
+  flip a placed part. KiCad shows that footprint with orientation `180 - r`.
+  The emitter writes it the way KiCad would: pads and graphics mirrored, every
+  `F.*` layer swapped for its `B.*` twin, texts mirrored. Placement reserves
+  the mirrored courtyard, and a shape in `boundaries` anchored to the part is
+  mirrored with it, so an antenna keepout stays over the antenna end.
 
 
 - **No-connect pins.** Every pin a pinout table declares open lands in that component's `no_connect_pins`, and the schematic emitter puts a KiCad no-connect flag on it. Without this, ERC and the review could not tell a pin the designer left open from one the design forgot.
