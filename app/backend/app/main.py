@@ -4969,8 +4969,18 @@ def delete_path(
     else:
         target.unlink()
         kind = "file"
+    ledger_updated = True
     if library_files:
-        quarantine.record_library_removal(checkout, rel, by=user.email or f"user {user.id}")
+        # After the delete, and caught for the same reason as the ignore list
+        # below: the bytes are already gone, so failing the request skipped
+        # the commit and reported a failed delete of a file that no longer
+        # exists. A ledger that could not be rewritten still claims the old
+        # path, which can only over-frame a later file of that name as vendor
+        # content. Nothing becomes trusted. Reported instead.
+        try:
+            quarantine.record_library_removal(checkout, rel, by=user.email or f"user {user.id}")
+        except OSError:
+            ledger_updated = False
     # After the delete, unlike a move's list update, and safely so: should this
     # write fail, the file is already gone and the entry left behind can only
     # over-ignore a later file of the same name. Nothing becomes readable.
@@ -4991,6 +5001,7 @@ def delete_path(
     return {
         "ok": True, "path": rel, "kind": kind, **commit,
         "ignore_list_updated": ignore_list_updated,
+        "ledger_updated": ledger_updated,
     }
 
 
@@ -5082,6 +5093,33 @@ def move_path(
             except OSError:
                 pass
         raise HTTPException(status_code=500, detail=f"{src_rel} was not moved: {e}") from e
+    def undo_move() -> None:
+        try:
+            dst.rename(src)
+        except OSError:
+            pass
+        if before is not None:
+            try:
+                llm_ignore.restore(checkout, before)
+            except OSError:
+                pass
+
+    # A footprint names its 3D model by exact path, so a moved model takes the
+    # footprints that name it along, in the same commit (Codex, PR #23): left
+    # alone, the next board came out without the 3D body and nothing said so.
+    moved_models = {
+        src_rel + str(p)[len(str(dst)):]: dst_rel + str(p)[len(str(dst)):]
+        for p in ([dst] if dst.is_file() else sorted(dst.rglob("*")) if dst.is_dir() else [])
+        if p.is_file() and not p.is_symlink() and p.suffix.lower() in library_upload.MODEL_SUFFIXES
+    }
+    try:
+        relinked = library_upload.follow_moved_models(checkout, moved_models)
+    except (OSError, RuntimeError) as e:
+        undo_move()
+        raise HTTPException(
+            status_code=500,
+            detail=f"{src_rel} was not moved: the footprints naming its 3D models could not be updated ({e})",
+        ) from e
     if library_files:
         try:
             quarantine.record_library_move(checkout, src_rel, dst_rel, by=user.email or f"user {user.id}")
@@ -5090,15 +5128,8 @@ def move_path(
             # vendor file as untrusted when the assistant reads it. Left moved,
             # the file would be read as the project's own text. So it goes back
             # where the ledger says it is, and the move is reported as failed.
-            try:
-                dst.rename(src)
-            except OSError:
-                pass
-            if before is not None:
-                try:
-                    llm_ignore.restore(checkout, before)
-                except OSError:
-                    pass
+            library_upload.restore_texts(checkout, relinked)
+            undo_move()
             raise HTTPException(
                 status_code=500,
                 detail=f"{src_rel} was not moved: the quarantine ledger could not be updated ({e})",
@@ -5118,6 +5149,7 @@ def move_path(
     )
     return {
         "ok": True, "from": src_rel, "to": dst_rel, **commit,
+        "relinked": [rel for rel, _ in relinked],
         "ignore_list_updated": ignore_list_updated,
     }
 

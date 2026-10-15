@@ -744,7 +744,11 @@ export function FileTree({
             stillHere(live.project, "nothing was deleted");
             const refusal = canDelete?.(path);
             if (refusal) throw new Error(refusal);
-            const r = await delJSON<{ committed?: boolean; ignore_list_updated?: boolean }>(
+            const r = await delJSON<{
+              committed?: boolean;
+              ignore_list_updated?: boolean;
+              ledger_updated?: boolean;
+            }>(
               `/api/projects/${live.project}/files/${encodePath(path)}`,
             );
             announcePushFrom(live.project, r);
@@ -760,6 +764,12 @@ export function FileTree({
             // would cover a new file made at that name (Codex, PR #17).
             if (r && r.ignore_list_updated === false) {
               notes.push(`The LLM-ignore list still names ${path}; remove it there if a new file at that name should be readable.`);
+            }
+            // The quarantine ledger could not be rewritten, so it still says an
+            // upload put a file here, and a new file at that name would be read
+            // by the assistant as vendor content until it is.
+            if (r && r.ledger_updated === false) {
+              notes.push(`The quarantine ledger still records an upload at ${path}; a new file there will be treated as vendor content.`);
             }
             if (notes.length) setError(notes.join(" "));
           }}
