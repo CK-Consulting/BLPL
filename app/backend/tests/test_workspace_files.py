@@ -63,6 +63,27 @@ from test_remote_urls import *  # noqa: E402,F401,F403
 from test_uploads_api import *  # noqa: E402,F401,F403
 from test_uploads_api import _no_scanner, _upload  # noqa: E402,F401
 
+# Library uploads, and the deletes, moves and symbol removals that keep the
+# ledger following them, are refused through the agent until it handles project
+# libraries; the refusals are tested below. Their mounted-route tests would only
+# pin that they are refused.
+del test_library_files_land_in_the_project_library_and_the_resolver_finds_them  # noqa: F821
+del test_a_library_file_is_read_by_the_assistant_as_untrusted  # noqa: F821
+del test_a_symbol_that_would_replace_one_already_there_is_held  # noqa: F821
+del test_a_file_that_is_not_what_its_kind_says_is_held  # noqa: F821
+del test_a_bad_library_name_fails_the_request_before_anything_lands  # noqa: F821
+del test_a_vendor_bundle_reports_each_entry  # noqa: F821
+del test_a_pdf_inside_a_bundle_records_its_own_verdict  # noqa: F821
+del test_a_stock_library_name_is_refused_and_nothing_lands  # noqa: F821
+del test_an_existing_project_library_with_a_stock_name_still_takes_uploads  # noqa: F821
+del test_a_placed_footprint_can_be_deleted_and_the_ledger_records_it  # noqa: F821
+del test_a_placed_model_can_be_moved_and_the_row_follows  # noqa: F821
+del test_a_collision_is_cleared_by_removing_one_symbol_and_uploading_again  # noqa: F821
+del test_a_library_upload_waits_for_a_run_in_flight_and_a_document_does_not  # noqa: F821
+del test_a_move_the_ledger_cannot_record_is_put_back  # noqa: F821
+del test_a_delete_the_ledger_cannot_record_still_lands_and_says_so  # noqa: F821
+del test_moving_an_uploaded_model_takes_the_footprint_that_names_it_along  # noqa: F821
+
 TOKEN = "w" * 64
 
 
@@ -841,3 +862,43 @@ def test_a_launch_without_the_mount_still_refuses_an_unknown_board(client, monke
     monkeypatch.setenv("BLPL_PROJECT_MOUNT", "absent")
     r = client.post("/api/projects/scratch/stages/stage5?board=nope")
     assert r.status_code == 400 and "single-board" in r.json()["detail"]
+
+
+
+# -- project libraries, until the agent handles them ------------------------------------
+
+
+def test_a_library_upload_is_refused_through_the_agent_and_nothing_lands(unlocked):
+    import app.main as main
+    from test_uploads_api import FOOTPRINT
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    r = _upload(unlocked, [("fp.kicad_mod", FOOTPRINT, {"kind": "footprint"})])
+    assert r.status_code == 409 and "workspaces" in r.json()["detail"]
+    assert not (main.PROJECTS_ROOT / "mine" / "libraries" / "footprints" / "mine.pretty").exists()
+    # A document still goes in.
+    r = _upload(unlocked, [("ds.pdf", BENIGN, {"kind": "datasheet", "mpn": "X"})])
+    assert r.status_code == 200, r.text
+
+
+def test_an_uploaded_library_file_is_not_deleted_or_moved_through_the_agent(unlocked, monkeypatch):
+    """Through the agent these would skip the ledger, so the vendor file would
+    lose its framing; refused instead, and the file stays where it is."""
+    import app.main as main
+    from test_uploads_api import FOOTPRINT
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    monkeypatch.delenv("BLPL_FILES_VIA_WORKSPACE")
+    r = _upload(unlocked, [("fp.kicad_mod", FOOTPRINT, {"kind": "footprint"})])
+    assert r.status_code == 200, r.text
+    monkeypatch.setenv("BLPL_FILES_VIA_WORKSPACE", "1")
+    rel = "libraries/footprints/mine.pretty/PCM12SMTBR.kicad_mod"
+
+    r = unlocked.delete(f"/api/projects/mine/files/{rel}")
+    assert r.status_code == 409 and "workspaces" in r.json()["detail"]
+    r = unlocked.post("/api/projects/mine/files/move",
+                      json={"path": rel, "to": "libraries/footprints/x.pretty/a.kicad_mod"})
+    assert r.status_code == 409
+    r = unlocked.post("/api/projects/mine/libraries/symbols/mine/remove", json={"symbol": "R"})
+    assert r.status_code == 409
+    assert (main.PROJECTS_ROOT / "mine" / rel).is_file()
