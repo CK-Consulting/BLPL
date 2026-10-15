@@ -538,6 +538,8 @@ def test_an_inner_layer_keepout_lands_on_an_inner_layer_the_board_has():
 @pytest.mark.parametrize("layers,stackup", [
     (["In1.Cu"], 2), (["In3.Cu"], 4), (["F.Cu", "In2.Cu"], None), (["B.Cu"], 1),
     (["F&B.Cu"], 1), (["Inner.Cu"], 4),
+    # Names not ending in .Cu used to skip the check entirely.
+    (["F.Cuu"], 2), (["F.Cu "], 2), (["F.SilkS"], 4), (["In1.cu"], 4),
 ])
 def test_a_keepout_on_copper_the_stackup_lacks_is_refused(layers, stackup):
     """A rule area on a layer the board has not enabled loads and protects

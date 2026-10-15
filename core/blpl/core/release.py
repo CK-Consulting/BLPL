@@ -41,13 +41,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-# The layers a two-layer board needs, in the order a fab expects to find them.
+from blpl.emitter import sexpr
+
+# The non-copper layers a fab needs, in the order a fab expects to find them.
 # Named explicitly rather than left to kicad-cli's default because the default
 # has changed between versions, and a package silently missing a mask layer is
-# a re-quote at best.
-GERBER_LAYERS = (
-    "F.Cu,B.Cu,F.Paste,B.Paste,F.Silkscreen,B.Silkscreen,F.Mask,B.Mask,Edge.Cuts"
-)
+# a re-quote at best. Copper comes from the board itself (copper_layers): a
+# fixed F.Cu,B.Cu here shipped a 4-layer board's package without its inner
+# layers, and nothing about the package said so.
+FAB_LAYERS = "F.Paste,B.Paste,F.Silkscreen,B.Silkscreen,F.Mask,B.Mask,Edge.Cuts"
+
+_COPPER_TYPES = {"signal", "power", "mixed", "jumper"}
 
 _TIMEOUT = 300
 
@@ -63,6 +67,36 @@ class Step:
 
     def to_dict(self) -> dict:
         return {"step": self.name, "ok": self.ok, "detail": self.detail, "outputs": self.outputs}
+
+
+def copper_layers(pcb: Path) -> list[str]:
+    """The copper layers ``pcb``'s layer table enables, top to bottom.
+
+    Read from the board rather than from the stackup in project.yaml, because
+    the board is what gets fabricated: if the two disagree, the gerbers have
+    to describe the board. Empty when the file has no readable layer table,
+    which the caller treats as a failure rather than guessing two layers.
+    """
+    try:
+        root = sexpr.parse(pcb.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, IndexError):
+        return []
+    table = sexpr.find(root, "layers") if isinstance(root, list) else None
+    names = [
+        sexpr.unquote(row[1]) for row in (table or [])[1:]
+        if isinstance(row, list) and len(row) >= 3 and row[2] in _COPPER_TYPES
+        and sexpr.unquote(row[1]).endswith(".Cu")
+    ]
+
+    def order(name: str) -> int:
+        if name == "F.Cu":
+            return 0
+        if name == "B.Cu":
+            return 1_000
+        m = re.fullmatch(r"In(\d+)\.Cu", name)
+        return int(m.group(1)) if m else 999
+
+    return sorted(names, key=order)
 
 
 def find_kicad_cli() -> str | None:
@@ -123,13 +157,20 @@ def export_fabrication(pcb: Path, out_dir: Path, *, kicad_cli: str | None = None
 
     gerbers = out_dir / "gerbers"
     gerbers.mkdir(parents=True, exist_ok=True)
-    steps = [
-        _run(
+    copper = copper_layers(pcb)
+    if copper:
+        gerber_step = _run(
             [cli, "pcb", "export", "gerbers", "--output", str(gerbers),
-             "--layers", GERBER_LAYERS, str(pcb)],
+             "--layers", ",".join([*copper, FAB_LAYERS]), str(pcb)],
             "gerbers",
             gerbers,
-        ),
+        )
+    else:
+        gerber_step = Step("gerbers", False,
+                           f"{pcb.name} has no readable copper layer table; not guessing "
+                           "which copper layers to export")
+    steps = [
+        gerber_step,
         _run(
             [cli, "pcb", "export", "drill", "--output", str(gerbers),
              "--format", "excellon", "--excellon-separate-th", str(pcb)],

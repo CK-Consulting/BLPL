@@ -637,19 +637,23 @@ def _check_keepout_layers(layers: tuple[str, ...], copper: tuple[str, ...],
     KiCad loads a rule area on a layer the board has not enabled and it
     protects nothing, so an antenna keepout written for In1.Cu on what is
     really a 2-layer board would build, pass, and leave the antenna's ground
-    plane exactly where it was. Only copper names are checked: ``*.Cu`` means
-    whatever copper there is, and ``F&B.Cu`` the two outer layers.
+    plane exactly where it was. Every name is checked, not only those ending
+    in ``.Cu``: a rule area is a copper-layer object in KiCad, so ``F.SilkS``
+    is as wrong as ``In7.Cu``, and a typo like ``F.Cuu`` or ``F.Cu `` used to
+    skip the check and reach the board verbatim. ``*.Cu`` means whatever
+    copper there is, and ``F&B.Cu`` the two outer layers.
     """
     allowed = set(copper) | {"*.Cu"}
     if len(copper) > 1:
         allowed.add("F&B.Cu")
-    missing = [layer for layer in layers if layer.endswith(".Cu") and layer not in allowed]
+    missing = [layer for layer in layers if layer not in allowed]
     if missing:
         raise BoardGeometryError(
-            f"{where}.layers names {', '.join(missing)}, but project.stackup.layers is "
-            f"{len(copper)}, so the board's copper is {', '.join(copper)}. A keepout on "
-            "a layer the board does not have protects nothing; change the layer or the "
-            "stackup."
+            f"{where}.layers names {', '.join(repr(m) for m in missing)}, but "
+            f"project.stackup.layers is {len(copper)}, so a keepout may be on "
+            f"{', '.join(copper)} or *.Cu{' or F&B.Cu' if len(copper) > 1 else ''}. A "
+            "keepout on a layer the board does not have protects nothing; change the "
+            "layer or the stackup."
         )
 
 

@@ -636,14 +636,15 @@ def _keepout_zone(feature: dict, copper: set[str]) -> sexpr.Node:
     footprint libraries do, so the file reads the same under KiCad 9 and 10
     whichever net syntax each prefers.
 
-    ``copper`` is the board's copper layer names. A keepout on a copper layer
-    the board does not have is a zone on nothing: KiCad loads it and it
+    ``copper`` is the board's copper layer names. A rule area is a copper
+    object, so any other name — a copper layer the board does not have, or a
+    non-copper one — is a zone on nothing: KiCad loads it and it
     protects nothing. Stage 5 refuses those with the reason; this is the
     backstop for an HDM that did not come through it.
     """
     layers = feature.get("layers") or ["*.Cu"]
-    missing = [layer for layer in layers if layer.endswith(".Cu")
-               and layer not in copper and layer not in ("*.Cu", "F&B.Cu")]
+    outer = {"F&B.Cu"} if "B.Cu" in copper else set()
+    missing = [layer for layer in layers if layer not in copper | outer | {"*.Cu"}]
     if missing:
         raise ValueError(
             f"keepout {feature.get('where') or feature.get('name') or ''} is on "
