@@ -569,3 +569,24 @@ def test_the_emitter_accepts_a_keepout_on_a_non_copper_layer_it_has():
     out = pcb.emit(_hdm(cfg), footprints_root=_FOOTPRINTS_ROOT)
     (zone,) = _tags(out, "zone")
     assert sexpr.find(zone, "layers")[1:] == ['"F.Cu"', '"F.Mask"']
+
+
+@pytest.mark.parametrize("count", [4.5, 3, 0, "4", True, None])
+def test_a_layer_count_outside_the_schemas_is_refused_not_rounded(count):
+    """hdm.yaml is hand-editable and Stage 6 does not re-run the schema, so
+    int(4.5) used to emit a 4-layer board from a stackup that said otherwise."""
+    cfg = _config()
+    cfg["project"]["stackup"] = {"layers": count}
+    hdm = _hdm(_config())             # built from a valid config, then edited by hand
+    hdm["project"] = cfg["project"]
+    with pytest.raises(ValueError, match="stackup.layers"):
+        pcb.emit(hdm, footprints_root=_FOOTPRINTS_ROOT)
+    with pytest.raises(bg.BoardGeometryError, match="stackup.layers"):
+        bg.from_config(cfg)
+
+
+def test_an_integral_float_layer_count_is_the_same_count():
+    cfg = _config()
+    cfg["project"]["stackup"] = {"layers": 4.0}
+    out = pcb.emit(_hdm(cfg), footprints_root=_FOOTPRINTS_ROOT)
+    assert [n for _, n in _copper_rows(out)] == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]

@@ -66,6 +66,10 @@ _NON_COPPER_LAYERS: list[sexpr.Sexp] = [
 ]
 
 
+# The counts schemas/project_config.v1.json allows.
+_COPPER_COUNTS = frozenset({1, 2, 4, 6, 8, 10, 12})
+
+
 def _copper_layers(count: int) -> list[sexpr.Sexp]:
     """The copper rows of the layer table for a ``count``-layer stackup.
 
@@ -90,13 +94,15 @@ def _copper_count(project: dict) -> int:
     read, so an HDM written without a stackup comes out as it always did.
     """
     raw = (project.get("stackup") or {}).get("layers", 2)
-    try:
-        count = int(raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"project.stackup.layers must be a layer count, not {raw!r}") from None
-    if count < 1 or (count > 2 and count % 2):
-        raise ValueError(f"project.stackup.layers must be 1 or an even count, not {count}")
-    return count
+    # Checked before any conversion: hdm.yaml is hand-editable and Stage 6 does
+    # not run it through the schema, and int(4.5) is a quiet 4-layer board.
+    # bool is excluded because True == 1.
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+            or raw not in _COPPER_COUNTS:
+        raise ValueError(
+            f"project.stackup.layers must be one of "
+            f"{', '.join(map(str, sorted(_COPPER_COUNTS)))}, not {raw!r}")
+    return int(raw)
 
 
 def _copper_names(hdm: dict) -> set[str]:

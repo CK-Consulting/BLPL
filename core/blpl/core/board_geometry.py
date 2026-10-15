@@ -628,6 +628,11 @@ def polygons_overlap(a: list[Point], b: list[Point]) -> bool:
 # --- project.yaml -------------------------------------------------------------
 
 
+# The counts schemas/project_config.v1.json allows; odd counts above 1 are
+# not manufacturable.
+COPPER_COUNTS = frozenset({1, 2, 4, 6, 8, 10, 12})
+
+
 def copper_layers(count: int) -> tuple[str, ...]:
     """The copper layer names of a ``count``-layer stackup, top to bottom."""
     if count <= 1:
@@ -782,11 +787,13 @@ def from_config(config: dict) -> Board:
     # 2 when the stackup is silent, because that is what the emitter draws
     # then; the schema has already held the count to its enum.
     count = ((config.get("project") or {}).get("stackup") or {}).get("layers", 2)
-    try:
-        copper = copper_layers(int(count))
-    except (TypeError, ValueError):
+    # Checked before converting, as the emitter does: int(4.5) is a quiet 4.
+    if isinstance(count, bool) or not isinstance(count, (int, float)) \
+            or count not in COPPER_COUNTS:
         raise BoardGeometryError(
-            f"project.stackup.layers must be a copper layer count, not {count!r}") from None
+            f"project.stackup.layers must be one of "
+            f"{', '.join(map(str, sorted(COPPER_COUNTS)))}, not {count!r}")
+    copper = copper_layers(int(count))
 
     board = Board(outline=outline, declared=declared, notes=notes)
     for kind, key in (("cutout", "cutouts"), ("keepout", "keepouts")):
