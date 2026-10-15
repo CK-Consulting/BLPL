@@ -180,6 +180,17 @@ On a `side: bottom` part, anchored shapes are mirrored with the footprint, and
 an anchored keepout's `F.*`/`B.*` layers swap with it, as the footprint's own
 zones do.
 
+The board's copper layers are the ones `project.stackup.layers` gives: F.Cu,
+In1.Cu … In(n-2).Cu, B.Cu, or 2 layers when the stackup is silent. A keepout
+on copper the stackup does not have — `In1.Cu` on a 2-layer board, `B.Cu` on a
+1-layer one — is refused, because KiCad loads a rule area on a missing layer
+and it protects nothing. `*.Cu` means every copper layer the board has and
+`F&B.Cu` the two outer ones. Non-copper layers are allowed under the names a
+`.kicad_pcb` file uses (`F.SilkS`, `F.Mask`, `Dwgs.User`), not the display
+names (`F.Silkscreen`, `User.Drawings`), which make KiCad refuse the board.
+Any other name is refused. The release package's
+gerbers carry every copper layer the emitted board has.
+
 A stock module's own keepout reaches KiCad's DRC, but the placer does not
 model it. To keep parts clear of it while placing, declare it as an anchored
 keepout too.

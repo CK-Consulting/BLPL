@@ -202,3 +202,53 @@ def test_the_jar_location_comes_from_the_environment(monkeypatch, tmp_path) -> N
 
     monkeypatch.setenv(autoroute.JAR_ENV, str(tmp_path / "absent.jar"))
     assert autoroute.find_jar() is None
+
+
+# -- gerbers carry every copper layer the board has ----------------------------
+
+
+def _board_with_layers(path: Path, rows: str) -> Path:
+    path.write_text(f"(kicad_pcb (version 20260206) (layers {rows}))\n", encoding="utf-8")
+    return path
+
+
+def _gerber_layers(pcb: Path, tmp_path: Path, monkeypatch) -> tuple[list[str], list]:
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, name, expect_dir=None):
+        seen.append(cmd)
+        return release.Step(name, True)
+
+    monkeypatch.setattr(release, "_run", fake_run)
+    steps = release.export_fabrication(pcb, tmp_path / "out", kicad_cli="kicad-cli")
+    gerbers = next((c for c in seen if c[3] == "gerbers"), None)
+    layers = gerbers[gerbers.index("--layers") + 1].split(",") if gerbers else []
+    return layers, steps
+
+
+def test_a_four_layer_board_exports_its_inner_copper(tmp_path, monkeypatch) -> None:
+    """The layer list was a fixed F.Cu,B.Cu: a 4-layer board's package shipped
+    without In1/In2 and nothing in the manifest said so."""
+    pcb = _board_with_layers(tmp_path / "b.kicad_pcb",
+                             '(0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" power) '
+                             '(2 "B.Cu" signal) (5 "F.SilkS" user "F.Silkscreen")')
+    layers, _ = _gerber_layers(pcb, tmp_path, monkeypatch)
+    assert layers[:4] == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+    assert "Edge.Cuts" in layers and "F.SilkS" not in layers[:4]
+
+
+def test_a_two_layer_board_exports_the_same_layers_as_before(tmp_path, monkeypatch) -> None:
+    pcb = _board_with_layers(tmp_path / "b.kicad_pcb", '(0 "F.Cu" signal) (2 "B.Cu" signal)')
+    layers, _ = _gerber_layers(pcb, tmp_path, monkeypatch)
+    assert ",".join(layers) == ("F.Cu,B.Cu,F.Paste,B.Paste,F.Silkscreen,B.Silkscreen,"
+                                "F.Mask,B.Mask,Edge.Cuts")
+
+
+def test_a_board_with_no_layer_table_fails_the_gerber_step(tmp_path, monkeypatch) -> None:
+    """Guessing two layers is how the inner ones went missing; say so instead."""
+    pcb = tmp_path / "b.kicad_pcb"
+    pcb.write_text("(kicad_pcb)\n", encoding="utf-8")
+    layers, steps = _gerber_layers(pcb, tmp_path, monkeypatch)
+    (gerbers,) = [s for s in steps if s.name == "gerbers"]
+    assert not gerbers.ok and "copper layer table" in gerbers.detail
+    assert layers == []
