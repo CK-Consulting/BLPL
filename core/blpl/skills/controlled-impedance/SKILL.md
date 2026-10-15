@@ -214,9 +214,10 @@ in the nearest reference plane.
 - No stubs: a test pad, a T-branch or an unused via barrel on a controlled
   line is a stub. (BLPL leaves controlled nets off synthesized test points.)
 - Coplanar lines: the ground pour beside the trace is at the calculated gap,
-  with a via fence along it. Declare that gap as the class's `coplanar_gap`;
-  BLPL writes it as the class clearance in `.kicad_pro`, which is the distance
-  KiCad keeps the pour from the trace.
+  with a via fence along it. Declare that gap as the class's `coplanar_gap`.
+  KiCad keeps the pour the class clearance from the trace, so BLPL raises the
+  clearance to a larger gap; a gap smaller than the class's clearance is a
+  conflict (ZC-010), never a lowered clearance for every other net.
 
 ## Termination: match the ends too
 

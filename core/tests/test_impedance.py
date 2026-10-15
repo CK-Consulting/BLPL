@@ -400,13 +400,22 @@ def test_a_coplanar_class_needs_its_ground_gap_and_the_sheet_prints_it():
     assert "| CPW | 50 Ω coplanar | ±10% | any | 0.3 | 0.15 | ANT |" in z.fab_table(hdm)
 
 
-def test_a_coplanar_gap_is_the_clearance_the_pour_keeps():
-    hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "clearance": 0.2, "coplanar_gap": 0.15,
-                                   "impedance": {"ohms": 50, "mode": "coplanar"}}}, "nets": {}}
-    (cpw,) = [c for c in pro.build(hdm, project_filename="p.kicad_pro")["net_settings"]["classes"]
-              if c["name"] == "CPW"]
-    assert cpw["clearance"] == 0.15
+def test_a_coplanar_gap_raises_the_clearance_but_never_lowers_it():
+    """The pour keeps the class clearance from the trace, so a larger gap raises
+    it. A smaller one used to lower it for every other net too (Codex, PR #31);
+    that conflict is ZC-010 now, and the project's clearance stands."""
+    def emitted(rules):
+        hdm = {"net_classes": {"CPW": {**rules, "impedance": {"ohms": 50, "mode": "coplanar"}}}, "nets": {}}
+        (cpw,) = [c for c in pro.build(hdm, project_filename="p.kicad_pro")["net_settings"]["classes"]
+                  if c["name"] == "CPW"]
+        return cpw["clearance"]
 
+    assert emitted({"trace_width": 0.3, "clearance": 0.2, "coplanar_gap": 0.25}) == 0.25
+    assert emitted({"trace_width": 0.3, "clearance": 0.2, "coplanar_gap": 0.15}) == 0.2
+    hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "clearance": 0.2, "coplanar_gap": 0.15,
+                                   "impedance": {"ohms": 50, "mode": "coplanar"}}},
+           "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
+    assert [f["rule_id"] for f in z.review(hdm)] == ["ZC-010"]
 
 def test_a_release_with_a_pair_split_across_complete_classes_is_not_quotable(released):
     """Every cell of the sheet is filled, and it still asks for two geometries
@@ -828,3 +837,19 @@ def test_a_plane_dependent_impedance_on_a_one_layer_board_is_an_error():
                                 "impedance": {"ohms": 50, "mode": "coplanar"}}
     assert z.review(hdm) == []
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg})")) == []
+
+
+
+def test_a_pour_on_the_signals_own_net_is_not_its_reference():
+    """Codex, PR #31: the trace's own net poured under it is not the plane its
+    width was calculated over."""
+    from blpl.emitter import sexpr
+
+    hdm = {"project": {"stackup": {"layers": 2}},
+           "net_classes": {"RF": {"trace_width": 2.9, "impedance": 50}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}}
+    seg = '(segment (start 0 0) (end 20 0) (width 2.9) (layer "F.Cu") (net "ANT"))'
+    own = _filled('(net "ANT")', "B.Cu", (-5, -5, 25, 5))
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {own})")) == [("RF", "F.Cu", "B.Cu")]
+    gnd = _filled('(net "GND")', "B.Cu", (-5, -5, 25, 5))
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {gnd})")) == []

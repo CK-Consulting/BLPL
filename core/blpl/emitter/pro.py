@@ -22,9 +22,11 @@ def build(hdm: dict, *, project_filename: str) -> dict:
                 "name": name,
                 # A coplanar line's impedance is set by its gap to the ground
                 # pour beside it, and the pour keeps the class clearance from
-                # the trace. So that gap is the clearance, or the pour lands
-                # somewhere the fab sheet does not say.
-                "clearance": rules.get("coplanar_gap", rules.get("clearance", 0.2)),
+                # the trace. So a larger gap raises the clearance to it. A
+                # smaller one never lowers it: that would let every other net
+                # closer than the project allows (Codex, PR #31). That conflict
+                # is Stage 8's ZC-010 instead.
+                "clearance": max(rules.get("clearance", 0.2), rules.get("coplanar_gap", 0)),
                 "track_width": rules.get("trace_width", 0.25),
                 "via_diameter": rules.get("via_dia", 0.6),
                 "via_drill": rules.get("via_drill", 0.3),

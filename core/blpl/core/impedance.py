@@ -446,6 +446,16 @@ def review(hdm: dict) -> list[dict]:
                 f"Add `layers: [F.Cu]` (or the layers the fab's calculator gave this width "
                 f"for) to net_classes.{name}.impedance, and route these nets only there.",
                 nets_=members)
+        if (spec.mode == "coplanar" and "coplanar_gap" in rules and "clearance" in rules
+                and float(rules["coplanar_gap"]) < float(rules["clearance"]) - 1e-9):
+            finding(
+                "ZC-010", "error",
+                f"Class {name} wants its ground pour {rules['coplanar_gap']} mm from the "
+                f"trace but declares a clearance of {rules['clearance']} mm, so the pour "
+                "cannot come that close without breaking the project's own clearance.",
+                f"Lower net_classes.{name}.clearance to the coplanar_gap if the fab allows "
+                "it, or get a coplanar width for a gap of at least the clearance.",
+                nets_=members)
         if spec.mode == "coplanar" and "coplanar_gap" not in rules:
             finding(
                 "ZC-006", "error",
@@ -817,7 +827,7 @@ def _distance_to_path(pt: tuple, lay: str, net: str, lines: list, arcs: list):
     return best
 
 
-def _filled_ground(pcb: list, *, ground_only: bool = True) -> dict[str, list[list[tuple[float, float]]]]:
+def _filled_ground(pcb: list, *, ground_only: bool = True, by_net: bool = False) -> dict:
     """Filled copper per layer, in either net spelling: ground only, or (for a
     reference plane, which may be a power plane) any net. A zone never filled
     has no ``filled_polygon`` and contributes nothing; a rule area has no net."""
@@ -844,7 +854,8 @@ def _filled_ground(pcb: list, *, ground_only: bool = True) -> dict[str, list[lis
             poly = [(float(xy[1]), float(xy[2])) for xy in pts[1:]
                     if isinstance(xy, list) and xy and xy[0] == "xy"]
             if len(poly) >= 3:
-                filled.setdefault(sexpr.unquote(str(lay[1])), []).append(poly)
+                filled.setdefault(sexpr.unquote(str(lay[1])), []).append(
+                    (name, poly) if by_net else poly)
     return filled
 
 
@@ -966,7 +977,8 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     if not ctl:
         return []
     pads = _pads(pcb)
-    planes = _filled_ground(pcb, ground_only=False)
+    planes = _filled_ground(pcb, ground_only=False, by_net=True)
+    nets = hdm.get("nets") or {}
     try:
         copper = int(((hdm.get("project") or {}).get("stackup") or {}).get("layers") or 2)
     except (TypeError, ValueError):
@@ -986,7 +998,11 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
                 # stackup. Nothing to find is not the same as nothing missing.
                 out.add((cls, lay, "none"))
                 continue
+            # The trace's own net, or its pair partner, poured under it is not
+            # the plane its width was calculated over (Codex, PR #31).
+            own = {net, (nets.get(net) or {}).get("diff_pair_of")}
             for ref in refs:
-                if not any(point_in_polygon(pt, poly) for poly in planes.get(ref, [])):
+                if not any(point_in_polygon(pt, poly)
+                           for zone_net, poly in planes.get(ref, []) if zone_net not in own):
                     out.add((cls, lay, ref))
     return sorted(out)
