@@ -207,6 +207,9 @@ class Record:
     # a bundle writes several, a merged symbol writes into a shared file.
     library: str = ""
     placed: list[str] = field(default_factory=list)
+    # Every library these bytes were placed into. One row per hash, and the
+    # same vendor file uploaded to two libraries is placed in both.
+    libraries: list[str] = field(default_factory=list)
     # The symbol or footprint names it brought, so removing one by name can
     # say which upload it came from.
     names: list[str] = field(default_factory=list)
@@ -262,9 +265,41 @@ def record_for(project_dir: str | Path, sha256: str) -> dict | None:
     return None
 
 
+def _released_paths(row: dict) -> list[str]:
+    """Every path a row says it put in the project."""
+    out = [p for p in row.get("placed") or [] if isinstance(p, str)]
+    if row.get("state") == RELEASED and row.get("released_as"):
+        path = f"{row.get('released_to') or TRUSTED_DIRNAME}/{row['released_as']}"
+        if path not in out:
+            out.append(path)
+    return out
+
+
 def _upsert(project_dir: str | Path, rec: Record) -> None:
+    """Record ``rec``, the one row for its hash, without forgetting a placement.
+
+    Rows are keyed by content, so the same bytes accepted again replace the
+    earlier row. Replacing it outright dropped every path the earlier
+    acceptance had put in the project: a vendor symbol uploaded to library A
+    and then to library B left A's file on disk with no row claiming it, and
+    the agent then read A's copy as the project's own text rather than as
+    untrusted vendor content. Every path the earlier row released is carried
+    into the new one, as are the libraries it went into.
+    """
     ledger = quarantine_dir(project_dir) / LEDGER_NAME
-    rows = [r for r in _load(ledger) if r.get("sha256") != rec.sha256]
+    rows = _load(ledger)
+    for old in rows:
+        if old.get("sha256") != rec.sha256:
+            continue
+        mine = set(_released_paths(rec.to_dict()))
+        rec.placed = list(rec.placed) + [
+            p for p in _released_paths(old) if p not in mine and p not in rec.placed]
+        rec.names = list(rec.names) + [n for n in old.get("names") or [] if n not in rec.names]
+        libs = list(old.get("libraries") or ([old["library"]] if old.get("library") else []))
+        rec.libraries = libs
+    if rec.library and rec.library not in rec.libraries:
+        rec.libraries = [*rec.libraries, rec.library]
+    rows = [r for r in rows if r.get("sha256") != rec.sha256]
     rows.append(rec.to_dict())
     rows.sort(key=lambda r: (r.get("retrieved_at", ""), r.get("sha256", "")))
     _save(ledger, rows)
@@ -707,11 +742,15 @@ def _under(path: str, rel: str) -> bool:
     return path == rel or path.startswith(rel + "/")
 
 
+def _is_library_row(row: dict) -> bool:
+    return bool(row.get("library") or row.get("libraries"))
+
+
 def library_placements_under(project_dir: str | Path, rel: str) -> list[str]:
     """Paths placed by library uploads at ``rel`` or below it."""
     rel = _norm(rel)
     return sorted({
-        p for row in ledger(project_dir) if row.get("library")
+        p for row in ledger(project_dir) if _is_library_row(row)
         for p in row.get("placed") or [] if _under(p, rel)
     })
 
@@ -739,7 +778,7 @@ def _apply(project_dir: str | Path, change, new_events: list[dict]) -> list[str]
     rows = _load(path)
     touched = []
     for row in rows:
-        if row.get("library") and change(row):
+        if _is_library_row(row) and change(row):
             _sync_released(row)
             touched.append(row.get("sha256", ""))
     for e in new_events:
@@ -795,7 +834,8 @@ def remove_library_symbol(project_dir: str | Path, library: str, symbol: str, *,
     path = out["path"]
 
     def change(row: dict) -> bool:
-        if row.get("library") != library or symbol not in (row.get("names") or []):
+        if library not in (row.get("libraries") or [row.get("library")]) \
+                or symbol not in (row.get("names") or []):
             return False
         if path not in (row.get("placed") or []):
             return False
