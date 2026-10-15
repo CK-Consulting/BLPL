@@ -103,7 +103,10 @@ what the board "probably" carries.
    on both sides at its gap (neither emitter pours that ground; draw and fill
    it), or a differential pair
    whose halves are on different layers or side by side at a gap other than
-   the class's. Order with
+   the class's, or a controlled trace with no filled plane under it on its
+   reference layer (the neighbouring layer by default; set
+   `impedance.reference` when the width was calculated against another).
+   Breakouts are excused only within 2 mm of a pad of the net. Order with
    impedance control and a TDR test coupon; ±10 % is the usual tolerance,
    tighter costs more.
 
