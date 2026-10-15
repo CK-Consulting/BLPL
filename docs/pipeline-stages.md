@@ -281,7 +281,8 @@ The rest follows from that:
     reference layer. By default that is the layer next to an outer trace, or
     both neighbours of an inner one, by the board's own layer table;
     `impedance.reference` names it explicitly. Another signal's pour is not a
-    plane, and nor is the trace's own net;
+    plane, and nor is the trace's own net. The plane must reach three trace
+    widths past each edge; a strip under the trace is not a plane;
   - a board whose copper layer count differs from the HDM's stackup, or a
     board with no HDM beside it.
 
