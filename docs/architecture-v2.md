@@ -815,7 +815,21 @@ sealing in a container, storage with limits.**
     list's cover/finish/restore done beside the files (`llm_ignore.py` ships
     in the image), and links out of the project refused;
   - the ignore list, the ledger view, artifacts and board resolution;
-  - creating a member's worktree (`worktrees.py` ships in the image).
+  - creating a member's worktree (`worktrees.py` ships in the image);
+  - project libraries: library-kind uploads (the library checked against the
+    checkout's own, the mounted route's `placed` and bundle `members` in the
+    answer), symbol listing and removal, and the delete and move of a file a
+    library upload placed, with the ledger following it
+    (`record_library_removal`, `record_library_move`), footprints following a
+    moved 3D model, and the mounted route's rollbacks. `library_upload` writes
+    with ordinary paths, so the agent first refuses a `libraries/` tree with a
+    link anywhere in it;
+  - the PDF verdict routes ("Inspect now", the verdict view, and the held
+    ledger row `pdf_verdicts.lookup` imports). The agent reads the bytes; the
+    backend hashes and inspects the buffer it was sent, so a PDF still renders
+    inline only on this backend's own verdict for those exact bytes. A vendor
+    bundle's PDF entries are read out of the zip the backend already holds and
+    inspected there too.
 - Changing a project's remote is done by the agent too (`/git/set_remote`).
   The origin lock is a flock in the project's git directory, and gVisor keeps
   file locks inside the sandbox. A remote change made on the host could
@@ -1279,8 +1293,9 @@ listed below answer 503.
   - KiCad open;
   - project create, clone and import;
   - members removal (worktree removal).
-- **The PDF verdict table** (phase 0). Blob disposition still goes by path and
-  suffix.
+- **The blob route's size limit through the agent.** It reads a file whole,
+  at most twice the upload limit, so a larger file is a 413 rather than a
+  download. Streaming a read through the agent would lift it.
 
 **Phase 5: terminal and desktops.**
 

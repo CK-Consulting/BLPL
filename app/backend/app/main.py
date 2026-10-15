@@ -4090,7 +4090,7 @@ def get_blob(
 
     def verdict_for(digest: str):
         project = _project_or_404(session, user, project_id)
-        return pdf_verdicts.lookup(session, project.id, digest, proj)
+        return pdf_verdicts.lookup(session, project.id, digest, proj, ledger=_ledger_reader(proj))
 
     if workspace_files.enabled():
         return workspace_files.blob(proj, path, request, verdict_for)
@@ -4399,7 +4399,17 @@ class BlobPath(BaseModel):
     path: str
 
 
+def _ledger_reader(proj: Path):
+    """Where pdf_verdicts.lookup reads a held ledger row: through the agent with
+    workspaces on (the backend may have no mount), from the checkout without."""
+    if workspace_files.enabled():
+        return lambda digest: workspace_files.ledger_record(proj, digest)
+    return None
+
+
 def _verdict_view(proj: Path, session: Session, user: User, project_id: str, path: str) -> dict:
+    if workspace_files.enabled():
+        return _workspace_verdict_view(proj, session, user, project_id, path)
     target = _tree_target(proj, path)
     fh, size, head = _open_once(target)
     with fh:
@@ -4431,6 +4441,38 @@ def _verdict_view(proj: Path, session: Session, user: User, project_id: str, pat
     return {**out, **view}
 
 
+def _workspace_verdict_view(proj: Path, session: Session, user: User, project_id: str,
+                            path: str) -> dict:
+    """_verdict_view, with the bytes read by the workspace's agent.
+
+    The same answer, field for field. What is hashed is the buffer the agent
+    sent, so the verdict looked up is for those bytes; a file the agent
+    measured at one size and read at another promises nothing, as on the
+    mounted route.
+    """
+    rel = workspace_files.tree_rel(path)
+    head, size, data = workspace_files.pdf_bytes(proj, rel, UPLOAD_MAX_BYTES)
+    pdf = quarantine.looks_like_pdf(head)
+    too_large = size > UPLOAD_MAX_BYTES or (pdf and data is None)
+    changed = pdf and not too_large and len(data) != size
+    out = {
+        "path": path,
+        "pdf": pdf,
+        "quarantined": rel.split("/")[0] == quarantine.QUARANTINE_DIRNAME,
+        "too_large": too_large,
+        "changed": changed,
+        "sha256": _sha256(data) if pdf and not too_large and not changed else None,
+    }
+    if not pdf or too_large or changed:
+        return {**out, **pdf_verdicts.describe(None)}
+    project = _project_or_404(session, user, project_id)
+    view = pdf_verdicts.describe(pdf_verdicts.lookup(
+        session, project.id, out["sha256"], proj, ledger=_ledger_reader(proj)))
+    if out["quarantined"]:
+        view["inline"] = False
+    return {**out, **view}
+
+
 @app.get("/api/projects/{project_id}/blob/verdict")
 def get_blob_verdict(
     project_id: str,
@@ -4445,7 +4487,7 @@ def get_blob_verdict(
     open says so — and says what was found, or that nothing has looked — before
     anyone clicks.
     """
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     return _verdict_view(proj, session, user, project_id, path)
 
 
@@ -4464,17 +4506,26 @@ def inspect_blob(
     changes afterwards it has a new hash and no verdict, so what was inspected
     is the only thing the verdict can ever apply to. The file is not moved:
     only how the browser may receive it changes.
+
+    With workspaces on, the agent reads the file and this backend inspects the
+    buffer it sent: the verdict is still this backend's own, about exactly the
+    bytes it holds, and the workspace (which a hostile file might have
+    compromised) only carries them.
     """
-    proj = _project_dir(session, user, project_id)
-    target = _tree_target(proj, payload.path)
-    fh, size, head = _open_once(target)
-    with fh:
-        # The whole file, because pdf_inspect and the scanner take bytes. Only
-        # for a PDF within the cap, on request, and read once from the same
-        # descriptor; one byte past the cap catches a file that grew.
-        body = None
-        if quarantine.looks_like_pdf(head) and size <= UPLOAD_MAX_BYTES:
-            body = fh.read(UPLOAD_MAX_BYTES + 1)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+    if workspace_files.enabled():
+        head, size, body = workspace_files.pdf_bytes(
+            proj, workspace_files.tree_rel(payload.path), UPLOAD_MAX_BYTES)
+    else:
+        target = _tree_target(proj, payload.path)
+        fh, size, head = _open_once(target)
+        with fh:
+            # The whole file, because pdf_inspect and the scanner take bytes. Only
+            # for a PDF within the cap, on request, and read once from the same
+            # descriptor; one byte past the cap catches a file that grew.
+            body = None
+            if quarantine.looks_like_pdf(head) and size <= UPLOAD_MAX_BYTES:
+                body = fh.read(UPLOAD_MAX_BYTES + 1)
     if body is not None and len(body) > UPLOAD_MAX_BYTES:
         body = None
     if body is not None and len(body) != size:
@@ -4881,17 +4932,18 @@ async def upload_files(
                 status_code=400,
                 detail=f"each file needs a kind: one of {sorted(quarantine.UPLOAD_KINDS)}",
             )
-        if spec["kind"] in quarantine.LIBRARY_KINDS and workspace_files.enabled():
-            _refuse_library_work_in_workspace("Uploading KiCad library files")
         if spec["kind"] in quarantine.LIBRARY_KINDS:
             # Checked before any file is read, so a typo in the library name
-            # fails the request rather than half of it.
-            try:
-                spec["library"] = library_upload.check_library(
-                    str(spec.get("library") or project_id), proj, suggest=project_id
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc))
+            # fails the request rather than half of it. Against the project's
+            # own libraries, so with workspaces on the agent checks it there.
+            name = str(spec.get("library") or project_id)
+            if workspace_files.enabled():
+                spec["library"] = workspace_files.check_library(proj, name, project_id)
+            else:
+                try:
+                    spec["library"] = library_upload.check_library(name, proj, suggest=project_id)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
 
     who = user.email or f"user {user.id}"
     project_row = _project_or_404(session, user, project_id)
@@ -4930,6 +4982,12 @@ async def upload_files(
                     quarantine.assess(data, is_pdf=True),
                     source=pdf_verdicts.UPLOAD, user_id=user.id,
                 )
+            if res.get("members"):
+                # The same for each PDF inside a vendor bundle the workspace
+                # unpacked: the zip's bytes are here, so its entries are read
+                # out of them and inspected here, one by one, as the mounted
+                # route records each entry `accept` inspected.
+                _record_bundle_pdf_verdicts(session, project_row.id, data, user.id)
             results.append({"name": name, **res})
             continue
         def record_member(member: quarantine.Record) -> None:
@@ -5013,6 +5071,22 @@ async def upload_files(
     return {"results": results, **commit}
 
 
+def _record_bundle_pdf_verdicts(session: Session, project_id: int, data: bytes,
+                                user_id: int) -> None:
+    """This backend's own verdict for every PDF entry of a vendor bundle."""
+    try:
+        members, _ = library_upload.unpack_bundle(data)
+    except library_upload.Refused:
+        return  # the workspace held the bundle whole for the same reason
+    for member in members:
+        if quarantine.looks_like_pdf(member.data):
+            pdf_verdicts.record_assessment(
+                session, project_id, _sha256(member.data),
+                quarantine.assess(member.data, is_pdf=True),
+                source=pdf_verdicts.UPLOAD, user_id=user_id,
+            )
+
+
 @app.get("/api/projects/{project_id}/uploads/library-names")
 def upload_library_names(
     project_id: str,
@@ -5027,11 +5101,13 @@ def upload_library_names(
     they are called. The upload itself enforces the same rule; this only lets
     the dialog say so while the name is being typed.
     """
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+    existing = (workspace_files.library_names(proj) if workspace_files.enabled()
+                else library_upload.existing_project_libraries(proj))
     return {
         "reserved": sorted(library_upload.stock_library_names()),
         "reserved_prefix": library_upload.GENERATED_PREFIX,
-        "existing": sorted(library_upload.existing_project_libraries(proj)),
+        "existing": sorted(existing),
     }
 
 
@@ -5044,7 +5120,9 @@ def list_library_symbols(
     master_key: bytes = Depends(require_master_key),
 ) -> dict:
     """The symbols in one project library, for choosing one to remove."""
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+    if workspace_files.enabled():
+        return workspace_files.library_symbols(proj, library)
     try:
         return library_upload.library_symbols(proj, library)
     except ValueError as exc:  # Refused is a ValueError
@@ -5071,16 +5149,18 @@ def remove_library_symbol(
     so deleting the file to get rid of one would take them all.
     """
     project = _project_or_404(session, user, project_id)
-    if workspace_files.enabled():
-        _refuse_library_work_in_workspace("Removing a symbol from a project library")
-    proj = _project_dir(session, user, project_id)
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     _refuse_while_running(session, user, project, "change its libraries")
-    try:
-        out = quarantine.remove_library_symbol(
-            proj, library, body.symbol, by=user.email or f"user {user.id}"
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    by = user.email or f"user {user.id}"
+    if workspace_files.enabled():
+        # Removed by the agent, beside the library, the ledger following it
+        # there; a refusal comes back as the same 409.
+        out = workspace_files.remove_library_symbol(proj, library, body.symbol, by)
+    else:
+        try:
+            out = quarantine.remove_library_symbol(proj, library, body.symbol, by=by)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
     activity.record(session, project, user, activity.DELETED, f"{library}:{body.symbol}")
     commit = _commit_landed_write(
         session, user, project, proj, f"library: remove {library}:{body.symbol}", master_key
@@ -5276,31 +5356,6 @@ def _refuse_while_running(session: Session, user: User, project: Project, then: 
         )
 
 
-def _refuse_library_work_in_workspace(what: str) -> None:
-    """Library uploads, and the deletes, moves and symbol removals that keep
-    the quarantine ledger following them, are not yet done through the
-    workspace agent. Done the agent's way today they would skip the ledger,
-    the footprint relinking and the rollbacks, and an uploaded vendor file
-    would be read back as the project's own text. Refused until they are.
-    """
-    raise HTTPException(
-        status_code=409,
-        detail=f"{what} is not available while projects run in workspaces yet; "
-        "it will be once the workspace agent handles project libraries",
-    )
-
-
-def _workspace_library_placements(checkout: Path, rel: str) -> list[str]:
-    """Uploaded library files at ``rel`` or below, from the ledger the agent reads."""
-    entries = workspace_files.quarantine_view(checkout).get("entries") or []
-    rel = rel.strip("/")
-    return sorted({
-        p for row in entries if row.get("library") or row.get("libraries")
-        for p in row.get("placed") or []
-        if isinstance(p, str) and (p == rel or p.startswith(rel + "/"))
-    })
-
-
 @app.delete("/api/projects/{project_id}/files/{name:path}")
 def delete_path(
     project_id: str, name: str,
@@ -5318,13 +5373,14 @@ def delete_path(
         checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
         rel = workspace_files.managed_rel(name)
         _refuse_while_running(session, user, project, "delete it")
-        if _workspace_library_placements(checkout, rel):
-            _refuse_library_work_in_workspace("Deleting an uploaded library file")
-        done = workspace_files.delete(checkout, rel)
+        # The agent applies this route's ledger rules beside the files: a
+        # library upload's files may go, and the ledger records that they went.
+        done = workspace_files.delete(checkout, rel, user.email or f"user {user.id}")
         activity.record(session, project, user, activity.DELETED, rel)
         commit = _commit_landed_write(session, user, project, checkout, f"delete: {rel}", master_key)
         return {"ok": True, "path": rel, "kind": done["kind"], **commit,
-                "ignore_list_updated": done["ignore_list_updated"]}
+                "ignore_list_updated": done["ignore_list_updated"],
+                "ledger_updated": done.get("ledger_updated", True)}
     checkout, target, rel = _managed_path(session, user, project_id, name)
     _refuse_while_running(session, user, project, "delete it")
     if not target.exists() and not target.is_symlink():
@@ -5413,18 +5469,20 @@ def move_path(
         src_rel = workspace_files.managed_rel(body.path)
         dst_rel = workspace_files.managed_rel(body.to)
         _refuse_while_running(session, user, project, "move it")
-        if _workspace_library_placements(checkout, src_rel):
-            _refuse_library_work_in_workspace("Moving an uploaded library file")
         if llm_ignore.is_external(src_rel) and not llm_ignore.is_external(dst_rel):
             raise HTTPException(status_code=403, detail=(
                 f"{src_rel} came from outside the project, and files there are read as "
                 "untrusted wherever they sit under datasheets/ or references/. It cannot be "
                 "moved out of them."))
-        done = workspace_files.move(checkout, src_rel, dst_rel)
+        # The agent moves, relinks the footprints naming a moved model, and
+        # has the ledger follow a library upload's files, with this route's
+        # rollbacks when either cannot be done.
+        done = workspace_files.move(checkout, src_rel, dst_rel, user.email or f"user {user.id}")
         activity.record(session, project, user, activity.MOVED, f"{src_rel} → {dst_rel}")
         commit = _commit_landed_write(
             session, user, project, checkout, f"move: {src_rel} -> {dst_rel}", master_key)
         return {"ok": True, "from": src_rel, "to": dst_rel, **commit,
+                "relinked": done.get("relinked", []),
                 "ignore_list_updated": done["ignore_list_updated"]}
     checkout, src, src_rel = _managed_path(session, user, project_id, body.path)
     _, dst, dst_rel = _managed_path(session, user, project_id, body.to)

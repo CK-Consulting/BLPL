@@ -130,10 +130,15 @@ class AgentClient:
     def stat(self, checkout: str, path: str) -> dict:
         return self.call("/fs/stat", {"checkout": checkout, "path": path})
 
-    def read(self, checkout: str, path: str, *, max_bytes: int | None = None) -> bytes:
+    def read(self, checkout: str, path: str, *, max_bytes: int | None = None,
+             head: int | None = None) -> bytes:
+        """The file's bytes; 413 over ``max_bytes``. With ``head``, at most that
+        many from the start, whatever the file's size."""
         body: dict[str, Any] = {"checkout": checkout, "path": path}
         if max_bytes is not None:
             body["max_bytes"] = max_bytes
+        if head is not None:
+            body["head"] = head
         return self._check(self._http.post("/fs/read", content=json.dumps(body))).content
 
     def write(self, checkout: str, path: str, data: bytes, *, mkdirs: bool = False) -> dict:
@@ -222,11 +227,12 @@ class AgentClient:
         self._check(self._http.post(f"/runs/{rid}/cancel"))
 
     # phase 4: the rest of the file manager, and the project's own records
-    def managed_delete(self, checkout: str, path: str) -> dict:
-        return self.call("/managed/delete", {"checkout": checkout, "path": path})
+    def managed_delete(self, checkout: str, path: str, by: str = "") -> dict:
+        return self.call("/managed/delete", {"checkout": checkout, "path": path, "by": by})
 
-    def managed_move(self, checkout: str, src: str, dst: str) -> dict:
-        return self.call("/managed/move", {"checkout": checkout, "src": src, "dst": dst})
+    def managed_move(self, checkout: str, src: str, dst: str, by: str = "") -> dict:
+        return self.call("/managed/move", {"checkout": checkout, "src": src, "dst": dst,
+                                           "by": by})
 
     def ignore_entries(self, checkout: str) -> list[dict]:
         return self.call("/ignore/entries", {"checkout": checkout})["files"]
@@ -237,6 +243,24 @@ class AgentClient:
 
     def quarantine_view(self, checkout: str) -> dict:
         return self.call("/quarantine/view", {"checkout": checkout})
+
+    def quarantine_record(self, checkout: str, sha256: str) -> dict | None:
+        return self.call("/quarantine/record", {"checkout": checkout, "sha256": sha256})["entry"]
+
+    # project libraries
+    def library_check(self, checkout: str, name: str, suggest: str) -> str:
+        return self.call("/library/check", {"checkout": checkout, "name": name,
+                                            "suggest": suggest})["library"]
+
+    def library_names(self, checkout: str) -> list[str]:
+        return self.call("/library/names", {"checkout": checkout})["existing"]
+
+    def library_symbols(self, checkout: str, library: str) -> dict:
+        return self.call("/library/symbols", {"checkout": checkout, "library": library})
+
+    def library_remove_symbol(self, checkout: str, library: str, symbol: str, by: str) -> dict:
+        return self.call("/library/remove_symbol", {"checkout": checkout, "library": library,
+                                                    "symbol": symbol, "by": by})
 
     def project_boards(self, checkout: str) -> dict:
         return self.call("/project/boards", {"checkout": checkout})
