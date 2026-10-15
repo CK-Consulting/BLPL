@@ -189,7 +189,8 @@ in the nearest reference plane.
 
 - A continuous reference plane directly under (or above and below) every
   controlled trace. Never route across a split, slot, or plane void; route
-  around it.
+  around it. The release wants the plane at least three trace widths past
+  each edge; a strip under the trace is not a plane.
 - Changing layers: put a ground stitching via right beside the signal via so
   the return current can change planes too. If the new layer references a
   different net (GND → power), place a stitching capacitor (10–100 nF) between

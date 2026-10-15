@@ -1057,6 +1057,13 @@ def copper_order(copper: int) -> list[str]:
     return ["F.Cu"] + [f"In{i}.Cu" for i in range(1, copper - 1)] + ["B.Cu"]
 
 
+# How far a reference plane must reach past each edge of a controlled trace,
+# in trace widths. The width was calculated over an unbounded plane, and the
+# field reaches out several widths before it stops seeing the plane's edge.
+# A floor on "wide", not the 3W rule, which is about trace spacing.
+_PLANE_MARGIN_W = 3.0
+
+
 def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     """(class, routed layer, reference layer) where a controlled trace has no
     filled plane under it.
@@ -1068,6 +1075,11 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     over filled copper — of any net; a power plane is a reference too — on each
     of its reference layers: the class's ``reference``, or the layers next to
     the routed one (one for an outer layer, both for an inner one).
+
+    Over means across, not merely under the centreline: a strip of ground the
+    width of the trace is not the plane the width was calculated against
+    (Codex, PR #31). The plane must reach ``_PLANE_MARGIN_W`` trace widths past
+    each edge; probes across that span must all be copper.
     """
     from .board_geometry import point_in_polygon
 
@@ -1094,9 +1106,13 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     order = board_copper(pcb) or copper_order(_hdm_copper(hdm))
     out = set()
     for net, (cls, _rules, spec) in ctl.items():
-        for lay, pt, _nrm, _w, _step, from_end in _samples(net, lines, arcs, pads.get(net)):
+        for lay, pt, nrm, w, _step, from_end in _samples(net, lines, arcs, pads.get(net)):
             if from_end <= _END_ALLOWANCE_MM:
                 continue
+            offs = [0.0] + [sign * (w / 2 + k * w)
+                            for sign in (1.0, -1.0)
+                            for k in (0.0, _PLANE_MARGIN_W / 2, _PLANE_MARGIN_W)]
+            span = [(pt[0] + nrm[0] * o, pt[1] + nrm[1] * o) for o in offs]
             refs = list(spec.reference)
             if not refs and lay in order:
                 i = order.index(lay)
@@ -1110,9 +1126,9 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
             # the plane its width was calculated over (Codex, PR #31).
             own = {net, (nets.get(net) or {}).get("diff_pair_of")}
             for ref in refs:
-                if not any(point_in_polygon(pt, poly)
-                           for zone_net, poly in planes.get(ref, [])
-                           if zone_net not in own and is_return(zone_net)):
+                polys = [poly for zone_net, poly in planes.get(ref, [])
+                         if zone_net not in own and is_return(zone_net)]
+                if not all(any(point_in_polygon(sp, poly) for poly in polys) for sp in span):
                     out.add((cls, lay, ref))
     return sorted(out)
 

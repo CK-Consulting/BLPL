@@ -431,7 +431,14 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
                         f"no hdm.yaml for {pcb.name}: cannot tell which traces are "
                         "impedance-controlled; run stage5 for this board")
         return Step("impedance", True, "no board and no hdm.yaml; nothing to say about impedance")
-    hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {}
+    # A hand-edited HDM that does not parse is a refused step, not a crashed
+    # build: the package and its refusal notice are still owed (Codex, PR #31).
+    try:
+        hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        return Step("impedance", False, f"could not read {hdm_path.name}: {exc}")
+    if not isinstance(hdm, dict):
+        return Step("impedance", False, f"{hdm_path.name} is not a mapping")
     # Review first. A tag that matched nothing leaves no controlled net and so
     # no table, and returning "nothing to control" before asking would let the
     # requirement it was meant to carry vanish from a quotable package.
