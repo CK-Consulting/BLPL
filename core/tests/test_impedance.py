@@ -635,7 +635,7 @@ def test_a_pair_bend_routed_as_arcs_is_measured():
     wide = sexpr.parse("(kicad_pcb " + arc("USB_DP", 5) + arc("USB_DM", 6) + ")")
     assert any("apart on F.Cu" in p for p in z.pair_problems(_PAIR_HDM, wide))
     alone = sexpr.parse("(kicad_pcb " + arc("USB_DP", 5) + arc("USB_DM", 5.33).replace("F.Cu", "B.Cu") + ")")
-    assert any("no USB_DM bend beside it" in p for p in z.pair_problems(_PAIR_HDM, alone))
+    assert any("with no USB_DM beside it" in p for p in z.pair_problems(_PAIR_HDM, alone))
 
 
 def test_a_tag_that_matches_nothing_is_an_error_that_blocks_release(tmp_path):
@@ -645,3 +645,54 @@ def test_a_tag_that_matches_nothing_is_an_error_that_blocks_release(tmp_path):
     assert hdm["synthesis"]["controlled_impedance"]["unmatched"] == ["controlled_impedance[0] ('^ANNT_')"]
     (f,) = z.review(hdm)
     assert (f["rule_id"], f["severity"]) == ("ZC-008", "error")
+
+
+
+# --- coupled all the way along, arcs included (Codex, PR #31) -------------------------
+
+
+def test_a_long_half_beside_only_a_scrap_of_its_partner_is_uncoupled():
+    board = _pair_board(_seg("USB_DP", 0, 0, 100, 0), _seg("USB_DM", 99.5, 0.33, 100, 0.33))
+    problems = z.pair_problems(_PAIR_HDM, board)
+    assert any(p.startswith("USB_DP runs") and "with no USB_DM beside it" in p for p in problems)
+
+
+def test_arcs_on_one_circle_in_different_quadrants_are_not_a_pair():
+    from blpl.emitter import sexpr
+
+    q1 = '(arc (start 5 0) (mid 3.535534 3.535534) (end 0 5) (width 0.18) (layer "F.Cu") (net "USB_DP"))'
+    # Radius 5.33, the right gap, but the opposite quadrant.
+    q3 = ('(arc (start -5.33 0) (mid -3.768879 -3.768879) (end 0 -5.33) (width 0.18) '
+          '(layer "F.Cu") (net "USB_DM"))')
+    problems = z.pair_problems(_PAIR_HDM, sexpr.parse(f"(kicad_pcb {q1} {q3})"))
+    assert any("with no USB_DM beside it" in p for p in problems)
+
+
+def test_a_curved_coplanar_feed_needs_ground_too():
+    import math
+
+    from blpl.emitter import sexpr
+
+    hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "coplanar_gap": 0.15,
+                                   "impedance": {"ohms": 50, "mode": "coplanar"}}},
+           "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
+    m = 10 / math.sqrt(2)
+    feed = (f'(arc (start 10 0) (mid {m:.6f} {m:.6f}) (end 0 10) (width 0.3) '
+            f'(layer "F.Cu") (net "ANT"))')
+    assert z.coplanar_without_ground(hdm, sexpr.parse(f"(kicad_pcb {feed})")) == [("CPW", "F.Cu")]
+
+    def disc(r, n=180):
+        return " ".join(f"(xy {r * math.cos(2 * math.pi * i / n):.4f} {r * math.sin(2 * math.pi * i / n):.4f})"
+                        for i in range(n))
+    # Ground inside the bend (a disc to r=9.7) and outside it (a band from
+    # r=10.3): the samples just past the gap sit at r~9.65 and r~10.35.
+    inner = f'(filled_polygon (layer "F.Cu") (pts {disc(9.7)}))'
+    outer_band = []
+    for i in range(36):
+        a0, a1 = 2 * math.pi * i / 36, 2 * math.pi * (i + 1) / 36
+        pts = [(10.3 * math.cos(a0), 10.3 * math.sin(a0)), (14 * math.cos(a0), 14 * math.sin(a0)),
+               (14 * math.cos(a1), 14 * math.sin(a1)), (10.3 * math.cos(a1), 10.3 * math.sin(a1))]
+        outer_band.append('(filled_polygon (layer "F.Cu") (pts '
+                          + " ".join(f"(xy {x:.4f} {y:.4f})" for x, y in pts) + "))")
+    zone = '(zone (net "GND") (layers "F.Cu") ' + inner + " " + " ".join(outer_band) + ")"
+    assert z.coplanar_without_ground(hdm, sexpr.parse(f"(kicad_pcb {feed} {zone})")) == []

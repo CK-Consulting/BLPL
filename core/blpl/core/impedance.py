@@ -623,94 +623,172 @@ def width_violations(hdm: dict, pcb: list) -> list[tuple[str, float, float, str]
     return sorted(out)
 
 
-def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
-    """(class, layer) for every coplanar class whose routed trace does not have
-    filled ground copper beside it at the declared gap.
+# --- routed geometry, sampled along the path --------------------------------------
+#
+# Checks that compare one segment with another keep missing cases: a long half
+# beside a scrap of its partner, two arcs on the same circle in different
+# quadrants, a curved coplanar feed. So the routed path of each controlled net
+# is walked in short steps, along segments and arcs alike, and every step is
+# asked the question directly: is the partner beside me at the gap? is ground
+# beside me on both sides? A net may be uncoupled for a short way at each end,
+# where it breaks out to its pads; anywhere else it may not.
 
-    A coplanar line is coplanar because ground copper runs beside it at the
-    declared gap. Neither emitter pours that copper and a class clearance cannot
-    create it; a ground zone somewhere else on the layer, or one never filled,
-    is not beside the trace either (Codex, PR #31). So for every straight
-    stretch of a coplanar net longer than ``_COUPLED_MIN_MM``, a point just
-    past the gap on each side of its middle must lie in a *filled* ground
-    polygon on that layer. A board with no fill data cannot show that, and
-    fails.
-    """
+#: Distance between samples along a routed path.
+_STEP_MM = 0.25
+#: How much of each end of a net may break out to its pads unmeasured.
+_END_ALLOWANCE_MM = 2.0
+#: Beyond this, the partner is not beside the trace at all.
+_COUPLED_SEARCH_MM = 5.0
+#: Board-file rounding, not a design difference.
+_GAP_SLACK_MM = 0.01
+
+
+def _samples(net: str, lines: list, arcs: list) -> list[tuple[str, tuple, tuple, float, float]]:
+    """(layer, point, unit normal, width, length it stands for) along a net's path."""
     import math
 
+    from .board_geometry import BoardGeometryError, _arc_center, _sweep
+
+    out = []
+    for n, lay, w, p1, p2 in lines:
+        if n != net:
+            continue
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        length = math.hypot(dx, dy)
+        if length == 0:
+            continue
+        k = max(1, math.ceil(length / _STEP_MM))
+        normal = (-dy / length, dx / length)
+        for i in range(k):
+            t = (i + 0.5) / k
+            out.append((lay, (p1[0] + dx * t, p1[1] + dy * t), normal, w or 0.0, length / k))
+    for n, lay, w, a, m, b in arcs:
+        if n != net:
+            continue
+        try:
+            c, r = _arc_center(a, m, b)
+            t0, sweep = _sweep(a, m, b, c)
+        except (BoardGeometryError, ValueError):
+            continue
+        length = r * abs(sweep)
+        k = max(1, math.ceil(length / _STEP_MM))
+        for i in range(k):
+            ang = t0 + sweep * (i + 0.5) / k
+            ux, uy = math.cos(ang), math.sin(ang)
+            out.append((lay, (c[0] + r * ux, c[1] + r * uy), (ux, uy), w or 0.0, length / k))
+    return out
+
+
+def _distance_to_path(pt: tuple, lay: str, net: str, lines: list, arcs: list):
+    """Nearest (distance, width) from a point to a net's copper centreline on a layer."""
+    import math
+
+    from .board_geometry import BoardGeometryError, _arc_center, _on_arc
+
+    best = None
+    for n, l, w, p1, p2 in lines:
+        if n != net or l != lay:
+            continue
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        ll = dx * dx + dy * dy
+        t = 0.0 if ll == 0 else max(0.0, min(1.0, ((pt[0] - p1[0]) * dx + (pt[1] - p1[1]) * dy) / ll))
+        d = math.hypot(pt[0] - (p1[0] + t * dx), pt[1] - (p1[1] + t * dy))
+        if best is None or d < best[0]:
+            best = (d, w or 0.0)
+    for n, l, w, a, m, b in arcs:
+        if n != net or l != lay:
+            continue
+        try:
+            c, r = _arc_center(a, m, b)
+        except (BoardGeometryError, ValueError):
+            continue
+        rad = math.dist(pt, c)
+        # The nearest point of the arc: on it radially if the point's angle is
+        # within the sweep, else whichever end is nearer.
+        on = rad > 0 and _on_arc((c[0] + (pt[0] - c[0]) * r / rad, c[1] + (pt[1] - c[1]) * r / rad),
+                                 a, m, b, c)
+        d = abs(rad - r) if on else min(math.dist(pt, a), math.dist(pt, b))
+        if best is None or d < best[0]:
+            best = (d, w or 0.0)
+    return best
+
+
+def _filled_ground(pcb: list) -> dict[str, list[list[tuple[float, float]]]]:
+    """Filled ground copper per layer, in either net spelling. A zone never filled
+    has no ``filled_polygon`` and contributes nothing."""
     from blpl.emitter import sexpr
 
-    from .board_geometry import point_in_polygon
-
-    _, _, lines, _ = _routed(pcb)
-    ctl = _controlled(hdm)
-    coplanar = {n: (cls, rules) for n, (cls, rules, spec) in ctl.items() if spec.mode == "coplanar"}
-    if not coplanar:
-        return []
     ordinals = {str(n[1]): sexpr.unquote(str(n[2])) for n in sexpr.find_all(pcb, "net")
                 if len(n) >= 3}
     filled: dict[str, list[list[tuple[float, float]]]] = {}
     for zone in sexpr.find_all(pcb, "zone"):
-        named = sexpr.find(zone, "net_name")
-        net = sexpr.find(zone, "net")
-        name = (sexpr.unquote(str(named[1])) if named is not None and len(named) > 1 else
-                (sexpr.unquote(str(net[1])) if net is not None and len(net) > 1
-                 and str(net[1]).startswith('"') else
-                 ordinals.get(str(net[1]), "") if net is not None and len(net) > 1 else ""))
+        named, net = sexpr.find(zone, "net_name"), sexpr.find(zone, "net")
+        if named is not None and len(named) > 1:
+            name = sexpr.unquote(str(named[1]))
+        elif net is not None and len(net) > 1:
+            tok = str(net[1])
+            name = sexpr.unquote(tok) if tok.startswith('"') else ordinals.get(tok, "")
+        else:
+            name = ""
         if not name or not _GROUND.search(name):
             continue
         for fp in sexpr.find_all(zone, "filled_polygon"):
-            lay = sexpr.find(fp, "layer")
-            pts = sexpr.find(fp, "pts")
+            lay, pts = sexpr.find(fp, "layer"), sexpr.find(fp, "pts")
             if lay is None or pts is None:
                 continue
             poly = [(float(xy[1]), float(xy[2])) for xy in pts[1:]
                     if isinstance(xy, list) and xy and xy[0] == "xy"]
             if len(poly) >= 3:
                 filled.setdefault(sexpr.unquote(str(lay[1])), []).append(poly)
+    return filled
+
+
+def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
+    """(class, layer) where a coplanar trace lacks filled ground on both sides at its gap.
+
+    A coplanar line is coplanar because ground copper runs beside it at the
+    declared gap. Neither emitter pours it and a class clearance cannot create
+    it; ground elsewhere on the layer, ground never filled, and ground beside
+    only the straight parts of a curved feed are none of them beside the trace
+    (Codex, PR #31). Every sample along the trace, segments and arcs alike,
+    needs filled ground just past the gap on both sides; up to
+    ``_END_ALLOWANCE_MM`` at each end may lack it, where the trace meets its pad.
+    """
+    from .board_geometry import point_in_polygon
+
+    _, _, lines, arcs = _routed(pcb)
+    ctl = _controlled(hdm)
+    filled = _filled_ground(pcb)
     out = set()
-    reach = 0.05            # just past the gap: inside the pour if it is there
-    for n, lay, w, p1, p2 in lines:
-        if n not in coplanar:
+    for net, (cls, rules, spec) in ctl.items():
+        if spec.mode != "coplanar":
             continue
-        cls, rules = coplanar[n]
-        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-        length = math.hypot(dx, dy)
-        if length <= _COUPLED_MIN_MM:
-            continue
-        nx, ny = -dy / length, dx / length
-        off = (w or 0) / 2 + float(rules.get("coplanar_gap", 0)) + reach
-        mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
-        sides = [(mx + nx * off, my + ny * off), (mx - nx * off, my - ny * off)]
-        polys = filled.get(lay, [])
-        if not all(any(point_in_polygon(pt, poly) for poly in polys) for pt in sides):
-            out.add((cls, lay))
+        gap = float(rules.get("coplanar_gap", 0))
+        bare: dict[str, float] = {}
+        for lay, pt, nrm, w, step in _samples(net, lines, arcs):
+            off = w / 2 + gap + 0.05
+            sides = [(pt[0] + nrm[0] * off, pt[1] + nrm[1] * off),
+                     (pt[0] - nrm[0] * off, pt[1] - nrm[1] * off)]
+            polys = filled.get(lay, [])
+            if not all(any(point_in_polygon(sp, poly) for poly in polys) for sp in sides):
+                bare[lay] = bare.get(lay, 0.0) + step
+        for lay, length in bare.items():
+            if length > 2 * _END_ALLOWANCE_MM:
+                out.add((cls, lay))
     return sorted(out)
-
-
-#: Pair geometry is checked on stretches longer than this. Shorter segments are
-#: breakouts at pads, where a pair legitimately splits to reach its pins.
-_COUPLED_MIN_MM = 1.0
-#: Beyond this, the partner is not beside the segment at all.
-_COUPLED_SEARCH_MM = 5.0
-#: Board-file rounding, not a design difference.
-_GAP_SLACK_MM = 0.01
 
 
 def pair_problems(hdm: dict, pcb: list) -> list[str]:
     """Where a routed differential pair is not coupled at its declared geometry.
 
     Each half can be the right width on an allowed layer and the pair still not
-    be the impedance on the fab sheet: the halves on different layers, or side
-    by side at a gap other than ``diff_pair_gap`` (Codex, PR #31). Checked per
-    pair: every layer one half is routed on carries the other half too, and
-    every straight stretch of one half longer than ``_COUPLED_MIN_MM`` has a
-    parallel, overlapping stretch of its partner on the same layer at the
-    declared gap. Arcs are not measured.
+    be the impedance on the fab sheet. Checked per pair: every layer one half
+    is routed on carries the other half too; and walking each half, segments
+    and arcs alike, its partner must be beside it on the same layer at the
+    declared edge-to-edge gap — all the way along, not merely somewhere
+    (Codex, PR #31). Up to ``_END_ALLOWANCE_MM`` at each end may break out.
     """
-    import math
-
-    from .board_geometry import _arc_center, _sweep
+    from statistics import median
 
     segments, _, lines, arcs = _routed(pcb)
     ctl = _controlled(hdm)
@@ -731,61 +809,25 @@ def pair_problems(hdm: dict, pcb: list) -> list[str]:
             continue
         gap = float(rules["diff_pair_gap"])
         for me, other in ((a, b), (b, a)):
-            theirs = [ln for ln in lines if ln[0] == other]
-            for _n, lay, w, p1, p2 in (ln for ln in lines if ln[0] == me):
-                dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-                length = math.hypot(dx, dy)
-                if length <= _COUPLED_MIN_MM:
+            apart: dict[str, float] = {}
+            wrong: dict[str, list[tuple[float, float]]] = {}
+            for lay, pt, _nrm, w, step in _samples(me, lines, arcs):
+                near = _distance_to_path(pt, lay, other, lines, arcs)
+                edge = None if near is None else near[0] - (w + near[1]) / 2
+                if edge is None or edge > _COUPLED_SEARCH_MM:
+                    apart[lay] = apart.get(lay, 0.0) + step
+                elif abs(edge - gap) > _GAP_SLACK_MM:
+                    wrong.setdefault(lay, []).append((edge, step))
+            allowance = 2 * _END_ALLOWANCE_MM
+            for lay in sorted(set(apart) | set(wrong)):
+                lone = apart.get(lay, 0.0)
+                off = sum(st for _, st in wrong.get(lay, []))
+                if lone + off <= allowance:
                     continue
-                ux, uy = dx / length, dy / length
-                best = None
-                for _o, olay, ow, q1, q2 in theirs:
-                    if olay != lay:
-                        continue
-                    ex, ey = q2[0] - q1[0], q2[1] - q1[1]
-                    olen = math.hypot(ex, ey)
-                    if olen == 0 or abs(ux * ey - uy * ex) / olen > 0.035:   # ~2 deg
-                        continue
-                    t1 = (q1[0] - p1[0]) * ux + (q1[1] - p1[1]) * uy
-                    t2 = (q2[0] - p1[0]) * ux + (q2[1] - p1[1]) * uy
-                    if min(max(t1, t2), length) - max(min(t1, t2), 0.0) <= 0:
-                        continue                       # side by side nowhere
-                    centre = abs((q1[0] - p1[0]) * uy - (q1[1] - p1[1]) * ux)
-                    edge = centre - ((w or 0) + (ow or 0)) / 2
-                    if best is None or edge < best:
-                        best = edge
-                if best is None or best > _COUPLED_SEARCH_MM:
-                    out.append(f"{me} runs {length:.1f} mm on {lay} with no {other} beside it")
-                elif abs(best - gap) > _GAP_SLACK_MM:
-                    out.append(f"{me} and {other} are {best:.3f} mm apart on {lay}, not {gap:g}")
-            # A bend routed as arcs: the partner's matching bend is concentric,
-            # and the gap is the difference of the radii less the half-widths.
-            # A pair drawn in arcs at an arbitrary separation used to pass
-            # unmeasured (Codex, PR #31).
-            their_arcs = [ar for ar in arcs if ar[0] == other]
-            for _n, lay, w, a1, am, a2 in (ar for ar in arcs if ar[0] == me):
-                try:
-                    centre, r = _arc_center(a1, am, a2)
-                    length = r * abs(_sweep(a1, am, a2, centre)[1])
-                except ValueError:
-                    continue
-                if length <= _COUPLED_MIN_MM:
-                    continue
-                best = None
-                for _o, olay, ow, b1, bm, b2 in their_arcs:
-                    if olay != lay:
-                        continue
-                    try:
-                        oc, orr = _arc_center(b1, bm, b2)
-                    except ValueError:
-                        continue
-                    if math.dist(centre, oc) > _GAP_SLACK_MM:
-                        continue
-                    edge = abs(r - orr) - ((w or 0) + (ow or 0)) / 2
-                    if best is None or edge < best:
-                        best = edge
-                if best is None:
-                    out.append(f"{me} bends {length:.1f} mm on {lay} with no {other} bend beside it")
-                elif abs(best - gap) > _GAP_SLACK_MM:
-                    out.append(f"{me} and {other} are {best:.3f} mm apart on {lay}, not {gap:g}")
+                if off > lone:
+                    seen = median(e for e, _ in wrong[lay])
+                    out.append(f"{me} and {other} are {seen:.3f} mm apart on {lay}, not {gap:g} "
+                               f"(for {off:.1f} mm)")
+                else:
+                    out.append(f"{me} runs {lone:.1f} mm on {lay} with no {other} beside it")
     return sorted(set(out))
