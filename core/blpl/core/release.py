@@ -422,7 +422,15 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
     candidates = ([pipeline / f"hdm.{pcb.stem}.yaml"] if pcb is not None else []) + [pipeline / "hdm.yaml"]
     hdm_path = next((c for c in candidates if c.is_file()), None)
     if hdm_path is None:
-        return Step("impedance", True, "no hdm.yaml; nothing to say about impedance")
+        if pcb is not None and pcb.is_file():
+            # A board with no HDM beside it cannot say which of its traces are
+            # controlled, and "nothing found" is not "nothing to control": a
+            # package released that way would drop every impedance requirement
+            # the board was designed with (Codex, PR #31).
+            return Step("impedance", False,
+                        f"no hdm.yaml for {pcb.name}: cannot tell which traces are "
+                        "impedance-controlled; run stage5 for this board")
+        return Step("impedance", True, "no board and no hdm.yaml; nothing to say about impedance")
     hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {}
     # Review first. A tag that matched nothing leaves no controlled net and so
     # no table, and returning "nothing to control" before asking would let the
@@ -456,8 +464,9 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
                    for cls, lay in impedance.coplanar_without_ground(hdm, board)]
                 + impedance.pair_problems(hdm, board)
                 + [(f"{cls} on {lay} has no reference layer at all" if ref == "none"
-                    else f"{cls} on {lay} has no plane on {ref} under it")
+                    else f"{cls} on {lay} has no ground or power plane on {ref} under it")
                    for cls, lay, ref in impedance.missing_reference(hdm, board)]
+                + impedance.stackup_mismatch(hdm, board)
             )
         except Exception as exc:  # an unreadable board cannot be vouched for
             return Step("impedance", False, f"could not read {pcb.name} to check controlled routing: {exc}",

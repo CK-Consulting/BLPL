@@ -1021,11 +1021,20 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     pads = _pads(pcb)
     planes = _filled_ground(pcb, ground_only=False, by_net=True)
     nets = hdm.get("nets") or {}
-    try:
-        copper = int(((hdm.get("project") or {}).get("stackup") or {}).get("layers") or 2)
-    except (TypeError, ValueError):
-        copper = 2
-    order = copper_order(copper)
+
+    def is_return(zone_net: str) -> bool:
+        """Ground or power: the nets a return current can flow on. Another
+        signal's pour under the trace is not a plane anyone calculated
+        against (Codex, PR #31)."""
+        if _GROUND.search(zone_net):
+            return True
+        if (nets.get(zone_net) or {}).get("class") == "Power_Bulk":
+            return True
+        from .stage4_synthesize_nets import _assign_class
+        return _assign_class(zone_net) == "Power_Bulk"
+
+    # The board's own layer table decides adjacency: it is what is fabricated.
+    order = board_copper(pcb) or copper_order(_hdm_copper(hdm))
     out = set()
     for net, (cls, _rules, spec) in ctl.items():
         for lay, pt, _nrm, _w, _step, from_end in _samples(net, lines, arcs, pads.get(net)):
@@ -1045,6 +1054,48 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
             own = {net, (nets.get(net) or {}).get("diff_pair_of")}
             for ref in refs:
                 if not any(point_in_polygon(pt, poly)
-                           for zone_net, poly in planes.get(ref, []) if zone_net not in own):
+                           for zone_net, poly in planes.get(ref, [])
+                           if zone_net not in own and is_return(zone_net)):
                     out.add((cls, lay, ref))
     return sorted(out)
+
+
+def _hdm_copper(hdm: dict) -> int:
+    try:
+        return int(((hdm.get("project") or {}).get("stackup") or {}).get("layers") or 2)
+    except (TypeError, ValueError):
+        return 2
+
+
+def board_copper(pcb: list) -> list[str]:
+    """The copper layers the board's own layer table declares, top to bottom.
+
+    KiCad's table lists layers by id, not physically, so the order is rebuilt:
+    F.Cu, the inner layers by number, B.Cu. Empty when the board has no table.
+    """
+    from blpl.emitter import sexpr
+
+    table = sexpr.find(pcb, "layers")
+    names = set()
+    for row in (table or [])[1:]:
+        if isinstance(row, list) and len(row) >= 2:
+            name = sexpr.unquote(str(row[1]))
+            if _COPPER.match(name):
+                names.add(name)
+    if not names:
+        return []
+    inner = sorted((n for n in names if n.startswith("In")), key=lambda n: int(n[2:-3]))
+    return ([n for n in ("F.Cu",) if n in names] + inner + [n for n in ("B.Cu",) if n in names])
+
+
+def stackup_mismatch(hdm: dict, pcb: list) -> list[str]:
+    """A board whose copper layer count is not the HDM's: the impedances were
+    designed, and are checked, for a stackup that is not the one fabricated."""
+    board = board_copper(pcb)
+    if not board or not _controlled(hdm):
+        return []
+    declared = _hdm_copper(hdm)
+    if len(board) != declared:
+        return [f"the board has {len(board)} copper layers but the HDM's stackup says {declared}; "
+                "re-run stage5 against the board's real stackup"]
+    return []

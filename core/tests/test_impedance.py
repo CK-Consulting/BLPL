@@ -886,3 +886,50 @@ def test_common_ground_spellings_are_ground(name):
 @pytest.mark.parametrize("name", ["VCC_3V3", "ANT", "SIGNAL", "BGNDX"])
 def test_other_nets_are_not_ground(name):
     assert not z._GROUND.search(name)
+
+
+# --- missing HDM, return-path nets, the board's own stackup (Codex, PR #31) ----------
+
+
+def test_a_board_released_without_its_hdm_is_not_quotable(tmp_path, monkeypatch):
+    proj = tmp_path / "dev"
+    (proj / ".pipeline").mkdir(parents=True)
+    (proj / "dev.kicad_pcb").write_text("(kicad_pcb)\n")
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    monkeypatch.setattr(release, "run_gate", lambda *_a, **_k: {"ok": True})
+    manifest = release.build(proj, now="2026-10-15_130000Z")
+    assert not manifest["quotable"]
+    (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
+    assert "no hdm.yaml" in step["detail"]
+
+
+def test_another_signals_pour_is_not_a_reference_plane():
+    from blpl.emitter import sexpr
+
+    hdm = {"project": {"stackup": {"layers": 2}},
+           "net_classes": {"RF": {"trace_width": 2.9, "impedance": 50}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}, "SW_NODE": {"class": "Default"}}}
+    seg = '(segment (start 0 0) (end 20 0) (width 2.9) (layer "F.Cu") (net "ANT"))'
+    switching = _filled('(net "SW_NODE")', "B.Cu", (-5, -5, 25, 5))
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {switching})")) == [("RF", "F.Cu", "B.Cu")]
+    # A rail the HDM classes as power is a reference, whatever its name.
+    hdm["nets"]["RAIL_A"] = {"class": "Power_Bulk"}
+    rail = _filled('(net "RAIL_A")', "B.Cu", (-5, -5, 25, 5))
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {rail})")) == []
+
+
+def test_adjacency_comes_from_the_boards_own_layer_table():
+    """A four-layer board with a stale two-layer HDM: F.Cu's plane is In1.Cu,
+    not B.Cu, and the mismatch itself is reported."""
+    from blpl.emitter import sexpr
+
+    hdm = {"project": {"stackup": {"layers": 2}},
+           "net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}}
+    table = '(layers (0 "F.Cu" signal) (2 "B.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal))'
+    seg = '(segment (start 0 0) (end 20 0) (width 0.35) (layer "F.Cu") (net "ANT"))'
+    under_b = _filled('(net "GND")', "B.Cu", (-5, -5, 25, 5))
+    board = sexpr.parse(f"(kicad_pcb {table} {seg} {under_b})")
+    assert z.board_copper(board) == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+    assert z.missing_reference(hdm, board) == [("RF", "F.Cu", "In1.Cu")]
+    assert z.stackup_mismatch(hdm, board) and "4 copper layers" in z.stackup_mismatch(hdm, board)[0]
