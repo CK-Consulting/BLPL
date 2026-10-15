@@ -381,3 +381,36 @@ def test_stage8_finds_a_part_off_a_shaped_board():
 
 def test_stage8_is_quiet_on_a_clean_board():
     assert s8._board_geometry_check(_reviewed_hdm([20, 20, 22, 22], hinted=False)) == ([], [])
+
+
+def test_a_shape_anchored_to_a_bottom_side_part_is_refused_not_misdrawn(tmp_path):
+    """KiCad mirrors a flipped footprint's frame, but the emitter does not flip
+    footprints yet. Mirroring the shape alone would put an antenna keepout on
+    the far end of an unmirrored module; refusing says so instead."""
+    cfg = _config(keepouts=[{"anchor": "R0", "shape": "rect", "center": [3, 0],
+                             "size": [2, 2]}])
+    cfg["test_points"] = {"policy": "none"}
+    cfg["placement"] = {"hints": {"R0": {"side": "bottom"}}}
+    with pytest.raises(s5.InvalidProjectConfigError, match="bottom side"):
+        s5.emit(*_stage5_inputs(), cfg)
+
+
+def test_the_geometry_module_refuses_a_bottom_side_anchor_whoever_calls_it():
+    board = bg.from_config(_config(keepouts=[{"anchor": "U1", "shape": "rect",
+                                              "size": [2, 2]}]))
+    with pytest.raises(bg.BoardGeometryError, match="bottom side"):
+        bg.place_anchored(board, "U1", 10, 10, 0, "bottom")
+
+
+def test_stage8_does_not_flag_a_part_against_its_own_anchored_keepout():
+    """An antenna keepout overlaps its module on purpose, and the placer allows it."""
+    board = bg.from_config(_config(keepouts=[{"anchor": "U1", "shape": "rect",
+                                              "center": [0, 0], "size": [6, 6]}]))
+    bg.place_anchored(board, "U1", 20, 15, 0)
+    hdm = {"board_geometry": bg.as_record(board),
+           "synthesis": {"placement": {"boxes": {"U1": [18, 13, 22, 17],
+                                                 "R1": [21, 14, 22.5, 15]},
+                                       "hinted_positions": []}}}
+    emitter, design = s8._board_geometry_check(hdm)
+    assert [c["components"] for c in emitter] == [["R1"]]
+    assert design == []
