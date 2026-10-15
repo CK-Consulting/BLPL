@@ -160,7 +160,8 @@ def record_ledger_row(
     )
 
 
-def lookup(session: Session, project_id: int, sha256: str, project_dir) -> PdfVerdict | None:
+def lookup(session: Session, project_id: int, sha256: str, project_dir, *,
+           ledger=None) -> PdfVerdict | None:
     """The verdict for these bytes, importing a *held* ledger row if there is none.
 
     A released ledger row is not imported. The ledger is committed, so a pull
@@ -168,11 +169,16 @@ def lookup(session: Session, project_id: int, sha256: str, project_dir) -> PdfVe
     trust this replaces with one more step. A held row can only keep the
     browser from rendering a file, so taking it on the ledger's word is safe,
     and it means the reasons are on screen before anyone downloads the file.
+
+    ``ledger(sha256)`` reads the row where the ledger is: with workspaces on,
+    the agent reads it in the workspace (workspace_files.ledger_record), since
+    the backend may have no mount to read ``project_dir`` through. The same
+    rule applies to its answer: a row is imported only when it says held.
     """
     row = find(session, project_id, sha256)
     if row is not None:
         return row
-    entry = quarantine.record_for(project_dir, sha256)
+    entry = ledger(sha256) if ledger is not None else quarantine.record_for(project_dir, sha256)
     if entry is None or quarantine.verdict_of(entry) != quarantine.HELD:
         return None
     return record_ledger_row(session, project_id, entry, source=LEDGER, user_id=None)

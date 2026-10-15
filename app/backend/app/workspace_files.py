@@ -11,12 +11,11 @@ The agent opens every path without following a link, runs git there with the
 identity and the one credential the operation needs, and refuses writes while
 a run is in progress. Off by default, and with it off nothing here is reached.
 
-What still uses the backend's own mount with the flag on is resolving the
-checkout: the permission check, the sealed check, and creating a member's
-worktree on first use (``_project_dir``). Delete and move use it too, because
-their guards read the quarantine ledger and the ignore list as files.
-docs/architecture-v2.md, phase 3, says what removing the mount entirely still
-needs.
+Phase 4 moved the rest of the file manager here too: delete and move with the
+ledger and ignore-list bookkeeping beside the files, project libraries (library
+uploads, symbol removal), and the PDF verdict routes, which read the bytes
+they judge through the agent. docs/architecture-v2.md says what removing the
+mount entirely still needs.
 
 Each function here is called by the route it is named after, after that route
 has done its own permission and argument checks. The helpers it shares with
@@ -395,9 +394,7 @@ def blob(checkout: Path, rel: str, request=None, verdict_for=None) -> Response:
 
     from . import main as m
 
-    parts = [p for p in rel.split("/") if p]
-    if not parts or rel.startswith("/") or "\\" in rel or ".." in parts:
-        raise HTTPException(status_code=400, detail="path is outside the project")
+    parts = tree_rel(rel).split("/")
     name = parts[-1]
     with agent(checkout) as c:
         data = c.read(str(checkout), "/".join(parts), max_bytes=m.UPLOAD_MAX_BYTES * 2)
@@ -670,14 +667,92 @@ def managed_rel(name: str) -> str:
     return "/".join(parts)
 
 
-def delete(checkout: Path, rel: str) -> dict:
+def delete(checkout: Path, rel: str, by: str = "") -> dict:
     with agent(checkout) as c:
-        return c.managed_delete(str(checkout), rel)
+        return c.managed_delete(str(checkout), rel, by)
 
 
-def move(checkout: Path, src: str, dst: str) -> dict:
+def move(checkout: Path, src: str, dst: str, by: str = "") -> dict:
     with agent(checkout) as c:
-        return c.managed_move(str(checkout), src, dst)
+        return c.managed_move(str(checkout), src, dst, by)
+
+
+# -- project libraries ---------------------------------------------------------------
+#
+# library_upload works on the checkout's libraries/, so the agent runs it there.
+# The control plane still decides who may and which names are legal; the agent
+# refuses a libraries/ tree with a link in it, which the mounted route's
+# sandbox would have resolved and contained.
+
+
+def check_library(checkout: Path, name: str, suggest: str) -> str:
+    """library_upload.check_library, against the project's own libraries."""
+    with agent(checkout) as c:
+        return c.library_check(str(checkout), name, suggest)
+
+
+def library_names(checkout: Path) -> list[str]:
+    with agent(checkout) as c:
+        return c.library_names(str(checkout))
+
+
+def library_symbols(checkout: Path, library: str) -> dict:
+    with agent(checkout) as c:
+        return c.library_symbols(str(checkout), library)
+
+
+def remove_library_symbol(checkout: Path, library: str, symbol: str, by: str) -> dict:
+    with agent(checkout) as c:
+        return c.library_remove_symbol(str(checkout), library, symbol, by)
+
+
+# -- PDF verdicts -------------------------------------------------------------------
+
+
+def tree_rel(rel: str) -> str:
+    """A tree path's lexical rules, as the blob route applies them. Links are
+    the agent's to refuse, and it refuses every one."""
+    parts = [p for p in rel.split("/") if p]
+    if not parts or rel.startswith("/") or "\\" in rel or ".." in parts:
+        raise HTTPException(status_code=400, detail="path is outside the project")
+    return "/".join(parts)
+
+
+def pdf_bytes(checkout: Path, rel: str, cap: int) -> tuple[bytes, int, bytes | None]:
+    """What the verdict routes judge a file by: its first kilobyte, its size,
+    and, for a PDF within ``cap``, its whole content, read once by the agent.
+
+    The content is what gets hashed and inspected, so a verdict is about the
+    bytes in hand, never about a path. None when the file is not a PDF or is
+    over the cap (by size, or by the read: the agent refuses past ``cap``).
+    """
+    from blpl.core import quarantine
+
+    with agent(checkout) as c:
+        try:
+            st = c.stat(str(checkout), rel)
+            if not st.get("exists") or st.get("dir"):
+                raise HTTPException(status_code=404, detail=f"{rel} is not a file in this project")
+            head = c.read(str(checkout), rel, head=1024)
+            data = None
+            if quarantine.looks_like_pdf(head) and st["bytes"] <= cap:
+                try:
+                    data = c.read(str(checkout), rel, max_bytes=cap)
+                except AgentCallError as exc:
+                    if exc.status != 413:
+                        raise
+        except AgentCallError as exc:
+            if exc.status == 404:
+                raise HTTPException(status_code=404,
+                                    detail=f"{rel} is not a file in this project") from exc
+            raise
+    return head, st["bytes"], data
+
+
+def ledger_record(checkout: Path, sha256: str) -> dict | None:
+    """quarantine.record_for, read in the workspace (pdf_verdicts.lookup)."""
+    with agent(checkout) as c:
+        return c.quarantine_record(str(checkout), sha256)
 
 
 def ignore_entries(checkout: Path) -> list[dict]:

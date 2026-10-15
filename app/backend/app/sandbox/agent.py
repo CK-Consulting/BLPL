@@ -633,6 +633,10 @@ class Agent:
         checkout = self.fs.checkout(b.get("checkout"))
         parts = self.fs.parts(b.get("path"))
         cap = int(b.get("max_bytes", MAX_BODY))
+        # At most this many bytes from the start, whatever the file's size: the
+        # first kilobyte says whether it is a PDF before anything decides to
+        # read the rest.
+        head = b.get("head")
         with self.fs.dir_fd(checkout, parts[:-1]) as dfd:
             try:
                 fd = open_at(parts[-1], dfd, os.O_RDONLY, want_dir=False)
@@ -646,6 +650,8 @@ class Agent:
             st = os.fstat(fh.fileno())
             if not stat.S_ISREG(st.st_mode):
                 raise _forbidden("not a regular file")
+            if head is not None:
+                return fh.read(max(0, int(head)))
             if st.st_size > cap:
                 raise AgentError(413, f"file is {st.st_size} bytes, over {cap}", "too_large")
             return fh.read()
@@ -735,6 +741,50 @@ class Agent:
             except FileNotFoundError:
                 pass
 
+    def _libraries_are_real(self, checkout: str) -> None:
+        """Refuse library work while anything under libraries/ is a link.
+
+        library_upload places, relinks and removes with ordinary paths, as it
+        does on the mounted backend, where the sandbox has already resolved
+        every path. Here nothing has, and a committed ``libraries/footprints ->
+        /somewhere`` would carry an upload, or a footprint rewritten to follow
+        a moved model, wherever it points. Every library operation goes
+        through here first, and nothing else writes the tree while it runs: a
+        run is refused, and the agent is the workspace's only other writer.
+        """
+        top = os.path.join(checkout, "libraries")
+        try:
+            if stat.S_ISLNK(os.lstat(top).st_mode):
+                raise _forbidden("libraries/ is a symlink in this checkout; refusing to use it")
+        except FileNotFoundError:
+            return
+        for here, dirs, files in os.walk(top, followlinks=False):
+            for name in dirs + files:
+                if os.path.islink(os.path.join(here, name)):
+                    rel = os.path.relpath(os.path.join(here, name), checkout)
+                    raise _forbidden(f"{rel} is a symlink in this checkout's libraries/; "
+                                     "refusing to change the library through it")
+
+    def _models_under(self, checkout: str, parts: list[str]) -> list[str]:
+        """3D model files at parts or below, as project-relative paths, no link followed."""
+        from blpl.core import library_upload
+
+        rel = "/".join(parts)
+        suffixes = library_upload.MODEL_SUFFIXES
+        with self.fs.dir_fd(checkout, parts[:-1]) as dfd:
+            st = os.lstat(parts[-1], dir_fd=dfd)
+        if stat.S_ISREG(st.st_mode):
+            return [rel] if parts[-1].lower().endswith(suffixes) else []
+        if not stat.S_ISDIR(st.st_mode):
+            return []
+        out = []
+        for here, _dirs, files in os.walk(os.path.join(checkout, rel), followlinks=False):
+            for name in files:
+                full = os.path.join(here, name)
+                if name.lower().endswith(suffixes) and not os.path.islink(full):
+                    out.append(os.path.relpath(full, checkout).replace(os.sep, "/"))
+        return sorted(out)
+
     def _link_leaves(self, checkout: str, parts: list[str], dfd: int) -> bool:
         """Whether parts names a link pointing outside the checkout.
 
@@ -754,6 +804,7 @@ class Agent:
 
     def managed_delete(self, b: dict) -> dict:
         from app import llm_ignore
+        from blpl.core import quarantine
 
         checkout = self.fs.checkout(b.get("checkout"))
         self._verify_git(checkout)  # llm_ignore's lock follows the gitfile
@@ -768,7 +819,11 @@ class Agent:
                 raise AgentError(404, f"no file or folder {rel!r}", "notfound") from None
             if self._link_leaves(checkout, parts, dfd):
                 raise _forbidden(f"{rel!r} is a link out of the project")
-            recorded = llm_ignore.released_under(Path(checkout), rel)
+            # A file a library upload placed is the project's library now, so
+            # it may go, and the ledger records that it went (main.delete_path).
+            library_files = set(quarantine.library_placements_under(Path(checkout), rel))
+            recorded = [p for p in llm_ignore.released_under(Path(checkout), rel)
+                        if p not in library_files]
             if recorded:
                 raise AgentError(409, (
                     f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
@@ -781,15 +836,25 @@ class Agent:
             else:
                 os.unlink(parts[-1], dir_fd=dfd)
                 kind = "file"
+        # After the delete and never fatal, as the mounted route: the bytes
+        # are gone, and a ledger still naming them can only over-frame a later
+        # file of that name. Reported instead.
+        ledger_updated = True
+        if library_files:
+            try:
+                quarantine.record_library_removal(Path(checkout), rel, by=str(b.get("by", "")))
+            except OSError:
+                ledger_updated = False
         updated = True
         try:
             llm_ignore.drop_entries(Path(checkout), rel)
         except OSError:
             updated = False
-        return {"kind": kind, "ignore_list_updated": updated}
+        return {"kind": kind, "ignore_list_updated": updated, "ledger_updated": ledger_updated}
 
     def managed_move(self, b: dict) -> dict:
         from app import llm_ignore
+        from blpl.core import library_upload, quarantine
 
         checkout = self.fs.checkout(b.get("checkout"))
         self._verify_git(checkout)  # llm_ignore's lock follows the gitfile
@@ -815,12 +880,24 @@ class Agent:
                 raise
         if stat.S_ISDIR(sst.st_mode) and (dst_rel == src_rel or dst_rel.startswith(src_rel + "/")):
             raise AgentError(400, "a folder cannot be moved inside itself")
-        recorded = llm_ignore.released_under(Path(checkout), src_rel)
+        # A library upload's files are the exception the ledger follows
+        # (quarantine.record_library_move), as on the mounted route.
+        library_files = set(quarantine.library_placements_under(Path(checkout), src_rel))
+        recorded = [p for p in llm_ignore.released_under(Path(checkout), src_rel)
+                    if p not in library_files]
         if recorded:
             raise AgentError(409, (
                 f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
                 "is recorded in the quarantine ledger at its current path; moving it would "
                 "leave the ledger naming a file that is not there"), "recorded")
+        # A footprint names its 3D model by exact path, so a moved model takes
+        # the footprints that name it along, in the same commit (Codex, PR
+        # #23). Found before the rename, so the libraries check below refuses
+        # before anything has moved.
+        moved_models = {old: dst_rel + old[len(src_rel):]
+                        for old in self._models_under(checkout, src)}
+        if moved_models:
+            self._libraries_are_real(checkout)
         try:
             before = llm_ignore.cover_move(Path(checkout), src_rel, dst_rel)
         except OSError as e:
@@ -839,13 +916,45 @@ class Agent:
             if isinstance(e, AgentError):
                 raise
             raise AgentError(500, f"{src_rel} was not moved: {e}", "not_moved") from None
+
+        def undo_move() -> None:
+            try:
+                with self.fs.dir_fd(checkout, dst[:-1]) as dfd, \
+                        self.fs.dir_fd(checkout, src[:-1]) as sfd:
+                    os.rename(dst[-1], src[-1], src_dir_fd=dfd, dst_dir_fd=sfd)
+            except (OSError, AgentError):
+                pass
+            if before is not None:
+                try:
+                    llm_ignore.restore(Path(checkout), before)
+                except OSError:
+                    pass
+
+        try:
+            relinked = library_upload.follow_moved_models(Path(checkout), moved_models)
+        except (OSError, RuntimeError) as e:
+            undo_move()
+            raise AgentError(500, f"{src_rel} was not moved: the footprints naming its 3D models "
+                                  f"could not be updated ({e})", "not_moved") from None
+        if library_files:
+            try:
+                quarantine.record_library_move(Path(checkout), src_rel, dst_rel,
+                                               by=str(b.get("by", "")))
+            except OSError as e:
+                # The ledger still names the old path, and it is what frames a
+                # vendor file as untrusted. Left moved, the file would be read
+                # as the project's own text, so it goes back.
+                library_upload.restore_texts(Path(checkout), relinked)
+                undo_move()
+                raise AgentError(500, f"{src_rel} was not moved: the quarantine ledger could "
+                                      f"not be updated ({e})", "not_moved") from None
         updated = True
         if before is not None:
             try:
                 llm_ignore.finish_move(Path(checkout), before)
             except OSError:
                 updated = False
-        return {"ignore_list_updated": updated}
+        return {"ignore_list_updated": updated, "relinked": [rel for rel, _ in relinked]}
 
     # -- the LLM-ignore list, the quarantine ledger, the board manifest -------
 
@@ -887,6 +996,70 @@ class Agent:
                     "entries": list(reversed(quarantine.ledger(Path(checkout))))[:500]}
         except quarantine.LinkRefused as e:
             raise _forbidden(str(e)) from None
+
+    def quarantine_record(self, b: dict) -> dict:
+        """The ledger row for these bytes, if any: pdf_verdicts.lookup's held import.
+
+        Data to the control plane, which takes a row only when it says held:
+        the ledger is committed content, and a row saying released proves
+        nothing about the bytes."""
+        from blpl.core import quarantine
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._bookkeeping_dirs_are_real(checkout)
+        try:
+            return {"entry": quarantine.record_for(Path(checkout), str(b.get("sha256", "")))}
+        except quarantine.LinkRefused as e:
+            raise _forbidden(str(e)) from None
+
+    # -- project libraries ------------------------------------------------------
+
+    def library_check(self, b: dict) -> dict:
+        """library_upload.check_library against this checkout's own libraries."""
+        from blpl.core import library_upload
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._libraries_are_real(checkout)
+        try:
+            return {"library": library_upload.check_library(
+                str(b.get("name", "")), checkout, suggest=str(b.get("suggest", "")))}
+        except ValueError as e:
+            raise AgentError(400, str(e), "library") from None
+
+    def library_names(self, b: dict) -> dict:
+        from blpl.core import library_upload
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._libraries_are_real(checkout)
+        return {"existing": sorted(library_upload.existing_project_libraries(checkout))}
+
+    def library_symbols(self, b: dict) -> dict:
+        from blpl.core import library_upload
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._libraries_are_real(checkout)
+        try:
+            return library_upload.library_symbols(checkout, str(b.get("library", "")))
+        except ValueError as e:  # Refused is a ValueError
+            raise AgentError(404, str(e), "notfound") from None
+
+    def library_remove_symbol(self, b: dict) -> dict:
+        """quarantine.remove_library_symbol: the symbol goes and the ledger says so."""
+        from blpl.core import quarantine
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._verify_git(checkout)
+        self._no_run(["libraries"])
+        self._bookkeeping_dirs_are_real(checkout)
+        self._libraries_are_real(checkout)
+        try:
+            return quarantine.remove_library_symbol(
+                Path(checkout), str(b.get("library", "")), str(b.get("symbol", "")),
+                by=str(b.get("by", "")))
+        except quarantine.LinkRefused as e:
+            raise _forbidden(str(e)) from None
+        except ValueError as e:
+            raise AgentError(409, str(e), "refused") from None
 
     def project_boards(self, b: dict) -> dict:
         from blpl.core import project_manifest
@@ -941,21 +1114,27 @@ class Agent:
     def quarantine_accept(self, q: dict, data: bytes) -> dict:
         checkout = self.fs.checkout(q.get("checkout"))
         self._verify_git(checkout)  # llm_ignore's lock follows the gitfile
-        self._no_run(["datasheets"])
+        from blpl.core import quarantine  # the pipeline's own; present in the workspace image
+
+        kind = q.get("kind", "")
+        library_kind = kind in quarantine.LIBRARY_KINDS
+        # A library file merges into the libraries/ a run reads.
+        self._no_run(["libraries" if library_kind else "datasheets"])
+        if library_kind:
+            self._libraries_are_real(checkout)
         for name in self._QUARANTINE_DIRS:
             try:
                 if stat.S_ISLNK(os.lstat(os.path.join(checkout, name)).st_mode):
                     raise _forbidden(f"{name}/ is a symlink in this checkout; refusing to write through it")
             except FileNotFoundError:
                 pass
-        from blpl.core import quarantine  # the pipeline's own; present in the workspace image
 
         by = q.get("uploaded_by", "")
         try:
             rec = quarantine.accept_upload(
                 data, checkout, original_name=q.get("original_name", "upload"),
-                kind=q.get("kind", ""), uploaded_by=by, mpn=q.get("mpn", ""),
-                llm_ignore=q.get("llm_ignore") == "True",
+                kind=kind, uploaded_by=by, mpn=q.get("mpn", ""),
+                llm_ignore=q.get("llm_ignore") == "True", library=q.get("library", ""),
                 # The control plane's policy, per request, as well as this
                 # container's environment: a workspace created before the
                 # policy was forwarded keeps the environment it started with,
@@ -966,11 +1145,20 @@ class Agent:
             raise _forbidden(str(e)) from None
         except ValueError as e:
             raise AgentError(400, str(e)) from None
-        path = (f"{rec.released_to}/{rec.released_as}"
-                if rec.state == quarantine.RELEASED else None)
-        if path and rec.llm_ignore:
-            _set_ignored(checkout, path, by)
-        return {"state": rec.state, "kind": rec.kind, "path": path, "reasons": rec.reasons,
+        # What main.upload_files answers on the mounted backend, field for field.
+        released = rec.state == quarantine.RELEASED
+        # A bundle is not itself a file in the project; its entries are.
+        path = f"{rec.released_to}/{rec.released_as}" if released and rec.released_as else None
+        placed = sorted({
+            *(rec.placed or ([path] if path else [])),
+            *(p for m in rec.members for p in m.get("placed") or []),
+        }) if released else []
+        if rec.llm_ignore:
+            for p in placed:
+                _set_ignored(checkout, p, by)
+        return {"state": rec.state, "kind": rec.kind, "path": path, "placed": placed,
+                "library": rec.library, "note": (rec.inspection or {}).get("placement", ""),
+                "members": rec.members, "reasons": rec.reasons,
                 "inspection": (rec.inspection or {}).get("state", ""),
                 "scan": (rec.scan or {}).get("state", ""), "llm_ignore": rec.llm_ignore}
 
@@ -1209,6 +1397,10 @@ _JSON_ROUTES = {
     "/managed/delete": Agent.managed_delete, "/managed/move": Agent.managed_move,
     "/ignore/entries": Agent.ignore_entries, "/ignore/set": Agent.ignore_set,
     "/quarantine/view": Agent.quarantine_view, "/project/boards": Agent.project_boards,
+    "/quarantine/record": Agent.quarantine_record,
+    "/library/check": Agent.library_check, "/library/names": Agent.library_names,
+    "/library/symbols": Agent.library_symbols,
+    "/library/remove_symbol": Agent.library_remove_symbol,
     "/worktree/ensure": Agent.worktree_ensure, "/worktree/remove": Agent.worktree_remove,
     "/runs/mark": Agent.run_mark,
 }

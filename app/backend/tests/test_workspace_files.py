@@ -62,27 +62,33 @@ from test_git_endpoints import *  # noqa: E402,F401,F403
 from test_remote_urls import *  # noqa: E402,F401,F403
 from test_uploads_api import *  # noqa: E402,F401,F403
 from test_uploads_api import _no_scanner, _upload  # noqa: E402,F401
-
-# Library uploads, and the deletes, moves and symbol removals that keep the
-# ledger following them, are refused through the agent until it handles project
-# libraries; the refusals are tested below. Their mounted-route tests would only
-# pin that they are refused.
-del test_library_files_land_in_the_project_library_and_the_resolver_finds_them  # noqa: F821
-del test_a_library_file_is_read_by_the_assistant_as_untrusted  # noqa: F821
-del test_a_symbol_that_would_replace_one_already_there_is_held  # noqa: F821
-del test_a_file_that_is_not_what_its_kind_says_is_held  # noqa: F821
-del test_a_bad_library_name_fails_the_request_before_anything_lands  # noqa: F821
-del test_a_vendor_bundle_reports_each_entry  # noqa: F821
-del test_a_pdf_inside_a_bundle_records_its_own_verdict  # noqa: F821
-del test_a_stock_library_name_is_refused_and_nothing_lands  # noqa: F821
-del test_an_existing_project_library_with_a_stock_name_still_takes_uploads  # noqa: F821
-del test_a_placed_footprint_can_be_deleted_and_the_ledger_records_it  # noqa: F821
-del test_a_placed_model_can_be_moved_and_the_row_follows  # noqa: F821
-del test_a_collision_is_cleared_by_removing_one_symbol_and_uploading_again  # noqa: F821
-del test_a_library_upload_waits_for_a_run_in_flight_and_a_document_does_not  # noqa: F821
-del test_a_move_the_ledger_cannot_record_is_put_back  # noqa: F821
-del test_a_delete_the_ledger_cannot_record_still_lands_and_says_so  # noqa: F821
-del test_moving_an_uploaded_model_takes_the_footprint_that_names_it_along  # noqa: F821
+# The PDF verdict routes, whose bytes the agent reads and this backend judges.
+# Not the ones that fail a read by patching the mounted route's own file
+# handling (_open_once, a growing file), which the agent does not use. Nor
+# test_a_pdf_over_the_limit_is_never_judged_or_inline: through the agent the
+# blob route reads at most twice the upload limit, so a file past that is a 413
+# rather than a download. The verdict routes still refuse it as too large.
+from test_pdf_verdicts import (  # noqa: E402,F401
+    test_a_clean_verdict_from_another_inspector_does_not_count,
+    test_a_filename_cannot_inject_a_header,
+    test_a_held_pdf_is_never_inline,
+    test_a_ledger_row_saying_held_is_shown_before_any_download,
+    test_a_ledger_row_saying_released_is_not_taken_on_its_word,
+    test_a_pdf_is_recognised_by_its_bytes_not_its_name,
+    test_a_range_of_an_inspected_pdf_is_inline_and_carries_its_etag,
+    test_a_range_of_an_uninspected_pdf_is_still_an_attachment,
+    test_a_renamed_or_copied_clean_pdf_keeps_its_verdict,
+    test_a_retrieved_file_stays_a_download_even_when_clean,
+    test_a_verdict_in_one_project_does_not_vouch_for_another,
+    test_active_types_committed_into_a_project_are_inert_downloads,
+    test_after_inspection_it_is,
+    test_an_uninspected_pdf_committed_into_a_project_is_not_served_inline,
+    test_an_unscanned_pdf_is_not_clean_enough_to_render,
+    test_an_upload_records_its_verdict_so_a_clean_one_opens,
+    test_content_changed_after_inspection_is_not_inline,
+    test_inspecting_does_not_reach_outside_the_project,
+    test_only_pdfs_are_inspected,
+)
 
 TOKEN = "w" * 64
 
@@ -121,6 +127,19 @@ class _Counting:
         self.server.server_close()
         self._agent_mod.RUN_LOG_DIR = self._old_logs
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _pdf_tests_get_a_scanner(request, monkeypatch):
+    """test_pdf_verdicts' own autouse scanner, for its tests alone: imported as
+    autouse it would answer clean for every test here, the upload tests that
+    need no scanner among them."""
+    if getattr(request.function, "__module__", "") == "test_pdf_verdicts":
+        from blpl.core import av, quarantine
+
+        monkeypatch.delenv("BLPL_QUARANTINE_REQUIRE_SCAN", raising=False)
+        monkeypatch.setattr(quarantine.av, "scan_bytes",
+                            lambda data: av.ScanResult(state="clean", scanner="test"))
 
 
 @pytest.fixture(autouse=True)
@@ -864,41 +883,157 @@ def test_a_launch_without_the_mount_still_refuses_an_unknown_board(client, monke
     assert r.status_code == 400 and "single-board" in r.json()["detail"]
 
 
+# -- project libraries and PDF verdicts, through the agent --------------------------------
 
-# -- project libraries, until the agent handles them ------------------------------------
 
+def test_the_library_and_pdf_routes_need_no_project_mount(unlocked, monkeypatch, via_agent):
+    """Library uploads, the moves, deletes and symbol removals that keep the
+    ledger following them, and the PDF verdict routes, with nothing read
+    through the mount. The held-ledger import on the verdict view is one of
+    them: it read the ledger from the checkout."""
+    import hashlib
+    import json as _json
 
-def test_a_library_upload_is_refused_through_the_agent_and_nothing_lands(unlocked):
     import app.main as main
-    from test_uploads_api import FOOTPRINT
+    from blpl.core import av, quarantine
+    from test_uploads_api import FOOTPRINT, STEP, SYMLIB
+
+    monkeypatch.setattr(quarantine.av, "scan_bytes",
+                        lambda data: av.ScanResult(state="clean", scanner="test"))
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    proj = main.PROJECTS_ROOT / "mine"
+    held_pdf = BENIGN.replace(b"%%EOF", b"% held\n%%EOF")
+    (proj / "datasheets").mkdir(exist_ok=True)
+    (proj / "datasheets" / "X.pdf").write_bytes(BENIGN)
+    (proj / "copied.pdf").write_bytes(held_pdf)
+    ledger = quarantine.quarantine_dir(proj) / quarantine.LEDGER_NAME
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(_json.dumps({"schema_version": 1, "retrieved": [{
+        "sha256": hashlib.sha256(held_pdf).hexdigest(), "filename": "x.pdf", "bytes": 1,
+        "state": "held", "inspection": {"state": "inspected"}, "scan": {"state": "infected"},
+        "reasons": ["a malware scanner matched Test"],
+    }]}))
+    other = SYMLIB.replace(b'"PCM12SMTBR"', b'"OTHER"').replace(b'"PCM12SMTBR_1_1"', b'"OTHER_1_1"')
+    model = "libraries/3dmodels/mine.3dshapes/m.step"
+    footprint = "libraries/footprints/mine.pretty/PCM12SMTBR.kicad_mod"
+
+    def upload(name, data, meta):
+        return ("post", "/api/projects/mine/uploads", {
+            "files": [("files", (name, data, "application/octet-stream"))],
+            "data": {"meta": _json.dumps([meta])}})
+
+    monkeypatch.setenv("BLPL_PROJECT_MOUNT", "absent")
+    root = str(main.PROJECTS_ROOT)
+    calls = [
+        upload("sym.kicad_sym", SYMLIB, {"kind": "symbol"}),
+        upload("o.kicad_sym", other, {"kind": "symbol"}),
+        upload("fp.kicad_mod", FOOTPRINT, {"kind": "footprint"}),
+        upload("m.step", STEP, {"kind": "3d_model"}),
+        ("get", "/api/projects/mine/uploads/library-names", {}),
+        ("get", "/api/projects/mine/libraries/symbols/mine", {}),
+        ("post", "/api/projects/mine/libraries/symbols/mine/remove", {"json": {"symbol": "OTHER"}}),
+        ("post", "/api/projects/mine/files/move",
+         {"json": {"path": model, "to": "libraries/3dmodels/vendor.3dshapes/m.step"}}),
+        ("delete", f"/api/projects/mine/files/{footprint}", {}),
+        ("get", "/api/projects/mine/blob/verdict", {"params": {"path": "datasheets/X.pdf"}}),
+        ("post", "/api/projects/mine/blob/inspect", {"json": {"path": "datasheets/X.pdf"}}),
+        ("get", "/api/projects/mine/blob", {"params": {"path": "datasheets/X.pdf"}}),
+        ("get", "/api/projects/mine/blob/verdict", {"params": {"path": "copied.pdf"}}),
+        ("get", "/api/projects/mine/blob", {"params": {"path": "copied.pdf"}}),
+    ]
+    _WATCH.update(root=root, seen=[])
+    answers = []
+    try:
+        for method, url, kw in calls:
+            r = getattr(unlocked, method)(url, **kw)
+            assert r.status_code == 200, (method, url, r.status_code, r.text[:300])
+            answers.append(r)
+        seen = list(_WATCH["seen"])
+    finally:
+        _WATCH["root"] = None
+    assert seen == [], f"the backend touched the project mount: {seen[:10]}"
+    assert [a.json()["results"][0]["state"] for a in answers[:4]] == ["released"] * 4
+    assert "mine" in answers[4].json()["existing"]
+    assert answers[5].json()["symbols"] == ["OTHER", "PCM12SMTBR"]
+    assert answers[6].json()["remaining"] == ["PCM12SMTBR"]
+    assert answers[9].json()["verdict"] is None
+    assert answers[10].json()["verdict"] == "clean"
+    assert answers[11].headers["content-type"] == "application/pdf"
+    assert answers[12].json()["verdict"] == "held" and answers[12].json()["source"] == "ledger"
+    assert answers[13].headers["x-blpl-pdf-verdict"] == "held"
+    events = [(e["event"], e["path"]) for e in quarantine.events(proj)]
+    assert events == [("symbol_removed", "libraries/symbols/mine.kicad_sym"),
+                      ("moved", model), ("removed", footprint)]
+
+
+def test_a_link_in_libraries_stops_library_work_through_the_agent(unlocked, monkeypatch):
+    """library_upload writes with ordinary paths. On the mounted backend the
+    sandbox resolves them; the agent resolves nothing, so a committed link
+    under libraries/ would carry an upload, a relink or a symbol removal
+    wherever it points. Refused, and nothing is written there."""
+    import app.main as main
+    from test_uploads_api import FOOTPRINT, STEP, SYMLIB
 
     unlocked.post("/api/projects/init", json=init_body("mine"))
-    r = _upload(unlocked, [("fp.kicad_mod", FOOTPRINT, {"kind": "footprint"})])
-    assert r.status_code == 409 and "workspaces" in r.json()["detail"]
-    assert not (main.PROJECTS_ROOT / "mine" / "libraries" / "footprints" / "mine.pretty").exists()
-    # A document still goes in.
-    r = _upload(unlocked, [("ds.pdf", BENIGN, {"kind": "datasheet", "mpn": "X"})])
-    assert r.status_code == 200, r.text
+    proj = main.PROJECTS_ROOT / "mine"
+    assert _upload(unlocked, [("sym.kicad_sym", SYMLIB, {"kind": "symbol"}),
+                              ("m.step", STEP, {"kind": "3d_model"})]).status_code == 200
+    outside = Path(tempfile.mkdtemp(prefix="blpl-outside-"))
+    try:
+        (proj / "libraries" / "footprints").mkdir(parents=True, exist_ok=True)
+        (proj / "libraries" / "footprints" / "mine.pretty").symlink_to(outside)
+
+        r = _upload(unlocked, [("fp.kicad_mod", FOOTPRINT, {"kind": "footprint"})])
+        assert r.status_code == 400 and "symlink" in r.json()["detail"]
+        r = unlocked.post("/api/projects/mine/libraries/symbols/mine/remove",
+                          json={"symbol": "PCM12SMTBR"})
+        assert r.status_code == 400 and "symlink" in r.json()["detail"]
+        src = "libraries/3dmodels/mine.3dshapes/m.step"
+        r = unlocked.post("/api/projects/mine/files/move",
+                          json={"path": src, "to": "libraries/3dmodels/v.3dshapes/m.step"})
+        assert r.status_code == 400 and "symlink" in r.json()["detail"]
+        assert (proj / src).is_file()
+        assert list(outside.iterdir()) == []
+        assert "PCM12SMTBR" in (proj / "libraries/symbols/mine.kicad_sym").read_text()
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
 
 
-def test_an_uploaded_library_file_is_not_deleted_or_moved_through_the_agent(unlocked, monkeypatch):
-    """Through the agent these would skip the ledger, so the vendor file would
-    lose its framing; refused instead, and the file stays where it is."""
+def test_a_bundle_pdf_gets_this_backends_verdict_not_the_workspaces(unlocked, monkeypatch):
+    """The workspace inspects each entry of a bundle as it unpacks it; a verdict
+    the browser renders by still comes only from this backend's own
+    inspection of the bytes. Here the workspace's scanner says clean and this
+    backend's says infected: the entry is held for the browser."""
+    import threading as _threading
+
+    from blpl.core import av, quarantine
+    from test_uploads_api import FOOTPRINT, _zip
+
+    def scan(data):
+        # The agent's threads are the workspace; anything else is this backend.
+        name = _threading.current_thread().name
+        if "process_request_thread" in name:
+            return av.ScanResult(state="clean", scanner="workspace")
+        return av.ScanResult(state="infected", scanner="backend", signature="Test")
+
+    monkeypatch.setattr(quarantine.av, "scan_bytes", scan)
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    bundle = _zip([("PCM12SMTBR.kicad_mod", FOOTPRINT), ("docs/datasheet.pdf", BENIGN)])
+    res = _upload(unlocked, [("PCM12SMTBR.zip", bundle, {"kind": "kicad_bundle"})]).json()
+    assert "references/PCM12SMTBR/datasheet.pdf" in res["results"][0]["placed"]
+    v = unlocked.get("/api/projects/mine/blob/verdict",
+                     params={"path": "references/PCM12SMTBR/datasheet.pdf"}).json()
+    assert v["verdict"] == "held" and v["scanner"] == "backend" and v["inline"] is False
+
+
+def test_a_pdf_over_the_limit_is_not_judged_through_the_agent(unlocked, monkeypatch):
+    """The verdict routes' half of test_a_pdf_over_the_limit_is_never_judged_or_inline."""
     import app.main as main
-    from test_uploads_api import FOOTPRINT
 
     unlocked.post("/api/projects/init", json=init_body("mine"))
-    monkeypatch.delenv("BLPL_FILES_VIA_WORKSPACE")
-    r = _upload(unlocked, [("fp.kicad_mod", FOOTPRINT, {"kind": "footprint"})])
-    assert r.status_code == 200, r.text
-    monkeypatch.setenv("BLPL_FILES_VIA_WORKSPACE", "1")
-    rel = "libraries/footprints/mine.pretty/PCM12SMTBR.kicad_mod"
-
-    r = unlocked.delete(f"/api/projects/mine/files/{rel}")
-    assert r.status_code == 409 and "workspaces" in r.json()["detail"]
-    r = unlocked.post("/api/projects/mine/files/move",
-                      json={"path": rel, "to": "libraries/footprints/x.pretty/a.kicad_mod"})
-    assert r.status_code == 409
-    r = unlocked.post("/api/projects/mine/libraries/symbols/mine/remove", json={"symbol": "R"})
-    assert r.status_code == 409
-    assert (main.PROJECTS_ROOT / "mine" / rel).is_file()
+    (main.PROJECTS_ROOT / "mine" / "big.pdf").write_bytes(BENIGN)
+    monkeypatch.setattr(main, "UPLOAD_MAX_BYTES", 16)
+    v = unlocked.get("/api/projects/mine/blob/verdict", params={"path": "big.pdf"}).json()
+    assert v["pdf"] is True and v["too_large"] is True and v["sha256"] is None
+    assert v["inline"] is False
+    assert unlocked.post("/api/projects/mine/blob/inspect", json={"path": "big.pdf"}).status_code == 413
