@@ -351,17 +351,32 @@ class _Canvas:
             self._inside[key] = hit
         return hit
 
+    def _on_board(self, x: float, y: float, w: float, h: float, m: float) -> bool:
+        if x - w / 2 < m or y - h / 2 < m:
+            return False
+        if x + w / 2 > self.w - m or y + h / 2 > self.h - m:
+            return False
+        return self.rect or self._within_outline(
+            (x - w / 2 - m, y - h / 2 - m, x + w / 2 + m, y + h / 2 + m))
+
+    def against(self, side: str, x: float, y: float, w: float, h: float) -> bool:
+        """Whether a part at (x, y) is as close to ``side`` as the outline allows.
+
+        True when one more search step towards that side would take it off the
+        board — so on a round board "top" means hard against the arc above it,
+        not against the bounding box's top line, which the part cannot reach.
+        """
+        reach = self.step + 0.01
+        dx, dy = {"top": (0.0, -reach), "bottom": (0.0, reach),
+                  "left": (-reach, 0.0), "right": (reach, 0.0)}[side]
+        return not self._on_board(x + dx, y + dy, w, h, self.edge_margin)
+
     def _fits(self, x: float, y: float, w: float, h: float, edge: bool) -> bool:
         # An edge-seeking part may approach the boundary, but not touch it:
         # copper hard against the board edge fails copper_edge_clearance, and a
         # routed board that cannot be milled is not a routed board.
         m = self.edge_margin if edge else self.margin
-        if x - w / 2 < m or y - h / 2 < m:
-            return False
-        if x + w / 2 > self.w - m or y + h / 2 > self.h - m:
-            return False
-        if not self.rect and not self._within_outline(
-                (x - w / 2 - m, y - h / 2 - m, x + w / 2 + m, y + h / 2 + m)):
+        if not self._on_board(x, y, w, h, m):
             return False
         c = self.clearance
         for (ox, oy, ow, oh) in self.taken:
@@ -473,6 +488,10 @@ def place(
         where = f"inside {bw:.1f}x{bh:.1f}mm"
     refs = set(components)
 
+    def against(ref: str) -> str:
+        side = (hints.get(ref) or {}).get("edge")
+        return f" against the {side} edge" if side else ""
+
     def wants_edge(ref: str) -> bool:
         return _wants_edge(ref) or bool((hints.get(ref) or {}).get("edge"))
 
@@ -489,6 +508,12 @@ def place(
 
     def fits(ref: str, spot: tuple[float, float], w: float, h: float, edge: bool) -> bool:
         if not canvas._fits(spot[0], spot[1], w, h, edge):
+            return False
+        # An edge hint is an instruction like any other hint: a part that
+        # cannot sit against the named edge is not placed, rather than placed
+        # wherever the ranking ran out of edge.
+        side = (hints.get(ref) or {}).get("edge")
+        if side and not canvas.against(side, spot[0], spot[1], w, h):
             return False
         mine = anchored_at(ref, spot)
         return not mine or canvas.features_clear(mine)
@@ -572,7 +597,7 @@ def place(
             None,
         )
         if spot is None:
-            result.unplaced[ref] = f"no free {w:.2f}x{h:.2f}mm position {where}"
+            result.unplaced[ref] = f"no free {w:.2f}x{h:.2f}mm position {where}{against(ref)}"
             remaining.remove(ref)
             continue
         hint = hints.get(ref) or {}
@@ -658,7 +683,7 @@ def place(
                 spot = (x, y)
                 break
         if spot is None:
-            result.unplaced[ref] = f"no free {w:.2f}x{h:.2f}mm position {where}"
+            result.unplaced[ref] = f"no free {w:.2f}x{h:.2f}mm position {where}{against(ref)}"
             continue
         hint = hints.get(ref) or {}
         dx, dy = offsets[ref]

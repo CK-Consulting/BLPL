@@ -404,14 +404,27 @@ def shape(spec: Any, where: str, *, default: str = "center") -> Shape:
             r = _pos(spec["radius"], f"{where}.radius")
         else:
             raise BoardGeometryError(f"{where} is a circle with no diameter")
+        if "origin" in spec and "center" in spec:
+            raise BoardGeometryError(f"{where} gives both origin and center; give one")
         if "center" in spec:
             c = _point(spec["center"], f"{where}.center")
+        elif "origin" in spec:
+            # The top-left of its bounding box, as for every other shape.
+            ox, oy = _point(spec["origin"], f"{where}.origin")
+            c = (ox + r, oy + r)
         else:
             c = (r, r) if default == "origin" else (0.0, 0.0)
         segs = [Segment("circle", (c,), radius=r)]
         return Shape(segs, _flatten(segs))
 
     if kind == "polygon":
+        # Its points say where it is. An origin or centre beside them could only
+        # be ignored or fought with, and ignoring a position is how a shape ends
+        # up somewhere other than where it was written.
+        for key in ("origin", "center"):
+            if key in spec:
+                raise BoardGeometryError(
+                    f"{where} is a polygon, whose points are its position; drop {key}")
         raw = spec.get("points")
         if not isinstance(raw, list):
             raise BoardGeometryError(f"{where}.points must be a list of [x, y]")

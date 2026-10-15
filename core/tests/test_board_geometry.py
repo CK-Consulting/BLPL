@@ -414,3 +414,81 @@ def test_stage8_does_not_flag_a_part_against_its_own_anchored_keepout():
     emitter, design = s8._board_geometry_check(hdm)
     assert [c["components"] for c in emitter] == [["R1"]]
     assert design == []
+
+
+def test_a_circle_origin_is_the_top_left_of_its_box():
+    """It was accepted by the schema and silently ignored."""
+    s = bg.shape({"shape": "circle", "diameter": 4, "origin": [10, 20]}, "k")
+    assert s.bbox == pytest.approx((10, 20, 14, 24))
+
+
+def test_a_polygon_refuses_a_position_beside_its_points():
+    with pytest.raises(bg.BoardGeometryError, match="drop origin"):
+        bg.shape({"shape": "polygon", "points": [[0, 0], [4, 0], [0, 4]],
+                  "origin": [5, 5]}, "k")
+
+
+def test_an_edge_hint_that_cannot_be_met_leaves_the_part_unplaced():
+    """Ranking alone put the part wherever the edge ran out — mid-board, even
+    against the opposite edge. A hint is an instruction, so it is refused."""
+    board = bg.from_config(_config(
+        dims=(40, 40), outline={"shape": "rect", "size": [40, 40]},
+        keepouts=[{"shape": "rect", "origin": [0, 30], "size": [40, 10]}],
+    ))
+    r = placement.place({"U1": {}, "R1": {}}, {}, board, hints={"U1": {"edge": "bottom"}})
+    assert "U1" in r.unplaced
+    assert "against the bottom edge" in r.unplaced["U1"]
+    assert "R1" in r.placements
+
+
+def test_kicad_happys_keepout_finding_on_a_hinted_part_is_the_designs():
+    ctx = s8._Context(pwr_flag_nets=set(), autoroute={}, test_points={},
+                      lifecycle_reason=None, emitter_evidence={}, hinted={"J1"})
+    finding = {"rule_id": "KO-001", "components": ["J1"]}
+    assert s8._classify(finding, ctx) == ("design", None)
+    finding = {"rule_id": "KO-001", "components": ["J1", "R4"]}
+    assert s8._classify(finding, ctx)[0] == "emitter"
+
+
+def _zone_bbox(zone) -> tuple[float, float, float, float]:
+    pts = [(float(p[1]), float(p[2]))
+           for p in sexpr.find(sexpr.find(zone, "polygon"), "pts")[1:]]
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+@pytest.mark.parametrize("rot, expect", [
+    # ESP-WROOM-02's library keepout spans local (-14, -18.1)..(14, -7.1): the
+    # antenna end. At (30, 25) that is sheet (28.5, 19.4)..(56.5, 30.4); turned
+    # +90 deg, (dx, dy) -> (dy, -dx) puts it on the module's left.
+    (0, (28.5, 19.4, 56.5, 30.4)),
+    (90, (24.4, 23.5, 35.4, 51.5)),
+])
+def test_a_library_footprints_own_keepout_lands_on_the_footprint(rot, expect):
+    """A board file stores a footprint's zones in board coordinates; copying the
+    library's local ones put this antenna keepout off the sheet at (-14, -18)."""
+    hdm = {"project": {"dimensions": [60, 50]}, "nets": {},
+           "components": {"U1": {"value": "esp", "footprint": "RF_Module:ESP-WROOM-02",
+                                 "placement": {"x": 30, "y": 25, "rot": rot, "side": "top"}}}}
+    fp = sexpr.find(sexpr.parse(pcb.emit(hdm, footprints_root=_FOOTPRINTS_ROOT)), "footprint")
+    (zone,) = [c for c in fp if isinstance(c, list) and c and c[0] == "zone"]
+    assert _zone_bbox(zone) == pytest.approx(expect, abs=0.06)
+
+
+def test_an_anchored_keepout_belongs_to_its_footprint_not_the_board():
+    """KiCad exempts only a rule area's own footprint from it: drawn at board
+    level, an antenna keepout reported its own module as not allowed."""
+    cfg = _config(dims=(60, 50), outline={"shape": "rect", "size": [60, 50]},
+                  keepouts=[{"anchor": "R1", "shape": "rect", "center": [0, -4],
+                             "size": [4, 2], "name": "ANT"}])
+    board = bg.from_config(cfg)
+    bg.place_anchored(board, "R1", 5, 5, 0)
+    hdm = {"project": cfg["project"], "board_geometry": bg.as_record(board), "nets": {},
+           "components": {"R1": {"value": "10k", "footprint": "Resistor_SMD:R_0402_1005Metric",
+                                 "placement": {"x": 5, "y": 5, "rot": 0, "side": "top"}}}}
+    out = pcb.emit(hdm, footprints_root=_FOOTPRINTS_ROOT)
+    assert _tags(out, "zone") == []
+    fp = sexpr.find(sexpr.parse(out), "footprint")
+    (zone,) = [c for c in fp if isinstance(c, list) and c and c[0] == "zone"]
+    assert sexpr.find(zone, "name")[1] == '"ANT"'
+    assert _zone_bbox(zone) == pytest.approx((15.5, 12.5, 19.5, 14.5))
