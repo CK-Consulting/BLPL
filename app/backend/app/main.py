@@ -4870,6 +4870,8 @@ async def upload_files(
                 status_code=400,
                 detail=f"each file needs a kind: one of {sorted(quarantine.UPLOAD_KINDS)}",
             )
+        if spec["kind"] in quarantine.LIBRARY_KINDS and workspace_files.enabled():
+            _refuse_library_work_in_workspace("Uploading KiCad library files")
         if spec["kind"] in quarantine.LIBRARY_KINDS:
             # Checked before any file is read, so a typo in the library name
             # fails the request rather than half of it.
@@ -5058,6 +5060,8 @@ def remove_library_symbol(
     so deleting the file to get rid of one would take them all.
     """
     project = _project_or_404(session, user, project_id)
+    if workspace_files.enabled():
+        _refuse_library_work_in_workspace("Removing a symbol from a project library")
     proj = _project_dir(session, user, project_id)
     _refuse_while_running(session, user, project, "change its libraries")
     try:
@@ -5261,6 +5265,31 @@ def _refuse_while_running(session: Session, user: User, project: Project, then: 
         )
 
 
+def _refuse_library_work_in_workspace(what: str) -> None:
+    """Library uploads, and the deletes, moves and symbol removals that keep
+    the quarantine ledger following them, are not yet done through the
+    workspace agent. Done the agent's way today they would skip the ledger,
+    the footprint relinking and the rollbacks, and an uploaded vendor file
+    would be read back as the project's own text. Refused until they are.
+    """
+    raise HTTPException(
+        status_code=409,
+        detail=f"{what} is not available while projects run in workspaces yet; "
+        "it will be once the workspace agent handles project libraries",
+    )
+
+
+def _workspace_library_placements(checkout: Path, rel: str) -> list[str]:
+    """Uploaded library files at ``rel`` or below, from the ledger the agent reads."""
+    entries = workspace_files.quarantine_view(checkout).get("entries") or []
+    rel = rel.strip("/")
+    return sorted({
+        p for row in entries if row.get("library") or row.get("libraries")
+        for p in row.get("placed") or []
+        if isinstance(p, str) and (p == rel or p.startswith(rel + "/"))
+    })
+
+
 @app.delete("/api/projects/{project_id}/files/{name:path}")
 def delete_path(
     project_id: str, name: str,
@@ -5278,6 +5307,8 @@ def delete_path(
         checkout = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
         rel = workspace_files.managed_rel(name)
         _refuse_while_running(session, user, project, "delete it")
+        if _workspace_library_placements(checkout, rel):
+            _refuse_library_work_in_workspace("Deleting an uploaded library file")
         done = workspace_files.delete(checkout, rel)
         activity.record(session, project, user, activity.DELETED, rel)
         commit = _commit_landed_write(session, user, project, checkout, f"delete: {rel}", master_key)
@@ -5371,6 +5402,8 @@ def move_path(
         src_rel = workspace_files.managed_rel(body.path)
         dst_rel = workspace_files.managed_rel(body.to)
         _refuse_while_running(session, user, project, "move it")
+        if _workspace_library_placements(checkout, src_rel):
+            _refuse_library_work_in_workspace("Moving an uploaded library file")
         if llm_ignore.is_external(src_rel) and not llm_ignore.is_external(dst_rel):
             raise HTTPException(status_code=403, detail=(
                 f"{src_rel} came from outside the project, and files there are read as "
