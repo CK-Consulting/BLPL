@@ -62,13 +62,19 @@ from test_git_endpoints import *  # noqa: E402,F401,F403
 from test_remote_urls import *  # noqa: E402,F401,F403
 from test_uploads_api import *  # noqa: E402,F401,F403
 from test_uploads_api import _no_scanner, _upload  # noqa: E402,F401
-# The PDF verdict routes, whose bytes the agent reads and this backend judges.
+# The PDF verdict routes, whose bytes the agent reads and this backend judges,
+# and the blob route's byte ranges, which it cuts from blocks the agent reads.
 # Not the ones that fail a read by patching the mounted route's own file
-# handling (_open_once, a growing file), which the agent does not use. Nor
-# test_a_pdf_over_the_limit_is_never_judged_or_inline: through the agent the
-# blob route reads at most twice the upload limit, so a file past that is a 413
-# rather than a download. The verdict routes still refuse it as too large.
+# handling (_open_once, a growing file), which the agent does not use.
 from test_pdf_verdicts import (  # noqa: E402,F401
+    test_a_large_non_pdf_is_streamed_not_read_whole,
+    test_a_large_pdf_is_hashed_in_pieces_too,
+    test_a_malformed_or_multiple_range_gets_the_whole_file,
+    test_a_pdf_over_the_limit_is_never_judged_or_inline,
+    test_a_range_of_a_non_pdf,
+    test_an_open_ended_and_a_suffix_range,
+    test_an_unsatisfiable_range_is_416_with_the_size,
+    test_bytes_changed_in_place_after_judging_are_not_what_is_sent,
     test_a_clean_verdict_from_another_inspector_does_not_count,
     test_a_filename_cannot_inject_a_header,
     test_a_held_pdf_is_never_inline,

@@ -141,6 +141,18 @@ class AgentClient:
             body["head"] = head
         return self._check(self._http.post("/fs/read", content=json.dumps(body))).content
 
+    def read_range(self, checkout: str, path: str, offset: int, length: int, *,
+                   expect: str | None = None) -> tuple[bytes, int, str]:
+        """At most ``length`` bytes from ``offset``, the file's size, and its
+        version. With ``expect``, a 409 (kind ``changed``) if the file is no
+        longer that version."""
+        body: dict[str, Any] = {"checkout": checkout, "path": path, "offset": offset,
+                                "length": length}
+        if expect is not None:
+            body["expect"] = expect
+        r = self._check(self._http.post("/fs/read_range", content=json.dumps(body)))
+        return r.content, int(r.headers["X-File-Size"]), r.headers["X-File-Id"]
+
     def write(self, checkout: str, path: str, data: bytes, *, mkdirs: bool = False) -> dict:
         r = self._http.post("/fs/write", params={"checkout": checkout, "path": path,
                                                  "mkdirs": "1" if mkdirs else "0"},

@@ -121,6 +121,49 @@ def test_file_round_trip(ag, projects):
     assert e.value.status == 409  # never an overwrite
 
 
+def test_a_ranged_read_is_one_versions_bytes_or_a_409(ag, projects):
+    """The blob route streams a large file as a run of these. A file rewritten
+    or replaced between two of them must not splice two files into one
+    download, or let a file classified by its first block (not a PDF) be
+    something else by its last."""
+    _, c, _ = ag
+    b = B(projects)
+    data = bytes(range(256)) * 64
+    (projects / "board" / "big.zip").write_bytes(data)
+    first, size, version = c.read_range(b, "big.zip", 0, 100)
+    assert first == data[:100] and size == len(data)
+    assert c.read_range(b, "big.zip", 16000, 10_000, expect=version)[0] == data[16000:]
+    assert c.read_range(b, "big.zip", size + 5, 10, expect=version)[0] == b""
+
+    # Rewritten in place, same length: a new version.
+    time.sleep(0.01)
+    with open(projects / "board" / "big.zip", "r+b") as fh:
+        fh.write(b"%PDF-1.4")
+    with pytest.raises(AgentCallError) as e:
+        c.read_range(b, "big.zip", 100, 100, expect=version)
+    assert e.value.status == 409 and e.value.kind == "changed"
+
+    # Replaced by a rename: another inode, also a new version.
+    _, _, version = c.read_range(b, "big.zip", 0, 1)
+    (projects / "board" / "other").write_bytes(data)
+    os.replace(projects / "board" / "other", projects / "board" / "big.zip")
+    with pytest.raises(AgentCallError) as e:
+        c.read_range(b, "big.zip", 0, 1, expect=version)
+    assert e.value.status == 409
+
+
+def test_a_ranged_read_is_capped_and_never_follows_a_link(ag, projects):
+    _, c, _ = ag
+    b = B(projects)
+    (projects / "board" / "huge.bin").write_bytes(b"\0" * (agent_mod.READ_RANGE_MAX + 10))
+    got, size, _ = c.read_range(b, "huge.bin", 0, agent_mod.READ_RANGE_MAX * 4)
+    assert len(got) == agent_mod.READ_RANGE_MAX and size == agent_mod.READ_RANGE_MAX + 10
+    (projects / "board" / "leak.md").symlink_to(projects / "victim" / "secret.md")
+    with pytest.raises(AgentCallError) as e:
+        c.read_range(b, "leak.md", 0, 100)
+    assert e.value.status == 403
+
+
 @pytest.mark.parametrize("path", ["../victim/secret.md", "/etc/passwd", ".git/config",
                                   "a/../../victim/secret.md", "x\\..\\y"])
 def test_lexical_escapes_are_refused(ag, projects, path):
