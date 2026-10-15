@@ -118,10 +118,21 @@ def _canon(fp: sexpr.Node) -> dict:
     for s in sexpr.find_all(fp, "fp_rect"):
         (x0, y0), (x1, y1) = _pt(sexpr.find(s, "start")), _pt(sexpr.find(s, "end"))
         shapes.append(("poly", _layers(s), tuple(sorted({(x0, y0), (x1, y0), (x1, y1), (x0, y1)}))))
+    boxes = {}
+    for b in sexpr.find_all(fp, "fp_text_box"):
+        if sexpr.find(b, "start") is not None:
+            (x0, y0), (x1, y1) = _pt(sexpr.find(b, "start")), _pt(sexpr.find(b, "end"))
+            corners = {(x0, y0), (x1, y0), (x1, y1), (x0, y1)}
+        else:
+            corners = set(_xys(b))
+        effects = sexpr.find(b, "effects")
+        justify = sexpr.find(effects, "justify") if effects else None
+        boxes[sexpr.unquote(b[1])] = (tuple(sorted(corners)), _angle(["at", 0, 0, *(sexpr.find(b, "angle") or ["angle", "0"])[1:]]),
+                                      _layers(b), tuple(sorted(justify[1:])) if justify else ())
     zones = sorted((_layers(z), tuple(sorted(_xys(sexpr.find(z, "polygon")))))
                    for z in sexpr.find_all(fp, "zone"))
     return {"layer": _layers(fp)[0], "at": (_pt(at), _angle(at)), "pads": pads,
-            "texts": texts, "shapes": sorted(shapes), "zones": zones}
+            "texts": texts, "shapes": sorted(shapes), "zones": zones, "boxes": boxes}
 
 
 @pytest.fixture(scope="module")
@@ -140,6 +151,7 @@ def test_the_emitter_places_a_footprint_the_way_kicad_does(placed, ref, rot, sid
     assert got["pads"] == want["pads"]
     assert got["shapes"] == want["shapes"]
     assert got["zones"] == want["zones"]
+    assert got["boxes"] == want["boxes"]
     # KiCad also writes the Datasheet and Description fields; every text the
     # emitter writes must match KiCad's.
     assert {k: want["texts"][k] for k in got["texts"]} == got["texts"]
@@ -281,3 +293,20 @@ def test_an_anchored_keepout_turns_over_with_its_bottom_side_part_once():
     emitted = sorted((x - 12.5, y - 12.5) for x, y in _xys(keepout))
     want = sorted(board.features[-1].shape.polygon)
     assert [v for p in emitted for v in p] == pytest.approx([v for p in want for v in p], abs=1e-3)
+
+
+def test_an_anchored_keepouts_layers_go_over_with_its_part_in_the_record():
+    """Stage 8 and the KiCad plugin read the HDM record, not the emitter's
+    output, so the record itself must say the keepout is on the back."""
+    board = _board(keepouts=[
+        {"anchor": "U1", "shape": "rect", "center": [3, 1], "size": [2, 2],
+         "layers": ["F.Cu", "F.Mask"], "name": "one-sided"},
+        {"anchor": "U1", "shape": "rect", "center": [-3, 1], "size": [2, 2], "name": "all"},
+    ])
+    bg.place_anchored(board, "U1", 20, 15, 0, "bottom")
+    record = {f["name"]: f["layers"] for f in bg.as_record(board)["features"]}
+    assert record == {"one-sided": ["B.Cu", "B.Mask"], "all": ["*.Cu"]}
+    top = _board(keepouts=[{"anchor": "U1", "shape": "rect", "center": [3, 1],
+                            "size": [2, 2], "layers": ["F.Cu"]}])
+    (placed,) = bg.place_anchored(top, "U1", 20, 15, 0, "top")
+    assert placed.layers == ("F.Cu",)

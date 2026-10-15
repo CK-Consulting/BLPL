@@ -282,6 +282,31 @@ def _orient_text(text: sexpr.Node, rot: float, bottom: bool) -> None:
     _set_angle(at, angle)
 
 
+def _flip_text_box(box: sexpr.Node) -> None:
+    """An fp_text_box turned over with its footprint.
+
+    Unlike fp_text, a text box keeps its angle relative to the footprint, so
+    rotation leaves it alone and only a flip changes it: corners mirrored,
+    layer swapped, text mirrored on a sided layer, and the angle ``a`` becomes
+    ``180 - a``, which is what pcbnew writes. Justification is not swapped —
+    a box has no keep-upright.
+    """
+    _mirror_points(box)
+    _flip_layers(box)
+    layer = sexpr.find(box, "layer")
+    name = sexpr.unquote(str(layer[1])) if layer is not None else ""
+    if name[:2] in ("F.", "B.") or name.endswith(".Cu"):
+        _toggle_text_mirror(box)
+    angle = sexpr.find(box, "angle")
+    flipped = _fmt((180.0 - (_num(angle[1]) if angle is not None else 0.0)) % 360.0)
+    if angle is not None:
+        angle[1:] = [flipped]
+    else:
+        anchor = sexpr.find(box, "pts") or sexpr.find(box, "end")
+        box.insert(box.index(anchor) + 1 if anchor is not None else len(box),
+                   ["angle", flipped])
+
+
 def _orient_pad(pad: sexpr.Node, rot: float, bottom: bool) -> None:
     at = sexpr.find(pad, "at")
     a = _angle_of(at) if at is not None else 0.0
@@ -355,6 +380,8 @@ def _orient_footprint(
             if bottom:
                 _mirror_points(child)
                 _flip_layers(child)
+        elif tag == "fp_text_box" and bottom:
+            _flip_text_box(child)
         elif tag == "zone":
             _orient_zone(child, x, y, orient, bottom)
     _override_footprint_position(footprint_node, x, y, orient)
@@ -1019,13 +1046,10 @@ def build(
         # among it — turns over with the rest of the part.
         _orient_footprint(fp_node, sheet_x, sheet_y, rot, side)
         # After orienting, not before: Stage 5 has already placed these in
-        # board coordinates, mirrored with a bottom-side part, so turning them
-        # again would put them back on the wrong side. Only their layers
-        # follow the part over, as the footprint's own zones' do.
-        for keepout in _anchored_keepouts(hdm, refdes):
-            if side.lower() == "bottom":
-                _flip_layers(keepout)
-            fp_node.append(keepout)
+        # board coordinates, mirrored with a bottom-side part and with their
+        # layers swapped (board_geometry.place_anchored), so turning them
+        # again would put them back on the wrong side.
+        fp_node.extend(_anchored_keepouts(hdm, refdes))
         node.append(fp_node)
 
     placeholders = sorted(r for r, c in components.items() if c.get("needs_manual_footprint"))
