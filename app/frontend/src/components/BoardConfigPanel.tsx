@@ -491,7 +491,7 @@ function FeatureList({
             {f.anchor && (
               <p className="muted small">
                 Coordinates are in {f.anchor}'s footprint frame, and the shape moves with the part.
-                A part on the bottom side cannot carry an anchored shape yet; Stage 5 refuses it.
+                On a bottom-side part it is mirrored with the footprint, and F./B. layers swap.
               </p>
             )}
             <ShapeFields prefix={prefix} spec={f} positioned onChange={(s) => set(i, s as BoardFeature)} />
