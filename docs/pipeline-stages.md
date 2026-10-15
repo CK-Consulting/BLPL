@@ -195,6 +195,57 @@ A stock module's own keepout reaches KiCad's DRC, but the placer does not
 model it. To keep parts clear of it while placing, declare it as an anchored
 keepout too.
 
+### Controlled impedance
+
+Which nets need a controlled impedance, and at what, is declared in the board's
+`project.yaml` (`core/blpl/core/impedance.py`). A net class names the target
+its widths are for; `controlled_impedance` tags nets by name. 50 Ω
+single-ended is the default:
+
+```yaml
+net_classes:
+  RF_50Ohm:
+    trace_width: 0.35          # from the fab's impedance calculator, this stackup
+    clearance: 0.2
+    impedance: 50              # true = 50; or {ohms, mode, tolerance_pct}
+  USB2_Diff_90Ohm:
+    trace_width: 0.18
+    diff_pair_gap: 0.15
+    impedance: {ohms: 90, mode: differential}
+controlled_impedance:
+  - nets: "_RF_(IN|OUT)$|^ANT_"
+  - nets: "_USB\\d*_D[PMN]$"
+    ohms: 90
+    mode: differential
+```
+
+Stage 5 moves each tagged net to the class it names, or to the one declared
+class with the same target. A differential tag brings in the net's pair partner.
+Each controlled net then carries `impedance` in the HDM, and so does every net
+Stage 4's name rules put on an impedance class. When no class has the target,
+one is made (`Z50_SE`, `Z90_DIFF`) with the Default class's geometry, so the
+board still builds. Stage 8 reports that as **ZC-001**, because a Default-width
+trace is not that impedance.
+
+The rest follows from that:
+
+- `.kicad_pro` carries each class's own `diff_pair_gap` and `diff_pair_width`,
+  where it used to write the clearance as the gap.
+- Synthesized test points leave controlled nets alone unless
+  `test_points.include_controlled_impedance` is set, because a pad on a
+  controlled line is a stub.
+- Stage 8 reports four findings:
+  - **ZC-001**: a controlled class has no stackup width.
+  - **ZC-002**: a differential class has no gap.
+  - **ZC-003**: a differential net has no pair partner.
+  - **ZC-004**: a class is named for an impedance, like `RF_50Ohm`, but
+    declares none.
+- `blpl release` writes `fab/impedance.md` for the board house. A package
+  where any width reads `NOT SET` is not quotable.
+
+The `controlled-impedance` skill covers choosing targets, routing, termination
+and ordering.
+
 `hdm.yaml` is the single source of truth for Stage 6. A human can read and edit it directly.
 
 Three things Stage 5 adds that no BOM row asked for:
