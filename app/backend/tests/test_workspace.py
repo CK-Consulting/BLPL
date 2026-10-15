@@ -800,3 +800,21 @@ def test_the_heartbeat_is_read_from_outside_the_projects_mount(unlocked, monkeyp
     monkeypatch.delenv("BLPL_KICAD_ACTIVE_FILE")
     assert main._kicad_active_file() == main._DATA / "kicad-desktop" / ".blpl-kicad-active"
     assert main.PROJECTS_ROOT not in main._kicad_active_file().parents
+
+
+def test_an_open_request_holds_the_project_before_the_desktop_has_seen_it(unlocked):
+    """The watcher polls; until it published a hold, a seal could take the
+    project out from under the KiCad about to open it (Codex, PR #33)."""
+    import time
+
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    request = main._kicad_open_request_file()
+    request.write_text("/config/projects/mine/.pipeline/mine_2026.kicad_pro\n")
+    assert _seal_now(unlocked)["sealed"] is False
+    assert (main.PROJECTS_ROOT / "mine").is_dir()
+
+    old = time.time() - main.KICAD_OPEN_HOLD_S - 5
+    os.utime(request, (old, old))
+    assert _seal_now(unlocked)["sealed"] is True

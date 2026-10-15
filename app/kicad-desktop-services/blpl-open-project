@@ -104,6 +104,10 @@ heartbeat() {
     # temporary name can redirect the write.
     tmp="$(mktemp "$(dirname "$ACTIVE")/.blpl-kicad-active.XXXXXX")" || return 0
     if { open_files; pending; } | sort -u > "$tmp"; then
+        # mktemp makes it 0600, and this runs as root while the backend runs
+        # as the deployment's user: unreadable, it read as "nothing open"
+        # (Codex, PR #33). It names paths, nothing secret.
+        chmod 0644 "$tmp"
         mv -f "$tmp" "$ACTIVE"
     else
         rm -f "$tmp"

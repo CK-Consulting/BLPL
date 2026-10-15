@@ -6360,6 +6360,9 @@ def _kicad_desktop_path(host_path: Path) -> str | None:
 
 #: A desktop heartbeat older than this is a desktop that is not running.
 KICAD_ACTIVE_FRESH_S = 120
+#: How long an "Open KiCad" request holds its project before the desktop's
+#: own lock is expected to.
+KICAD_OPEN_HOLD_S = 60
 
 
 def _kicad_active_file() -> Path:
@@ -6383,13 +6386,23 @@ def _kicad_desktop_holds(project_id: str) -> list[str]:
     """
     import time
 
+    lines: list[str] = []
     beat = _kicad_active_file()
     try:
-        if time.time() - beat.stat().st_mtime > KICAD_ACTIVE_FRESH_S:
-            return []
-        lines = [ln.strip() for ln in beat.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if time.time() - beat.stat().st_mtime <= KICAD_ACTIVE_FRESH_S:
+            lines = [ln.strip() for ln in beat.read_text(encoding="utf-8").splitlines() if ln.strip()]
     except OSError:
-        return []
+        pass
+    # An open this backend asked for in the last minute holds too, from the
+    # moment the request is written: the watcher polls, and until it has seen
+    # the request and published a hold of its own there was a window in which
+    # nothing held the project and a seal could take it (Codex, PR #33).
+    request = _kicad_open_request_file()
+    try:
+        if time.time() - request.stat().st_mtime <= KICAD_OPEN_HOLD_S:
+            lines += [ln.strip() for ln in request.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        pass
     roots = [r.rstrip("/") for r in (
         _kicad_desktop_path(PROJECTS_ROOT / project_id),
         _kicad_desktop_path(PROJECTS_ROOT / worktrees.WORKTREES_DIR / project_id),
