@@ -264,9 +264,12 @@ The rest follows from that:
   - a coplanar trace without *filled* ground copper on both sides at its
     declared gap;
   - a differential pair whose halves are not routed together: on different
-    layers, or side by side at a gap other than `diff_pair_gap`. Bends drawn
-    as arcs are measured against the partner's concentric arc. Stretches of
-    1 mm or less are breakouts at the pads and are not measured.
+    layers, or not side by side at `diff_pair_gap`.
+
+  Coupling and ground are judged by walking each controlled net's routed path
+  every 0.25 mm, along segments and arcs alike, so a curve or a partial
+  overlap is measured the same as a straight run. Up to 2 mm at each end of a
+  net may go unmeasured, where it breaks out to its pads.
 
   A class width is only the router's default and constrains no layer, so the
   release reads the board itself. Neither emitter pours ground, so that zone is
