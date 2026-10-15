@@ -768,6 +768,15 @@ def check_feature(board: Board, f: Feature) -> None:
             raise BoardGeometryError(f"{f.where} overlaps {other.where}")
 
 
+def _flip_layer(name: str) -> str:
+    """``F.Cu`` <-> ``B.Cu`` and the like; ``*.Cu`` and inner layers unchanged."""
+    if name.startswith("F."):
+        return "B." + name[2:]
+    if name.startswith("B."):
+        return "F." + name[2:]
+    return name
+
+
 def place_anchored(board: Board, ref: str, x: float, y: float, rot: float,
                    side: str = "top") -> list[Feature]:
     """Fix ``ref``'s anchored shapes at its placement, check them, and return them.
@@ -778,12 +787,18 @@ def place_anchored(board: Board, ref: str, x: float, y: float, rot: float,
     the wrong side of the part either way. The emitter now turns the footprint
     over the way KiCad does, and the shape goes where the part's own geometry
     goes: an antenna keepout stays over the antenna end of the module.
+
+    Its layers go over too, as a footprint's own zones' do: ``F.Cu`` under a
+    part on top is ``B.Cu`` under the same part on the bottom. Done here rather
+    than in the emitter, so that the HDM record Stage 8 and the KiCad plugin
+    read already says which side the keepout is on.
     """
     mirror = str(side).lower() == "bottom"
     placed = []
     for f in board.anchored_to(ref):
+        layers = tuple(_flip_layer(n) for n in f.layers) if mirror else f.layers
         g = Feature(f.kind, transform(f.shape, x, y, rot, mirror), f.where, anchor=f.anchor,
-                    layers=f.layers, forbid=f.forbid, name=f.name)
+                    layers=layers, forbid=f.forbid, name=f.name)
         check_feature(board, g)
         board.features.append(g)
         placed.append(g)

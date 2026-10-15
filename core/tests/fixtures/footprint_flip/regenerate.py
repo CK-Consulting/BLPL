@@ -10,8 +10,9 @@ and swapping both justifications). Run it with KiCad's Python:
 FlipProbe is authored for this test, not taken from a library: one of every
 kind of thing a flip has to carry — rotated, chamfered, trapezoid and custom
 pads, a drilled oval, an arc, a circle, a polygon, a courtyard rect, a
-back-side text, justified texts and a keepout zone. The placements follow the
-KiCad plugin's hdm_to_pcb: orient, then flip left to right.
+back-side text, justified texts, a plain and an angled text box and a keepout
+zone. The placements follow the KiCad plugin's hdm_to_pcb: orient, then flip
+left to right.
 """
 
 from pathlib import Path
