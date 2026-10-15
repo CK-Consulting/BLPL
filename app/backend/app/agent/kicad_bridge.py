@@ -49,6 +49,8 @@ POLICY: dict[str, tuple[ToolKind, Approval]] = {
     "search_symbols": ("query", "auto"),
     "search_footprints": ("query", "auto"),
     "extract_project_netlist": ("query", "auto"),
+    # What Edge.Cuts actually holds, to compare against project.yaml's outline.
+    "get_board_outline": ("query", "auto"),
     # -- mutations: these change the board -----------------------------------
     #
     # "ask" rather than "ask_always": routing is hundreds of calls, and a
@@ -60,6 +62,12 @@ POLICY: dict[str, tuple[ToolKind, Approval]] = {
     "set_footprint_position": ("kicad_mutation", "ask"),
     "align_footprints": ("kicad_mutation", "ask"),
     "distribute_footprints": ("kicad_mutation", "ask"),
+    # Only the rectangle is exposed, not kcaa's add_board_outline_segment /
+    # _arc that could draw any other shape. Edge.Cuts is regenerated from
+    # project.yaml on every emit, so a shape drawn into the .kicad_pcb is gone
+    # on the next build and, until then, contradicts the design file. Other
+    # shapes, cutouts and keepouts go through propose_board_shape, which edits
+    # project.yaml and checks the result the way Stage 5 will.
     "set_board_outline_rect": ("kicad_mutation", "ask_always"),
     "add_zone": ("kicad_mutation", "ask_always"),
     "set_net_class_rules": ("kicad_mutation", "ask_always"),

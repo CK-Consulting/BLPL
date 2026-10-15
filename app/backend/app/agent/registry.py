@@ -34,6 +34,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import yaml
+
 from blpl.agent.tools.bom import HOUSES as HOUSES_FOR_SCHEMA
 from blpl.agent.tools.parts import fetch_datasheet, search_parts
 
@@ -433,6 +435,80 @@ async def _propose_edit(ctx: ToolContext, args: dict) -> str:
     return (
         f"Proposed to {'update' if exists else 'create'} {rel} (proposal {proposal.id}). "
         "The user must accept it before anything is written; do not assume it is applied."
+    )
+
+
+async def _propose_board_shape(ctx: ToolContext, args: dict) -> str:
+    """A board's outline, cutouts and keepouts, as a proposal to its project.yaml.
+
+    Why this and not the KiCad bridge's ``set_board_outline_rect``: that draws
+    Edge.Cuts into the .kicad_pcb, which Stage 6 rewrites from project.yaml on
+    the next emit — so an outline drawn there is lost on the next build, and
+    until then the board and its design file describe two different boards.
+    project.yaml is where the shape is decided, so that is what this edits.
+
+    It builds the file itself rather than asking the model for it, because the
+    one rule a hand-built edit gets wrong is the one Stage 5 refuses for:
+    with an outline shape, ``dimensions`` must be its bounding box, and a
+    rounded corner or a circle has a bounding box nobody computes correctly in
+    their head. The size is measured by core's own shape builder and written
+    alongside, and the whole result is checked the way Stage 5 checks it
+    before the user is ever shown it.
+    """
+    from .. import board_config
+    from ..chat import ProposalStore, sha_of
+    from blpl.core.board_geometry import BoardGeometryError
+
+    target = _project_file(ctx, str(args.get("path", "")))
+    rel = _rel(ctx, target)
+    if target.name != "project.yaml":
+        raise ToolDenied(f"{rel} is not a board's project.yaml")
+    ctx.sandbox.check_write(target)
+    if not target.is_file():
+        raise ToolDenied(
+            f"{rel} does not exist yet. A board's shape is one part of its project.yaml; "
+            "create the file with propose_file_edit (or the board panel) first."
+        )
+    edits = {k: args[k] for k in ("outline", "cutouts", "keepouts") if k in args}
+    if not edits:
+        raise ToolDenied("give at least one of outline, cutouts or keepouts")
+
+    current = target.read_text(encoding="utf-8", errors="replace")
+    try:
+        config = yaml.safe_load(current) or {}
+    except yaml.YAMLError as exc:
+        raise ToolDenied(f"{rel} is not valid YAML, so there is nothing to edit: {exc}")
+    if not isinstance(config, dict):
+        raise ToolDenied(f"{rel} is not a mapping")
+    try:
+        new = board_config.with_shape(config, **edits)
+    except BoardGeometryError as exc:
+        raise ToolDenied(f"that outline cannot be built: {exc}")
+    errors = board_config.errors(new)
+    if errors:
+        raise ToolDenied(
+            "Stage 5 would refuse the result, so nothing was proposed:\n  "
+            + "\n  ".join(errors[:8])
+        )
+    new_content = board_config.render(new)
+    if sha_of(new_content) == sha_of(current):
+        raise ToolDenied(f"{rel} already describes exactly this board")
+
+    # The base is the bytes this tool just read and built from, so accepting
+    # it over a file that has changed since is a conflict, not a revert.
+    proposal = ProposalStore(ctx.project_dir).create(
+        path=rel,
+        new_content=new_content,
+        rationale=str(args.get("rationale", "")),
+        base_sha=sha_of(current),
+        conversation=ctx.conversation,
+    )
+    w, h = (new.get("project") or {}).get("dimensions") or [None, None]
+    return (
+        f"Proposed a new board shape for {rel} (proposal {proposal.id}); dimensions "
+        f"{w} x {h} mm. The user must accept it before anything is written. Comments in "
+        "the file are not preserved — the diff shows them going. Re-run Stage 5 after it "
+        "is accepted for the board to change."
     )
 
 
@@ -1643,6 +1719,61 @@ def project_tools() -> list[ToolSpec]:
             # approval, and asking twice for one decision trains people to click.
             kind="file_read",
             handler=_propose_edit,
+            path_args=("path",),
+            write_args=("path",),
+        ),
+        ToolSpec(
+            name="propose_board_shape",
+            description=(
+                "Propose a board's outline, cutouts and/or keepouts in its project.yaml. The "
+                "user reviews it as a diff, as with propose_file_edit. Use this rather than "
+                "editing boundaries by hand: it sets project.dimensions to the outline's "
+                "bounding box (Stage 5 refuses a file where they differ), replaces the legacy "
+                "'type: rect' block, and checks the result as Stage 5 will. Prefer it to the "
+                "KiCad tool set_board_outline_rect, whose drawing is overwritten by the next "
+                "emit.\n\n"
+                "Board mm, origin top-left, y down. A shape is one of:\n"
+                "  {shape: rect, size: [w, h], corner_radius?, origin?: [x, y] | center?: [x, y]}\n"
+                "  {shape: circle, diameter (or radius), origin?: [x, y] | center?: [x, y]}\n"
+                "  {shape: polygon, points: [[x, y], ...], corner_radius?}\n"
+                "  {shape: trapezoid, bottom, top, height, top_offset?, corner_radius?, "
+                "origin? | center?}\n"
+                "origin is always the top-left of the shape's bounding box. A polygon's points "
+                "are its position: it takes neither origin nor center. An outline with no "
+                "origin/center sits at (0, 0); no point may be at negative x or y. Cutouts and "
+                "keepouts are shapes centred on (0, 0) unless they give center/origin, and may "
+                "add name and anchor (a refdes: the shape is then in that part's frame and "
+                "follows it, mirrored with it on a bottom-side part, with F./B. layers swapped). "
+                "Keepouts may add "
+                "layers (default "
+                "['*.Cu']) and forbid (any of tracks, vias, pads, copperpour, footprints; "
+                "default all). A cutout must lie wholly inside the outline — a notch in the "
+                "edge belongs in the outline polygon.\n\n"
+                "Each of outline, cutouts and keepouts replaces what is there when given and is "
+                "left alone when omitted. outline: null goes back to a plain rectangle of "
+                "the current dimensions; an empty list removes all cutouts or keepouts."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "The board's project.yaml, relative to the project root: "
+                            "project.yaml on a single-board project, <board>/project.yaml "
+                            "on a multi-board one."
+                        ),
+                    },
+                    "outline": {"type": ["object", "null"], "description": "The board outline shape."},
+                    "cutouts": {"type": "array", "items": {"type": "object"}},
+                    "keepouts": {"type": "array", "items": {"type": "object"}},
+                    "rationale": {"type": "string", "description": "What changed and why, briefly."},
+                },
+                "required": ["path", "rationale"],
+            },
+            # Like propose_file_edit: the accept step is the approval.
+            kind="file_read",
+            handler=_propose_board_shape,
             path_args=("path",),
             write_args=("path",),
         ),

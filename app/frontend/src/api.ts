@@ -8,6 +8,8 @@
 // mid-session — the failure mode being "the app stops working after a while",
 // which is miserable to diagnose.
 
+import type { ShapeSpec as BoardShape } from "./boardShape";
+
 let getToken: () => Promise<string | null> = async () => null;
 let onLocked: () => void = () => {};
 let onNeedsUnlock: () => void = () => {};
@@ -569,6 +571,14 @@ export type Run = {
 };
 
 /** One board's project.yaml, plus whether it currently validates. */
+/** A cutout or keepout: a shape, optionally following a part, plus what it forbids. */
+export type BoardFeature = BoardShape & {
+  name?: string;
+  anchor?: string;
+  layers?: string[];
+  forbid?: string[];
+};
+
 export type BoardConfig = {
   board: string;
   exists: boolean;
@@ -581,6 +591,13 @@ export type BoardConfig = {
       board_id?: string;
       dimensions?: [number, number];
       stackup?: { layers?: number; thickness?: number; finish?: string };
+    };
+    /** Outline, cutouts and keepouts; shapes as in src/boardShape.ts. */
+    boundaries?: {
+      board_outline?: BoardShape & { type?: string; start?: unknown; end?: unknown };
+      cutouts?: BoardFeature[];
+      keepouts?: BoardFeature[];
+      [k: string]: unknown;
     };
     [k: string]: unknown;
   };

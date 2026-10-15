@@ -128,6 +128,21 @@ def test_reads_are_free_and_writes_are_not(monkeypatch) -> None:
     assert specs["revert_kicad_edits"].approval == "ask_always"
 
 
+def test_the_outline_can_be_read_but_only_a_rectangle_drawn(monkeypatch) -> None:
+    """Edge.Cuts is regenerated from project.yaml on every emit, so a shape
+    drawn segment by segment into the .kicad_pcb would vanish on the next build
+    and contradict the design file until then. Other shapes go through
+    propose_board_shape instead."""
+    _fake_client(sorted(kb.REQUIRED) + ["add_board_outline_segment", "add_board_outline_arc",
+                                        "clear_board_outline"], monkeypatch)
+    _status, usable = kb.probe("http://kcaa:9000/mcp")
+    specs = {s.name: s for s in kb.build_tools("http://kcaa:9000/mcp", usable)}
+    assert specs["get_board_outline"].kind == "query"
+    assert specs["get_board_outline"].approval == "auto"
+    assert not {"add_board_outline_segment", "add_board_outline_arc",
+                "clear_board_outline"} & set(specs)
+
+
 # -- the undo anchor ----------------------------------------------------------
 
 

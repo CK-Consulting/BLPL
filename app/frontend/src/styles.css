@@ -949,6 +949,21 @@ header .kicad-launch { margin-left: .4rem; }
 .board-config label { display: flex; flex-direction: column; gap: .2rem; }
 .board-config label > span { color: #7d8590; font-size: 12px; }
 .board-config input[type="number"] { width: 7rem; }
+.board-config input[readonly] { opacity: .7; }
+/* The board as the file describes it. y is down in both board mm and SVG, so
+   the drawing needs no flip. Strokes stay one pixel at any board size. */
+.board-preview { margin: .6rem 0; }
+.board-preview svg { display: block; width: 100%; max-width: 360px; max-height: 260px;
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px; }
+.board-preview-outline { fill: #1f3a2a; stroke: #7ee2a8; stroke-width: 1.5; }
+.board-preview-cutout { fill: #0d1117; stroke: #7ee2a8; stroke-width: 1; }
+.board-preview-keepout { fill: rgba(255, 123, 114, .18); stroke: #ff7b72; stroke-width: 1;
+  stroke-dasharray: 4 3; }
+.board-features { margin: .8rem 0; padding: .4rem .8rem; border: 1px solid #30363d; border-radius: 6px; }
+.board-features legend { color: #b9c3d0; font-size: 13px; padding: 0 .3rem; }
+.board-feature { padding: .3rem 0; border-bottom: 1px dashed #30363d; }
+.board-forbid { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; font-size: 12px; }
+.board-config label.inline { flex-direction: row; align-items: center; gap: .25rem; }
 /* Errors in the field-qualified form the schema reports them in, so the message
    names the thing to fix rather than describing it. */
 .config-errors { margin: .6rem 0; padding: .5rem .8rem; list-style: disc inside;
