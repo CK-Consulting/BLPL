@@ -680,7 +680,27 @@ def from_config(config: dict) -> Board:
     raw_outline = boundaries.get("board_outline") or {}
     notes: list[str] = []
 
-    if isinstance(raw_outline, dict) and "shape" in raw_outline:
+    # Only an absent outline and the legacy forms may fall back to the
+    # dimensions rectangle. The schema requires neither 'shape' nor 'type' and
+    # allows extra keys, so a typo such as 'shpae: circle' used to pass it and
+    # build a rectangle the text does not describe, with nothing said.
+    if not isinstance(raw_outline, dict):
+        raise BoardGeometryError(
+            f"boundaries.board_outline must be a mapping with a 'shape', "
+            f"not {type(raw_outline).__name__} {raw_outline!r}"
+        )
+    if raw_outline and "shape" not in raw_outline and raw_outline.get("type") not in (
+            "rect", "polygon"):
+        keys = ", ".join(sorted(str(k) for k in raw_outline))
+        legacy = (f" and the legacy 'type' is {raw_outline['type']!r}, not 'rect'"
+                  if "type" in raw_outline else "")
+        raise BoardGeometryError(
+            f"boundaries.board_outline has no 'shape'{legacy} (it gives: {keys}). "
+            "Describe the outline with 'shape:' (rect, circle, trapezoid or polygon), "
+            "or remove the block to use project.dimensions."
+        )
+
+    if "shape" in raw_outline:
         outline = shape(raw_outline, "boundaries.board_outline", default="origin")
         x0, y0, x1, y1 = outline.bbox
         if abs((x1 - x0) - dw) > 0.01 or abs((y1 - y0) - dh) > 0.01:
@@ -700,7 +720,7 @@ def from_config(config: dict) -> Board:
             )
         declared = True
     else:
-        if isinstance(raw_outline, dict) and raw_outline.get("type") == "rect":
+        if raw_outline.get("type") == "rect":
             start, end = raw_outline.get("start"), raw_outline.get("end")
             try:
                 lw = float(end[0]) - float(start[0])
@@ -714,7 +734,7 @@ def from_config(config: dict) -> Board:
                     )
             except (TypeError, ValueError, IndexError):
                 pass
-        elif isinstance(raw_outline, dict) and raw_outline.get("type") == "polygon":
+        elif raw_outline.get("type") == "polygon":
             # The schema has accepted this since the first version and the
             # emitter has always drawn a rectangle anyway. Refusing is the
             # honest answer now that a polygon can actually be drawn.

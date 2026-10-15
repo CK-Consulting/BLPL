@@ -108,6 +108,28 @@ def test_a_legacy_polygon_is_refused_rather_than_drawn_as_a_rectangle():
         bg.from_config(_config({"type": "polygon"}))
 
 
+@pytest.mark.parametrize("outline, match", [
+    # A typo of 'shape' passed the schema and built a 50 x 30 rectangle.
+    ({"shpae": "circle", "diameter": 40}, r"no 'shape'.*diameter, shpae"),
+    ({"type": "circle", "diameter": 40}, r"legacy 'type' is 'circle'"),
+    ({"layer": "Edge.Cuts", "width": 0.1}, r"no 'shape'.*layer, width"),
+    ("circle", "must be a mapping"),
+    ([[0, 0], [50, 0], [25, 30]], "must be a mapping"),
+])
+def test_an_outline_that_is_not_a_known_form_is_refused_not_made_a_rectangle(outline, match):
+    with pytest.raises(bg.BoardGeometryError, match=match):
+        bg.from_config(_config(outline))
+
+
+@pytest.mark.parametrize("outline", [None, {}, ""])
+def test_an_absent_outline_is_the_dimensions_rectangle(outline):
+    config = _config()
+    config["boundaries"]["board_outline"] = outline
+    board = bg.from_config(config)
+    assert board.size == pytest.approx((50, 30))
+    assert not board.declared and not board.notes
+
+
 def test_dimensions_must_agree_with_a_shaped_outline():
     with pytest.raises(bg.BoardGeometryError, match=r"set dimensions to \[40, 40\]"):
         bg.from_config(_config({"shape": "circle", "diameter": 40}, dims=(50, 30)))
