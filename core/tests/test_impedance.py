@@ -384,3 +384,38 @@ def test_a_pair_width_alone_is_a_stackup_width_for_a_differential_class():
            "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
                     "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}
     assert z.review(hdm) == []
+
+
+# --- coplanar and release errors (Codex, PR #31) --------------------------------------
+
+
+def test_a_coplanar_class_needs_its_ground_gap_and_the_sheet_prints_it():
+    hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "impedance": {"ohms": 50, "mode": "coplanar"}}},
+           "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
+    (f,) = z.review(hdm)
+    assert (f["rule_id"], f["severity"]) == ("ZC-006", "error")
+    assert "| CPW | 50 Ω coplanar | ±10% | 0.3 | NOT SET | ANT |" in z.fab_table(hdm)
+    hdm["net_classes"]["CPW"]["coplanar_gap"] = 0.15
+    assert z.review(hdm) == []
+    assert "| CPW | 50 Ω coplanar | ±10% | 0.3 | 0.15 | ANT |" in z.fab_table(hdm)
+
+
+def test_a_coplanar_gap_is_the_clearance_the_pour_keeps():
+    hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "clearance": 0.2, "coplanar_gap": 0.15,
+                                   "impedance": {"ohms": 50, "mode": "coplanar"}}}, "nets": {}}
+    (cpw,) = [c for c in pro.build(hdm, project_filename="p.kicad_pro")["net_settings"]["classes"]
+              if c["name"] == "CPW"]
+    assert cpw["clearance"] == 0.15
+
+
+def test_a_release_with_a_pair_split_across_complete_classes_is_not_quotable(released):
+    """Every cell of the sheet is filled, and it still asks for two geometries
+    for one coupled pair."""
+    proj, build = released
+    full = {"trace_width": 0.18, "diff_pair_gap": 0.15, "impedance": {"ohms": 90, "mode": "differential"}}
+    manifest = build({"net_classes": {"A": full, "B": {**full, "diff_pair_gap": 0.1}},
+                      "nets": {"X_P": {"class": "A", "impedance": {"ohms": 90}, "diff_pair_of": "X_N"},
+                               "X_N": {"class": "B", "impedance": {"ohms": 90}, "diff_pair_of": "X_P"}}})
+    assert not manifest["quotable"]
+    (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
+    assert "ZC-005" in step["detail"]

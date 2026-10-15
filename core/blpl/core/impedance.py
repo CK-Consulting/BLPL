@@ -295,6 +295,18 @@ def width_key(rules: dict, spec: Spec) -> str:
     return "trace_width"
 
 
+#: The gap that sets each mode's impedance alongside the width: a pair's
+#: inner gap, or a coplanar line's gap to the ground pour beside it.
+GAP_KEY = {"differential": "diff_pair_gap", "coplanar": "coplanar_gap"}
+
+
+def _gap(rules: dict, spec: Spec) -> str:
+    key = GAP_KEY.get(spec.mode)
+    if key is None:
+        return "—"
+    return f"{rules[key]}" if key in rules else "NOT SET"
+
+
 def _has_width(rules: dict, spec: Spec) -> bool:
     return rules.get("synthesized") != SYNTHESIZED and width_key(rules, spec) in rules
 
@@ -363,6 +375,15 @@ def review(hdm: dict) -> list[dict]:
                 f"Add the diff_pair_gap your fab's calculator gives for {spec.label} to "
                 f"net_classes.{name}.",
                 nets_=members)
+        if spec.mode == "coplanar" and "coplanar_gap" not in rules:
+            finding(
+                "ZC-006", "error",
+                f"Class {name} is {spec.label} but declares no coplanar_gap. A grounded "
+                "coplanar line's impedance is set by its gap to the ground pour beside it "
+                "as much as by its width.",
+                f"Add the coplanar_gap your fab's calculator gives for {spec.label} to "
+                f"net_classes.{name}, and keep the ground pour that far from the trace.",
+                nets_=members)
         if spec.mode == "differential":
             lonely = [n for n in members if nets.get(n, {}).get("diff_pair_of") not in nets]
             split = sorted(
@@ -410,7 +431,10 @@ def fab_table(hdm: dict) -> str | None:
         "verify with a TDR test coupon. Please confirm before fabrication if the target",
         "cannot be met on the stackup quoted.",
         "",
-        "| Net class | Target | Tolerance | Trace width (mm) | Pair gap (mm) | Nets |",
+        "Gap is the inner gap of a differential pair, or a coplanar line's gap to the",
+        "ground pour on either side.",
+        "",
+        "| Net class | Target | Tolerance | Trace width (mm) | Gap (mm) | Nets |",
         "|---|---|---|---|---|---|",
     ]
     for cls in sorted(rows):
@@ -420,8 +444,7 @@ def fab_table(hdm: dict) -> str | None:
         # the class gives one. The sheet and the project must say the same.
         width = (f"{rules[width_key(rules, spec)]}" if _has_width(rules, spec)
                  else "NOT SET")
-        gap = (f"{rules['diff_pair_gap']}" if "diff_pair_gap" in rules
-               else ("NOT SET" if spec.mode == "differential" else "—"))
+        gap = _gap(rules, spec)
         names = sorted(rows[cls])
         shown = ", ".join(names[:8]) + (f" and {len(names) - 8} more" if len(names) > 8 else "")
         lines.append(

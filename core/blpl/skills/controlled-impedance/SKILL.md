@@ -84,9 +84,12 @@ what the board "probably" carries.
    - **ZC-005** — the two halves of a pair on different classes, so they would
      be routed with different geometry. One tag or rule must match both names.
      (A half that reaches a differential class alone brings its partner along.)
+   - **ZC-006** — a coplanar class with no `coplanar_gap`: the gap to the
+     ground pour sets its impedance as much as the width does.
 5. **Release.** `blpl release` writes `fab/impedance.md` — class, target,
    tolerance, width, gap, nets — for the board house, and refuses to mark the
-   package quotable while any controlled class says `NOT SET`. Order with
+   package quotable while any ZC error stands (a cell reading `NOT SET`, a pair
+   split across classes, a missing gap). Order with
    impedance control and a TDR test coupon; ±10 % is the usual tolerance,
    tighter costs more.
 
@@ -191,7 +194,9 @@ in the nearest reference plane.
 - No stubs: a test pad, a T-branch or an unused via barrel on a controlled
   line is a stub. (BLPL leaves controlled nets off synthesized test points.)
 - Coplanar lines: the ground pour beside the trace is at the calculated gap,
-  with a via fence along it.
+  with a via fence along it. Declare that gap as the class's `coplanar_gap`;
+  BLPL writes it as the class clearance in `.kicad_pro`, which is the distance
+  KiCad keeps the pour from the trace.
 
 ## Termination: match the ends too
 

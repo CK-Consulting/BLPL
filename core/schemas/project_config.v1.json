@@ -60,6 +60,10 @@
             "description": "Edge-to-edge gap inside a differential pair. Sets a differential impedance as much as the width does.",
             "type": "number", "exclusiveMinimum": 0, "maximum": 20
           },
+          "coplanar_gap": {
+            "description": "Gap from a coplanar line to the ground pour on either side. Sets a coplanar impedance as much as the width does.",
+            "type": "number", "exclusiveMinimum": 0, "maximum": 20
+          },
           "impedance": { "$ref": "#/$defs/impedance" }
         }
       }

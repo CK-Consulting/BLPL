@@ -430,11 +430,16 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
     dest = out_dir / "fab" / "impedance.md"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(table, encoding="utf-8")
-    if "NOT SET" in table:
+    # Any impedance error Stage 8 would report blocks the package, not only a
+    # missing number: two complete classes for one pair (ZC-005) fill every
+    # cell of the sheet and still ask the fab for two geometries at once.
+    errors = sorted({f["rule_id"] for f in impedance.review(hdm) if f["severity"] == "error"})
+    if "NOT SET" in table or errors:
         return Step(
             "impedance", False,
-            "a controlled-impedance class has no trace width (or pair gap) from a stackup; "
-            "see fab/impedance.md and Stage 8's ZC findings",
+            "controlled impedance is not ready for a fab"
+            + (f" ({', '.join(errors)})" if errors else "")
+            + "; see fab/impedance.md and Stage 8's ZC findings",
             [str(dest.relative_to(out_dir))],
         )
     return Step("impedance", True, "", [str(dest.relative_to(out_dir))])

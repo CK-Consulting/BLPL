@@ -20,7 +20,11 @@ def build(hdm: dict, *, project_filename: str) -> dict:
         classes.append(
             {
                 "name": name,
-                "clearance": rules.get("clearance", 0.2),
+                # A coplanar line's impedance is set by its gap to the ground
+                # pour beside it, and the pour keeps the class clearance from
+                # the trace. So that gap is the clearance, or the pour lands
+                # somewhere the fab sheet does not say.
+                "clearance": rules.get("coplanar_gap", rules.get("clearance", 0.2)),
                 "track_width": rules.get("trace_width", 0.25),
                 "via_diameter": rules.get("via_dia", 0.6),
                 "via_drill": rules.get("via_drill", 0.3),
