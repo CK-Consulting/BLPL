@@ -613,6 +613,63 @@ def place_model(data: bytes, project_dir: str | Path, library: str, original_nam
     )
 
 
+def follow_moved_models(project_dir: str | Path, mapping: dict[str, str]) -> list[tuple[str, str]]:
+    """Point every project footprint that names a moved model at where it went.
+
+    ``mapping`` is old -> new project-relative path for each model that moved.
+    The relinker writes a footprint's model as ``${KIPRJMOD}/../<path>``, exact,
+    so a moved model (or its whole ``.3dshapes`` folder) left those footprints
+    naming a file that is not there, and the next board came out without the 3D
+    body and nothing said so. Rewritten through the parser and read back, as
+    every relink is.
+
+    Returns (footprint path, its text before) for each footprint changed, so a
+    caller whose move fails afterwards can put them back with ``restore_texts``.
+    """
+    project_dir = Path(project_dir)
+    prefix = "${KIPRJMOD}/../"
+    wanted = {prefix + old: prefix + new for old, new in mapping.items()}
+    if not wanted:
+        return []
+    before: list[tuple[str, str]] = []
+    root = project_dir / FOOTPRINTS_DIR
+    for fp in sorted(root.glob("*.pretty/*.kicad_mod")) if root.is_dir() else []:
+        if fp.is_symlink() or not fp.is_file():
+            continue
+        try:
+            text = fp.read_text(encoding="utf-8")
+            node = sexpr.parse(text)
+        except (OSError, sexpr.ParseError, RecursionError, UnicodeDecodeError):
+            continue
+        changed = []
+        for child in sexpr.find_all(node, "model"):
+            if len(child) < 2 or not isinstance(child[1], str):
+                continue
+            raw = sexpr.unquote(child[1])
+            if raw in wanted:
+                child[1] = sexpr.quote(wanted[raw])
+                changed.append((raw, wanted[raw]))
+        if changed:
+            rel = fp.relative_to(project_dir).as_posix()
+            out = _dump_relinked(node, changed, fp.name)
+            before.append((rel, text))
+            try:
+                _write(fp, out)
+            except BaseException:
+                restore_texts(project_dir, before[:-1])
+                raise
+    return before
+
+
+def restore_texts(project_dir: str | Path, saved: list[tuple[str, str]]) -> None:
+    """Put back files ``follow_moved_models`` changed, best effort."""
+    for rel, text in saved:
+        try:
+            _write(Path(project_dir) / rel, text)
+        except OSError:
+            pass
+
+
 # --------------------------------------------------------------------------- bundles
 
 # Limits on a vendor zip. Vendor library bundles are a few files and a few
