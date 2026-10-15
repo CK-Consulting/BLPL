@@ -72,6 +72,21 @@ class LoadHDMPlugin(pcbnew.ActionPlugin):
             )
             return
 
+        # Build the outline, cutouts and keepouts before touching the board. A
+        # refusal (an unknown segment, a keepout on a layer this board lacks)
+        # then leaves the open board exactly as it was, rather than half-drawn
+        # and doubled up on a retry. This board's stackup is the user's and is
+        # not changed to suit the HDM.
+        try:
+            geometry = hdm_to_pcb._board_geometry(board, hdm, pcbnew)
+        except ValueError as exc:
+            wx.MessageBox(
+                f"Nothing was added — the board outline cannot be drawn: {exc}",
+                self.name,
+                wx.OK | wx.ICON_ERROR,
+            )
+            return
+
         # hdm_to_pcb.build_board creates a fresh BOARD; we want to add into the
         # existing one. Reuse the lower-level helpers instead.
         pad_to_net = hdm_to_pcb._pad_net_table(hdm)
@@ -89,16 +104,13 @@ class LoadHDMPlugin(pcbnew.ActionPlugin):
             else:
                 missing.append(refdes)
 
-        try:
-            segs, keepouts = hdm_to_pcb._add_board_geometry(board, hdm, pcbnew)
-        except ValueError as exc:
-            wx.MessageBox(
-                f"Footprints were placed, but the board outline was not drawn: {exc}",
-                self.name,
-                wx.OK | wx.ICON_ERROR,
-            )
-            pcbnew.Refresh()
-            return
+        if geometry is None:
+            width, height = hdm_to_pcb._board_dimensions(hdm)
+            segs = hdm_to_pcb._add_edge_cuts_rect(board, width, height, pcbnew)
+            keepouts = 0
+        else:
+            geometry.add_to(board)
+            segs, keepouts = geometry.edge_cut_segments, geometry.keepout_zones
 
         pcbnew.Refresh()
         wx.MessageBox(

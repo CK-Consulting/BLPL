@@ -191,6 +191,18 @@ class _FakeNet:
 class _FakeBoard:
     def __init__(self) -> None:
         self.items: list = []
+        # A fresh pcbnew BOARD has two copper layers.
+        self.copper_layers = 2
+
+    def SetCopperLayerCount(self, n: int) -> None:
+        self.copper_layers = n
+
+    def GetCopperLayerCount(self) -> int:
+        return self.copper_layers
+
+    def IsLayerEnabled(self, layer_id: int) -> bool:
+        inner = {_LAYER_IDS["In1.Cu"], _LAYER_IDS["In2.Cu"]}
+        return layer_id not in inner or self.copper_layers >= 4
 
     def Add(self, item) -> None:
         self.items.append(item)
@@ -223,6 +235,7 @@ def _make_fake_pcbnew(footprint_lookup: dict[tuple[str, str], _FakeFootprint]) -
         PCB_SHAPE=_FakeShape,
         ZONE=_FakeZone,
         LSET=_FakeLayerSet,
+        IsCopperLayer=lambda layer_id: layer_id in _ALL_CU_IDS,
         VECTOR2I=_FakeVector2I,
         Edge_Cuts="Edge.Cuts",
         SHAPE_T_SEGMENT="SEGMENT",
@@ -457,6 +470,35 @@ def test_board_geometry_unknown_segment_kind_is_refused() -> None:
     hdm["board_geometry"]["outline"]["segments"][0]["kind"] = "bezier"
     with pytest.raises(ValueError, match="bezier"):
         _build(hdm)
+
+
+def test_board_geometry_inner_layer_keepout_refused_on_two_layer_board() -> None:
+    """GetLayerID resolves In1.Cu on a two-layer board; the rule would guard nothing."""
+    hdm = _shaped_hdm()
+    hdm["board_geometry"]["features"][1]["layers"] = ["In1.Cu"]
+    with pytest.raises(ValueError, match="In1.Cu.*2-layer"):
+        _build(hdm)
+
+
+def test_board_geometry_inner_layer_keepout_follows_hdm_stackup() -> None:
+    hdm = _shaped_hdm()
+    hdm["project"]["stackup"] = {"layers": 4, "thickness": 1.6}
+    hdm["board_geometry"]["features"][1]["layers"] = ["In1.Cu"]
+    board, report = _build(hdm)
+    assert board.copper_layers == 4
+    assert report.keepout_zones == 1
+    zone = next(it for it in board.items if isinstance(it, _FakeZone))
+    assert zone.layer_set.layers == {_LAYER_IDS["In1.Cu"]}
+
+
+def test_board_geometry_refusal_adds_nothing_to_the_board() -> None:
+    """A late failure must not leave the outline's first segments on an open board."""
+    hdm = _shaped_hdm()
+    hdm["board_geometry"]["features"][1]["layers"] = ["In7.Cu"]
+    board = _FakeBoard()
+    with pytest.raises(ValueError):
+        hdm_to_pcb._add_board_geometry(board, hdm, _make_fake_pcbnew({}))
+    assert board.items == []
 
 
 def test_board_geometry_absent_falls_back_to_dimensions_rectangle() -> None:
