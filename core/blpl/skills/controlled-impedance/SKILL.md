@@ -91,6 +91,8 @@ what the board "probably" carries.
      layers: [F.Cu]}`.
    - **ZC-008** — a tag whose pattern matches no net; fix the pattern to the
      names in `nets.json`.
+   - **ZC-009** — a single-ended or differential impedance on a one-layer
+     board, which has nowhere for its reference plane. Coplanar is allowed.
 
    ZC-003 and every ZC finding except ZC-004 are errors.
 5. **Release.** The release build — the app's release action, or

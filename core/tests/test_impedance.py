@@ -798,3 +798,33 @@ def test_an_inner_trace_needs_planes_on_both_sides():
     seg = '(segment (start 0 0) (end 20 0) (width 0.15) (layer "In1.Cu") (net "ANT"))'
     top = _filled('(net "GND")', "F.Cu", (-5, -5, 25, 5))
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {top})")) == [("RF", "In1.Cu", "In2.Cu")]
+
+
+# --- an unmatched tag alone, and one-layer boards (Codex, PR #31) --------------------
+
+
+def test_a_release_whose_only_tag_matched_nothing_is_not_quotable(released):
+    """No controlled net, so no table, and the release used to stop there
+    before ZC-008 could be asked."""
+    proj, build = released
+    manifest = build({"net_classes": {}, "nets": {"ANT": {"class": "Default"}},
+                      "synthesis": {"controlled_impedance": {"unmatched": ["controlled_impedance[0] ('^ANNT_')"]}}})
+    assert not manifest["quotable"]
+    (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
+    assert "ZC-008" in step["detail"]
+
+
+def test_a_plane_dependent_impedance_on_a_one_layer_board_is_an_error():
+    from blpl.emitter import sexpr
+
+    hdm = {"project": {"stackup": {"layers": 1}},
+           "net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}}
+    assert [f["rule_id"] for f in z.review(hdm)] == ["ZC-009"]
+    seg = '(segment (start 0 0) (end 20 0) (width 0.35) (layer "F.Cu") (net "ANT"))'
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg})")) == [("RF", "F.Cu", "none")]
+    # Coplanar can stand on its own ground beside the trace.
+    hdm["net_classes"]["RF"] = {"trace_width": 0.35, "coplanar_gap": 0.15,
+                                "impedance": {"ohms": 50, "mode": "coplanar"}}
+    assert z.review(hdm) == []
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg})")) == []

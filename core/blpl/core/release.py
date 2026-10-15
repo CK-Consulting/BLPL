@@ -424,8 +424,16 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
     if hdm_path is None:
         return Step("impedance", True, "no hdm.yaml; nothing to say about impedance")
     hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {}
+    # Review first. A tag that matched nothing leaves no controlled net and so
+    # no table, and returning "nothing to control" before asking would let the
+    # requirement it was meant to carry vanish from a quotable package.
+    errors = sorted({f["rule_id"] for f in impedance.review(hdm) if f["severity"] == "error"})
     table = impedance.fab_table(hdm)
     if table is None:
+        if errors:
+            return Step("impedance", False,
+                        f"controlled impedance is not ready for a fab ({', '.join(errors)}); "
+                        "see Stage 8's ZC findings")
         return Step("impedance", True, "no impedance-controlled nets")
     dest = out_dir / "fab" / "impedance.md"
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -433,7 +441,6 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
     # Any impedance error Stage 8 would report blocks the package, not only a
     # missing number: two complete classes for one pair (ZC-005) fill every
     # cell of the sheet and still ask the fab for two geometries at once.
-    errors = sorted({f["rule_id"] for f in impedance.review(hdm) if f["severity"] == "error"})
     # And what was routed: a class width is right at its width, on its layer,
     # and a coplanar line only with its ground copper beside it.
     if pcb is not None and pcb.is_file():
@@ -448,7 +455,8 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
                 + [f"{cls} has no ground zone on {lay}"
                    for cls, lay in impedance.coplanar_without_ground(hdm, board)]
                 + impedance.pair_problems(hdm, board)
-                + [f"{cls} on {lay} has no plane on {ref} under it"
+                + [(f"{cls} on {lay} has no reference layer at all" if ref == "none"
+                    else f"{cls} on {lay} has no plane on {ref} under it")
                    for cls, lay, ref in impedance.missing_reference(hdm, board)]
             )
         except Exception as exc:  # an unreadable board cannot be vouched for

@@ -427,6 +427,16 @@ def review(hdm: dict) -> list[dict]:
                 f"Add the diff_pair_gap your fab's calculator gives for {spec.label} to "
                 f"net_classes.{name}.",
                 nets_=members)
+        if copper == 1 and spec.mode != "coplanar":
+            finding(
+                "ZC-009", "error",
+                f"Class {name} is {spec.label} on a one-layer board. A {spec.mode.replace('_', '-')} "
+                "impedance is a trace over a plane, and a one-layer board has no layer to put "
+                "one on.",
+                f"Make the board two layers or more, or make {name} coplanar with ground "
+                "copper beside the trace (mode: coplanar, coplanar_gap) if the fab's "
+                "calculator gives a coplanar width without a plane under it.",
+                nets_=members)
         if copper > 2 and not spec.layers:
             finding(
                 "ZC-007", "error",
@@ -971,6 +981,11 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
             if not refs and lay in order:
                 i = order.index(lay)
                 refs = [order[j] for j in (i - 1, i + 1) if 0 <= j < len(order)]
+            if not refs and spec.mode != "coplanar":
+                # No layer to be over: a one-layer board, or a layer outside the
+                # stackup. Nothing to find is not the same as nothing missing.
+                out.add((cls, lay, "none"))
+                continue
             for ref in refs:
                 if not any(point_in_polygon(pt, poly) for poly in planes.get(ref, [])):
                     out.add((cls, lay, ref))
