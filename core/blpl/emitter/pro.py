@@ -24,8 +24,12 @@ def build(hdm: dict, *, project_filename: str) -> dict:
                 "track_width": rules.get("trace_width", 0.25),
                 "via_diameter": rules.get("via_dia", 0.6),
                 "via_drill": rules.get("via_drill", 0.3),
-                "diff_pair_width": rules.get("trace_width", 0.25),
-                "diff_pair_gap": rules.get("clearance", 0.2),
+                # A pair's own width and gap when the class gives them. The
+                # gap used to be the clearance, which for any impedance-
+                # controlled pair is simply a different number: the gap sets a
+                # differential impedance as much as the width does.
+                "diff_pair_width": rules.get("diff_pair_width", rules.get("trace_width", 0.25)),
+                "diff_pair_gap": rules.get("diff_pair_gap", rules.get("clearance", 0.2)),
             }
         )
     if not any(c["name"] == "Default" for c in classes):

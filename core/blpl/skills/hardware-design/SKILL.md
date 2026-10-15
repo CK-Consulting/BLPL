@@ -426,6 +426,32 @@ These aren't style preferences — they affect what the pipeline can parse.
    and the project is not ready for Stage 5: say that, rather than writing
    something in the cell that looks like a value.
 
+## Controlled impedance — tag the nets in project.yaml
+
+A net class *name* such as `RF_50Ohm` says nothing the pipeline can check. Which
+nets need a controlled impedance, and at what, is said in the board's
+`project.yaml`. 50 Ω single-ended is the default:
+
+```yaml
+controlled_impedance:
+  - nets: "_RF_(IN|OUT)$|^ANT_"     # regex over net names; 50 Ω single-ended
+  - nets: "_USB\\d*_D[PMN]$"
+    ohms: 90
+    mode: differential              # single_ended | differential | coplanar
+net_classes:
+  RF_50Ohm:
+    trace_width: 0.35               # from the fab's calculator for this stackup
+    clearance: 0.2
+    impedance: 50
+```
+
+A tag lands on the class it names (`class:`) or on the one declared class with
+the same impedance; if there is none, Stage 5 makes one with the Default width
+and Stage 8 reports it (ZC-001) until a real width is declared. Never invent a
+width: it comes from the fab's impedance calculator for the stackup being
+ordered. The `controlled-impedance` skill has the full procedure — which
+interfaces need what, routing, termination, and what to order.
+
 ## Known pitfalls — patterns that have broken the pipeline before
 
 - **Grouped pin ranges**: `| 1-5 | Power |` in a pinout table prevents Stage 0 from mapping any of those pins to a refdes. Enumerate every pin individually, even when the signal is identical. Example fix: list pins 1, 2, 3, 4, 5 each on their own row.

@@ -404,6 +404,42 @@ def _sha256(path: Path) -> str:
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
+def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
+    """The fab's table of impedance-controlled traces, from the HDM the board came from.
+
+    A fab cannot see which traces are meant to be 50 ohms: on the gerbers they
+    are just widths. Without this sheet the controlled lines are etched like
+    any other, and the board measures whatever it measures.
+
+    Not ok when a controlled class has no width from a stackup. That board is
+    not quotable: the fab would be asked to control an impedance on a trace
+    drawn at the Default width, which is the one thing the sheet exists to stop.
+    """
+    import yaml
+
+    from . import impedance
+
+    candidates = ([pipeline / f"hdm.{pcb.stem}.yaml"] if pcb is not None else []) + [pipeline / "hdm.yaml"]
+    hdm_path = next((c for c in candidates if c.is_file()), None)
+    if hdm_path is None:
+        return Step("impedance", True, "no hdm.yaml; nothing to say about impedance")
+    hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {}
+    table = impedance.fab_table(hdm)
+    if table is None:
+        return Step("impedance", True, "no impedance-controlled nets")
+    dest = out_dir / "fab" / "impedance.md"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(table, encoding="utf-8")
+    if "NOT SET" in table:
+        return Step(
+            "impedance", False,
+            "a controlled-impedance class has no trace width (or pair gap) from a stackup; "
+            "see fab/impedance.md and Stage 8's ZC findings",
+            [str(dest.relative_to(out_dir))],
+        )
+    return Step("impedance", True, "", [str(dest.relative_to(out_dir))])
+
+
 def build(
     project_dir: Path,
     *,
@@ -445,12 +481,16 @@ def build(
         steps.append(Step("bom", False, "no BOM artifact in .pipeline — run stage1/stage2 first"))
 
     steps.append(copy_native_project(project_dir, out_dir))
+    z_step = export_impedance(pipeline, pcbs[0] if pcbs else None, out_dir)
+    steps.append(z_step)
 
     gate = run_gate(pipeline, out_dir)
     gate_ok = bool(gate.get("ok")) and not gate.get("skipped")
+    quotable = gate_ok and z_step.ok
 
-    if not gate_ok:
-        (out_dir / "READ-ME-FIRST.txt").write_text(_refusal_text(gate, steps), encoding="utf-8")
+    if not quotable:
+        (out_dir / "READ-ME-FIRST.txt").write_text(
+            _refusal_text(gate, steps, gate_ok=gate_ok), encoding="utf-8")
 
     files: list[dict] = []
     for path in sorted(p for p in out_dir.rglob("*") if p.is_file()):
@@ -467,7 +507,7 @@ def build(
         "release": name,
         "schema_version": 1,
         "created": stamp,
-        "quotable": gate_ok,
+        "quotable": quotable,
         "gate": gate,
         "steps": [s.to_dict() for s in steps],
         "tools": {"kicad_cli": _tool_version(cli) if cli else "not found"},
@@ -492,12 +532,14 @@ def build(
     return manifest
 
 
-def _refusal_text(gate: dict, steps: list[Step]) -> str:
+def _refusal_text(gate: dict, steps: list[Step], *, gate_ok: bool = False) -> str:
     lines = [
         "THIS PACKAGE IS NOT CLEARED FOR FABRICATION.",
         "",
     ]
-    if gate.get("skipped"):
+    if gate_ok:
+        lines.append("The release gate passed, but the package is not complete (below).")
+    elif gate.get("skipped"):
         lines.append(f"The release gate could not run: {gate.get('reason', 'no reason recorded')}")
         lines.append(
             "That is not the same as passing. Nothing here has been checked against the "
@@ -544,7 +586,10 @@ def main(argv: list[str] | None = None) -> int:
     if manifest["quotable"]:
         print(f"release: gate passed → {manifest['archive']}", flush=True)
         return 0
-    why = gate.get("reason") or "the gate did not pass"
+    if gate.get("ok") and not gate.get("skipped"):
+        why = "incomplete: " + ", ".join(manifest["incomplete"])
+    else:
+        why = gate.get("reason") or "the gate did not pass"
     print(
         f"release: NOT cleared for fabrication ({why}). Package written anyway for inspection: "
         f"{manifest['archive']}",
