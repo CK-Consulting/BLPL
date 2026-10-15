@@ -260,18 +260,36 @@ def _links_elsewhere(raw: str) -> bool:
     return raw.startswith(("${KICAD", "$(KICAD", "${KIPRJMOD}", "$(KIPRJMOD)"))
 
 
+def _names_this_library(raw: str, library: str) -> bool:
+    """A KiCad-variable path into ``<library>.3dshapes`` — the vendor's own.
+
+    Vendors export footprints as if their library were installed with KiCad's:
+    ``${KICAD9_3DMODEL_DIR}/Vendor.3dshapes/foo.step``. Uploaded as library
+    ``Vendor``, that model is in the project, not under /usr/share/kicad, so the
+    reference must be rewritten like an archive-relative one. A stock library's
+    name cannot be taken by an upload, so this never captures a genuine stock
+    reference.
+    """
+    if not raw.startswith(("${KICAD", "$(KICAD")):
+        return False
+    parts = re.split(r"[\\/]", raw)
+    return len(parts) >= 2 and parts[-2].lower() == f"{library}.3dshapes".lower()
+
+
 def _relink(node: list, library: str, models: dict[str, list[str]]) -> list[tuple[str, str]]:
     """Point this footprint's ``(model ...)`` children at uploaded models, in place.
 
     Only a reference whose file is among ``models`` changes, and never one that
-    already goes through a path variable. Returns (old, new) per change.
+    already goes through a path variable to somewhere else: the stock models,
+    or the project. A variable path into this library's own ``.3dshapes`` is
+    the vendor's, and is relinked. Returns (old, new) per change.
     """
     changed = []
     for child in sexpr.find_all(node, "model"):
         if len(child) < 2 or not isinstance(child[1], str):
             continue
         raw = sexpr.unquote(child[1])
-        if _links_elsewhere(raw):
+        if _links_elsewhere(raw) and not _names_this_library(raw, library):
             continue
         names = models.get(_model_stem(raw))
         if not names:

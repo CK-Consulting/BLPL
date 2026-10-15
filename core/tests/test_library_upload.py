@@ -507,6 +507,25 @@ def test_a_footprint_naming_a_stock_model_is_left_alone(tmp_path):
     assert (tmp_path / "libraries" / "footprints" / "myproj.pretty" / "SW_Push.kicad_mod").read_bytes() == data
 
 
+def test_a_vendor_footprint_naming_its_own_library_through_a_kicad_variable_is_relinked(tmp_path):
+    """Vendors export as if their library were installed with KiCad's. Uploaded
+    as library Vendor, ${KICAD9_3DMODEL_DIR}/Vendor.3dshapes/... is in the
+    project, and leaving the reference alone pointed it at /usr/share/kicad."""
+    bundle = _zip([
+        ("Vendor.pretty/SW.kicad_mod",
+         b'(footprint "SW" (layer "F.Cu")\n'
+         b'  (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))\n'
+         b'  (model "${KICAD9_3DMODEL_DIR}/Vendor.3dshapes/SW.step")\n)\n'),
+        ("Vendor.3dshapes/SW.step", STEP),
+    ])
+    rec = _up(tmp_path, bundle, "kicad_bundle", "Vendor.zip", library="Vendor")
+    assert rec.state == quarantine.RELEASED, rec.reasons
+    fp = tmp_path / "libraries" / "footprints" / "Vendor.pretty" / "SW.kicad_mod"
+    [ref] = _model_refs(fp)
+    assert ref == "${KIPRJMOD}/../libraries/3dmodels/Vendor.3dshapes/SW.step"
+    assert _resolves(tmp_path, ref).read_bytes() == STEP
+
+
 def test_a_footprint_naming_a_model_nobody_uploaded_is_written_as_is(tmp_path):
     data = _footprint("LONELY")
     _up(tmp_path, data, "footprint", "l.kicad_mod")
@@ -603,3 +622,19 @@ def test_a_symbol_another_one_extends_is_not_removed(tmp_path):
     with pytest.raises(library_upload.Refused, match="has no symbol NOPE"):
         quarantine.remove_library_symbol(tmp_path, "myproj", "NOPE", by="f@x")
     assert quarantine.events(tmp_path) == []
+
+
+def test_the_same_bytes_placed_in_two_libraries_keep_both_placements(tmp_path):
+    """The ledger has one row per hash. Uploading identical bytes to a second
+    library used to replace the row, so the first library's copy lost its claim
+    and the agent read that vendor file as the project's own text."""
+    data = _footprint("SW_PCM12")
+    a = _up(tmp_path, data, "footprint", "SW_PCM12.kicad_mod", library="VendorA")
+    b = _up(tmp_path, data, "footprint", "SW_PCM12.kicad_mod", library="VendorB")
+    assert a.state == b.state == quarantine.RELEASED
+    (row,) = [r for r in quarantine.ledger(tmp_path) if r["sha256"] == b.sha256]
+    placed = set(row["placed"])
+    assert any("VendorA" in p for p in placed) and any("VendorB" in p for p in placed)
+    assert set(row["libraries"]) == {"VendorA", "VendorB"}
+    for p in placed:
+        assert (tmp_path / p).is_file(), p
