@@ -250,6 +250,8 @@ The rest follows from that:
     gap as the class clearance, which is how far KiCad keeps the pour away.
   - **ZC-007**: on a board with more than two copper layers, a class does not
     say which layer its width is for (`impedance.layers`).
+  - **ZC-008**: a `controlled_impedance` tag matches no net, so its
+    requirement would silently vanish.
 
   Every one except ZC-004 is an error.
 - The release build (the app, or `python -m blpl.core.release`) writes
@@ -259,9 +261,11 @@ The rest follows from that:
   these:
   - a controlled trace on a layer its class's width is not for;
   - a controlled trace at a width other than the class's;
-  - a coplanar class with no ground zone on its layer;
+  - a coplanar trace without *filled* ground copper on both sides at its
+    declared gap;
   - a differential pair whose halves are not routed together: on different
-    layers, or side by side at a gap other than `diff_pair_gap`. Stretches of
+    layers, or side by side at a gap other than `diff_pair_gap`. Bends drawn
+    as arcs are measured against the partner's concentric arc. Stretches of
     1 mm or less are breakouts at the pads and are not measured.
 
   A class width is only the router's default and constrains no layer, so the
