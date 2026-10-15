@@ -635,7 +635,9 @@ def width_violations(hdm: dict, pcb: list) -> list[tuple[str, float, float, str]
 
 #: Distance between samples along a routed path.
 _STEP_MM = 0.25
-#: How much of each end of a net may break out to its pads unmeasured.
+#: How far from each end of a net's routed path it may break out to its pads
+#: unmeasured. Measured along the copper from the end, so it forgives the
+#: breakout and nothing in the middle of a run.
 _END_ALLOWANCE_MM = 2.0
 #: Beyond this, the partner is not beside the trace at all.
 _COUPLED_SEARCH_MM = 5.0
@@ -643,13 +645,26 @@ _COUPLED_SEARCH_MM = 5.0
 _GAP_SLACK_MM = 0.01
 
 
-def _samples(net: str, lines: list, arcs: list) -> list[tuple[str, tuple, tuple, float, float]]:
-    """(layer, point, unit normal, width, length it stands for) along a net's path."""
+def _samples(net: str, lines: list, arcs: list) -> list[tuple[str, tuple, tuple, float, float, float]]:
+    """(layer, point, unit normal, width, length it stands for, distance from the
+    nearest end of the routed path) along a net's path, segments and arcs alike.
+
+    The path is a graph: a node is a trace end, keyed by position alone so a via
+    joins the layers it connects, and a path end is a node only one trace
+    reaches — where the net meets a pad. Distance from an end is measured along
+    the copper, so only the true breakout at each end is close to one; a
+    stretch in the middle of a long run is not, however the run folds
+    (Codex, PR #31).
+    """
+    import heapq
     import math
 
     from .board_geometry import BoardGeometryError, _arc_center, _sweep
 
-    out = []
+    def key(pt):
+        return (round(pt[0], 3), round(pt[1], 3))
+
+    elements = []            # (layer, width, u, v, length, point-at(s), normal-at(s))
     for n, lay, w, p1, p2 in lines:
         if n != net:
             continue
@@ -657,11 +672,10 @@ def _samples(net: str, lines: list, arcs: list) -> list[tuple[str, tuple, tuple,
         length = math.hypot(dx, dy)
         if length == 0:
             continue
-        k = max(1, math.ceil(length / _STEP_MM))
-        normal = (-dy / length, dx / length)
-        for i in range(k):
-            t = (i + 0.5) / k
-            out.append((lay, (p1[0] + dx * t, p1[1] + dy * t), normal, w or 0.0, length / k))
+        nrm = (-dy / length, dx / length)
+        elements.append((lay, w or 0.0, key(p1), key(p2), length,
+                         (lambda s, p1=p1, dx=dx, dy=dy, L=length: (p1[0] + dx * s / L, p1[1] + dy * s / L)),
+                         (lambda s, nrm=nrm: nrm)))
     for n, lay, w, a, m, b in arcs:
         if n != net:
             continue
@@ -671,11 +685,38 @@ def _samples(net: str, lines: list, arcs: list) -> list[tuple[str, tuple, tuple,
         except (BoardGeometryError, ValueError):
             continue
         length = r * abs(sweep)
+        if length == 0:
+            continue
+        elements.append((lay, w or 0.0, key(a), key(b), length,
+                         (lambda s, c=c, r=r, t0=t0, sw=sweep, L=length:
+                          (c[0] + r * math.cos(t0 + sw * s / L), c[1] + r * math.sin(t0 + sw * s / L))),
+                         (lambda s, t0=t0, sw=sweep, L=length:
+                          (math.cos(t0 + sw * s / L), math.sin(t0 + sw * s / L)))))
+
+    adj: dict[tuple, list[tuple[tuple, float]]] = {}
+    for _lay, _w, u, v, length, _pt, _n in elements:
+        adj.setdefault(u, []).append((v, length))
+        adj.setdefault(v, []).append((u, length))
+    ends = [node for node, links in adj.items() if len(links) == 1]
+    dist = {node: 0.0 for node in ends}
+    heap = [(0.0, node) for node in ends]
+    while heap:
+        d, node = heapq.heappop(heap)
+        if d > dist.get(node, math.inf):
+            continue
+        for nxt, length in adj[node]:
+            if d + length < dist.get(nxt, math.inf):
+                dist[nxt] = d + length
+                heapq.heappush(heap, (d + length, nxt))
+
+    out = []
+    for lay, w, u, v, length, point_at, normal_at in elements:
         k = max(1, math.ceil(length / _STEP_MM))
+        du, dv = dist.get(u, math.inf), dist.get(v, math.inf)
         for i in range(k):
-            ang = t0 + sweep * (i + 0.5) / k
-            ux, uy = math.cos(ang), math.sin(ang)
-            out.append((lay, (c[0] + r * ux, c[1] + r * uy), (ux, uy), w or 0.0, length / k))
+            s = length * (i + 0.5) / k
+            from_end = min(du + s, dv + (length - s))
+            out.append((lay, point_at(s), normal_at(s), w, length / k, from_end))
     return out
 
 
@@ -765,16 +806,17 @@ def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
             continue
         gap = float(rules.get("coplanar_gap", 0))
         bare: dict[str, float] = {}
-        for lay, pt, nrm, w, step in _samples(net, lines, arcs):
+        for lay, pt, nrm, w, step, from_end in _samples(net, lines, arcs):
+            if from_end <= _END_ALLOWANCE_MM:
+                continue              # where the trace meets its pad
             off = w / 2 + gap + 0.05
             sides = [(pt[0] + nrm[0] * off, pt[1] + nrm[1] * off),
                      (pt[0] - nrm[0] * off, pt[1] - nrm[1] * off)]
             polys = filled.get(lay, [])
             if not all(any(point_in_polygon(sp, poly) for poly in polys) for sp in sides):
                 bare[lay] = bare.get(lay, 0.0) + step
-        for lay, length in bare.items():
-            if length > 2 * _END_ALLOWANCE_MM:
-                out.add((cls, lay))
+        for lay in bare:
+            out.add((cls, lay))
     return sorted(out)
 
 
@@ -811,19 +853,18 @@ def pair_problems(hdm: dict, pcb: list) -> list[str]:
         for me, other in ((a, b), (b, a)):
             apart: dict[str, float] = {}
             wrong: dict[str, list[tuple[float, float]]] = {}
-            for lay, pt, _nrm, w, step in _samples(me, lines, arcs):
+            for lay, pt, _nrm, w, step, from_end in _samples(me, lines, arcs):
+                if from_end <= _END_ALLOWANCE_MM:
+                    continue          # breaking out to its pad
                 near = _distance_to_path(pt, lay, other, lines, arcs)
                 edge = None if near is None else near[0] - (w + near[1]) / 2
                 if edge is None or edge > _COUPLED_SEARCH_MM:
                     apart[lay] = apart.get(lay, 0.0) + step
                 elif abs(edge - gap) > _GAP_SLACK_MM:
                     wrong.setdefault(lay, []).append((edge, step))
-            allowance = 2 * _END_ALLOWANCE_MM
             for lay in sorted(set(apart) | set(wrong)):
                 lone = apart.get(lay, 0.0)
                 off = sum(st for _, st in wrong.get(lay, []))
-                if lone + off <= allowance:
-                    continue
                 if off > lone:
                     seen = median(e for e, _ in wrong[lay])
                     out.append(f"{me} and {other} are {seen:.3f} mm apart on {lay}, not {gap:g} "

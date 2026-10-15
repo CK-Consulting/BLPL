@@ -696,3 +696,40 @@ def test_a_curved_coplanar_feed_needs_ground_too():
                           + " ".join(f"(xy {x:.4f} {y:.4f})" for x, y in pts) + "))")
     zone = '(zone (net "GND") (layers "F.Cu") ' + inner + " " + " ".join(outer_band) + ")"
     assert z.coplanar_without_ground(hdm, sexpr.parse(f"(kicad_pcb {feed} {zone})")) == []
+
+
+# --- the breakout allowance is at the ends only (Codex, PR #31) ----------------------
+
+
+def test_a_pair_that_parts_for_3_mm_mid_run_is_found():
+    """Under the old 4 mm total, a 3 mm detour in the middle passed."""
+    dp = [_seg("USB_DP", 0, 0, 30, 0)]
+    # USB_DM runs beside it at the gap, but steps 1 mm away from x=14 to x=17.
+    dm = [_seg("USB_DM", 0, 0.33, 14, 0.33), _seg("USB_DM", 14, 0.33, 14, 1.33),
+          _seg("USB_DM", 14, 1.33, 17, 1.33), _seg("USB_DM", 17, 1.33, 17, 0.33),
+          _seg("USB_DM", 17, 0.33, 30, 0.33)]
+    problems = z.pair_problems(_PAIR_HDM, _pair_board(*dp, *dm))
+    assert any("apart on F.Cu" in p for p in problems)
+
+
+def test_a_3_mm_hole_in_coplanar_ground_mid_run_is_found():
+    from blpl.emitter import sexpr
+
+    hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "coplanar_gap": 0.15,
+                                   "impedance": {"ohms": 50, "mode": "coplanar"}}},
+           "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
+    seg = '(segment (start 0 0) (end 30 0) (width 0.3) (layer "F.Cu") (net "ANT"))'
+    # Ground on both sides everywhere except x=14..17 above the trace.
+    zone = _filled('(net "GND")', "F.Cu", (-1, 0.3, 14, 3), (17, 0.3, 31, 3), (-1, -3, 31, -0.3))
+    assert z.coplanar_without_ground(hdm, sexpr.parse(f"(kicad_pcb {seg} {zone})")) == [("CPW", "F.Cu")]
+    whole = _filled('(net "GND")', "F.Cu", (-1, 0.3, 31, 3), (-1, -3, 31, -0.3))
+    assert z.coplanar_without_ground(hdm, sexpr.parse(f"(kicad_pcb {seg} {whole})")) == []
+
+
+def test_samples_know_how_far_they_are_from_the_ends_of_the_path():
+    lines = [("N", "F.Cu", 0.2, (0, 0), (10, 0)), ("N", "B.Cu", 0.2, (10, 0), (20, 0))]
+    samples = z._samples("N", lines, [])
+    # A via at x=10 joins the layers, so the middle is 10 mm from either end.
+    mid = min(samples, key=lambda s: abs(s[1][0] - 10))
+    assert mid[5] == pytest.approx(10, abs=0.2)
+    assert min(s[5] for s in samples) == pytest.approx(0.125, abs=0.01)
