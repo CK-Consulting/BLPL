@@ -220,10 +220,12 @@ controlled_impedance:
 ```
 
 Stage 5 moves each tagged net to the class it names, or to the one declared
-class with the same target. A differential tag brings in the net's pair partner.
+class with the same ohms and mode. A tag that states a tolerance needs a class
+at least that tight; a net always records its class's spec, which is what the
+fab sheet prints. A differential tag brings in the net's pair partner.
 Each controlled net then carries `impedance` in the HDM, and so does every net
 Stage 4's name rules put on an impedance class. When no class has the target,
-one is made (`Z50_SE`, `Z90_DIFF`) with the Default class's geometry, so the
+one is made (`Z50_SE`, `Z90_DIFF`, `Z50_SE_T5` for ±5%; never a declared class's name) with the Default class's geometry, so the
 board still builds. Stage 8 reports that as **ZC-001**, because a Default-width
 trace is not that impedance.
 
