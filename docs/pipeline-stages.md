@@ -257,6 +257,9 @@ The rest follows from that:
     requirement would silently vanish.
   - **ZC-009**: a single-ended or differential impedance on a one-layer board,
     which has no layer for the plane it needs. Coplanar is allowed.
+  - **ZC-011**: a net carries its own `impedance` but its class declares none,
+    or one that does not parse. The class is what the board is routed and
+    checked by, so the sheet marks the row NOT SET rather than guessing.
 
   Every one except ZC-004 is an error.
 - The release build (the app, or `python -m blpl.core.release`) writes
@@ -290,7 +293,8 @@ The rest follows from that:
   every 0.25 mm, along segments and arcs alike, so a curve or a partial
   overlap is measured the same as a straight run. Only the first and last 2 mm
   of the routed path, measured along the copper from where it meets a pad of
-  its own net, go unmeasured as breakout. A dead end anywhere else is a stub,
+  its own net, go unmeasured as breakout — and never more than half the
+  path's reach, so a short pad-to-pad run is measured in its middle. A dead end anywhere else is a stub,
   and a gap anywhere in between is reported.
 
   A class width is only the router's default and constrains no layer, so the
