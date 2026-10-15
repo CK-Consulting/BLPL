@@ -67,9 +67,12 @@ what the board "probably" carries.
    ```
 
    A tag lands on the class it names (`class:`), or on the one declared class
-   with the same ohms and mode. If none exists BLPL makes one (`Z50_SE`,
-   `Z90_DIFF`) with Default's width so the board still builds — and Stage 8
-   reports it as an error, because Default's width is not that impedance.
+   with the same ohms and mode. A tag that states `tolerance_pct` needs a class
+   at least that tight, since the class's tolerance is what the fab is told. If
+   none fits BLPL makes one (`Z50_SE`, `Z90_DIFF`, `Z50_SE_T5` for ±5%), never
+   reusing a declared class's name, with Default's width so the board still
+   builds — and Stage 8 reports it as an error, because Default's width is not
+   that impedance.
 4. **Run stage4 → stage8 and read the `ZC` findings** (design issues):
    - **ZC-001** — controlled nets on a class whose width did not come from a
      stackup. Fix: declare the class with the fab's width.

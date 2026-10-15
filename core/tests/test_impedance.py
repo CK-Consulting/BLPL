@@ -97,7 +97,7 @@ def test_two_classes_with_the_same_target_make_a_tag_say_which():
     cfg = _config(classes={"A": {"trace_width": 0.3, "impedance": 50},
                            "B": {"trace_width": 0.1, "impedance": 50}},
                   controlled_impedance=[{"nets": "RF"}])
-    with pytest.raises(z.ImpedanceConfigError, match="A, B all declare it"):
+    with pytest.raises(z.ImpedanceConfigError, match="A, B all meet it"):
         z.resolve(cfg, _nets("RF"))
 
 
@@ -139,6 +139,47 @@ def test_one_net_cannot_be_two_impedances():
     cfg = _config(controlled_impedance=[{"nets": "RF"}, {"nets": "RF_IN", "ohms": 75}])
     with pytest.raises(z.ImpedanceConfigError, match="tagged 50"):
         z.resolve(cfg, _nets("RF_IN"))
+
+
+def test_a_tighter_tolerance_does_not_land_on_a_looser_class():
+    """Codex, PR #31: the class's tolerance is what the fab is told, so a ±5%
+    net on a ±10% class would be built to ±10%."""
+    cfg = _config(classes={"RF_50Ohm": {"trace_width": 0.35, "impedance": 50}},
+                  controlled_impedance=[{"nets": "ANT", "tolerance_pct": 5}])
+    nets = _nets("ANT")
+    res = z.resolve(cfg, nets)
+    assert nets["ANT"]["class"] == "Z50_SE_T5"
+    assert nets["ANT"]["impedance"]["tolerance_pct"] == 5
+    hdm = {"net_classes": {**cfg["net_classes"], **z.synthesized_classes(cfg, res)}, "nets": nets}
+    assert "| Z50_SE_T5 | 50 Ω single-ended | ±5% |" in z.fab_table(hdm)
+
+
+def test_a_looser_tolerance_is_met_by_a_tighter_class_and_records_the_class():
+    cfg = _config(classes={"RF5": {"trace_width": 0.35, "impedance": {"ohms": 50, "tolerance_pct": 5}}},
+                  controlled_impedance=[{"nets": "ANT", "tolerance_pct": 10}])
+    nets = _nets("ANT")
+    z.resolve(cfg, nets)
+    assert nets["ANT"]["class"] == "RF5"
+    assert nets["ANT"]["impedance"]["tolerance_pct"] == 5
+
+
+def test_a_tag_naming_a_looser_class_is_refused():
+    cfg = _config(classes={"RF": {"trace_width": 0.35, "impedance": 50}},
+                  controlled_impedance=[{"nets": "ANT", "class": "RF", "tolerance_pct": 5}])
+    with pytest.raises(z.ImpedanceConfigError, match="class 'RF' is 50"):
+        z.tags(cfg)
+
+
+def test_a_made_class_never_takes_the_name_of_a_declared_one():
+    """Codex, PR #31: a declared Z50_SE would have been overwritten with
+    Default's width, and every net on it marked as controlled."""
+    cfg = _config(classes={"Z50_SE": {"trace_width": 0.6}},
+                  controlled_impedance=[{"nets": "ANT"}])
+    nets = {**_nets("ANT"), "VBUS": {"class": "Z50_SE", "pads": [["U1", "9"]]}}
+    res = z.resolve(cfg, nets)
+    assert set(res.synthesized) == {"Z50_SE_2"}
+    assert nets["ANT"]["class"] == "Z50_SE_2"
+    assert nets["VBUS"]["class"] == "Z50_SE" and "impedance" not in nets["VBUS"]
 
 
 def test_a_tag_that_matches_nothing_says_so():

@@ -71,6 +71,17 @@ class Spec:
     def same_target(self, other: "Spec") -> bool:
         return abs(self.ohms - other.ohms) < 1e-6 and self.mode == other.mode
 
+    def meets(self, wanted: "Spec", tolerance_given: bool) -> bool:
+        """Whether a class with this spec builds what a tag asked for.
+
+        Same ohms and mode, and — when the tag stated a tolerance — one at
+        least as tight. A class at ±10% does not meet a ±5% requirement, and
+        the fab is told the class's tolerance, so landing a ±5% net there
+        would tell the fab ±10% for it.
+        """
+        return self.same_target(wanted) and (
+            not tolerance_given or self.tolerance_pct <= wanted.tolerance_pct + 1e-9)
+
     def as_dict(self) -> dict[str, Any]:
         return {"ohms": _num(self.ohms), "mode": self.mode,
                 "tolerance_pct": _num(self.tolerance_pct)}
@@ -129,6 +140,8 @@ class Tag:
     spec: Spec
     cls: str | None
     where: str
+    #: Whether the entry stated a tolerance. Without one it takes the class's.
+    tolerance_given: bool = False
 
 
 def tags(project_config: dict) -> list[Tag]:
@@ -160,15 +173,31 @@ def tags(project_config: dict) -> list[Tag]:
             spec = specs[cls]
         else:
             spec = parse(given or True, where)
-        if cls is not None and not spec.same_target(specs[cls]):
+        tol_given = "tolerance_pct" in entry
+        if cls is not None and not specs[cls].meets(spec, tol_given):
             raise ImpedanceConfigError(
                 f"{where} asks for {spec.label} but class {cls!r} is {specs[cls].label}")
-        out.append(Tag(pat, spec, cls, where))
+        out.append(Tag(pat, spec, cls, where, tol_given))
     return out
 
 
-def synthesized_name(spec: Spec) -> str:
-    return f"Z{_num(spec.ohms)}_{_MODE_TAG[spec.mode]}".replace(".", "p")
+def synthesized_name(spec: Spec, taken: set[str] = frozenset()) -> str:
+    """A name for a class nobody declared, never one somebody did.
+
+    The tolerance is in the name when it is not the default, so a ±5% class
+    and a ±10% class at the same impedance are two classes. And a declared
+    class that happens to be called ``Z50_SE`` keeps its name and geometry:
+    taking it would overwrite the class with Default's width and mark every
+    net already on it as impedance-controlled.
+    """
+    base = f"Z{_num(spec.ohms)}_{_MODE_TAG[spec.mode]}"
+    if abs(spec.tolerance_pct - DEFAULT_TOLERANCE_PCT) > 1e-9:
+        base += f"_T{_num(spec.tolerance_pct)}"
+    base = base.replace(".", "p")
+    name, n = base, 2
+    while name in taken:
+        name, n = f"{base}_{n}", n + 1
+    return name
 
 
 @dataclass
@@ -190,9 +219,7 @@ def resolve(project_config: dict, nets_out: dict) -> Resolution:
     """
     res = Resolution()
     specs = class_specs(project_config)
-    by_target: dict[tuple[float, str], list[str]] = {}
-    for name, spec in specs.items():
-        by_target.setdefault((spec.ohms, spec.mode), []).append(name)
+    declared = set(project_config.get("net_classes") or {})
 
     tagged: dict[str, tuple[str, Spec, str]] = {}
     for tag in tags(project_config):
@@ -202,15 +229,16 @@ def resolve(project_config: dict, nets_out: dict) -> Resolution:
             continue
         cls = tag.cls
         if cls is None:
-            same = sorted(by_target.get((tag.spec.ohms, tag.spec.mode), []))
+            same = sorted(n for n, sp in specs.items() if sp.meets(tag.spec, tag.tolerance_given))
             if len(same) == 1:
                 cls = same[0]
             elif len(same) > 1:
                 raise ImpedanceConfigError(
-                    f"{tag.where} asks for {tag.spec.label}, and {', '.join(same)} all declare "
+                    f"{tag.where} asks for {tag.spec.label}, and {', '.join(same)} all meet "
                     "it; say which with `class:`")
             else:
-                cls = synthesized_name(tag.spec)
+                made = next((n for n, sp in res.synthesized.items() if sp == tag.spec), None)
+                cls = made or synthesized_name(tag.spec, declared | set(res.synthesized))
                 res.synthesized.setdefault(cls, tag.spec)
         if tag.spec.mode == "differential":
             # A pair is routed as one thing. Half of it controlled is neither.
@@ -222,15 +250,19 @@ def resolve(project_config: dict, nets_out: dict) -> Resolution:
                         f"{partner} is controlled with its pair partner {n} ({tag.where})")
         for n in hits:
             prev = tagged.get(n)
-            if prev and not prev[1].same_target(tag.spec):
+            if prev and prev[0] != cls:
                 raise ImpedanceConfigError(
-                    f"{n} is tagged {prev[1].label} by {prev[2]} and {tag.spec.label} by {tag.where}")
+                    f"{n} is tagged {prev[1].label} by {prev[2]} and {tag.spec.label} by "
+                    f"{tag.where}, which land it on two classes ({prev[0]}, {cls})")
             tagged.setdefault(n, (cls, tag.spec, tag.where))
 
     all_specs = {**specs, **res.synthesized}
     for name, net in nets_out.items():
         if name in tagged:
-            cls, spec, _ = tagged[name]
+            cls = tagged[name][0]
+            # What the net records is its class's spec, the one the fab sheet
+            # prints for that class — the two can never say different things.
+            spec = all_specs[cls]
             net["class"] = cls
         elif net.get("class") in all_specs:
             cls, spec = net["class"], all_specs[net["class"]]
