@@ -252,11 +252,18 @@ The rest follows from that:
     say which layer its width is for (`impedance.layers`).
 
   Every one except ZC-004 is an error.
-- `blpl release` writes `fab/impedance.md` for the board house, naming every
-  controlled net and the layers each width is for. A package is not quotable
-  while any ZC error stands, or while the routed `.kicad_pcb` has a controlled
-  trace on a layer its class's width is not for. KiCad net classes constrain
-  width, not layer, so the release reads the board itself.
+- The release build (the app, or `python -m blpl.core.release`) writes
+  `fab/impedance.md` for the board house, naming every controlled net and the
+  layers each width is for. A package is not quotable while any ZC error
+  stands. It is also not quotable while the routed `.kicad_pcb` has any of
+  these:
+  - a controlled trace on a layer its class's width is not for;
+  - a controlled trace at a width other than the class's;
+  - a coplanar class with no ground zone on its layer.
+
+  A class width is only the router's default and constrains no layer, so the
+  release reads the board itself. Neither emitter pours ground, so that zone is
+  drawn by hand.
 
 The `controlled-impedance` skill covers choosing targets, routing, termination
 and ordering.
