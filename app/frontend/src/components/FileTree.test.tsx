@@ -688,6 +688,22 @@ describe("what a delete reports", () => {
   });
 });
 
+describe("what a library delete reports", () => {
+  it("says when the quarantine ledger could not record it", async () => {
+    // Codex, PR #23: the ledger is rewritten after the unlink. A failed
+    // rewrite no longer fails a delete whose bytes are gone; it is said so.
+    mockReply({ ok: true, path: "overview.md", kind: "file", committed: true, ledger_updated: false });
+    const user = userEvent.setup();
+    render(<FileTree projectId="p" reloadToken={0} onOpen={() => {}} />);
+    await screen.findByText("overview.md");
+    await user.pointer({ keys: "[MouseRight]", target: screen.getByText("overview.md") });
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete file" });
+    await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+    expect(await screen.findByText(/quarantine ledger still records an upload at overview\.md/)).toBeInTheDocument();
+  });
+});
+
 describe("the path a new file opens at", () => {
   async function create(typed: string) {
     const user = userEvent.setup();

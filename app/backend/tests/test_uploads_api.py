@@ -521,3 +521,49 @@ def test_a_move_the_ledger_cannot_record_is_put_back(unlocked, monkeypatch):
     assert (proj / src).is_file() and not (proj / dst).exists()
     row = next(x for x in quarantine.ledger(proj) if x["original_name"] == "m.step")
     assert row["placed"] == [src]
+
+
+def test_a_delete_the_ledger_cannot_record_still_lands_and_says_so(unlocked, monkeypatch):
+    """The bytes were already unlinked when the ledger write failed, and the
+    500 that followed skipped the commit: a delete reported as failed, of a
+    file that was gone and whose removal was nowhere recorded."""
+    import app.main as main
+    from blpl.core import quarantine
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    _upload(unlocked, [("fp.kicad_mod", FOOTPRINT, {"kind": "footprint"})])
+    rel = "libraries/footprints/mine.pretty/PCM12SMTBR.kicad_mod"
+
+    def full(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(quarantine, "record_library_removal", full)
+    r = unlocked.delete(f"/api/projects/mine/files/{rel}")
+    assert r.status_code == 200, r.text
+    assert r.json()["committed"] is True and r.json()["ledger_updated"] is False
+    proj = main.PROJECTS_ROOT / "mine"
+    assert not (proj / rel).exists()
+    assert rel in _git(proj, "show", "--name-only", "HEAD")
+
+
+def test_moving_an_uploaded_model_takes_the_footprint_that_names_it_along(unlocked):
+    """The relinker writes the model's exact path into the footprint; moving the
+    model left the footprint pointing at nothing and the board lost its 3D body."""
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    _upload(unlocked, [("PCM12SMTBR.step", STEP, {"kind": "3d_model"})])
+    fp_with_model = FOOTPRINT.replace(
+        b'  (pad "1"', b'  (model "PCM12SMTBR.stp" (offset (xyz 0 0 0)))\n  (pad "1"')
+    _upload(unlocked, [("fp.kicad_mod", fp_with_model, {"kind": "footprint"})])
+    proj = main.PROJECTS_ROOT / "mine"
+    fp = proj / "libraries/footprints/mine.pretty/PCM12SMTBR.kicad_mod"
+    src = "libraries/3dmodels/mine.3dshapes/PCM12SMTBR.step"
+    dst = "libraries/3dmodels/vendor.3dshapes/PCM12SMTBR.step"
+    assert "${KIPRJMOD}/../" + src in fp.read_text()
+
+    r = unlocked.post("/api/projects/mine/files/move", json={"path": src, "to": dst})
+    assert r.status_code == 200, r.text
+    assert r.json()["relinked"] == ["libraries/footprints/mine.pretty/PCM12SMTBR.kicad_mod"]
+    assert "${KIPRJMOD}/../" + dst in fp.read_text()
+    assert "PCM12SMTBR.kicad_mod" in _git(proj, "show", "--name-only", "HEAD")
