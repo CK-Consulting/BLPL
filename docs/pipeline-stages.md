@@ -260,8 +260,10 @@ The rest follows from that:
 
   Every one except ZC-004 is an error.
 - The release build (the app, or `python -m blpl.core.release`) writes
-  `fab/impedance.md` for the board house, naming every controlled net and the
-  layers each width is for. A package is not quotable while any ZC error
+  `fab/impedance.md` for the board house, naming every controlled net, the
+  layers each width is for, and the plane it was calculated against. A net on
+  a class that declares an impedance is controlled whether or not it carries
+  its own `impedance` mapping. A package is not quotable while any ZC error
   stands. It is also not quotable while the routed `.kicad_pcb` has any of
   these:
   - a controlled trace on a layer its class's width is not for;
