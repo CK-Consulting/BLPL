@@ -544,3 +544,52 @@ def test_a_release_with_a_coplanar_line_and_no_ground_is_not_quotable(released):
     assert not manifest["quotable"]
     (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
     assert "CPW has no ground zone on F.Cu" in step["detail"]
+
+
+# --- a routed pair is coupled at its geometry (Codex, PR #31) ------------------------
+
+
+_PAIR_HDM = {"net_classes": {"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+                                     "impedance": {"ohms": 90, "mode": "differential"}}},
+             "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
+                      "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}
+
+
+def _seg(net, x1, y1, x2, y2, layer="F.Cu", w=0.18):
+    return f'(segment (start {x1} {y1}) (end {x2} {y2}) (width {w}) (layer "{layer}") (net "{net}"))'
+
+
+def _pair_board(*segs):
+    from blpl.emitter import sexpr
+    return sexpr.parse("(kicad_pcb " + " ".join(segs) + ")")
+
+
+def test_a_pair_routed_at_its_gap_is_quiet_breakouts_and_all():
+    # Centres 0.33 apart: 0.18 wide each, so 0.15 edge to edge. The short
+    # stubs at the start are breakouts to the pads and are not measured.
+    board = _pair_board(_seg("USB_DP", 0, 0, 0.5, 0.5), _seg("USB_DP", 0.5, 0.5, 20.5, 0.5),
+                        _seg("USB_DM", 0, 1.5, 0.5, 0.83), _seg("USB_DM", 0.5, 0.83, 20.5, 0.83))
+    assert z.pair_problems(_PAIR_HDM, board) == []
+
+
+def test_a_pair_routed_at_another_gap_is_found():
+    board = _pair_board(_seg("USB_DP", 0, 0, 20, 0), _seg("USB_DM", 0, 0.43, 20, 0.43))
+    problems = z.pair_problems(_PAIR_HDM, board)
+    assert any("0.250 mm apart on F.Cu, not 0.15" in p for p in problems)
+
+
+def test_a_pair_split_across_layers_is_found():
+    board = _pair_board(_seg("USB_DP", 0, 0, 20, 0), _seg("USB_DM", 0, 0.33, 20, 0.33, layer="B.Cu"))
+    problems = z.pair_problems(_PAIR_HDM, board)
+    assert "USB_DM is routed on B.Cu without its pair partner" in problems
+    assert "USB_DP is routed on F.Cu without its pair partner" in problems
+
+
+def test_a_release_with_an_uncoupled_pair_is_not_quotable(released):
+    proj, build = released
+    (proj / "dev.kicad_pcb").write_text(
+        "(kicad_pcb " + _seg("USB_DP", 0, 0, 20, 0) + _seg("USB_DM", 0, 0.43, 20, 0.43) + ")\n")
+    manifest = build(_PAIR_HDM)
+    assert not manifest["quotable"]
+    (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
+    assert "apart on F.Cu" in step["detail"]

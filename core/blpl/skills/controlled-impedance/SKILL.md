@@ -97,8 +97,10 @@ what the board "probably" carries.
    tolerance, layers, width, gap, and every controlled net, for the board
    house. It refuses to mark the package quotable while any ZC error stands,
    or while the routed `.kicad_pcb` has a controlled trace on a layer or at a
-   width its class is not for, or a coplanar class with no ground zone on its
-   layer (neither emitter pours that ground; draw it). Order with
+   width its class is not for, a coplanar class with no ground zone on its
+   layer (neither emitter pours that ground; draw it), or a differential pair
+   whose halves are on different layers or side by side at a gap other than
+   the class's. Order with
    impedance control and a TDR test coupon; ±10 % is the usual tolerance,
    tighter costs more.
 

@@ -514,6 +514,7 @@ def _routed(pcb: list):
         return sexpr.unquote(tok) if tok.startswith('"') else ordinals.get(tok, tok)
 
     segments = []
+    lines = []          # straight segments with their ends, for pair geometry
     for seg in sexpr.find_all(pcb, "segment") + sexpr.find_all(pcb, "arc"):
         layer, width = sexpr.find(seg, "layer"), sexpr.find(seg, "width")
         name = net_of(seg)
@@ -524,6 +525,13 @@ def _routed(pcb: list):
         except ValueError:
             w = None
         segments.append((name, sexpr.unquote(str(layer[1])), w))
+        if seg[0] == "segment":
+            a, b = sexpr.find(seg, "start"), sexpr.find(seg, "end")
+            try:
+                lines.append((name, sexpr.unquote(str(layer[1])), w,
+                              (float(a[1]), float(a[2])), (float(b[1]), float(b[2]))))
+            except (TypeError, IndexError, ValueError):
+                pass
     zones = []
     for zone in sexpr.find_all(pcb, "zone"):
         name = net_of(zone)
@@ -531,7 +539,7 @@ def _routed(pcb: list):
             continue                      # a rule area, not copper
         layers = sexpr.find(zone, "layers") or sexpr.find(zone, "layer")
         zones.append((name, [sexpr.unquote(str(x)) for x in (layers or [])[1:]]))
-    return segments, zones
+    return segments, zones, lines
 
 
 def _controlled(hdm: dict) -> dict[str, tuple[str, dict, Spec]]:
@@ -564,7 +572,7 @@ def layer_violations(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     KiCad net classes constrain width, not layer, so nothing in the board stops
     a controlled trace moving to a layer where its width is another impedance.
     """
-    segments, _ = _routed(pcb)
+    segments, _, _ = _routed(pcb)
     ctl = _controlled(hdm)
     return sorted({(n, lay, ctl[n][0]) for n, lay, _ in segments
                    if n in ctl and ctl[n][2].layers and lay not in ctl[n][2].layers})
@@ -578,7 +586,7 @@ def width_violations(hdm: dict, pcb: list) -> list[tuple[str, float, float, str]
     imported segment carries its own ``(width ...)``, and that is what the
     gerber will etch whatever the fab sheet says (Codex, PR #31).
     """
-    segments, _ = _routed(pcb)
+    segments, _, _ = _routed(pcb)
     ctl = _controlled(hdm)
     out = set()
     for n, _lay, w in segments:
@@ -602,7 +610,7 @@ def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
     cannot create it, so without a ground zone on the layer the line is an
     ordinary microstrip at the wrong width (Codex, PR #31).
     """
-    segments, zones = _routed(pcb)
+    segments, zones, _ = _routed(pcb)
     ctl = _controlled(hdm)
     ground_layers = {lay for n, layers in zones if _GROUND.search(n) for lay in layers}
     if any(lay == "*.Cu" for lay in ground_layers):
@@ -615,3 +623,74 @@ def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
             if lay not in ground_layers:
                 out.add((cls, lay))
     return sorted(out)
+
+
+#: Pair geometry is checked on stretches longer than this. Shorter segments are
+#: breakouts at pads, where a pair legitimately splits to reach its pins.
+_COUPLED_MIN_MM = 1.0
+#: Beyond this, the partner is not beside the segment at all.
+_COUPLED_SEARCH_MM = 5.0
+#: Board-file rounding, not a design difference.
+_GAP_SLACK_MM = 0.01
+
+
+def pair_problems(hdm: dict, pcb: list) -> list[str]:
+    """Where a routed differential pair is not coupled at its declared geometry.
+
+    Each half can be the right width on an allowed layer and the pair still not
+    be the impedance on the fab sheet: the halves on different layers, or side
+    by side at a gap other than ``diff_pair_gap`` (Codex, PR #31). Checked per
+    pair: every layer one half is routed on carries the other half too, and
+    every straight stretch of one half longer than ``_COUPLED_MIN_MM`` has a
+    parallel, overlapping stretch of its partner on the same layer at the
+    declared gap. Arcs are not measured.
+    """
+    import math
+
+    segments, _, lines = _routed(pcb)
+    ctl = _controlled(hdm)
+    nets = hdm.get("nets") or {}
+    done: set[frozenset[str]] = set()
+    out: list[str] = []
+    for a, (cls, rules, spec) in sorted(ctl.items()):
+        b = (nets.get(a) or {}).get("diff_pair_of")
+        if spec.mode != "differential" or b not in ctl or frozenset((a, b)) in done:
+            continue
+        done.add(frozenset((a, b)))
+        layers_a = {lay for n, lay, _ in segments if n == a}
+        layers_b = {lay for n, lay, _ in segments if n == b}
+        for lay in sorted(layers_a ^ layers_b):
+            alone = a if lay in layers_a else b
+            out.append(f"{alone} is routed on {lay} without its pair partner")
+        if "diff_pair_gap" not in rules:
+            continue
+        gap = float(rules["diff_pair_gap"])
+        for me, other in ((a, b), (b, a)):
+            theirs = [ln for ln in lines if ln[0] == other]
+            for _n, lay, w, p1, p2 in (ln for ln in lines if ln[0] == me):
+                dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+                length = math.hypot(dx, dy)
+                if length <= _COUPLED_MIN_MM:
+                    continue
+                ux, uy = dx / length, dy / length
+                best = None
+                for _o, olay, ow, q1, q2 in theirs:
+                    if olay != lay:
+                        continue
+                    ex, ey = q2[0] - q1[0], q2[1] - q1[1]
+                    olen = math.hypot(ex, ey)
+                    if olen == 0 or abs(ux * ey - uy * ex) / olen > 0.035:   # ~2 deg
+                        continue
+                    t1 = (q1[0] - p1[0]) * ux + (q1[1] - p1[1]) * uy
+                    t2 = (q2[0] - p1[0]) * ux + (q2[1] - p1[1]) * uy
+                    if min(max(t1, t2), length) - max(min(t1, t2), 0.0) <= 0:
+                        continue                       # side by side nowhere
+                    centre = abs((q1[0] - p1[0]) * uy - (q1[1] - p1[1]) * ux)
+                    edge = centre - ((w or 0) + (ow or 0)) / 2
+                    if best is None or edge < best:
+                        best = edge
+                if best is None or best > _COUPLED_SEARCH_MM:
+                    out.append(f"{me} runs {length:.1f} mm on {lay} with no {other} beside it")
+                elif abs(best - gap) > _GAP_SLACK_MM:
+                    out.append(f"{me} and {other} are {best:.3f} mm apart on {lay}, not {gap:g}")
+    return sorted(set(out))
