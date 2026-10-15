@@ -490,3 +490,57 @@ def test_a_release_with_a_controlled_trace_off_its_layer_is_not_quotable(release
     assert not manifest["quotable"]
     (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
     assert "ANT on B.Cu" in step["detail"]
+
+
+# --- routed width, coplanar ground, partial tags (Codex, PR #31) ----------------------
+
+
+def test_a_controlled_trace_routed_at_another_width_is_found():
+    from blpl.emitter import sexpr
+
+    hdm = {"net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}}
+    pcb = sexpr.parse('(kicad_pcb (net 0 "") (net 2 "ANT")'
+                      ' (segment (start 0 0) (end 1 0) (width 0.35) (layer "F.Cu") (net 2))'
+                      ' (segment (start 1 0) (end 2 0) (width 0.2) (layer "F.Cu") (net 2)))')
+    assert z.width_violations(hdm, pcb) == [("ANT", 0.2, 0.35, "RF")]
+
+
+def test_a_coplanar_class_needs_ground_copper_on_its_layer():
+    from blpl.emitter import sexpr
+
+    hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "coplanar_gap": 0.15,
+                                   "impedance": {"ohms": 50, "mode": "coplanar"}}},
+           "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
+    seg = '(segment (start 0 0) (end 1 0) (width 0.3) (layer "F.Cu") (net "ANT"))'
+    bare = sexpr.parse(f"(kicad_pcb {seg})")
+    assert z.coplanar_without_ground(hdm, bare) == [("CPW", "F.Cu")]
+    # A ground pour on the bottom only is not beside the trace.
+    bottom = sexpr.parse(f'(kicad_pcb {seg} (zone (net 1) (net_name "GND") (layer "B.Cu")))')
+    assert z.coplanar_without_ground(hdm, bottom) == [("CPW", "F.Cu")]
+    poured = sexpr.parse(f'(kicad_pcb {seg} (zone (net "GND") (layers "F.Cu" "B.Cu")))')
+    assert z.coplanar_without_ground(hdm, poured) == []
+    # A rule area is not copper.
+    keepout = sexpr.parse(f'(kicad_pcb {seg} (zone (layers "F.Cu") (keepout (tracks not_allowed))))')
+    assert z.coplanar_without_ground(hdm, keepout) == [("CPW", "F.Cu")]
+
+
+def test_a_tag_naming_a_class_takes_what_it_leaves_out_from_that_class():
+    cfg = _config(classes={"USB90": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+                                     "impedance": {"ohms": 90, "mode": "differential",
+                                                   "tolerance_pct": 5}}},
+                  controlled_impedance=[{"nets": "USB", "class": "USB90", "tolerance_pct": 10}])
+    (tag,) = z.tags(cfg)
+    assert (tag.spec.ohms, tag.spec.mode, tag.spec.tolerance_pct) == (90, "differential", 10)
+
+
+def test_a_release_with_a_coplanar_line_and_no_ground_is_not_quotable(released):
+    proj, build = released
+    (proj / "dev.kicad_pcb").write_text(
+        '(kicad_pcb (segment (start 0 0) (end 1 0) (width 0.3) (layer "F.Cu") (net "ANT")))\n')
+    manifest = build({"net_classes": {"CPW": {"trace_width": 0.3, "coplanar_gap": 0.15,
+                                              "impedance": {"ohms": 50, "mode": "coplanar"}}},
+                      "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}})
+    assert not manifest["quotable"]
+    (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
+    assert "CPW has no ground zone on F.Cu" in step["detail"]

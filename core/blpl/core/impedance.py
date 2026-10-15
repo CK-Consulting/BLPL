@@ -185,8 +185,13 @@ def tags(project_config: dict) -> list[Tag]:
                     f"{where}.class {cls!r} declares no impedance; add `impedance:` to it, "
                     "so the class says what its width is for")
         given = {k: entry[k] for k in ("ohms", "mode", "tolerance_pct") if k in entry}
-        if cls is not None and not given:
-            spec = specs[cls]
+        if cls is not None:
+            # What the tag leaves out comes from the class it names, not from
+            # the 50 ohm single-ended default: `class: USB90, tolerance_pct: 5`
+            # means that class's target at ±5%.
+            base = specs[cls]
+            spec = parse({"ohms": base.ohms, "mode": base.mode,
+                          "tolerance_pct": base.tolerance_pct, **given}, where)
         else:
             spec = parse(given or True, where)
         tol_given = "tolerance_pct" in entry
@@ -484,45 +489,129 @@ def fab_table(hdm: dict) -> str | None:
     return "\n".join(lines) + "\n"
 
 
+def _routed(pcb: list):
+    """(net, layer, width) for every segment and arc, and (net, layers) for every
+    zone with a net, in either net spelling.
+
+    KiCad 10 writes a net as ``(net "NAME")``; older boards write an ordinal,
+    ``(net 3)``, resolved through the board's ``(net 3 "NAME")`` table, and a
+    zone's name in ``(net_name "NAME")``. Reading only one form would find
+    nothing on boards written in the other and report them clean.
+    """
+    from blpl.emitter import sexpr
+
+    ordinals = {str(n[1]): sexpr.unquote(str(n[2])) for n in sexpr.find_all(pcb, "net")
+                if len(n) >= 3}
+
+    def net_of(node) -> str | None:
+        named = sexpr.find(node, "net_name")
+        if named is not None and len(named) >= 2 and sexpr.unquote(str(named[1])):
+            return sexpr.unquote(str(named[1]))
+        net = sexpr.find(node, "net")
+        if net is None or len(net) < 2:
+            return None
+        tok = str(net[1])
+        return sexpr.unquote(tok) if tok.startswith('"') else ordinals.get(tok, tok)
+
+    segments = []
+    for seg in sexpr.find_all(pcb, "segment") + sexpr.find_all(pcb, "arc"):
+        layer, width = sexpr.find(seg, "layer"), sexpr.find(seg, "width")
+        name = net_of(seg)
+        if name is None or layer is None or len(layer) < 2:
+            continue
+        try:
+            w = float(width[1]) if width is not None and len(width) >= 2 else None
+        except ValueError:
+            w = None
+        segments.append((name, sexpr.unquote(str(layer[1])), w))
+    zones = []
+    for zone in sexpr.find_all(pcb, "zone"):
+        name = net_of(zone)
+        if not name:
+            continue                      # a rule area, not copper
+        layers = sexpr.find(zone, "layers") or sexpr.find(zone, "layer")
+        zones.append((name, [sexpr.unquote(str(x)) for x in (layers or [])[1:]]))
+    return segments, zones
+
+
+def _controlled(hdm: dict) -> dict[str, tuple[str, dict, Spec]]:
+    nets = hdm.get("nets") or {}
+    classes = hdm.get("net_classes") or {}
+    out = {}
+    for name, d in nets.items():
+        if not d.get("impedance"):
+            continue
+        cls = str(d.get("class"))
+        rules = classes.get(cls) or {}
+        try:
+            spec = parse(rules.get("impedance"), cls)
+        except ImpedanceConfigError:
+            spec = None
+        if spec is not None:
+            out[name] = (cls, rules, spec)
+    return out
+
+
+_GROUND = re.compile(r"^(A|D|P|S)?GND\d*$|^VSS$|_GND$|^GND_", re.I)
+#: Rounding in a board file, not a design difference.
+_WIDTH_SLACK_MM = 0.001
+
+
 def layer_violations(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     """(net, layer, class) for every routed piece of a controlled net on a layer
     its class's width is not for.
 
     KiCad net classes constrain width, not layer, so nothing in the board stops
     a controlled trace moving to a layer where its width is another impedance.
-    This reads what was actually routed. Both net spellings are read: KiCad 10
-    writes a segment's net as ``(net "NAME")``; older boards write an ordinal,
-    ``(net 3)``, resolved through the board's ``(net 3 "NAME")`` table. Reading
-    only one form would find no segments at all on the other, and report a
-    clean board.
     """
-    from blpl.emitter import sexpr
+    segments, _ = _routed(pcb)
+    ctl = _controlled(hdm)
+    return sorted({(n, lay, ctl[n][0]) for n, lay, _ in segments
+                   if n in ctl and ctl[n][2].layers and lay not in ctl[n][2].layers})
 
-    nets = hdm.get("nets") or {}
-    classes = hdm.get("net_classes") or {}
-    allowed: dict[str, tuple[str, tuple[str, ...]]] = {}
-    for name, d in nets.items():
-        if not d.get("impedance"):
+
+def width_violations(hdm: dict, pcb: list) -> list[tuple[str, float, float, str]]:
+    """(net, routed width, class width, class) for every routed piece of a
+    controlled net at a width other than the one its class is for.
+
+    A class width is the router's default, not a guarantee: a hand-routed or
+    imported segment carries its own ``(width ...)``, and that is what the
+    gerber will etch whatever the fab sheet says (Codex, PR #31).
+    """
+    segments, _ = _routed(pcb)
+    ctl = _controlled(hdm)
+    out = set()
+    for n, _lay, w in segments:
+        if n not in ctl or w is None:
             continue
-        cls = str(d.get("class"))
-        try:
-            spec = parse((classes.get(cls) or {}).get("impedance"), cls)
-        except ImpedanceConfigError:
-            spec = None
-        if spec and spec.layers:
-            allowed[name] = (cls, spec.layers)
-    if not allowed:
+        cls, rules, spec = ctl[n]
+        if not _has_width(rules, spec):
+            continue
+        want = float(rules[width_key(rules, spec)])
+        if abs(w - want) > _WIDTH_SLACK_MM:
+            out.add((n, w, want, cls))
+    return sorted(out)
+
+
+def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
+    """(class, layer) for every coplanar class with no ground zone on a layer it
+    is routed on.
+
+    A coplanar line is coplanar because ground copper runs beside it at the
+    declared gap. Neither emitter pours that copper, and a class clearance
+    cannot create it, so without a ground zone on the layer the line is an
+    ordinary microstrip at the wrong width (Codex, PR #31).
+    """
+    segments, zones = _routed(pcb)
+    ctl = _controlled(hdm)
+    ground_layers = {lay for n, layers in zones if _GROUND.search(n) for lay in layers}
+    if any(lay == "*.Cu" for lay in ground_layers):
         return []
-    ordinals = {str(n[1]): sexpr.unquote(str(n[2])) for n in sexpr.find_all(pcb, "net")
-                if len(n) >= 3}
-    out: set[tuple[str, str, str]] = set()
-    for seg in sexpr.find_all(pcb, "segment") + sexpr.find_all(pcb, "arc"):
-        net, layer = sexpr.find(seg, "net"), sexpr.find(seg, "layer")
-        if net is None or layer is None or len(net) < 2 or len(layer) < 2:
-            continue
-        tok = str(net[1])
-        name = sexpr.unquote(tok) if tok.startswith('"') else ordinals.get(tok, tok)
-        where = sexpr.unquote(str(layer[1]))
-        if name in allowed and where not in allowed[name][1]:
-            out.add((name, where, allowed[name][0]))
+    coplanar = {cls: spec for cls, _rules, spec in ctl.values() if spec.mode == "coplanar"}
+    out = set()
+    for cls, spec in coplanar.items():
+        routed = {lay for n, lay, _ in segments if n in ctl and ctl[n][0] == cls}
+        for lay in sorted(routed or set(spec.layers) or {"F.Cu"}):
+            if lay not in ground_layers:
+                out.add((cls, lay))
     return sorted(out)

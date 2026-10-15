@@ -91,11 +91,14 @@ what the board "probably" carries.
      layers: [F.Cu]}`.
 
    ZC-003 and every ZC finding except ZC-004 are errors.
-5. **Release.** `blpl release` writes `fab/impedance.md` — class, target,
-   tolerance, layers, width, gap, and every controlled net — for the board
-   house. It refuses to mark the package quotable while any ZC error stands, or
-   while a routed controlled trace sits on a layer its class's width is not
-   for (it reads the `.kicad_pcb`). Order with
+5. **Release.** The release build — the app's release action, or
+   `python -m blpl.core.release --project-dir <board dir>` (there is no
+   `blpl release` subcommand yet) — writes `fab/impedance.md`: class, target,
+   tolerance, layers, width, gap, and every controlled net, for the board
+   house. It refuses to mark the package quotable while any ZC error stands,
+   or while the routed `.kicad_pcb` has a controlled trace on a layer or at a
+   width its class is not for, or a coplanar class with no ground zone on its
+   layer (neither emitter pours that ground; draw it). Order with
    impedance control and a TDR test coupon; ±10 % is the usual tolerance,
    tighter costs more.
 
