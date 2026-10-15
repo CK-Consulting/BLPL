@@ -151,7 +151,7 @@ def test_a_tighter_tolerance_does_not_land_on_a_looser_class():
     assert nets["ANT"]["class"] == "Z50_SE_T5"
     assert nets["ANT"]["impedance"]["tolerance_pct"] == 5
     hdm = {"net_classes": {**cfg["net_classes"], **z.synthesized_classes(cfg, res)}, "nets": nets}
-    assert "| Z50_SE_T5 | 50 Ω single-ended | ±5% | any |" in z.fab_table(hdm)
+    assert "| Z50_SE_T5 | 50 Ω single-ended | ±5% | any | adjacent |" in z.fab_table(hdm)
 
 
 def test_a_looser_tolerance_is_met_by_a_tighter_class_and_records_the_class():
@@ -292,8 +292,8 @@ def test_the_fab_sheet_lists_each_controlled_class_and_says_when_a_width_is_miss
            "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}},
                     "USB_DP": {"class": "Z90_DIFF", "impedance": {"ohms": 90}}}}
     table = z.fab_table(hdm)
-    assert "| RF | 50 Ω single-ended | ±10% | any | 0.35 | — | ANT |" in table
-    assert "| Z90_DIFF | 90 Ω differential | ±10% | any | NOT SET | NOT SET | USB_DP |" in table
+    assert "| RF | 50 Ω single-ended | ±10% | any | adjacent | 0.35 | — | ANT |" in table
+    assert "| Z90_DIFF | 90 Ω differential | ±10% | any | adjacent | NOT SET | NOT SET | USB_DP |" in table
     assert z.fab_table({"net_classes": {}, "nets": {"X": {"class": "Default"}}}) is None
 
 
@@ -375,7 +375,7 @@ def test_the_fab_sheet_gives_the_width_a_pair_is_routed_at():
                                    "impedance": {"ohms": 90, "mode": "differential"}}},
            "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
                     "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}
-    assert "| USB | 90 Ω differential | ±10% | any | 0.18 | 0.15 |" in z.fab_table(hdm)
+    assert "| USB | 90 Ω differential | ±10% | any | adjacent | 0.18 | 0.15 |" in z.fab_table(hdm)
 
 
 def test_a_pair_width_alone_is_a_stackup_width_for_a_differential_class():
@@ -394,10 +394,10 @@ def test_a_coplanar_class_needs_its_ground_gap_and_the_sheet_prints_it():
            "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
     (f,) = z.review(hdm)
     assert (f["rule_id"], f["severity"]) == ("ZC-006", "error")
-    assert "| CPW | 50 Ω coplanar | ±10% | any | 0.3 | NOT SET | ANT |" in z.fab_table(hdm)
+    assert "| CPW | 50 Ω coplanar | ±10% | any | adjacent | 0.3 | NOT SET | ANT |" in z.fab_table(hdm)
     hdm["net_classes"]["CPW"]["coplanar_gap"] = 0.15
     assert z.review(hdm) == []
-    assert "| CPW | 50 Ω coplanar | ±10% | any | 0.3 | 0.15 | ANT |" in z.fab_table(hdm)
+    assert "| CPW | 50 Ω coplanar | ±10% | any | adjacent | 0.3 | 0.15 | ANT |" in z.fab_table(hdm)
 
 
 def test_a_coplanar_gap_raises_the_clearance_but_never_lowers_it():
@@ -445,7 +445,7 @@ def test_on_a_multilayer_board_a_class_must_say_which_layer_its_width_is_for():
     assert (f["rule_id"], f["severity"]) == ("ZC-007", "error")
     rules["impedance"] = {"ohms": 50, "layers": ["F.Cu"]}
     assert z.review(hdm) == []
-    assert "| RF | 50 Ω single-ended | ±10% | F.Cu | 0.35 | — | ANT |" in z.fab_table(hdm)
+    assert "| RF | 50 Ω single-ended | ±10% | F.Cu | In1.Cu | 0.35 | — | ANT |" in z.fab_table(hdm)
 
 
 def test_a_two_layer_board_needs_no_layer():
@@ -853,3 +853,36 @@ def test_a_pour_on_the_signals_own_net_is_not_its_reference():
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {own})")) == [("RF", "F.Cu", "B.Cu")]
     gnd = _filled('(net "GND")', "B.Cu", (-5, -5, 25, 5))
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {gnd})")) == []
+
+
+
+# --- class membership, the reference on the sheet, ground names (Codex, PR #31) ------
+
+
+def test_a_net_on_an_impedance_class_is_controlled_without_its_own_mapping():
+    """A hand-edited HDM moved the net onto the class without copying the
+    mapping: routed as controlled, it was reviewed and sheeted as not."""
+    hdm = {"net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
+           "nets": {"ANT": {"class": "RF"}}}
+    assert "| RF |" in z.fab_table(hdm) and "ANT" in z.fab_table(hdm)
+    hdm["net_classes"]["RF"].pop("trace_width")
+    assert [f["rule_id"] for f in z.review(hdm)] == ["ZC-001"]
+
+
+def test_the_fab_sheet_names_an_explicit_reference_plane():
+    hdm = {"project": {"stackup": {"layers": 4}},
+           "net_classes": {"RF": {"trace_width": 2.9, "impedance": {
+               "ohms": 50, "layers": ["F.Cu"], "reference": ["B.Cu"]}}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}}
+    assert "| RF | 50 Ω single-ended | ±10% | F.Cu | B.Cu | 2.9 | — | ANT |" in z.fab_table(hdm)
+
+
+@pytest.mark.parametrize("name", ["GND", "AGND", "PGND", "GNDA", "GNDD", "GND1", "CHASSIS_GND",
+                                  "GND_PA", "VSS", "VSSA"])
+def test_common_ground_spellings_are_ground(name):
+    assert z._GROUND.search(name)
+
+
+@pytest.mark.parametrize("name", ["VCC_3V3", "ANT", "SIGNAL", "BGNDX"])
+def test_other_nets_are_not_ground(name):
+    assert not z._GROUND.search(name)

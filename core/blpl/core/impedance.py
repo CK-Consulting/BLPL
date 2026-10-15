@@ -361,6 +361,24 @@ def synthesized_classes(project_config: dict, res: Resolution) -> dict[str, dict
 # --- Review --------------------------------------------------------------------------
 
 
+def is_controlled(net: dict, classes: dict) -> bool:
+    """Whether a net is impedance-controlled: its own ``impedance`` mapping, or a
+    class that declares one.
+
+    The class is what the .kicad_pro routes a net by, so it is authoritative.
+    Reading only the per-net mapping Stage 5 writes left a hand-edited HDM —
+    a net moved onto an impedance class without the mapping copied — routed as
+    controlled and reviewed, sheeted and released as not (Codex, PR #31).
+    """
+    if net.get("impedance"):
+        return True
+    rules = classes.get(str(net.get("class"))) or {}
+    try:
+        return parse(rules.get("impedance"), "") is not None
+    except ImpedanceConfigError:
+        return True        # a class that tries to say something is not nothing
+
+
 def review(hdm: dict) -> list[dict]:
     """What a fab cannot build to, or a designer did not finish. Stage 8 findings."""
     out: list[dict] = []
@@ -372,7 +390,7 @@ def review(hdm: dict) -> list[dict]:
         copper = 2
     used: dict[str, list[str]] = {}
     for n, d in nets.items():
-        if d.get("impedance"):
+        if is_controlled(d, classes):
             used.setdefault(str(d.get("class")), []).append(n)
 
     def finding(rule: str, severity: str, summary: str, rec: str, components=(), nets_=()):
@@ -500,7 +518,7 @@ def fab_table(hdm: dict) -> str | None:
     nets = hdm.get("nets") or {}
     rows: dict[str, list[str]] = {}
     for n, d in nets.items():
-        if d.get("impedance"):
+        if is_controlled(d, classes):
             rows.setdefault(str(d.get("class")), []).append(n)
     if not rows:
         return None
@@ -515,9 +533,17 @@ def fab_table(hdm: dict) -> str | None:
         "Gap is the inner gap of a differential pair, or a coplanar line's gap to the",
         "ground pour on either side.",
         "",
-        "| Net class | Target | Tolerance | Layers | Trace width (mm) | Gap (mm) | Nets |",
-        "|---|---|---|---|---|---|---|",
+        "Reference is the plane each width was calculated against: the impedance is",
+        "that trace over that plane.",
+        "",
+        "| Net class | Target | Tolerance | Layers | Reference | Trace width (mm) | Gap (mm) | Nets |",
+        "|---|---|---|---|---|---|---|---|",
     ]
+    try:
+        copper = int(((hdm.get("project") or {}).get("stackup") or {}).get("layers") or 2)
+    except (TypeError, ValueError):
+        copper = 2
+    order = copper_order(copper)
     for cls in sorted(rows):
         rules = classes.get(cls) or {}
         spec = parse(rules.get("impedance"), cls) or Spec()
@@ -530,9 +556,22 @@ def fab_table(hdm: dict) -> str | None:
         # net left off this sheet is a trace the fab will not control.
         shown = ", ".join(sorted(rows[cls]))
         layers = ", ".join(spec.layers) if spec.layers else "any"
+        # The plane the width is for, as the release checks it: the class's own
+        # reference, else the layers next to its routed ones (Codex, PR #31).
+        if spec.reference:
+            reference = ", ".join(spec.reference)
+        elif spec.layers:
+            near = []
+            for lay in spec.layers:
+                if lay in order:
+                    i = order.index(lay)
+                    near += [order[j] for j in (i - 1, i + 1) if 0 <= j < len(order) and order[j] not in near]
+            reference = ", ".join(near) or "none"
+        else:
+            reference = "adjacent"
         lines.append(
             f"| {cls} | {_num(spec.ohms)} Ω {spec.mode.replace('_', '-')} | ±{_num(spec.tolerance_pct)}% "
-            f"| {layers} | {width} | {gap} | {shown} |")
+            f"| {layers} | {reference} | {width} | {gap} | {shown} |")
     return "\n".join(lines) + "\n"
 
 
@@ -603,7 +642,7 @@ def _controlled(hdm: dict) -> dict[str, tuple[str, dict, Spec]]:
     classes = hdm.get("net_classes") or {}
     out = {}
     for name, d in nets.items():
-        if not d.get("impedance"):
+        if not is_controlled(d, classes):
             continue
         cls = str(d.get("class"))
         rules = classes.get(cls) or {}
@@ -616,7 +655,10 @@ def _controlled(hdm: dict) -> dict[str, tuple[str, dict, Spec]]:
     return out
 
 
-_GROUND = re.compile(r"^(A|D|P|S)?GND\d*$|^VSS$|_GND$|^GND_", re.I)
+#: A ground net: any GND token in the name — GND, AGND, PGND, GNDA, GNDD, GND1,
+#: CHASSIS_GND, GND_PA — or VSS. Names are a convention, not a contract, so this
+#: is generous; the zone still has to be filled copper beside the trace.
+_GROUND = re.compile(r"(^|[_\-])[ADPSC]?GND[A-Z0-9]*($|[_\-])|^VSS[A-Z0-9]*$", re.I)
 #: Rounding in a board file, not a design difference.
 _WIDTH_SLACK_MM = 0.001
 
