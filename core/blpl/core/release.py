@@ -434,6 +434,23 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
     # missing number: two complete classes for one pair (ZC-005) fill every
     # cell of the sheet and still ask the fab for two geometries at once.
     errors = sorted({f["rule_id"] for f in impedance.review(hdm) if f["severity"] == "error"})
+    # And what was routed: a class width is right on its layer only.
+    if pcb is not None and pcb.is_file():
+        from blpl.emitter import sexpr
+
+        try:
+            stray = impedance.layer_violations(hdm, sexpr.parse(pcb.read_text(encoding="utf-8")))
+        except Exception as exc:  # an unreadable board cannot be vouched for
+            return Step("impedance", False, f"could not read {pcb.name} to check controlled layers: {exc}",
+                        [str(dest.relative_to(out_dir))])
+        if stray:
+            shown = ", ".join(f"{n} on {lay}" for n, lay, _ in stray[:6])
+            more = f" and {len(stray) - 6} more" if len(stray) > 6 else ""
+            return Step(
+                "impedance", False,
+                f"controlled nets are routed on layers their class width is not for: {shown}{more}",
+                [str(dest.relative_to(out_dir))],
+            )
     if "NOT SET" in table or errors:
         return Step(
             "impedance", False,

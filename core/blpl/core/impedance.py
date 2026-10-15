@@ -54,6 +54,8 @@ _MODE_TAG = {"single_ended": "SE", "differential": "DIFF", "coplanar": "CPW"}
 #: Marks a class this module made, in the HDM's net_classes.
 SYNTHESIZED = "controlled_impedance"
 
+_COPPER = re.compile(r"^(F|B|In\d+)\.Cu$")
+
 #: A class name that states an impedance, e.g. RF_50Ohm, USB2_Diff_90Ohm.
 _NAMED_OHMS = re.compile(r"(\d+(?:\.\d+)?)\s*ohms?\b", re.I)
 
@@ -67,6 +69,10 @@ class Spec:
     ohms: float = DEFAULT_OHMS
     mode: str = "single_ended"
     tolerance_pct: float = DEFAULT_TOLERANCE_PCT
+    #: The copper layers the class's width is for. A width is right for one
+    #: layer's height above its reference; on another layer it is another
+    #: impedance. Empty means not stated.
+    layers: tuple[str, ...] = ()
 
     def same_target(self, other: "Spec") -> bool:
         return abs(self.ohms - other.ohms) < 1e-6 and self.mode == other.mode
@@ -83,8 +89,11 @@ class Spec:
             not tolerance_given or self.tolerance_pct <= wanted.tolerance_pct + 1e-9)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"ohms": _num(self.ohms), "mode": self.mode,
-                "tolerance_pct": _num(self.tolerance_pct)}
+        out: dict[str, Any] = {"ohms": _num(self.ohms), "mode": self.mode,
+                               "tolerance_pct": _num(self.tolerance_pct)}
+        if self.layers:
+            out["layers"] = list(self.layers)
+        return out
 
     @property
     def label(self) -> str:
@@ -110,8 +119,15 @@ def parse(raw: Any, where: str) -> Spec | None:
         tol = raw.get("tolerance_pct", DEFAULT_TOLERANCE_PCT)
         if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not 0 < tol <= 50:
             raise ImpedanceConfigError(f"{where}.tolerance_pct must be a percentage above 0 and at most 50")
+        layers = raw.get("layers", [])
+        if isinstance(layers, str):
+            layers = [layers]
+        if not isinstance(layers, list) or not all(
+                isinstance(x, str) and _COPPER.match(x) for x in layers):
+            raise ImpedanceConfigError(
+                f"{where}.layers must be copper layer names such as F.Cu, In1.Cu, B.Cu")
         return Spec(ohms=_ohms(raw.get("ohms", DEFAULT_OHMS), f"{where}.ohms"),
-                    mode=mode, tolerance_pct=float(tol))
+                    mode=mode, tolerance_pct=float(tol), layers=tuple(layers))
     raise ImpedanceConfigError(f"{where} must be true, a number of ohms, or a mapping")
 
 
@@ -327,6 +343,10 @@ def review(hdm: dict) -> list[dict]:
     out: list[dict] = []
     classes = hdm.get("net_classes") or {}
     nets = hdm.get("nets") or {}
+    try:
+        copper = int(((hdm.get("project") or {}).get("stackup") or {}).get("layers") or 2)
+    except (TypeError, ValueError):
+        copper = 2
     used: dict[str, list[str]] = {}
     for n, d in nets.items():
         if d.get("impedance"):
@@ -375,6 +395,15 @@ def review(hdm: dict) -> list[dict]:
                 f"Add the diff_pair_gap your fab's calculator gives for {spec.label} to "
                 f"net_classes.{name}.",
                 nets_=members)
+        if copper > 2 and not spec.layers:
+            finding(
+                "ZC-007", "error",
+                f"Class {name} is {spec.label} on a {copper}-layer board but does not say "
+                "which copper layer its width is for. The same width is a different "
+                "impedance on an outer layer and an inner one.",
+                f"Add `layers: [F.Cu]` (or the layers the fab's calculator gave this width "
+                f"for) to net_classes.{name}.impedance, and route these nets only there.",
+                nets_=members)
         if spec.mode == "coplanar" and "coplanar_gap" not in rules:
             finding(
                 "ZC-006", "error",
@@ -400,7 +429,7 @@ def review(hdm: dict) -> list[dict]:
                     nets_=split + [nets[n]["diff_pair_of"] for n in split])
             if lonely:
                 finding(
-                    "ZC-003", "warning",
+                    "ZC-003", "error",
                     f"{len(lonely)} net(s) need a differential impedance but have no pair "
                     "partner on this board, so there is nothing to couple to.",
                     "Name the pair with matching suffixes (_P/_N, _DP/_DM, +/-) so Stage 4 "
@@ -434,8 +463,8 @@ def fab_table(hdm: dict) -> str | None:
         "Gap is the inner gap of a differential pair, or a coplanar line's gap to the",
         "ground pour on either side.",
         "",
-        "| Net class | Target | Tolerance | Trace width (mm) | Gap (mm) | Nets |",
-        "|---|---|---|---|---|---|",
+        "| Net class | Target | Tolerance | Layers | Trace width (mm) | Gap (mm) | Nets |",
+        "|---|---|---|---|---|---|---|",
     ]
     for cls in sorted(rows):
         rules = classes.get(cls) or {}
@@ -445,9 +474,55 @@ def fab_table(hdm: dict) -> str | None:
         width = (f"{rules[width_key(rules, spec)]}" if _has_width(rules, spec)
                  else "NOT SET")
         gap = _gap(rules, spec)
-        names = sorted(rows[cls])
-        shown = ", ".join(names[:8]) + (f" and {len(names) - 8} more" if len(names) > 8 else "")
+        # Every name. The gerbers do not say which traces are controlled, so a
+        # net left off this sheet is a trace the fab will not control.
+        shown = ", ".join(sorted(rows[cls]))
+        layers = ", ".join(spec.layers) if spec.layers else "any"
         lines.append(
             f"| {cls} | {_num(spec.ohms)} Ω {spec.mode.replace('_', '-')} | ±{_num(spec.tolerance_pct)}% "
-            f"| {width} | {gap} | {shown} |")
+            f"| {layers} | {width} | {gap} | {shown} |")
     return "\n".join(lines) + "\n"
+
+
+def layer_violations(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
+    """(net, layer, class) for every routed piece of a controlled net on a layer
+    its class's width is not for.
+
+    KiCad net classes constrain width, not layer, so nothing in the board stops
+    a controlled trace moving to a layer where its width is another impedance.
+    This reads what was actually routed. Both net spellings are read: KiCad 10
+    writes a segment's net as ``(net "NAME")``; older boards write an ordinal,
+    ``(net 3)``, resolved through the board's ``(net 3 "NAME")`` table. Reading
+    only one form would find no segments at all on the other, and report a
+    clean board.
+    """
+    from blpl.emitter import sexpr
+
+    nets = hdm.get("nets") or {}
+    classes = hdm.get("net_classes") or {}
+    allowed: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for name, d in nets.items():
+        if not d.get("impedance"):
+            continue
+        cls = str(d.get("class"))
+        try:
+            spec = parse((classes.get(cls) or {}).get("impedance"), cls)
+        except ImpedanceConfigError:
+            spec = None
+        if spec and spec.layers:
+            allowed[name] = (cls, spec.layers)
+    if not allowed:
+        return []
+    ordinals = {str(n[1]): sexpr.unquote(str(n[2])) for n in sexpr.find_all(pcb, "net")
+                if len(n) >= 3}
+    out: set[tuple[str, str, str]] = set()
+    for seg in sexpr.find_all(pcb, "segment") + sexpr.find_all(pcb, "arc"):
+        net, layer = sexpr.find(seg, "net"), sexpr.find(seg, "layer")
+        if net is None or layer is None or len(net) < 2 or len(layer) < 2:
+            continue
+        tok = str(net[1])
+        name = sexpr.unquote(tok) if tok.startswith('"') else ordinals.get(tok, tok)
+        where = sexpr.unquote(str(layer[1]))
+        if name in allowed and where not in allowed[name][1]:
+            out.add((name, where, allowed[name][0]))
+    return sorted(out)

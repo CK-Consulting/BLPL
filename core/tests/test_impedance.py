@@ -151,7 +151,7 @@ def test_a_tighter_tolerance_does_not_land_on_a_looser_class():
     assert nets["ANT"]["class"] == "Z50_SE_T5"
     assert nets["ANT"]["impedance"]["tolerance_pct"] == 5
     hdm = {"net_classes": {**cfg["net_classes"], **z.synthesized_classes(cfg, res)}, "nets": nets}
-    assert "| Z50_SE_T5 | 50 Ω single-ended | ±5% |" in z.fab_table(hdm)
+    assert "| Z50_SE_T5 | 50 Ω single-ended | ±5% | any |" in z.fab_table(hdm)
 
 
 def test_a_looser_tolerance_is_met_by_a_tighter_class_and_records_the_class():
@@ -292,8 +292,8 @@ def test_the_fab_sheet_lists_each_controlled_class_and_says_when_a_width_is_miss
            "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}},
                     "USB_DP": {"class": "Z90_DIFF", "impedance": {"ohms": 90}}}}
     table = z.fab_table(hdm)
-    assert "| RF | 50 Ω single-ended | ±10% | 0.35 | — | ANT |" in table
-    assert "| Z90_DIFF | 90 Ω differential | ±10% | NOT SET | NOT SET | USB_DP |" in table
+    assert "| RF | 50 Ω single-ended | ±10% | any | 0.35 | — | ANT |" in table
+    assert "| Z90_DIFF | 90 Ω differential | ±10% | any | NOT SET | NOT SET | USB_DP |" in table
     assert z.fab_table({"net_classes": {}, "nets": {"X": {"class": "Default"}}}) is None
 
 
@@ -375,7 +375,7 @@ def test_the_fab_sheet_gives_the_width_a_pair_is_routed_at():
                                    "impedance": {"ohms": 90, "mode": "differential"}}},
            "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
                     "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}
-    assert "| USB | 90 Ω differential | ±10% | 0.18 | 0.15 |" in z.fab_table(hdm)
+    assert "| USB | 90 Ω differential | ±10% | any | 0.18 | 0.15 |" in z.fab_table(hdm)
 
 
 def test_a_pair_width_alone_is_a_stackup_width_for_a_differential_class():
@@ -394,10 +394,10 @@ def test_a_coplanar_class_needs_its_ground_gap_and_the_sheet_prints_it():
            "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
     (f,) = z.review(hdm)
     assert (f["rule_id"], f["severity"]) == ("ZC-006", "error")
-    assert "| CPW | 50 Ω coplanar | ±10% | 0.3 | NOT SET | ANT |" in z.fab_table(hdm)
+    assert "| CPW | 50 Ω coplanar | ±10% | any | 0.3 | NOT SET | ANT |" in z.fab_table(hdm)
     hdm["net_classes"]["CPW"]["coplanar_gap"] = 0.15
     assert z.review(hdm) == []
-    assert "| CPW | 50 Ω coplanar | ±10% | 0.3 | 0.15 | ANT |" in z.fab_table(hdm)
+    assert "| CPW | 50 Ω coplanar | ±10% | any | 0.3 | 0.15 | ANT |" in z.fab_table(hdm)
 
 
 def test_a_coplanar_gap_is_the_clearance_the_pour_keeps():
@@ -419,3 +419,74 @@ def test_a_release_with_a_pair_split_across_complete_classes_is_not_quotable(rel
     assert not manifest["quotable"]
     (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
     assert "ZC-005" in step["detail"]
+
+
+
+# --- layers, unpaired nets, the whole list (Codex, PR #31) ----------------------------
+
+
+def _four_layer(cls_rules: dict, nets: dict) -> dict:
+    return {"project": {"stackup": {"layers": 4}}, "net_classes": {"RF": cls_rules}, "nets": nets}
+
+
+def test_on_a_multilayer_board_a_class_must_say_which_layer_its_width_is_for():
+    rules = {"trace_width": 0.35, "impedance": 50}
+    hdm = _four_layer(rules, {"ANT": {"class": "RF", "impedance": {"ohms": 50}}})
+    (f,) = z.review(hdm)
+    assert (f["rule_id"], f["severity"]) == ("ZC-007", "error")
+    rules["impedance"] = {"ohms": 50, "layers": ["F.Cu"]}
+    assert z.review(hdm) == []
+    assert "| RF | 50 Ω single-ended | ±10% | F.Cu | 0.35 | — | ANT |" in z.fab_table(hdm)
+
+
+def test_a_two_layer_board_needs_no_layer():
+    hdm = {"project": {"stackup": {"layers": 2}},
+           "net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}}
+    assert z.review(hdm) == []
+
+
+def test_an_unpaired_differential_net_is_an_error():
+    hdm = {"net_classes": {"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+                                   "impedance": {"ohms": 90, "mode": "differential"}}},
+           "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}}}}
+    (f,) = z.review(hdm)
+    assert (f["rule_id"], f["severity"]) == ("ZC-003", "error")
+
+
+def test_the_fab_sheet_names_every_controlled_net():
+    """The gerbers do not say which traces are controlled; a name left off is a
+    trace the fab will not control."""
+    names = [f"N{i:02d}" for i in range(12)]
+    hdm = {"net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
+           "nets": {n: {"class": "RF", "impedance": {"ohms": 50}} for n in names}}
+    table = z.fab_table(hdm)
+    assert all(n in table for n in names) and "more" not in table
+
+
+@pytest.mark.parametrize("pcb_text", [
+    # KiCad 10: a segment names its net.
+    '(kicad_pcb (segment (start 0 0) (end 1 0) (width 0.35) (layer "F.Cu") (net "ANT"))'
+    ' (segment (start 1 0) (end 2 0) (width 0.35) (layer "In2.Cu") (net "ANT")))',
+    # Before it: an ordinal, resolved through the board's net table.
+    '(kicad_pcb (net 0 "") (net 3 "ANT")'
+    ' (segment (start 0 0) (end 1 0) (width 0.35) (layer "F.Cu") (net 3))'
+    ' (segment (start 1 0) (end 2 0) (width 0.35) (layer "In2.Cu") (net 3)))',
+])
+def test_a_controlled_trace_routed_off_its_layer_is_found_in_either_net_syntax(pcb_text):
+    from blpl.emitter import sexpr
+
+    hdm = _four_layer({"trace_width": 0.35, "impedance": {"ohms": 50, "layers": ["F.Cu"]}},
+                      {"ANT": {"class": "RF", "impedance": {"ohms": 50}}})
+    assert z.layer_violations(hdm, sexpr.parse(pcb_text)) == [("ANT", "In2.Cu", "RF")]
+
+
+def test_a_release_with_a_controlled_trace_off_its_layer_is_not_quotable(released):
+    proj, build = released
+    (proj / "dev.kicad_pcb").write_text(
+        '(kicad_pcb (segment (start 0 0) (end 1 0) (width 0.35) (layer "B.Cu") (net "ANT")))\n')
+    manifest = build(_four_layer({"trace_width": 0.35, "impedance": {"ohms": 50, "layers": ["F.Cu"]}},
+                                 {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}))
+    assert not manifest["quotable"]
+    (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
+    assert "ANT on B.Cu" in step["detail"]

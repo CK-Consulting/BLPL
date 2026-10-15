@@ -86,10 +86,16 @@ what the board "probably" carries.
      (A half that reaches a differential class alone brings its partner along.)
    - **ZC-006** — a coplanar class with no `coplanar_gap`: the gap to the
      ground pour sets its impedance as much as the width does.
+   - **ZC-007** — on a board with more than two copper layers, a class that
+     does not say which layer its width is for: `impedance: {ohms: 50,
+     layers: [F.Cu]}`.
+
+   ZC-003 and every ZC finding except ZC-004 are errors.
 5. **Release.** `blpl release` writes `fab/impedance.md` — class, target,
-   tolerance, width, gap, nets — for the board house, and refuses to mark the
-   package quotable while any ZC error stands (a cell reading `NOT SET`, a pair
-   split across classes, a missing gap). Order with
+   tolerance, layers, width, gap, and every controlled net — for the board
+   house. It refuses to mark the package quotable while any ZC error stands, or
+   while a routed controlled trace sits on a layer its class's width is not
+   for (it reads the `.kicad_pcb`). Order with
    impedance control and a TDR test coupon; ±10 % is the usual tolerance,
    tighter costs more.
 
@@ -151,8 +157,9 @@ taller dielectric → higher Z; higher Dk → lower Z.
   number like these is a sanity check, not a design value.
 - **Each layer has its own width.** An outer microstrip and an inner stripline
   at the same impedance are different widths. Where a controlled net changes
-  layer, the class width is for one layer; record which, and keep controlled
-  nets on that layer where you can.
+  layer, the class width is for one layer; record which in the class's
+  `impedance.layers`, and keep controlled nets on those layers. KiCad's net
+  classes do not constrain layer, so the release checks the routed board.
 - **Make controlled widths distinctive** (e.g. 0.127 mm, not the 0.125 mm used
   elsewhere), so the fab can find them on the gerbers and adjust them.
 - **Real-world effects** — etch factor (trapezoidal trace), copper roughness
