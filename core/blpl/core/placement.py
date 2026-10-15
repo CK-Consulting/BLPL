@@ -63,6 +63,8 @@ from pathlib import Path
 
 from blpl.emitter import loaders, sexpr
 
+from . import board_geometry
+
 #: Edge-to-edge gap between neighbouring courtyards. The courtyard already
 #: carries the part's own clearance, so this is room to route between parts
 #: rather than a manufacturing minimum.
@@ -306,16 +308,48 @@ def _declared_anchor(ref: str, hints: dict, refs: set[str]) -> str | None:
 
 
 class _Canvas:
-    """Occupied rectangles, and where the next one can go."""
+    """Occupied rectangles, and where the next one can go.
+
+    The board is an outline polygon plus whatever blocks parts inside it —
+    cutouts, which are holes, and keepouts that forbid footprints or pads. An
+    axis-aligned rectangle with nothing in it keeps the plain arithmetic this
+    class started with, so a board whose project.yaml says nothing new places
+    exactly as it did before shapes existed.
+    """
 
     def __init__(self, w: float, h: float, clearance: float, margin: float, step: float,
-                 edge_margin: float = 0.3):
+                 edge_margin: float = 0.3, board: "board_geometry.Board | None" = None):
         self.w, self.h = w, h
         self.clearance = clearance
         self.margin = margin
         self.edge_margin = edge_margin
         self.step = step
         self.taken: list[tuple[float, float, float, float]] = []
+        self.board = board
+        self.outline = board.outline.polygon if board is not None else None
+        # The plain arithmetic assumes the rectangle runs from (0, 0); a
+        # rectangle written with an origin elsewhere takes the general path.
+        self.rect = board is None or (
+            board.outline.axis_rect
+            and max(abs(v) for v in board.outline.bbox[:2]) < 1e-6)
+        # Containment against a curved outline is the expensive part of a fit
+        # test, and the same few part sizes are tried at the same grid points
+        # over and over — every 0402 on the board asks the same question.
+        self._inside: dict[tuple, bool] = {}
+        self._edge: dict[tuple[float, float], float] = {}
+
+    def _blockers(self) -> list["board_geometry.Feature"]:
+        if self.board is None:
+            return []
+        return [f for f in self.board.features if f.blocks_parts]
+
+    def _within_outline(self, box: tuple[float, float, float, float]) -> bool:
+        key = tuple(round(v, 4) for v in box)
+        hit = self._inside.get(key)
+        if hit is None:
+            hit = board_geometry.box_inside(box, self.outline)
+            self._inside[key] = hit
+        return hit
 
     def _fits(self, x: float, y: float, w: float, h: float, edge: bool) -> bool:
         # An edge-seeking part may approach the boundary, but not touch it:
@@ -326,11 +360,59 @@ class _Canvas:
             return False
         if x + w / 2 > self.w - m or y + h / 2 > self.h - m:
             return False
+        if not self.rect and not self._within_outline(
+                (x - w / 2 - m, y - h / 2 - m, x + w / 2 + m, y + h / 2 + m)):
+            return False
         c = self.clearance
         for (ox, oy, ow, oh) in self.taken:
             if abs(x - ox) < (w + ow) / 2 + c and abs(y - oy) < (h + oh) / 2 + c:
                 return False
+        for f in self._blockers():
+            # A cutout is board edge, so it keeps the edge margin; a keepout is
+            # a rule about copper and parts, and a courtyard may meet its line.
+            pad = m if f.kind == "cutout" else 0.0
+            if board_geometry.box_overlaps(
+                    (x - w / 2 - pad, y - h / 2 - pad, x + w / 2 + pad, y + h / 2 + pad),
+                    f.shape.polygon):
+                return False
         return True
+
+    def features_clear(self, features: list["board_geometry.Feature"]) -> bool:
+        """Whether a part's anchored shapes can go where the part is about to.
+
+        Its own keepout must not land on a part already down — the part would
+        then sit in a keepout the placer itself created — and its own cutout
+        must be a hole inside the board, not a bite out of its edge.
+        """
+        for f in features:
+            if f.kind == "cutout":
+                if not board_geometry.polygon_inside(f.shape.polygon, self.outline_polygon()):
+                    return False
+                if any(board_geometry.polygons_overlap(f.shape.polygon, o.shape.polygon)
+                       for o in self._blockers() if o.kind == "cutout"):
+                    return False
+            if f.blocks_parts:
+                for (ox, oy, ow, oh) in self.taken:
+                    if board_geometry.box_overlaps(
+                            (ox - ow / 2, oy - oh / 2, ox + ow / 2, oy + oh / 2),
+                            f.shape.polygon):
+                        return False
+        return True
+
+    def outline_polygon(self) -> list[tuple[float, float]]:
+        if self.outline is not None:
+            return self.outline
+        return [(0.0, 0.0), (self.w, 0.0), (self.w, self.h), (0.0, self.h)]
+
+    def to_edge(self, p: tuple[float, float]) -> float:
+        """How far a candidate centre is from the board's edge."""
+        if self.rect:
+            return min(p[0], p[1], self.w - p[0], self.h - p[1])
+        d = self._edge.get(p)
+        if d is None:
+            d = board_geometry.distance_to_boundary(p, self.outline)
+            self._edge[p] = d
+        return d
 
     def candidates(self, edge: bool) -> list[tuple[float, float]]:
         """Every legal centre on the search grid, cheapest first is the caller's job."""
@@ -343,7 +425,7 @@ class _Canvas:
         if edge:
             # Perimeter first, so an edge-seeking part takes the edge even when
             # the interior is emptier and therefore nearer its neighbours.
-            out.sort(key=lambda p: min(p[0], p[1], self.w - p[0], self.h - p[1]))
+            out.sort(key=self.to_edge)
         return out
 
     def take(self, x: float, y: float, w: float, h: float) -> None:
@@ -353,7 +435,7 @@ class _Canvas:
 def place(
     components: dict,
     nets: dict,
-    board: tuple[float, float],
+    board: "tuple[float, float] | board_geometry.Board",
     *,
     footprint_roots: Sequence[Path | str] = (),
     hints: dict | None = None,
@@ -362,16 +444,60 @@ def place(
 ) -> Result:
     """Place every component, or say which ones would not fit.
 
+    ``board`` is a (width, height) rectangle or a ``board_geometry.Board``
+    — an outline of any shape, with cutouts and keepouts the parts must stay
+    out of. A Board's anchored shapes are fixed as their part is placed and
+    added to it, so the caller gets back a board whose features are all in
+    board coordinates (or still anchored, if their part did not fit).
+
     ``hints`` maps a refdes to a partial placement — ``{"x":…, "y":…}``,
-    ``{"rot":…}``, ``{"side":"bottom"}``, or ``{"near": "U1"}``. A hint is an
-    instruction, not a preference: a hinted position is taken as given and
-    reserved before anything else is placed, because a human writing one knows
-    something this module does not.
+    ``{"rot":…}``, ``{"side":"bottom"}``, ``{"near": "U1"}``, or
+    ``{"edge": "top"}``. A hint is an instruction, not a preference: a hinted
+    position is taken as given and reserved before anything else is placed,
+    because a human writing one knows something this module does not.
     """
     hints = hints or {}
     result = Result()
-    bw, bh = board
+    shaped: board_geometry.Board | None = None
+    if isinstance(board, board_geometry.Board):
+        shaped = board
+        # The search area runs from 0 to the outline's far corner; an outline
+        # written as points need not start at the origin, and the fit test,
+        # not the grid, is what keeps a part inside it.
+        bw, bh = board.extent
+        sw, sh = board.size
+        where = (f"inside {sw:.1f}x{sh:.1f}mm" if board.outline.axis_rect
+                 else f"inside the {sw:.1f}x{sh:.1f}mm board outline")
+    else:
+        bw, bh = board
+        where = f"inside {bw:.1f}x{bh:.1f}mm"
     refs = set(components)
+
+    def wants_edge(ref: str) -> bool:
+        return _wants_edge(ref) or bool((hints.get(ref) or {}).get("edge"))
+
+    def anchored_at(ref: str, spot: tuple[float, float]) -> list:
+        """The part's anchored shapes as they would land with its box at ``spot``."""
+        if shaped is None:
+            return []
+        dx, dy = offsets[ref]
+        rot = float((hints.get(ref) or {}).get("rot", 0.0))
+        return [board_geometry.Feature(
+                    f.kind, board_geometry.transform(f.shape, spot[0] - dx, spot[1] - dy, rot),
+                    f.where, anchor=f.anchor, layers=f.layers, forbid=f.forbid, name=f.name)
+                for f in shaped.anchored_to(ref)]
+
+    def fits(ref: str, spot: tuple[float, float], w: float, h: float, edge: bool) -> bool:
+        if not canvas._fits(spot[0], spot[1], w, h, edge):
+            return False
+        mine = anchored_at(ref, spot)
+        return not mine or canvas.features_clear(mine)
+
+    def commit(ref: str, spot: tuple[float, float], w: float, h: float) -> None:
+        canvas.take(spot[0], spot[1], w, h)
+        if shaped is not None:
+            p = result.placements[ref]
+            board_geometry.place_anchored(shaped, ref, p.x, p.y, p.rot)
 
     offsets: dict[str, tuple[float, float]] = {}
     for ref, comp in components.items():
@@ -400,7 +526,7 @@ def place(
     result.offsets = offsets
 
     step = max(0.5, min(min(e) for e in result.extents.values()) / 2) if result.extents else 1.0
-    canvas = _Canvas(bw, bh, clearance, edge_margin, step)
+    canvas = _Canvas(bw, bh, clearance, edge_margin, step, board=shaped)
 
     # 1. Fixed hints first: they are constraints, and everything else works
     #    around them rather than the other way about.
@@ -413,8 +539,12 @@ def place(
                           float(hint.get("rot", 0.0)), str(hint.get("side", "top")))
             result.placements[ref] = p
             # A hint gives the footprint origin; the box it occupies is offset
-            # from that by wherever its author put the origin.
+            # from that by wherever its author put the origin. Its anchored
+            # shapes go down with it, unchecked like the part itself: Stage 8
+            # is where a hint that puts something in a keepout is reported.
             canvas.take(p.x + dx, p.y + dy, w, h)
+            if shaped is not None:
+                board_geometry.place_anchored(shaped, ref, p.x, p.y, p.rot)
 
     adj = _adjacency(nets, refs)
     remaining = [r for r in sorted(refs) if r not in result.placements]
@@ -428,7 +558,7 @@ def place(
     majors.sort(key=lambda r: (-_area(result.extents[r]), r))
     for ref in majors:
         w, h = result.extents[ref]
-        edge = _wants_edge(ref)
+        edge = wants_edge(ref)
         anchors = [result.placements[n] for n in adj[ref] if n in result.placements]
         if anchors:
             tx = sum(a.x for a in anchors) / len(anchors)
@@ -436,14 +566,13 @@ def place(
         else:
             tx, ty = bw / 2, bh / 2
         spot = next(
-            ((x, y) for (x, y) in _ranked_spots(canvas, edge, tx, ty)
-             if canvas._fits(x, y, w, h, edge)),
+            ((x, y) for (x, y) in _ranked_spots(canvas, edge, tx, ty,
+                                                (hints.get(ref) or {}).get("edge"))
+             if fits(ref, (x, y), w, h, edge)),
             None,
         )
         if spot is None:
-            result.unplaced[ref] = (
-                f"no free {w:.2f}x{h:.2f}mm position inside {bw:.1f}x{bh:.1f}mm"
-            )
+            result.unplaced[ref] = f"no free {w:.2f}x{h:.2f}mm position {where}"
             remaining.remove(ref)
             continue
         hint = hints.get(ref) or {}
@@ -452,7 +581,7 @@ def place(
         result.placements[ref] = Placement(spot[0] - dx, spot[1] - dy,
                                            float(hint.get("rot", 0.0)),
                                            str(hint.get("side", "top")))
-        canvas.take(spot[0], spot[1], w, h)
+        commit(ref, spot, w, h)
         remaining.remove(ref)
 
     # 3. Seed with the most-connected part, which is almost always the thing
@@ -461,14 +590,20 @@ def place(
         seed = max(remaining, key=lambda r: (sum(adj[r].values()), -_area(result.extents[r]), r))
         w, h = result.extents[seed]
         hint = hints.get(seed) or {}
-        for (x, y) in sorted(canvas.candidates(False), key=lambda p: (p[0] - bw / 2) ** 2 + (p[1] - bh / 2) ** 2):
-            if canvas._fits(x, y, w, h, False):
+        edge = wants_edge(seed)
+        # Ranked like every other part. The seed used to take the spot nearest
+        # the centre unconditionally, so a connector that happened to be the
+        # most connected part landed mid-board whatever it wanted — and an
+        # edge hint on it did nothing. For a part that wants no edge the
+        # ordering is the same nearest-the-centre one as before.
+        for (x, y) in _ranked_spots(canvas, edge, bw / 2, bh / 2, hint.get("edge")):
+            if fits(seed, (x, y), w, h, edge):
                 sdx, sdy = offsets[seed]
                 result.placements[seed] = Placement(
                     x - sdx, y - sdy,
                     float(hint.get("rot", 0.0)), str(hint.get("side", "top"))
                 )
-                canvas.take(x, y, w, h)
+                commit(seed, (x, y), w, h)
                 remaining.remove(seed)
                 break
 
@@ -499,7 +634,7 @@ def place(
             remaining.sort(key=lambda r: (tie(r), r), reverse=True)
             ref = remaining.pop(0)
         w, h = result.extents[ref]
-        edge = _wants_edge(ref)
+        edge = wants_edge(ref)
 
         anchors = [result.placements[n] for n in adj[ref] if n in result.placements]
         declared = _declared_anchor(ref, hints, refs)
@@ -518,26 +653,25 @@ def place(
             tx, ty = bw / 2, bh / 2
 
         spot = None
-        for (x, y) in _ranked_spots(canvas, edge, tx, ty):
-            if canvas._fits(x, y, w, h, edge):
+        for (x, y) in _ranked_spots(canvas, edge, tx, ty, (hints.get(ref) or {}).get("edge")):
+            if fits(ref, (x, y), w, h, edge):
                 spot = (x, y)
                 break
         if spot is None:
-            result.unplaced[ref] = (
-                f"no free {w:.2f}x{h:.2f}mm position inside {bw:.1f}x{bh:.1f}mm"
-            )
+            result.unplaced[ref] = f"no free {w:.2f}x{h:.2f}mm position {where}"
             continue
         hint = hints.get(ref) or {}
         dx, dy = offsets[ref]
         result.placements[ref] = Placement(spot[0] - dx, spot[1] - dy,
                                            float(hint.get("rot", 0.0)),
                                            str(hint.get("side", "top")))
-        canvas.take(spot[0], spot[1], w, h)
+        commit(ref, spot, w, h)
 
     return result
 
 
-def _ranked_spots(canvas: "_Canvas", edge: bool, tx: float, ty: float):
+def _ranked_spots(canvas: "_Canvas", edge: bool, tx: float, ty: float,
+                  side: str | None = None):
     """Candidate centres, best first, for a part that does or does not seek an edge.
 
     Both passes used to sort the perimeter-ordered candidate list by distance
@@ -548,13 +682,27 @@ def _ranked_spots(canvas: "_Canvas", edge: bool, tx: float, ty: float):
     go, and the flex had nowhere to exit. Edge-seeking is a hard preference
     ranked *before* locality, because something outside the board plugs into
     these parts and no amount of short routing makes an interior position work.
+
+    ``side`` names *which* edge, from an ``edge`` hint. Any edge is not good
+    enough for a module whose antenna has to clear the ground plane, or a
+    connector that has to face the enclosure's opening. It is measured against
+    the board's bounding box, so on a round or angled board "top" means as near
+    the top as the part fits — the fit test, not this ranking, keeps it inside.
     """
+    by_side = {
+        "top": lambda q: q[1],
+        "bottom": lambda q: canvas.h - q[1],
+        "left": lambda q: q[0],
+        "right": lambda q: canvas.w - q[0],
+    }
+
     def key(q: tuple[float, float]) -> tuple:
         near_target = math.hypot(q[0] - tx, q[1] - ty)
+        if side in by_side:
+            return (round(by_side[side](q), 3), near_target)
         if not edge:
             return (0.0, near_target)
-        to_edge = min(q[0], q[1], canvas.w - q[0], canvas.h - q[1])
-        return (round(to_edge, 3), near_target)
+        return (round(canvas.to_edge(q), 3), near_target)
 
     return sorted(canvas.candidates(edge), key=key)
 
