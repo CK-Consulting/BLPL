@@ -216,6 +216,21 @@ def _place_components(
             f"boundaries anchors a shape to {', '.join(unknown)}, which is not a part on "
             "this board. A shape anchored to nothing has nowhere to go."
         )
+    hints = (project_config.get("placement") or {}).get("hints") or {}
+    flipped = sorted(
+        {f.anchor for f in board.anchored}
+        & {r for r, h in hints.items() if isinstance(h, dict)
+           and str(h.get("side", "top")).lower() == "bottom"}
+    )
+    if flipped:
+        # Checked here, before placement, so the message names the cause; see
+        # board_geometry.place_anchored for why it is refused at all.
+        raise InvalidProjectConfigError(
+            f"boundaries anchors shapes to {', '.join(flipped)}, which placement.hints "
+            "puts on the bottom side. The emitter does not mirror flipped footprints yet, "
+            "so an anchored shape would land on the wrong side of the part. Draw the "
+            "shape in board coordinates instead."
+        )
 
     roots: list[Path] = []
     if project_dir is not None and stock_footprints_root is not None:
@@ -224,7 +239,6 @@ def _place_components(
     elif stock_footprints_root is not None:
         roots = [Path(stock_footprints_root)]
 
-    hints = (project_config.get("placement") or {}).get("hints") or {}
     try:
         result = placement.place(
             components_out, nets_out, board, footprint_roots=roots, hints=hints

@@ -497,7 +497,7 @@ def place(
         canvas.take(spot[0], spot[1], w, h)
         if shaped is not None:
             p = result.placements[ref]
-            board_geometry.place_anchored(shaped, ref, p.x, p.y, p.rot)
+            board_geometry.place_anchored(shaped, ref, p.x, p.y, p.rot, p.side)
 
     offsets: dict[str, tuple[float, float]] = {}
     for ref, comp in components.items():
@@ -544,7 +544,7 @@ def place(
             # is where a hint that puts something in a keepout is reported.
             canvas.take(p.x + dx, p.y + dy, w, h)
             if shaped is not None:
-                board_geometry.place_anchored(shaped, ref, p.x, p.y, p.rot)
+                board_geometry.place_anchored(shaped, ref, p.x, p.y, p.rot, p.side)
 
     adj = _adjacency(nets, refs)
     remaining = [r for r in sorted(refs) if r not in result.placements]

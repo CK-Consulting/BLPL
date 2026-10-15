@@ -750,8 +750,25 @@ def check_feature(board: Board, f: Feature) -> None:
             raise BoardGeometryError(f"{f.where} overlaps {other.where}")
 
 
-def place_anchored(board: Board, ref: str, x: float, y: float, rot: float) -> list[Feature]:
-    """Fix ``ref``'s anchored shapes at its placement, check them, and return them."""
+def place_anchored(board: Board, ref: str, x: float, y: float, rot: float,
+                   side: str = "top") -> list[Feature]:
+    """Fix ``ref``'s anchored shapes at its placement, check them, and return them.
+
+    A bottom-side part is refused rather than mirrored. KiCad mirrors a
+    flipped footprint's frame, so mirroring is what an anchored shape *should*
+    do — but the emitter does not flip footprints yet (it relabels the
+    footprint B.Cu and leaves its pads unmirrored on F.Cu), and a mirrored
+    keepout beside an unmirrored part is on the wrong side of it either way.
+    Until the two agree, saying so beats drawing the antenna keepout over the
+    wrong end of the module.
+    """
+    if str(side).lower() == "bottom" and board.anchored_to(ref):
+        raise BoardGeometryError(
+            f"{ref} is on the bottom side and has anchored shapes "
+            f"({', '.join(f.where for f in board.anchored_to(ref))}); anchoring to a "
+            "bottom-side part is not supported yet, because the emitter does not mirror "
+            "flipped footprints. Draw the shape in board coordinates instead"
+        )
     placed = []
     for f in board.anchored_to(ref):
         g = Feature(f.kind, transform(f.shape, x, y, rot), f.where, anchor=f.anchor,
