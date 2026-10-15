@@ -24,7 +24,7 @@
 import { useEffect, useState } from "react";
 
 import { getJSON, putJSON, type BoardConfig, type BoardFeature } from "../api";
-import { outlineSize, SHAPE_KINDS, seedShape, type ShapeKind, type ShapeSpec } from "../boardShape";
+import { bbox, outlineSize, SHAPE_KINDS, seedShape, type ShapeKind, type ShapeSpec } from "../boardShape";
 import { BoardPreview, ShapeFields, tryBuild } from "./BoardShapeFields";
 
 const FINISHES = ["ENIG", "HASL", "LF-HASL", "OSP", "Immersion Silver", "Immersion Tin", "Hard Gold"];
@@ -377,6 +377,30 @@ function FeatureList({
       ? { shape: "circle", diameter: 3, center: [round(w / 2), round(h / 2)] }
       : { shape: "rect", size: [10, 5], center: [round(w / 2), 5] };
   const set = (i: number, f: BoardFeature) => onChange(list.map((g, k) => (k === i ? f : g)));
+
+  /** Where a feature sits: the middle of the shape it builds to. A polygon has
+   *  no center key — its points are its position — so this is the one answer
+   *  that holds for every shape. */
+  const middle = (f: BoardFeature): [number, number] => {
+    const { segs } = tryBuild({ ...f, anchor: undefined }, "feature", "center");
+    if (!segs) return Array.isArray(f.center) ? [Number(f.center[0]) || 0, Number(f.center[1]) || 0] : [0, 0];
+    const [x0, y0, x1, y1] = bbox(segs);
+    return [round((x0 + x1) / 2), round((y0 + y1) / 2)];
+  };
+  /** `f` moved so its middle is at `c`: through its points for a polygon,
+   *  through `center` for everything else (an `origin` is replaced). */
+  const placeAt = (f: BoardFeature, c: [number, number]): BoardFeature => {
+    if (f.shape === "polygon" && Array.isArray(f.points)) {
+      const [mx, my] = middle(f);
+      const points = (f.points as unknown[]).map((p) =>
+        Array.isArray(p) ? [round(Number(p[0]) + c[0] - mx), round(Number(p[1]) + c[1] - my)] : p,
+      );
+      return { ...f, points };
+    }
+    const next: BoardFeature = { ...f, center: c };
+    delete next.origin;
+    return next;
+  };
   const Kind = kind === "cutout" ? "Cutout" : "Keepout";
 
   return (
@@ -386,7 +410,10 @@ function FeatureList({
       {list.map((f, i) => {
         const prefix = `${Kind} ${i + 1}`;
         const { problem } = f.anchor ? { problem: null } : tryBuild(f, prefix, "center");
-        const forbid = f.forbid ?? FORBIDDABLE;
+        // Read defensively: a hand-edited `layers: F.Cu` reaches here as a
+        // string with its error beside it, and must not stop the form rendering.
+        const forbid = Array.isArray(f.forbid) ? f.forbid : FORBIDDABLE;
+        const layerList = Array.isArray(f.layers) ? f.layers : typeof f.layers === "string" ? [f.layers] : [];
         return (
           <div className="board-feature" key={i}>
             <div className="field-row">
@@ -398,22 +425,19 @@ function FeatureList({
                   onChange={(e) => {
                     // A new shape's own keys, with where it is and what it
                     // means kept: changing a slot to a circle should not move
-                    // it or lift its keepout rules.
-                    const { center, origin, name, anchor, layers, forbid: fb } = f;
-                    const seeded = seedShape(e.target.value as ShapeKind, 10, 5);
-                    let keep: Record<string, unknown> = { center, origin, name, anchor, layers, forbid: fb };
+                    // it or lift its keepout rules. Where it is comes from the
+                    // shape, not the center key — a polygon has none, and a
+                    // keepout silently moved to (0, 0) still saves, because
+                    // keepouts may run off the board.
+                    const { name, anchor, layers, forbid: fb } = f;
+                    const seeded: BoardFeature = seedShape(e.target.value as ShapeKind, 10, 5);
                     if (seeded.shape === "polygon") {
-                      // A polygon's points are its position, and core refuses
-                      // a center beside them: the position moves into the points.
-                      const [cx, cy] = Array.isArray(center) ? (center as number[]) : [0, 0];
-                      seeded.points = [[-5, -2.5], [5, -2.5], [5, 2.5], [-5, 2.5]].map(
-                        ([x, y]) => [round(x + cx), round(y + cy)],
-                      );
-                      keep = { name, anchor, layers, forbid: fb };
+                      seeded.points = [[-5, -2.5], [5, -2.5], [5, 2.5], [-5, 2.5]];
                     }
-                    const next: BoardFeature = { ...seeded };
-                    for (const [k, v] of Object.entries(keep)) if (v !== undefined) next[k] = v;
-                    set(i, next);
+                    for (const [k, v] of Object.entries({ name, anchor, layers, forbid: fb })) {
+                      if (v !== undefined) seeded[k] = v;
+                    }
+                    set(i, placeAt(seeded, middle(f)));
                   }}
                 >
                   {SHAPE_KINDS.map((k) => (
@@ -442,8 +466,16 @@ function FeatureList({
                   placeholder="fixed on the board"
                   value={f.anchor ?? ""}
                   onChange={(e) => {
-                    const next: BoardFeature = { ...f, anchor: e.target.value.trim() };
+                    let next: BoardFeature = { ...f, anchor: e.target.value.trim() };
                     if (!next.anchor) delete next.anchor;
+                    // Anchoring changes what the coordinates mean: board mm
+                    // become the part's footprint frame. Kept as they were,
+                    // a keepout seeded mid-board would land that far from the
+                    // part. So it is re-placed on the part's origin, and back
+                    // on the board's middle when the anchor is cleared.
+                    if (!!next.anchor !== !!f.anchor) {
+                      next = placeAt(next, next.anchor ? [0, 0] : [round(w / 2), round(h / 2)]);
+                    }
                     set(i, next);
                   }}
                 />
@@ -470,7 +502,7 @@ function FeatureList({
                   <input
                     aria-label={`${prefix} layers`}
                     placeholder="*.Cu"
-                    value={(f.layers ?? []).join(", ")}
+                    value={layerList.join(", ")}
                     onChange={(e) => {
                       const layers = e.target.value.split(",").map((x) => x.trim()).filter(Boolean);
                       const next: BoardFeature = { ...f, layers };

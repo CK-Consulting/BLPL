@@ -269,6 +269,65 @@ describe("the board's shape", () => {
     expect(screen.getByText("Add keepout")).toBeInTheDocument();
   });
 
+  it("keeps a polygon keepout where it is when it becomes another shape", async () => {
+    // A polygon has no center key, and keepouts may run off the board, so a
+    // keepout silently moved to (0, 0) would still save.
+    const box: { sent: any } = { sent: null };
+    stub(
+      {
+        config: {
+          ...LEGACY,
+          boundaries: {
+            ...LEGACY.boundaries,
+            keepouts: [{ shape: "polygon", points: [[70, 50], [90, 50], [90, 70], [70, 70]] }],
+          },
+        },
+      },
+      (body) => {
+        box.sent = body;
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    );
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.change(await screen.findByLabelText("Keepout 1 shape"), { target: { value: "rect" } });
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.boundaries.keepouts[0]).toMatchObject({ shape: "rect", center: [80, 60] });
+  });
+
+  it("re-places a shape when anchoring changes what its coordinates mean", async () => {
+    // Board mm become the part's footprint frame; kept as they were, a keepout
+    // seeded mid-board would land that far from the part.
+    capture();
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByText("Add keepout"));
+    expect(screen.getByLabelText("Keepout 1 center x (mm)")).toHaveValue(50);
+    fireEvent.change(screen.getByLabelText("Keepout 1 anchor"), { target: { value: "U1" } });
+    expect(screen.getByLabelText("Keepout 1 center x (mm)")).toHaveValue(0);
+    expect(screen.getByLabelText("Keepout 1 center y (mm)")).toHaveValue(0);
+    // Typing more of the refdes is not another change of frame.
+    fireEvent.change(screen.getByLabelText("Keepout 1 center x (mm)"), { target: { value: "3" } });
+    fireEvent.change(screen.getByLabelText("Keepout 1 anchor"), { target: { value: "U12" } });
+    expect(screen.getByLabelText("Keepout 1 center x (mm)")).toHaveValue(3);
+    fireEvent.change(screen.getByLabelText("Keepout 1 anchor"), { target: { value: "" } });
+    expect(screen.getByLabelText("Keepout 1 center x (mm)")).toHaveValue(50);
+    expect(screen.getByLabelText("Keepout 1 center y (mm)")).toHaveValue(40);
+  });
+
+  it("still opens a keepout whose layers and forbid are not lists", async () => {
+    stub({
+      valid: false,
+      errors: ["boundaries.keepouts.0.layers: 'F.Cu' is not of type 'array'"],
+      config: {
+        ...CONFIG.config,
+        boundaries: { keepouts: [{ shape: "rect", size: [4, 4], layers: "F.Cu", forbid: "tracks" }] },
+      },
+    });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("layers");
+    expect(screen.getByLabelText("Keepout 1 layers")).toHaveValue("F.Cu");
+  });
+
   it("adds cutouts and keepouts with what they forbid", async () => {
     const box = capture();
     render(<BoardConfigPanel projectId="p" board="core" />);
