@@ -7,40 +7,207 @@
 # the files were always there, mounted and readable, just not opened.
 #
 # The app cannot launch a process in this container, and KasmVNC takes no file
-# argument, so the two sides meet on a file: the backend writes the absolute
-# in-container path of a .kicad_pro into a request file, and this watches for it.
+# argument, so the two sides meet on files: the backend writes the absolute
+# in-container path of a .kicad_pro into a request file, and this watches for
+# it. In the other direction this writes a heartbeat saying which projects a
+# KiCad here has open, which the backend reads before it seals one (below).
 #
 # Polling rather than inotify: this runs in a stock linuxserver image where
 # inotify-tools is not installed, the request arrives at human speed, and two
 # seconds of latency on a click nobody is timing is not worth a dependency.
 
 REQUEST="${BLPL_KICAD_OPEN_REQUEST:-/config/projects/.blpl-kicad-open}"
+# In this container's own /config (the host's data/kicad-desktop), not beside
+# the projects: a deployment without the project mount hides the projects
+# from the backend, and in the one-project mount the projects root is a
+# checkout a repository controls (Codex, PR #33).
+ACTIVE="${BLPL_KICAD_ACTIVE_FILE:-/config/.blpl-kicad-active}"
 STATE=/config/.blpl-kicad-open.handled
+PENDING=/config/.blpl-kicad-pending
+PROJECTS="$(dirname "$REQUEST")"
+
+export WAYLAND_DISPLAY="${BLPL_KICAD_WAYLAND:-wayland-0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/config/.XDG}"
 
 log() { echo "[blpl-open-project] $*"; }
 
+# kicad_projects: "pid path" for every KiCad started on a project file.
+kicad_projects() {
+    local p args
+    for p in $(pgrep -x kicad 2>/dev/null); do
+        args="$(tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | sed -n 2p)"
+        [ -n "$args" ] && echo "$p $args"
+    done
+}
+
+# open_files: every file a live KiCad here has open, from KiCad's own locks.
+#
+# KiCad writes ~<file>.lck beside a project, schematic or board while it has
+# it open, naming the host, and removes it on close — File > Close Project
+# included. That is the live state. The launch command line was the first
+# answer and is not: it never changes, so a project closed inside a KiCad that
+# was left running stayed "open" and would never have been sealed (Codex, PR
+# #33). Locks also cover a project opened from inside KiCad, which no command
+# line names.
+#
+# A lock counts only when it names this host and something alive answers for
+# it: a KiCad started on that project, or a window whose title names it (a
+# project opened from inside KiCad has no command line naming it). A KiCad that
+# crashed has neither, so its lock — which it never got to remove — holds
+# nothing. Comparing against the oldest KiCad's start time was not enough: the
+# autostarted manager is older than everything, so a crashed project window's
+# lock stayed "live" for as long as it ran (Codex, PR #33).
+open_files() {
+    local host lck name file stem argv shown
+    host="$(hostname)"
+    pgrep -x kicad >/dev/null 2>&1 || return 0
+    argv="$(kicad_projects | cut -d' ' -f2-)"
+    shown="$(titles)"
+    find "$PROJECTS" -maxdepth 8 -path '*/.sealed' -prune -o -name '~*.lck' -type f -print 2>/dev/null |
+    while IFS= read -r lck; do
+        grep -qF "\"hostname\":\"$host\"" "$lck" 2>/dev/null || continue
+        name="$(basename "$lck")"
+        name="${name#\~}"
+        file="$(dirname "$lck")/${name%.lck}"
+        stem="$(basename "$file")"
+        stem="${stem%.*}"
+        if printf '%s\n' "$argv" | grep -qxF "$(dirname "$file")/$stem.kicad_pro" ||
+           { [ -n "$stem" ] && printf '%s\n' "$shown" | grep -qF "$stem"; }; then
+            echo "$file"
+        fi
+    done
+}
+
+# pending: projects asked for in the last minute, whose KiCad may not have
+# locked them yet. Published before KiCad is started, so the gap between a
+# click and the lock is never a moment in which nothing holds the project
+# (Codex, PR #33).
+pending() {
+    local now t path
+    [ -f "$PENDING" ] || return 0
+    now="$(date +%s)"
+    while IFS=' ' read -r t path; do
+        [ -n "$path" ] && [ $((now - t)) -lt 60 ] && echo "$path"
+    done < "$PENDING"
+}
+
+# Every KiCad here is a window someone may be working in. The backend seals a
+# project nobody has touched through the app for half an hour, and editing in
+# this desktop touched nothing there — so a project could be encrypted and its
+# directory deleted under an open KiCad. That window then showed "Failed to get
+# the working directory" over an empty file tree, still titled with the run it
+# had open, and any save from it had nowhere to go. The heartbeat names the
+# files open here; the backend will not seal a project while one is listed and
+# the heartbeat is fresh.
+heartbeat() {
+    local tmp
+    # mktemp creates a fresh file exclusively, so nothing planted at a fixed
+    # temporary name can redirect the write.
+    tmp="$(mktemp "$(dirname "$ACTIVE")/.blpl-kicad-active.XXXXXX")" || return 0
+    if { open_files; pending; } | sort -u > "$tmp"; then
+        # mktemp makes it 0600, and this runs as root while the backend runs
+        # as the deployment's user: unreadable, it read as "nothing open"
+        # (Codex, PR #33). It names paths, nothing secret.
+        chmod 0644 "$tmp"
+        mv -f "$tmp" "$ACTIVE"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+# titles: every toplevel window's title.
+titles() {
+    command -v wlrctl >/dev/null 2>&1 || return 0
+    s6-setuidgid abc env WAYLAND_DISPLAY="$WAYLAND_DISPLAY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        wlrctl toplevel list 2>/dev/null | sed -n 's/^kicad: //p'
+}
+
+focus_title() {
+    s6-setuidgid abc env WAYLAND_DISPLAY="$WAYLAND_DISPLAY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        wlrctl toplevel focus "app_id:kicad" "title:$1" >/dev/null 2>&1
+}
+
+# bring_forward <project-path> <titles-before-launch>
+#
+# Each `kicad <project>` is its own window, and labwc does not always put it
+# on top: the one that opened at 21:45 sat behind an older run's window, held
+# up by its own "Recover Unsaved Changes" dialog, and the reader saw the old
+# run. So the project's main window is focused when it appears — or, while it
+# is held up, whatever dialog appeared since the launch, which is what is in
+# the way. wlrctl matches titles exactly, hence the listing first.
+bring_forward() {
+    local name before i t main fresh
+    name="$(basename "$1" .kicad_pro)"
+    before="$2"
+    command -v wlrctl >/dev/null 2>&1 || return 0
+    for i in $(seq 1 30); do
+        main="$(titles | grep -F "$name — KiCad" | head -1)"
+        if [ -n "$main" ]; then
+            focus_title "$main"
+            return 0
+        fi
+        # Only a window that appeared after this launch can be its dialog.
+        # With nothing to compare against (the project was already open),
+        # any other dialog belongs to some other KiCad: leave it alone.
+        if [ -n "$before" ]; then
+            fresh="$(titles | grep -vxF -f <(printf '%s\n' "$before") | tail -1)"
+            [ -n "$fresh" ] && focus_title "$fresh"
+        fi
+        sleep 1
+    done
+}
+
+# Lock files from an earlier container. KiCad writes ~<file>.lck naming the
+# host that opened the file, and removes it on a clean close; a container that
+# was recreated with KiCad open leaves every one of them behind. Each then
+# greets the next open with "already open by 'abc' at <old container>", and
+# the autostarted KiCad, which reopens its last project, stops on that dialog
+# before anyone has asked for anything. A lock naming another host cannot be a
+# KiCad here — this container is the only one that opens these files.
+host="$(hostname)"
+find "$(dirname "$REQUEST")" -path '*/.sealed' -prune -o -name '~*.lck' -type f -print 2>/dev/null |
+while IFS= read -r lck; do
+    grep -qF "\"hostname\":\"$host\"" "$lck" 2>/dev/null && continue
+    rm -f "$lck" && log "removed stale lock $lck"
+done
+
 log "watching $REQUEST"
+n=0
 while true; do
     if [ -s "$REQUEST" ]; then
         want="$(head -c 4096 "$REQUEST" | tr -d '\r\n')"
+        # A request is the path *and* when it was written. Keyed on the path
+        # alone, clicking "Open KiCad" again for the same run did nothing, so a
+        # window closed by mistake could not be got back. The backend rewrites
+        # the file on every click, so the mtime is the click.
+        key="$(stat -c %Y "$REQUEST" 2>/dev/null) $want"
         seen=""
         [ -f "$STATE" ] && seen="$(cat "$STATE")"
-        # Compared by content, not mtime: asking for the same project twice is
-        # a no-op rather than a second window, and re-requesting a different
-        # one always fires even if the clock did not move.
-        if [ -n "$want" ] && [ "$want" != "$seen" ]; then
-            if [ -f "$want" ]; then
+        if [ -n "$want" ] && [ "$key" != "$seen" ]; then
+            printf '%s' "$key" > "$STATE"
+            if [ ! -f "$want" ]; then
+                log "requested project does not exist: $want"
+            elif kicad_projects | cut -d' ' -f2- | grep -qxF "$want"; then
+                log "already open, bringing it forward: $want"
+                bring_forward "$want" "" &
+            else
                 log "opening $want"
-                printf '%s' "$want" > "$STATE"
+                # Every entry is older than a minute once the file is: start over.
+                [ -n "$(find "$PENDING" -mmin +1 2>/dev/null)" ] && : > "$PENDING"
+                printf '%s %s\n' "$(date +%s)" "$want" >> "$PENDING"
+                heartbeat
+                before="$(titles)"
                 # setsid so KiCad outlives this supervised shell: s6 restarts
                 # `run` scripts, and a child in this process group would be
                 # killed along with it.
                 setsid s6-setuidgid abc kicad "$want" >/dev/null 2>&1 &
-            else
-                log "requested project does not exist: $want"
-                printf '%s' "$want" > "$STATE"
+                bring_forward "$want" "$before" &
             fi
         fi
     fi
+    # Every 10 s; the backend treats a heartbeat older than 2 min as gone, so
+    # a stopped desktop never holds a project open.
+    if [ $((n % 5)) -eq 0 ]; then heartbeat; fi
+    n=$((n + 1))
     sleep 2
 done

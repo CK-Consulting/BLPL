@@ -36,3 +36,10 @@ FROM lscr.io/linuxserver/kicad:10.0.3-r0-ls150
 RUN pip3 install --no-cache-dir --break-system-packages \
     kikit \
     psutil
+
+# wlrctl, so the open-project watcher (kicad-desktop-services/blpl-open-project)
+# can bring a newly opened board to the front. The desktop is labwc on
+# Wayland: KiCad's windows are not on the X display, so xdotool cannot see
+# them, and without focusing, a new run opened behind an older run's window
+# and the older one is what people saw.
+RUN apk add --no-cache wlrctl

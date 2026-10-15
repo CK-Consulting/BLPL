@@ -12,6 +12,7 @@ import {
 import { PolicyFields, ProjectPolicyPanel, useNewProjectPolicy } from "./LibraryPolicy";
 import { ProjectIcon } from "./Icons";
 import { BoardConfigPanel } from "./BoardConfigPanel";
+import { ConfirmDialog } from "./Dialog";
 import { Modal, PromptDialog } from "./Dialog";
 import { onPushPending } from "../commitEvents";
 import {
@@ -752,6 +753,16 @@ export function ProjectSettings({
   board?: string | null;
 }) {
   const [open, setOpen] = useState(false);
+  const [boardDirty, setBoardDirty] = useState(false);
+  const [asking, setAsking] = useState(false);
+  // Closing with board edits unsaved discards them, and the dialog's other
+  // panels each have a Save of their own that does not save the board. So ask.
+  const discard = () => {
+    setBoardDirty(false);
+    setAsking(false);
+    setOpen(false);
+  };
+  const close = () => (boardDirty ? setAsking(true) : discard());
   if (!open)
     return (
       <button
@@ -764,21 +775,35 @@ export function ProjectSettings({
       </button>
     );
   return (
-    <div className="modal-backdrop" onClick={() => setOpen(false)}>
+    <div className="modal-backdrop" onClick={close}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <header className="modal-head">
           <h2>Project settings — {projectId}</h2>
-          <button className="link" onClick={() => setOpen(false)}>
+          <button className="link" onClick={close}>
             Close
           </button>
         </header>
         <div className="modal-body">
-          <BoardConfigPanel projectId={projectId} board={board ?? null} />
+          <BoardConfigPanel
+            projectId={projectId}
+            board={board ?? null}
+            onDirtyChange={setBoardDirty}
+          />
           <ProjectRoutingPanel projectId={projectId} />
           <ProjectGitPanel projectId={projectId} onRemoteChanged={onRemoteChanged} />
           <ProjectPolicyPanel projectId={projectId} />
         </div>
       </div>
+      {asking && (
+        <ConfirmDialog
+          title="Discard board changes?"
+          confirmLabel="Discard"
+          danger
+          message="The board config has edits that were not saved with “Save board config”. The other panels’ Save buttons do not save it. Close and discard them?"
+          onConfirm={discard}
+          onClose={() => setAsking(false)}
+        />
+      )}
     </div>
   );
 }

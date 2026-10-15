@@ -2587,6 +2587,17 @@ def _seal_workspace(session: Session, project_id: str, why: list[str] | None = N
                 why.append("a run is in progress in this project; seal it when the run "
                            "has finished")
             return False
+    held = _kicad_desktop_holds(project_id)
+    if held:
+        # Sealing deletes the plaintext tree. A KiCad window with that tree
+        # open then shows "Failed to get the working directory" over an empty
+        # file list, and anything saved from it has nowhere to go. Editing in
+        # the desktop touches nothing here, so an hour of routing there read
+        # as an idle project and was sealed out from under it.
+        workspaces.touch(project_id)
+        if why is not None:
+            why.append("it is open in the KiCad desktop; close it there first")
+        return False
     # With workspaces behind the agent (phase 4), in a sealer container, after
     # the workspace is stopped and removed, so no container is left holding the
     # plaintext. Its failures are caught here as WorkspaceError's are; with the
@@ -6345,6 +6356,58 @@ def _kicad_desktop_path(host_path: Path) -> str | None:
     except (ValueError, OSError):
         return None
     return f"{mounted_at}/{rel.as_posix()}" if rel.parts else mounted_at
+
+
+#: A desktop heartbeat older than this is a desktop that is not running.
+KICAD_ACTIVE_FRESH_S = 120
+#: How long an "Open KiCad" request holds its project before the desktop's
+#: own lock is expected to.
+KICAD_OPEN_HOLD_S = 60
+
+
+def _kicad_active_file() -> Path:
+    """The desktop's heartbeat: its /config, which is data/kicad-desktop here.
+
+    Not beside the projects. A backend run without the project mount sees an
+    empty tmpfs there, so a heartbeat in it read as "nothing open" and the
+    sweep sealed a tree KiCad still had open (Codex, PR #33).
+    """
+    configured = os.environ.get("BLPL_KICAD_ACTIVE_FILE", "").strip()
+    return Path(configured) if configured else _DATA / "kicad-desktop" / ".blpl-kicad-active"
+
+
+def _kicad_desktop_holds(project_id: str) -> list[str]:
+    """Projects the KiCad desktop has open in this project or a member's worktree of it.
+
+    Read from the heartbeat its watcher writes beside the open request
+    (``.blpl-kicad-active``: one in-container project path per line, for every
+    KiCad started on a project). A stale or missing heartbeat holds nothing, so
+    a stopped desktop can never keep a project unsealed.
+    """
+    import time
+
+    lines: list[str] = []
+    beat = _kicad_active_file()
+    try:
+        if time.time() - beat.stat().st_mtime <= KICAD_ACTIVE_FRESH_S:
+            lines = [ln.strip() for ln in beat.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        pass
+    # An open this backend asked for in the last minute holds too, from the
+    # moment the request is written: the watcher polls, and until it has seen
+    # the request and published a hold of its own there was a window in which
+    # nothing held the project and a seal could take it (Codex, PR #33).
+    request = _kicad_open_request_file()
+    try:
+        if time.time() - request.stat().st_mtime <= KICAD_OPEN_HOLD_S:
+            lines += [ln.strip() for ln in request.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        pass
+    roots = [r.rstrip("/") for r in (
+        _kicad_desktop_path(PROJECTS_ROOT / project_id),
+        _kicad_desktop_path(PROJECTS_ROOT / worktrees.WORKTREES_DIR / project_id),
+    ) if r]
+    return [ln for ln in lines if any(ln == r or ln.startswith(r + "/") for r in roots)]
 
 
 def _kicad_open_request_file() -> Path:
