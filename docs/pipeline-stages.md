@@ -272,10 +272,13 @@ The rest follows from that:
     declared gap;
   - a differential pair whose halves are not routed together: on different
     layers, or not side by side at `diff_pair_gap`;
-  - a controlled trace with no filled plane under it on its reference layer.
-    By default that is the layer next to an outer trace, or both neighbours of
-    an inner one; `impedance.reference` names it explicitly. A power plane
-    counts.
+  - a controlled trace with no filled ground or power plane under it on its
+    reference layer. By default that is the layer next to an outer trace, or
+    both neighbours of an inner one, by the board's own layer table;
+    `impedance.reference` names it explicitly. Another signal's pour is not a
+    plane, and nor is the trace's own net;
+  - a board whose copper layer count differs from the HDM's stackup, or a
+    board with no HDM beside it.
 
   Coupling and ground are judged by walking each controlled net's routed path
   every 0.25 mm, along segments and arcs alike, so a curve or a partial
