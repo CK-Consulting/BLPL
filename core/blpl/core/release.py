@@ -442,8 +442,13 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
     # Review first. A tag that matched nothing leaves no controlled net and so
     # no table, and returning "nothing to control" before asking would let the
     # requirement it was meant to carry vanish from a quotable package.
-    errors = sorted({f["rule_id"] for f in impedance.review(hdm) if f["severity"] == "error"})
-    table = impedance.fab_table(hdm)
+    # A malformed value in a hand-edited HDM refuses the step; it must not
+    # abort the build and lose the refusal notice (Codex, PR #31).
+    try:
+        errors = sorted({f["rule_id"] for f in impedance.review(hdm) if f["severity"] == "error"})
+        table = impedance.fab_table(hdm)
+    except (impedance.ImpedanceConfigError, TypeError, ValueError, AttributeError) as exc:
+        return Step("impedance", False, f"{hdm_path.name} has impedance settings that do not parse: {exc}")
     if table is None:
         if errors:
             return Step("impedance", False,

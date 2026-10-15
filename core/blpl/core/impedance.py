@@ -411,9 +411,23 @@ def review(hdm: dict) -> list[dict]:
         rules = rules or {}
         try:
             spec = parse(rules.get("impedance"), f"net_classes.{name}.impedance")
-        except ImpedanceConfigError:
-            spec = None
+            why = "declares no impedance"
+        except ImpedanceConfigError as exc:
+            spec, why = None, f"has an impedance that does not parse ({exc})"
         members = used.get(name, [])
+        if spec is None and members:
+            # A net carrying its own target on a class without one: the class is
+            # what the board is routed and checked by, so neither the sheet nor
+            # the routing checks know the target (Codex, PR #31).
+            finding(
+                "ZC-011", "error",
+                f"{len(members)} net(s) are impedance-controlled but their class {name} {why}, "
+                "so the fab sheet cannot say what to build them to and the routed board "
+                "is not checked against it.",
+                f"Declare the impedance on net_classes.{name} (or move these nets onto the "
+                "class that has it), or drop the nets' own impedance if they are not controlled.",
+                nets_=members)
+            continue
         if spec is None:
             m = _NAMED_OHMS.search(name)
             if m and any(d.get("class") == name for d in nets.values()):
@@ -546,7 +560,17 @@ def fab_table(hdm: dict) -> str | None:
     order = copper_order(copper)
     for cls in sorted(rows):
         rules = classes.get(cls) or {}
-        spec = parse(rules.get("impedance"), cls) or Spec()
+        try:
+            declared = parse(rules.get("impedance"), cls)
+        except ImpedanceConfigError:
+            declared = None
+        if declared is None:
+            # Controlled nets on a class with no usable target (ZC-011). The
+            # sheet says so rather than inventing 50 ohms for them.
+            lines.append(f"| {cls} | NOT SET | NOT SET | NOT SET | NOT SET | NOT SET | NOT SET "
+                         f"| {', '.join(sorted(rows[cls]))} |")
+            continue
+        spec = declared
         # The width the .kicad_pro routes these nets at: a pair's own width when
         # the class gives one. The sheet and the project must say the same.
         width = (f"{rules[width_key(rules, spec)]}" if _has_width(rules, spec)
@@ -835,6 +859,20 @@ def _samples(net: str, lines: list, arcs: list, pads: list | None = None) -> lis
     return out
 
 
+def _measured(net: str, lines: list, arcs: list, pads: list | None = None) -> list:
+    """The samples of a net's path that are checked: all but its breakouts.
+
+    Each end may break out for ``_END_ALLOWANCE_MM``, but never for more than
+    half the path's own reach, so the middle of a short route is measured too.
+    A pad-to-pad run of 4 mm or less used to lie wholly inside its two
+    allowances and pass every check unmeasured (Codex, PR #31).
+    """
+    samples = _samples(net, lines, arcs, pads)
+    finite = [s[5] for s in samples if s[5] != float("inf")]
+    allowance = min(_END_ALLOWANCE_MM, max(finite) / 2) if finite else _END_ALLOWANCE_MM
+    return [s for s in samples if s[5] > allowance]
+
+
 def _distance_to_path(pt: tuple, lay: str, net: str, lines: list, arcs: list):
     """Nearest (distance, width) from a point to a net's copper centreline on a layer."""
     import math
@@ -928,9 +966,7 @@ def _coplanar_findings(hdm: dict, pcb: list) -> dict[tuple[str, str], set[str]]:
             continue
         gap = float(rules.get("coplanar_gap", 0))
         clear_at = [gap * f for f in (0.25, 0.5, 0.75)] + [max(gap - _GAP_SLACK_MM, 0.0)]
-        for lay, pt, nrm, w, step, from_end in _samples(net, lines, arcs, pads.get(net)):
-            if from_end <= _END_ALLOWANCE_MM:
-                continue              # where the trace meets its pad
+        for lay, pt, nrm, w, step, from_end in _measured(net, lines, arcs, pads.get(net)):
             polys = filled.get(lay, [])
 
             def ground(sign: float, d: float) -> bool:
@@ -1029,9 +1065,7 @@ def pair_problems(hdm: dict, pcb: list) -> list[str]:
         for me, other in ((a, b), (b, a)):
             apart: dict[str, float] = {}
             wrong: dict[str, list[tuple[float, float]]] = {}
-            for lay, pt, _nrm, w, step, from_end in _samples(me, lines, arcs, pads.get(me)):
-                if from_end <= _END_ALLOWANCE_MM:
-                    continue          # breaking out to its pad
+            for lay, pt, _nrm, w, step, from_end in _measured(me, lines, arcs, pads.get(me)):
                 near = _distance_to_path(pt, lay, other, lines, arcs)
                 edge = None if near is None else near[0] - (w + near[1]) / 2
                 if edge is None or edge > _COUPLED_SEARCH_MM:
@@ -1106,9 +1140,7 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     order = board_copper(pcb) or copper_order(_hdm_copper(hdm))
     out = set()
     for net, (cls, _rules, spec) in ctl.items():
-        for lay, pt, nrm, w, _step, from_end in _samples(net, lines, arcs, pads.get(net)):
-            if from_end <= _END_ALLOWANCE_MM:
-                continue
+        for lay, pt, nrm, w, _step, from_end in _measured(net, lines, arcs, pads.get(net)):
             offs = [0.0] + [sign * (w / 2 + k * w)
                             for sign in (1.0, -1.0)
                             for k in (0.0, _PLANE_MARGIN_W / 2, _PLANE_MARGIN_W)]

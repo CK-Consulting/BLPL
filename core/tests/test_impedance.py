@@ -956,6 +956,40 @@ def test_a_release_with_an_unreadable_hdm_is_refused_not_crashed(released):
     assert "could not read hdm.yaml" in step["detail"]
 
 
+def test_a_short_route_is_measured_not_all_breakout():
+    """Codex, PR #31: a pad-to-pad run of 4 mm or less lay wholly inside its two
+    end allowances, so a pair at any gap passed unmeasured."""
+    pads = ('(footprint "J1" (at 0 0)'
+            ' (pad "1" smd rect (at 0 0) (size 0.3 0.3) (net "USB_DP"))'
+            ' (pad "2" smd rect (at 0 0.5) (size 0.3 0.3) (net "USB_DM"))'
+            ' (pad "3" smd rect (at 3 0) (size 0.3 0.3) (net "USB_DP"))'
+            ' (pad "4" smd rect (at 3 0.5) (size 0.3 0.3) (net "USB_DM")))')
+    wrong = _pair_board(_seg("USB_DP", 0, 0, 3, 0), _seg("USB_DM", 0, 0.5, 3, 0.5), pads)
+    assert any("not 0.15" in p for p in z.pair_problems(_PAIR_HDM, wrong))
+    right = _pair_board(_seg("USB_DP", 0, 0, 3, 0), _seg("USB_DM", 0, 0.33, 3, 0.33),
+                        pads.replace("(at 0 0.5)", "(at 0 0.33)").replace("(at 3 0.5)", "(at 3 0.33)"))
+    assert z.pair_problems(_PAIR_HDM, right) == []
+
+
+def test_a_net_with_its_own_target_on_a_class_without_one_is_an_error():
+    """Codex, PR #31: the sheet printed it as 50 ohms single-ended whatever its
+    own target, and no routing check ran on it."""
+    hdm = {"net_classes": {"Default": {"trace_width": 0.2}},
+           "nets": {"USB_DP": {"class": "Default", "impedance": {"ohms": 90, "mode": "differential"}}}}
+    assert [f["rule_id"] for f in z.review(hdm)] == ["ZC-011"]
+    table = z.fab_table(hdm)
+    assert "| Default | NOT SET |" in table and "50 Ω" not in table
+
+
+def test_a_release_with_an_unparseable_class_impedance_is_refused_not_crashed(released):
+    proj, build = released
+    manifest = build({"net_classes": {"RF": {"trace_width": 0.35, "impedance": {"ohms": "fifty"}}},
+                      "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}})
+    assert not manifest["quotable"]
+    (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
+    assert "ZC-011" in step["detail"] or "do not parse" in step["detail"]
+
+
 def test_another_signals_pour_is_not_a_reference_plane():
     from blpl.emitter import sexpr
 
