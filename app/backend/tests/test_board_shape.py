@@ -179,6 +179,13 @@ def test_a_shape_stage5_would_refuse_is_never_proposed(project) -> None:
     assert ProposalStore(project).pending() == []
 
 
+def test_a_polygon_with_a_center_is_refused_as_stage5_refuses_it(project) -> None:
+    res = _call(project, path="project.yaml", rationale="r",
+                keepouts=[{"shape": "polygon", "points": [[0, 0], [4, 0], [2, 3]],
+                           "center": [10, 10]}])
+    assert res.is_error and "drop center" in res.content
+
+
 def test_only_a_project_yaml_is_a_board_shape(project) -> None:
     (project / "notes.yaml").write_text("a: 1\n", encoding="utf-8")
     res = _call(project, path="notes.yaml", rationale="r", outline={"shape": "circle",

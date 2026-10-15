@@ -393,10 +393,16 @@ function FeatureList({
                     // it or lift its keepout rules.
                     const { center, origin, name, anchor, layers, forbid: fb } = f;
                     const seeded = seedShape(e.target.value as ShapeKind, 10, 5);
+                    let keep: Record<string, unknown> = { center, origin, name, anchor, layers, forbid: fb };
                     if (seeded.shape === "polygon") {
-                      seeded.points = [[-5, -2.5], [5, -2.5], [5, 2.5], [-5, 2.5]];
+                      // A polygon's points are its position, and core refuses
+                      // a center beside them: the position moves into the points.
+                      const [cx, cy] = Array.isArray(center) ? (center as number[]) : [0, 0];
+                      seeded.points = [[-5, -2.5], [5, -2.5], [5, 2.5], [-5, 2.5]].map(
+                        ([x, y]) => [round(x + cx), round(y + cy)],
+                      );
+                      keep = { name, anchor, layers, forbid: fb };
                     }
-                    const keep = { center, origin, name, anchor, layers, forbid: fb };
                     const next: BoardFeature = { ...seeded };
                     for (const [k, v] of Object.entries(keep)) if (v !== undefined) next[k] = v;
                     set(i, next);
@@ -445,6 +451,7 @@ function FeatureList({
             {f.anchor && (
               <p className="muted small">
                 Coordinates are in {f.anchor}'s footprint frame, and the shape moves with the part.
+                A part on the bottom side cannot carry an anchored shape yet; Stage 5 refuses it.
               </p>
             )}
             <ShapeFields prefix={prefix} spec={f} positioned onChange={(s) => set(i, s as BoardFeature)} />

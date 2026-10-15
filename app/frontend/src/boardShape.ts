@@ -221,12 +221,25 @@ export function buildShape(spec: ShapeSpec, where: string, place: "origin" | "ce
       if (spec.diameter !== undefined) rad = pos(spec.diameter, `${where}.diameter`) / 2;
       else if (spec.radius !== undefined) rad = pos(spec.radius, `${where}.radius`);
       else throw new ShapeError(`${where} is a circle with no diameter`);
-      const c: Pt = spec.center !== undefined
-        ? point(spec.center, `${where}.center`)
-        : place === "origin" ? [rad, rad] : [0, 0];
+      if (spec.origin !== undefined && spec.center !== undefined) {
+        throw new ShapeError(`${where} gives both origin and center; give one`);
+      }
+      let c: Pt = place === "origin" ? [rad, rad] : [0, 0];
+      if (spec.center !== undefined) c = point(spec.center, `${where}.center`);
+      else if (spec.origin !== undefined) {
+        // The top-left of its bounding box, as for every other shape.
+        const [ox, oy] = point(spec.origin, `${where}.origin`);
+        c = [ox + rad, oy + rad];
+      }
       return [{ kind: "circle", c, r: rad }];
     }
     case "polygon": {
+      // Its points are its position, so core refuses an origin or centre beside them.
+      for (const key of ["origin", "center"]) {
+        if (spec[key] !== undefined) {
+          throw new ShapeError(`${where} is a polygon, whose points are its position; drop ${key}`);
+        }
+      }
       if (!Array.isArray(spec.points)) throw new ShapeError(`${where}.points must be a list of [x, y]`);
       const pts = spec.points.map((p, i) => point(p, `${where} point ${i + 1}`));
       return polygonSegs(pts, r, where);

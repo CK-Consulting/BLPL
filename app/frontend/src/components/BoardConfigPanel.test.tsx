@@ -242,6 +242,20 @@ describe("the board's shape", () => {
     expect(await screen.findByRole("img", { name: "Board outline preview" })).toBeInTheDocument();
   });
 
+  it("moves a cutout's centre into its points when it becomes a polygon", async () => {
+    // Core refuses a polygon with a center beside its points.
+    const box = capture();
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByText("Add cutout"));
+    fireEvent.change(screen.getByLabelText("Cutout 1 shape"), { target: { value: "polygon" } });
+    expect(screen.queryByLabelText("Cutout 1 center x (mm)")).toBeNull();
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    const [cut] = box.sent.config.boundaries.cutouts;
+    expect(cut.center).toBeUndefined();
+    expect(cut.points).toEqual([[45, 37.5], [55, 37.5], [55, 42.5], [45, 42.5]]);
+  });
+
   it("adds cutouts and keepouts with what they forbid", async () => {
     const box = capture();
     render(<BoardConfigPanel projectId="p" board="core" />);

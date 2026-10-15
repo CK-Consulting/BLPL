@@ -94,7 +94,8 @@ export function ShapeFields({
   // A shape placed by its top-left keeps that; otherwise it is placed by its
   // centre, which is what the shape vocabulary defaults to off the outline.
   const where = spec.origin !== undefined ? "origin" : "center";
-  const position = positioned
+  // A polygon's points are its position; core refuses an origin or centre on one.
+  const position = positioned && spec.shape !== "polygon"
     ? [p(where === "origin" ? "Origin X (mm)" : "Center X (mm)", where, 0),
       p(where === "origin" ? "Origin Y (mm)" : "Center Y (mm)", where, 1)]
     : [];

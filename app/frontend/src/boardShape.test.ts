@@ -49,6 +49,17 @@ describe("shapes core would refuse", () => {
     );
   });
 
+  it("refuses a polygon given an origin or center, since its points are its position", () => {
+    expect(() =>
+      buildShape({ shape: "polygon", points: [[0, 0], [4, 0], [2, 3]], center: [5, 5] }, "o", "center"),
+    ).toThrow(/drop center/);
+  });
+
+  it("places a circle by origin at the top-left of its box", () => {
+    const [seg] = buildShape({ shape: "circle", diameter: 4, origin: [10, 20] }, "o", "center");
+    expect(seg).toMatchObject({ kind: "circle", c: [12, 22], r: 2 });
+  });
+
   it("refuses a circle that is both diameter and radius", () => {
     expect(() => buildShape({ shape: "circle", diameter: 4, radius: 2 }, "o", "center")).toThrow(
       /give one/,
