@@ -520,7 +520,9 @@ def test_an_inner_layer_keepout_lands_on_an_inner_layer_the_board_has():
     (["In1.Cu"], 2), (["In3.Cu"], 4), (["F.Cu", "In2.Cu"], None), (["B.Cu"], 1),
     (["F&B.Cu"], 1), (["Inner.Cu"], 4),
     # Names not ending in .Cu used to skip the check entirely.
-    (["F.Cuu"], 2), (["F.Cu "], 2), (["F.SilkS"], 4), (["In1.cu"], 4),
+    (["F.Cuu"], 2), (["F.Cu "], 2), (["In1.cu"], 4),
+    # A display name instead of the file's name makes KiCad refuse the board.
+    (["F.Silkscreen"], 2), (["User.Drawings"], 2),
 ])
 def test_a_keepout_on_copper_the_stackup_lacks_is_refused(layers, stackup):
     """A rule area on a layer the board has not enabled loads and protects
@@ -540,7 +542,8 @@ def test_an_anchored_keepout_on_missing_copper_is_refused_too():
         bg.from_config(cfg)
 
 
-@pytest.mark.parametrize("layers", [["*.Cu"], ["F&B.Cu"], ["F.Cu", "In4.Cu", "B.Cu"]])
+@pytest.mark.parametrize("layers", [["*.Cu"], ["F&B.Cu"], ["F.Cu", "In4.Cu", "B.Cu"],
+                                    ["F.Cu", "F.Mask"], ["F.SilkS"]])
 def test_keepouts_on_copper_the_stackup_has_are_accepted(layers):
     cfg = _config(keepouts=[{"shape": "rect", "center": [10, 10], "size": [4, 4],
                              "layers": layers}])
@@ -558,3 +561,11 @@ def test_the_emitter_refuses_a_keepout_on_missing_copper_it_is_handed():
     hdm["project"] = {**hdm["project"], "stackup": {"layers": 2}}
     with pytest.raises(ValueError, match="In1.Cu"):
         pcb.emit(hdm, footprints_root=_FOOTPRINTS_ROOT)
+
+
+def test_the_emitter_accepts_a_keepout_on_a_non_copper_layer_it_has():
+    cfg = _config(keepouts=[{"shape": "rect", "center": [25, 5], "size": [10, 4],
+                             "layers": ["F.Cu", "F.Mask"]}])
+    out = pcb.emit(_hdm(cfg), footprints_root=_FOOTPRINTS_ROOT)
+    (zone,) = _tags(out, "zone")
+    assert sexpr.find(zone, "layers")[1:] == ['"F.Cu"', '"F.Mask"']

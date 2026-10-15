@@ -635,6 +635,17 @@ def copper_layers(count: int) -> tuple[str, ...]:
     return ("F.Cu", *(f"In{n}.Cu" for n in range(1, count - 1)), "B.Cu")
 
 
+# KiCad's canonical non-copper layer names, the ones a .kicad_pcb file uses.
+# A rule area may sit on these (KiCad keeps one on F.Mask through a save and
+# reload), but only under these spellings: a zone written with the display
+# name "F.Silkscreen" or "User.Drawings" makes the whole board fail to load.
+NON_COPPER_LAYERS = frozenset({
+    "F.Adhes", "B.Adhes", "F.Paste", "B.Paste", "F.SilkS", "B.SilkS",
+    "F.Mask", "B.Mask", "Dwgs.User", "Cmts.User", "Eco1.User", "Eco2.User",
+    "Edge.Cuts", "Margin", "F.CrtYd", "B.CrtYd", "F.Fab", "B.Fab",
+})
+
+
 def _check_keepout_layers(layers: tuple[str, ...], copper: tuple[str, ...],
                           where: str) -> None:
     """A keepout on copper the stackup does not have is refused.
@@ -643,12 +654,12 @@ def _check_keepout_layers(layers: tuple[str, ...], copper: tuple[str, ...],
     protects nothing, so an antenna keepout written for In1.Cu on what is
     really a 2-layer board would build, pass, and leave the antenna's ground
     plane exactly where it was. Every name is checked, not only those ending
-    in ``.Cu``: a rule area is a copper-layer object in KiCad, so ``F.SilkS``
-    is as wrong as ``In7.Cu``, and a typo like ``F.Cuu`` or ``F.Cu `` used to
-    skip the check and reach the board verbatim. ``*.Cu`` means whatever
-    copper there is, and ``F&B.Cu`` the two outer layers.
+    in ``.Cu``: a typo like ``F.Cuu`` or ``F.Cu `` used to skip the check and
+    reach the board verbatim. ``*.Cu`` means whatever copper there is,
+    ``F&B.Cu`` the two outer layers, and the canonical non-copper names are
+    accepted as they are.
     """
-    allowed = set(copper) | {"*.Cu"}
+    allowed = set(copper) | {"*.Cu"} | NON_COPPER_LAYERS
     if len(copper) > 1:
         allowed.add("F&B.Cu")
     missing = [layer for layer in layers if layer not in allowed]
@@ -656,9 +667,10 @@ def _check_keepout_layers(layers: tuple[str, ...], copper: tuple[str, ...],
         raise BoardGeometryError(
             f"{where}.layers names {', '.join(repr(m) for m in missing)}, but "
             f"project.stackup.layers is {len(copper)}, so a keepout may be on "
-            f"{', '.join(copper)} or *.Cu{' or F&B.Cu' if len(copper) > 1 else ''}. A "
-            "keepout on a layer the board does not have protects nothing; change the "
-            "layer or the stackup."
+            f"{', '.join(copper)} or *.Cu{' or F&B.Cu' if len(copper) > 1 else ''}, or a "
+            "non-copper layer by its KiCad file name (F.SilkS, F.Mask, ...). A keepout on "
+            "a layer the board does not have protects nothing; change the layer or the "
+            "stackup."
         )
 
 
