@@ -213,6 +213,10 @@ class Record:
     # The symbol or footprint names it brought, so removing one by name can
     # say which upload it came from.
     names: list[str] = field(default_factory=list)
+    # The same names, by the library they were placed in. One row can hold
+    # one set of bytes placed in several libraries, and removing a symbol from
+    # one of them must not forget it is still in the others.
+    names_by_library: dict[str, list[str]] = field(default_factory=dict)
     # A bundle's verdict per entry: name, kind, state, path, reasons.
     members: list[dict] = field(default_factory=list)
 
@@ -275,6 +279,16 @@ def _released_paths(row: dict) -> list[str]:
     return out
 
 
+def _names_by_library(row: dict) -> dict[str, list[str]]:
+    """A row's names per library; an older row knew only its one library."""
+    by_lib = row.get("names_by_library")
+    if isinstance(by_lib, dict) and by_lib:
+        return {str(k): list(v or []) for k, v in by_lib.items()}
+    if row.get("library") and row.get("names"):
+        return {row["library"]: list(row["names"])}
+    return {}
+
+
 def _upsert(project_dir: str | Path, rec: Record) -> None:
     """Record ``rec``, the one row for its hash, without forgetting a placement.
 
@@ -294,6 +308,11 @@ def _upsert(project_dir: str | Path, rec: Record) -> None:
         mine = set(_released_paths(rec.to_dict()))
         rec.placed = list(rec.placed) + [
             p for p in _released_paths(old) if p not in mine and p not in rec.placed]
+        mine_by_lib = {k: list(v) for k, v in (rec.names_by_library or {}).items()}
+        for lib, names in _names_by_library(old).items():
+            have = mine_by_lib.setdefault(lib, [])
+            have.extend(n for n in names if n not in have)
+        rec.names_by_library = mine_by_lib
         rec.names = list(rec.names) + [n for n in old.get("names") or [] if n not in rec.names]
         libs = list(old.get("libraries") or ([old["library"]] if old.get("library") else []))
         rec.libraries = libs
@@ -636,6 +655,7 @@ def _place(data: bytes, project_dir: str | Path, rec: Record, *, library: str) -
     rec.released_as = placed.paths[0][len(base) + 1:]
     rec.placed = placed.paths
     rec.names = placed.names
+    rec.names_by_library = {library: list(placed.names)} if placed.names else {}
     rec.state = RELEASED
     rec.reasons = []
     if placed.note:
@@ -834,13 +854,19 @@ def remove_library_symbol(project_dir: str | Path, library: str, symbol: str, *,
     path = out["path"]
 
     def change(row: dict) -> bool:
-        if library not in (row.get("libraries") or [row.get("library")]) \
-                or symbol not in (row.get("names") or []):
+        by_lib = _names_by_library(row)
+        if symbol not in by_lib.get(library, []):
             return False
         if path not in (row.get("placed") or []):
             return False
-        row["names"] = [n for n in row["names"] if n != symbol]
-        mine = set(row["names"]) & set(out["remaining"])
+        # Gone from this library only: the same bytes placed in another one
+        # still carry the name there, and a later removal from that library
+        # has to find it.
+        by_lib[library] = [n for n in by_lib[library] if n != symbol]
+        row["names_by_library"] = by_lib
+        row["names"] = [n for n in row.get("names") or []
+                        if any(n in names for names in by_lib.values())]
+        mine = set(by_lib[library]) & set(out["remaining"])
         if out["file_removed"] or not mine:
             row["placed"] = [p for p in row["placed"] if p != path]
         return True

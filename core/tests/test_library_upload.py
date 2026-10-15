@@ -638,3 +638,42 @@ def test_the_same_bytes_placed_in_two_libraries_keep_both_placements(tmp_path):
     assert set(row["libraries"]) == {"VendorA", "VendorB"}
     for p in placed:
         assert (tmp_path / p).is_file(), p
+
+
+def test_removing_a_symbol_from_one_library_leaves_its_twin_in_another_removable(tmp_path):
+    """One row holds the same bytes placed in two libraries. With one shared
+    names list, removing the symbol from A forgot it was still in B, so the
+    removal from B matched nothing and the row went on claiming B's file —
+    framing whatever the project later wrote there as vendor content."""
+    data = _symlib(_symbol("TWIN"))
+    _up(tmp_path, data, "symbol", "twin.kicad_sym", library="VendorA")
+    _up(tmp_path, data, "symbol", "twin.kicad_sym", library="VendorB")
+
+    quarantine.remove_library_symbol(tmp_path, "VendorA", "TWIN", by="a@x")
+    row = _row(tmp_path, "twin.kicad_sym")
+    assert row["names_by_library"] == {"VendorA": [], "VendorB": ["TWIN"]}
+    assert row["placed"] == ["libraries/symbols/VendorB.kicad_sym"]
+
+    quarantine.remove_library_symbol(tmp_path, "VendorB", "TWIN", by="a@x")
+    row = _row(tmp_path, "twin.kicad_sym")
+    assert row["placed"] == [] and row["state"] == quarantine.REMOVED
+
+
+def test_moving_a_linked_model_takes_its_footprints_with_it(tmp_path):
+    """The footprint names the model by its exact path. Moving the model left
+    it naming nothing, and the board lost its 3D body without a word."""
+    _up(tmp_path, STEP, "3d_model", "PCM12SMTBR.step")
+    _up(tmp_path, _footprint("PCM12SMTBR"), "footprint", "fp.kicad_mod")
+    fp = tmp_path / "libraries" / "footprints" / "myproj.pretty" / "PCM12SMTBR.kicad_mod"
+    src = "libraries/3dmodels/myproj.3dshapes/PCM12SMTBR.step"
+    dst = "libraries/3dmodels/vendor.3dshapes/PCM12SMTBR.step"
+    assert _model_refs(fp) == ["${KIPRJMOD}/../" + src]
+    before = fp.read_text(encoding="utf-8")
+
+    saved = library_upload.follow_moved_models(tmp_path, {src: dst})
+    assert [rel for rel, _ in saved] == ["libraries/footprints/myproj.pretty/PCM12SMTBR.kicad_mod"]
+    assert _model_refs(fp) == ["${KIPRJMOD}/../" + dst]
+    assert len(sexpr.find_all(sexpr.parse(fp.read_text()), "pad")) == 1
+
+    library_upload.restore_texts(tmp_path, saved)
+    assert fp.read_text(encoding="utf-8") == before
