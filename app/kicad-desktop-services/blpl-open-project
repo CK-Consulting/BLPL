@@ -17,7 +17,11 @@
 # seconds of latency on a click nobody is timing is not worth a dependency.
 
 REQUEST="${BLPL_KICAD_OPEN_REQUEST:-/config/projects/.blpl-kicad-open}"
-ACTIVE="${BLPL_KICAD_ACTIVE_FILE:-/config/projects/.blpl-kicad-active}"
+# In this container's own /config (the host's data/kicad-desktop), not beside
+# the projects: a deployment without the project mount hides the projects
+# from the backend, and in the one-project mount the projects root is a
+# checkout a repository controls (Codex, PR #33).
+ACTIVE="${BLPL_KICAD_ACTIVE_FILE:-/config/.blpl-kicad-active}"
 STATE=/config/.blpl-kicad-open.handled
 
 export WAYLAND_DISPLAY="${BLPL_KICAD_WAYLAND:-wayland-0}"
@@ -44,8 +48,15 @@ kicad_projects() {
 # fresh. A project opened from inside KiCad (File > Open) is not on a command
 # line and is not covered: open boards from the workbench.
 heartbeat() {
-    local tmp="$ACTIVE.tmp"
-    kicad_projects | cut -d' ' -f2- > "$tmp" 2>/dev/null && mv -f "$tmp" "$ACTIVE"
+    local tmp
+    # mktemp creates a fresh file exclusively, so nothing planted at a fixed
+    # temporary name can redirect the write.
+    tmp="$(mktemp "$(dirname "$ACTIVE")/.blpl-kicad-active.XXXXXX")" || return 0
+    if kicad_projects | cut -d' ' -f2- > "$tmp"; then
+        mv -f "$tmp" "$ACTIVE"
+    else
+        rm -f "$tmp"
+    fi
 }
 
 # titles: every toplevel window's title.

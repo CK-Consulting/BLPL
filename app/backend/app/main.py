@@ -6362,6 +6362,17 @@ def _kicad_desktop_path(host_path: Path) -> str | None:
 KICAD_ACTIVE_FRESH_S = 120
 
 
+def _kicad_active_file() -> Path:
+    """The desktop's heartbeat: its /config, which is data/kicad-desktop here.
+
+    Not beside the projects. A backend run without the project mount sees an
+    empty tmpfs there, so a heartbeat in it read as "nothing open" and the
+    sweep sealed a tree KiCad still had open (Codex, PR #33).
+    """
+    configured = os.environ.get("BLPL_KICAD_ACTIVE_FILE", "").strip()
+    return Path(configured) if configured else _DATA / "kicad-desktop" / ".blpl-kicad-active"
+
+
 def _kicad_desktop_holds(project_id: str) -> list[str]:
     """Projects the KiCad desktop has open in this project or a member's worktree of it.
 
@@ -6372,8 +6383,7 @@ def _kicad_desktop_holds(project_id: str) -> list[str]:
     """
     import time
 
-    base, _ = _kicad_desktop_mount()
-    beat = base / ".blpl-kicad-active"
+    beat = _kicad_active_file()
     try:
         if time.time() - beat.stat().st_mtime > KICAD_ACTIVE_FRESH_S:
             return []

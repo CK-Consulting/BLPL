@@ -22,6 +22,8 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import workspace  # noqa: E402
@@ -738,7 +740,14 @@ def test_the_blob_directory_can_be_configured(tmp_path, monkeypatch):
 
 
 def _kicad_has_open(main, *paths: str) -> None:
-    (main.PROJECTS_ROOT / ".blpl-kicad-active").write_text("".join(f"{p}\n" for p in paths))
+    beat = main._kicad_active_file()
+    beat.parent.mkdir(parents=True, exist_ok=True)
+    beat.write_text("".join(f"{p}\n" for p in paths))
+
+
+@pytest.fixture(autouse=True)
+def _heartbeat_here(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLPL_KICAD_ACTIVE_FILE", str(tmp_path / "kicad-desktop" / ".blpl-kicad-active"))
 
 
 def test_a_project_open_in_the_kicad_desktop_is_not_sealed(unlocked):
@@ -769,7 +778,7 @@ def test_a_stale_desktop_heartbeat_holds_nothing(unlocked):
     unlocked.post("/api/projects/init", json=init_body("mine"))
     _kicad_has_open(main, "/config/projects/mine/.pipeline/mine_2026.kicad_pro")
     old = time.time() - main.KICAD_ACTIVE_FRESH_S - 5
-    os.utime(main.PROJECTS_ROOT / ".blpl-kicad-active", (old, old))
+    os.utime(main._kicad_active_file(), (old, old))
 
     assert _seal_now(unlocked)["sealed"] is True
     assert not (main.PROJECTS_ROOT / "mine").exists()
@@ -781,3 +790,13 @@ def test_another_project_open_in_kicad_does_not_hold_this_one(unlocked):
     unlocked.post("/api/projects/init", json=init_body("mine"))
     _kicad_has_open(main, "/config/projects/mine2/x.kicad_pro", "/config/projects/other/y.kicad_pro")
     assert _seal_now(unlocked)["sealed"] is True
+
+
+def test_the_heartbeat_is_read_from_outside_the_projects_mount(unlocked, monkeypatch):
+    """Without the project mount the backend sees an empty tmpfs where the
+    projects are; a heartbeat kept there read as "nothing open" (Codex, PR #33)."""
+    import app.main as main
+
+    monkeypatch.delenv("BLPL_KICAD_ACTIVE_FILE")
+    assert main._kicad_active_file() == main._DATA / "kicad-desktop" / ".blpl-kicad-active"
+    assert main.PROJECTS_ROOT not in main._kicad_active_file().parents
