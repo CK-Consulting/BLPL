@@ -352,3 +352,21 @@ describe("the board's shape", () => {
     });
   });
 });
+
+describe("edits that are not saved", () => {
+  it("say so, and say so to whoever holds the panel, until they are saved", async () => {
+    // The settings dialog stacks this panel with others that each have a Save.
+    // A trapezoid drawn here and "saved" with the policy panel's button was
+    // dropped on close, and the next run built the old rectangle.
+    stub();
+    const dirty = vi.fn();
+    render(<BoardConfigPanel projectId="p" board="core" onDirtyChange={dirty} />);
+    fireEvent.change(await screen.findByLabelText("Width (mm)"), { target: { value: "90" } });
+    expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    expect(dirty).toHaveBeenLastCalledWith(true);
+
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(dirty).toHaveBeenLastCalledWith(false));
+    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+  });
+});

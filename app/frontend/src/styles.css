@@ -977,6 +977,7 @@ header .kicad-launch { margin-left: .4rem; }
    names the thing to fix rather than describing it. */
 .config-errors { margin: .6rem 0; padding: .5rem .8rem; list-style: disc inside;
   background: #3a1113; border: 1px solid #6e2126; border-radius: 6px; color: #ff9b9b; font-size: 12px; }
+.unsaved { margin-left: .6rem; font-size: 12px; color: #f0c674; align-self: center; }
 
 /* A Private Use Area codepoint: only a font that defines it can draw it, and
    this app ships no webfont. Nerd Font patches first, then the platform

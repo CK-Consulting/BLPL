@@ -42,6 +42,7 @@ type Boundaries = NonNullable<BoardConfig["config"]["boundaries"]>;
 export function BoardConfigPanel({
   projectId,
   board,
+  onDirtyChange,
 }: {
   projectId: string;
   /** The selected board, or null on a single-board project.
@@ -54,6 +55,11 @@ export function BoardConfigPanel({
    *  projects: unreachable for the simplest case, which is the one most
    *  likely to be somebody's first board. */
   board: string | null;
+  /** Told whether the form holds edits that are not saved. The settings dialog
+   *  stacks this panel with others, each with its own Save; a board outline
+   *  drawn here and then "saved" with another panel's button was dropped on
+   *  close without a word, and the next run built the old board. */
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [data, setData] = useState<BoardConfig | null>(null);
   const [draft, setDraft] = useState<BoardConfig["config"] | null>(null);
@@ -100,6 +106,11 @@ export function BoardConfigPanel({
       })
       .catch((e) => setNote((e as Error).message));
   }, [projectId, target]);
+
+  const dirty = !!data && !!draft && JSON.stringify(draft) !== JSON.stringify(data.config);
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
 
   if (!data || !draft) return <p className="muted small">Reading board config…</p>;
 
@@ -340,6 +351,11 @@ export function BoardConfigPanel({
         <button className="btn" onClick={save} disabled={busy}>
           {busy ? "Saving…" : "Save board config"}
         </button>
+        {dirty && !busy && (
+          <span className="unsaved" role="status">
+            Unsaved changes — not used by the pipeline until saved
+          </span>
+        )}
       </div>
 
       {/* Everything this form does not cover is still in the file, and the file
