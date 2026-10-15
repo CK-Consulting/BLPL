@@ -264,13 +264,18 @@ The rest follows from that:
   - a coplanar trace without *filled* ground copper on both sides at its
     declared gap;
   - a differential pair whose halves are not routed together: on different
-    layers, or not side by side at `diff_pair_gap`.
+    layers, or not side by side at `diff_pair_gap`;
+  - a controlled trace with no filled plane under it on its reference layer.
+    By default that is the layer next to an outer trace, or both neighbours of
+    an inner one; `impedance.reference` names it explicitly. A power plane
+    counts.
 
   Coupling and ground are judged by walking each controlled net's routed path
   every 0.25 mm, along segments and arcs alike, so a curve or a partial
   overlap is measured the same as a straight run. Only the first and last 2 mm
-  of the routed path, measured along the copper from where it meets a pad, go
-  unmeasured as breakout; a gap anywhere in between is reported.
+  of the routed path, measured along the copper from where it meets a pad of
+  its own net, go unmeasured as breakout. A dead end anywhere else is a stub,
+  and a gap anywhere in between is reported.
 
   A class width is only the router's default and constrains no layer, so the
   release reads the board itself. Neither emitter pours ground, so that zone is
