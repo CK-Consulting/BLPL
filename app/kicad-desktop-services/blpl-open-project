@@ -23,6 +23,8 @@ REQUEST="${BLPL_KICAD_OPEN_REQUEST:-/config/projects/.blpl-kicad-open}"
 # checkout a repository controls (Codex, PR #33).
 ACTIVE="${BLPL_KICAD_ACTIVE_FILE:-/config/.blpl-kicad-active}"
 STATE=/config/.blpl-kicad-open.handled
+PENDING=/config/.blpl-kicad-pending
+PROJECTS="$(dirname "$REQUEST")"
 
 export WAYLAND_DISPLAY="${BLPL_KICAD_WAYLAND:-wayland-0}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/config/.XDG}"
@@ -38,21 +40,70 @@ kicad_projects() {
     done
 }
 
+# open_files: every file a live KiCad here has open, from KiCad's own locks.
+#
+# KiCad writes ~<file>.lck beside a project, schematic or board while it has
+# it open, naming the host, and removes it on close — File > Close Project
+# included. That is the live state. The launch command line was the first
+# answer and is not: it never changes, so a project closed inside a KiCad that
+# was left running stayed "open" and would never have been sealed (Codex, PR
+# #33). Locks also cover a project opened from inside KiCad, which no command
+# line names.
+#
+# A lock counts only when it names this host and is no older than the oldest
+# KiCad running here: one left by a KiCad that crashed before the current ones
+# started is not anybody's.
+open_files() {
+    local host oldest p t lck now name
+    host="$(hostname)"
+    oldest=""
+    now="$(date +%s)"
+    for p in $(pgrep -x kicad 2>/dev/null); do
+        # Elapsed seconds from ps: /proc/<pid>'s own mtime is not when the
+        # process started, and moved past it here.
+        t="$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')"
+        [ -n "$t" ] || continue
+        t=$((now - t))
+        if [ -z "$oldest" ] || [ "$t" -lt "$oldest" ]; then oldest="$t"; fi
+    done
+    [ -n "$oldest" ] || return 0
+    find "$PROJECTS" -maxdepth 8 -path '*/.sealed' -prune -o -name '~*.lck' -type f \
+        -newermt "@$((oldest - 5))" -print 2>/dev/null |
+    while IFS= read -r lck; do
+        grep -qF "\"hostname\":\"$host\"" "$lck" 2>/dev/null || continue
+        name="$(basename "$lck")"
+        name="${name#\~}"
+        echo "$(dirname "$lck")/${name%.lck}"
+    done
+}
+
+# pending: projects asked for in the last minute, whose KiCad may not have
+# locked them yet. Published before KiCad is started, so the gap between a
+# click and the lock is never a moment in which nothing holds the project
+# (Codex, PR #33).
+pending() {
+    local now t path
+    [ -f "$PENDING" ] || return 0
+    now="$(date +%s)"
+    while IFS=' ' read -r t path; do
+        [ -n "$path" ] && [ $((now - t)) -lt 60 ] && echo "$path"
+    done < "$PENDING"
+}
+
 # Every KiCad here is a window someone may be working in. The backend seals a
 # project nobody has touched through the app for half an hour, and editing in
 # this desktop touched nothing there — so a project could be encrypted and its
 # directory deleted under an open KiCad. That window then showed "Failed to get
 # the working directory" over an empty file tree, still titled with the run it
 # had open, and any save from it had nowhere to go. The heartbeat names the
-# projects open here; the backend will not seal one while it is listed and
-# fresh. A project opened from inside KiCad (File > Open) is not on a command
-# line and is not covered: open boards from the workbench.
+# files open here; the backend will not seal a project while one is listed and
+# the heartbeat is fresh.
 heartbeat() {
     local tmp
     # mktemp creates a fresh file exclusively, so nothing planted at a fixed
     # temporary name can redirect the write.
     tmp="$(mktemp "$(dirname "$ACTIVE")/.blpl-kicad-active.XXXXXX")" || return 0
-    if kicad_projects | cut -d' ' -f2- > "$tmp"; then
+    if { open_files; pending; } | sort -u > "$tmp"; then
         mv -f "$tmp" "$ACTIVE"
     else
         rm -f "$tmp"
@@ -136,13 +187,16 @@ while true; do
                 bring_forward "$want" "" &
             else
                 log "opening $want"
+                # Every entry is older than a minute once the file is: start over.
+                [ -n "$(find "$PENDING" -mmin +1 2>/dev/null)" ] && : > "$PENDING"
+                printf '%s %s\n' "$(date +%s)" "$want" >> "$PENDING"
+                heartbeat
                 before="$(titles)"
                 # setsid so KiCad outlives this supervised shell: s6 restarts
                 # `run` scripts, and a child in this process group would be
                 # killed along with it.
                 setsid s6-setuidgid abc kicad "$want" >/dev/null 2>&1 &
                 bring_forward "$want" "$before" &
-                heartbeat
             fi
         fi
     fi
