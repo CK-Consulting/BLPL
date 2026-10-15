@@ -623,7 +623,38 @@ def polygons_overlap(a: list[Point], b: list[Point]) -> bool:
 # --- project.yaml -------------------------------------------------------------
 
 
-def _feature(kind: str, spec: Any, where: str) -> Feature:
+def copper_layers(count: int) -> tuple[str, ...]:
+    """The copper layer names of a ``count``-layer stackup, top to bottom."""
+    if count <= 1:
+        return ("F.Cu",)
+    return ("F.Cu", *(f"In{n}.Cu" for n in range(1, count - 1)), "B.Cu")
+
+
+def _check_keepout_layers(layers: tuple[str, ...], copper: tuple[str, ...],
+                          where: str) -> None:
+    """A keepout on copper the stackup does not have is refused.
+
+    KiCad loads a rule area on a layer the board has not enabled and it
+    protects nothing, so an antenna keepout written for In1.Cu on what is
+    really a 2-layer board would build, pass, and leave the antenna's ground
+    plane exactly where it was. Only copper names are checked: ``*.Cu`` means
+    whatever copper there is, and ``F&B.Cu`` the two outer layers.
+    """
+    allowed = set(copper) | {"*.Cu"}
+    if len(copper) > 1:
+        allowed.add("F&B.Cu")
+    missing = [layer for layer in layers if layer.endswith(".Cu") and layer not in allowed]
+    if missing:
+        raise BoardGeometryError(
+            f"{where}.layers names {', '.join(missing)}, but project.stackup.layers is "
+            f"{len(copper)}, so the board's copper is {', '.join(copper)}. A keepout on "
+            "a layer the board does not have protects nothing; change the layer or the "
+            "stackup."
+        )
+
+
+def _feature(kind: str, spec: Any, where: str,
+             copper: tuple[str, ...] = ("F.Cu", "B.Cu")) -> Feature:
     if not isinstance(spec, dict):
         raise BoardGeometryError(f"{where} must be a mapping with a 'shape'")
     anchor = spec.get("anchor")
@@ -640,6 +671,7 @@ def _feature(kind: str, spec: Any, where: str) -> Feature:
                 not all(isinstance(x, str) and x for x in raw_layers):
             raise BoardGeometryError(f"{where}.layers must be a list of layer names")
         layers = tuple(raw_layers)
+        _check_keepout_layers(layers, copper, where)
         raw_forbid = spec.get("forbid", list(DEFAULT_FORBID))
         if not isinstance(raw_forbid, list) or not raw_forbid:
             raise BoardGeometryError(
@@ -726,13 +758,22 @@ def from_config(config: dict) -> Board:
                         default="origin")
         declared = False
 
+    # 2 when the stackup is silent, because that is what the emitter draws
+    # then; the schema has already held the count to its enum.
+    count = ((config.get("project") or {}).get("stackup") or {}).get("layers", 2)
+    try:
+        copper = copper_layers(int(count))
+    except (TypeError, ValueError):
+        raise BoardGeometryError(
+            f"project.stackup.layers must be a copper layer count, not {count!r}") from None
+
     board = Board(outline=outline, declared=declared, notes=notes)
     for kind, key in (("cutout", "cutouts"), ("keepout", "keepouts")):
         raw = boundaries.get(key) or []
         if not isinstance(raw, list):
             raise BoardGeometryError(f"boundaries.{key} must be a list")
         for i, spec in enumerate(raw):
-            f = _feature(kind, spec, f"boundaries.{key}[{i}]")
+            f = _feature(kind, spec, f"boundaries.{key}[{i}]", copper)
             (board.anchored if f.anchor else board.features).append(f)
 
     for f in board.features:

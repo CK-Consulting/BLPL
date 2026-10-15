@@ -492,3 +492,86 @@ def test_an_anchored_keepout_belongs_to_its_footprint_not_the_board():
     (zone,) = [c for c in fp if isinstance(c, list) and c and c[0] == "zone"]
     assert sexpr.find(zone, "name")[1] == '"ANT"'
     assert _zone_bbox(zone) == pytest.approx((15.5, 12.5, 19.5, 14.5))
+
+
+# --- Copper layers come from the stackup ------------------------------------------
+
+
+def _copper_rows(out: str) -> list[tuple[str, str]]:
+    (layers,) = _tags(out, "layers")
+    return [(row[0], row[1].strip('"')) for row in layers[1:] if row[2] == "signal"]
+
+
+def test_a_four_layer_stackup_is_emitted_as_four_layers():
+    """The layer table was a fixed F.Cu/B.Cu list, so every 4-layer design came
+    out of the emitter as a 2-layer board. Numbers as pcbnew 10 saves them."""
+    cfg = _config()
+    cfg["project"]["stackup"] = {"layers": 4}
+    out = pcb.emit(_hdm(cfg), footprints_root=_FOOTPRINTS_ROOT)
+    assert _copper_rows(out) == [("0", "F.Cu"), ("4", "In1.Cu"), ("6", "In2.Cu"), ("2", "B.Cu")]
+
+
+def test_a_six_layer_stackup_numbers_its_inner_layers_by_two():
+    cfg = _config()
+    cfg["project"]["stackup"] = {"layers": 6}
+    out = pcb.emit(_hdm(cfg), footprints_root=_FOOTPRINTS_ROOT)
+    assert [n for _, n in _copper_rows(out)] == ["F.Cu", "In1.Cu", "In2.Cu", "In3.Cu",
+                                                  "In4.Cu", "B.Cu"]
+    assert dict((n, i) for i, n in _copper_rows(out))["In4.Cu"] == "10"
+
+
+def test_without_a_stackup_the_board_is_two_layers_as_before():
+    out = pcb.emit(_hdm(_config()), footprints_root=_FOOTPRINTS_ROOT)
+    assert _copper_rows(out) == [("0", "F.Cu"), ("2", "B.Cu")]
+
+
+def test_an_inner_layer_keepout_lands_on_an_inner_layer_the_board_has():
+    cfg = _config(keepouts=[{"shape": "rect", "center": [25, 5], "size": [10, 4],
+                             "layers": ["In1.Cu"]}])
+    cfg["project"]["stackup"] = {"layers": 4}
+    out = pcb.emit(_hdm(cfg), footprints_root=_FOOTPRINTS_ROOT)
+    (zone,) = _tags(out, "zone")
+    assert sexpr.find(zone, "layers")[1:] == ['"In1.Cu"']
+    assert "In1.Cu" in [n for _, n in _copper_rows(out)]
+
+
+@pytest.mark.parametrize("layers,stackup", [
+    (["In1.Cu"], 2), (["In3.Cu"], 4), (["F.Cu", "In2.Cu"], None), (["B.Cu"], 1),
+    (["F&B.Cu"], 1), (["Inner.Cu"], 4),
+])
+def test_a_keepout_on_copper_the_stackup_lacks_is_refused(layers, stackup):
+    """A rule area on a layer the board has not enabled loads and protects
+    nothing; layer strings used to be accepted unchecked."""
+    cfg = _config(keepouts=[{"shape": "rect", "center": [10, 10], "size": [4, 4],
+                             "layers": layers}])
+    if stackup is not None:
+        cfg["project"]["stackup"] = {"layers": stackup}
+    with pytest.raises(bg.BoardGeometryError, match="stackup.layers"):
+        bg.from_config(cfg)
+
+
+def test_an_anchored_keepout_on_missing_copper_is_refused_too():
+    cfg = _config(keepouts=[{"anchor": "U1", "shape": "rect", "size": [4, 4],
+                             "layers": ["In1.Cu"]}])
+    with pytest.raises(bg.BoardGeometryError, match="In1.Cu"):
+        bg.from_config(cfg)
+
+
+@pytest.mark.parametrize("layers", [["*.Cu"], ["F&B.Cu"], ["F.Cu", "In4.Cu", "B.Cu"]])
+def test_keepouts_on_copper_the_stackup_has_are_accepted(layers):
+    cfg = _config(keepouts=[{"shape": "rect", "center": [10, 10], "size": [4, 4],
+                             "layers": layers}])
+    cfg["project"]["stackup"] = {"layers": 6}
+    (k,) = bg.from_config(cfg).features
+    assert k.layers == tuple(layers)
+
+
+def test_the_emitter_refuses_a_keepout_on_missing_copper_it_is_handed():
+    """The backstop for an HDM that did not come through Stage 5."""
+    cfg = _config(keepouts=[{"shape": "rect", "center": [25, 5], "size": [10, 4],
+                             "layers": ["In1.Cu"]}])
+    cfg["project"]["stackup"] = {"layers": 4}
+    hdm = _hdm(cfg)
+    hdm["project"] = {**hdm["project"], "stackup": {"layers": 2}}
+    with pytest.raises(ValueError, match="In1.Cu"):
+        pcb.emit(hdm, footprints_root=_FOOTPRINTS_ROOT)

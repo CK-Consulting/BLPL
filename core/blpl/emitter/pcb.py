@@ -41,9 +41,10 @@ _EDGE_CUTS_WIDTH = 0.05
 
 
 # v10 layer table (IDs differ from v6). Copied from a KiCad-10-saved reference.
-_DEFAULT_LAYERS: list[sexpr.Sexp] = [
-    ["0", '"F.Cu"', "signal"],
-    ["2", '"B.Cu"', "signal"],
+# Copper is not in it: how many copper layers a board has is the stackup's to
+# say, and a fixed F.Cu/B.Cu table emitted every 4- and 6-layer design as a
+# 2-layer board. _copper_layers builds that part.
+_NON_COPPER_LAYERS: list[sexpr.Sexp] = [
     ["9", '"F.Adhes"', "user", '"F.Adhesive"'],
     ["11", '"B.Adhes"', "user", '"B.Adhesive"'],
     ["13", '"F.Paste"', "user"],
@@ -63,6 +64,51 @@ _DEFAULT_LAYERS: list[sexpr.Sexp] = [
     ["35", '"F.Fab"', "user"],
     ["33", '"B.Fab"', "user"],
 ]
+
+
+def _copper_layers(count: int) -> list[sexpr.Sexp]:
+    """The copper rows of the layer table for a ``count``-layer stackup.
+
+    KiCad 10 numbers copper F.Cu = 0, B.Cu = 2 and In<n>.Cu = 2n + 2, and lists
+    the inner layers between F.Cu and B.Cu — checked against boards pcbnew
+    saved after ``SetCopperLayerCount``. A 1-layer board is written with B.Cu
+    still in the table, because that is what pcbnew itself writes: the format
+    has no way to say "one copper layer", and such a file reloads as 2-layer.
+    """
+    inner = max(count, 2) - 2
+    return [
+        ["0", '"F.Cu"', "signal"],
+        *[[str(2 * n + 2), f'"In{n}.Cu"', "signal"] for n in range(1, inner + 1)],
+        ["2", '"B.Cu"', "signal"],
+    ]
+
+
+def _copper_count(project: dict) -> int:
+    """``project.stackup.layers``, or 2 when the HDM does not say.
+
+    The default is what every board was emitted as before the stackup was
+    read, so an HDM written without a stackup comes out as it always did.
+    """
+    raw = (project.get("stackup") or {}).get("layers", 2)
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"project.stackup.layers must be a layer count, not {raw!r}") from None
+    if count < 1 or (count > 2 and count % 2):
+        raise ValueError(f"project.stackup.layers must be 1 or an even count, not {count}")
+    return count
+
+
+def _copper_names(hdm: dict) -> set[str]:
+    """The copper layer names the emitted board has, by the stackup's count.
+
+    For a 1-layer stackup that is F.Cu alone, although the table carries B.Cu
+    (see _copper_layers): a keepout on B.Cu would sit on copper the design
+    says is not there.
+    """
+    count = _copper_count(hdm.get("project") or {})
+    names = {row[1].strip('"') for row in _copper_layers(count)}
+    return names - {"B.Cu"} if count == 1 else names
 
 
 def _new_uuid() -> str:
@@ -583,19 +629,32 @@ def _edge_cuts_shape(segments: list[dict]) -> list[sexpr.Node]:
     return out
 
 
-def _keepout_zone(feature: dict) -> sexpr.Node:
+def _keepout_zone(feature: dict, copper: set[str]) -> sexpr.Node:
     """A board-level rule area, laid out like the ones stock RF module footprints carry.
 
     No net: a rule area has none, and leaving the field out is what the
     footprint libraries do, so the file reads the same under KiCad 9 and 10
     whichever net syntax each prefers.
+
+    ``copper`` is the board's copper layer names. A keepout on a copper layer
+    the board does not have is a zone on nothing: KiCad loads it and it
+    protects nothing. Stage 5 refuses those with the reason; this is the
+    backstop for an HDM that did not come through it.
     """
+    layers = feature.get("layers") or ["*.Cu"]
+    missing = [layer for layer in layers if layer.endswith(".Cu")
+               and layer not in copper and layer not in ("*.Cu", "F&B.Cu")]
+    if missing:
+        raise ValueError(
+            f"keepout {feature.get('where') or feature.get('name') or ''} is on "
+            f"{', '.join(missing)}, which this board's stackup does not have "
+            f"(copper: {', '.join(sorted(copper))})")
     forbid = set(feature.get("forbid") or ())
     rules = [[k, "not_allowed" if k in forbid else "allowed"]
              for k in ("tracks", "vias", "pads", "copperpour", "footprints")]
     node: sexpr.Node = [
         "zone",
-        ["layers", *[sexpr.quote(layer) for layer in feature.get("layers") or ["*.Cu"]]],
+        ["layers", *[sexpr.quote(layer) for layer in layers]],
         ["uuid", _new_uuid()],
     ]
     if feature.get("name"):
@@ -628,7 +687,7 @@ def _board_shapes(hdm: dict, width: float, height: float) -> list[sexpr.Node]:
             out += _edge_cuts_shape(feature["segments"])
         elif feature.get("kind") == "keepout" and not feature.get("anchor"):
             # Anchored keepouts go inside their footprint; see _anchored_keepouts.
-            out.append(_keepout_zone(feature))
+            out.append(_keepout_zone(feature, _copper_names(hdm)))
     return out
 
 
@@ -645,7 +704,8 @@ def _anchored_keepouts(hdm: dict, refdes: str) -> list[sexpr.Node]:
     geom = hdm.get("board_geometry")
     if not isinstance(geom, dict):
         return []
-    return [_keepout_zone(f) for f in geom.get("features") or []
+    copper = _copper_names(hdm)
+    return [_keepout_zone(f, copper) for f in geom.get("features") or []
             if f.get("kind") == "keepout" and f.get("anchor") == refdes]
 
 
@@ -726,6 +786,7 @@ def build(
     """Build a v10 (kicad_pcb ...) node from an HDM dict."""
     project = hdm.get("project", {})
     thickness = project.get("stackup", {}).get("thickness", 1.6)
+    copper_rows = _copper_layers(_copper_count(project))
     components = hdm.get("components", {})
     nets = hdm.get("nets", {})
 
@@ -739,7 +800,7 @@ def build(
         ["generator_version", f'"{_GENERATOR_VERSION}"'],
         ["general", ["thickness", f"{thickness}"], ["legacy_teardrops", "no"]],
         ["paper", '"A4"'],
-        ["layers", *_DEFAULT_LAYERS],
+        ["layers", *copper_rows, *_NON_COPPER_LAYERS],
         _default_setup(),
     ]
 
