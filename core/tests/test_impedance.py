@@ -314,6 +314,9 @@ def released(tmp_path: Path, monkeypatch):
 
 def test_a_release_carries_the_fab_sheet(released):
     proj, build = released
+    (proj / "dev.kicad_pcb").write_text(
+        '(kicad_pcb (segment (start 0 0) (end 10 0) (width 0.35) (layer "F.Cu") (net "ANT")) '
+        + _filled('(net "GND")', "B.Cu", (-5, -5, 15, 5)) + ')\n')
     manifest = build({"net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
                       "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}})
     assert manifest["quotable"]
@@ -575,6 +578,47 @@ def test_a_release_with_a_coplanar_line_and_no_ground_is_not_quotable(released):
     assert not manifest["quotable"]
     (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
     assert "CPW has no ground zone on F.Cu" in step["detail"]
+
+
+def test_a_coplanar_gap_is_measured_not_assumed():
+    """Codex, PR #31: one probe just past the gap passed ground 0.04 mm further
+    out than the sheet's geometry, and never looked inside the gap at all."""
+    from blpl.emitter import sexpr
+
+    hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "coplanar_gap": 0.15,
+                                   "impedance": {"ohms": 50, "mode": "coplanar"}}},
+           "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
+    seg = '(segment (start 0 0) (end 10 0) (width 0.3) (layer "F.Cu") (net "ANT"))'
+
+    def board(edge):
+        zone = _filled('(net "GND")', "F.Cu", (-1, edge, 11, 3), (-1, -3, 11, -edge))
+        return sexpr.parse(f"(kicad_pcb {seg} {zone})")
+
+    # Half-width 0.15 plus the 0.15 gap: ground from 0.30 out is the declared line.
+    assert z.coplanar_gap_problems(hdm, board(0.30)) == []
+    assert z.coplanar_without_ground(hdm, board(0.30)) == []
+    # 0.04 mm further out is a different impedance, though ground is beside it.
+    assert z.coplanar_gap_problems(hdm, board(0.34)) == [
+        "CPW on F.Cu has its ground pulled back past its 0.15 mm coplanar gap"]
+    assert z.coplanar_without_ground(hdm, board(0.34)) == []
+    # And ground inside the gap is a narrower one.
+    assert z.coplanar_gap_problems(hdm, board(0.25)) == [
+        "CPW on F.Cu has ground inside its 0.15 mm coplanar gap"]
+
+
+def test_a_release_with_a_controlled_net_not_on_the_board_is_not_quotable(released):
+    """Codex, PR #31: an hdm.yaml naming a net the board does not route — stale,
+    renamed, or another board's — passed every routing check by having nothing
+    to measure."""
+    proj, build = released
+    (proj / "dev.kicad_pcb").write_text(
+        '(kicad_pcb (segment (start 0 0) (end 10 0) (width 0.35) (layer "F.Cu") (net "OTHER")) '
+        + _filled('(net "GND")', "B.Cu", (-5, -5, 15, 5)) + ')\n')
+    manifest = build({"net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
+                      "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}})
+    assert not manifest["quotable"]
+    (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
+    assert "ANT is controlled in the HDM but has no routed copper on the board" in step["detail"]
 
 
 # --- a routed pair is coupled at its geometry (Codex, PR #31) ------------------------

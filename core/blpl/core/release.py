@@ -448,20 +448,33 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
     dest.write_text(table, encoding="utf-8")
     # Any impedance error Stage 8 would report blocks the package, not only a
     # missing number: two complete classes for one pair (ZC-005) fill every
-    # cell of the sheet and still ask the fab for two geometries at once.
-    # And what was routed: a class width is right at its width, on its layer,
-    # and a coplanar line only with its ground copper beside it.
+    # cell of the sheet and still ask the fab for two geometries at once. The
+    # design is judged before the routing: a board cannot be checked against
+    # a sheet that is itself incomplete or contradictory.
+    if "NOT SET" in table or errors:
+        return Step(
+            "impedance", False,
+            "controlled impedance is not ready for a fab"
+            + (f" ({', '.join(errors)})" if errors else "")
+            + "; see fab/impedance.md and Stage 8's ZC findings",
+            [str(dest.relative_to(out_dir))],
+        )
+    # Then what was routed: every controlled net is, at its width, on its
+    # layer, and a coplanar line with its ground copper at its gap.
     if pcb is not None and pcb.is_file():
         from blpl.emitter import sexpr
 
         try:
             board = sexpr.parse(pcb.read_text(encoding="utf-8"))
             problems = (
-                [f"{n} on {lay}" for n, lay, _ in impedance.layer_violations(hdm, board)]
+                [f"{n} is controlled in the HDM but has no routed copper on the board"
+                 for n in impedance.unrouted_controlled(hdm, board)]
+                + [f"{n} on {lay}" for n, lay, _ in impedance.layer_violations(hdm, board)]
                 + [f"{n} at {w:g} mm, not {want:g}"
                    for n, w, want, _ in impedance.width_violations(hdm, board)]
                 + [f"{cls} has no ground zone on {lay}"
                    for cls, lay in impedance.coplanar_without_ground(hdm, board)]
+                + impedance.coplanar_gap_problems(hdm, board)
                 + impedance.pair_problems(hdm, board)
                 + [(f"{cls} on {lay} has no reference layer at all" if ref == "none"
                     else f"{cls} on {lay} has no ground or power plane on {ref} under it")
@@ -479,14 +492,6 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
                 f"the routed board does not build the controlled impedances: {shown}{more}",
                 [str(dest.relative_to(out_dir))],
             )
-    if "NOT SET" in table or errors:
-        return Step(
-            "impedance", False,
-            "controlled impedance is not ready for a fab"
-            + (f" ({', '.join(errors)})" if errors else "")
-            + "; see fab/impedance.md and Stage 8's ZC findings",
-            [str(dest.relative_to(out_dir))],
-        )
     return Step("impedance", True, "", [str(dest.relative_to(out_dir))])
 
 

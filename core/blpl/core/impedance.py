@@ -901,16 +901,20 @@ def _filled_ground(pcb: list, *, ground_only: bool = True, by_net: bool = False)
     return filled
 
 
-def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
-    """(class, layer) where a coplanar trace lacks filled ground on both sides at its gap.
+# How far past the declared gap ground may sit before it is no longer the
+# coplanar ground but merely ground somewhere nearby.
+_COPLANAR_REACH_MM = 0.5
 
-    A coplanar line is coplanar because ground copper runs beside it at the
-    declared gap. Neither emitter pours it and a class clearance cannot create
-    it; ground elsewhere on the layer, ground never filled, and ground beside
-    only the straight parts of a curved feed are none of them beside the trace
-    (Codex, PR #31). Every sample along the trace, segments and arcs alike,
-    needs filled ground just past the gap on both sides; up to
-    ``_END_ALLOWANCE_MM`` at each end may lack it, where the trace meets its pad.
+
+def _coplanar_findings(hdm: dict, pcb: list) -> dict[tuple[str, str], set[str]]:
+    """(class, layer) -> what is wrong with the ground beside a coplanar trace.
+
+    ``none``: no filled ground within reach on both sides. ``narrow``: ground
+    inside the declared gap. ``wide``: ground beside the trace, but pulled back
+    past the gap. The gap is measured, not assumed: probes across it must be
+    clear and the point just past it must be ground, so the real gap equals the
+    declared one within ``_GAP_SLACK_MM`` (Codex, PR #31: one probe past the gap
+    passed a pour 0.04 mm further out than the fab sheet's geometry).
     """
     from .board_geometry import point_in_polygon
 
@@ -918,24 +922,77 @@ def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
     ctl = _controlled(hdm)
     filled = _filled_ground(pcb)
     pads = _pads(pcb)
-    out = set()
+    out: dict[tuple[str, str], set[str]] = {}
     for net, (cls, rules, spec) in ctl.items():
         if spec.mode != "coplanar":
             continue
         gap = float(rules.get("coplanar_gap", 0))
-        bare: dict[str, float] = {}
+        clear_at = [gap * f for f in (0.25, 0.5, 0.75)] + [max(gap - _GAP_SLACK_MM, 0.0)]
         for lay, pt, nrm, w, step, from_end in _samples(net, lines, arcs, pads.get(net)):
             if from_end <= _END_ALLOWANCE_MM:
                 continue              # where the trace meets its pad
-            off = w / 2 + gap + 0.05
-            sides = [(pt[0] + nrm[0] * off, pt[1] + nrm[1] * off),
-                     (pt[0] - nrm[0] * off, pt[1] - nrm[1] * off)]
             polys = filled.get(lay, [])
-            if not all(any(point_in_polygon(sp, poly) for poly in polys) for sp in sides):
-                bare[lay] = bare.get(lay, 0.0) + step
-        for lay in bare:
-            out.add((cls, lay))
-    return sorted(out)
+
+            def ground(sign: float, d: float) -> bool:
+                off = sign * (w / 2 + d)
+                sp = (pt[0] + nrm[0] * off, pt[1] + nrm[1] * off)
+                return any(point_in_polygon(sp, poly) for poly in polys)
+
+            for sign in (1.0, -1.0):
+                if any(ground(sign, d) for d in clear_at):
+                    kind = "narrow"
+                elif ground(sign, gap + _GAP_SLACK_MM):
+                    continue
+                elif any(ground(sign, gap + d) for d in (0.05, 0.1, 0.2, _COPLANAR_REACH_MM)):
+                    kind = "wide"
+                else:
+                    kind = "none"
+                out.setdefault((cls, lay), set()).add(kind)
+    return out
+
+
+def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
+    """(class, layer) where a coplanar trace lacks filled ground on both sides near its gap.
+
+    A coplanar line is coplanar because ground copper runs beside it at the
+    declared gap. Neither emitter pours it and a class clearance cannot create
+    it; ground elsewhere on the layer, ground never filled, and ground beside
+    only the straight parts of a curved feed are none of them beside the trace
+    (Codex, PR #31). Every sample along the trace, segments and arcs alike,
+    needs it on both sides; up to ``_END_ALLOWANCE_MM`` at each end may lack
+    it, where the trace meets its pad. Ground present at the wrong distance is
+    :func:`coplanar_gap_problems`.
+    """
+    return sorted(k for k, kinds in _coplanar_findings(hdm, pcb).items() if "none" in kinds)
+
+
+def coplanar_gap_problems(hdm: dict, pcb: list) -> list[str]:
+    """Where a coplanar trace has ground beside it, but not at the declared gap.
+
+    The gap sets a coplanar impedance as much as the width does, so ground
+    0.19 mm away under a sheet that says 0.15 is a different line.
+    """
+    gaps = {cls: float(rules.get("coplanar_gap", 0))
+            for _, (cls, rules, _) in _controlled(hdm).items()}
+    out = []
+    for (cls, lay), kinds in sorted(_coplanar_findings(hdm, pcb).items()):
+        if "narrow" in kinds:
+            out.append(f"{cls} on {lay} has ground inside its {gaps[cls]:g} mm coplanar gap")
+        if "wide" in kinds:
+            out.append(f"{cls} on {lay} has its ground pulled back past its {gaps[cls]:g} mm coplanar gap")
+    return out
+
+
+def unrouted_controlled(hdm: dict, pcb: list) -> list[str]:
+    """Controlled nets the HDM names that have no routed copper on the board.
+
+    Every routing check measures what is there, so a net with nothing routed —
+    unrouted, renamed since, or an hdm.yaml from another board — passes all of
+    them and leaves its row on the fab sheet unchecked (Codex, PR #31).
+    """
+    segments, _, _, arcs = _routed(pcb)
+    routed = {s[0] for s in segments} | {a[0] for a in arcs}
+    return sorted(n for n in _controlled(hdm) if n not in routed)
 
 
 def pair_problems(hdm: dict, pcb: list) -> list[str]:

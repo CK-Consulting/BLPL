@@ -172,7 +172,9 @@ taller dielectric → higher Z; higher Dk → lower Z.
   at the same impedance are different widths. Where a controlled net changes
   layer, the class width is for one layer; record which in the class's
   `impedance.layers`, and keep controlled nets on those layers. KiCad's net
-  classes do not constrain layer, so the release checks the routed board.
+  classes do not constrain layer, so the release checks the routed board —
+  and refuses while a controlled net is not routed at all, since there is
+  then nothing to check.
 - **Make controlled widths distinctive** (e.g. 0.127 mm, not the 0.125 mm used
   elsewhere), so the fab can find them on the gerbers and adjust them.
 - **Real-world effects** — etch factor (trapezoidal trace), copper roughness
@@ -217,7 +219,9 @@ in the nearest reference plane.
   with a via fence along it. Declare that gap as the class's `coplanar_gap`.
   KiCad keeps the pour the class clearance from the trace, so BLPL raises the
   clearance to a larger gap; a gap smaller than the class's clearance is a
-  conflict (ZC-010), never a lowered clearance for every other net.
+  conflict (ZC-010), never a lowered clearance for every other net. The
+  release measures the gap on the routed board, to within 0.01 mm, so a pour
+  drawn with a larger clearance than the class's is caught there.
 
 ## Termination: match the ends too
 
