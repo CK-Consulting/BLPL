@@ -266,10 +266,15 @@ The rest follows from that:
   its own `impedance` mapping. A package is not quotable while any ZC error
   stands. It is also not quotable while the routed `.kicad_pcb` has any of
   these:
+  - a controlled net with no routed copper at all: unrouted, renamed since,
+    or named by an `hdm.yaml` from another board. Every other check measures
+    what is there, so a net with nothing there would otherwise pass them all;
   - a controlled trace on a layer its class's width is not for;
   - a controlled trace at a width other than the class's;
   - a coplanar trace without *filled* ground copper on both sides at its
-    declared gap;
+    declared gap. The gap is measured: the span across it must be clear of
+    ground and ground must begin just past it, so a pour pulled back 0.04 mm
+    or reaching into the gap is a different line and is reported;
   - a differential pair whose halves are not routed together: on different
     layers, or not side by side at `diff_pair_gap`;
   - a controlled trace with no filled ground or power plane under it on its
