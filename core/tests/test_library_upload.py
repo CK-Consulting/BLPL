@@ -379,6 +379,26 @@ def test_something_that_is_not_a_zip_is_held(tmp_path):
     assert "not a readable zip" in rec.reasons[0]
 
 
+def test_a_scan_the_caller_insists_on_reaches_every_entry_of_a_bundle(tmp_path, monkeypatch):
+    """The scanner answers for the zip and then goes away. The workspace's own
+    environment requires no scan; the control plane, whose policy it is, said
+    one is required. Each entry was accepted without that and released."""
+    answers = iter([av.ScanResult(state="clean", scanner="test")])
+    monkeypatch.setattr(
+        quarantine.av, "scan_bytes",
+        lambda data: next(answers, av.ScanResult(state="unscanned", scanner="", detail="gone")),
+    )
+    bundle = _zip([("PART.kicad_mod", _footprint("PART")), ("readme.txt", b"notes\n")])
+    rec = quarantine.accept_upload(
+        bundle, tmp_path, original_name="vendor.zip", kind="kicad_bundle",
+        uploaded_by="a@example.com", library="myproj", insist_on_scan=True,
+    )
+    assert rec.state == quarantine.HELD
+    assert {m["state"] for m in rec.members} == {quarantine.HELD}
+    assert all("no scanner" in m["reasons"][0] for m in rec.members)
+    assert not (tmp_path / "libraries").exists() and not (tmp_path / "references").exists()
+
+
 def test_a_bundle_with_nothing_usable_is_held_and_says_why(tmp_path):
     rec = _up(tmp_path, _zip([("x.SchLib", b"\x00")]), "kicad_bundle", "altium.zip")
     assert rec.state == quarantine.HELD

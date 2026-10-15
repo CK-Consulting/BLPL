@@ -829,7 +829,7 @@ def accept_upload(
     if rec.reasons:
         return rec
     if kind == "kicad_bundle":
-        return _unpack_bundle(data, project_dir, rec, library=library)
+        return _unpack_bundle(data, project_dir, rec, library=library, insist_on_scan=insist_on_scan)
     if kind in LIBRARY_KINDS:
         return _place(data, project_dir, rec, library=library)
     if kind == "datasheet" and mpn:
@@ -873,7 +873,8 @@ def _place(data: bytes, project_dir: str | Path, rec: Record, *, library: str) -
     return rec
 
 
-def _unpack_bundle(data: bytes, project_dir: str | Path, rec: Record, *, library: str) -> Record:
+def _unpack_bundle(data: bytes, project_dir: str | Path, rec: Record, *, library: str,
+                   insist_on_scan: bool = False) -> Record:
     """Each usable entry of a passed zip through quarantine on its own, then placed.
 
     Every entry gets its own ledger row, its own scan and — for a PDF — its own
@@ -881,6 +882,10 @@ def _unpack_bundle(data: bytes, project_dir: str | Path, rec: Record, *, library
     nothing about what a reader will do with the files inside it. Entries that
     are neither library files nor documents are not unpacked; they stay inside
     the zip, which stays in ``retrieved/``.
+
+    ``insist_on_scan`` reaches every entry too. Dropped here, a scanner that
+    answered for the zip and not for one of its entries released that entry
+    unscanned in a workspace whose own environment did not require a scan.
     """
     project_dir = Path(project_dir)
     rec.library = library
@@ -907,7 +912,7 @@ def _unpack_bundle(data: bytes, project_dir: str | Path, rec: Record, *, library
             sub = accept(
                 member.data, project_dir, suffix=suffix, origin=UPLOAD,
                 uploaded_by=rec.uploaded_by, original_name=label, kind="reference",
-                llm_ignore=rec.llm_ignore,
+                llm_ignore=rec.llm_ignore, insist_on_scan=insist_on_scan,
             )
             if not sub.reasons:
                 sub = release(
@@ -919,6 +924,7 @@ def _unpack_bundle(data: bytes, project_dir: str | Path, rec: Record, *, library
             sub = accept_upload(
                 member.data, project_dir, original_name=label, kind=kind,
                 uploaded_by=rec.uploaded_by, llm_ignore=rec.llm_ignore, library=library,
+                insist_on_scan=insist_on_scan,
             )
         path = f"{sub.released_to}/{sub.released_as}" if sub.state == RELEASED else None
         out.append({
