@@ -175,12 +175,14 @@ net_classes:
 
 boundaries:
   board_outline:
-    type: rect
-    start: [0, 0]
-    end: [40, 30]
-    layer: Edge.Cuts
-    width: 0.1
+    shape: rect
+    size: [40, 30]
+    corner_radius: 2
 ```
+
+The outline can also be a `circle`, `polygon` or `trapezoid`, and `boundaries`
+takes `cutouts` and `keepouts` too. See
+[Stage 5 in pipeline-stages.md](pipeline-stages.md#board-shape-cutouts-and-keepouts).
 
 Re-run Stage 4 (to synthesise nets) and Stage 5 (to emit the HDM):
 
