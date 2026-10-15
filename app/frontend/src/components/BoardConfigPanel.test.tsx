@@ -158,3 +158,111 @@ describe("a single-board project", () => {
     );
   });
 });
+
+describe("the board's shape", () => {
+  /**
+   * With a shape outline Stage 5 refuses a file whose dimensions are not the
+   * outline's bounding box, so the panel derives them rather than letting the
+   * two be edited apart — and a shape replaces the legacy `type: rect` block
+   * `blpl init` writes, rather than sitting beside it contradicting it.
+   */
+  const LEGACY = {
+    ...CONFIG.config,
+    boundaries: {
+      board_outline: { type: "rect", start: [0, 0], end: [100, 80], layer: "Edge.Cuts" },
+      keepouts: [],
+    },
+  };
+
+  function capture() {
+    const box: { sent: any } = { sent: null };
+    stub({ config: LEGACY }, (body) => {
+      box.sent = body;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    return box;
+  }
+
+  it("derives the dimensions from a shape and replaces the legacy outline", async () => {
+    const box = capture();
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.change(await screen.findByLabelText("Outline shape"), { target: { value: "circle" } });
+    fireEvent.change(screen.getByLabelText("Outline diameter (mm)"), { target: { value: "36" } });
+
+    expect(screen.getByLabelText("Width (mm)")).toHaveValue(36);
+    expect(screen.getByLabelText("Width (mm)")).toHaveAttribute("readonly");
+
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.boundaries.board_outline).toEqual({ shape: "circle", diameter: 36 });
+    expect(box.sent.config.project.dimensions).toEqual([36, 36]);
+    // What the form has no field for is still there.
+    expect(box.sent.config.boundaries.keepouts).toEqual([]);
+    expect(box.sent.config.net_classes).toEqual({ Default: { trace_width: 0.15 } });
+  });
+
+  it("measures a rounded corner the way Stage 5 does, not by its points", async () => {
+    const box = capture();
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.change(await screen.findByLabelText("Outline shape"), { target: { value: "polygon" } });
+    // The seeded polygon is the board's rectangle; turn it into a triangle.
+    fireEvent.click(screen.getByLabelText("Outline remove point 4"));
+    fireEvent.change(screen.getByLabelText("Outline point 3 x"), { target: { value: "50" } });
+    fireEvent.change(screen.getByLabelText("Outline corner radius (mm)"), { target: { value: "2" } });
+
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    const [w, h] = box.sent.config.project.dimensions;
+    // A 100 x 80 triangle, rounded: smaller than its vertices on both axes.
+    expect(w).toBeLessThan(100);
+    expect(h).toBeLessThan(80);
+    expect(box.sent.config.boundaries.board_outline.points).toEqual([[0, 0], [100, 0], [50, 80]]);
+  });
+
+  it("leaves a legacy outline alone until a shape is chosen, and says why", async () => {
+    const box = capture();
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    expect(await screen.findByText(/legacy/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.boundaries.board_outline).toEqual(LEGACY.boundaries.board_outline);
+  });
+
+  it("says when a shape cannot be built, before it is saved", async () => {
+    capture();
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.change(await screen.findByLabelText("Outline shape"), { target: { value: "rect" } });
+    fireEvent.change(screen.getByLabelText("Outline corner radius (mm)"), { target: { value: "60" } });
+    expect(await screen.findByText(/more than half of the shorter side/)).toBeInTheDocument();
+  });
+
+  it("draws the board it describes", async () => {
+    capture();
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    expect(await screen.findByRole("img", { name: "Board outline preview" })).toBeInTheDocument();
+  });
+
+  it("adds cutouts and keepouts with what they forbid", async () => {
+    const box = capture();
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByText("Add cutout"));
+    fireEvent.click(screen.getByText("Add keepout"));
+    fireEvent.change(screen.getByLabelText("Keepout 1 anchor"), { target: { value: "U1" } });
+    fireEvent.change(screen.getByLabelText("Keepout 1 layers"), { target: { value: "F.Cu, B.Cu" } });
+    fireEvent.click(screen.getByLabelText("footprints"));
+    // An anchored shape is in its part's frame, so it is named, not drawn.
+    expect(screen.getByText(/follow a part/)).toHaveTextContent("on U1");
+
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    const { cutouts, keepouts } = box.sent.config.boundaries;
+    expect(cutouts).toEqual([{ shape: "circle", diameter: 3, center: [50, 40] }]);
+    expect(keepouts).toHaveLength(1);
+    expect(keepouts[0]).toMatchObject({
+      shape: "rect",
+      anchor: "U1",
+      layers: ["F.Cu", "B.Cu"],
+      forbid: ["tracks", "vias", "pads", "copperpour"],
+    });
+  });
+});
