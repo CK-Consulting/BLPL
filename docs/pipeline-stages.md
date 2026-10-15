@@ -252,6 +252,8 @@ The rest follows from that:
     say which layer its width is for (`impedance.layers`).
   - **ZC-008**: a `controlled_impedance` tag matches no net, so its
     requirement would silently vanish.
+  - **ZC-009**: a single-ended or differential impedance on a one-layer board,
+    which has no layer for the plane it needs. Coplanar is allowed.
 
   Every one except ZC-004 is an error.
 - The release build (the app, or `python -m blpl.core.release`) writes
