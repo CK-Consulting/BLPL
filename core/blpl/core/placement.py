@@ -500,9 +500,12 @@ def place(
         if shaped is None:
             return []
         dx, dy = offsets[ref]
-        rot = float((hints.get(ref) or {}).get("rot", 0.0))
+        hint = hints.get(ref) or {}
+        rot = float(hint.get("rot", 0.0))
+        mirror = str(hint.get("side", "top")).lower() == "bottom"
         return [board_geometry.Feature(
-                    f.kind, board_geometry.transform(f.shape, spot[0] - dx, spot[1] - dy, rot),
+                    f.kind, board_geometry.transform(f.shape, spot[0] - dx, spot[1] - dy, rot,
+                                                     mirror),
                     f.where, anchor=f.anchor, layers=f.layers, forbid=f.forbid, name=f.name)
                 for f in shaped.anchored_to(ref)]
 
@@ -536,15 +539,18 @@ def place(
         else:
             ext = (box[0], box[1])
             offsets[ref] = (box[2], box[3])
-        # Apply the rotation here, once, rather than at each of the four sites
-        # that place something. ``rot`` can only come from a hint, so it is
-        # known before anything is placed, and rotating the geometry up front
+        # Apply the rotation, and a bottom side's mirror, here, once, rather
+        # than at each of the four sites that place something. ``rot`` and
+        # ``side`` can only come from a hint, so they are known before
+        # anything is placed, and turning the geometry up front
         # means every later use of it -- the fit test, the reservation, the
         # largest-first ordering, occupied_box -- is about the part KiCad will
         # actually draw.
-        rot = float((hints.get(ref) or {}).get("rot", 0.0))
-        if rot:
-            rw, rh, rdx, rdy = rotated_geometry(ext[0], ext[1], *offsets[ref], rot)
+        hint = hints.get(ref) or {}
+        rot = float(hint.get("rot", 0.0))
+        side = str(hint.get("side", "top"))
+        if rot or side.lower() == "bottom":
+            rw, rh, rdx, rdy = rotated_geometry(ext[0], ext[1], *offsets[ref], rot, side)
             ext = (rw, rh)
             offsets[ref] = (rdx, rdy)
         result.extents[ref] = ext
@@ -737,8 +743,8 @@ def _area(extent: tuple[float, float]) -> float:
 
 
 def rotated_geometry(w: float, h: float, dx: float, dy: float,
-                     rot: float) -> tuple[float, float, float, float]:
-    """A footprint's extents and origin offset as they are after ``rot``.
+                     rot: float, side: str = "top") -> tuple[float, float, float, float]:
+    """A footprint's extents and origin offset as they are after ``rot`` and ``side``.
 
     KiCad rotates a footprint's own geometry about its origin, so the library's
     ``(w, h, dx, dy)`` describes the part only at rot=0. Reserving that
@@ -753,8 +759,20 @@ def rotated_geometry(w: float, h: float, dx: float, dy: float,
     Angles that are not multiples of 90 deg take the axis-aligned bounding box
     of the rotated rectangle, which is conservative — never smaller than the
     truth, so it cannot certify an overlap as clear.
+
+    A bottom-side part is the top-side part at ``rot`` turned over left to
+    right about its origin — what the emitter and the KiCad plugin both do —
+    so its box keeps its size and its offset changes sides in x. Leaving that
+    out reserves the mirror image of where an off-centre connector really is.
     """
-    rot = float(rot) % 360.0
+    w, h, dx, dy = _rotated(w, h, dx, dy, float(rot) % 360.0)
+    if str(side).lower() == "bottom":
+        dx = -dx
+    return (w, h, dx, dy)
+
+
+def _rotated(w: float, h: float, dx: float, dy: float,
+             rot: float) -> tuple[float, float, float, float]:
     if rot == 0.0:
         return (w, h, dx, dy)
     if rot == 90.0:
