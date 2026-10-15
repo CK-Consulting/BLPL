@@ -379,8 +379,18 @@ def make_folder(checkout: Path, rel: str, shown: str) -> None:
             raise
 
 
-def blob(checkout: Path, rel: str) -> Response:
-    """The bytes of one file, with the same disposition rules as the mounted route."""
+def blob(checkout: Path, rel: str, request=None, verdict_for=None) -> Response:
+    """The bytes of one file, with the same disposition rules as the mounted route.
+
+    A PDF goes to the browser's viewer only if these exact bytes have a clean
+    verdict from this backend's own inspection, as on the mounted route; any
+    other PDF is an opaque download. The bytes are read once, through the
+    agent, and the buffer that was hashed is the buffer that is sent, so a
+    file swapped in the workspace afterwards goes out under no verdict at all.
+    """
+    import hashlib
+    import io
+
     from blpl.core import quarantine
 
     from . import main as m
@@ -393,14 +403,22 @@ def blob(checkout: Path, rel: str) -> Response:
         data = c.read(str(checkout), "/".join(parts), max_bytes=m.UPLOAD_MAX_BYTES * 2)
     if parts[0] == quarantine.QUARANTINE_DIRNAME:
         return Response(data, media_type="application/octet-stream", headers={
-            "Content-Disposition": f'attachment; filename="{name}"',
+            "Content-Disposition": m._disposition("attachment", name),
             "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": m._INERT_CSP,
             "X-BLPL-Quarantined": "1",
         })
+    if quarantine.looks_like_pdf(data):
+        if len(data) > m.UPLOAD_MAX_BYTES or verdict_for is None:
+            return Response(data, media_type="application/octet-stream",
+                            headers=m._opaque_headers(name, "too_large" if verdict_for else "none"))
+        digest = hashlib.sha256(data).hexdigest()
+        return m._pdf_response(request, io.BytesIO(data), len(data), digest, name, verdict_for(digest))
     media_type, inline = m._blob_disposition(Path(name))
     return Response(data, media_type=media_type, headers={
         "X-Content-Type-Options": "nosniff",
-        "Content-Disposition": f'{"inline" if inline else "attachment"}; filename="{name}"',
+        "Content-Disposition": m._disposition("inline" if inline else "attachment", name),
+        "Content-Security-Policy": m._INERT_CSP,
     })
 
 

@@ -4076,8 +4076,13 @@ def get_blob(
     a deliberate act on something the user has been told is unverified.
     """
     proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+
+    def verdict_for(digest: str):
+        project = _project_or_404(session, user, project_id)
+        return pdf_verdicts.lookup(session, project.id, digest, proj)
+
     if workspace_files.enabled():
-        return workspace_files.blob(proj, path)
+        return workspace_files.blob(proj, path, request, verdict_for)
     target = _tree_target(proj, path)
     if _is_quarantined(proj, target):
         return FileResponse(
@@ -4114,10 +4119,6 @@ def get_blob(
     except BaseException:
         fh.close()
         raise
-
-    def verdict_for(digest: str):
-        project = _project_or_404(session, user, project_id)
-        return pdf_verdicts.lookup(session, project.id, digest, proj)
 
     return _serve_pdf(request, fh, size, UPLOAD_MAX_BYTES, target.name, verdict_for)
 
@@ -4903,6 +4904,19 @@ async def upload_files(
                 mpn=str(spec.get("mpn") or "").strip(), llm_ignore=bool(spec.get("llm_ignore")),
                 library=str(spec.get("library") or ""),
             )
+            if quarantine.looks_like_pdf(data):
+                # The workspace inspected these bytes, and its ledger row says
+                # what it found, but a verdict the browser renders by comes only
+                # from an inspection this backend ran itself: a workspace is
+                # exactly what a hostile file might have compromised. The bytes
+                # are already here, so they are inspected here too, as "Inspect
+                # now" does — otherwise every PDF uploaded to a workspace would
+                # download until someone asked.
+                pdf_verdicts.record_assessment(
+                    session, project_row.id, _sha256(data),
+                    quarantine.assess(data, is_pdf=True),
+                    source=pdf_verdicts.UPLOAD, user_id=user.id,
+                )
             results.append({"name": name, **res})
             continue
         def record_member(member: quarantine.Record) -> None:
