@@ -784,6 +784,7 @@ def emit(
         "nets": len(z.nets),
         "classes": sorted({cls for cls, _ in z.nets.values()}),
         "synthesized": sorted(z.synthesized),
+        **({"unmatched": z.unmatched} if z.unmatched else {}),
         **({"notes": z.notes} if z.notes else {}),
     }
     if not_placed:

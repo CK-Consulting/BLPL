@@ -506,23 +506,45 @@ def test_a_controlled_trace_routed_at_another_width_is_found():
     assert z.width_violations(hdm, pcb) == [("ANT", 0.2, 0.35, "RF")]
 
 
-def test_a_coplanar_class_needs_ground_copper_on_its_layer():
+def _filled(net_form: str, layer: str, *rects) -> str:
+    polys = " ".join(
+        f'(filled_polygon (layer "{layer}") (pts (xy {x0} {y0}) (xy {x1} {y0}) (xy {x1} {y1}) (xy {x0} {y1})))'
+        for x0, y0, x1, y1 in rects)
+    return f'(zone {net_form} (layers "{layer}") (polygon (pts (xy -5 -5) (xy 15 -5) (xy 15 5) (xy -5 5))) {polys})'
+
+
+def test_a_coplanar_class_needs_filled_ground_beside_the_trace():
+    """Codex, PR #31: any ground zone on the layer used to pass, however far
+    from the trace and whether or not it was ever filled."""
     from blpl.emitter import sexpr
 
     hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "coplanar_gap": 0.15,
                                    "impedance": {"ohms": 50, "mode": "coplanar"}}},
            "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
-    seg = '(segment (start 0 0) (end 1 0) (width 0.3) (layer "F.Cu") (net "ANT"))'
-    bare = sexpr.parse(f"(kicad_pcb {seg})")
-    assert z.coplanar_without_ground(hdm, bare) == [("CPW", "F.Cu")]
-    # A ground pour on the bottom only is not beside the trace.
-    bottom = sexpr.parse(f'(kicad_pcb {seg} (zone (net 1) (net_name "GND") (layer "B.Cu")))')
-    assert z.coplanar_without_ground(hdm, bottom) == [("CPW", "F.Cu")]
-    poured = sexpr.parse(f'(kicad_pcb {seg} (zone (net "GND") (layers "F.Cu" "B.Cu")))')
-    assert z.coplanar_without_ground(hdm, poured) == []
+    seg = '(segment (start 0 0) (end 10 0) (width 0.3) (layer "F.Cu") (net "ANT"))'
+    # Copper from 0.3 mm out (0.15 half-width + 0.15 gap) on both sides.
+    beside = [(-1, 0.3, 11, 3), (-1, -3, 11, -0.3)]
+
+    def board(*zones):
+        return sexpr.parse("(kicad_pcb " + seg + " " + " ".join(zones) + ")")
+
+    assert z.coplanar_without_ground(hdm, board()) == [("CPW", "F.Cu")]
+    # Filled, on the layer, in both net spellings: passes.
+    assert z.coplanar_without_ground(hdm, board(_filled('(net "GND")', "F.Cu", *beside))) == []
+    assert z.coplanar_without_ground(
+        hdm, board(_filled('(net 1) (net_name "GND")', "F.Cu", *beside))) == []
+    # Ground far from the trace is not beside it.
+    far = _filled('(net "GND")', "F.Cu", (-1, 20, 11, 25))
+    assert z.coplanar_without_ground(hdm, board(far)) == [("CPW", "F.Cu")]
+    # A zone that was never filled has no copper.
+    unfilled = '(zone (net "GND") (layers "F.Cu") (polygon (pts (xy -5 -5) (xy 15 -5) (xy 15 5) (xy -5 5))))'
+    assert z.coplanar_without_ground(hdm, board(unfilled)) == [("CPW", "F.Cu")]
+    # Ground on one side only is not coplanar.
+    assert z.coplanar_without_ground(
+        hdm, board(_filled('(net "GND")', "F.Cu", beside[0]))) == [("CPW", "F.Cu")]
     # A rule area is not copper.
-    keepout = sexpr.parse(f'(kicad_pcb {seg} (zone (layers "F.Cu") (keepout (tracks not_allowed))))')
-    assert z.coplanar_without_ground(hdm, keepout) == [("CPW", "F.Cu")]
+    keepout = '(zone (layers "F.Cu") (keepout (tracks not_allowed)))'
+    assert z.coplanar_without_ground(hdm, board(keepout)) == [("CPW", "F.Cu")]
 
 
 def test_a_tag_naming_a_class_takes_what_it_leaves_out_from_that_class():
@@ -537,7 +559,7 @@ def test_a_tag_naming_a_class_takes_what_it_leaves_out_from_that_class():
 def test_a_release_with_a_coplanar_line_and_no_ground_is_not_quotable(released):
     proj, build = released
     (proj / "dev.kicad_pcb").write_text(
-        '(kicad_pcb (segment (start 0 0) (end 1 0) (width 0.3) (layer "F.Cu") (net "ANT")))\n')
+        '(kicad_pcb (segment (start 0 0) (end 10 0) (width 0.3) (layer "F.Cu") (net "ANT")))\n')
     manifest = build({"net_classes": {"CPW": {"trace_width": 0.3, "coplanar_gap": 0.15,
                                               "impedance": {"ohms": 50, "mode": "coplanar"}}},
                       "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}})
@@ -593,3 +615,33 @@ def test_a_release_with_an_uncoupled_pair_is_not_quotable(released):
     assert not manifest["quotable"]
     (step,) = [s for s in manifest["steps"] if s["step"] == "impedance"]
     assert "apart on F.Cu" in step["detail"]
+
+
+
+def test_a_pair_bend_routed_as_arcs_is_measured():
+    """Codex, PR #31: arcs were left out of the coupling check, so a pair drawn
+    in arcs at any separation passed."""
+    from blpl.emitter import sexpr
+
+    def arc(net, r):
+        # A quarter circle about the origin, radius r.
+        import math
+        m = r / math.sqrt(2)
+        return (f'(arc (start {r} 0) (mid {m:.6f} {m:.6f}) (end 0 {r}) (width 0.18) '
+                f'(layer "F.Cu") (net "{net}"))')
+
+    good = sexpr.parse("(kicad_pcb " + arc("USB_DP", 5) + arc("USB_DM", 5.33) + ")")
+    assert z.pair_problems(_PAIR_HDM, good) == []
+    wide = sexpr.parse("(kicad_pcb " + arc("USB_DP", 5) + arc("USB_DM", 6) + ")")
+    assert any("apart on F.Cu" in p for p in z.pair_problems(_PAIR_HDM, wide))
+    alone = sexpr.parse("(kicad_pcb " + arc("USB_DP", 5) + arc("USB_DM", 5.33).replace("F.Cu", "B.Cu") + ")")
+    assert any("no USB_DM bend beside it" in p for p in z.pair_problems(_PAIR_HDM, alone))
+
+
+def test_a_tag_that_matches_nothing_is_an_error_that_blocks_release(tmp_path):
+    """Codex, PR #31: a misspelled tag dropped its requirement silently."""
+    cfg = _config(controlled_impedance=[{"nets": "^ANNT_"}])
+    hdm, _, _ = s5.emit(*_stage5_inputs([("1", "ANT_FEED")]), cfg)
+    assert hdm["synthesis"]["controlled_impedance"]["unmatched"] == ["controlled_impedance[0] ('^ANNT_')"]
+    (f,) = z.review(hdm)
+    assert (f["rule_id"], f["severity"]) == ("ZC-008", "error")

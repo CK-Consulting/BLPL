@@ -228,6 +228,9 @@ class Resolution:
     #: classes made because no declared class had the impedance a tag asked for.
     synthesized: dict[str, Spec] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    #: Tags whose pattern matched no net: a misspelled or stale tag drops its
+    #: requirement on the floor, so Stage 8 makes each one an error (ZC-008).
+    unmatched: list[str] = field(default_factory=list)
 
 
 def resolve(project_config: dict, nets_out: dict) -> Resolution:
@@ -247,6 +250,7 @@ def resolve(project_config: dict, nets_out: dict) -> Resolution:
         hits = [n for n in nets_out if tag.pattern.search(n)]
         if not hits:
             res.notes.append(f"{tag.where} ({tag.pattern.pattern!r}) matches no net on this board")
+            res.unmatched.append(f"{tag.where} ({tag.pattern.pattern!r})")
             continue
         cls = tag.cls
         if cls is None:
@@ -361,6 +365,15 @@ def review(hdm: dict) -> list[dict]:
         out.append({"source": "impedance", "rule_id": rule, "severity": severity,
                     "summary": summary, "recommendation": rec,
                     "components": list(components), "nets": sorted(nets_)})
+
+    record = ((hdm.get("synthesis") or {}).get("controlled_impedance") or {})
+    for tag in record.get("unmatched") or []:
+        finding(
+            "ZC-008", "error",
+            f"The impedance tag {tag} matches no net on this board, so whatever it was "
+            "meant to control is not controlled and the fab is not told.",
+            "Fix the pattern to match the nets' names as they appear in nets.json, or "
+            "remove the tag if those nets are not on this board.")
 
     for name, rules in sorted(classes.items()):
         rules = rules or {}
@@ -515,6 +528,7 @@ def _routed(pcb: list):
 
     segments = []
     lines = []          # straight segments with their ends, for pair geometry
+    arcs = []           # arcs with start, mid and end, likewise
     for seg in sexpr.find_all(pcb, "segment") + sexpr.find_all(pcb, "arc"):
         layer, width = sexpr.find(seg, "layer"), sexpr.find(seg, "width")
         name = net_of(seg)
@@ -525,6 +539,14 @@ def _routed(pcb: list):
         except ValueError:
             w = None
         segments.append((name, sexpr.unquote(str(layer[1])), w))
+        if seg[0] == "arc":
+            a, m, b = sexpr.find(seg, "start"), sexpr.find(seg, "mid"), sexpr.find(seg, "end")
+            try:
+                arcs.append((name, sexpr.unquote(str(layer[1])), w,
+                             (float(a[1]), float(a[2])), (float(m[1]), float(m[2])),
+                             (float(b[1]), float(b[2]))))
+            except (TypeError, IndexError, ValueError):
+                pass
         if seg[0] == "segment":
             a, b = sexpr.find(seg, "start"), sexpr.find(seg, "end")
             try:
@@ -539,7 +561,7 @@ def _routed(pcb: list):
             continue                      # a rule area, not copper
         layers = sexpr.find(zone, "layers") or sexpr.find(zone, "layer")
         zones.append((name, [sexpr.unquote(str(x)) for x in (layers or [])[1:]]))
-    return segments, zones, lines
+    return segments, zones, lines, arcs
 
 
 def _controlled(hdm: dict) -> dict[str, tuple[str, dict, Spec]]:
@@ -572,7 +594,7 @@ def layer_violations(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     KiCad net classes constrain width, not layer, so nothing in the board stops
     a controlled trace moving to a layer where its width is another impedance.
     """
-    segments, _, _ = _routed(pcb)
+    segments, _, _, _ = _routed(pcb)
     ctl = _controlled(hdm)
     return sorted({(n, lay, ctl[n][0]) for n, lay, _ in segments
                    if n in ctl and ctl[n][2].layers and lay not in ctl[n][2].layers})
@@ -586,7 +608,7 @@ def width_violations(hdm: dict, pcb: list) -> list[tuple[str, float, float, str]
     imported segment carries its own ``(width ...)``, and that is what the
     gerber will etch whatever the fab sheet says (Codex, PR #31).
     """
-    segments, _, _ = _routed(pcb)
+    segments, _, _, _ = _routed(pcb)
     ctl = _controlled(hdm)
     out = set()
     for n, _lay, w in segments:
@@ -602,26 +624,67 @@ def width_violations(hdm: dict, pcb: list) -> list[tuple[str, float, float, str]
 
 
 def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
-    """(class, layer) for every coplanar class with no ground zone on a layer it
-    is routed on.
+    """(class, layer) for every coplanar class whose routed trace does not have
+    filled ground copper beside it at the declared gap.
 
     A coplanar line is coplanar because ground copper runs beside it at the
-    declared gap. Neither emitter pours that copper, and a class clearance
-    cannot create it, so without a ground zone on the layer the line is an
-    ordinary microstrip at the wrong width (Codex, PR #31).
+    declared gap. Neither emitter pours that copper and a class clearance cannot
+    create it; a ground zone somewhere else on the layer, or one never filled,
+    is not beside the trace either (Codex, PR #31). So for every straight
+    stretch of a coplanar net longer than ``_COUPLED_MIN_MM``, a point just
+    past the gap on each side of its middle must lie in a *filled* ground
+    polygon on that layer. A board with no fill data cannot show that, and
+    fails.
     """
-    segments, zones, _ = _routed(pcb)
+    import math
+
+    from blpl.emitter import sexpr
+
+    from .board_geometry import point_in_polygon
+
+    _, _, lines, _ = _routed(pcb)
     ctl = _controlled(hdm)
-    ground_layers = {lay for n, layers in zones if _GROUND.search(n) for lay in layers}
-    if any(lay == "*.Cu" for lay in ground_layers):
+    coplanar = {n: (cls, rules) for n, (cls, rules, spec) in ctl.items() if spec.mode == "coplanar"}
+    if not coplanar:
         return []
-    coplanar = {cls: spec for cls, _rules, spec in ctl.values() if spec.mode == "coplanar"}
+    ordinals = {str(n[1]): sexpr.unquote(str(n[2])) for n in sexpr.find_all(pcb, "net")
+                if len(n) >= 3}
+    filled: dict[str, list[list[tuple[float, float]]]] = {}
+    for zone in sexpr.find_all(pcb, "zone"):
+        named = sexpr.find(zone, "net_name")
+        net = sexpr.find(zone, "net")
+        name = (sexpr.unquote(str(named[1])) if named is not None and len(named) > 1 else
+                (sexpr.unquote(str(net[1])) if net is not None and len(net) > 1
+                 and str(net[1]).startswith('"') else
+                 ordinals.get(str(net[1]), "") if net is not None and len(net) > 1 else ""))
+        if not name or not _GROUND.search(name):
+            continue
+        for fp in sexpr.find_all(zone, "filled_polygon"):
+            lay = sexpr.find(fp, "layer")
+            pts = sexpr.find(fp, "pts")
+            if lay is None or pts is None:
+                continue
+            poly = [(float(xy[1]), float(xy[2])) for xy in pts[1:]
+                    if isinstance(xy, list) and xy and xy[0] == "xy"]
+            if len(poly) >= 3:
+                filled.setdefault(sexpr.unquote(str(lay[1])), []).append(poly)
     out = set()
-    for cls, spec in coplanar.items():
-        routed = {lay for n, lay, _ in segments if n in ctl and ctl[n][0] == cls}
-        for lay in sorted(routed or set(spec.layers) or {"F.Cu"}):
-            if lay not in ground_layers:
-                out.add((cls, lay))
+    reach = 0.05            # just past the gap: inside the pour if it is there
+    for n, lay, w, p1, p2 in lines:
+        if n not in coplanar:
+            continue
+        cls, rules = coplanar[n]
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        length = math.hypot(dx, dy)
+        if length <= _COUPLED_MIN_MM:
+            continue
+        nx, ny = -dy / length, dx / length
+        off = (w or 0) / 2 + float(rules.get("coplanar_gap", 0)) + reach
+        mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+        sides = [(mx + nx * off, my + ny * off), (mx - nx * off, my - ny * off)]
+        polys = filled.get(lay, [])
+        if not all(any(point_in_polygon(pt, poly) for poly in polys) for pt in sides):
+            out.add((cls, lay))
     return sorted(out)
 
 
@@ -647,7 +710,9 @@ def pair_problems(hdm: dict, pcb: list) -> list[str]:
     """
     import math
 
-    segments, _, lines = _routed(pcb)
+    from .board_geometry import _arc_center, _sweep
+
+    segments, _, lines, arcs = _routed(pcb)
     ctl = _controlled(hdm)
     nets = hdm.get("nets") or {}
     done: set[frozenset[str]] = set()
@@ -691,6 +756,36 @@ def pair_problems(hdm: dict, pcb: list) -> list[str]:
                         best = edge
                 if best is None or best > _COUPLED_SEARCH_MM:
                     out.append(f"{me} runs {length:.1f} mm on {lay} with no {other} beside it")
+                elif abs(best - gap) > _GAP_SLACK_MM:
+                    out.append(f"{me} and {other} are {best:.3f} mm apart on {lay}, not {gap:g}")
+            # A bend routed as arcs: the partner's matching bend is concentric,
+            # and the gap is the difference of the radii less the half-widths.
+            # A pair drawn in arcs at an arbitrary separation used to pass
+            # unmeasured (Codex, PR #31).
+            their_arcs = [ar for ar in arcs if ar[0] == other]
+            for _n, lay, w, a1, am, a2 in (ar for ar in arcs if ar[0] == me):
+                try:
+                    centre, r = _arc_center(a1, am, a2)
+                    length = r * abs(_sweep(a1, am, a2, centre)[1])
+                except ValueError:
+                    continue
+                if length <= _COUPLED_MIN_MM:
+                    continue
+                best = None
+                for _o, olay, ow, b1, bm, b2 in their_arcs:
+                    if olay != lay:
+                        continue
+                    try:
+                        oc, orr = _arc_center(b1, bm, b2)
+                    except ValueError:
+                        continue
+                    if math.dist(centre, oc) > _GAP_SLACK_MM:
+                        continue
+                    edge = abs(r - orr) - ((w or 0) + (ow or 0)) / 2
+                    if best is None or edge < best:
+                        best = edge
+                if best is None:
+                    out.append(f"{me} bends {length:.1f} mm on {lay} with no {other} bend beside it")
                 elif abs(best - gap) > _GAP_SLACK_MM:
                     out.append(f"{me} and {other} are {best:.3f} mm apart on {lay}, not {gap:g}")
     return sorted(set(out))

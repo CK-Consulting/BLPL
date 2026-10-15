@@ -89,6 +89,8 @@ what the board "probably" carries.
    - **ZC-007** — on a board with more than two copper layers, a class that
      does not say which layer its width is for: `impedance: {ohms: 50,
      layers: [F.Cu]}`.
+   - **ZC-008** — a tag whose pattern matches no net; fix the pattern to the
+     names in `nets.json`.
 
    ZC-003 and every ZC finding except ZC-004 are errors.
 5. **Release.** The release build — the app's release action, or
@@ -97,8 +99,9 @@ what the board "probably" carries.
    tolerance, layers, width, gap, and every controlled net, for the board
    house. It refuses to mark the package quotable while any ZC error stands,
    or while the routed `.kicad_pcb` has a controlled trace on a layer or at a
-   width its class is not for, a coplanar class with no ground zone on its
-   layer (neither emitter pours that ground; draw it), or a differential pair
+   width its class is not for, a coplanar trace without filled ground copper
+   on both sides at its gap (neither emitter pours that ground; draw and fill
+   it), or a differential pair
    whose halves are on different layers or side by side at a gap other than
    the class's. Order with
    impedance control and a TDR test coupon; ±10 % is the usual tolerance,
