@@ -89,13 +89,21 @@ class LoadHDMPlugin(pcbnew.ActionPlugin):
             else:
                 missing.append(refdes)
 
-        width, height = hdm_to_pcb._board_dimensions(hdm)
-        segs = hdm_to_pcb._add_edge_cuts_rect(board, width, height, pcbnew)
+        try:
+            segs, keepouts = hdm_to_pcb._add_board_geometry(board, hdm, pcbnew)
+        except ValueError as exc:
+            wx.MessageBox(
+                f"Footprints were placed, but the board outline was not drawn: {exc}",
+                self.name,
+                wx.OK | wx.ICON_ERROR,
+            )
+            pcbnew.Refresh()
+            return
 
         pcbnew.Refresh()
         wx.MessageBox(
             f"Placed {placed} footprints, created {len(net_cache)} nets, "
-            f"{segs} Edge.Cuts segments.\n"
+            f"{segs} Edge.Cuts shapes, {keepouts} keepout zone(s).\n"
             + (f"\n{len(missing)} missing footprint(s): {', '.join(missing[:5])}" if missing else ""),
             self.name,
         )

@@ -41,6 +41,7 @@ class BuildReport:
     footprints_missing: list[str] = None  # type: ignore[assignment]
     nets_created: int = 0
     edge_cut_segments: int = 0
+    keepout_zones: int = 0
 
     def __post_init__(self) -> None:
         if self.footprints_missing is None:
@@ -186,6 +187,111 @@ def _add_edge_cuts_rect(board: Any, width_mm: float, height_mm: float, pcbnew: A
     return count
 
 
+def _sheet_vector(point: Any, pcbnew: Any) -> Any:
+    return pcbnew.VECTOR2I(*_sheet_position(float(point[0]), float(point[1])))
+
+
+def _add_edge_cuts_path(board: Any, segments: list[dict], pcbnew: Any) -> int:
+    """Draw one closed path from Stage 5's ``board_geometry`` on Edge.Cuts.
+
+    Arcs stay arcs and a circle stays a circle, as in the core emitter:
+    flattening them would hand the fab a faceted edge nobody asked for.
+    """
+    count = 0
+    for seg in segments:
+        kind, pts = seg["kind"], seg["points"]
+        shape = pcbnew.PCB_SHAPE(board)
+        if kind == "line":
+            shape.SetShape(pcbnew.SHAPE_T_SEGMENT)
+            shape.SetStart(_sheet_vector(pts[0], pcbnew))
+            shape.SetEnd(_sheet_vector(pts[1], pcbnew))
+        elif kind == "arc":
+            shape.SetShape(pcbnew.SHAPE_T_ARC)
+            shape.SetArcGeometry(
+                _sheet_vector(pts[0], pcbnew),
+                _sheet_vector(pts[1], pcbnew),
+                _sheet_vector(pts[2], pcbnew),
+            )
+        elif kind == "circle":
+            cx, cy = float(pts[0][0]), float(pts[0][1])
+            shape.SetShape(pcbnew.SHAPE_T_CIRCLE)
+            shape.SetCenter(_sheet_vector((cx, cy), pcbnew))
+            # A circle's end is any point on it; the emitter uses due east.
+            shape.SetEnd(_sheet_vector((cx + float(seg["radius"]), cy), pcbnew))
+        else:
+            # Skipping it would leave the outline open with nothing to say why.
+            raise ValueError(f"board_geometry segment of unknown kind {kind!r}")
+        shape.SetLayer(pcbnew.Edge_Cuts)
+        shape.SetWidth(_mm_to_nm(0.05))
+        board.Add(shape)
+        count += 1
+    return count
+
+
+def _keepout_layer_set(board: Any, layers: list[str], pcbnew: Any) -> Any:
+    """The ``LSET`` a keepout's layer names describe; ``*.Cu`` is every copper layer."""
+    lset = pcbnew.LSET()
+    for name in layers:
+        if name == "*.Cu":
+            lset.AddLayerSet(pcbnew.LSET.AllCuMask())
+            continue
+        names = ["F.Cu", "B.Cu"] if name == "F&B.Cu" else [name]
+        for single in names:
+            layer_id = board.GetLayerID(single)
+            if layer_id < 0:
+                # Dropping a layer would draw a keepout that guards less than
+                # the design asked for, and report it as drawn.
+                raise ValueError(f"keepout names unknown layer {single!r}")
+            lset.AddLayer(layer_id)
+    return lset
+
+
+def _add_keepout_zone(board: Any, feature: dict, pcbnew: Any) -> None:
+    """A board-level rule area forbidding what the feature's ``forbid`` lists."""
+    forbid = set(feature.get("forbid") or ())
+    zone = pcbnew.ZONE(board)
+    zone.SetIsRuleArea(True)
+    zone.SetLayerSet(_keepout_layer_set(board, feature.get("layers") or ["*.Cu"], pcbnew))
+    zone.SetDoNotAllowTracks("tracks" in forbid)
+    zone.SetDoNotAllowVias("vias" in forbid)
+    zone.SetDoNotAllowPads("pads" in forbid)
+    zone.SetDoNotAllowFootprints("footprints" in forbid)
+    # KiCad 9 renamed the copper-pour flag; older builds only have the old name.
+    set_pour = getattr(zone, "SetDoNotAllowZoneFills", None) or zone.SetDoNotAllowCopperPour
+    set_pour("copperpour" in forbid)
+    if feature.get("name"):
+        zone.SetZoneName(str(feature["name"]))
+    outline = zone.Outline()
+    outline.NewOutline()
+    for point in feature["polygon"]:
+        x_nm, y_nm = _sheet_position(float(point[0]), float(point[1]))
+        outline.Append(x_nm, y_nm)
+    board.Add(zone)
+
+
+def _add_board_geometry(board: Any, hdm: dict, pcbnew: Any) -> tuple[int, int]:
+    """Outline, cutouts and keepouts; returns (Edge.Cuts shapes, keepout zones).
+
+    Draws from Stage 5's resolved ``board_geometry`` when the HDM has it, the
+    same record the core emitter draws from. An HDM without one predates
+    shaped outlines (or was written by hand) and gets the rectangle its
+    dimensions describe, as before.
+    """
+    geom = hdm.get("board_geometry")
+    if not isinstance(geom, dict):
+        width, height = _board_dimensions(hdm)
+        return _add_edge_cuts_rect(board, width, height, pcbnew), 0
+    edges = _add_edge_cuts_path(board, geom["outline"]["segments"], pcbnew)
+    keepouts = 0
+    for feature in geom.get("features") or []:
+        if feature.get("kind") == "cutout":
+            edges += _add_edge_cuts_path(board, feature["segments"], pcbnew)
+        elif feature.get("kind") == "keepout":
+            _add_keepout_zone(board, feature, pcbnew)
+            keepouts += 1
+    return edges, keepouts
+
+
 def build_board(
     hdm: dict,
     *,
@@ -221,8 +327,7 @@ def build_board(
 
     report.nets_created = len(net_cache)
 
-    width, height = _board_dimensions(hdm)
-    report.edge_cut_segments = _add_edge_cuts_rect(board, width, height, pcbnew)
+    report.edge_cut_segments, report.keepout_zones = _add_board_geometry(board, hdm, pcbnew)
 
     return board, report
 
