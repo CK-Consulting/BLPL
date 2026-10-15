@@ -169,21 +169,268 @@ def _override_footprint_position(footprint_node: sexpr.Node, x: float, y: float,
     if rot:
         new_at.append(f"{rot}")
     if at_node is not None:
-        at_node[:] = new_at
+        footprint_node.remove(at_node)
+    # Where KiCad writes it: straight after the footprint's layer (and uuid,
+    # if that follows). Position is not cosmetic. KiCad's parser applies the
+    # footprint's (at ...) when it reaches it, moving and turning whatever it
+    # has already read — so an (at ...) after the pads turns them a second
+    # time, and moves the footprint's board-coordinate zones by the position
+    # again. Inserting "after the last layer or uuid" found the uuid
+    # _replace_uuid had appended at the very end, and did exactly that.
+    insert_idx = 1
+    for i, child in enumerate(footprint_node[1:], start=1):
+        if isinstance(child, list) and sexpr.head(child) == "layer":
+            insert_idx = i + 1
+            nxt = footprint_node[insert_idx] if insert_idx < len(footprint_node) else None
+            if isinstance(nxt, list) and sexpr.head(nxt) == "uuid":
+                insert_idx += 1
+            break
+    footprint_node.insert(insert_idx, new_at)
+
+
+# Orienting a footprint ------------------------------------------------------
+#
+# A footprint on the board is not the library footprint with a different
+# ``(at ...)``. KiCad's file stores a footprint's children in its own frame, but
+# the *angle* on every pad and text is absolute — the footprint's orientation
+# is already added in — and a footprint's zones are in board coordinates. A
+# bottom-side footprint is more different still: every child is mirrored, every
+# F.* layer is B.* and back, and texts are mirrored.
+#
+# The emitter used to do none of it. A rotated part kept its pads at their
+# library angle, so KiCad loaded them turned against their own footprint (an
+# 0603 at 90 deg had pads 0.8 wide across the part instead of along it). A
+# bottom-side part was only relabelled ``(layer "B.Cu")``: its pads stayed on
+# F.Cu/F.Mask/F.Paste with unmirrored coordinates, which is a front-side land
+# pattern nobody can solder to under a back-side label.
+#
+# ``side: bottom, rot: r`` means what the KiCad plugin's ``hdm_to_pcb`` makes
+# of it: the part as it would sit on top at ``r``, then turned over left to
+# right about its origin (``FOOTPRINT::Flip`` with ``FLIP_DIRECTION::LEFT_RIGHT``).
+# KiCad stores that as orientation ``180 - r`` with the children mirrored
+# top-to-bottom in the footprint's frame, which is what is written here —
+# measured against footprints pcbnew flipped itself, not derived, because the
+# text rules in particular are not what anyone would guess.
+
+#: Child tags whose coordinate pairs are points in the footprint's frame.
+_POINT_TAGS = frozenset({"at", "start", "end", "mid", "center", "xy"})
+_TEXT_TAGS = frozenset({"property", "fp_text"})
+_GRAPHIC_TAGS = frozenset({"fp_line", "fp_arc", "fp_circle", "fp_rect", "fp_poly", "fp_curve"})
+_JUSTIFY_SWAP = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
+_CHAMFER_SWAP = {"top_left": "bottom_left", "bottom_left": "top_left",
+                 "top_right": "bottom_right", "bottom_right": "top_right"}
+
+
+def _flip_layer_name(name: str) -> str:
+    """``F.SilkS`` -> ``B.SilkS`` and back; wildcards and inner layers unchanged."""
+    if name.startswith("F."):
+        return "B." + name[2:]
+    if name.startswith("B."):
+        return "F." + name[2:]
+    return name
+
+
+def _flip_layers(node: sexpr.Node) -> None:
+    for tag in ("layer", "layers"):
+        for layer_node in sexpr.find_all(node, tag):
+            layer_node[1:] = [
+                sexpr.quote(_flip_layer_name(sexpr.unquote(a))) if isinstance(a, str) else a
+                for a in layer_node[1:]
+            ]
+
+
+def _mirror_points(node: sexpr.Node) -> None:
+    """Negate y on every point under ``node``, however deeply nested.
+
+    Deep because polygons keep their vertices in a nested ``(pts (xy ..))`` and
+    a custom pad keeps its shape in ``(primitives (gr_poly (pts ..)))``; a flip
+    that reads only direct children leaves exactly those behind.
+    """
+    for child in node:
+        if not isinstance(child, list) or not child:
+            continue
+        if child[0] in _POINT_TAGS and len(child) >= 3:
+            child[2] = _fmt(-_num(child[2]))
+        elif child[0] == "offset" and len(child) >= 3:
+            # A drill offset, in the pad's frame.
+            child[2] = _fmt(-_num(child[2]))
+        else:
+            _mirror_points(child)
+
+
+def _angle_of(at: sexpr.Node) -> float:
+    return _num(at[3]) if len(at) >= 4 else 0.0
+
+
+def _set_angle(at: sexpr.Node, angle: float) -> None:
+    angle = angle % 360.0
+    if abs(angle - 360.0) < 1e-9:
+        angle = 0.0
+    del at[3:]
+    at.append(_fmt(angle))
+
+
+def _justify(text: sexpr.Node) -> sexpr.Node | None:
+    effects = sexpr.find(text, "effects")
+    return None if effects is None else sexpr.find(effects, "justify")
+
+
+def _toggle_text_mirror(text: sexpr.Node) -> None:
+    effects = sexpr.find(text, "effects")
+    if effects is None:
+        effects = ["effects", ["font", ["size", "1", "1"], ["thickness", "0.15"]]]
+        text.append(effects)
+    justify = sexpr.find(effects, "justify")
+    if justify is None:
+        effects.append(["justify", "mirror"])
+    elif "mirror" in justify:
+        justify.remove("mirror")
+        if len(justify) == 1:
+            effects.remove(justify)
     else:
-        # Insert near the top (after layer if present).
-        insert_idx = 1
-        for i, child in enumerate(footprint_node[1:], start=1):
-            if isinstance(child, list) and sexpr.head(child) in ("layer", "uuid"):
-                insert_idx = i + 1
-        footprint_node.insert(insert_idx, new_at)
+        justify.append("mirror")
 
 
-def _override_footprint_layer(footprint_node: sexpr.Node, side: str) -> None:
-    target = '"B.Cu"' if side.lower() == "bottom" else '"F.Cu"'
+def _orient_text(text: sexpr.Node, rot: float, bottom: bool) -> None:
+    """A property or fp_text as KiCad leaves it after rotating and flipping.
+
+    On the bottom the angle becomes ``-(a + rot)``, text on an F./B. or copper
+    layer is mirrored, and
+    then — unless the text is ``(unlocked yes)``, KiCad's "keep upright" off —
+    an angle of 180 or more is brought back by 180 with both justifications
+    swapped, which is the same box read the right way up. That last step is
+    ``PCB_TEXT::KeepUpright``; leaving it out puts every reference on a
+    flipped part upside-down.
+    """
+    at = sexpr.find(text, "at")
+    if at is None:
+        return
+    a = _angle_of(at)
+    if not bottom:
+        _set_angle(at, a + rot)
+        return
+    at[2] = _fmt(-_num(at[2]))
+    angle = -(a + rot) % 360.0
+    layer = sexpr.find(text, "layer")
+    name = sexpr.unquote(str(layer[1])) if layer is not None else ""
+    if name[:2] in ("F.", "B.") or name.endswith(".Cu"):
+        # Only text on a sided or copper layer is read through the board. A
+        # note on User.Drawings is read from above whichever side its part is
+        # on, and KiCad leaves it unmirrored.
+        _toggle_text_mirror(text)
+    unlocked = sexpr.find(text, "unlocked")
+    keep_upright = unlocked is None or sexpr.unquote(str(unlocked[1])) != "yes"
+    if keep_upright and angle >= 180.0 - 1e-9:
+        angle -= 180.0
+        justify = _justify(text)
+        if justify is not None:
+            justify[1:] = [_JUSTIFY_SWAP.get(j, j) for j in justify[1:]]
+    _set_angle(at, angle)
+
+
+def _flip_text_box(box: sexpr.Node) -> None:
+    """An fp_text_box turned over with its footprint.
+
+    Unlike fp_text, a text box keeps its angle relative to the footprint, so
+    rotation leaves it alone and only a flip changes it: corners mirrored,
+    layer swapped, text mirrored on a sided layer, and the angle ``a`` becomes
+    ``180 - a``, which is what pcbnew writes. Justification is not swapped —
+    a box has no keep-upright.
+    """
+    _mirror_points(box)
+    _flip_layers(box)
+    layer = sexpr.find(box, "layer")
+    name = sexpr.unquote(str(layer[1])) if layer is not None else ""
+    if name[:2] in ("F.", "B.") or name.endswith(".Cu"):
+        _toggle_text_mirror(box)
+    angle = sexpr.find(box, "angle")
+    flipped = _fmt((180.0 - (_num(angle[1]) if angle is not None else 0.0)) % 360.0)
+    if angle is not None:
+        angle[1:] = [flipped]
+    else:
+        anchor = sexpr.find(box, "pts") or sexpr.find(box, "end")
+        box.insert(box.index(anchor) + 1 if anchor is not None else len(box),
+                   ["angle", flipped])
+
+
+def _orient_pad(pad: sexpr.Node, rot: float, bottom: bool) -> None:
+    at = sexpr.find(pad, "at")
+    a = _angle_of(at) if at is not None else 0.0
+    if bottom:
+        # Mirroring the footprint mirrors the pad's own frame with it, so its
+        # angle, its primitives, a trapezoid's taper and its chamfered
+        # corners all turn over too.
+        _mirror_points(pad)
+        _flip_layers(pad)
+        delta = sexpr.find(pad, "rect_delta")
+        if delta is not None and len(delta) >= 3:
+            delta[2] = _fmt(-_num(delta[2]))
+        chamfer = sexpr.find(pad, "chamfer")
+        if chamfer is not None:
+            chamfer[1:] = [_CHAMFER_SWAP.get(c, c) for c in chamfer[1:]]
+        a = 180.0 - rot - a
+    else:
+        a = a + rot
+    if at is not None:
+        _set_angle(at, a)
+
+
+def _orient_zone(zone: sexpr.Node, x: float, y: float, orient: float, bottom: bool) -> None:
+    """A footprint's zone, which KiCad stores in board coordinates."""
+    if bottom:
+        _mirror_points(zone)
+        _flip_layers(zone)
+    theta = math.radians(orient)
+    c, s = math.cos(theta), math.sin(theta)
+
+    def place(node: sexpr.Node) -> None:
+        for child in node:
+            if not isinstance(child, list) or not child:
+                continue
+            if child[0] == "xy" and len(child) >= 3:
+                px, py = _num(child[1]), _num(child[2])
+                child[1] = _fmt(x + px * c + py * s)
+                child[2] = _fmt(y - px * s + py * c)
+            else:
+                place(child)
+
+    for tag in ("polygon", "filled_polygon"):
+        for poly in sexpr.find_all(zone, tag):
+            place(poly)
+
+
+def _orient_footprint(
+    footprint_node: sexpr.Node, x: float, y: float, rot: float, side: str
+) -> None:
+    """Put a library footprint on the board at (x, y), turned ``rot``, on ``side``.
+
+    ``x``/``y`` are sheet coordinates. Everything the footprint carries is
+    rewritten the way KiCad would write it — see the block comment above.
+    """
+    bottom = side.lower() == "bottom"
+    orient = (180.0 - rot if bottom else rot) % 360.0
     layer_node = sexpr.find(footprint_node, "layer")
     if layer_node is not None:
-        layer_node[:] = ["layer", target]
+        layer_node[:] = ["layer", '"B.Cu"' if bottom else '"F.Cu"']
+    for child in footprint_node:
+        if not isinstance(child, list) or not child:
+            continue
+        tag = child[0]
+        if tag in _TEXT_TAGS:
+            _orient_text(child, rot, bottom)
+            if bottom:
+                _flip_layers(child)
+        elif tag == "pad":
+            _orient_pad(child, rot, bottom)
+        elif tag in _GRAPHIC_TAGS:
+            if bottom:
+                _mirror_points(child)
+                _flip_layers(child)
+        elif tag == "fp_text_box" and bottom:
+            _flip_text_box(child)
+        elif tag == "zone":
+            _orient_zone(child, x, y, orient, bottom)
+    _override_footprint_position(footprint_node, x, y, orient)
 
 
 # Legacy footprint upgrade --------------------------------------------------
@@ -710,36 +957,6 @@ def _anchored_keepouts(hdm: dict, refdes: str) -> list[sexpr.Node]:
             if f.get("kind") == "keepout" and f.get("anchor") == refdes]
 
 
-def _place_footprint_zones(fp_node: sexpr.Node, sheet_x: float, sheet_y: float,
-                           rot: float) -> None:
-    """Move a library footprint's own zones from its frame to the board's.
-
-    A ``.kicad_mod`` stores a zone's outline relative to the footprint origin,
-    and a board file stores a footprint's zones in board coordinates — unlike
-    its pads and graphics, which stay local. Copying the library zone verbatim
-    therefore left it wherever its local numbers fell on the sheet: the
-    ESP-WROOM-02 antenna keepout loaded at (-14, -18)..(14, -7), off the sheet,
-    while the module sat at (42.5, 37.5), and its antenna had no keepout at all.
-
-    Same rotation mapping the placer measured with pcbnew: an orientation of
-    +90 deg sends a local (dx, dy) to (dy, -dx).
-    """
-    a = math.radians(rot)
-    c, sn = math.cos(a), math.sin(a)
-    for zone in fp_node:
-        if not (isinstance(zone, list) and zone and zone[0] == "zone"):
-            continue
-        for poly in zone:
-            if not (isinstance(poly, list) and poly and poly[0] in ("polygon", "filled_polygon")):
-                continue
-            pts = sexpr.find(poly, "pts")
-            for xy in (pts or [])[1:]:
-                if isinstance(xy, list) and xy and xy[0] == "xy":
-                    lx, ly = float(xy[1]), float(xy[2])
-                    xy[1] = _mm(sheet_x + lx * c + ly * sn)
-                    xy[2] = _mm(sheet_y - lx * sn + ly * c)
-
-
 def _in_notch(sheet_x: float, sheet_y: float) -> bool:
     """True when (sheet_x, sheet_y) falls inside the title-block cutout."""
     return (
@@ -853,10 +1070,6 @@ def build(
         sheet_x = bx + _ORIGIN_X
         sheet_y = by + _ORIGIN_Y
 
-        _override_footprint_layer(fp_node, side)
-        _override_footprint_position(fp_node, sheet_x, sheet_y, rot)
-        _place_footprint_zones(fp_node, sheet_x, sheet_y, rot)
-        fp_node.extend(_anchored_keepouts(hdm, refdes))
         _set_reference_and_value(fp_node, refdes, str(comp.get("value", refdes)))
         _replace_uuid(fp_node)
 
@@ -891,6 +1104,14 @@ def build(
                 _override_pad_net(pad_node, ordinal, net_name)
             _replace_uuid(pad_node)
 
+        # Last, so that whatever was added above — the placeholder marker
+        # among it — turns over with the rest of the part.
+        _orient_footprint(fp_node, sheet_x, sheet_y, rot, side)
+        # After orienting, not before: Stage 5 has already placed these in
+        # board coordinates, mirrored with a bottom-side part and with their
+        # layers swapped (board_geometry.place_anchored), so turning them
+        # again would put them back on the wrong side.
+        fp_node.extend(_anchored_keepouts(hdm, refdes))
         node.append(fp_node)
 
     placeholders = sorted(r for r, c in components.items() if c.get("needs_manual_footprint"))
