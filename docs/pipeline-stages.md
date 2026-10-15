@@ -172,9 +172,16 @@ The old `type: rect` with `start`/`end`, which `blpl init` still writes, was
 never read. `dimensions` still decides the board for it, and a stale one is
 reported rather than obeyed.
 
-A module's own antenna keepout — the rule area inside a stock RF module
-footprint — reaches KiCad's DRC, but the placer does not model it. To keep
-parts clear of it while placing, declare it as an anchored keepout.
+An anchored keepout is emitted inside its part's footprint, like the antenna
+keepout a stock RF module footprint ships with, because KiCad exempts only a
+rule area's own footprint from it. KiCad still checks that footprint's *pads*
+against it, so an anchored keepout that forbids pads must not cover them.
+A `side: bottom` part cannot carry anchored shapes yet: the emitter does not
+mirror flipped footprints.
+
+A stock module's own keepout reaches KiCad's DRC, but the placer does not
+model it. To keep parts clear of it while placing, declare it as an anchored
+keepout too.
 
 `hdm.yaml` is the single source of truth for Stage 6. A human can read and edit it directly.
 
