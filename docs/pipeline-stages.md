@@ -248,9 +248,15 @@ The rest follows from that:
   - **ZC-006**: a coplanar class has no `coplanar_gap`, the gap to the ground
     pour that sets its impedance alongside the width. `.kicad_pro` writes that
     gap as the class clearance, which is how far KiCad keeps the pour away.
-- `blpl release` writes `fab/impedance.md` for the board house. A package is
-  not quotable while any ZC error stands, whether a cell reads `NOT SET` or a
-  pair is split across classes.
+  - **ZC-007**: on a board with more than two copper layers, a class does not
+    say which layer its width is for (`impedance.layers`).
+
+  Every one except ZC-004 is an error.
+- `blpl release` writes `fab/impedance.md` for the board house, naming every
+  controlled net and the layers each width is for. A package is not quotable
+  while any ZC error stands, or while the routed `.kicad_pcb` has a controlled
+  trace on a layer its class's width is not for. KiCad net classes constrain
+  width, not layer, so the release reads the board itself.
 
 The `controlled-impedance` skill covers choosing targets, routing, termination
 and ordering.
