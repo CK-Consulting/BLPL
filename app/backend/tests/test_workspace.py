@@ -735,3 +735,49 @@ def test_the_blob_directory_can_be_configured(tmp_path, monkeypatch):
     root, key = _sealed_project(tmp_path)
     assert (tmp_path / "elsewhere" / "p.blob").is_file()
     assert workspace.is_sealed(root, "p")
+
+
+def _kicad_has_open(main, *paths: str) -> None:
+    (main.PROJECTS_ROOT / ".blpl-kicad-active").write_text("".join(f"{p}\n" for p in paths))
+
+
+def test_a_project_open_in_the_kicad_desktop_is_not_sealed(unlocked):
+    """Editing in the desktop touches nothing here, so a long routing session
+    read as idle and the project was sealed under it: KiCad was left showing
+    "Failed to get the working directory" over an empty file tree."""
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    _kicad_has_open(main, "/config/projects/mine/.pipeline/mine_2026.kicad_pro")
+    main.workspaces.all_open()[0].last_touched -= timedelta(hours=2)
+
+    with main.SessionFactory() as session:
+        for idle in main.workspaces.idle():
+            assert main._seal_workspace(session, idle.workspace) is False
+    assert (main.PROJECTS_ROOT / "mine").is_dir()
+    assert main.workspaces.idle() == []  # held open is being in it
+    body = unlocked.post("/api/auth/lock").json()
+    assert body["sealed"] == []
+
+
+def test_a_stale_desktop_heartbeat_holds_nothing(unlocked):
+    """A desktop that stopped must not keep a project decrypted forever."""
+    import time
+
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    _kicad_has_open(main, "/config/projects/mine/.pipeline/mine_2026.kicad_pro")
+    old = time.time() - main.KICAD_ACTIVE_FRESH_S - 5
+    os.utime(main.PROJECTS_ROOT / ".blpl-kicad-active", (old, old))
+
+    assert _seal_now(unlocked)["sealed"] is True
+    assert not (main.PROJECTS_ROOT / "mine").exists()
+
+
+def test_another_project_open_in_kicad_does_not_hold_this_one(unlocked):
+    import app.main as main
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    _kicad_has_open(main, "/config/projects/mine2/x.kicad_pro", "/config/projects/other/y.kicad_pro")
+    assert _seal_now(unlocked)["sealed"] is True

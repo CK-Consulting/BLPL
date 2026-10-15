@@ -2587,6 +2587,17 @@ def _seal_workspace(session: Session, project_id: str, why: list[str] | None = N
                 why.append("a run is in progress in this project; seal it when the run "
                            "has finished")
             return False
+    held = _kicad_desktop_holds(project_id)
+    if held:
+        # Sealing deletes the plaintext tree. A KiCad window with that tree
+        # open then shows "Failed to get the working directory" over an empty
+        # file list, and anything saved from it has nowhere to go. Editing in
+        # the desktop touches nothing here, so an hour of routing there read
+        # as an idle project and was sealed out from under it.
+        workspaces.touch(project_id)
+        if why is not None:
+            why.append("it is open in the KiCad desktop; close it there first")
+        return False
     # With workspaces behind the agent (phase 4), in a sealer container, after
     # the workspace is stopped and removed, so no container is left holding the
     # plaintext. Its failures are caught here as WorkspaceError's are; with the
@@ -6345,6 +6356,35 @@ def _kicad_desktop_path(host_path: Path) -> str | None:
     except (ValueError, OSError):
         return None
     return f"{mounted_at}/{rel.as_posix()}" if rel.parts else mounted_at
+
+
+#: A desktop heartbeat older than this is a desktop that is not running.
+KICAD_ACTIVE_FRESH_S = 120
+
+
+def _kicad_desktop_holds(project_id: str) -> list[str]:
+    """Projects the KiCad desktop has open in this project or a member's worktree of it.
+
+    Read from the heartbeat its watcher writes beside the open request
+    (``.blpl-kicad-active``: one in-container project path per line, for every
+    KiCad started on a project). A stale or missing heartbeat holds nothing, so
+    a stopped desktop can never keep a project unsealed.
+    """
+    import time
+
+    base, _ = _kicad_desktop_mount()
+    beat = base / ".blpl-kicad-active"
+    try:
+        if time.time() - beat.stat().st_mtime > KICAD_ACTIVE_FRESH_S:
+            return []
+        lines = [ln.strip() for ln in beat.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return []
+    roots = [r.rstrip("/") for r in (
+        _kicad_desktop_path(PROJECTS_ROOT / project_id),
+        _kicad_desktop_path(PROJECTS_ROOT / worktrees.WORKTREES_DIR / project_id),
+    ) if r]
+    return [ln for ln in lines if any(ln == r or ln.startswith(r + "/") for r in roots)]
 
 
 def _kicad_open_request_file() -> Path:
