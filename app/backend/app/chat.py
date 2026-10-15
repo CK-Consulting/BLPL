@@ -116,7 +116,9 @@ has not, and quoting the committed value beats reconstructing it.
 - You cannot write files. To change one, call propose_file_edit (any design document in \
 the project, including a board's own directory such as core/core.md); the user sees \
 your change as a diff and accepts or rejects it. Propose the complete new file \
-content, not a fragment. Say in the rationale what you changed and why.
+content, not a fragment. Say in the rationale what you changed and why. For a \
+board's outline, cutouts or keepouts use propose_board_shape instead: it keeps \
+project.dimensions equal to the outline, which Stage 5 requires.
 - When the user is deciding something — which part, which pinout, whether a \
 warning matters — walk them through the evidence you actually read, quoting the \
 specific line or row. Do not guess an MPN or a footprint; if the design does not \
@@ -1197,7 +1199,7 @@ class ChatSessionManager:
                 # A proposal is the one tool result the UI must render as a
                 # reviewable card rather than a log line, so it is promoted to
                 # its own event with the proposal attached.
-                if isinstance(event, llm_chat.ToolResult) and event.name == "propose_file_edit":
+                if isinstance(event, llm_chat.ToolResult) and event.name in _PROPOSING_TOOLS:
                     pid = _proposal_id_in(event.content)
                     if pid:
                         proposal = ProposalStore(req.project_dir).get(pid)
@@ -1413,6 +1415,12 @@ class ChatSessionManager:
                 yield item
         finally:
             live.queues.discard(q)
+
+
+# Tools whose result is a proposal the user must review. propose_board_shape
+# writes the same kind of proposal as propose_file_edit; without it here its
+# proposals were created but never shown as a card, so nobody could accept them.
+_PROPOSING_TOOLS = frozenset({"propose_file_edit", "propose_board_shape"})
 
 
 def _proposal_id_in(text: str) -> str | None:

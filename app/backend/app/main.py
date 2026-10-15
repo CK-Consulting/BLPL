@@ -73,6 +73,7 @@ from . import (
     appconfig,
     attachments,
     autopush,
+    board_config,
     chat as chat_mod,
     clerk_auth,
     components,
@@ -3421,11 +3422,7 @@ def get_board_config(
             return {"board": board, "exists": True, "valid": False,
                     "errors": [f"not valid YAML: {exc}"], "config": {},
                     "schema": _project_config_schema()}
-        errors = [
-            ".".join(str(p) for p in e.absolute_path) + ": " + e.message
-            for e in sorted(hdm_schema.validator("project_config").iter_errors(raw),
-                            key=lambda e: list(e.absolute_path))
-        ]
+        errors = board_config.errors(raw)
         valid = not errors
     return {"board": board, "exists": path.is_file(), "valid": valid,
             "errors": errors, "config": raw, "schema": _project_config_schema()}
@@ -3454,23 +3451,16 @@ def put_board_config(
     """
     proj = _project_dir(session, user, project_id)
     path = _board_config_path(proj, project_id, board)
-    errors = [
-        ".".join(str(p) for p in e.absolute_path) + ": " + e.message
-        for e in sorted(hdm_schema.validator("project_config").iter_errors(body.config),
-                        key=lambda e: list(e.absolute_path))
-    ]
+    # Schema and geometry both, as Stage 5 checks them: a config that only
+    # passed the schema could still name a self-crossing outline or
+    # dimensions that disagree with it, and stop the next build.
+    errors = board_config.errors(body.config)
     if errors:
         raise HTTPException(status_code=422, detail={"errors": errors})
 
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        "# Written by BLPL's project settings. Safe to hand-edit — Stage 5\n"
-        "# validates this file every time it reads it, against\n"
-        "# schemas/project_config.v1.json.\n\n"
-        + yaml.safe_dump(body.config, sort_keys=False),
-        encoding="utf-8",
-    )
+    tmp.write_text(board_config.render(body.config), encoding="utf-8")
     os.replace(tmp, path)
     workspaces.touch(project_id, user.id)
     return {"ok": True, "board": board}

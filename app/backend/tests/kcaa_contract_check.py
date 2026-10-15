@@ -33,6 +33,7 @@ REQUIRED_TOOLS = {
     "list_nets",
     "get_ratsnest",
     # outline / zones
+    "get_board_outline",
     "set_board_outline_rect",
     "add_zone",
     # design rules / net classes (BLPL emits net classes in the .kicad_pro)
