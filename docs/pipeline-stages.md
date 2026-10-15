@@ -139,7 +139,9 @@ boundaries:
   board_outline:
     shape: polygon              # rect | circle | polygon | trapezoid
     points: [[0, 0], [60, 0], [60, 25], [30, 40], [0, 25]]
-    corner_radius: 1            # optional; rect and polygon
+    # corner_radius: 1          # optional; rect and polygon. Rounding a pointed
+    #                           # corner pulls the edge in: this pentagon would
+    #                           # become 39.882 mm tall, and dimensions must say so.
   # shape: rect,      size: [60, 40], corner_radius: 3
   # shape: circle,    diameter: 40
   # shape: trapezoid, bottom: 60, top: 40, height: 30   # top_offset optional
