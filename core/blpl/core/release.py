@@ -448,6 +448,8 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
                 + [f"{cls} has no ground zone on {lay}"
                    for cls, lay in impedance.coplanar_without_ground(hdm, board)]
                 + impedance.pair_problems(hdm, board)
+                + [f"{cls} on {lay} has no plane on {ref} under it"
+                   for cls, lay, ref in impedance.missing_reference(hdm, board)]
             )
         except Exception as exc:  # an unreadable board cannot be vouched for
             return Step("impedance", False, f"could not read {pcb.name} to check controlled routing: {exc}",

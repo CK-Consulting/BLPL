@@ -589,8 +589,10 @@ def _pair_board(*segs):
 def test_a_pair_routed_at_its_gap_is_quiet_breakouts_and_all():
     # Centres 0.33 apart: 0.18 wide each, so 0.15 edge to edge. The short
     # stubs at the start are breakouts to the pads and are not measured.
+    pads = ('(footprint "J1" (at 0 0) (pad "1" smd rect (at 0 0) (size 0.6 0.6) (net "USB_DP"))'
+            ' (pad "2" smd rect (at 0 1.5) (size 0.6 0.6) (net "USB_DM")))')
     board = _pair_board(_seg("USB_DP", 0, 0, 0.5, 0.5), _seg("USB_DP", 0.5, 0.5, 20.5, 0.5),
-                        _seg("USB_DM", 0, 1.5, 0.5, 0.83), _seg("USB_DM", 0.5, 0.83, 20.5, 0.83))
+                        _seg("USB_DM", 0, 1.5, 0.5, 0.83), _seg("USB_DM", 0.5, 0.83, 20.5, 0.83), pads)
     assert z.pair_problems(_PAIR_HDM, board) == []
 
 
@@ -728,8 +730,71 @@ def test_a_3_mm_hole_in_coplanar_ground_mid_run_is_found():
 
 def test_samples_know_how_far_they_are_from_the_ends_of_the_path():
     lines = [("N", "F.Cu", 0.2, (0, 0), (10, 0)), ("N", "B.Cu", 0.2, (10, 0), (20, 0))]
-    samples = z._samples("N", lines, [])
+    samples = z._samples("N", lines, [], [(0, 0, 0.3), (20, 0, 0.3)])
     # A via at x=10 joins the layers, so the middle is 10 mm from either end.
     mid = min(samples, key=lambda s: abs(s[1][0] - 10))
     assert mid[5] == pytest.approx(10, abs=0.2)
     assert min(s[5] for s in samples) == pytest.approx(0.125, abs=0.01)
+
+
+
+# --- ends at pads, and a plane under the trace (Codex, PR #31) -----------------------
+
+
+def test_only_a_dead_end_on_a_pad_is_a_breakout():
+    """A dead end anywhere else is a stub off the run, checked like the run."""
+    lines = [("N", "F.Cu", 0.2, (0, 0), (20, 0)), ("N", "F.Cu", 0.2, (10, 0), (10, 3))]
+    with_pads = z._samples("N", lines, [], [(0, 0, 0.3), (20, 0, 0.3)])
+    stub = [s for s in with_pads if s[1][0] == pytest.approx(10) and s[1][1] > 0]
+    assert stub and min(s[5] for s in stub) > 9          # 10 mm from a pad, not 0
+    rotated = ('(kicad_pcb (footprint "U1" (at 10 10 90) '
+               '(pad "1" smd rect (at 2 0) (size 0.5 0.5) (net "N"))))')
+    from blpl.emitter import sexpr
+    # +90 deg sends local (2, 0) to (0, -2): the pad is at (10, 8).
+    assert z._pads(sexpr.parse(rotated))["N"] == [(pytest.approx(10), pytest.approx(8), 0.25)]
+
+
+def test_a_stub_off_a_pair_is_not_excused_as_a_breakout():
+    pads = ('(footprint "J1" (at 0 0) (pad "1" smd rect (at 0 0) (size 0.6 0.6) (net "USB_DP"))'
+            ' (pad "2" smd rect (at 0 0.33) (size 0.6 0.6) (net "USB_DM"))'
+            ' (pad "3" smd rect (at 30 0) (size 0.6 0.6) (net "USB_DP"))'
+            ' (pad "4" smd rect (at 30 0.33) (size 0.6 0.6) (net "USB_DM")))')
+    board = _pair_board(_seg("USB_DP", 0, 0, 30, 0), _seg("USB_DM", 0, 0.33, 30, 0.33),
+                        _seg("USB_DP", 15, 0, 15, -3), pads)
+    # The stub is 0.3–3 mm from USB_DM, inside the search radius, so it reads as
+    # the wrong gap; either way it is reported, where before it was excused.
+    problems = z.pair_problems(_PAIR_HDM, board)
+    assert any(p.startswith("USB_DP") and "F.Cu" in p for p in problems)
+    unstubbed = _pair_board(_seg("USB_DP", 0, 0, 30, 0), _seg("USB_DM", 0, 0.33, 30, 0.33), pads)
+    assert z.pair_problems(_PAIR_HDM, unstubbed) == []
+
+
+def test_a_controlled_trace_needs_a_filled_plane_on_its_reference_layer():
+    from blpl.emitter import sexpr
+
+    hdm = {"project": {"stackup": {"layers": 4}},
+           "net_classes": {"RF": {"trace_width": 0.35, "impedance": {"ohms": 50, "layers": ["F.Cu"]}}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}}
+    seg = '(segment (start 0 0) (end 20 0) (width 0.35) (layer "F.Cu") (net "ANT"))'
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg})")) == [("RF", "F.Cu", "In1.Cu")]
+    # A power plane is a reference too.
+    plane = _filled('(net "VCC_3V3")', "In1.Cu", (-5, -5, 25, 5))
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {plane})")) == []
+    # A plane on the wrong layer is not under the trace.
+    wrong = _filled('(net "GND")', "B.Cu", (-5, -5, 25, 5))
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {wrong})")) == [("RF", "F.Cu", "In1.Cu")]
+    # A class can name its own reference.
+    hdm["net_classes"]["RF"]["impedance"]["reference"] = ["B.Cu"]
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {wrong})")) == []
+
+
+def test_an_inner_trace_needs_planes_on_both_sides():
+    assert z.copper_order(4) == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+    from blpl.emitter import sexpr
+
+    hdm = {"project": {"stackup": {"layers": 4}},
+           "net_classes": {"RF": {"trace_width": 0.15, "impedance": {"ohms": 50, "layers": ["In1.Cu"]}}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}}
+    seg = '(segment (start 0 0) (end 20 0) (width 0.15) (layer "In1.Cu") (net "ANT"))'
+    top = _filled('(net "GND")', "F.Cu", (-5, -5, 25, 5))
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {top})")) == [("RF", "In1.Cu", "In2.Cu")]

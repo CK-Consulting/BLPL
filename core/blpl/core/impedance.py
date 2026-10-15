@@ -73,6 +73,10 @@ class Spec:
     #: layer's height above its reference; on another layer it is another
     #: impedance. Empty means not stated.
     layers: tuple[str, ...] = ()
+    #: The plane layers the width was calculated against. Empty means the
+    #: layers next to the routed one: one for an outer layer, both for an
+    #: inner (stripline) one.
+    reference: tuple[str, ...] = ()
 
     def same_target(self, other: "Spec") -> bool:
         return abs(self.ohms - other.ohms) < 1e-6 and self.mode == other.mode
@@ -93,6 +97,8 @@ class Spec:
                                "tolerance_pct": _num(self.tolerance_pct)}
         if self.layers:
             out["layers"] = list(self.layers)
+        if self.reference:
+            out["reference"] = list(self.reference)
         return out
 
     @property
@@ -126,8 +132,16 @@ def parse(raw: Any, where: str) -> Spec | None:
                 isinstance(x, str) and _COPPER.match(x) for x in layers):
             raise ImpedanceConfigError(
                 f"{where}.layers must be copper layer names such as F.Cu, In1.Cu, B.Cu")
+        reference = raw.get("reference", [])
+        if isinstance(reference, str):
+            reference = [reference]
+        if not isinstance(reference, list) or not all(
+                isinstance(x, str) and _COPPER.match(x) for x in reference):
+            raise ImpedanceConfigError(
+                f"{where}.reference must be copper layer names such as In1.Cu")
         return Spec(ohms=_ohms(raw.get("ohms", DEFAULT_OHMS), f"{where}.ohms"),
-                    mode=mode, tolerance_pct=float(tol), layers=tuple(layers))
+                    mode=mode, tolerance_pct=float(tol), layers=tuple(layers),
+                    reference=tuple(reference))
     raise ImpedanceConfigError(f"{where} must be true, a number of ohms, or a mapping")
 
 
@@ -645,16 +659,54 @@ _COUPLED_SEARCH_MM = 5.0
 _GAP_SLACK_MM = 0.01
 
 
-def _samples(net: str, lines: list, arcs: list) -> list[tuple[str, tuple, tuple, float, float, float]]:
+def _pads(pcb: list) -> dict[str, list[tuple[float, float, float]]]:
+    """(x, y, reach) of every pad, by net, in board coordinates.
+
+    A footprint's pads are stored relative to it; the footprint's own rotation
+    maps a local (dx, dy) to (dy, -dx) at +90 deg, the mapping placement
+    measured with pcbnew. ``reach`` is half the pad's larger side: a trace ending
+    within it ends on the pad.
+    """
+    import math
+
+    from blpl.emitter import sexpr
+
+    ordinals = {str(n[1]): sexpr.unquote(str(n[2])) for n in sexpr.find_all(pcb, "net")
+                if len(n) >= 3}
+    out: dict[str, list[tuple[float, float, float]]] = {}
+    for fp in sexpr.find_all(pcb, "footprint"):
+        at = sexpr.find(fp, "at")
+        try:
+            fx, fy = float(at[1]), float(at[2])
+            rot = math.radians(float(at[3])) if len(at) > 3 else 0.0
+        except (TypeError, IndexError, ValueError):
+            continue
+        c, sn = math.cos(rot), math.sin(rot)
+        for pad in sexpr.find_all(fp, "pad"):
+            pat, net, size = sexpr.find(pad, "at"), sexpr.find(pad, "net"), sexpr.find(pad, "size")
+            if pat is None or net is None or len(net) < 2:
+                continue
+            tok = str(net[-1]) if len(net) > 2 else str(net[1])
+            name = sexpr.unquote(tok) if tok.startswith('"') else ordinals.get(tok, tok)
+            try:
+                px, py = float(pat[1]), float(pat[2])
+                reach = max(float(size[1]), float(size[2])) / 2 if size is not None else 0.5
+            except (TypeError, IndexError, ValueError):
+                continue
+            out.setdefault(name, []).append((fx + px * c + py * sn, fy - px * sn + py * c, reach))
+    return out
+
+
+def _samples(net: str, lines: list, arcs: list, pads: list | None = None) -> list[tuple[str, tuple, tuple, float, float, float]]:
     """(layer, point, unit normal, width, length it stands for, distance from the
     nearest end of the routed path) along a net's path, segments and arcs alike.
 
     The path is a graph: a node is a trace end, keyed by position alone so a via
-    joins the layers it connects, and a path end is a node only one trace
-    reaches — where the net meets a pad. Distance from an end is measured along
-    the copper, so only the true breakout at each end is close to one; a
-    stretch in the middle of a long run is not, however the run folds
-    (Codex, PR #31).
+    joins the layers it connects. A path end is a node only one trace reaches
+    *and* that lies on a pad of this net (``pads``). A dead end anywhere else is
+    a stub branching off the run, not a breakout, and gets no allowance
+    (Codex, PR #31). Distance from an end is measured along the copper, so only
+    the true breakout at each end is close to one.
     """
     import heapq
     import math
@@ -697,7 +749,8 @@ def _samples(net: str, lines: list, arcs: list) -> list[tuple[str, tuple, tuple,
     for _lay, _w, u, v, length, _pt, _n in elements:
         adj.setdefault(u, []).append((v, length))
         adj.setdefault(v, []).append((u, length))
-    ends = [node for node, links in adj.items() if len(links) == 1]
+    ends = [node for node, links in adj.items() if len(links) == 1
+            and any(math.dist(node, (px, py)) <= reach + 0.01 for px, py, reach in (pads or []))]
     dist = {node: 0.0 for node in ends}
     heap = [(0.0, node) for node in ends]
     while heap:
@@ -754,9 +807,10 @@ def _distance_to_path(pt: tuple, lay: str, net: str, lines: list, arcs: list):
     return best
 
 
-def _filled_ground(pcb: list) -> dict[str, list[list[tuple[float, float]]]]:
-    """Filled ground copper per layer, in either net spelling. A zone never filled
-    has no ``filled_polygon`` and contributes nothing."""
+def _filled_ground(pcb: list, *, ground_only: bool = True) -> dict[str, list[list[tuple[float, float]]]]:
+    """Filled copper per layer, in either net spelling: ground only, or (for a
+    reference plane, which may be a power plane) any net. A zone never filled
+    has no ``filled_polygon`` and contributes nothing; a rule area has no net."""
     from blpl.emitter import sexpr
 
     ordinals = {str(n[1]): sexpr.unquote(str(n[2])) for n in sexpr.find_all(pcb, "net")
@@ -771,7 +825,7 @@ def _filled_ground(pcb: list) -> dict[str, list[list[tuple[float, float]]]]:
             name = sexpr.unquote(tok) if tok.startswith('"') else ordinals.get(tok, "")
         else:
             name = ""
-        if not name or not _GROUND.search(name):
+        if not name or (ground_only and not _GROUND.search(name)):
             continue
         for fp in sexpr.find_all(zone, "filled_polygon"):
             lay, pts = sexpr.find(fp, "layer"), sexpr.find(fp, "pts")
@@ -800,13 +854,14 @@ def coplanar_without_ground(hdm: dict, pcb: list) -> list[tuple[str, str]]:
     _, _, lines, arcs = _routed(pcb)
     ctl = _controlled(hdm)
     filled = _filled_ground(pcb)
+    pads = _pads(pcb)
     out = set()
     for net, (cls, rules, spec) in ctl.items():
         if spec.mode != "coplanar":
             continue
         gap = float(rules.get("coplanar_gap", 0))
         bare: dict[str, float] = {}
-        for lay, pt, nrm, w, step, from_end in _samples(net, lines, arcs):
+        for lay, pt, nrm, w, step, from_end in _samples(net, lines, arcs, pads.get(net)):
             if from_end <= _END_ALLOWANCE_MM:
                 continue              # where the trace meets its pad
             off = w / 2 + gap + 0.05
@@ -833,6 +888,7 @@ def pair_problems(hdm: dict, pcb: list) -> list[str]:
     from statistics import median
 
     segments, _, lines, arcs = _routed(pcb)
+    pads = _pads(pcb)
     ctl = _controlled(hdm)
     nets = hdm.get("nets") or {}
     done: set[frozenset[str]] = set()
@@ -853,7 +909,7 @@ def pair_problems(hdm: dict, pcb: list) -> list[str]:
         for me, other in ((a, b), (b, a)):
             apart: dict[str, float] = {}
             wrong: dict[str, list[tuple[float, float]]] = {}
-            for lay, pt, _nrm, w, step, from_end in _samples(me, lines, arcs):
+            for lay, pt, _nrm, w, step, from_end in _samples(me, lines, arcs, pads.get(me)):
                 if from_end <= _END_ALLOWANCE_MM:
                     continue          # breaking out to its pad
                 near = _distance_to_path(pt, lay, other, lines, arcs)
@@ -872,3 +928,50 @@ def pair_problems(hdm: dict, pcb: list) -> list[str]:
                 else:
                     out.append(f"{me} runs {lone:.1f} mm on {lay} with no {other} beside it")
     return sorted(set(out))
+
+
+def copper_order(copper: int) -> list[str]:
+    """The copper layers top to bottom for a board with ``copper`` of them."""
+    if copper <= 1:
+        return ["F.Cu"]
+    return ["F.Cu"] + [f"In{i}.Cu" for i in range(1, copper - 1)] + ["B.Cu"]
+
+
+def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
+    """(class, routed layer, reference layer) where a controlled trace has no
+    filled plane under it.
+
+    An impedance is a trace *over a plane*: the width was calculated for a
+    height above a reference, and over nothing the trace is not that impedance,
+    whatever its width, and the fab cannot fix it by adjusting one (Codex,
+    PR #31). Every sample of a controlled trace outside its breakouts must lie
+    over filled copper — of any net; a power plane is a reference too — on each
+    of its reference layers: the class's ``reference``, or the layers next to
+    the routed one (one for an outer layer, both for an inner one).
+    """
+    from .board_geometry import point_in_polygon
+
+    _, _, lines, arcs = _routed(pcb)
+    ctl = _controlled(hdm)
+    if not ctl:
+        return []
+    pads = _pads(pcb)
+    planes = _filled_ground(pcb, ground_only=False)
+    try:
+        copper = int(((hdm.get("project") or {}).get("stackup") or {}).get("layers") or 2)
+    except (TypeError, ValueError):
+        copper = 2
+    order = copper_order(copper)
+    out = set()
+    for net, (cls, _rules, spec) in ctl.items():
+        for lay, pt, _nrm, _w, _step, from_end in _samples(net, lines, arcs, pads.get(net)):
+            if from_end <= _END_ALLOWANCE_MM:
+                continue
+            refs = list(spec.reference)
+            if not refs and lay in order:
+                i = order.index(lay)
+                refs = [order[j] for j in (i - 1, i + 1) if 0 <= j < len(order)]
+            for ref in refs:
+                if not any(point_in_polygon(pt, poly) for poly in planes.get(ref, [])):
+                    out.add((cls, lay, ref))
+    return sorted(out)
