@@ -3,13 +3,15 @@
 Two writers change a board's shape — the board panel, through
 ``PUT /boards/{board}/config``, and the agent, through ``propose_board_shape``
 — and both have to agree with Stage 5 about what a valid file is. Stage 5's
-``ensure_project_config`` runs two checks: the JSON Schema, then
+``ensure_project_config`` runs three checks: the JSON Schema, then
 ``board_geometry.from_config``, which catches what a schema cannot say (a
 polygon that crosses itself, a corner radius bigger than its edge, a cutout
-that is really a notch, dimensions that disagree with the outline). The write
-path used to run only the first, so a file the form accepted could still stop
-the next build. ``errors`` runs both, in the same order, so a write refused
-here is exactly a load Stage 5 would refuse.
+that is really a notch, dimensions that disagree with the outline), then
+``impedance.tags``, which catches a controlled-impedance tag naming a class
+that does not exist or asking it for a different target. The write path used
+to run only the first, so a file the form accepted could still stop the next
+build. ``errors`` runs all three, in the same order, so a write refused here is
+exactly a load Stage 5 would refuse.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import copy
 
 import yaml
 
-from blpl.core import board_geometry
+from blpl.core import board_geometry, impedance
 from blpl.core import schema as hdm_schema
 
 HEADER = (
@@ -45,6 +47,13 @@ def errors(config: dict) -> list[str]:
     try:
         board_geometry.from_config(config)
     except board_geometry.BoardGeometryError as exc:
+        return [str(exc)]
+    # Stage 5 checks the tags after the geometry; a file that passed the
+    # schema and the outline but named a tag's class wrongly still stopped the
+    # next build, and the panel that wrote it had said "Saved".
+    try:
+        impedance.tags(config)
+    except impedance.ImpedanceConfigError as exc:
         return [str(exc)]
     return []
 
@@ -101,4 +110,38 @@ def with_shape(config: dict, *, outline=_UNSET, cutouts=_UNSET, keepouts=_UNSET)
         out["boundaries"] = boundaries
     else:
         out.pop("boundaries", None)
+    return out
+
+
+def with_impedance(config: dict, *, tags=_UNSET, classes=None) -> dict:
+    """``config`` with its controlled-impedance tags and class fields changed.
+
+    ``tags`` replaces the ``controlled_impedance`` list when given; an empty
+    list removes it. ``classes`` maps a net class to the fields to set on it,
+    merged into what is there so a class's clearance and vias survive a new
+    width; a field given as None is removed. A class that does not exist is
+    created from only what is given — not from Default, because a class
+    copied from Default carries Default's width, and that width is the one
+    thing Stage 8's ZC-001 exists to say is not an impedance.
+    """
+    out = copy.deepcopy(config)
+    if tags is not _UNSET:
+        if tags:
+            out["controlled_impedance"] = copy.deepcopy(list(tags))
+        else:
+            out.pop("controlled_impedance", None)
+    if classes:
+        net_classes = dict(out.get("net_classes") or {})
+        for name, fields in classes.items():
+            if fields is None:
+                net_classes.pop(name, None)
+                continue
+            merged = dict(net_classes.get(name) or {})
+            for k, v in fields.items():
+                if v is None:
+                    merged.pop(k, None)
+                else:
+                    merged[k] = copy.deepcopy(v)
+            net_classes[name] = merged
+        out["net_classes"] = net_classes
     return out

@@ -597,6 +597,34 @@ export type BoardFeature = BoardShape & {
   forbid?: string[];
 };
 
+export type ImpedanceMode = "single_ended" | "differential" | "coplanar";
+
+/** A class's impedance as project.yaml may spell it: true is 50 ohms
+ *  single-ended, a number is ohms, a mapping says all three. */
+export type Impedance =
+  | true
+  | number
+  | { ohms?: number; mode?: ImpedanceMode; tolerance_pct?: number };
+
+export type NetClass = {
+  trace_width?: number;
+  clearance?: number;
+  via_dia?: number;
+  via_drill?: number;
+  diff_pair_width?: number;
+  diff_pair_gap?: number;
+  impedance?: Impedance | false;
+  [k: string]: unknown;
+};
+
+export type ImpedanceTag = {
+  nets: string;
+  ohms?: number;
+  mode?: ImpedanceMode;
+  tolerance_pct?: number;
+  class?: string;
+};
+
 export type BoardConfig = {
   board: string;
   exists: boolean;
@@ -617,6 +645,9 @@ export type BoardConfig = {
       keepouts?: BoardFeature[];
       [k: string]: unknown;
     };
+    net_classes?: Record<string, NetClass>;
+    /** Which nets need controlled impedance, by name. */
+    controlled_impedance?: ImpedanceTag[];
     [k: string]: unknown;
   };
   /** The pipeline's own schema, so the form's fields cannot drift from it. */

@@ -370,3 +370,206 @@ describe("edits that are not saved", () => {
     expect(screen.queryByText(/Unsaved changes/)).toBeNull();
   });
 });
+
+describe("controlled impedance, as fields", () => {
+  /**
+   * Impedance used to be editable only in project.yaml, and the mistake it
+   * exists to catch — a class claiming 50 ohms at the Default width — was
+   * reported only by Stage 8, after a full build.
+   */
+  const IMPEDANCE = {
+    ...CONFIG,
+    config: {
+      ...CONFIG.config,
+      net_classes: {
+        Default: { trace_width: 0.15, clearance: 0.15 },
+        Power: { trace_width: 0.5 },
+        RF_50Ohm: { trace_width: 0.29, clearance: 0.2 },
+      },
+    },
+  };
+
+  function stubWith(
+    config: Record<string, unknown>,
+    opts: { review?: unknown; onPut?: (body: any) => Response } = {},
+  ) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (init?.method === "PUT") {
+          return opts.onPut
+            ? opts.onPut(JSON.parse(String(init.body)))
+            : new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        if (String(url).includes("/artifacts/")) {
+          return opts.review
+            ? new Response(JSON.stringify(opts.review), { status: 200 })
+            : new Response(JSON.stringify({ detail: "no artifact" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({ ...IMPEDANCE, config }), { status: 200 });
+      }),
+    );
+  }
+
+  const capture = () => {
+    const box: { sent: any } = { sent: null };
+    const onPut = (body: any) => {
+      box.sent = body;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+    return { box, onPut };
+  };
+
+  it("writes a class's impedance the way a person would", async () => {
+    const { box, onPut } = capture();
+    stubWith(IMPEDANCE.config, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByLabelText("RF_50Ohm controlled impedance"));
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    // `true` is 50 ohms single-ended: nothing more needs saying.
+    expect(box.sent.config.net_classes.RF_50Ohm).toEqual({
+      trace_width: 0.29,
+      clearance: 0.2,
+      impedance: true,
+    });
+  });
+
+  it("writes a differential target with its gap", async () => {
+    const { box, onPut } = capture();
+    stubWith(
+      { ...IMPEDANCE.config, net_classes: { Default: {}, USB: { trace_width: 0.18, impedance: true } } },
+      { onPut },
+    );
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.change(await screen.findByLabelText("USB ohms"), { target: { value: "90" } });
+    fireEvent.change(screen.getByLabelText("USB mode"), { target: { value: "differential" } });
+    fireEvent.change(screen.getByLabelText("USB pair gap"), { target: { value: "0.15" } });
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.net_classes.USB).toEqual({
+      trace_width: 0.18,
+      impedance: { ohms: 90, mode: "differential" },
+      diff_pair_gap: 0.15,
+    });
+  });
+
+  it("says before a build that a class with no width is not its impedance", async () => {
+    stubWith({ ...IMPEDANCE.config, net_classes: { Default: {}, Z: { impedance: { ohms: 90, mode: "differential" } } } });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    expect(await screen.findByText(/ZC-001: no trace width/)).toBeInTheDocument();
+    expect(screen.getByText(/ZC-002: a differential class with no pair gap/)).toBeInTheDocument();
+  });
+
+  it("adds a tag, and says which class it will land on", async () => {
+    const { box, onPut } = capture();
+    stubWith(IMPEDANCE.config, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByText("Add impedance tag"));
+    fireEvent.change(screen.getByLabelText("Tag 1 nets"), { target: { value: "^ANT_" } });
+    // No class declares 50 ohms yet, so Stage 5 will make one at Default's width.
+    expect(screen.getByText(/Stage 5 makes Z50_SE/)).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("RF_50Ohm controlled impedance"));
+    expect(screen.getByText("Lands on RF_50Ohm.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    // Defaults left unsaid, as by hand.
+    expect(box.sent.config.controlled_impedance).toEqual([{ nets: "^ANT_" }]);
+  });
+
+  it("takes a tag's target from the class it names", async () => {
+    const { box, onPut } = capture();
+    const config = {
+      ...IMPEDANCE.config,
+      net_classes: {
+        Default: {},
+        USB: { trace_width: 0.18, diff_pair_gap: 0.15, impedance: { ohms: 90, mode: "differential" } },
+      },
+      controlled_impedance: [{ nets: "^USB_D", ohms: 50 }],
+    };
+    stubWith(config, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.change(await screen.findByLabelText("Tag 1 class"), { target: { value: "USB" } });
+    // Shown, not editable: a second place to say it is a second place to disagree.
+    expect(screen.getByLabelText("Tag 1 ohms")).toHaveValue(90);
+    expect(screen.getByLabelText("Tag 1 ohms")).toHaveAttribute("readonly");
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.controlled_impedance).toEqual([{ nets: "^USB_D", class: "USB" }]);
+  });
+
+  it("removing the last tag removes the list", async () => {
+    const { box, onPut } = capture();
+    stubWith({ ...IMPEDANCE.config, controlled_impedance: [{ nets: "^ANT_" }] }, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByText("Remove tag"));
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect("controlled_impedance" in box.sent.config).toBe(false);
+  });
+
+  it("shows Stage 5's refusal on the tag it is about", async () => {
+    const msg = "controlled_impedance[0].class 'Power' declares no impedance; add `impedance:` to it";
+    stubWith(
+      { ...IMPEDANCE.config, controlled_impedance: [{ nets: "^RF", class: "Power" }] },
+      {
+        onPut: () =>
+          new Response(JSON.stringify({ detail: { errors: [msg] } }), { status: 422 }),
+      },
+    );
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByText("Save board config"));
+    const shown = await screen.findByText(msg);
+    // On the row, beside the field that caused it.
+    expect(shown.closest(".board-feature")).toContainElement(screen.getByLabelText("Tag 1 nets"));
+    expect(screen.getByRole("alert")).toHaveTextContent("1 more beside");
+  });
+
+  it("puts the last Stage 8 run's impedance findings beside their class", async () => {
+    stubWith(IMPEDANCE.config, {
+      review: {
+        design_issues: [
+          {
+            source: "impedance",
+            rule_id: "ZC-004",
+            severity: "warning",
+            summary: "Net class RF_50Ohm is named for 50 Ω but declares no impedance, so nothing checks its width.",
+            recommendation: "Add `impedance: 50` to net_classes.RF_50Ohm.",
+          },
+          {
+            source: "impedance",
+            rule_id: "ZC-003",
+            severity: "warning",
+            summary: "2 net(s) need a differential impedance but have no pair partner on this board.",
+          },
+          { source: "schematic", rule_id: "ERC-1", severity: "error", summary: "not ours" },
+        ],
+      },
+    });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    const zc4 = await screen.findByText(/is named for 50 Ω/);
+    expect(zc4.closest(".board-feature")).toContainElement(
+      screen.getByLabelText("RF_50Ohm controlled impedance"),
+    );
+    expect(screen.getByText(/no pair partner/)).toBeInTheDocument();
+    expect(screen.getByText(/From the last Stage 8 review/)).toBeInTheDocument();
+    expect(screen.queryByText("not ours")).toBeNull();
+  });
+
+  it("adds a net class, and refuses a name already taken", async () => {
+    const { box, onPut } = capture();
+    stubWith(IMPEDANCE.config, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    const name = await screen.findByLabelText("New net class name");
+    fireEvent.change(name, { target: { value: "Power" } });
+    expect(screen.getByText("Add net class")).toBeDisabled();
+    fireEvent.change(name, { target: { value: "USB2_Diff_90Ohm" } });
+    fireEvent.click(screen.getByText("Add net class"));
+    fireEvent.change(screen.getByLabelText("USB2_Diff_90Ohm trace width"), { target: { value: "0.18" } });
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.net_classes.USB2_Diff_90Ohm).toEqual({ trace_width: 0.18 });
+    expect(box.sent.config.net_classes.Power).toEqual({ trace_width: 0.5 });
+  });
+});

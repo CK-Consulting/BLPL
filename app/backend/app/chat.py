@@ -118,7 +118,11 @@ the project, including a board's own directory such as core/core.md); the user s
 your change as a diff and accepts or rejects it. Propose the complete new file \
 content, not a fragment. Say in the rationale what you changed and why. For a \
 board's outline, cutouts or keepouts use propose_board_shape instead: it keeps \
-project.dimensions equal to the outline, which Stage 5 requires.
+project.dimensions equal to the outline, which Stage 5 requires. For which nets \
+need controlled impedance (RF feeds, USB, MIPI, Ethernet pairs) and the net-class \
+impedance, width and gap behind it, use propose_controlled_impedance; the \
+hardware-design skill has the syntax. Never make up a width or gap for an \
+impedance — ask for the fab's stackup calculator result.
 - When the user is deciding something — which part, which pinout, whether a \
 warning matters — walk them through the evidence you actually read, quoting the \
 specific line or row. Do not guess an MPN or a footprint; if the design does not \
@@ -1420,7 +1424,8 @@ class ChatSessionManager:
 # Tools whose result is a proposal the user must review. propose_board_shape
 # writes the same kind of proposal as propose_file_edit; without it here its
 # proposals were created but never shown as a card, so nobody could accept them.
-_PROPOSING_TOOLS = frozenset({"propose_file_edit", "propose_board_shape"})
+_PROPOSING_TOOLS = frozenset(
+    {"propose_file_edit", "propose_board_shape", "propose_controlled_impedance"})
 
 
 def _proposal_id_in(text: str) -> str | None:
