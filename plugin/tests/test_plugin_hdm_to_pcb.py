@@ -106,6 +106,82 @@ class _FakeShape:
     def SetWidth(self, w) -> None:
         self.width = w
 
+    def SetArcGeometry(self, start, mid, end) -> None:
+        self.start, self.mid, self.end = start, mid, end
+
+    def SetCenter(self, v) -> None:
+        self.center = v
+
+
+# Layer numbers as a four-layer board's GetLayerID would give them.
+_LAYER_IDS = {"F.Cu": 0, "In1.Cu": 4, "In2.Cu": 6, "B.Cu": 2, "F.SilkS": 9}
+_ALL_CU_IDS = {0, 4, 6, 2}
+
+
+class _FakeLayerSet:
+
+    def __init__(self) -> None:
+        self.layers: set = set()
+
+    @classmethod
+    def AllCuMask(cls) -> "_FakeLayerSet":
+        out = cls()
+        out.layers = set(_ALL_CU_IDS)
+        return out
+
+    def AddLayer(self, layer) -> None:
+        self.layers.add(layer)
+
+    def AddLayerSet(self, other) -> None:
+        self.layers |= other.layers
+
+
+class _FakeOutline:
+    def __init__(self) -> None:
+        self.outlines: list[list] = []
+
+    def NewOutline(self) -> None:
+        self.outlines.append([])
+
+    def Append(self, x: int, y: int) -> None:
+        self.outlines[-1].append((x, y))
+
+
+class _FakeZone:
+    def __init__(self, _board) -> None:
+        self.rule_area = False
+        self.layer_set = None
+        self.forbids: dict[str, bool] = {}
+        self.name = ""
+        self._outline = _FakeOutline()
+
+    def SetIsRuleArea(self, v: bool) -> None:
+        self.rule_area = v
+
+    def SetLayerSet(self, lset) -> None:
+        self.layer_set = lset
+
+    def SetDoNotAllowTracks(self, v: bool) -> None:
+        self.forbids["tracks"] = v
+
+    def SetDoNotAllowVias(self, v: bool) -> None:
+        self.forbids["vias"] = v
+
+    def SetDoNotAllowPads(self, v: bool) -> None:
+        self.forbids["pads"] = v
+
+    def SetDoNotAllowFootprints(self, v: bool) -> None:
+        self.forbids["footprints"] = v
+
+    def SetDoNotAllowZoneFills(self, v: bool) -> None:
+        self.forbids["copperpour"] = v
+
+    def SetZoneName(self, name: str) -> None:
+        self.name = name
+
+    def Outline(self) -> _FakeOutline:
+        return self._outline
+
 
 class _FakeNet:
     def __init__(self, _board, name: str) -> None:
@@ -115,9 +191,25 @@ class _FakeNet:
 class _FakeBoard:
     def __init__(self) -> None:
         self.items: list = []
+        # A fresh pcbnew BOARD has two copper layers.
+        self.copper_layers = 2
+
+    def SetCopperLayerCount(self, n: int) -> None:
+        self.copper_layers = n
+
+    def GetCopperLayerCount(self) -> int:
+        return self.copper_layers
+
+    def IsLayerEnabled(self, layer_id: int) -> bool:
+        inner = {_LAYER_IDS["In1.Cu"], _LAYER_IDS["In2.Cu"]}
+        return layer_id not in inner or self.copper_layers >= 4
 
     def Add(self, item) -> None:
         self.items.append(item)
+
+    def GetLayerID(self, name: str) -> int:
+        # Negative for a name the board does not have, as the real call does.
+        return _LAYER_IDS.get(name, -1)
 
 
 class _FakeVector2I:
@@ -141,9 +233,14 @@ def _make_fake_pcbnew(footprint_lookup: dict[tuple[str, str], _FakeFootprint]) -
         FootprintLoad=_footprint_load,
         NETINFO_ITEM=_FakeNet,
         PCB_SHAPE=_FakeShape,
+        ZONE=_FakeZone,
+        LSET=_FakeLayerSet,
+        IsCopperLayer=lambda layer_id: layer_id in _ALL_CU_IDS,
         VECTOR2I=_FakeVector2I,
         Edge_Cuts="Edge.Cuts",
         SHAPE_T_SEGMENT="SEGMENT",
+        SHAPE_T_ARC="ARC",
+        SHAPE_T_CIRCLE="CIRCLE",
     )
 
 
@@ -251,6 +348,164 @@ def test_build_board_honours_bottom_side_placement_by_flipping() -> None:
         hdm, footprints_root=_FOOTPRINTS_ROOT, pcbnew_module=fake_pcbnew
     )
     assert fake_fp.flipped is True
+
+
+def _nm(x_mm: float, y_mm: float) -> _FakeVector2I:
+    """Board-local mm to the sheet-absolute nm the plugin draws at."""
+    return _FakeVector2I(round((x_mm + 12.5) * 1_000_000), round((y_mm + 12.5) * 1_000_000))
+
+
+def _shaped_hdm() -> dict:
+    """A 40×30 board with two rounded corners, a round cutout and an antenna keepout.
+
+    Shaped the way core Stage 5 writes ``board_geometry`` (``as_record``):
+    board-local mm, arcs as start/mid/end, a circle as centre plus radius.
+    """
+    hdm = _minimal_hdm()
+    hdm["project"]["dimensions"] = [40, 30]
+    hdm["board_geometry"] = {
+        "outline": {
+            "declared": True,
+            "segments": [
+                {"kind": "line", "points": [[2, 0], [38, 0]]},
+                {"kind": "arc", "points": [[38, 0], [39.414214, 0.585786], [40, 2]]},
+                {"kind": "line", "points": [[40, 2], [40, 30]]},
+                {"kind": "line", "points": [[40, 30], [0, 30]]},
+                {"kind": "line", "points": [[0, 30], [0, 2]]},
+                {"kind": "arc", "points": [[0, 2], [0.585786, 0.585786], [2, 0]]},
+            ],
+            "polygon": [[2, 0], [38, 0], [40, 2], [40, 30], [0, 30], [0, 2]],
+        },
+        "features": [
+            {
+                "kind": "cutout",
+                "where": "boundaries.cutouts[0]",
+                "polygon": [[11.5, 10], [10, 11.5], [8.5, 10], [10, 8.5]],
+                "segments": [{"kind": "circle", "points": [[10, 10]], "radius": 1.5}],
+            },
+            {
+                "kind": "keepout",
+                "where": "boundaries.keepouts[0]",
+                "name": "ANT",
+                "anchor": "J1",
+                "layers": ["*.Cu"],
+                "forbid": ["tracks", "copperpour"],
+                "polygon": [[20, 5], [30, 5], [30, 15], [20, 15]],
+                "segments": [],
+            },
+        ],
+    }
+    return hdm
+
+
+def _build(hdm: dict):
+    return hdm_to_pcb.build_board(
+        hdm, footprints_root=_FOOTPRINTS_ROOT, pcbnew_module=_make_fake_pcbnew({})
+    )
+
+
+def test_board_geometry_outline_keeps_arcs_as_arcs() -> None:
+    board, report = _build(_shaped_hdm())
+    shapes = [it for it in board.items if isinstance(it, _FakeShape)]
+    # Six outline segments plus the cutout's one circle.
+    assert report.edge_cut_segments == 7 == len(shapes)
+    assert [s.shape for s in shapes[:6]] == ["SEGMENT", "ARC", "SEGMENT", "SEGMENT", "SEGMENT", "ARC"]
+    arc = shapes[1]
+    assert (arc.start, arc.mid, arc.end) == (_nm(38, 0), _nm(39.414214, 0.585786), _nm(40, 2))
+    assert all(s.layer == "Edge.Cuts" for s in shapes)
+    assert all(s.width == 50_000 for s in shapes)
+
+
+def test_board_geometry_outline_is_closed() -> None:
+    """Each segment starts where the last ended — an open outline fails DRC."""
+    board, _report = _build(_shaped_hdm())
+    outline = [it for it in board.items if isinstance(it, _FakeShape)][:6]
+    for prev, cur in zip(outline, outline[1:] + outline[:1]):
+        assert prev.end == cur.start
+
+
+def test_board_geometry_cutout_circle_is_centre_and_radius() -> None:
+    board, _report = _build(_shaped_hdm())
+    circle = [it for it in board.items if isinstance(it, _FakeShape)][6]
+    assert circle.shape == "CIRCLE"
+    assert circle.center == _nm(10, 10)
+    assert circle.end == _nm(11.5, 10)
+
+
+def test_board_geometry_keepout_becomes_rule_area_with_its_forbids() -> None:
+    board, report = _build(_shaped_hdm())
+    zones = [it for it in board.items if isinstance(it, _FakeZone)]
+    assert report.keepout_zones == 1 == len(zones)
+    zone = zones[0]
+    assert zone.rule_area is True
+    assert zone.name == "ANT"
+    assert zone.forbids == {
+        "tracks": True, "vias": False, "pads": False, "footprints": False, "copperpour": True,
+    }
+    assert zone.layer_set.layers == _ALL_CU_IDS
+    assert zone.Outline().outlines == [
+        [(p.x, p.y) for p in (_nm(20, 5), _nm(30, 5), _nm(30, 15), _nm(20, 15))]
+    ]
+
+
+def test_board_geometry_keepout_on_named_layers() -> None:
+    hdm = _shaped_hdm()
+    keepout = hdm["board_geometry"]["features"][1]
+    keepout["layers"] = ["F&B.Cu", "F.SilkS"]
+    board, _report = _build(hdm)
+    zone = next(it for it in board.items if isinstance(it, _FakeZone))
+    assert zone.layer_set.layers == {_LAYER_IDS[n] for n in ("F.Cu", "B.Cu", "F.SilkS")}
+
+
+def test_board_geometry_keepout_on_unknown_layer_is_refused() -> None:
+    """Dropping the layer would draw a keepout that guards less than asked."""
+    hdm = _shaped_hdm()
+    hdm["board_geometry"]["features"][1]["layers"] = ["In7.Cu"]
+    with pytest.raises(ValueError, match="In7.Cu"):
+        _build(hdm)
+
+
+def test_board_geometry_unknown_segment_kind_is_refused() -> None:
+    hdm = _shaped_hdm()
+    hdm["board_geometry"]["outline"]["segments"][0]["kind"] = "bezier"
+    with pytest.raises(ValueError, match="bezier"):
+        _build(hdm)
+
+
+def test_board_geometry_inner_layer_keepout_refused_on_two_layer_board() -> None:
+    """GetLayerID resolves In1.Cu on a two-layer board; the rule would guard nothing."""
+    hdm = _shaped_hdm()
+    hdm["board_geometry"]["features"][1]["layers"] = ["In1.Cu"]
+    with pytest.raises(ValueError, match="In1.Cu.*2-layer"):
+        _build(hdm)
+
+
+def test_board_geometry_inner_layer_keepout_follows_hdm_stackup() -> None:
+    hdm = _shaped_hdm()
+    hdm["project"]["stackup"] = {"layers": 4, "thickness": 1.6}
+    hdm["board_geometry"]["features"][1]["layers"] = ["In1.Cu"]
+    board, report = _build(hdm)
+    assert board.copper_layers == 4
+    assert report.keepout_zones == 1
+    zone = next(it for it in board.items if isinstance(it, _FakeZone))
+    assert zone.layer_set.layers == {_LAYER_IDS["In1.Cu"]}
+
+
+def test_board_geometry_refusal_adds_nothing_to_the_board() -> None:
+    """A late failure must not leave the outline's first segments on an open board."""
+    hdm = _shaped_hdm()
+    hdm["board_geometry"]["features"][1]["layers"] = ["In7.Cu"]
+    board = _FakeBoard()
+    with pytest.raises(ValueError):
+        hdm_to_pcb._add_board_geometry(board, hdm, _make_fake_pcbnew({}))
+    assert board.items == []
+
+
+def test_board_geometry_absent_falls_back_to_dimensions_rectangle() -> None:
+    board, report = _build(_minimal_hdm())
+    assert report.edge_cut_segments == 4
+    assert report.keepout_zones == 0
+    assert not [it for it in board.items if isinstance(it, _FakeZone)]
 
 
 # ---------------------------------------------------------------------------
