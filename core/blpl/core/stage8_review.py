@@ -270,12 +270,15 @@ class _Context:
         test_points: dict | None,
         lifecycle_reason: str | None,
         emitter_evidence: dict,
+        hinted: set[str] | None = None,
     ) -> None:
         self.pwr_flag_nets = pwr_flag_nets
         self.autoroute = autoroute or {}
         self.test_points = test_points or {}
         self.lifecycle_reason = lifecycle_reason
         self.emitter_evidence = emitter_evidence
+        #: Parts placed by an x/y hint, which the placer takes as given.
+        self.hinted = hinted or set()
         # rule_id -> the sentence that explains why it is excused this run.
         self.reasons: dict[str, str] = {}
 
@@ -320,6 +323,15 @@ def _classify(finding: dict, ctx: _Context) -> tuple[str, str | None]:
 
     if rule == "DS-001":
         return ctx.excuse("DS-001", "datasheet corpus is not synced by default.")
+
+    if rule == "KO-001":
+        # A part placed by an x/y hint is where someone said to put it; the
+        # placer does not second-guess hints. _board_geometry_check already
+        # reports it as the design's, and reporting it here as the emitter's
+        # too would gate the board on a choice the user made.
+        parts = set(finding.get("components") or [])
+        if parts and parts <= ctx.hinted:
+            return "design", None
 
     if rule in _EMITTER_RULES:
         owner, _ = _EMITTER_RULES[rule]
@@ -1053,6 +1065,8 @@ def run(
         test_points=test_points,
         lifecycle_reason=lifecycle_reason,
         emitter_evidence=emitter_evidence,
+        hinted=set(((hdm.get("synthesis") or {}).get("placement") or {})
+                   .get("hinted_positions") or []) if isinstance(hdm, dict) else set(),
     )
 
     # Partition every analyzer finding by provenance.

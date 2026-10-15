@@ -626,9 +626,57 @@ def _board_shapes(hdm: dict, width: float, height: float) -> list[sexpr.Node]:
     for feature in geom.get("features") or []:
         if feature.get("kind") == "cutout":
             out += _edge_cuts_shape(feature["segments"])
-        elif feature.get("kind") == "keepout":
+        elif feature.get("kind") == "keepout" and not feature.get("anchor"):
+            # Anchored keepouts go inside their footprint; see _anchored_keepouts.
             out.append(_keepout_zone(feature))
     return out
+
+
+def _anchored_keepouts(hdm: dict, refdes: str) -> list[sexpr.Node]:
+    """Keepouts anchored to ``refdes``, as zones owned by its footprint.
+
+    Owned by the footprint, not the board, because KiCad exempts a rule area's
+    own footprint from it and nothing else. An antenna keepout drawn at board
+    level over its module reported the module's own pads and footprint as
+    "items not allowed" — the keepout doing its job against the one part it
+    exists for. Inside the footprint it behaves like the keepout a stock RF
+    module footprint ships with.
+    """
+    geom = hdm.get("board_geometry")
+    if not isinstance(geom, dict):
+        return []
+    return [_keepout_zone(f) for f in geom.get("features") or []
+            if f.get("kind") == "keepout" and f.get("anchor") == refdes]
+
+
+def _place_footprint_zones(fp_node: sexpr.Node, sheet_x: float, sheet_y: float,
+                           rot: float) -> None:
+    """Move a library footprint's own zones from its frame to the board's.
+
+    A ``.kicad_mod`` stores a zone's outline relative to the footprint origin,
+    and a board file stores a footprint's zones in board coordinates — unlike
+    its pads and graphics, which stay local. Copying the library zone verbatim
+    therefore left it wherever its local numbers fell on the sheet: the
+    ESP-WROOM-02 antenna keepout loaded at (-14, -18)..(14, -7), off the sheet,
+    while the module sat at (42.5, 37.5), and its antenna had no keepout at all.
+
+    Same rotation mapping the placer measured with pcbnew: an orientation of
+    +90 deg sends a local (dx, dy) to (dy, -dx).
+    """
+    a = math.radians(rot)
+    c, sn = math.cos(a), math.sin(a)
+    for zone in fp_node:
+        if not (isinstance(zone, list) and zone and zone[0] == "zone"):
+            continue
+        for poly in zone:
+            if not (isinstance(poly, list) and poly and poly[0] in ("polygon", "filled_polygon")):
+                continue
+            pts = sexpr.find(poly, "pts")
+            for xy in (pts or [])[1:]:
+                if isinstance(xy, list) and xy and xy[0] == "xy":
+                    lx, ly = float(xy[1]), float(xy[2])
+                    xy[1] = _mm(sheet_x + lx * c + ly * sn)
+                    xy[2] = _mm(sheet_y - lx * sn + ly * c)
 
 
 def _in_notch(sheet_x: float, sheet_y: float) -> bool:
@@ -745,6 +793,8 @@ def build(
 
         _override_footprint_layer(fp_node, side)
         _override_footprint_position(fp_node, sheet_x, sheet_y, rot)
+        _place_footprint_zones(fp_node, sheet_x, sheet_y, rot)
+        fp_node.extend(_anchored_keepouts(hdm, refdes))
         _set_reference_and_value(fp_node, refdes, str(comp.get("value", refdes)))
         _replace_uuid(fp_node)
 
