@@ -545,6 +545,140 @@ def _edge_cuts_rect(width: float, height: float) -> list[sexpr.Node]:
     return segments
 
 
+def _mm(v: float) -> str:
+    """A coordinate as KiCad wants it: plain decimal, no exponent, no float noise."""
+    r = round(float(v), 6)
+    out = f"{r:.6f}".rstrip("0").rstrip(".")
+    return "0" if out in ("", "-0") else out
+
+
+def _sheet(p) -> tuple[str, str]:
+    return _mm(float(p[0]) + _ORIGIN_X), _mm(float(p[1]) + _ORIGIN_Y)
+
+
+def _edge_cuts_shape(segments: list[dict]) -> list[sexpr.Node]:
+    """Edge.Cuts graphics for one closed path from Stage 5's ``board_geometry``.
+
+    Arcs stay arcs and a circle stays a circle. Flattening them here would
+    give the fab a faceted edge it was never asked for, and give DRC a
+    polygon that is not the board the outline describes.
+    """
+    stroke = ["stroke", ["width", f"{_EDGE_CUTS_WIDTH}"], ["type", "solid"]]
+    out: list[sexpr.Node] = []
+    for seg in segments:
+        kind, pts = seg["kind"], seg["points"]
+        if kind == "line":
+            node = ["gr_line", ["start", *_sheet(pts[0])], ["end", *_sheet(pts[1])], stroke]
+        elif kind == "arc":
+            node = ["gr_arc", ["start", *_sheet(pts[0])], ["mid", *_sheet(pts[1])],
+                    ["end", *_sheet(pts[2])], stroke]
+        elif kind == "circle":
+            c = pts[0]
+            node = ["gr_circle", ["center", *_sheet(c)],
+                    ["end", *_sheet((float(c[0]) + float(seg["radius"]), c[1]))],
+                    stroke, ["fill", "no"]]
+        else:
+            raise ValueError(f"board_geometry segment of unknown kind {kind!r}")
+        out.append([*node, ["layer", '"Edge.Cuts"'], ["uuid", _new_uuid()]])
+    return out
+
+
+def _keepout_zone(feature: dict) -> sexpr.Node:
+    """A board-level rule area, laid out like the ones stock RF module footprints carry.
+
+    No net: a rule area has none, and leaving the field out is what the
+    footprint libraries do, so the file reads the same under KiCad 9 and 10
+    whichever net syntax each prefers.
+    """
+    forbid = set(feature.get("forbid") or ())
+    rules = [[k, "not_allowed" if k in forbid else "allowed"]
+             for k in ("tracks", "vias", "pads", "copperpour", "footprints")]
+    node: sexpr.Node = [
+        "zone",
+        ["layers", *[sexpr.quote(layer) for layer in feature.get("layers") or ["*.Cu"]]],
+        ["uuid", _new_uuid()],
+    ]
+    if feature.get("name"):
+        node.append(["name", sexpr.quote(str(feature["name"]))])
+    node += [
+        ["hatch", "edge", "0.5"],
+        ["connect_pads", ["clearance", "0"]],
+        ["min_thickness", "0.25"],
+        ["filled_areas_thickness", "no"],
+        ["keepout", *rules],
+        ["placement", ["enabled", "no"], ["sheetname", '""']],
+        ["fill", ["thermal_gap", "0.5"], ["thermal_bridge_width", "0.5"]],
+        ["polygon", ["pts", *[["xy", *_sheet(p)] for p in feature["polygon"]]]],
+    ]
+    return node
+
+
+def _board_shapes(hdm: dict, width: float, height: float) -> list[sexpr.Node]:
+    """Outline, cutouts and keepouts — from Stage 5's resolved geometry when present.
+
+    An HDM without ``board_geometry`` predates shaped outlines (or was written
+    by hand); it gets the rectangle its dimensions describe, as before.
+    """
+    geom = hdm.get("board_geometry")
+    if not isinstance(geom, dict):
+        return _edge_cuts_rect(width, height)
+    out = _edge_cuts_shape(geom["outline"]["segments"])
+    for feature in geom.get("features") or []:
+        if feature.get("kind") == "cutout":
+            out += _edge_cuts_shape(feature["segments"])
+        elif feature.get("kind") == "keepout" and not feature.get("anchor"):
+            # Anchored keepouts go inside their footprint; see _anchored_keepouts.
+            out.append(_keepout_zone(feature))
+    return out
+
+
+def _anchored_keepouts(hdm: dict, refdes: str) -> list[sexpr.Node]:
+    """Keepouts anchored to ``refdes``, as zones owned by its footprint.
+
+    Owned by the footprint, not the board, because KiCad exempts a rule area's
+    own footprint from it and nothing else. An antenna keepout drawn at board
+    level over its module reported the module's own pads and footprint as
+    "items not allowed" — the keepout doing its job against the one part it
+    exists for. Inside the footprint it behaves like the keepout a stock RF
+    module footprint ships with.
+    """
+    geom = hdm.get("board_geometry")
+    if not isinstance(geom, dict):
+        return []
+    return [_keepout_zone(f) for f in geom.get("features") or []
+            if f.get("kind") == "keepout" and f.get("anchor") == refdes]
+
+
+def _place_footprint_zones(fp_node: sexpr.Node, sheet_x: float, sheet_y: float,
+                           rot: float) -> None:
+    """Move a library footprint's own zones from its frame to the board's.
+
+    A ``.kicad_mod`` stores a zone's outline relative to the footprint origin,
+    and a board file stores a footprint's zones in board coordinates — unlike
+    its pads and graphics, which stay local. Copying the library zone verbatim
+    therefore left it wherever its local numbers fell on the sheet: the
+    ESP-WROOM-02 antenna keepout loaded at (-14, -18)..(14, -7), off the sheet,
+    while the module sat at (42.5, 37.5), and its antenna had no keepout at all.
+
+    Same rotation mapping the placer measured with pcbnew: an orientation of
+    +90 deg sends a local (dx, dy) to (dy, -dx).
+    """
+    a = math.radians(rot)
+    c, sn = math.cos(a), math.sin(a)
+    for zone in fp_node:
+        if not (isinstance(zone, list) and zone and zone[0] == "zone"):
+            continue
+        for poly in zone:
+            if not (isinstance(poly, list) and poly and poly[0] in ("polygon", "filled_polygon")):
+                continue
+            pts = sexpr.find(poly, "pts")
+            for xy in (pts or [])[1:]:
+                if isinstance(xy, list) and xy and xy[0] == "xy":
+                    lx, ly = float(xy[1]), float(xy[2])
+                    xy[1] = _mm(sheet_x + lx * c + ly * sn)
+                    xy[2] = _mm(sheet_y - lx * sn + ly * c)
+
+
 def _in_notch(sheet_x: float, sheet_y: float) -> bool:
     """True when (sheet_x, sheet_y) falls inside the title-block cutout."""
     return (
@@ -613,9 +747,9 @@ def build(
     for ordinal, name in net_table:
         node.append(["net", str(ordinal), sexpr.quote(name)])
 
-    # Board outline on Edge.Cuts.
-    for seg in _edge_cuts_rect(width, height):
-        node.append(seg)
+    # Board outline and cutouts on Edge.Cuts; keepouts as rule areas.
+    for shape in _board_shapes(hdm, width, height):
+        node.append(shape)
 
     # Footprints. A component with no loadable footprint used to be skipped
     # silently, so the board simply came out missing parts and nothing said so.
@@ -659,6 +793,8 @@ def build(
 
         _override_footprint_layer(fp_node, side)
         _override_footprint_position(fp_node, sheet_x, sheet_y, rot)
+        _place_footprint_zones(fp_node, sheet_x, sheet_y, rot)
+        fp_node.extend(_anchored_keepouts(hdm, refdes))
         _set_reference_and_value(fp_node, refdes, str(comp.get("value", refdes)))
         _replace_uuid(fp_node)
 

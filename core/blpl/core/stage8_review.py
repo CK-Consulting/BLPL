@@ -44,7 +44,7 @@ from pathlib import Path
 
 import yaml
 
-from . import schema
+from . import board_geometry, schema
 from .project_manifest import artifact_path
 
 _PIPELINE_ROOT = Path(__file__).resolve().parent.parent
@@ -59,9 +59,13 @@ _EMITTER_RULES: dict[str, tuple[str, str]] = {
         "power_out pin, so every externally-fed rail reads as undriven.",
     ),
     "KO-001": (
-        "emitter/pcb.py::_auto_grid_position",
-        "Component placed inside a keepout that project.yaml declares. The grid "
-        "placer does not read the keepout list it emits.",
+        "core/placement.py",
+        "Component inside a keepout. A keepout declared in project.yaml is one the "
+        "placer avoids, so that is a placer bug (the board_geometry check below says "
+        "which). A footprint's own rule area — the antenna keepout an RF module's "
+        "library footprint carries — is not modelled by the placer yet: declare it as "
+        "a boundaries.keepouts entry anchored to the module and the placer will keep "
+        "clear of it.",
     ),
     "SS-001": (
         "emitter/sch.py",
@@ -266,12 +270,15 @@ class _Context:
         test_points: dict | None,
         lifecycle_reason: str | None,
         emitter_evidence: dict,
+        hinted: set[str] | None = None,
     ) -> None:
         self.pwr_flag_nets = pwr_flag_nets
         self.autoroute = autoroute or {}
         self.test_points = test_points or {}
         self.lifecycle_reason = lifecycle_reason
         self.emitter_evidence = emitter_evidence
+        #: Parts placed by an x/y hint, which the placer takes as given.
+        self.hinted = hinted or set()
         # rule_id -> the sentence that explains why it is excused this run.
         self.reasons: dict[str, str] = {}
 
@@ -316,6 +323,15 @@ def _classify(finding: dict, ctx: _Context) -> tuple[str, str | None]:
 
     if rule == "DS-001":
         return ctx.excuse("DS-001", "datasheet corpus is not synced by default.")
+
+    if rule == "KO-001":
+        # A part placed by an x/y hint is where someone said to put it; the
+        # placer does not second-guess hints. _board_geometry_check already
+        # reports it as the design's, and reporting it here as the emitter's
+        # too would gate the board on a choice the user made.
+        parts = set(finding.get("components") or [])
+        if parts and parts <= ctx.hinted:
+            return "design", None
 
     if rule in _EMITTER_RULES:
         owner, _ = _EMITTER_RULES[rule]
@@ -578,6 +594,104 @@ def _emitter_crosschecks(
             )
 
     return checks
+
+
+def _board_geometry_check(hdm: dict) -> tuple[list[dict], list[dict]]:
+    """Every placed part against the board it was placed on: (emitter, design).
+
+    The placer refuses positions off the board or in a keepout, so on a part
+    it positioned itself either finding is a placer bug. A part placed by an
+    ``x``/``y`` hint is taken as given — someone wrote the hint knowing
+    something — and the same finding is then the design's to fix, in the hint.
+
+    kicad-happy's KO-001 sees the emitted board and nothing else; this sees
+    what Stage 5 meant, which is what separates those two cases. It also
+    reports what KO-001 cannot: a part outside a non-rectangular outline,
+    which no keepout describes.
+    """
+    geom = hdm.get("board_geometry") if isinstance(hdm, dict) else None
+    place = ((hdm.get("synthesis") or {}).get("placement") or {}) if isinstance(hdm, dict) else {}
+    boxes = place.get("boxes") or {}
+    if not isinstance(geom, dict):
+        return [], []
+    hinted = set(place.get("hinted_positions") or [])
+    outline = [tuple(p) for p in geom["outline"]["polygon"]]
+    blockers = [f for f in geom.get("features") or []
+                if f.get("kind") == "cutout"
+                or {"footprints", "pads"} & set(f.get("forbid") or [])]
+
+    off: dict[bool, list[str]] = {True: [], False: []}
+    inside: dict[bool, list[str]] = {True: [], False: []}
+    for ref, box in sorted(boxes.items()):
+        box = tuple(float(v) for v in box)
+        by_hint = ref in hinted
+        if not board_geometry.box_inside(box, outline):
+            off[by_hint].append(ref)
+        elif any(board_geometry.box_overlaps(box, [tuple(p) for p in f["polygon"]])
+                 for f in blockers if f.get("anchor") != ref):
+            # A part's own anchored shapes are exempt: a keepout under a
+            # module's antenna or a slot through its courtyard overlaps the
+            # module on purpose, and the placer allows exactly that.
+            inside[by_hint].append(ref)
+
+    emitter: list[dict] = []
+    design: list[dict] = []
+    for refs, by_hint, check, what in (
+        (off[False], False, "placed_off_board", "outside the board outline"),
+        (inside[False], False, "placed_in_keepout", "in a cutout or keepout"),
+        (off[True], True, "placed_off_board", "outside the board outline"),
+        (inside[True], True, "placed_in_keepout", "in a cutout or keepout"),
+    ):
+        if not refs:
+            continue
+        if by_hint:
+            design.append({
+                "source": "board_geometry",
+                "rule_id": check,
+                "severity": "error",
+                "summary": f"{len(refs)} part(s) placed by hint sit {what}: {_shown(refs)}",
+                "recommendation": "Move them in placement.hints, or move the shape in boundaries.",
+                "components": refs,
+                "nets": [],
+            })
+        else:
+            emitter.append({
+                "check": check,
+                "severity": "error",
+                "owner": "core/placement.py",
+                "components": refs,
+                "summary": f"{len(refs)} part(s) the placer positioned sit {what}: {_shown(refs)}",
+                "recommendation": (
+                    "The placer's fit test should have refused these positions; it and "
+                    "this check disagree about the board's shape."
+                ),
+            })
+
+    unresolved = geom.get("unresolved_anchors") or []
+    if unresolved:
+        design.append({
+            "source": "board_geometry",
+            "rule_id": "anchor_unplaced",
+            "severity": "warning",
+            "summary": (
+                f"Cutouts or keepouts anchored to {_shown(unresolved)} were not drawn: "
+                "their part could not be placed."
+            ),
+            "recommendation": "Place the part (see synthesis.placement.unplaced) and re-run.",
+            "components": list(unresolved),
+            "nets": [],
+        })
+    for note in geom.get("notes") or []:
+        design.append({
+            "source": "board_geometry",
+            "rule_id": "outline_ambiguous",
+            "severity": "warning",
+            "summary": note,
+            "recommendation": None,
+            "components": [],
+            "nets": [],
+        })
+    return emitter, design
 
 
 def pcb_count_lt(pcb: dict, bom_count: int) -> bool:
@@ -941,6 +1055,8 @@ def run(
 
     crosschecks = _stage1_crosscheck(design_artifact, bom)
     crosschecks += _emitter_crosschecks(bom, sch_json, pcb_json, hdm, project_dir, board)
+    geometry_emitter, geometry_design = _board_geometry_check(hdm)
+    crosschecks += geometry_emitter
     emitter_evidence = {c["check"]: True for c in crosschecks}
 
     ctx = _Context(
@@ -949,11 +1065,13 @@ def run(
         test_points=test_points,
         lifecycle_reason=lifecycle_reason,
         emitter_evidence=emitter_evidence,
+        hinted=set(((hdm.get("synthesis") or {}).get("placement") or {})
+                   .get("hinted_positions") or []) if isinstance(hdm, dict) else set(),
     )
 
     # Partition every analyzer finding by provenance.
     emitter_defects: list[dict] = list(crosschecks)
-    design_issues: list[dict] = []
+    design_issues: list[dict] = list(geometry_design)
     expected_counts: dict[str, int] = {}
 
     for source in ("schematic", "pcb", "cross", "emc", "spice"):

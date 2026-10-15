@@ -21,7 +21,7 @@ from typing import Any
 
 import yaml
 
-from . import placement, schema, symbol_resolution
+from . import board_geometry, placement, schema, symbol_resolution
 from . import stage4_synthesize_nets
 
 
@@ -132,6 +132,16 @@ def ensure_project_config(project_config_path: Path, project_id: str) -> dict:
                 f"Nothing was guessed and nothing was defaulted — fix the file and re-run. "
                 f"See schemas/project_config.v1.json for what each field accepts."
             )
+        # The schema can say a circle needs a diameter; it cannot say that a
+        # polygon crosses itself, that a corner radius is bigger than its edge,
+        # or that dimensions and outline describe two different boards. Those
+        # stop the run here too, for the same reason.
+        try:
+            board_geometry.from_config(config)
+        except board_geometry.BoardGeometryError as exc:
+            raise InvalidProjectConfigError(
+                f"{project_config_path} is not a valid project config:\n  {exc}"
+            ) from exc
         return config
     template_path = project_config_path.with_suffix(project_config_path.suffix + ".template")
     template_path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,10 +191,12 @@ def _place_components(
     *,
     project_dir: Path | None,
     stock_footprints_root: Path | None,
-) -> dict:
+) -> tuple[dict, dict]:
     """Replace the build-time grid with a real placement, and record what happened.
 
-    Returns a record rather than only mutating, because "every part is on the
+    Returns the placement record and the board geometry resolved against it
+    (anchored shapes in board coordinates). A record rather than only mutating,
+    because "every part is on the
     board" and "eleven parts did not fit" are both outcomes a later stage needs
     to be able to see. The grid's failure was that it could not express the
     second one: it always succeeded, and the overflow surfaced much later as a
@@ -195,10 +207,30 @@ def _place_components(
     origin, which looks like a different bug.
     """
     # No fallback: ensure_project_config has already guaranteed two positive
-    # numbers, so a default here could only mask a validator that stopped
-    # running.
-    dims = project_config["project"]["dimensions"]
-    board = (float(dims[0]), float(dims[1]))
+    # numbers and a buildable outline, so a default here could only mask a
+    # validator that stopped running.
+    board = board_geometry.from_config(project_config)
+    unknown = sorted({f.anchor for f in board.anchored} - set(components_out))
+    if unknown:
+        raise InvalidProjectConfigError(
+            f"boundaries anchors a shape to {', '.join(unknown)}, which is not a part on "
+            "this board. A shape anchored to nothing has nowhere to go."
+        )
+    hints = (project_config.get("placement") or {}).get("hints") or {}
+    flipped = sorted(
+        {f.anchor for f in board.anchored}
+        & {r for r, h in hints.items() if isinstance(h, dict)
+           and str(h.get("side", "top")).lower() == "bottom"}
+    )
+    if flipped:
+        # Checked here, before placement, so the message names the cause; see
+        # board_geometry.place_anchored for why it is refused at all.
+        raise InvalidProjectConfigError(
+            f"boundaries anchors shapes to {', '.join(flipped)}, which placement.hints "
+            "puts on the bottom side. The emitter does not mirror flipped footprints yet, "
+            "so an anchored shape would land on the wrong side of the part. Draw the "
+            "shape in board coordinates instead."
+        )
 
     roots: list[Path] = []
     if project_dir is not None and stock_footprints_root is not None:
@@ -207,18 +239,26 @@ def _place_components(
     elif stock_footprints_root is not None:
         roots = [Path(stock_footprints_root)]
 
-    hints = (project_config.get("placement") or {}).get("hints") or {}
-    result = placement.place(
-        components_out, nets_out, board, footprint_roots=roots, hints=hints
-    )
+    try:
+        result = placement.place(
+            components_out, nets_out, board, footprint_roots=roots, hints=hints
+        )
+    except board_geometry.BoardGeometryError as exc:
+        # Only a hinted part gets here: the placer checks the shapes of the
+        # parts it positions itself, and takes a hint as given.
+        raise InvalidProjectConfigError(
+            f"{exc}. The part is placed by a hint, which is taken as given — move it in "
+            "placement.hints."
+        ) from exc
     for ref, p in result.placements.items():
         if ref in components_out:
             components_out[ref]["placement"] = p.as_dict()
 
+    size = board.size
     record: dict[str, Any] = {
         "placed": len(result.placements),
         "unplaced": sorted(result.unplaced),
-        "board_mm": [board[0], board[1]],
+        "board_mm": [round(size[0], 3), round(size[1], 3)],
         "hinted": sorted(hints),
         "connection_length_mm": round(
             placement.total_connection_length(result.placements, nets_out), 1
@@ -228,7 +268,16 @@ def _place_components(
         record["reasons"] = dict(sorted(result.unplaced.items()))
     if result.notes:
         record["notes"] = result.notes
-    return record
+    # Box each part occupies, so Stage 8 can check placements against the
+    # board without loading every footprint again.
+    record["boxes"] = {
+        ref: [round(v, 3) for v in placement.occupied_box(result, ref)]
+        for ref in sorted(result.placements)
+    }
+    record["hinted_positions"] = sorted(
+        r for r, h in hints.items() if isinstance(h, dict) and "x" in h
+    )
+    return record, board_geometry.as_record(board)
 
 
 def _pin_map_for(
@@ -701,7 +750,7 @@ def emit(
     # off the bottom of the board — and a router handed parts that are not on
     # the board can do nothing with them. Done here, after test points, so that
     # synthesized parts are placed too.
-    place_record = _place_components(
+    place_record, geometry_record = _place_components(
         components_out, nets_out, project_config,
         project_dir=project_dir, stock_footprints_root=stock_footprints_root,
     )
@@ -716,6 +765,10 @@ def emit(
     # points because the policy said so" from "no test points because the
     # pipeline cannot make them".
     hdm["synthesis"] = {"test_points": tp_record, "placement": place_record}
+    # Resolved geometry, every shape in board coordinates. The emitter draws
+    # from this and not from boundaries, because an anchored cutout has a
+    # position only after the placement above.
+    hdm["board_geometry"] = geometry_record
     if class_notes:
         hdm["synthesis"]["net_class_notes"] = class_notes
     if not_placed:

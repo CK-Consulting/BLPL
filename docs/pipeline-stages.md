@@ -126,6 +126,63 @@ wherever dimensions were unreadable, so a typo in the board size produced a
 complete, plausible board of the wrong size. The web UI's Board tab writes the
 same file through the same validator.
 
+### Board shape, cutouts and keepouts
+
+`boundaries` in `project.yaml` describes the board's edge, holes through it and
+rule areas on it, all in one shape vocabulary (`core/blpl/core/board_geometry.py`):
+board millimetres, origin at the top-left, y pointing down.
+
+```yaml
+project:
+  dimensions: [60, 40]          # must equal the outline's bounding box
+boundaries:
+  board_outline:
+    shape: polygon              # rect | circle | polygon | trapezoid
+    points: [[0, 0], [60, 0], [60, 25], [30, 40], [0, 25]]
+    # corner_radius: 1          # optional; rect and polygon. Rounding a pointed
+    #                           # corner pulls the edge in: this pentagon would
+    #                           # become 39.882 mm tall, and dimensions must say so.
+  # shape: rect,      size: [60, 40], corner_radius: 3
+  # shape: circle,    diameter: 40
+  # shape: trapezoid, bottom: 60, top: 40, height: 30   # top_offset optional
+  cutouts:                      # holes and slots, wholly inside the outline
+    - shape: circle
+      center: [8, 8]
+      diameter: 3.2
+  keepouts:                     # rule areas; default every copper layer, everything forbidden
+    - anchor: U3                # in U3's footprint frame; follows it through placement
+      shape: rect
+      center: [0, -9]
+      size: [18, 7]
+      layers: [F.Cu, B.Cu]
+      forbid: [tracks, vias, pads, copperpour, footprints]
+placement:
+  hints:
+    U3: {edge: top}             # sit against this edge (rot says which way it faces)
+```
+
+A notch in the edge is part of the outline, so draw it in the polygon. A cutout
+that crosses the edge is refused. The placer keeps parts inside the outline and
+out of cutouts, and out of keepouts that forbid footprints or pads. An anchored
+shape is fixed once its part is placed. Stage 5 writes the resolved geometry to
+`hdm.board_geometry`, and the emitter draws it as `gr_line`/`gr_arc`/`gr_circle`
+on Edge.Cuts plus `zone` rule areas.
+
+The old `type: rect` with `start`/`end`, which `blpl init` still writes, was
+never read. `dimensions` still decides the board for it, and a stale one is
+reported rather than obeyed.
+
+An anchored keepout is emitted inside its part's footprint, like the antenna
+keepout a stock RF module footprint ships with, because KiCad exempts only a
+rule area's own footprint from it. KiCad still checks that footprint's *pads*
+against it, so an anchored keepout that forbids pads must not cover them.
+A `side: bottom` part cannot carry anchored shapes yet: the emitter does not
+mirror flipped footprints.
+
+A stock module's own keepout reaches KiCad's DRC, but the placer does not
+model it. To keep parts clear of it while placing, declare it as an anchored
+keepout too.
+
 `hdm.yaml` is the single source of truth for Stage 6. A human can read and edit it directly.
 
 Three things Stage 5 adds that no BOM row asked for:

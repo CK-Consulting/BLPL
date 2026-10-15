@@ -73,8 +73,10 @@
       "additionalProperties": true,
       "properties": {
         "board_outline": {
+          "description": "The board's edge. With 'shape' it is drawn, and project.dimensions must equal its bounding box. The legacy 'type: rect' form with start/end was never read; dimensions decides for it.",
           "type": "object",
           "additionalProperties": true,
+          "$ref": "#/$defs/shape",
           "properties": {
             "type": { "enum": ["rect", "polygon"] },
             "start": { "$ref": "#/$defs/point" },
@@ -83,7 +85,45 @@
             "width": { "type": "number", "exclusiveMinimum": 0 }
           }
         },
-        "keepouts": { "type": "array" },
+        "cutouts": {
+          "description": "Holes and slots through the board, wholly inside the outline. A notch in the edge belongs in board_outline instead.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["shape"],
+            "$ref": "#/$defs/shape",
+            "unevaluatedProperties": false,
+            "properties": {
+              "anchor": { "$ref": "#/$defs/anchor" },
+              "name": { "type": "string" }
+            }
+          }
+        },
+        "keepouts": {
+          "description": "Board-level rule areas. Default: every copper layer, everything forbidden.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["shape"],
+            "$ref": "#/$defs/shape",
+            "unevaluatedProperties": false,
+            "properties": {
+              "anchor": { "$ref": "#/$defs/anchor" },
+              "name": { "type": "string" },
+              "layers": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "forbid": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "enum": ["tracks", "vias", "pads", "copperpour", "footprints"] }
+              }
+            }
+          }
+        },
         "copper_zones": { "type": "array" }
       }
     },
@@ -122,6 +162,10 @@
                 "type": "string",
                 "minLength": 1,
                 "description": "Refdes to sit beside. Outranks both the netlist and the naming convention."
+              },
+              "edge": {
+                "enum": ["top", "bottom", "left", "right"],
+                "description": "Board edge this part sits against: a connector's mating side, a module's antenna end. rot says which way the part faces."
               }
             },
             "dependentRequired": { "x": ["y"], "y": ["x"] }
@@ -136,6 +180,51 @@
       "minItems": 2,
       "maxItems": 2,
       "items": { "type": "number" }
+    },
+    "anchor": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Refdes whose footprint frame the shape is in. The shape follows the part through placement."
+    },
+    "shape": {
+      "description": "One shape, in board-local mm: origin top-left, y down. Checked fully by core/blpl/core/board_geometry.py; this catches the missing field.",
+      "properties": {
+        "shape": { "enum": ["rect", "circle", "polygon", "trapezoid"] },
+        "size": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "number", "exclusiveMinimum": 0 }
+        },
+        "origin": { "$ref": "#/$defs/point" },
+        "center": { "$ref": "#/$defs/point" },
+        "corner_radius": { "type": "number", "minimum": 0 },
+        "diameter": { "type": "number", "exclusiveMinimum": 0 },
+        "radius": { "type": "number", "exclusiveMinimum": 0 },
+        "points": { "type": "array", "minItems": 3, "items": { "$ref": "#/$defs/point" } },
+        "bottom": { "type": "number", "exclusiveMinimum": 0 },
+        "top": { "type": "number", "exclusiveMinimum": 0 },
+        "height": { "type": "number", "exclusiveMinimum": 0 },
+        "top_offset": { "type": "number" }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["shape"], "properties": { "shape": { "const": "rect" } } },
+          "then": { "required": ["size"] }
+        },
+        {
+          "if": { "required": ["shape"], "properties": { "shape": { "const": "circle" } } },
+          "then": { "oneOf": [{ "required": ["diameter"] }, { "required": ["radius"] }] }
+        },
+        {
+          "if": { "required": ["shape"], "properties": { "shape": { "const": "polygon" } } },
+          "then": { "required": ["points"] }
+        },
+        {
+          "if": { "required": ["shape"], "properties": { "shape": { "const": "trapezoid" } } },
+          "then": { "required": ["bottom", "top", "height"] }
+        }
+      ]
     }
   }
 }
