@@ -268,8 +268,9 @@ The rest follows from that:
 
   Coupling and ground are judged by walking each controlled net's routed path
   every 0.25 mm, along segments and arcs alike, so a curve or a partial
-  overlap is measured the same as a straight run. Up to 2 mm at each end of a
-  net may go unmeasured, where it breaks out to its pads.
+  overlap is measured the same as a straight run. Only the first and last 2 mm
+  of the routed path, measured along the copper from where it meets a pad, go
+  unmeasured as breakout; a gap anywhere in between is reported.
 
   A class width is only the router's default and constrains no layer, so the
   release reads the board itself. Neither emitter pours ground, so that zone is
