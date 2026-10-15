@@ -270,7 +270,33 @@ def resolve(project_config: dict, nets_out: dict) -> Resolution:
             continue
         net["impedance"] = spec.as_dict()
         res.nets[name] = (cls, spec)
+
+    # A pair is one thing, however its first half got onto a differential
+    # class — a tag, Stage 4's name rules, a net_class_rules pattern that
+    # matched _DP and not _DM. The partner left behind would be routed with
+    # Default's geometry and missing from the fab sheet (Codex, PR #31).
+    for name, (cls, spec) in list(res.nets.items()):
+        if spec.mode != "differential":
+            continue
+        partner = (nets_out.get(name) or {}).get("diff_pair_of")
+        if partner in nets_out and partner not in res.nets:
+            nets_out[partner]["class"] = cls
+            nets_out[partner]["impedance"] = spec.as_dict()
+            res.nets[partner] = (cls, spec)
+            res.notes.append(f"{partner} is on {cls} with its pair partner {name}")
     return res
+
+
+def width_key(rules: dict, spec: Spec) -> str:
+    """Which width a class routes its controlled nets at: a pair's own width when
+    it has one, as the .kicad_pro emitter routes it, else the trace width."""
+    if spec.mode == "differential" and "diff_pair_width" in rules:
+        return "diff_pair_width"
+    return "trace_width"
+
+
+def _has_width(rules: dict, spec: Spec) -> bool:
+    return rules.get("synthesized") != SYNTHESIZED and width_key(rules, spec) in rules
 
 
 def synthesized_classes(project_config: dict, res: Resolution) -> dict[str, dict]:
@@ -319,7 +345,7 @@ def review(hdm: dict) -> list[dict]:
             continue
         if not members:
             continue
-        if rules.get("synthesized") == SYNTHESIZED or "trace_width" not in rules:
+        if not _has_width(rules, spec):
             finding(
                 "ZC-001", "error",
                 f"{len(members)} net(s) need {spec.label} on class {name}, whose trace width "
@@ -338,7 +364,19 @@ def review(hdm: dict) -> list[dict]:
                 f"net_classes.{name}.",
                 nets_=members)
         if spec.mode == "differential":
-            lonely = [n for n in members if not nets.get(n, {}).get("diff_pair_of")]
+            lonely = [n for n in members if nets.get(n, {}).get("diff_pair_of") not in nets]
+            split = sorted(
+                n for n in members if n not in lonely
+                and nets[nets[n]["diff_pair_of"]].get("class") != name)
+            if split:
+                finding(
+                    "ZC-005", "error",
+                    f"{len(split)} net(s) on differential class {name} have their pair "
+                    "partner on another class, so the two halves would be routed with "
+                    "different geometry.",
+                    "Put both halves of each pair on the same class: one tag or rule "
+                    "pattern that matches both names.",
+                    nets_=split + [nets[n]["diff_pair_of"] for n in split])
             if lonely:
                 finding(
                     "ZC-003", "warning",
@@ -378,8 +416,10 @@ def fab_table(hdm: dict) -> str | None:
     for cls in sorted(rows):
         rules = classes.get(cls) or {}
         spec = parse(rules.get("impedance"), cls) or Spec()
-        unset = rules.get("synthesized") == SYNTHESIZED or "trace_width" not in rules
-        width = "NOT SET" if unset else f"{rules['trace_width']}"
+        # The width the .kicad_pro routes these nets at: a pair's own width when
+        # the class gives one. The sheet and the project must say the same.
+        width = (f"{rules[width_key(rules, spec)]}" if _has_width(rules, spec)
+                 else "NOT SET")
         gap = (f"{rules['diff_pair_gap']}" if "diff_pair_gap" in rules
                else ("NOT SET" if spec.mode == "differential" else "—"))
         names = sorted(rows[cls])

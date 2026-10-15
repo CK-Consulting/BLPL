@@ -81,6 +81,9 @@ what the board "probably" carries.
      matching suffixes (`_P/_N`, `_DP/_DM`, `+/-`) so Stage 4 pairs them.
    - **ZC-004** — a class named for an impedance (`RF_50Ohm`) that declares
      none, so nothing checks it and the fab is not told.
+   - **ZC-005** — the two halves of a pair on different classes, so they would
+     be routed with different geometry. One tag or rule must match both names.
+     (A half that reaches a differential class alone brings its partner along.)
 5. **Release.** `blpl release` writes `fab/impedance.md` — class, target,
    tolerance, width, gap, nets — for the board house, and refuses to mark the
    package quotable while any controlled class says `NOT SET`. Order with

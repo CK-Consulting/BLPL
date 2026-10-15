@@ -339,3 +339,48 @@ def test_a_release_with_an_unset_impedance_width_is_not_quotable_and_says_why(re
 def test_the_skill_ships_and_installs_by_default():
     assert "controlled-impedance" in skills_install.DEFAULT_SET
     assert "controlled-impedance" in skills_install.available(source=Path("/nonexistent"))
+
+
+# --- pairs, both halves (Codex, PR #31) -----------------------------------------------
+
+
+def test_a_pair_half_classed_by_a_rule_brings_its_partner_onto_the_class():
+    """A net_class_rules pattern matched _DP and not _DM: the minus half stayed
+    on Default, routed with other geometry and missing from the fab sheet."""
+    cfg = _config(classes={"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+                                   "impedance": {"ohms": 90, "mode": "differential"}}})
+    nets = _nets("USB_DP", "USB_DM", pairs={"USB_DP": "USB_DM"})
+    nets["USB_DP"]["class"] = "USB"
+    res = z.resolve(cfg, nets)
+    assert nets["USB_DM"]["class"] == "USB" and nets["USB_DM"]["impedance"]["ohms"] == 90
+    assert any("USB_DM" in n for n in res.notes)
+
+
+def test_a_pair_split_across_two_classes_is_an_error():
+    hdm = {"net_classes": {"A": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+                                 "impedance": {"ohms": 90, "mode": "differential"}},
+                           "B": {"trace_width": 0.2, "diff_pair_gap": 0.1,
+                                 "impedance": {"ohms": 90, "mode": "differential"}}},
+           "nets": {"X_P": {"class": "A", "impedance": {"ohms": 90}, "diff_pair_of": "X_N"},
+                    "X_N": {"class": "B", "impedance": {"ohms": 90}, "diff_pair_of": "X_P"}}}
+    found = z.review(hdm)
+    assert [f["rule_id"] for f in found] == ["ZC-005", "ZC-005"]
+    assert all(f["severity"] == "error" for f in found)
+
+
+def test_the_fab_sheet_gives_the_width_a_pair_is_routed_at():
+    """.kicad_pro routes a pair at diff_pair_width; the sheet said trace_width."""
+    hdm = {"net_classes": {"USB": {"trace_width": 0.25, "diff_pair_width": 0.18,
+                                   "diff_pair_gap": 0.15,
+                                   "impedance": {"ohms": 90, "mode": "differential"}}},
+           "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
+                    "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}
+    assert "| USB | 90 Ω differential | ±10% | 0.18 | 0.15 |" in z.fab_table(hdm)
+
+
+def test_a_pair_width_alone_is_a_stackup_width_for_a_differential_class():
+    hdm = {"net_classes": {"USB": {"diff_pair_width": 0.18, "diff_pair_gap": 0.15,
+                                   "impedance": {"ohms": 90, "mode": "differential"}}},
+           "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
+                    "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}
+    assert z.review(hdm) == []
