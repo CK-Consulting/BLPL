@@ -653,6 +653,10 @@ def _feature(kind: str, spec: Any, where: str) -> Feature:
                    layers=layers, forbid=forbid, name=str(spec.get("name") or ""))
 
 
+#: What ``blpl init`` writes in the legacy outline, and all the schema names for it.
+_LEGACY_RECT_KEYS = frozenset({"type", "start", "end", "layer", "width"})
+
+
 def from_config(config: dict) -> Board:
     """The board ``project.yaml`` describes, checked, or a BoardGeometryError.
 
@@ -699,6 +703,18 @@ def from_config(config: dict) -> Board:
             "Describe the outline with 'shape:' (rect, circle, trapezoid or polygon), "
             "or remove the block to use project.dimensions."
         )
+    # The legacy block is exempt only as init wrote it. A shape field added to
+    # it without deleting 'type' (or a typo of 'shape' beside it) is someone
+    # describing a different board, not the stale rectangle.
+    if "shape" not in raw_outline and raw_outline.get("type") == "rect":
+        unknown = sorted(str(k) for k in raw_outline if k not in _LEGACY_RECT_KEYS)
+        if unknown:
+            raise BoardGeometryError(
+                f"boundaries.board_outline is the legacy 'type: rect' block but also gives "
+                f"{', '.join(unknown)}, which it does not use. To describe the outline, "
+                "replace the block with 'shape:' (rect, circle, trapezoid or polygon); "
+                "otherwise remove the extra keys."
+            )
 
     if "shape" in raw_outline:
         outline = shape(raw_outline, "boundaries.board_outline", default="origin")

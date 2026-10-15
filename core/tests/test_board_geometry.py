@@ -113,6 +113,9 @@ def test_a_legacy_polygon_is_refused_rather_than_drawn_as_a_rectangle():
     ({"shpae": "circle", "diameter": 40}, r"no 'shape'.*diameter, shpae"),
     ({"type": "circle", "diameter": 40}, r"legacy 'type' is 'circle'"),
     ({"layer": "Edge.Cuts", "width": 0.1}, r"no 'shape'.*layer, width"),
+    # Shape fields added to init's legacy block without deleting 'type'.
+    ({"type": "rect", "start": [0, 0], "end": [50, 30], "shpae": "circle", "diameter": 40},
+     r"legacy 'type: rect' block but also gives diameter, shpae"),
     ("circle", "must be a mapping"),
     ([[0, 0], [50, 0], [25, 30]], "must be a mapping"),
 ])
