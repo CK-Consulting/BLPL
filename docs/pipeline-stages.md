@@ -259,7 +259,10 @@ The rest follows from that:
   these:
   - a controlled trace on a layer its class's width is not for;
   - a controlled trace at a width other than the class's;
-  - a coplanar class with no ground zone on its layer.
+  - a coplanar class with no ground zone on its layer;
+  - a differential pair whose halves are not routed together: on different
+    layers, or side by side at a gap other than `diff_pair_gap`. Stretches of
+    1 mm or less are breakouts at the pads and are not measured.
 
   A class width is only the router's default and constrains no layer, so the
   release reads the board itself. Neither emitter pours ground, so that zone is
