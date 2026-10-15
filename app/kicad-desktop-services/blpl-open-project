@@ -50,30 +50,31 @@ kicad_projects() {
 # #33). Locks also cover a project opened from inside KiCad, which no command
 # line names.
 #
-# A lock counts only when it names this host and is no older than the oldest
-# KiCad running here: one left by a KiCad that crashed before the current ones
-# started is not anybody's.
+# A lock counts only when it names this host and something alive answers for
+# it: a KiCad started on that project, or a window whose title names it (a
+# project opened from inside KiCad has no command line naming it). A KiCad that
+# crashed has neither, so its lock — which it never got to remove — holds
+# nothing. Comparing against the oldest KiCad's start time was not enough: the
+# autostarted manager is older than everything, so a crashed project window's
+# lock stayed "live" for as long as it ran (Codex, PR #33).
 open_files() {
-    local host oldest p t lck now name
+    local host lck name file stem argv shown
     host="$(hostname)"
-    oldest=""
-    now="$(date +%s)"
-    for p in $(pgrep -x kicad 2>/dev/null); do
-        # Elapsed seconds from ps: /proc/<pid>'s own mtime is not when the
-        # process started, and moved past it here.
-        t="$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')"
-        [ -n "$t" ] || continue
-        t=$((now - t))
-        if [ -z "$oldest" ] || [ "$t" -lt "$oldest" ]; then oldest="$t"; fi
-    done
-    [ -n "$oldest" ] || return 0
-    find "$PROJECTS" -maxdepth 8 -path '*/.sealed' -prune -o -name '~*.lck' -type f \
-        -newermt "@$((oldest - 5))" -print 2>/dev/null |
+    pgrep -x kicad >/dev/null 2>&1 || return 0
+    argv="$(kicad_projects | cut -d' ' -f2-)"
+    shown="$(titles)"
+    find "$PROJECTS" -maxdepth 8 -path '*/.sealed' -prune -o -name '~*.lck' -type f -print 2>/dev/null |
     while IFS= read -r lck; do
         grep -qF "\"hostname\":\"$host\"" "$lck" 2>/dev/null || continue
         name="$(basename "$lck")"
         name="${name#\~}"
-        echo "$(dirname "$lck")/${name%.lck}"
+        file="$(dirname "$lck")/${name%.lck}"
+        stem="$(basename "$file")"
+        stem="${stem%.*}"
+        if printf '%s\n' "$argv" | grep -qxF "$(dirname "$file")/$stem.kicad_pro" ||
+           { [ -n "$stem" ] && printf '%s\n' "$shown" | grep -qF "$stem"; }; then
+            echo "$file"
+        fi
     done
 }
 
