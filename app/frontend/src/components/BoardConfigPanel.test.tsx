@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { BoardConfigPanel } from "./BoardConfigPanel";
@@ -555,6 +555,121 @@ describe("controlled impedance, as fields", () => {
     expect(screen.getByText(/no pair partner/)).toBeInTheDocument();
     expect(screen.getByText(/From the last Stage 8 review/)).toBeInTheDocument();
     expect(screen.queryByText("not ours")).toBeNull();
+  });
+
+  // Every key #31 gave a class, on a four-layer board.
+  const FULL = {
+    ...IMPEDANCE.config,
+    net_classes: {
+      Default: { trace_width: 0.15 },
+      USB: {
+        trace_width: 0.15,
+        diff_pair_width: 0.18,
+        diff_pair_gap: 0.15,
+        impedance: { ohms: 90, mode: "differential", layers: ["F.Cu"], reference: ["In1.Cu"] },
+      },
+      RF: {
+        trace_width: 0.5,
+        clearance: 0.15,
+        coplanar_gap: 0.2,
+        impedance: { mode: "coplanar", layers: ["F.Cu", "In6.Cu"] },
+      },
+    },
+    test_points: { policy: "power", include_controlled_impedance: true },
+  };
+
+  it("round-trips every impedance key it does not touch", async () => {
+    const { box, onPut } = capture();
+    stubWith(FULL, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.change(await screen.findByLabelText("Width (mm)"), { target: { value: "90" } });
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.net_classes).toEqual(FULL.net_classes);
+    expect(box.sent.config.test_points).toEqual(FULL.test_points);
+  });
+
+  it("edits the layers a width is for and the planes it is against", async () => {
+    const { box, onPut } = capture();
+    stubWith(FULL, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    const layers = within(await screen.findByRole("group", { name: "USB layers" }));
+    // The stackup's own layers, by KiCad name.
+    expect(layers.getAllByRole("checkbox").map((c) => c.parentElement?.textContent)).toEqual([
+      "F.Cu",
+      "In1.Cu",
+      "In2.Cu",
+      "B.Cu",
+    ]);
+    fireEvent.click(layers.getByLabelText("B.Cu"));
+    fireEvent.click(within(screen.getByRole("group", { name: "USB reference" })).getByLabelText("In1.Cu"));
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    // In stackup order; an emptied list is dropped (the schema wants one or none).
+    expect(box.sent.config.net_classes.USB.impedance).toEqual({
+      ohms: 90,
+      mode: "differential",
+      layers: ["F.Cu", "B.Cu"],
+    });
+  });
+
+  it("keeps showing a layer the stackup no longer has, so it can be removed", async () => {
+    const { box, onPut } = capture();
+    stubWith(FULL, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    const rf = within(await screen.findByRole("group", { name: "RF layers" }));
+    expect(rf.getByLabelText("In6.Cu")).toBeChecked();
+    fireEvent.click(rf.getByLabelText("In6.Cu"));
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.net_classes.RF.impedance).toEqual({ mode: "coplanar", layers: ["F.Cu"] });
+  });
+
+  it("shows the coplanar gap for a coplanar class and writes it", async () => {
+    const { box, onPut } = capture();
+    stubWith(
+      { ...IMPEDANCE.config, net_classes: { Default: {}, RF: { trace_width: 0.5, impedance: true } } },
+      { onPut },
+    );
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    expect(screen.queryByLabelText("RF coplanar gap")).toBeNull();
+    fireEvent.change(await screen.findByLabelText("RF mode"), { target: { value: "coplanar" } });
+    // Stage 8 would refuse it without one, and without layers on four layers.
+    expect(screen.getByText(/ZC-006/)).toBeInTheDocument();
+    expect(screen.getByText(/ZC-007/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("RF coplanar gap"), { target: { value: "0.1" } });
+    // Under the 0.2 mm clearance a class with none gets.
+    expect(screen.getByText(/ZC-010/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.net_classes.RF).toEqual({
+      trace_width: 0.5,
+      impedance: { mode: "coplanar" },
+      coplanar_gap: 0.1,
+    });
+  });
+
+  it("toggles test points on controlled nets without disturbing the policy", async () => {
+    const { box, onPut } = capture();
+    stubWith(FULL, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    const box1 = await screen.findByLabelText("Test points on controlled-impedance nets");
+    expect(box1).toBeChecked();
+    fireEvent.click(box1);
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    // Off is the default, so it is removed rather than written as false.
+    expect(box.sent.config.test_points).toEqual({ policy: "power" });
+  });
+
+  it("adds test_points only when the box is ticked", async () => {
+    const { box, onPut } = capture();
+    stubWith(IMPEDANCE.config, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByLabelText("Test points on controlled-impedance nets"));
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.test_points).toEqual({ include_controlled_impedance: true });
   });
 
   it("adds a net class, and refuses a name already taken", async () => {

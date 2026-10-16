@@ -174,3 +174,34 @@ def test_its_proposals_are_shown_as_cards() -> None:
     from app import chat
 
     assert "propose_controlled_impedance" in chat._PROPOSING_TOOLS
+
+
+def test_layers_reference_and_coplanar_gap_round_trip(project) -> None:
+    """The keys #31 added after this tool was written: a class's coplanar gap and
+    the copper layers its impedance is for and against."""
+    from app.chat import ProposalStore
+
+    rf = {"trace_width": 0.5, "clearance": 0.15, "coplanar_gap": 0.2,
+          "impedance": {"mode": "coplanar", "layers": ["F.Cu"], "reference": ["In1.Cu"]}}
+    res = _call(project, path="project.yaml", rationale="r", classes={"RF": rf})
+    assert not res.is_error, res.content
+    [proposal] = ProposalStore(project).pending()
+    proposed = yaml.safe_load(proposal.new_content)
+    assert proposed["net_classes"]["RF"] == rf
+    assert board_config.errors(proposed) == []
+
+
+def test_a_layer_that_is_not_copper_is_refused(project) -> None:
+    res = _call(project, path="project.yaml", rationale="r",
+                classes={"RF": {"trace_width": 0.3, "impedance": {"layers": ["F.SilkS"]}}})
+    assert res.is_error and "layers" in res.content
+
+
+def test_a_pair_sized_by_its_pair_width_is_not_called_unsized(project) -> None:
+    """A differential class routes at diff_pair_width when it has one, so that
+    is a width from a stackup even with no trace_width."""
+    res = _call(project, path="project.yaml", rationale="r",
+                classes={"USB": {"diff_pair_width": 0.18, "diff_pair_gap": 0.15,
+                                 "impedance": {"ohms": 90, "mode": "differential"}}})
+    assert not res.is_error, res.content
+    assert "ZC-001" not in res.content

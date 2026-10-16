@@ -26,7 +26,15 @@ export type ZcFinding = {
   nets?: string[];
 };
 
-type Spec = { ohms?: number; mode?: ImpedanceMode; tolerance_pct?: number };
+type Spec = {
+  ohms?: number;
+  mode?: ImpedanceMode;
+  tolerance_pct?: number;
+  /** Copper layers the class's width is for. */
+  layers?: string[];
+  /** Plane layers the width was calculated against. */
+  reference?: string[];
+};
 
 const MODES: ImpedanceMode[] = ["single_ended", "differential", "coplanar"];
 const MODE_LABELS: Record<ImpedanceMode, string> = {
@@ -38,6 +46,16 @@ const MODE_LABELS: Record<ImpedanceMode, string> = {
 const MODE_TAG: Record<ImpedanceMode, string> = { single_ended: "SE", differential: "DIFF", coplanar: "CPW" };
 const DEFAULT_OHMS = 50;
 const DEFAULT_TOLERANCE = 10;
+// pro.build()'s clearance for a class that declares none, which is what a
+// coplanar gap is measured against (impedance.py: _DEFAULT_CLEARANCE_MM).
+const DEFAULT_CLEARANCE = 0.2;
+
+/** The copper layers of a board with `count` of them, in KiCad's names. */
+export function copperLayers(count: number): string[] {
+  if (count <= 1) return ["F.Cu"];
+  const inner = Array.from({ length: count - 2 }, (_, i) => `In${i + 1}.Cu`);
+  return ["F.Cu", ...inner, "B.Cu"];
+}
 
 const isMap = (v: unknown): v is Record<string, unknown> =>
   !!v && typeof v === "object" && !Array.isArray(v);
@@ -60,6 +78,9 @@ export function writeImpedance(spec: Spec): Impedance {
   if (spec.ohms !== undefined) kept.ohms = spec.ohms;
   if (spec.mode !== undefined && spec.mode !== "single_ended") kept.mode = spec.mode;
   if (spec.tolerance_pct !== undefined) kept.tolerance_pct = spec.tolerance_pct;
+  // The schema wants at least one layer when either list is given at all.
+  if (Array.isArray(spec.layers) && spec.layers.length) kept.layers = spec.layers;
+  if (Array.isArray(spec.reference) && spec.reference.length) kept.reference = spec.reference;
   const keys = Object.keys(kept);
   if (!keys.length) return true;
   if (keys.length === 1 && kept.ohms !== undefined) return kept.ohms;
@@ -138,6 +159,43 @@ function NumField({
   );
 }
 
+/** A set of copper layers, as checkboxes over the board's own. A layer the
+ *  file names that the stackup no longer has (the board went from six layers
+ *  to four) stays listed and ticked, so it can be seen and unticked rather
+ *  than kept invisibly. */
+function LayerPicks({
+  aria,
+  title,
+  board,
+  value,
+  onChange,
+}: {
+  aria: string;
+  title: string;
+  board: string[];
+  value: string[];
+  onChange: (v: string[]) => void;
+}) {
+  const all = [...board, ...value.filter((l) => !board.includes(l))];
+  return (
+    <span className="board-forbid" role="group" aria-label={aria}>
+      <span className="muted small">{title}</span>
+      {all.map((l) => (
+        <label key={l} className="inline">
+          <input
+            type="checkbox"
+            checked={value.includes(l)}
+            onChange={(e) =>
+              onChange(e.target.checked ? all.filter((x) => x === l || value.includes(x)) : value.filter((x) => x !== l))
+            }
+          />
+          {l}
+        </label>
+      ))}
+    </span>
+  );
+}
+
 function Problems({ list, role = "status" }: { list: string[]; role?: string }) {
   if (!list.length) return null;
   return (
@@ -168,6 +226,9 @@ export function ImpedanceFields({
   tags,
   errors,
   findings,
+  copper,
+  testPoints,
+  onTestPoints,
   onChange,
 }: {
   netClasses: Record<string, NetClass>;
@@ -176,9 +237,15 @@ export function ImpedanceFields({
   errors: ReturnType<typeof routeErrors>;
   /** ZC-* findings from the last Stage 8 run, or null when there is none. */
   findings: ZcFinding[] | null;
+  /** The board's copper layer count, from the stackup. */
+  copper: number;
+  /** test_points.include_controlled_impedance. */
+  testPoints: boolean;
+  onTestPoints: (v: boolean) => void;
   onChange: (netClasses: Record<string, NetClass>, tags: ImpedanceTag[]) => void;
 }) {
   const [newName, setNewName] = useState("");
+  const boardLayers = copperLayers(copper);
   const names = Object.keys(netClasses);
   const specs: Record<string, Spec> = {};
   for (const n of names) {
@@ -221,14 +288,30 @@ export function ImpedanceFields({
           const ran = byClass[name] ?? [];
           const ranRules = new Set(ran.map((f) => f.rule_id));
           // What Stage 8 will say about this class as it is now drafted, when
-          // the last run has not already said it.
-          const predicted: string[] = [];
-          if (spec && rules.trace_width === undefined && !ranRules.has("ZC-001"))
-            predicted.push(
-              "ZC-001: no trace width, so its nets get the Default width — not " + `${label(spec)}.`,
-            );
-          if (spec && modeOf(spec) === "differential" && rules.diff_pair_gap === undefined && !ranRules.has("ZC-002"))
-            predicted.push("ZC-002: a differential class with no pair gap. The gap sets the impedance as much as the width.");
+          // the last run has not already said it. The same rules as
+          // impedance.review, as far as the config alone can say them: it
+          // cannot see the nets, so ZC-003/005/008/011 wait for Stage 8.
+          const mode = spec ? modeOf(spec) : null;
+          // A pair routes at its own width when it has one (impedance.width_key).
+          const widthKey = mode === "differential" && rules.diff_pair_width !== undefined ? "diff_pair_width" : "trace_width";
+          const clearance = typeof rules.clearance === "number" ? rules.clearance : DEFAULT_CLEARANCE;
+          const rules8: [string, boolean, string][] = spec
+            ? [
+                ["ZC-001", rules[widthKey] === undefined,
+                  `ZC-001: no ${widthKey === "trace_width" ? "trace" : "pair"} width, so its nets get the Default width — not ${label(spec)}.`],
+                ["ZC-002", mode === "differential" && rules.diff_pair_gap === undefined,
+                  "ZC-002: a differential class with no pair gap. The gap sets the impedance as much as the width."],
+                ["ZC-006", mode === "coplanar" && rules.coplanar_gap === undefined,
+                  "ZC-006: a coplanar class with no coplanar gap. The gap to the ground pour sets the impedance as much as the width."],
+                ["ZC-007", copper > 2 && !(Array.isArray(spec.layers) && spec.layers.length),
+                  `ZC-007: no layers on a ${copper}-layer board. The same width is a different impedance on an outer layer and an inner one.`],
+                ["ZC-009", copper === 1 && mode !== "coplanar",
+                  "ZC-009: a one-layer board has no plane under the trace; only a coplanar line works there."],
+                ["ZC-010", mode === "coplanar" && typeof rules.coplanar_gap === "number" && rules.coplanar_gap < clearance - 1e-9,
+                  `ZC-010: the coplanar gap is less than the class's ${clearance} mm clearance, so the pour cannot come that close.`],
+              ]
+            : [];
+          const predicted = rules8.filter(([id, hit]) => hit && !ranRules.has(id)).map(([, , msg]) => msg);
           const set = (patch: Spec) => setField(name, rules, "impedance", writeImpedance({ ...spec, ...patch }));
           return (
             <div className="board-feature" key={name}>
@@ -238,10 +321,21 @@ export function ImpedanceFields({
                   onChange={(v) => setField(name, rules, "trace_width", v)} />
                 <NumField label="Clearance" aria={`${name} clearance`} value={rules.clearance}
                   onChange={(v) => setField(name, rules, "clearance", v)} />
-                <NumField label="Pair width" aria={`${name} pair width`} value={rules.diff_pair_width}
-                  placeholder="trace width" onChange={(v) => setField(name, rules, "diff_pair_width", v)} />
-                <NumField label="Pair gap" aria={`${name} pair gap`} value={rules.diff_pair_gap}
-                  onChange={(v) => setField(name, rules, "diff_pair_gap", v)} />
+                {/* Geometry for a mode the class is not in is hidden, unless the
+                    file already has it — a value nobody can see is a value
+                    nobody can remove. */}
+                {(mode === "differential" || rules.diff_pair_width !== undefined) && (
+                  <NumField label="Pair width" aria={`${name} pair width`} value={rules.diff_pair_width}
+                    placeholder="trace width" onChange={(v) => setField(name, rules, "diff_pair_width", v)} />
+                )}
+                {(mode === "differential" || rules.diff_pair_gap !== undefined) && (
+                  <NumField label="Pair gap" aria={`${name} pair gap`} value={rules.diff_pair_gap}
+                    onChange={(v) => setField(name, rules, "diff_pair_gap", v)} />
+                )}
+                {(mode === "coplanar" || rules.coplanar_gap !== undefined) && (
+                  <NumField label="Coplanar gap" aria={`${name} coplanar gap`} value={rules.coplanar_gap}
+                    onChange={(v) => setField(name, rules, "coplanar_gap", v)} />
+                )}
                 {name !== "Default" && (
                   <button
                     className="btn"
@@ -284,6 +378,14 @@ export function ImpedanceFields({
                   </>
                 )}
               </div>
+              {spec && (
+                <div className="field-row">
+                  <LayerPicks aria={`${name} layers`} title="Width is for" board={boardLayers}
+                    value={Array.isArray(spec.layers) ? spec.layers : []} onChange={(v) => set({ layers: v })} />
+                  <LayerPicks aria={`${name} reference`} title="Against planes" board={boardLayers}
+                    value={Array.isArray(spec.reference) ? spec.reference : []} onChange={(v) => set({ reference: v })} />
+                </div>
+              )}
               {predicted.map((p) => (
                 <p key={p} className="muted small">Stage 8 will report {p}</p>
               ))}
@@ -400,6 +502,20 @@ export function ImpedanceFields({
         <button className="btn" type="button" onClick={() => onChange(netClasses, [...tags, { nets: "" }])}>
           Add impedance tag
         </button>
+        <div className="field-row">
+          <label className="inline">
+            <input
+              type="checkbox"
+              aria-label="Test points on controlled-impedance nets"
+              checked={testPoints}
+              onChange={(e) => onTestPoints(e.target.checked)}
+            />
+            Test points on controlled-impedance nets
+          </label>
+        </div>
+        <p className="muted small">
+          Off by default: a test pad on a controlled line is a stub that changes its impedance.
+        </p>
         {findings && unplaced.length > 0 && (
           <>
             <p className="muted small">From the last Stage 8 review:</p>

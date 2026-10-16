@@ -164,6 +164,7 @@ export function BoardConfigPanel({
   // Refusals about a class or a tag are shown on its row; the rest stay in
   // the list by the save button.
   const routed = routeErrors(errors);
+  const testPoints: Record<string, unknown> = isMap(draft.test_points) ? draft.test_points : {};
   const built = shaped
     ? tryBuild(outline as ShapeSpec, "board outline", "origin")
     : tryBuild({ shape: "rect", size: dims }, "dimensions", "origin");
@@ -202,6 +203,20 @@ export function BoardConfigPanel({
     next.net_classes = classes;
     if (list.length) next.controlled_impedance = list;
     else delete next.controlled_impedance;
+    setDraft(next);
+  };
+
+  // Only the one key this form owns; the rest of test_points (policy,
+  // symbol, include/exclude) is left as the file has it. Unticked, the key is
+  // removed rather than written as false: false is the default, and a file
+  // that never said it should not start saying it.
+  const setTestPoints = (on: boolean) => {
+    const next = structuredClone(draft);
+    const tp = { ...testPoints };
+    if (on) tp.include_controlled_impedance = true;
+    else delete tp.include_controlled_impedance;
+    if (Object.keys(tp).length) next.test_points = tp;
+    else delete next.test_points;
     setDraft(next);
   };
 
@@ -383,6 +398,9 @@ export function BoardConfigPanel({
         tags={tags}
         errors={routed}
         findings={findings}
+        copper={Number(stackup.layers ?? 4)}
+        testPoints={testPoints.include_controlled_impedance === true}
+        onTestPoints={setTestPoints}
         onChange={setImpedance}
       />
 

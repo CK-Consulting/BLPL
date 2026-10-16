@@ -604,7 +604,13 @@ export type ImpedanceMode = "single_ended" | "differential" | "coplanar";
 export type Impedance =
   | true
   | number
-  | { ohms?: number; mode?: ImpedanceMode; tolerance_pct?: number };
+  | {
+      ohms?: number;
+      mode?: ImpedanceMode;
+      tolerance_pct?: number;
+      layers?: string[];
+      reference?: string[];
+    };
 
 export type NetClass = {
   trace_width?: number;
@@ -613,6 +619,7 @@ export type NetClass = {
   via_drill?: number;
   diff_pair_width?: number;
   diff_pair_gap?: number;
+  coplanar_gap?: number;
   impedance?: Impedance | false;
   [k: string]: unknown;
 };

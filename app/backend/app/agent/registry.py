@@ -577,10 +577,13 @@ async def _propose_controlled_impedance(ctx: ToolContext, args: dict) -> str:
     # Said every time, because it is the mistake this feature exists to catch:
     # a target with no width from the fab's calculator is a label, not an
     # impedance.
-    unsized = sorted(
-        name for name, rules in (new.get("net_classes") or {}).items()
-        if isinstance(rules, dict) and rules.get("impedance") not in (None, False)
-        and "trace_width" not in rules)
+    from blpl.core import impedance
+
+    unsized = []
+    for name, rules in sorted((new.get("net_classes") or {}).items()):
+        spec = impedance.parse((rules or {}).get("impedance"), name)
+        if spec is not None and impedance.width_key(rules, spec) not in rules:
+            unsized.append(name)
     note = (f" Classes {', '.join(unsized)} have an impedance but no trace_width; Stage 8 "
             "reports ZC-001 until the width from the fab's stackup calculator is added."
             if unsized else "")
@@ -1878,12 +1881,17 @@ def project_tools() -> list[ToolSpec]:
                 "Z90_DIFF) with the Default width, which Stage 8 reports as ZC-001.\n\n"
                 "classes maps a class name to fields merged into it; a field set to null is "
                 "removed, a class set to null is deleted. Impedance fields: impedance (true "
-                "= 50 ohm single-ended, a number of ohms, or {ohms, mode, tolerance_pct}), "
-                "trace_width, diff_pair_width, diff_pair_gap (mm). Never invent a width or "
-                "gap: they come from the fab's impedance calculator for this board's "
-                "stackup. If the user has not given one, propose the impedance without it "
-                "and say that Stage 8 will report ZC-001 (no width) or ZC-002 (a "
-                "differential class with no gap) until they add it."
+                "= 50 ohm single-ended, a number of ohms, or {ohms, mode, tolerance_pct, "
+                "layers, reference}, where layers are the copper layers the width is for "
+                "and reference the planes it was calculated against, each a list such as "
+                "[F.Cu] or [In1.Cu]), trace_width, diff_pair_width, diff_pair_gap, "
+                "coplanar_gap (mm). On a board of more than two copper layers give layers, "
+                "or Stage 8 reports ZC-007. Never invent a width or gap: they come from the "
+                "fab's impedance calculator for this board's stackup. If the user has not "
+                "given one, propose the impedance without it and say that Stage 8 will "
+                "report ZC-001 (no width), ZC-002 (a differential class with no "
+                "diff_pair_gap) or ZC-006 (a coplanar class with no coplanar_gap) until "
+                "they add it."
             ),
             input_schema={
                 "type": "object",
