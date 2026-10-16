@@ -459,6 +459,26 @@ def _global_label(net: str, x: float, y: float, angle: int) -> sexpr.Node:
     ]
 
 
+_FLAGS_PER_ROW = 12
+
+
+def _flag_y(first_row_y: float, i: int) -> float:
+    """Where the ``i``-th PWR_FLAG stands: twelve to a row."""
+    return _snap(first_row_y + (i // _FLAGS_PER_ROW) * 12 * GRID_MM)
+
+
+def _sheet_height(first_row_y: float, n_flags: int) -> float:
+    """The sheet's height: down past the last PWR_FLAG row and its terminal.
+
+    Every row, not just the first: 49 rails wrap to five rows, and a sheet
+    sized for one cut the rest off its bottom edge (Codex, PR #42). A flag's
+    terminal hangs about 8 grid below it.
+    """
+    if not n_flags:
+        return _snap(first_row_y + 20 * GRID_MM)
+    return _snap(_flag_y(first_row_y, n_flags - 1) + 12 * GRID_MM + 20 * GRID_MM)
+
+
 def _junction(x: float, y: float) -> sexpr.Node:
     """The dot that marks three wires meeting, where a run's tie passes a stub."""
     return ["junction", ["at", _mm(x), _mm(y)], ["diameter", "0"], ["color", "0", "0", "0", "0"],
@@ -619,14 +639,14 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
     texts = {r: (r, str(components[r].get("value", r))) for r in parts}
     undriven = _undriven_power_nets(hdm, pin_net_map, pins_by_lib_id)
     # The PWR_FLAG row goes under the blocks; the packing leaves it room.
-    flag_rows = math.ceil(len(undriven) / 12) if undriven else 0
+    flag_rows = math.ceil(len(undriven) / _FLAGS_PER_ROW) if undriven else 0
     placed = sch_layout.layout(blocks, parts, pin_net_map, texts,
                                extra_height=(12 + 12 * flag_rows) * GRID_MM + 20 * GRID_MM)
     content_w = max((b.x1 for b in blocks), default=100.0)
     content_h = max((b.y1 for b in blocks), default=100.0)
     flag_row_y = _snap(content_h + 12 * GRID_MM)
     sheet_w = _snap(content_w + 20 * GRID_MM)
-    sheet_h = _snap(flag_row_y + (16 * GRID_MM if undriven else 0) + 20 * GRID_MM)
+    sheet_h = _sheet_height(flag_row_y, len(undriven))
 
     # Gather the unique lib_ids (from each component's lib_symbol field, if any).
     lib_ids: list[str] = []
@@ -852,7 +872,7 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
         _add(PWR_FLAG_LIB_ID)
         for i, net_name in enumerate(undriven):
             fx = _snap(20 * GRID_MM + (i % 12) * 16 * GRID_MM)
-            fy = _snap(flag_row_y + (i // 12) * 12 * GRID_MM)
+            fy = _flag_y(flag_row_y, i)
             node.append(
                 _pwr_flag_instance(i + 1, fx, fy, project_name, schematic_uuid, net_name)
             )

@@ -285,3 +285,6 @@ def test_engineering_values_for_passives_and_the_mpn_for_everything_else():
     assert v("R1", "RES 0402 470 OHM") == "470Ω"
     assert v("C3", "CAP 0603") == "MPN-1"
     assert v("U1", "MCU 32-bit 64MHz") == "MPN-1"
+    # A module's parts carry the module's name in front.
+    assert v("ltc4015-charger.C1", "CAP CER 10UF 0603") == "10µF"
+    assert v("ltc4015-charger.R7", "RES SMD 4K7") == "4.7kΩ"
