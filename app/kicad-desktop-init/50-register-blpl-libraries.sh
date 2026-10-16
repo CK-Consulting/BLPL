@@ -29,9 +29,10 @@
 
 set -u
 
-KICAD_CONFIG_DIR="/config/.config/kicad"
-PROJECTS_DIR="/config/projects"
-SHARED_DIR="/config/shared-libraries"
+# Overridable only so the script can be tested against a scratch tree.
+KICAD_CONFIG_DIR="${BLPL_KICAD_CONFIG_DIR:-/config/.config/kicad}"
+PROJECTS_DIR="${BLPL_KICAD_PROJECTS_DIR:-/config/projects}"
+SHARED_DIR="${BLPL_KICAD_SHARED_DIR:-/config/shared-libraries}"
 
 # The newest kicad config dir present, or 10.0 on a first boot where the
 # desktop has not created one yet — the table files are created either way.
@@ -119,6 +120,32 @@ else
     done
 fi
 
+# --- which symbol libraries the mounted schematics use ---------------------
+#
+# KiCad parses every enabled symbol library when a project opens, before the
+# board editor is usable. With the fork's stock libraries and the desktop's
+# plugin-manager installs that was over 300 libraries and some 25,000 files,
+# a minute or more on a fresh desktop, nearly all of it libraries no board
+# here reads (a schematic carries its own copy of every symbol it places).
+# So libraries no schematic uses are registered but disabled: free at load,
+# and one tick away in Preferences -> Manage Symbol Libraries.
+#
+# A library is switched on when a schematic starts using it, not at every
+# start: the libraries in use last time are kept beside the tables, and only
+# one newly in use is switched on. After that a row stays as whoever last set
+# it in KiCad left it, on or off (Codex, PR #36).
+used_libs="$(mktemp)"
+find "$PROJECTS_DIR" -name '*.kicad_sch' -not -path '*/.git/*' \
+    -exec grep -ho '(lib_id "[^:"]*:' {} + 2>/dev/null \
+    | sed 's/^(lib_id "//; s/:$//' | sort -u > "$used_libs"
+used_before="$KICAD_CONFIG_DIR/$ver/.blpl-used-symbol-libraries"
+newly_used="$(mktemp)"
+if [ -f "$used_before" ]; then
+    sort -u "$used_before" | comm -13 - "$used_libs" > "$newly_used"
+else
+    cp "$used_libs" "$newly_used"
+fi
+
 # --- stock symbols: repair the registration the mount breaks ----------------
 # The image's template sym-lib-table lists the flat <Lib>.kicad_sym files the
 # Alpine kicad-library package installs — and the compose mount replaces
@@ -129,17 +156,45 @@ fi
 # symdir one, generate a table that names what is actually there and repoint
 # the global table's "KiCad" include row at it. Regenerated every start, so
 # the registration tracks the fork as it grows.
-STOCK_SYMBOLS="/usr/share/kicad/symbols"
+#
+# Every stock library is registered, but only the ones in use are enabled
+# (see above). The first time, that is every library a mounted schematic
+# places a symbol from and a few that drawing a new sheet nearly always
+# needs. After that, the rows enabled in the table this script wrote last
+# time (whatever someone ticked on or off since) plus any library newly in
+# use. BLPL_KICAD_STOCK_SYMBOLS=all enables every library, as before.
+STOCK_SYMBOLS="${BLPL_KICAD_STOCK_SYMBOLS_DIR:-/usr/share/kicad/symbols}"
 stock_table="$KICAD_CONFIG_DIR/$ver/blpl-stock-sym-lib-table"
+STOCK_ALWAYS="Device power Connector Connector_Generic"
 if ls "$STOCK_SYMBOLS"/*.kicad_symdir >/dev/null 2>&1; then
+    wanted="$(mktemp)"
+    {
+        # A table from before this change enabled every row, so it counts as
+        # a first time: carrying its rows over would undo the point.
+        if [ -f "$stock_table" ] && grep -q '(disabled)' "$stock_table"; then
+            grep '(lib (name "' "$stock_table" | grep -v '(disabled)' \
+                | sed 's/.*(lib (name "\([^"]*\)").*/\1/'
+            cat "$newly_used"
+        else
+            printf '%s\n' $STOCK_ALWAYS
+            cat "$used_libs"
+        fi
+    } | sort -u > "$wanted"
     {
         printf '(sym_lib_table\n\t(version 7)\n'
         for d in "$STOCK_SYMBOLS"/*.kicad_symdir; do
-            printf '\t(lib (name "%s") (type "KiCad") (uri "%s") (options "") (descr "stock symbols (read-only)"))\n' \
-                "$(basename "$d" .kicad_symdir)" "$d"
+            name="$(basename "$d" .kicad_symdir)"
+            off=" (disabled)"
+            if [ "${BLPL_KICAD_STOCK_SYMBOLS:-}" = "all" ] || grep -qxF "$name" "$wanted"; then
+                off=""
+            fi
+            printf '\t(lib (name "%s") (type "KiCad") (uri "%s") (options "") (descr "stock symbols (read-only)")%s)\n' \
+                "$name" "$d" "$off"
         done
         printf ')\n'
-    } > "$stock_table"
+    } > "$stock_table.blpl-tmp"
+    mv "$stock_table.blpl-tmp" "$stock_table"
+    rm -f "$wanted"
     sed -i 's|(lib (name "KiCad") (type "Table") (uri "[^"]*")|(lib (name "KiCad") (type "Table") (uri "'"$stock_table"'")|' "$SYM_TABLE"
     if ! grep -qF "$stock_table" "$SYM_TABLE"; then
         # No include row to repoint (a fresh table this script created):
@@ -150,7 +205,8 @@ if ls "$STOCK_SYMBOLS"/*.kicad_symdir >/dev/null 2>&1; then
             "$stock_table" >> "$tmp"
         mv "$tmp" "$SYM_TABLE"
     fi
-    echo "kicad-init: stock symbol table -> $stock_table ($(grep -c '(lib ' "$stock_table") libraries)"
+    echo "kicad-init: stock symbol table -> $stock_table ($(grep -c '(lib ' "$stock_table") libraries," \
+         "$(grep '(lib ' "$stock_table" | grep -vc '(disabled)') enabled)"
 fi
 
 # --- the shared vendor libraries, read-only, under their pipeline names -----
@@ -164,3 +220,32 @@ if [ -d "$SHARED_DIR" ]; then
         add_entry "$FP_TABLE" "$nick" "$d" "BLPL shared vendor library (read-only)"
     done
 fi
+
+# --- plugin-manager libraries: the same, once ---------------------------------
+#
+# Libraries installed through KiCad's Plugin and Content Manager live in the
+# desktop's own /config and are rows of the global table that the manager
+# writes. Unused ones are disabled the first time this runs (the marker says
+# it has); after that only a library newly in use is switched on, and a row
+# someone ticked on or off themselves is left as they set it.
+pcm_marker="$KICAD_CONFIG_DIR/$ver/.blpl-pcm-libraries-lazy"
+if [ "${BLPL_KICAD_STOCK_SYMBOLS:-}" != "all" ] && grep -q '_3RD_PARTY}' "$SYM_TABLE"; then
+    first=1
+    [ -f "$pcm_marker" ] && first=0
+    on_file="$newly_used"
+    [ "$first" = 1 ] && on_file="$used_libs"
+    awk -v first="$first" -v used_file="$on_file" '
+        BEGIN { while ((getline l < used_file) > 0) used[l] = 1 }
+        /\(lib \(name "/ && /_3RD_PARTY}/ {
+            match($0, /\(name "[^"]*"\)/)
+            name = substr($0, RSTART + 7, RLENGTH - 9)
+            if (name in used) sub(/ \(disabled\)/, "")
+            else if (first == 1 && $0 !~ /\(disabled\)/) sub(/\)[ \t]*$/, " (disabled))")
+        }
+        { print }' "$SYM_TABLE" > "$SYM_TABLE.blpl-tmp" && mv "$SYM_TABLE.blpl-tmp" "$SYM_TABLE"
+    touch "$pcm_marker"
+    echo "kicad-init: plugin-manager symbol libraries: $(grep '_3RD_PARTY}' "$SYM_TABLE" | grep -vc '(disabled)') of" \
+         "$(grep -c '_3RD_PARTY}' "$SYM_TABLE") enabled"
+fi
+cp "$used_libs" "$used_before"
+rm -f "$used_libs" "$newly_used"
