@@ -5382,54 +5382,58 @@ def delete_path(
                 "ignore_list_updated": done["ignore_list_updated"],
                 "ledger_updated": done.get("ledger_updated", True)}
     checkout, target, rel = _managed_path(session, user, project_id, name)
-    _refuse_while_running(session, user, project, "delete it")
-    if not target.exists() and not target.is_symlink():
-        raise HTTPException(status_code=404, detail=f"no file or folder {rel!r}")
-    # The same rule as a move, for the same reason: the ledger names a released
-    # file by its path and is never edited to keep up, so deleting one would
-    # leave it recording a release of a file that is not there.
-    # A file a library upload placed is the exception: it is the project's
-    # library now, so it may go, and the ledger records that it went.
-    library_files = set(quarantine.library_placements_under(checkout, rel))
-    recorded = [p for p in llm_ignore.released_under(checkout, rel) if p not in library_files]
-    if recorded:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
-                "is recorded in the quarantine ledger as released at its current path; "
-                "deleting it would leave the ledger naming a file that is not there"
-            ),
-        )
-    if target.is_dir() and not target.is_symlink():
-        shutil.rmtree(target)
-        kind = "folder"
-    else:
-        target.unlink()
-        kind = "file"
-    ledger_updated = True
-    if library_files:
-        # After the delete, and caught for the same reason as the ignore list
-        # below: the bytes are already gone, so failing the request skipped
-        # the commit and reported a failed delete of a file that no longer
-        # exists. A ledger that could not be rewritten still claims the old
-        # path, which can only over-frame a later file of that name as vendor
-        # content. Nothing becomes trusted. Reported instead.
+    # One transaction against a concurrent upload, move or removal in this
+    # checkout: the ledger rule, the delete and the ledger's record of it
+    # (quarantine.locked; Codex, PR #32).
+    with quarantine.locked(checkout):
+        _refuse_while_running(session, user, project, "delete it")
+        if not target.exists() and not target.is_symlink():
+            raise HTTPException(status_code=404, detail=f"no file or folder {rel!r}")
+        # The same rule as a move, for the same reason: the ledger names a released
+        # file by its path and is never edited to keep up, so deleting one would
+        # leave it recording a release of a file that is not there.
+        # A file a library upload placed is the exception: it is the project's
+        # library now, so it may go, and the ledger records that it went.
+        library_files = set(quarantine.library_placements_under(checkout, rel))
+        recorded = [p for p in llm_ignore.released_under(checkout, rel) if p not in library_files]
+        if recorded:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
+                    "is recorded in the quarantine ledger as released at its current path; "
+                    "deleting it would leave the ledger naming a file that is not there"
+                ),
+            )
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+            kind = "folder"
+        else:
+            target.unlink()
+            kind = "file"
+        ledger_updated = True
+        if library_files:
+            # After the delete, and caught for the same reason as the ignore list
+            # below: the bytes are already gone, so failing the request skipped
+            # the commit and reported a failed delete of a file that no longer
+            # exists. A ledger that could not be rewritten still claims the old
+            # path, which can only over-frame a later file of that name as vendor
+            # content. Nothing becomes trusted. Reported instead.
+            try:
+                quarantine.record_library_removal(checkout, rel, by=user.email or f"user {user.id}")
+            except OSError:
+                ledger_updated = False
+        # After the delete, unlike a move's list update, and safely so: should this
+        # write fail, the file is already gone and the entry left behind can only
+        # over-ignore a later file of the same name. Nothing becomes readable.
+        # Caught, as a move's post-rename cleanup is (Codex, PR #17): let through,
+        # the error skipped the commit and the dialog reported a failed delete of
+        # bytes that were already gone. The stale entry is reported instead.
+        ignore_list_updated = True
         try:
-            quarantine.record_library_removal(checkout, rel, by=user.email or f"user {user.id}")
+            llm_ignore.drop_entries(checkout, rel)
         except OSError:
-            ledger_updated = False
-    # After the delete, unlike a move's list update, and safely so: should this
-    # write fail, the file is already gone and the entry left behind can only
-    # over-ignore a later file of the same name. Nothing becomes readable.
-    # Caught, as a move's post-rename cleanup is (Codex, PR #17): let through,
-    # the error skipped the commit and the dialog reported a failed delete of
-    # bytes that were already gone. The stale entry is reported instead.
-    ignore_list_updated = True
-    try:
-        llm_ignore.drop_entries(checkout, rel)
-    except OSError:
-        ignore_list_updated = False
+            ignore_list_updated = False
     activity.record(session, project, user, activity.DELETED, rel)
     # Reported, never fatal, for the reason write_file gives: the change is
     # already on disk, and failing the request would misstate what happened.
@@ -5486,121 +5490,124 @@ def move_path(
                 "ignore_list_updated": done["ignore_list_updated"]}
     checkout, src, src_rel = _managed_path(session, user, project_id, body.path)
     _, dst, dst_rel = _managed_path(session, user, project_id, body.to)
-    _refuse_while_running(session, user, project, "move it")
-    if not src.exists() and not src.is_symlink():
-        raise HTTPException(status_code=404, detail=f"no file or folder {src_rel!r}")
-    if dst.exists() or dst.is_symlink():
-        # Never an overwrite: the file at the destination is somebody's work,
-        # and a rename is not where anyone expects to find it replaced.
-        raise HTTPException(status_code=409, detail=f"{dst_rel} already exists")
-    if src.is_dir() and not src.is_symlink() and dst.is_relative_to(src):
-        raise HTTPException(status_code=400, detail="a folder cannot be moved inside itself")
-    # The assistant frames a file as untrusted by where it is: anything under
-    # datasheets/ or references/ arrived from outside. Moving one out would
-    # have it read back as the project's own text, vendor instructions and
-    # all, so that is refused. Moving a file *in* is allowed: it only means
-    # more framing, which errs the safe way.
-    if llm_ignore.is_external(src_rel) and not llm_ignore.is_external(dst_rel):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"{src_rel} came from outside the project, and files there are read as "
-                "untrusted wherever they sit under datasheets/ or references/. It cannot be "
-                "moved out of them."
-            ),
-        )
-    # A released file is named in the quarantine ledger by its path, which is
-    # how its origin is shown and how a datasheet is found by MPN. Moving it
-    # would leave the ledger describing a file that is not there, and the
-    # ledger is never edited to keep up, so a released file stays put.
-    # Except a library upload's files, which the ledger follows (see
-    # quarantine.record_library_move): a library is reorganised like any other.
-    library_files = set(quarantine.library_placements_under(checkout, src_rel))
-    recorded = [p for p in llm_ignore.released_under(checkout, src_rel) if p not in library_files]
-    if recorded:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
-                "is recorded in the quarantine ledger at its current path; moving it would "
-                "leave the ledger naming a file that is not there"
-            ),
-        )
-    # The ignore list is keyed by path, and it changes in the same commit as
-    # the move. Its new paths are written *before* the rename, beside the old
-    # ones (Codex, PR #17): rewritten after, a failed write left an ignored
-    # file at a name the list did not cover, readable by the assistant, with
-    # the request reporting failure. See llm_ignore.cover_move for why not
-    # rename-then-roll-back.
-    try:
-        before = llm_ignore.cover_move(checkout, src_rel, dst_rel)
-    except OSError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"{src_rel} was not moved: the LLM-ignore list could not be updated ({e})",
-        ) from e
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        src.rename(dst)
-    except OSError as e:
-        if before is not None:
-            # Best effort. Should this fail too, the superset stays, which
-            # names the file where it still is: over-ignoring, not exposure.
-            try:
-                llm_ignore.restore(checkout, before)
-            except OSError:
-                pass
-        raise HTTPException(status_code=500, detail=f"{src_rel} was not moved: {e}") from e
-    def undo_move() -> None:
+    # One transaction, as delete_path: the move, the footprints following its
+    # models and the ledger's record of it (quarantine.locked; Codex, PR #32).
+    with quarantine.locked(checkout):
+        _refuse_while_running(session, user, project, "move it")
+        if not src.exists() and not src.is_symlink():
+            raise HTTPException(status_code=404, detail=f"no file or folder {src_rel!r}")
+        if dst.exists() or dst.is_symlink():
+            # Never an overwrite: the file at the destination is somebody's work,
+            # and a rename is not where anyone expects to find it replaced.
+            raise HTTPException(status_code=409, detail=f"{dst_rel} already exists")
+        if src.is_dir() and not src.is_symlink() and dst.is_relative_to(src):
+            raise HTTPException(status_code=400, detail="a folder cannot be moved inside itself")
+        # The assistant frames a file as untrusted by where it is: anything under
+        # datasheets/ or references/ arrived from outside. Moving one out would
+        # have it read back as the project's own text, vendor instructions and
+        # all, so that is refused. Moving a file *in* is allowed: it only means
+        # more framing, which errs the safe way.
+        if llm_ignore.is_external(src_rel) and not llm_ignore.is_external(dst_rel):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"{src_rel} came from outside the project, and files there are read as "
+                    "untrusted wherever they sit under datasheets/ or references/. It cannot be "
+                    "moved out of them."
+                ),
+            )
+        # A released file is named in the quarantine ledger by its path, which is
+        # how its origin is shown and how a datasheet is found by MPN. Moving it
+        # would leave the ledger describing a file that is not there, and the
+        # ledger is never edited to keep up, so a released file stays put.
+        # Except a library upload's files, which the ledger follows (see
+        # quarantine.record_library_move): a library is reorganised like any other.
+        library_files = set(quarantine.library_placements_under(checkout, src_rel))
+        recorded = [p for p in llm_ignore.released_under(checkout, src_rel) if p not in library_files]
+        if recorded:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{', '.join(recorded[:3])}{' and others' if len(recorded) > 3 else ''} "
+                    "is recorded in the quarantine ledger at its current path; moving it would "
+                    "leave the ledger naming a file that is not there"
+                ),
+            )
+        # The ignore list is keyed by path, and it changes in the same commit as
+        # the move. Its new paths are written *before* the rename, beside the old
+        # ones (Codex, PR #17): rewritten after, a failed write left an ignored
+        # file at a name the list did not cover, readable by the assistant, with
+        # the request reporting failure. See llm_ignore.cover_move for why not
+        # rename-then-roll-back.
         try:
-            dst.rename(src)
-        except OSError:
-            pass
-        if before is not None:
-            try:
-                llm_ignore.restore(checkout, before)
-            except OSError:
-                pass
-
-    # A footprint names its 3D model by exact path, so a moved model takes the
-    # footprints that name it along, in the same commit (Codex, PR #23): left
-    # alone, the next board came out without the 3D body and nothing said so.
-    moved_models = {
-        src_rel + str(p)[len(str(dst)):]: dst_rel + str(p)[len(str(dst)):]
-        for p in ([dst] if dst.is_file() else sorted(dst.rglob("*")) if dst.is_dir() else [])
-        if p.is_file() and not p.is_symlink() and p.suffix.lower() in library_upload.MODEL_SUFFIXES
-    }
-    try:
-        relinked = library_upload.follow_moved_models(checkout, moved_models)
-    except (OSError, RuntimeError, ValueError) as e:  # ValueError: quarantine.LinkRefused
-        undo_move()
-        raise HTTPException(
-            status_code=500,
-            detail=f"{src_rel} was not moved: the footprints naming its 3D models could not be updated ({e})",
-        ) from e
-    if library_files:
-        try:
-            quarantine.record_library_move(checkout, src_rel, dst_rel, by=user.email or f"user {user.id}")
+            before = llm_ignore.cover_move(checkout, src_rel, dst_rel)
         except OSError as e:
-            # The ledger still names the old path, and it is what frames a
-            # vendor file as untrusted when the assistant reads it. Left moved,
-            # the file would be read as the project's own text. So it goes back
-            # where the ledger says it is, and the move is reported as failed.
-            library_upload.restore_texts(checkout, relinked)
+            raise HTTPException(
+                status_code=500,
+                detail=f"{src_rel} was not moved: the LLM-ignore list could not be updated ({e})",
+            ) from e
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(dst)
+        except OSError as e:
+            if before is not None:
+                # Best effort. Should this fail too, the superset stays, which
+                # names the file where it still is: over-ignoring, not exposure.
+                try:
+                    llm_ignore.restore(checkout, before)
+                except OSError:
+                    pass
+            raise HTTPException(status_code=500, detail=f"{src_rel} was not moved: {e}") from e
+        def undo_move() -> None:
+            try:
+                dst.rename(src)
+            except OSError:
+                pass
+            if before is not None:
+                try:
+                    llm_ignore.restore(checkout, before)
+                except OSError:
+                    pass
+
+        # A footprint names its 3D model by exact path, so a moved model takes the
+        # footprints that name it along, in the same commit (Codex, PR #23): left
+        # alone, the next board came out without the 3D body and nothing said so.
+        moved_models = {
+            src_rel + str(p)[len(str(dst)):]: dst_rel + str(p)[len(str(dst)):]
+            for p in ([dst] if dst.is_file() else sorted(dst.rglob("*")) if dst.is_dir() else [])
+            if p.is_file() and not p.is_symlink() and p.suffix.lower() in library_upload.MODEL_SUFFIXES
+        }
+        try:
+            relinked = library_upload.follow_moved_models(checkout, moved_models)
+        except (OSError, RuntimeError, ValueError) as e:  # ValueError: quarantine.LinkRefused
             undo_move()
             raise HTTPException(
                 status_code=500,
-                detail=f"{src_rel} was not moved: the quarantine ledger could not be updated ({e})",
+                detail=f"{src_rel} was not moved: the footprints naming its 3D models could not be updated ({e})",
             ) from e
-    ignore_list_updated = True
-    if before is not None:
-        try:
-            llm_ignore.finish_move(checkout, before)
-        except OSError:
-            # The move happened, and failing the request would misstate that,
-            # as with a commit that fails. The superset still covers the file at
-            # its new path; only a stale entry on the old name is left, said so.
-            ignore_list_updated = False
+        if library_files:
+            try:
+                quarantine.record_library_move(checkout, src_rel, dst_rel, by=user.email or f"user {user.id}")
+            except OSError as e:
+                # The ledger still names the old path, and it is what frames a
+                # vendor file as untrusted when the assistant reads it. Left moved,
+                # the file would be read as the project's own text. So it goes back
+                # where the ledger says it is, and the move is reported as failed.
+                library_upload.restore_texts(checkout, relinked)
+                undo_move()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"{src_rel} was not moved: the quarantine ledger could not be updated ({e})",
+                ) from e
+        ignore_list_updated = True
+        if before is not None:
+            try:
+                llm_ignore.finish_move(checkout, before)
+            except OSError:
+                # The move happened, and failing the request would misstate that,
+                # as with a commit that fails. The superset still covers the file at
+                # its new path; only a stale entry on the old name is left, said so.
+                ignore_list_updated = False
     activity.record(session, project, user, activity.MOVED, f"{src_rel} → {dst_rel}")
     commit = _commit_landed_write(
         session, user, project, checkout, f"move: {src_rel} -> {dst_rel}", master_key
