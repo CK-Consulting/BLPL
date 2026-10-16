@@ -751,10 +751,14 @@ export function ProjectSettings({
   projectId,
   board,
   onRemoteChanged,
+  onFilesChanged,
 }: {
   projectId: string;
   /** Called after the remote is added or changed, for the git strip. */
   onRemoteChanged?: () => void;
+  /** Called after a save wrote a project file (the board's project.yaml), so
+   *  the app's views of the project's files reload. */
+  onFilesChanged?: () => void;
   /** The active board, because geometry is per board: two boards do not share
    *  an outline or a stackup. Null on a single-board project, whose one board
    *  is implicit — the panel resolves that itself rather than being withheld,
@@ -826,6 +830,7 @@ export function ProjectSettings({
               projectId={projectId}
               board={board ?? null}
               onDirtyChange={setBoardDirty}
+              onSaved={onFilesChanged}
             />
           </div>
           <div role="tabpanel" hidden={tab !== "routing"}>

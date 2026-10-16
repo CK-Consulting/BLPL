@@ -86,3 +86,18 @@ describe("project settings tabs", () => {
     expect(screen.getByRole("dialog", { name: "Discard board changes?" })).toBeInTheDocument();
   });
 });
+
+describe("saving the board config", () => {
+  // project.yaml open in the file view kept what it had loaded before the
+  // save, so a save that had happened read as one that had not.
+  it("tells the app its files changed, so open views of project.yaml reload", async () => {
+    stubFetch();
+    const onFilesChanged = vi.fn();
+    render(<ProjectSettings projectId="p" board="core" onFilesChanged={onFilesChanged} />);
+    fireEvent.click(screen.getByLabelText("Project settings — p"));
+    fireEvent.change(await screen.findByLabelText("Width (mm)"), { target: { value: "90" } });
+    expect(onFilesChanged).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Save board config" }));
+    await waitFor(() => expect(onFilesChanged).toHaveBeenCalledTimes(1));
+  });
+});
