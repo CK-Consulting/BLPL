@@ -70,26 +70,30 @@ def publish(
 ) -> dict[str, Path]:
     """Copy ``base_dir/<base>.kicad_*`` to ``dest_dir/<name>.kicad_*``.
 
-    Returns the published paths by kind (``pro``, ``sch``, ``pcb``). A kind
-    with no source file is skipped rather than raising: a partial emit is
-    stage 6's failure to report, not this function's, and the files that do
-    exist are still the latest of their kind.
+    Returns the published paths by kind (``pro``, ``sch``, ``pcb``, ``libs``),
+    or nothing when the emit is not a whole project. All three or none: a
+    board published beside the schematic of an earlier run is a pair that
+    disagree while looking like one design, which is worse than a tracked copy
+    one run behind. ``stage6-plugin`` alone writes only a board (Codex, PR
+    #40); with ``--stamp`` shared with ``stage6`` it is whole and publishes.
     """
+    srcs = {s: Path(base_dir) / f"{base}{s}" for s in _SUFFIXES}
+    absent = [p.name for p in srcs.values() if not p.is_file()]
+    if absent:
+        print(f"        publish: skipped, {', '.join(absent)} not emitted; "
+              "the tracked copy in kicad/ is unchanged")
+        return {}
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     out: dict[str, Path] = {}
-    for suffix in _SUFFIXES:
-        src = Path(base_dir) / f"{base}{suffix}"
-        if not src.is_file():
-            continue
+    for suffix, src in srcs.items():
         data = src.read_bytes()
         if suffix == ".kicad_pro":
             data = _renamed_project(data, base, name)
         dest = dest_dir / f"{name}{suffix}"
         _write_atomic(dest, data)
         out[suffix.removeprefix(".kicad_")] = dest
-    if "sch" in out or "pcb" in out:
-        out.update(_publish_libraries(Path(base_dir), out, dest_dir, board))
+    out.update(_publish_libraries(Path(base_dir), out, dest_dir, board))
     return out
 
 

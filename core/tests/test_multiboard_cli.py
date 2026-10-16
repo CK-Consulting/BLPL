@@ -414,11 +414,7 @@ def test_stage6_publishes_a_single_board_project_at_its_root(tmp_path, monkeypat
     assert (tmp_path / "kicad" / "solo.kicad_pcb").read_text() == "(pcb)\n"
 
 
-def test_stage6_plugin_publishes_the_board_too(project, monkeypatch):
-    # The documented alternative Stage 6 returned before the hook, so its
-    # board never reached the tracked copy.
-    (project / ".pipeline").mkdir()
-    (project / ".pipeline" / "hdm.base.yaml").write_text("project: {name: x}\n")
+def _fake_plugin(project, monkeypatch):
     monkeypatch.setattr(cli, "_resolve_kicad_python", lambda v: Path("/usr/bin/true"))
     monkeypatch.setattr(cli, "_resolve_plugin_dir", lambda: project)
 
@@ -427,8 +423,31 @@ def test_stage6_plugin_publishes_the_board_too(project, monkeypatch):
         return argparse.Namespace(returncode=0)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    (project / ".pipeline").mkdir(exist_ok=True)
+    (project / ".pipeline" / "hdm.base.yaml").write_text("project: {name: x}\n")
+
+
+def test_stage6_plugin_publishes_when_it_completes_stage6s_project(project, monkeypatch):
+    # It returned before the hook, so its board never reached the tracked copy.
+    _fake_plugin(project, monkeypatch)
+    stem = f"{project.name}_base_2026-10-16_124325Z"
+    (project / ".pipeline" / f"{stem}.kicad_sch").write_text("(kicad_sch)\n")
+    (project / ".pipeline" / f"{stem}.kicad_pro").write_text("{}")
     rc = cli.main(["stage6-plugin", "--project-dir", str(project), "--board", "base",
                    "--stamp", "2026-10-16_124325Z"])
     assert rc == 0
     published = project / "base" / "kicad" / f"{project.name}.kicad_pcb"
     assert published.read_text() == "(kicad_pcb (plugin))\n"
+
+
+def test_stage6_plugin_alone_does_not_pair_its_board_with_an_old_schematic(project, monkeypatch, capsys):
+    # Alone it writes only a board. Published, it would sit beside the
+    # schematic and project of whichever run published last (Codex, PR #40).
+    _fake_plugin(project, monkeypatch)
+    kicad = project / "base" / "kicad"
+    kicad.mkdir()
+    (kicad / f"{project.name}.kicad_pcb").write_text("(kicad_pcb (earlier))\n")
+    rc = cli.main(["stage6-plugin", "--project-dir", str(project), "--board", "base"])
+    assert rc == 0
+    assert (kicad / f"{project.name}.kicad_pcb").read_text() == "(kicad_pcb (earlier))\n"
+    assert "publish: skipped" in capsys.readouterr().out
