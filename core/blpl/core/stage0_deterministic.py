@@ -468,7 +468,13 @@ def _absorb_connections_table(
             pairs = [(pin, net)] if pin and net else []
         else:
             pairs = [(n, row.get(h, "").strip()) for n, h in sorted(pin_cols.items(), key=lambda x: int(x[0]))]
-            pairs = [(n, v) for n, v in pairs if v]
+            # Every pin column filled, or the row is refused. A blank one left
+            # that pad floating while the part counted as connected, so the
+            # unconnected-parts check passed on half a resistor (Codex, PR
+            # #41). A pin meant to be open says NC.
+            if any(not v for _, v in pairs):
+                skipped.append(ref)
+                continue
         if not pairs:
             skipped.append(ref)
             continue
@@ -478,8 +484,9 @@ def _absorb_connections_table(
         warnings.append({
             "code": "STAGE0-008",
             "summary": (f"Connections table: {len(skipped)} row(s) not read — each needs exactly "
-                        f"one Ref and at least one net: {', '.join(skipped[:8])}"),
-            "fix": "One part per row, e.g. | R8 | I2C_SDA | VDD_3V3 | under | Ref | Pin 1 | Pin 2 |.",
+                        f"one Ref and a net in every pin column: {', '.join(skipped[:8])}"),
+            "fix": ("One part per row with every pin named, e.g. | R8 | I2C_SDA | VDD_3V3 | "
+                    "under | Ref | Pin 1 | Pin 2 |. A pin meant to be open says NC."),
             "source_ref": source_ref,
         })
 

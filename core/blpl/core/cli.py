@@ -189,6 +189,9 @@ def _cmd_stage0_llm(args: argparse.Namespace) -> int:
         f"{len(artifact['connectors'])} connectors"
     )
     print(f"            wrote {out}")
+    # Connections rows go in deterministically here too, and fail the same way.
+    if any(w.get("code") == stage0_deterministic.CONFLICT_CODE for w in artifact.get("warnings", [])):
+        return 1
     return 0
 
 
