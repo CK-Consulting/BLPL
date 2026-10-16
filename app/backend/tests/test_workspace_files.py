@@ -1037,6 +1037,48 @@ def test_a_link_that_appears_after_the_check_is_still_not_written_through(unlock
         shutil.rmtree(outside, ignore_errors=True)
 
 
+def test_two_library_uploads_at_once_through_the_agent_both_land(unlocked, monkeypatch):
+    """The agent serves each request on its own thread. Two uploads into one
+    flat library each read it and wrote it back, and the slower dropped the
+    other's symbol (Codex, PR #32). The read is slowed so they always overlap."""
+    import time
+
+    import app.main as main
+    from blpl.core import library_upload, quarantine
+    from blpl.emitter import sexpr
+    from test_uploads_api import SYMLIB
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    assert _upload(unlocked, [("sym.kicad_sym", SYMLIB, {"kind": "symbol"})]).status_code == 200
+    real = library_upload.existing_symbols
+
+    def slow(project_dir, library):
+        out = real(project_dir, library)
+        time.sleep(0.3)
+        return out
+
+    monkeypatch.setattr(library_upload, "existing_symbols", slow)
+    answers = {}
+
+    def upload(name):
+        data = SYMLIB.replace(b'"PCM12SMTBR"', f'"{name}"'.encode()) \
+                     .replace(b'"PCM12SMTBR_1_1"', f'"{name}_1_1"'.encode())
+        answers[name] = _upload(unlocked, [(f"{name}.kicad_sym", data, {"kind": "symbol"})])
+
+    threads = [threading.Thread(target=upload, args=(n,)) for n in ("ALPHA", "BETA")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert [answers[n].json()["results"][0]["state"] for n in ("ALPHA", "BETA")] == ["released"] * 2
+    proj = main.PROJECTS_ROOT / "mine"
+    lib = sexpr.parse((proj / "libraries/symbols/mine.kicad_sym").read_text())
+    names = {sexpr.unquote(x[1]) for x in sexpr.find_all(lib, "symbol")}
+    assert {"PCM12SMTBR", "ALPHA", "BETA"} <= names
+    rows = {r["original_name"] for r in quarantine.ledger(proj)}
+    assert {"ALPHA.kicad_sym", "BETA.kicad_sym"} <= rows
+
+
 def test_a_bundle_pdf_gets_this_backends_verdict_not_the_workspaces(unlocked, monkeypatch):
     """The workspace inspects each entry of a bundle as it unpacks it; a verdict
     the browser renders by still comes only from this backend's own

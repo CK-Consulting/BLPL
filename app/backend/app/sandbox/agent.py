@@ -802,6 +802,17 @@ class Agent:
         return not (dest == checkout or dest.startswith(checkout + "/"))
 
     def managed_delete(self, b: dict) -> dict:
+        # Under the checkout's quarantine lock for the whole of it: the
+        # ledger rule, the delete and the ledger's record of it are one
+        # transaction against a concurrent upload or move (Codex, PR #32).
+        from blpl.core import quarantine
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._verify_git(checkout)
+        with quarantine.locked(Path(checkout)):
+            return self._managed_delete(b)
+
+    def _managed_delete(self, b: dict) -> dict:
         from app import llm_ignore
         from blpl.core import quarantine
 
@@ -852,6 +863,16 @@ class Agent:
         return {"kind": kind, "ignore_list_updated": updated, "ledger_updated": ledger_updated}
 
     def managed_move(self, b: dict) -> dict:
+        # One transaction, as managed_delete: the relink and the ledger's
+        # record of the move must not interleave with another library change.
+        from blpl.core import quarantine
+
+        checkout = self.fs.checkout(b.get("checkout"))
+        self._verify_git(checkout)
+        with quarantine.locked(Path(checkout)):
+            return self._managed_move(b)
+
+    def _managed_move(self, b: dict) -> dict:
         from app import llm_ignore
         from blpl.core import library_upload, quarantine
 
