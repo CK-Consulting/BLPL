@@ -147,9 +147,10 @@ def known_refs(md_files: list[Path]) -> set[str]:
             if _md.classify(table) != "bom":
                 continue
             for row in table.rows:
-                ref = _column_lookup(row, ["Ref", "Reference", "Refdes", "Designator"]).strip()
-                if ref:
-                    refs.add(ref)
+                cell = _column_lookup(row, ["Ref", "Reference", "Refdes", "Designator"]).strip()
+                # Split as the BOM is: a grouped "SW1, SW2" row is two parts,
+                # and each one's "## SW1 pinout" must anchor on it (Codex, PR #41).
+                refs.update(split_refs(cell))
     return refs
 
 
@@ -406,6 +407,37 @@ def _absorb_bom_row(row: dict, ref: str, components: dict[str, dict], source_ref
             comp["pin_count_hint"] = n
 
 
+def _merge_pins(
+    connectors: dict[str, dict], ref: str, pins: list[dict], source_ref: dict, warnings: list[dict] | None
+) -> None:
+    """Add pins to a part, refusing any that would put a pin on a second net.
+
+    Every table that names a part's pins merges through here — pinout and
+    Connections alike, in whichever order they are met — so a pin two tables
+    disagree about is caught whichever came first. The first assignment
+    stands, the later one is not applied, and the stage fails (Codex, PR #41).
+    """
+    entry = connectors.setdefault(
+        ref, {"local_id": ref, "pins": [], "pin_count": 0, "source_ref": source_ref})
+    have = {p["pin"]: p["signal"] for p in entry["pins"]}
+    for pin in pins:
+        num, net = pin["pin"], pin["signal"]
+        if num in have:
+            if have[num] != net and warnings is not None:
+                warnings.append({
+                    "code": CONFLICT_CODE,
+                    "summary": (f"error: {ref} pin {num} is {have[num]!r} in one table and "
+                                f"{net!r} in another. The second was not applied."),
+                    "fix": "A pin is on one net. Correct whichever table is wrong.",
+                    "local_id": ref,
+                    "source_ref": source_ref,
+                })
+            continue
+        entry["pins"].append(pin)
+        have[num] = net
+    entry["pin_count"] = len(entry["pins"])
+
+
 def _absorb_connections_table(
     table: _md.ParsedTable, connectors: dict[str, dict], warnings: list[dict]
 ) -> None:
@@ -440,29 +472,8 @@ def _absorb_connections_table(
         if not pairs:
             skipped.append(ref)
             continue
-        entry = connectors.setdefault(
-            refs[0], {"local_id": refs[0], "pins": [], "pin_count": 0, "source_ref": source_ref})
-        have = {p["pin"]: p["signal"] for p in entry["pins"]}
-        for pin, net in pairs:
-            if pin in have and have[pin] != net:
-                # Not applied, and an error. Kept, the pin sat in two nets and
-                # each emitter silently drew whichever it met last, so a typo
-                # became copper while every check passed (Codex, PR #41).
-                warnings.append({
-                    "code": CONFLICT_CODE,
-                    "summary": (f"error: {refs[0]} pin {pin} is {have[pin]!r} in one table and "
-                                f"{net!r} in a Connections table. The Connections row was not "
-                                "applied."),
-                    "fix": "A pin is on one net. Correct whichever table is wrong.",
-                    "local_id": refs[0],
-                    "source_ref": source_ref,
-                })
-                continue
-            if have.get(pin) == net:
-                continue
-            entry["pins"].append({"pin": pin, "signal": net})
-            have[pin] = net
-        entry["pin_count"] = len(entry["pins"])
+        _merge_pins(connectors, refs[0], [{"pin": p, "signal": n} for p, n in pairs],
+                    source_ref, warnings)
     if skipped:
         warnings.append({
             "code": "STAGE0-008",
@@ -550,18 +561,10 @@ def _absorb_pinout_table(
                 }
             )
         return
-    entry = connectors.get(connector_ref)
-    if entry is None:
-        connectors[connector_ref] = {
-            "local_id": connector_ref,
-            "pins": pins,
-            "pin_count": len(pins),
-            "source_ref": _make_source_ref(table),
-        }
-    else:
-        # Append pins (handles multi-table connectors).
-        entry["pins"].extend(pins)
-        entry["pin_count"] = len(entry["pins"])
+    # Through the shared merge: a part split over several tables appends, and
+    # a pin another table (a Connections row, met first) already placed on a
+    # different net is refused rather than put on two.
+    _merge_pins(connectors, connector_ref, pins, _make_source_ref(table), warnings)
 
 
 def _absorb_gpio_table(
