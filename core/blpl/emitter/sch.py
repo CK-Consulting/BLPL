@@ -24,7 +24,7 @@ import uuid as _uuid
 from copy import deepcopy
 from pathlib import Path
 
-from . import loaders, sexpr
+from . import loaders, sch_layout, sexpr
 
 
 _SCH_VERSION = "20260306"
@@ -60,19 +60,23 @@ def _empty_font() -> sexpr.Node:
 
 
 def _default_property(
-    name: str, value: str, x: float, y: float, *, hidden: bool = False
+    name: str, value: str, x: float, y: float, *, hidden: bool = False, justify: str | None = None,
+    angle: str = "0",
 ) -> sexpr.Node:
     prop: sexpr.Node = [
         "property",
         sexpr.quote(name),
         sexpr.quote(value),
-        ["at", _mm(x), _mm(y), "0"],
+        ["at", _mm(x), _mm(y), angle],
         ["show_name", "no"],
         ["do_not_autoplace", "no"],
     ]
     if hidden:
         prop.append(["hide", "yes"])
-    prop.append(_empty_font())
+    effects = _empty_font()
+    if justify:
+        effects = [*effects, ["justify", justify]]
+    prop.append(effects)
     return prop
 
 
@@ -91,11 +95,19 @@ def _component_instance(
     manufacturer: str = "",
     datasheet: str = "",
     unit: int = 1,
+    rot: int = 0,
+    ref_at: tuple[float, float, str | None] | None = None,
+    value_at: tuple[float, float, str | None] | None = None,
 ) -> sexpr.Node:
+    rx, ry, rj = ref_at or (x, y - 10, None)
+    vx, vy, vj = value_at or (x, y + 10, None)
+    # KiCad turns a field with its symbol; turning it back keeps a resistor
+    # lying on its side labelled in horizontal text.
+    field_angle = str(rot % 180)
     return [
         "symbol",
         ["lib_id", sexpr.quote(lib_id)],
-        ["at", _mm(x), _mm(y), "0"],
+        ["at", _mm(x), _mm(y), str(rot)],
         ["unit", str(unit)],
         ["body_style", "1"],
         ["exclude_from_sim", "no"],
@@ -104,8 +116,8 @@ def _component_instance(
         ["in_pos_files", "yes"],
         ["dnp", "no"],
         ["uuid", _new_uuid()],
-        _default_property("Reference", refdes, x, y - 10),
-        _default_property("Value", value, x, y + 10),
+        _default_property("Reference", refdes, rx, ry, justify=rj, angle=field_angle),
+        _default_property("Value", value, vx, vy, justify=vj, angle=field_angle),
         _default_property("Footprint", footprint, x, y + 15, hidden=True),
         _default_property("Datasheet", datasheet, x, y, hidden=True),
         _default_property("Description", description, x, y, hidden=True),
@@ -354,36 +366,6 @@ def _title_block(project: dict) -> sexpr.Node:
     ]
 
 
-def _pin_absolute_tip(comp_x: float, comp_y: float, pin: dict) -> tuple[float, float]:
-    """Schematic-coord absolute position of a pin's electrical endpoint.
-
-    Library symbols are defined with Y-up; schematic coords are Y-down. We
-    flip the pin's local Y when projecting into the schematic frame. Component
-    rotation is assumed 0 for the auto-placed grid (the only layout the
-    emitter currently produces).
-    """
-    return (comp_x + pin["x"], comp_y - pin["y"])
-
-
-def _pin_stub_endpoint(tip_x: float, tip_y: float, rot: float, stub_len: float) -> tuple[float, float]:
-    """Where the far end of a pin's label-stub wire lands.
-
-    A pin's ``(at x y rot)`` is its *connection point*, and ``rot`` is the
-    direction the pin body is drawn in FROM that point — i.e. inward, toward the
-    symbol. Conn_01x18 pin 1 is ``(at -5.08 20.32 0)`` with length 3.81, and the
-    symbol body starts at x=-1.27: the pin runs rightward, into the body.
-
-    So a stub must run the opposite way, at rot+180. We had it running along rot,
-    which drew every stub back across the symbol it came from and left the wire
-    dangling instead of connecting.
-    """
-    import math
-    angle = math.radians(rot + 180.0)
-    dx = math.cos(angle) * stub_len
-    dy = -math.sin(angle) * stub_len  # schematic Y inverted relative to library
-    return (_snap(tip_x + dx), _snap(tip_y + dy))
-
-
 def _wire(x1: float, y1: float, x2: float, y2: float) -> sexpr.Node:
     return [
         "wire",
@@ -406,13 +388,132 @@ def _no_connect(x: float, y: float) -> sexpr.Node:
     return ["no_connect", ["at", _mm(x), _mm(y)], ["uuid", _new_uuid()]]
 
 
-def _label(net_name: str, x: float, y: float, rot: float = 0) -> sexpr.Node:
+POWER_RAIL_LIB_ID = "power:VCC"
+POWER_GROUND_LIB_ID = "power:GND"
+
+
+def _power_instance(
+    lib_id: str, refdes: str, net: str, x: float, y: float, rot: int,
+    project_name: str, schematic_uuid: str,
+) -> sexpr.Node:
+    """A power symbol for one rail. Its Value is the net's name, and is what
+    KiCad names the net after — so one symbol serves every rail."""
+    ox, oy = sch_layout._rot(0, -2.54 if lib_id == POWER_RAIL_LIB_ID else 2.54, rot)
+    tx, ty = sch_layout._rot(0, -5.08 if lib_id == POWER_RAIL_LIB_ID else 5.08, rot)
     return [
-        "label",
-        sexpr.quote(net_name),
-        ["at", _mm(x), _mm(y), f"{rot}"],
-        ["effects", ["font", ["size", "1.27", "1.27"]], ["justify", "left", "bottom"]],
+        "symbol",
+        ["lib_id", sexpr.quote(lib_id)],
+        ["at", _mm(x), _mm(y), str(rot)],
+        ["unit", "1"],
+        ["body_style", "1"],
+        ["exclude_from_sim", "no"],
+        ["in_bom", "no"],
+        ["on_board", "no"],
+        ["in_pos_files", "no"],
+        ["dnp", "no"],
         ["uuid", _new_uuid()],
+        _default_property("Reference", refdes, x + ox, y + oy, hidden=True),
+        _default_property("Value", net, x + tx, y + ty),
+        _default_property("Footprint", "", x, y, hidden=True),
+        _default_property("Datasheet", "", x, y, hidden=True),
+        _default_property("Description", f"Power symbol: {net}", x, y, hidden=True),
+        [
+            "instances",
+            [
+                "project",
+                sexpr.quote(project_name),
+                [
+                    "path",
+                    sexpr.quote(f"/{sexpr.unquote(schematic_uuid)}"),
+                    ["reference", sexpr.quote(refdes)],
+                    ["unit", "1"],
+                ],
+            ],
+        ],
+    ]
+
+
+def _global_label(net: str, x: float, y: float, angle: int) -> sexpr.Node:
+    """A label whose net is ``NET`` everywhere — the name the board uses.
+
+    A local label names its net ``/NET``, and the board's pads carry ``NET``;
+    that mismatch alone was 87 schematic-parity errors on verdacor-ear-tag.
+    ``angle`` is the direction the label runs away from the pin.
+    """
+    justify = "right" if angle in (180, 270) else "left"
+    return [
+        "global_label",
+        sexpr.quote(net),
+        ["shape", "passive"],
+        ["at", _mm(x), _mm(y), str(angle)],
+        ["fields_autoplaced", "yes"],
+        ["effects", ["font", ["size", "1.27", "1.27"]], ["justify", justify]],
+        ["uuid", _new_uuid()],
+        [
+            "property",
+            '"Intersheetrefs"',
+            '"${INTERSHEET_REFS}"',
+            ["at", _mm(x), _mm(y), "0"],
+            ["effects", ["font", ["size", "1.27", "1.27"]], ["hide", "yes"]],
+        ],
+    ]
+
+
+def _junction(x: float, y: float) -> sexpr.Node:
+    """The dot that marks three wires meeting, where a run's tie passes a stub."""
+    return ["junction", ["at", _mm(x), _mm(y)], ["diameter", "0"], ["color", "0", "0", "0", "0"],
+            ["uuid", _new_uuid()]]
+
+
+def _same_net_runs(
+    pins: list[dict], tips: list[tuple[float, float, int]], nets: dict[str, str]
+) -> list[list[tuple[str, float, float, int]]]:
+    """Pins with a net, grouped into runs of neighbours on one edge on one net.
+
+    Neighbours in the order they sit along the edge, counting every pin on it,
+    so a run never jumps a pin on another net. A one-pin run is just a pin.
+    """
+    by_edge: dict[int, list[tuple[float, str | None, float, float]]] = {}
+    for pin, (tx, ty, d) in zip(pins, tips):
+        along = ty if d in (0, 180) else tx
+        by_edge.setdefault(d, []).append((along, nets.get(pin["number"]), tx, ty))
+    runs: list[list[tuple[str, float, float, int]]] = []
+    for d, edge in by_edge.items():
+        edge.sort()
+        current: list[tuple[str, float, float, int]] = []
+        for along, net, tx, ty in edge:
+            if current and net == current[-1][0] and net is not None and (
+                (d in (0, 180) and tx == current[-1][1]) or (d in (90, 270) and ty == current[-1][2])
+            ):
+                current.append((net, tx, ty, d))
+                continue
+            if current:
+                runs.append(current)
+            current = [(net, tx, ty, d)] if net else []
+        if current:
+            runs.append(current)
+    return runs
+
+
+def _frame(block: "sch_layout.Block") -> list[sexpr.Node]:
+    """The dashed box and title that make a block read as one circuit."""
+    return [
+        [
+            "rectangle",
+            ["start", _mm(block.x0), _mm(block.y0)],
+            ["end", _mm(block.x1), _mm(block.y1)],
+            ["stroke", ["width", "0"], ["type", "dash"]],
+            ["fill", ["type", "none"]],
+            ["uuid", _new_uuid()],
+        ],
+        [
+            "text",
+            sexpr.quote(block.title),
+            ["exclude_from_sim", "no"],
+            ["at", _mm(block.x0 + 2.54), _mm(block.y0 + 3.81), "0"],
+            ["effects", ["font", ["size", "2.54", "2.54"], ["bold", "yes"]], ["justify", "left", "bottom"]],
+            ["uuid", _new_uuid()],
+        ],
     ]
 
 
@@ -451,150 +552,6 @@ def _snap(v: float) -> float:
     return round(v / GRID_MM) * GRID_MM
 
 
-# KiCad's stroke font at size 1.27 is about 1.1mm per character advance. Round up
-# to 1.4: a label that is wider than we budgeted for reaches into the neighbouring
-# component's pins, and coincident points are, to KiCad, a wire.
-_CHAR_MM = 1.4
-_STUB_MM = 2 * GRID_MM  # 2.54mm
-
-
-def _cell_size(hdm: dict, symbols_root: Path) -> tuple[float, float]:
-    """How much room one component needs: its body, its stubs, and its labels.
-
-    A label is text, and text takes space on the sheet. If a cell is narrower
-    than symbol + stub + label, one component's labels reach across into its
-    neighbour's pins — and KiCad reads coincident points as connected.
-    """
-    components = hdm.get("components", {}) or {}
-    sym_w = sym_h = 0.0
-    for comp in components.values():
-        lib_id = comp.get("lib_symbol") or ""
-        if ":" not in lib_id:
-            continue
-        try:
-            w, h = loaders.symbol_extents(lib_id, symbols_root)
-        except loaders.LibraryMiss:
-            continue
-        sym_w, sym_h = max(sym_w, w), max(sym_h, h)
-
-    longest = max((len(n) for n in (hdm.get("nets") or {})), default=8)
-    label_mm = longest * _CHAR_MM
-
-    # Labels sit on both sides of a symbol, so the stub+label allowance is doubled.
-    cell_w = sym_w + 2 * (_STUB_MM + label_mm) + 4 * GRID_MM
-    cell_h = sym_h + 8 * GRID_MM  # room for Reference/Value text above and below
-    return (_snap(cell_w), _snap(cell_h))
-
-
-def _component_grid(
-    components: dict,
-    cell_w: float,
-    cell_h: float,
-    cols: int,
-    origin_x: float = 20 * GRID_MM,
-    origin_y: float = 20 * GRID_MM,
-) -> list[tuple[str, float, float]]:
-    """Arrange components on a grid sized to the widest and tallest symbol.
-
-    Two things were wrong with the fixed 50mm/5-column grid this replaces. 50 is
-    not a multiple of 1.27, so every component — and every pin and wire endpoint
-    hanging off it — sat off KiCad's connection grid and could not connect. And
-    50mm is smaller than a 30-pin connector, so symbols overlapped bodily and
-    KiCad read the overlapping pins as wired together, shorting unrelated nets.
-    """
-    layout = []
-    for i, key in enumerate(components):
-        col, row = i % cols, i // cols
-        layout.append(
-            (key, _snap(origin_x + col * cell_w), _snap(origin_y + row * cell_h))
-        )
-    return layout
-
-
-def _placements(components: dict, units_by_lib_id: dict[str, dict[int, list[dict]]]) -> list[tuple[str, int]]:
-    """Every (refdes, unit) that gets its own symbol instance and grid cell.
-
-    A multi-unit symbol is several bodies sharing one reference, and KiCad
-    wants each body placed separately. Counting components rather than units
-    sized the sheet for one body per part and drew exactly that — so a
-    216-pin MCU appeared as its 64-pin unit 1 and nothing else.
-    """
-    out: list[tuple[str, int]] = []
-    for refdes, comp in components.items():
-        lib_id = comp.get("lib_symbol") or ""
-        units = units_by_lib_id.get(lib_id) or {1: []}
-        for unit in sorted(units):
-            out.append((refdes, unit))
-    return out
-
-
-def _reading_order(
-    placements: list[tuple[str, int]],
-    components: dict,
-    bands: int | None = None,
-    unplaced: "set[str] | frozenset[str]" = frozenset(),
-) -> list[tuple[str, int]]:
-    """Order symbols so parts that belong together land together on the sheet.
-
-    The grid used to follow BOM order, which is the order parts happen to
-    appear in the design document. A decoupling capacitor could sit a dozen
-    cells from the pin it decouples, and reviewing the sheet meant chasing
-    labels across it — every connection here is a net label, so there is no
-    wire to follow with your eye. "A grid of symbols" was a fair description.
-
-    Stage 5 has already solved the grouping problem for the board:
-    ``placement.py`` clusters by net adjacency with the global rails excluded,
-    and anchors each bypass capacitor to the IC it is named for. Reusing those
-    coordinates costs nothing and means the schematic and the board agree about
-    what is near what, which is its own help when reading one beside the other.
-
-    Ordering is a horizontal sweep through bands of the board — reading order —
-    rather than raw ``(y, x)``, so a part a millimetre lower than its
-    neighbour does not get pushed to a different row of the sheet.
-
-    Components with no placement keep their original relative order and go
-    last, so an unplaced part is never silently dropped or reshuffled.
-
-    ``unplaced`` matters more than it looks. Stage 5 does not clear the
-    coordinates of a component it could not place — it leaves the build-time
-    grid values alone deliberately, so the part lands somewhere visibly wrong
-    rather than stacked at the origin, and records the failure only in
-    ``synthesis.placement.unplaced``. Read without that set, a failed placement
-    looks like a real one; worse, the grid it fell back to can run far off the
-    board (rows reaching y=455 on a 35 mm board is the case that motivated the
-    placer), which stretches the band range enough to collapse every genuine
-    placement into a single band and undo the grouping entirely.
-    """
-    pos: dict[str, tuple[float, float]] = {}
-    for refdes, comp in components.items():
-        if refdes in unplaced:
-            continue
-        p = comp.get("placement") or {}
-        x, y = p.get("x"), p.get("y")
-        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-            pos[refdes] = (float(x), float(y))
-    if not pos:
-        return list(placements)
-
-    ys = [y for _, y in pos.values()]
-    lo, hi = min(ys), max(ys)
-    span = (hi - lo) or 1.0
-    n = bands or max(1, round(len(pos) ** 0.5))
-    original = {item: i for i, item in enumerate(placements)}
-
-    def key(item: tuple[str, int]) -> tuple:
-        refdes, unit = item
-        if refdes not in pos:
-            return (1, 0, 0.0, original[item])
-        x, y = pos[refdes]
-        # Clamped so the part at exactly `hi` lands in the last band rather
-        # than one past it.
-        band = min(n - 1, int((y - lo) / span * n))
-        return (0, band, x, original[item])
-
-    return sorted(placements, key=key)
-
-
 def _load_units(components: dict, symbols_root: Path) -> dict[str, dict[int, list[dict]]]:
     """Pins per unit for every lib_symbol in use; a missing symbol reads as unit 1, no pins."""
     out: dict[str, dict[int, list[dict]]] = {}
@@ -630,15 +587,46 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
 
     # Lay the sheet out first: the paper size depends on how much sheet the
     # components actually need, and a symbol that runs off the page is a symbol
-    # whose pins are unreachable.
-    cell_w, cell_h = _cell_size(hdm, symbols_root)
+    # whose pins are unreachable. See sch_layout for how parts are grouped
+    # into blocks and turned the conventional way round.
     units_by_lib_id = _load_units(components, symbols_root)
-    placements = _placements(components, units_by_lib_id)
-    n = max(1, len(placements))
-    cols = max(1, min(6, math.ceil(math.sqrt(n))))
-    rows = math.ceil(n / cols)
-    sheet_w = _snap(2 * 20 * GRID_MM + cols * cell_w)
-    sheet_h = _snap(2 * 20 * GRID_MM + rows * cell_h + 24 * GRID_MM)  # + PWR_FLAG row
+    pin_net_map = _build_component_pin_net_map(hdm)
+    pins_by_lib_id = _all_unit_pins(units_by_lib_id)
+    parts: dict[str, list[tuple[int, list[dict]]]] = {}
+    for refdes, comp in components.items():
+        lib_id = comp.get("lib_symbol") or ""
+        if ":" not in lib_id:
+            continue
+        units = units_by_lib_id.get(lib_id) or {1: []}
+        parts[refdes] = [(u, units[u]) for u in sorted(units)]
+    unplaced = set(((hdm.get("synthesis") or {}).get("placement") or {}).get("unplaced") or [])
+    positions: dict[str, tuple[float, float]] = {}
+    for refdes, comp in components.items():
+        pl = comp.get("placement") or {}
+        if refdes not in unplaced and isinstance(pl.get("x"), (int, float)) and isinstance(pl.get("y"), (int, float)):
+            positions[refdes] = (float(pl["x"]), float(pl["y"]))
+    # The refdes and what it is, short: a block is as wide as its title, and a
+    # full catalogue description stretched one connector's block across half
+    # the sheet. The description is on the symbol for anyone who wants it.
+    def _title(r: str) -> str:
+        what = str(components[r].get("mpn") or components[r].get("value") or "")
+        title = f"{r} — {what}" if what and what != r else r
+        return title if len(title) <= 48 else title[:47] + "…"
+
+    titles = {r: _title(r) for r in parts}
+    near = {r: c["near"] for r, c in components.items() if c.get("near")}
+    blocks = sch_layout.assign_blocks(parts, pin_net_map, positions, titles, near)
+    texts = {r: (r, str(components[r].get("value", r))) for r in parts}
+    undriven = _undriven_power_nets(hdm, pin_net_map, pins_by_lib_id)
+    # The PWR_FLAG row goes under the blocks; the packing leaves it room.
+    flag_rows = math.ceil(len(undriven) / 12) if undriven else 0
+    placed = sch_layout.layout(blocks, parts, pin_net_map, texts,
+                               extra_height=(12 + 12 * flag_rows) * GRID_MM + 20 * GRID_MM)
+    content_w = max((b.x1 for b in blocks), default=100.0)
+    content_h = max((b.y1 for b in blocks), default=100.0)
+    flag_row_y = _snap(content_h + 12 * GRID_MM)
+    sheet_w = _snap(content_w + 20 * GRID_MM)
+    sheet_h = _snap(flag_row_y + (16 * GRID_MM if undriven else 0) + 20 * GRID_MM)
 
     # Gather the unique lib_ids (from each component's lib_symbol field, if any).
     lib_ids: list[str] = []
@@ -745,35 +733,88 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
     # unrelated nets together (KiCad: "Both NC_JMIC_8 and VCC_3V3 are attached to
     # the same items"). Every pin that has a net already carries its own label.
 
-    # Component instances + per-pin label stubs for declared nets.
-    pin_net_map = _build_component_pin_net_map(hdm)
-    pins_by_lib_id = _all_unit_pins(units_by_lib_id)
+    power_count = 0
 
-    stub_len = 2.54  # one grid unit; enough to clear the symbol body.
-    ordered = _reading_order(
-        placements,
-        hdm.get("components", {}) or {},
-        unplaced=set(
-            ((hdm.get("synthesis") or {}).get("placement") or {}).get("unplaced") or []
-        ),
-    )
-    for (refdes, unit), x, y in _component_grid(ordered, cell_w, cell_h, cols):
-        comp = components[refdes]
-        lib_id = comp.get("lib_symbol") or ""
-        if ":" not in lib_id:
-            # Without a resolvable lib_symbol, we skip the instance: KiCad would
-            # flag a lib_id mismatch otherwise. The user can add it after editing
-            # bom.json and re-running the pipeline.
-            continue
+    def terminate(net: str, tx: float, ty: float, d: int, *, labels_only: bool = False) -> list[sexpr.Node]:
+        """End a pin: a stub, then a power symbol for a rail or ground, a
+        global label for anything else."""
+        nonlocal power_count
+        sx, sy = sch_layout._STEP[d]
+        ex, ey = _snap(tx + sx * sch_layout.STUB), _snap(ty + sy * sch_layout.STUB)
+        out: list[sexpr.Node] = [_wire(tx, ty, ex, ey)]
+        kind = sch_layout.net_kind(net)
+        # A power symbol only where it reads the right way up: a rail's
+        # standing up, ground's hanging down. Turned on its side it is as tall
+        # as two pin pitches and its name runs across the neighbouring pins,
+        # so a side pin takes a label of the same name (KiCad joins the two).
+        if not sch_layout.ends_in_symbol(net, d, labels_only):
+            out.append(_global_label(net, ex, ey, d))
+            return out
+        lib = POWER_GROUND_LIB_ID if kind == "ground" else POWER_RAIL_LIB_ID
+        _add(lib)
+        # GND's body hangs below its pin and VCC's stands above it; turn each
+        # so the body continues the way the stub runs.
+        body = 270 if kind == "ground" else 90
+        power_count += 1
+        out.append(_power_instance(lib, f"#PWR{power_count:03d}", net, ex, ey,
+                                   (d - body) % 360, project_name, schematic_uuid))
+        return out
+
+    def run_terminals(run: list[tuple[str, float, float, int]], labels_only: bool = False) -> list[sexpr.Node]:
+        """End a run of adjacent pins on one net, side by side on one edge.
+
+        One pin ends as ``terminate`` ends it. Several are tied: a stub from
+        each, a wire along their ends, and one terminal for the lot — ground
+        hanging below the last, a rail standing on the first, a signal's label
+        at the first. Five GND pins in a row used to be five ground symbols
+        drawn on top of each other.
+        """
+        net = run[0][0]
+        if len(run) == 1:
+            _, tx, ty, d = run[0]
+            return terminate(net, tx, ty, d, labels_only=labels_only)
+        d = run[0][3]
+        sx, sy = sch_layout._STEP[d]
+        ends = [(_snap(tx + sx * sch_layout.STUB), _snap(ty + sy * sch_layout.STUB)) for _, tx, ty, _ in run]
+        out: list[sexpr.Node] = [_wire(tx, ty, ex, ey) for (_, tx, ty, _), (ex, ey) in zip(run, ends)]
+        out += [_wire(*a, *b) for a, b in zip(ends, ends[1:])]
+        out += [_junction(*e) for e in ends[1:-1]]
+        # The terminal goes outward from the first end, the way the pins
+        # point. Hung below the run instead, a ground symbol's stub landed on
+        # the next pin's stub 2.54 mm down and shorted RF_LRHF to GND.
+        return out + terminate(net, *ends[0], d, labels_only=labels_only)
+
+    for block in blocks:
+        node.extend(_frame(block))
+
+    for p in placed:
+        comp = components[p.ref]
+        lib_id = comp["lib_symbol"]
         placeholder = bool(comp.get("needs_manual_symbol"))
+        nets = pin_net_map.get(p.ref) or {}
+        x0, y0, x1, y1 = sch_layout.part_extent(p.pins, p.rot, nets)
+        tips = [sch_layout.pin_tip(pin, p.x, p.y, p.rot) for pin in p.pins]
+        if len(p.pins) > 2 or not tips:
+            ref_at = (p.x, _snap(p.y + y0 - GRID_MM), None)
+            value_at = (p.x, _snap(p.y + y1 + 2 * GRID_MM), None)
+        elif len({t[0] for t in tips}) == 1:
+            # Standing up: the text sits beside the body. KiCad mirrors a
+            # field's justification with a symbol turned 180°, so it is given
+            # mirrored to come out left-aligned clear of the body.
+            just = "right" if p.rot == 180 else "left"
+            ref_at = (_snap(p.x + 2 * GRID_MM), _snap(p.y - GRID_MM), just)
+            value_at = (_snap(p.x + 2 * GRID_MM), _snap(p.y + GRID_MM), just)
+        else:
+            ref_at = (p.x, _snap(p.y - 3 * GRID_MM), None)
+            value_at = (p.x, _snap(p.y + 3 * GRID_MM), None)
         node.append(
             _component_instance(
-                refdes=refdes,
+                refdes=p.ref,
                 lib_id=lib_id,
-                value=str(comp.get("value", refdes)),
+                value=str(comp.get("value", p.ref)),
                 footprint=str(comp.get("footprint", "")),
-                x=x,
-                y=y,
+                x=p.x,
+                y=p.y,
                 project_name=project_name,
                 schematic_uuid=schematic_uuid,
                 description=(
@@ -785,42 +826,37 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
                 mpn=str(comp.get("mpn", "")),
                 manufacturer=str(comp.get("manufacturer", "")),
                 datasheet=str(comp.get("datasheet", "")),
-                unit=unit,
+                unit=p.unit,
+                rot=p.rot,
+                ref_at=ref_at,
+                value_at=value_at,
             )
         )
-
-        component_nets = pin_net_map.get(refdes) or {}
         # Physical pin numbers the design declares not-connected (Stage 5 writes
         # them as ``no_connect_pins``). A pin that is both NC and on a net is a
         # contradiction upstream; the net wins here, because a wire that exists
         # is the safer thing to show.
-        nc_pins = {str(p) for p in (comp.get("no_connect_pins") or [])}
-        if not component_nets and not nc_pins:
-            continue
-        for pin in units_by_lib_id.get(lib_id, {}).get(unit, []):
-            net_name = component_nets.get(pin["number"])
-            tip_x, tip_y = _pin_absolute_tip(x, y, pin)
-            if not net_name:
-                if pin["number"] in nc_pins:
-                    node.append(_no_connect(_snap(tip_x), _snap(tip_y)))
-                continue
-            end_x, end_y = _pin_stub_endpoint(tip_x, tip_y, pin["rot"], stub_len)
-            node.append(_wire(tip_x, tip_y, end_x, end_y))
-            node.append(_label(net_name, end_x, end_y, rot=pin["rot"]))
+        nc_pins = {str(n) for n in (comp.get("no_connect_pins") or [])}
+        for pin, (tx, ty, d) in zip(p.pins, tips):
+            if not nets.get(pin["number"]) and pin["number"] in nc_pins:
+                node.append(_no_connect(tx, ty))
+        # An IC's pins sit one pitch apart, and a power symbol's name is wider
+        # than that: on an anchor every pin ends in a label. Power symbols are
+        # for the small parts, where each stands clear of the next.
+        for run in _same_net_runs(p.pins, tips, nets):
+            node.extend(run_terminals(run, labels_only=len(p.pins) > 2))
 
-    # PWR_FLAGs. Placed in a row along the bottom, each with a label naming the
-    # rail it declares a source for. PWR_FLAG's pin sits at the symbol origin with
-    # zero length, so a label at the same point is the connection — no stub needed.
-    undriven = _undriven_power_nets(hdm, pin_net_map, pins_by_lib_id)
+    # PWR_FLAGs, in a row under the blocks: each declares its rail driven, and
+    # carries the rail's own power symbol (or label) so it joins that net.
     if undriven:
         _add(PWR_FLAG_LIB_ID)
         for i, net_name in enumerate(undriven):
-            fx = _snap(20 * GRID_MM + (i % 12) * 20 * GRID_MM)
-            fy = _snap(20 * GRID_MM + rows * cell_h + 8 * GRID_MM + (i // 12) * 8 * GRID_MM)
+            fx = _snap(20 * GRID_MM + (i % 12) * 16 * GRID_MM)
+            fy = _snap(flag_row_y + (i // 12) * 12 * GRID_MM)
             node.append(
                 _pwr_flag_instance(i + 1, fx, fy, project_name, schematic_uuid, net_name)
             )
-            node.append(_label(net_name, fx, fy))
+            node.extend(terminate(net_name, fx, fy, 270))
 
     node.append(["sheet_instances", ["path", '"/"', ["page", '"1"']]])
     node.append(["embedded_fonts", "no"])

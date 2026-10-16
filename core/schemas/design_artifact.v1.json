@@ -29,7 +29,7 @@
     },
     "warnings": {
       "type": "array",
-      "description": "What Stage 0 could not extract cleanly. Stage 0 is forgiving by design \u2014 it skips what it does not recognize \u2014 and the silence around that is the parser's worst behaviour: a dropped pinout table produces no error, the pins simply never become nets. Every skip is recorded here so the loss is visible in the artifact itself, not only to whoever remembered to run `blpl doctor`.",
+      "description": "What Stage 0 could not extract cleanly. Stage 0 is forgiving by design — it skips what it does not recognize — and the silence around that is the parser's worst behaviour: a dropped pinout table produces no error, the pins simply never become nets. Every skip is recorded here so the loss is visible in the artifact itself, not only to whoever remembered to run `blpl doctor`.",
       "items": {
         "type": "object",
         "required": [
@@ -150,6 +150,10 @@
           },
           "source_ref": {
             "$ref": "#/$defs/source_ref"
+          },
+          "near": {
+            "type": "string",
+            "description": "The part this one serves, named in its Connections row's purpose (\"at U3 pin 8\"). Stage 5 places it beside that part unless project.yaml hints otherwise, and the schematic draws it in that part's block."
           }
         }
       }
@@ -183,7 +187,7 @@
     },
     "gpio_assignments": {
       "type": "array",
-      "description": "Rows from GPIO-assignment maps (GPIO | Signal | Destination ...): which host pin drives which subsystem signal. Extracted verbatim; Stage 4 interprets them \u2014 joining bindable rows into nets and reporting the rest.",
+      "description": "Rows from GPIO-assignment maps (GPIO | Signal | Destination ...): which host pin drives which subsystem signal. Extracted verbatim; Stage 4 interprets them — joining bindable rows into nets and reporting the rest.",
       "items": {
         "type": "object",
         "required": [
@@ -199,7 +203,7 @@
           },
           "gpio": {
             "type": "string",
-            "description": "Raw pin cell, e.g. 'GPIO8' \u2014 or 'GPIO\u2014 (TBD)', kept so it can be counted."
+            "description": "Raw pin cell, e.g. 'GPIO8' — or 'GPIO— (TBD)', kept so it can be counted."
           },
           "signal": {
             "type": "string"

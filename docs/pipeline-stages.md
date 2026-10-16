@@ -375,6 +375,12 @@ Two implementations, same output shape:
 - **`blpl stage6`** — hand-rolled S-expression emitter. Pure Python stdlib; runs without KiCad installed. Good for CI and headless flows.
 - **`blpl stage6-plugin`** — invokes KiCad's bundled Python interpreter to call the native `pcbnew` API. Produces `.kicad_pcb` via KiCad's own writer (reliable v10 format, real `PCB_SHAPE` Edge.Cuts, native net objects). Schematic side still uses the emitter (v10 has no eeschema Python API).
 
+### How the schematic is drawn
+
+Not as a grid of parts. Each part with more than two pins is the anchor of a framed block; every one- and two-pin part joins the block of the part it serves — the one its Connections row names ("at U3 pin 8"), else the one it shares its rarest net with, else the nearest on the board. Small parts are turned the conventional way round (supply up, ground down, a series part on its side) and end in a power symbol named for the rail where it reads upright, otherwise in a global label. An IC's pins end in labels, and adjacent pins on one net are tied with a single terminal. Every net name is global, the name the board uses, so schematic and board agree (local labels were 87 of one board's parity errors). Blocks are packed onto the smallest landscape sheet that holds them. See `core/blpl/emitter/sch_layout.py`.
+
+Passives print their engineering value (`47µF`, `4.7kΩ`), parsed from the BOM description, on the schematic and the board alike; the MPN stays in its own field.
+
 ### The tracked copy: `kicad/`
 
 `.pipeline/` is a build directory and gitignored, so nothing in a project's history held its schematic or board. After every Stage 6, and again after a successful Stage 6a route, the latest emit is published to fixed names beside the board's design markdown:

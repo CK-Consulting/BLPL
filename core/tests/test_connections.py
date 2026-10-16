@@ -253,3 +253,35 @@ def test_doctor_sees_a_grouped_row_s_parts_and_a_connections_only_file(tmp_path)
     conn = tmp_path / "wiring.md"
     conn.write_text("| Ref | Pin 1 | Pin 2 |\n|---|---|---|\n| SW1 | BTN_A | GND |\n")
     assert conn in doctor._design_files(tmp_path)
+
+
+def test_a_connections_row_says_which_part_it_serves(tmp_path):
+    # A bypass capacitor is on a rail every IC shares, and C6 is not named
+    # after U1; its purpose cell is the one place that says where it goes.
+    a = _artifact(tmp_path, """
+| Ref | Pin 1 | Pin 2 | Purpose |
+|-----|-------|-------|---------|
+| C6 | VDD_3V3 | GND | HF decoupling, at U1 pin 2 |
+| R8 | I2C_SDA | VDD_3V3 | pull-up |
+""")
+    by_ref = {c["local_id"]: c for c in a["connectors"]}
+    assert by_ref["C6"]["near"] == "U1"
+    assert "near" not in by_ref["R8"]
+
+
+def test_engineering_values_for_passives_and_the_mpn_for_everything_else():
+    from blpl.core.stage5_emit_yaml_hdm import _display_value as value
+
+    def v(ref, desc):
+        return value(ref, {"mpn": "MPN-1", "description": desc})
+
+    assert v("C1", "CAP CER 47UF 6.3V X5R 1206") == "47µF"
+    assert v("C5", "CAP CER 0.1UF 16V X7R 0402") == "100nF"
+    assert v("R8", "RES 4.7K OHM 1% 1/16W 0402") == "4.7kΩ"
+    assert v("R2", "RES SMD 4K7") == "4.7kΩ"
+    assert v("FB1", "FERRITE BEAD 1 KOHM 0402") == "1kΩ"
+    assert v("L1", "IND 10UH 1A") == "10µH"
+    # A package code is not a value, and a part with none keeps its MPN.
+    assert v("R1", "RES 0402 470 OHM") == "470Ω"
+    assert v("C3", "CAP 0603") == "MPN-1"
+    assert v("U1", "MCU 32-bit 64MHz") == "MPN-1"
