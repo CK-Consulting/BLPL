@@ -378,45 +378,135 @@ def make_folder(checkout: Path, rel: str, shown: str) -> None:
             raise
 
 
+class _AgentFile:
+    """One file in the workspace, read through the agent a block at a time.
+
+    What main._file_response and main._spool_and_hash need of a file object
+    (read, seek, close), so the blob route streams a file of any size, and a
+    range of one, the way the mounted route streams from its descriptor.
+
+    Every read after the first names the version of the file the first one
+    saw, so the agent refuses (409) rather than hand over bytes of a file
+    replaced or rewritten since: everything sent is one file's bytes, and a
+    file classified by its first block is the file the rest comes from. One
+    client for the whole stream, but neither a connection to the agent nor
+    the gate is held between blocks: a slow download does not take one of
+    the agent's connection slots or hold a seal off, and a seal between
+    blocks ends the download rather than waiting for it.
+    """
+
+    BLOCK = 1024 * 1024
+
+    def __init__(self, checkout: Path, rel: str):
+        self.checkout, self.rel = checkout, rel
+        with gated(checkout):
+            self._client = _connect(checkout)
+        try:
+            self._buf, self.size, self._ident = self._fetch(0, None)
+        except BaseException:
+            self._client.close()
+            raise
+        self._at, self._pos = 0, 0
+
+    def _fetch(self, offset: int, expect: str | None) -> tuple[bytes, int, str]:
+        try:
+            with gated(self.checkout):
+                if self._client.version() < 2:
+                    # A workspace an older backend started, not yet replaced
+                    # (agentclient.PROTOCOL): its agent has no ranged read, so
+                    # the file comes whole, as one block, as it did then. Over
+                    # twice the upload limit that is a 413 until it is.
+                    from . import main as m
+
+                    data = self._client.read(str(self.checkout), self.rel,
+                                             max_bytes=m.UPLOAD_MAX_BYTES * 2)
+                    return data, len(data), ""
+                return self._client.read_range(str(self.checkout), self.rel, offset,
+                                               self.BLOCK, expect=expect)
+        except AgentCallError as exc:
+            if exc.status == 404:
+                raise HTTPException(status_code=404,
+                                    detail=f"{self.rel} is not a file in this project") from exc
+            raise HTTPException(status_code=_status(exc), detail=str(exc)) from exc
+
+    @property
+    def head(self) -> bytes:
+        return self._buf[:1024] if self._at == 0 else b""
+
+    def seek(self, pos: int) -> None:
+        self._pos = pos
+
+    def read(self, n: int = -1) -> bytes:
+        if self._pos >= self.size:
+            return b""
+        if not self._at <= self._pos < self._at + len(self._buf):
+            self._buf, _, _ = self._fetch(self._pos, self._ident)
+            self._at = self._pos
+            if not self._buf:
+                return b""
+        i = self._pos - self._at
+        out = self._buf[i:] if n is None or n < 0 else self._buf[i:i + n]
+        self._pos += len(out)
+        return out
+
+    def close(self) -> None:
+        self._client.close()
+
+
 def blob(checkout: Path, rel: str, request=None, verdict_for=None) -> Response:
     """The bytes of one file, with the same disposition rules as the mounted route.
 
     A PDF goes to the browser's viewer only if these exact bytes have a clean
     verdict from this backend's own inspection, as on the mounted route; any
-    other PDF is an opaque download. The bytes are read once, through the
-    agent, and the buffer that was hashed is the buffer that is sent, so a
-    file swapped in the workspace afterwards goes out under no verdict at all.
+    other PDF is an opaque download. A PDF within the upload limit is spooled
+    through the agent and hashed, and the spool that was hashed is what is
+    sent, so a file swapped in the workspace afterwards goes out under no
+    verdict at all. Anything else, a PDF over the limit included, is streamed
+    from the workspace as it is read (_AgentFile), with Range honoured.
     """
-    import hashlib
-    import io
-
     from blpl.core import quarantine
 
     from . import main as m
 
     parts = tree_rel(rel).split("/")
     name = parts[-1]
-    with agent(checkout) as c:
-        data = c.read(str(checkout), "/".join(parts), max_bytes=m.UPLOAD_MAX_BYTES * 2)
-    if parts[0] == quarantine.QUARANTINE_DIRNAME:
-        return Response(data, media_type="application/octet-stream", headers={
-            "Content-Disposition": m._disposition("attachment", name),
-            "X-Content-Type-Options": "nosniff",
-            "Content-Security-Policy": m._INERT_CSP,
-            "X-BLPL-Quarantined": "1",
-        })
-    if quarantine.looks_like_pdf(data):
-        if len(data) > m.UPLOAD_MAX_BYTES or verdict_for is None:
-            return Response(data, media_type="application/octet-stream",
-                            headers=m._opaque_headers(name, "too_large" if verdict_for else "none"))
-        digest = hashlib.sha256(data).hexdigest()
-        return m._pdf_response(request, io.BytesIO(data), len(data), digest, name, verdict_for(digest))
-    media_type, inline = m._blob_disposition(Path(name))
-    return Response(data, media_type=media_type, headers={
-        "X-Content-Type-Options": "nosniff",
-        "Content-Disposition": m._disposition("inline" if inline else "attachment", name),
-        "Content-Security-Policy": m._INERT_CSP,
-    })
+    fh = _AgentFile(checkout, "/".join(parts))
+    try:
+        if parts[0] == quarantine.QUARANTINE_DIRNAME:
+            return m._file_response(request, fh, fh.size, "application/octet-stream", {
+                "Content-Disposition": m._disposition("attachment", name),
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": m._INERT_CSP,
+                "X-BLPL-Quarantined": "1",
+            })
+        if not quarantine.looks_like_pdf(fh.head):
+            media_type, inline = m._blob_disposition(Path(name))
+            return m._file_response(request, fh, fh.size, media_type, {
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": m._disposition("inline" if inline else "attachment", name),
+                "Content-Security-Policy": m._INERT_CSP,
+            })
+        if fh.size > m.UPLOAD_MAX_BYTES or verdict_for is None:
+            # Never judged, so never inline: streamed as an attachment with no
+            # validator, as the mounted route sends a PDF over the limit.
+            return m._file_response(request, fh, fh.size, "application/octet-stream",
+                                    m._opaque_headers(name, "too_large" if verdict_for else "none"))
+        spool, digest, total = m._spool_and_hash(fh, m.UPLOAD_MAX_BYTES)
+    except BaseException:
+        fh.close()
+        raise
+    fh.close()
+    try:
+        # Not expected: every block was read from the version the size came
+        # from. Said rather than judged if it happens.
+        if total != fh.size:
+            raise HTTPException(status_code=409,
+                                detail=f"{name} changed while it was being read; try again")
+        verdict = verdict_for(digest)
+    except BaseException:
+        spool.close()
+        raise
+    return m._pdf_response(request, spool, total, digest, name, verdict)
 
 
 async def accept_upload(checkout: Path, data: bytes, **meta: Any) -> dict:

@@ -830,6 +830,15 @@ sealing in a container, storage with limits.**
     inline only on this backend's own verdict for those exact bytes. A vendor
     bundle's PDF entries are read out of the zip the backend already holds and
     inspected there too.
+  - the blob route streams through the agent (`/fs/read_range`), a block at a
+    time, with Range honoured, so a file of any size downloads as it does
+    from the mount. Each block after the first names the file version the
+    first one saw, and the agent answers 409 rather than send bytes of a file
+    rewritten or replaced since. A PDF within the upload limit is spooled and
+    hashed first, and the spool is what is sent; one over it goes out as an
+    attachment with `X-BLPL-PDF-Verdict: too_large` and no verdict, as on the
+    mounted route. The gate is taken per block, so a long download does not
+    hold a seal off; a seal mid-download ends it;
 - Changing a project's remote is done by the agent too (`/git/set_remote`).
   The origin lock is a flock in the project's git directory, and gVisor keeps
   file locks inside the sandbox. A remote change made on the host could
@@ -1293,9 +1302,6 @@ listed below answer 503.
   - KiCad open;
   - project create, clone and import;
   - members removal (worktree removal).
-- **The blob route's size limit through the agent.** It reads a file whole,
-  at most twice the upload limit, so a larger file is a 413 rather than a
-  download. Streaming a read through the agent would lift it.
 
 **Phase 5: terminal and desktops.**
 

@@ -74,7 +74,10 @@ class Access:
             base,
             agent_dir=Mount(kind="bind", source=f"{self.host_agent_root}/{name}",
                             target=AGENT_DIR),
-            env={**base.env, "BLPL_AGENT_ROOTS": ":".join(roots)},
+            # The protocol is in the spec so that a backend speaking a newer
+            # one sees a workspace an older backend started as stale.
+            env={**base.env, "BLPL_AGENT_ROOTS": ":".join(roots),
+                 "BLPL_AGENT_PROTOCOL": str(agentclient.PROTOCOL)},
         )
 
     def agent_dir(self, project: str) -> Path:

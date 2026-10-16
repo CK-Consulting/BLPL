@@ -88,6 +88,13 @@ def current_token(agent_dir: Path, server_key: bytes, container: str) -> str | N
 NETWORK_TIMEOUT_S = 690.0
 
 
+# The agent protocol this control plane is written for (agent.VERSION in the
+# same image). It is part of every workspace's spec, so raising it marks a
+# workspace started by an older backend stale, to be replaced once idle; until
+# then a caller asks AgentClient.version() before using a newer verb.
+PROTOCOL = 2
+
+
 class AgentClient:
     """Synchronous: the backend's file and git routes are plain functions."""
 
@@ -99,6 +106,7 @@ class AgentClient:
             headers={"Authorization": f"Bearer {token}"},
             timeout=httpx.Timeout(timeout, connect=5.0),
         )
+        self._version: int | None = None
 
     def close(self) -> None:
         self._http.close()
@@ -119,7 +127,16 @@ class AgentClient:
         return self._check(self._http.post(path, content=json.dumps(body or {}), **kw)).json()
 
     def health(self) -> dict:
-        return self._check(self._http.get("/health")).json()
+        h = self._check(self._http.get("/health")).json()
+        self._version = int(h.get("version", 0))
+        return h
+
+    def version(self) -> int:
+        """The agent's protocol version: from the health check a connection
+        starts with, or asked now."""
+        if self._version is None:
+            self.health()
+        return self._version or 0
 
     # files
     def list(self, checkout: str, path: str = "", *, skip: list[str] | None = None,
@@ -140,6 +157,23 @@ class AgentClient:
         if head is not None:
             body["head"] = head
         return self._check(self._http.post("/fs/read", content=json.dumps(body))).content
+
+    def read_range(self, checkout: str, path: str, offset: int, length: int, *,
+                   expect: str | None = None) -> tuple[bytes, int, str]:
+        """At most ``length`` bytes from ``offset``, the file's size, and its
+        version. With ``expect``, a 409 (kind ``changed``) if the file is no
+        longer that version."""
+        body: dict[str, Any] = {"checkout": checkout, "path": path, "offset": offset,
+                                "length": length}
+        if expect is not None:
+            body["expect"] = expect
+        # Closed after each block: a download is paced by whoever reads it, and
+        # a connection kept between blocks holds one of the agent's few slots
+        # (serving.Bounded) for as long as the slowest reader takes (Codex,
+        # PR #35).
+        r = self._check(self._http.post("/fs/read_range", content=json.dumps(body),
+                                        headers={"Connection": "close"}))
+        return r.content, int(r.headers["X-File-Size"]), r.headers["X-File-Id"]
 
     def write(self, checkout: str, path: str, data: bytes, *, mkdirs: bool = False) -> dict:
         r = self._http.post("/fs/write", params={"checkout": checkout, "path": path,

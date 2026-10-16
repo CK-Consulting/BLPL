@@ -74,8 +74,13 @@ from app import serving as _serving  # type: ignore[import-not-found]
 
 logger = logging.getLogger("blpl.wsagent")
 
-VERSION = 1
+# The protocol this agent speaks, reported by /health. Raised with every verb
+# the control plane may call that an older agent does not have, and equal to
+# agentclient.PROTOCOL in the same image. 2: /fs/read_range.
+VERSION = 2
 MAX_BODY = 160 * 1024 * 1024  # an upload's cap plus headroom
+# The most one ranged read returns: a large file goes out as a run of these.
+READ_RANGE_MAX = 8 * 1024 * 1024
 RUN_LOG_DIR = Path(os.environ.get("BLPL_AGENT_RUN_LOGS", "/tmp/blpl-runs"))
 CANCEL_GRACE_S = 10.0
 # How long a held origin lock waits for the control plane's release before
@@ -629,14 +634,9 @@ class Agent:
                 "symlink": stat.S_ISLNK(st.st_mode), "bytes": st.st_size,
                 "mtime": st.st_mtime}
 
-    def fs_read(self, b: dict) -> bytes:
+    def _open_regular(self, b: dict):
         checkout = self.fs.checkout(b.get("checkout"))
         parts = self.fs.parts(b.get("path"))
-        cap = int(b.get("max_bytes", MAX_BODY))
-        # At most this many bytes from the start, whatever the file's size: the
-        # first kilobyte says whether it is a PDF before anything decides to
-        # read the rest.
-        head = b.get("head")
         with self.fs.dir_fd(checkout, parts[:-1]) as dfd:
             try:
                 fd = open_at(parts[-1], dfd, os.O_RDONLY, want_dir=False)
@@ -646,15 +646,57 @@ class Agent:
                 raise
             except OSError as e:
                 raise _forbidden(f"cannot open {parts[-1]!r}: {e.strerror}") from None
-        with os.fdopen(fd, "rb") as fh:
+        fh = os.fdopen(fd, "rb")
+        try:
             st = os.fstat(fh.fileno())
             if not stat.S_ISREG(st.st_mode):
                 raise _forbidden("not a regular file")
+        except BaseException:
+            fh.close()
+            raise
+        return fh, st
+
+    def fs_read(self, b: dict) -> bytes:
+        cap = int(b.get("max_bytes", MAX_BODY))
+        # At most this many bytes from the start, whatever the file's size: the
+        # first kilobyte says whether it is a PDF before anything decides to
+        # read the rest.
+        head = b.get("head")
+        fh, st = self._open_regular(b)
+        with fh:
             if head is not None:
                 return fh.read(max(0, int(head)))
             if st.st_size > cap:
                 raise AgentError(413, f"file is {st.st_size} bytes, over {cap}", "too_large")
             return fh.read()
+
+    def fs_read_range(self, b: dict) -> tuple[bytes, dict[str, str]]:
+        """At most ``length`` bytes from ``offset``, and which file they are from.
+
+        For a file too large for one body: the backend streams it as a run of
+        these. ``X-File-Id`` names this version of the file (device, inode,
+        size, mtime and ctime). With ``expect`` set to one, a file that is no
+        longer that version is a 409 rather than bytes of another, so a
+        download put together from many reads is one file's bytes, and a file
+        classified by its first read is still the file the last read is from.
+        """
+        offset = max(0, int(b.get("offset", 0)))
+        length = min(max(0, int(b.get("length", READ_RANGE_MAX))), READ_RANGE_MAX)
+        def ident(st: os.stat_result) -> str:
+            return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}"
+
+        fh, st = self._open_regular(b)
+        with fh:
+            before = ident(st)
+            expect = b.get("expect")
+            if expect is not None and expect != before:
+                raise AgentError(409, "the file changed while it was being read", "changed")
+            fh.seek(offset)
+            data = fh.read(max(0, min(length, st.st_size - offset)))
+            # Again after: a write during this read is a change too.
+            if ident(os.fstat(fh.fileno())) != before:
+                raise AgentError(409, "the file changed while it was being read", "changed")
+        return data, {"X-File-Size": str(st.st_size), "X-File-Id": before}
 
     def fs_write(self, q: dict, data: bytes) -> dict:
         checkout = self.fs.checkout(q.get("checkout"))
@@ -1470,6 +1512,9 @@ def make_handler(agent: Agent) -> type[BaseHTTPRequestHandler]:
                 if method == "POST" and path == "/fs/read":
                     body = json.loads(self._body() or b"{}")
                     return self._send(200, agent.fs_read(body), "application/octet-stream")
+                if method == "POST" and path == "/fs/read_range":
+                    data, headers = agent.fs_read_range(json.loads(self._body() or b"{}"))
+                    return self._send(200, data, "application/octet-stream", headers)
                 if method == "POST" and path in _JSON_ROUTES:
                     body = json.loads(self._body() or b"{}")
                     if not isinstance(body, dict):

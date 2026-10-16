@@ -62,13 +62,19 @@ from test_git_endpoints import *  # noqa: E402,F401,F403
 from test_remote_urls import *  # noqa: E402,F401,F403
 from test_uploads_api import *  # noqa: E402,F401,F403
 from test_uploads_api import _no_scanner, _upload  # noqa: E402,F401
-# The PDF verdict routes, whose bytes the agent reads and this backend judges.
+# The PDF verdict routes, whose bytes the agent reads and this backend judges,
+# and the blob route's byte ranges, which it cuts from blocks the agent reads.
 # Not the ones that fail a read by patching the mounted route's own file
-# handling (_open_once, a growing file), which the agent does not use. Nor
-# test_a_pdf_over_the_limit_is_never_judged_or_inline: through the agent the
-# blob route reads at most twice the upload limit, so a file past that is a 413
-# rather than a download. The verdict routes still refuse it as too large.
+# handling (_open_once, a growing file), which the agent does not use.
 from test_pdf_verdicts import (  # noqa: E402,F401
+    test_a_large_non_pdf_is_streamed_not_read_whole,
+    test_a_large_pdf_is_hashed_in_pieces_too,
+    test_a_malformed_or_multiple_range_gets_the_whole_file,
+    test_a_pdf_over_the_limit_is_never_judged_or_inline,
+    test_a_range_of_a_non_pdf,
+    test_an_open_ended_and_a_suffix_range,
+    test_an_unsatisfiable_range_is_416_with_the_size,
+    test_bytes_changed_in_place_after_judging_are_not_what_is_sent,
     test_a_clean_verdict_from_another_inspector_does_not_count,
     test_a_filename_cannot_inject_a_header,
     test_a_held_pdf_is_never_inline,
@@ -1117,3 +1123,74 @@ def test_a_pdf_over_the_limit_is_not_judged_through_the_agent(unlocked, monkeypa
     assert v["pdf"] is True and v["too_large"] is True and v["sha256"] is None
     assert v["inline"] is False
     assert unlocked.post("/api/projects/mine/blob/inspect", json={"path": "big.pdf"}).status_code == 413
+
+
+def test_an_older_agent_without_ranged_reads_still_serves_blobs(unlocked, via_agent, monkeypatch):
+    """Codex, PR #35: a workspace an older backend started runs an agent with
+    no /fs/read_range until it is replaced. Asked its version, it gets the
+    whole-file read it has, as before: ranges still cut, a clean PDF still
+    is judged, and only a file over twice the limit is refused."""
+    import app.main as main
+    from app.sandbox import agent as agent_mod
+
+    def no_route(self, b):
+        raise agent_mod.AgentError(404, "no route POST /fs/read_range", "notfound")
+
+    monkeypatch.setattr(agent_mod, "VERSION", 1)
+    monkeypatch.setattr(agent_mod.Agent, "fs_read_range", no_route)
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    proj = main.PROJECTS_ROOT / "mine"
+    data = b"PK\x03\x04" + bytes(range(256)) * 40
+    (proj / "gerbers.zip").write_bytes(data)
+    whole = unlocked.get("/api/projects/mine/blob", params={"path": "gerbers.zip"})
+    assert whole.status_code == 200 and whole.content == data
+    part = unlocked.get("/api/projects/mine/blob", params={"path": "gerbers.zip"},
+                        headers={"Range": "bytes=10-19"})
+    assert part.status_code == 206 and part.content == data[10:20]
+
+    (proj / "a.pdf").write_bytes(BENIGN)
+    unlocked.post("/api/projects/mine/blob/inspect", json={"path": "a.pdf"})
+    r = unlocked.get("/api/projects/mine/blob", params={"path": "a.pdf"})
+    assert r.status_code == 200 and r.content == BENIGN
+    assert r.headers["x-blpl-pdf-verdict"] != "too_large"
+
+    monkeypatch.setattr(main, "UPLOAD_MAX_BYTES", 16)
+    assert unlocked.get("/api/projects/mine/blob", params={"path": "a.pdf"}).status_code == 413
+
+
+def test_a_streamed_blob_holds_no_agent_connection_between_blocks(unlocked, via_agent):
+    """Codex, PR #35: the agent serves at most 32 connections at once. A
+    download kept its connection open while the browser read, so a few slow
+    ones would leave every other operation on the workspace a 503."""
+    import time as _time
+
+    import app.main as main
+    import app.workspace_files as wf
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    proj = main.PROJECTS_ROOT / "mine"
+    data = bytes(range(256)) * (3 * wf._AgentFile.BLOCK // 256 + 7)
+    (proj / "big.bin").write_bytes(data)
+    server = via_agent.server
+
+    def held() -> int:
+        # The agent releases a slot as its handler thread ends, just after
+        # the response: wait for it rather than race it.
+        deadline = _time.monotonic() + 2
+        while _time.monotonic() < deadline:
+            n = server.max_connections - server._slots._value
+            if n == 0:
+                return 0
+            _time.sleep(0.01)
+        return n
+
+    fh = wf._AgentFile(proj, "big.bin")
+    try:
+        assert held() == 0
+        got = b""
+        while chunk := fh.read(256 * 1024):
+            got += chunk
+            assert held() == 0
+    finally:
+        fh.close()
+    assert got == data

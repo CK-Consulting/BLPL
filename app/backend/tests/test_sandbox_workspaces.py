@@ -121,6 +121,28 @@ def test_a_workspace_started_without_an_agent_is_replaced(setup):
     assert ("stop", access.spec("board").key) in driver.ops
 
 
+def test_a_workspace_an_older_backend_started_is_stale(setup, monkeypatch):
+    """Codex, PR #35: a workspace started before an upgrade runs the older
+    agent, without the verbs the new backend calls. The protocol is in the
+    spec, so raising it marks that workspace stale (replaced once idle), and
+    the client reports the version a caller checks until then."""
+    from app.sandbox.driver import LABEL_SPEC
+
+    access, _, _ = setup
+    assert agent_mod.VERSION == agentclient.PROTOCOL
+    spec = access.spec("board")
+    assert spec.env["BLPL_AGENT_PROTOCOL"] == str(agentclient.PROTOCOL)
+    label = build_create_body(spec, DockerConfig(network="blpl-egress"))["Labels"][LABEL_SPEC]
+    monkeypatch.setattr(agentclient, "PROTOCOL", agentclient.PROTOCOL - 1)
+    older = build_create_body(access.spec("board"), DockerConfig(network="blpl-egress"))
+    assert older["Labels"][LABEL_SPEC] != label
+    monkeypatch.undo()
+
+    c = asyncio.run(access.ensure("board"))
+    assert c.version() == agent_mod.VERSION
+    c.close()
+
+
 def test_agent_idle_is_asked_without_starting_anything(setup):
     access, driver, projects = setup
     name = access.spec("board").key.container_name()
