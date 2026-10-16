@@ -423,7 +423,7 @@ export function BoardConfigPanel({
       {note && <p className="muted small">{note}</p>}
 
       <div className="field-row">
-        <button className="btn" onClick={save} disabled={busy}>
+        <button className="btn primary" onClick={save} disabled={busy}>
           {busy ? "Saving…" : "Save board config"}
         </button>
         {dirty && !busy && (

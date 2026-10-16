@@ -738,6 +738,15 @@ export function NewProject({
  * account; a project gets the wrench and screwdriver, and both say what they
  * are.
  */
+type ProjectSettingsTab = "board" | "routing" | "git" | "policy";
+
+const PROJECT_SETTINGS_TABS: { id: ProjectSettingsTab; label: string }[] = [
+  { id: "board", label: "Board" },
+  { id: "routing", label: "Task routing" },
+  { id: "git", label: "Git" },
+  { id: "policy", label: "Library policy" },
+];
+
 export function ProjectSettings({
   projectId,
   board,
@@ -753,6 +762,7 @@ export function ProjectSettings({
   board?: string | null;
 }) {
   const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<ProjectSettingsTab>("board");
   const [boardDirty, setBoardDirty] = useState(false);
   const [asking, setAsking] = useState(false);
   // Closing with board edits unsaved discards them, and the dialog's other
@@ -779,19 +789,54 @@ export function ProjectSettings({
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <header className="modal-head">
           <h2>Project settings — {projectId}</h2>
+          {/* Tabs, as account settings has. Stacked in one scroll, four panels
+              each had a Save of its own, and the one at the bottom of the
+              dialog, the library policy's plain "Save", read as the dialog's
+              Save. A trapezoid drawn in the board panel and "saved" with it was
+              never written, and the next run built the old rectangle. One
+              panel per tab puts each Save beside the only settings it saves. */}
+          <div className="seg small settings-tabs" role="tablist">
+            {PROJECT_SETTINGS_TABS.map((t) => (
+              <button
+                key={t.id}
+                role="tab"
+                aria-selected={tab === t.id}
+                className={tab === t.id ? "on" : ""}
+                onClick={() => setTab(t.id)}
+              >
+                {t.label}
+                {t.id === "board" && boardDirty && (
+                  <span className="tab-dirty" title="Unsaved board changes"> •</span>
+                )}
+              </button>
+            ))}
+          </div>
+          <span className="spacer" />
           <button className="link" onClick={close}>
             Close
           </button>
         </header>
+        {/* Every panel stays mounted and only the chosen one is shown: a board
+            outline half drawn must survive a look at the Git tab, and the close
+            guard below needs the board panel's dirty state whichever tab is
+            open. */}
         <div className="modal-body">
-          <BoardConfigPanel
-            projectId={projectId}
-            board={board ?? null}
-            onDirtyChange={setBoardDirty}
-          />
-          <ProjectRoutingPanel projectId={projectId} />
-          <ProjectGitPanel projectId={projectId} onRemoteChanged={onRemoteChanged} />
-          <ProjectPolicyPanel projectId={projectId} />
+          <div role="tabpanel" hidden={tab !== "board"}>
+            <BoardConfigPanel
+              projectId={projectId}
+              board={board ?? null}
+              onDirtyChange={setBoardDirty}
+            />
+          </div>
+          <div role="tabpanel" hidden={tab !== "routing"}>
+            <ProjectRoutingPanel projectId={projectId} />
+          </div>
+          <div role="tabpanel" hidden={tab !== "git"}>
+            <ProjectGitPanel projectId={projectId} onRemoteChanged={onRemoteChanged} />
+          </div>
+          <div role="tabpanel" hidden={tab !== "policy"}>
+            <ProjectPolicyPanel projectId={projectId} />
+          </div>
         </div>
       </div>
       {asking && (
@@ -799,7 +844,7 @@ export function ProjectSettings({
           title="Discard board changes?"
           confirmLabel="Discard"
           danger
-          message="The board config has edits that were not saved with “Save board config”. The other panels’ Save buttons do not save it. Close and discard them?"
+          message="The Board tab has edits that were not saved with “Save board config”. The other tabs’ Save buttons do not save it. Close and discard them?"
           onConfirm={discard}
           onClose={() => setAsking(false)}
         />
