@@ -126,3 +126,11 @@ def test_a_library_the_next_run_no_longer_uses_is_gone(tmp_path):
     publish.publish(pipe, BASE, tmp_path / "kicad", "ear-tag")
     assert not (tmp_path / "kicad" / "libs" / "Resistor_SMD.pretty").exists()
     assert (tmp_path / "kicad" / "libs" / "Device.kicad_sym").is_file()
+
+
+def test_a_partial_emit_publishes_nothing(tmp_path, capsys):
+    _emit(tmp_path / "pipe")
+    (tmp_path / "pipe" / f"{BASE}.kicad_sch").unlink()
+    assert publish.publish(tmp_path / "pipe", BASE, tmp_path / "kicad", "ear-tag") == {}
+    assert not (tmp_path / "kicad").exists()
+    assert "kicad_sch not emitted" in capsys.readouterr().out
