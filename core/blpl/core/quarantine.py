@@ -1065,6 +1065,7 @@ def remove_library_symbol(project_dir: str | Path, library: str, symbol: str, *,
     the file once none of their symbols are left in it.
     """
     out = library_upload.remove_symbol(project_dir, library, symbol)
+    before = out.pop("before")
     path = out["path"]
 
     def change(row: dict) -> bool:
@@ -1085,10 +1086,18 @@ def remove_library_symbol(project_dir: str | Path, library: str, symbol: str, *,
             row["placed"] = [p for p in row["placed"] if p != path]
         return True
 
-    _apply(project_dir, change, [{
-        "event": EVENT_SYMBOL_REMOVED, "path": path, "library": library, "symbol": symbol,
-        "file_removed": out["file_removed"], "by": by, "at": _now(),
-    }])
+    try:
+        _apply(project_dir, change, [{
+            "event": EVENT_SYMBOL_REMOVED, "path": path, "library": library, "symbol": symbol,
+            "file_removed": out["file_removed"], "by": by, "at": _now(),
+        }])
+    except BaseException:
+        # The ledger still says the upload's symbol is in that file. Left
+        # removed, the file would no longer be what the ledger describes, and
+        # the route reports a failure it then does not commit (Codex, PR #32).
+        # So the file goes back as it was.
+        library_upload.restore_texts(project_dir, [(path, before)])
+        raise
     return out
 
 

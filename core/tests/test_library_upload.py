@@ -635,6 +635,62 @@ def test_a_symbol_in_a_symdir_is_its_own_file_and_goes_with_it(tmp_path):
     assert (symdir / "KEEP.kicad_sym").exists()
 
 
+@pytest.mark.parametrize("flat", [True, False])
+def test_a_symbol_removal_the_ledger_cannot_record_is_put_back(tmp_path, monkeypatch, flat):
+    """The file was changed, or deleted, before the ledger write failed, and the
+    route then reported a failure it did not commit: the symbol was gone while
+    the ledger still said the upload's symbol was in that file (Codex, PR #32)."""
+    if not flat:
+        (tmp_path / "libraries" / "symbols" / "myproj.kicad_symdir").mkdir(parents=True)
+    _up(tmp_path, _symlib(_symbol("A"), _symbol("B")), "symbol", "ab.kicad_sym")
+    files = sorted((tmp_path / "libraries" / "symbols").rglob("*.kicad_sym"))
+    before = {f: f.read_bytes() for f in files}
+    ledger_before = quarantine.ledger(tmp_path)
+
+    def full(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(quarantine, "_save", full)
+    with pytest.raises(OSError):
+        quarantine.remove_library_symbol(tmp_path, "myproj", "A", by="g@x")
+    assert {f: f.read_bytes() for f in files} == before
+    assert quarantine.ledger(tmp_path) == ledger_before
+
+
+def test_a_library_write_never_goes_through_a_link(tmp_path):
+    """Nothing checks for links first and then writes by path: that was a race
+    with whatever else writes the checkout (Codex, PR #32). Each write opens
+    its way down from the project without following one, so a link anywhere
+    on the path, or at the file, is refused and nothing lands where it points."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    proj = tmp_path / "proj"
+    fps = proj / "libraries" / "footprints"
+    fps.mkdir(parents=True)
+    (fps / "myproj.pretty").symlink_to(outside)
+    with pytest.raises(quarantine.LinkRefused):
+        library_upload.place_footprint(_footprint("PART"), proj, "myproj")
+    assert list(outside.iterdir()) == []
+
+    # A link at the file itself: the library file a merge would rewrite.
+    syms = proj / "libraries" / "symbols"
+    syms.mkdir(parents=True)
+    target = outside / "elsewhere.kicad_sym"
+    target.write_bytes(_symlib(_symbol("THEIRS")))
+    (syms / "myproj.kicad_sym").symlink_to(target)
+    with pytest.raises(quarantine.LinkRefused):
+        library_upload.place_symbols(_symlib(_symbol("MINE")), proj, "myproj")
+    assert b"MINE" not in target.read_bytes()
+
+    # And a whole libraries/ that is a link.
+    other = tmp_path / "other"
+    (other / "libraries").mkdir(parents=True)
+    (other / "libraries" / "3dmodels").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(quarantine.LinkRefused):
+        library_upload.place_model(STEP, other, "myproj", "m.step")
+    assert sorted(p.name for p in outside.iterdir()) == ["elsewhere.kicad_sym"]
+
+
 def test_a_symbol_another_one_extends_is_not_removed(tmp_path):
     _up(tmp_path, _symlib(_symbol("PARENT"), _symbol("CHILD", extends="PARENT")), "symbol", "p.kicad_sym")
     with pytest.raises(library_upload.Refused, match="CHILD in library myproj extends PARENT"):
