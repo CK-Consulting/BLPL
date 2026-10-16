@@ -379,6 +379,10 @@ def is_controlled(net: dict, classes: dict) -> bool:
         return True        # a class that tries to say something is not nothing
 
 
+#: The clearance pro.build() gives a class that declares none.
+_DEFAULT_CLEARANCE_MM = 0.2
+
+
 def review(hdm: dict) -> list[dict]:
     """What a fab cannot build to, or a designer did not finish. Stage 8 findings."""
     out: list[dict] = []
@@ -478,14 +482,17 @@ def review(hdm: dict) -> list[dict]:
                 f"Add `layers: [F.Cu]` (or the layers the fab's calculator gave this width "
                 f"for) to net_classes.{name}.impedance, and route these nets only there.",
                 nets_=members)
-        if (spec.mode == "coplanar" and "coplanar_gap" in rules and "clearance" in rules
-                and float(rules["coplanar_gap"]) < float(rules["clearance"]) - 1e-9):
+        # The clearance the .kicad_pro will carry: an omitted one is the
+        # emitter's 0.2 mm default, not no clearance at all (Codex, PR #31).
+        clearance = rules.get("clearance", _DEFAULT_CLEARANCE_MM)
+        if (spec.mode == "coplanar" and "coplanar_gap" in rules
+                and float(rules["coplanar_gap"]) < float(clearance) - 1e-9):
             finding(
                 "ZC-010", "error",
                 f"Class {name} wants its ground pour {rules['coplanar_gap']} mm from the "
-                f"trace but declares a clearance of {rules['clearance']} mm, so the pour "
+                f"trace but has a clearance of {clearance} mm, so the pour "
                 "cannot come that close without breaking the project's own clearance.",
-                f"Lower net_classes.{name}.clearance to the coplanar_gap if the fab allows "
+                f"Set net_classes.{name}.clearance to the coplanar_gap if the fab allows "
                 "it, or get a coplanar width for a gap of at least the clearance.",
                 nets_=members)
         if spec.mode == "coplanar" and "coplanar_gap" not in rules:

@@ -249,7 +249,8 @@ The rest follows from that:
     pour that sets its impedance alongside the width. KiCad keeps the pour the
     class clearance from the trace, so `.kicad_pro` raises the clearance to a
     larger gap, and never lowers it to a smaller one.
-  - **ZC-010**: a coplanar gap smaller than the class's own clearance. The
+  - **ZC-010**: a coplanar gap smaller than the class's own clearance (the
+    emitter's 0.2 mm when the class declares none). The
     pour cannot come that close without breaking the project's clearance.
   - **ZC-007**: on a board with more than two copper layers, a class does not
     say which layer its width is for (`impedance.layers`).

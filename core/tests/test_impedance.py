@@ -398,7 +398,7 @@ def test_a_coplanar_class_needs_its_ground_gap_and_the_sheet_prints_it():
     (f,) = z.review(hdm)
     assert (f["rule_id"], f["severity"]) == ("ZC-006", "error")
     assert "| CPW | 50 Ω coplanar | ±10% | any | adjacent | 0.3 | NOT SET | ANT |" in z.fab_table(hdm)
-    hdm["net_classes"]["CPW"]["coplanar_gap"] = 0.15
+    hdm["net_classes"]["CPW"].update(coplanar_gap=0.15, clearance=0.15)
     assert z.review(hdm) == []
     assert "| CPW | 50 Ω coplanar | ±10% | any | adjacent | 0.3 | 0.15 | ANT |" in z.fab_table(hdm)
 
@@ -572,7 +572,7 @@ def test_a_release_with_a_coplanar_line_and_no_ground_is_not_quotable(released):
     proj, build = released
     (proj / "dev.kicad_pcb").write_text(
         '(kicad_pcb (segment (start 0 0) (end 10 0) (width 0.3) (layer "F.Cu") (net "ANT")))\n')
-    manifest = build({"net_classes": {"CPW": {"trace_width": 0.3, "coplanar_gap": 0.15,
+    manifest = build({"net_classes": {"CPW": {"trace_width": 0.3, "clearance": 0.15, "coplanar_gap": 0.15,
                                               "impedance": {"ohms": 50, "mode": "coplanar"}}},
                       "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}})
     assert not manifest["quotable"]
@@ -877,7 +877,7 @@ def test_a_plane_dependent_impedance_on_a_one_layer_board_is_an_error():
     seg = '(segment (start 0 0) (end 20 0) (width 0.35) (layer "F.Cu") (net "ANT"))'
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg})")) == [("RF", "F.Cu", "none")]
     # Coplanar can stand on its own ground beside the trace.
-    hdm["net_classes"]["RF"] = {"trace_width": 0.35, "coplanar_gap": 0.15,
+    hdm["net_classes"]["RF"] = {"trace_width": 0.35, "clearance": 0.15, "coplanar_gap": 0.15,
                                 "impedance": {"ohms": 50, "mode": "coplanar"}}
     assert z.review(hdm) == []
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg})")) == []
@@ -1039,3 +1039,14 @@ def test_adjacency_comes_from_the_boards_own_layer_table():
     assert z.board_copper(board) == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
     assert z.missing_reference(hdm, board) == [("RF", "F.Cu", "In1.Cu")]
     assert z.stackup_mismatch(hdm, board) and "4 copper layers" in z.stackup_mismatch(hdm, board)[0]
+
+
+def test_a_coplanar_gap_below_the_default_clearance_is_a_conflict():
+    """Codex, PR #31: with no clearance declared the .kicad_pro still carries
+    0.2 mm, so a 0.15 mm gap could pass neither KiCad's DRC nor the release."""
+    hdm = {"net_classes": {"CPW": {"trace_width": 0.3, "coplanar_gap": 0.15,
+                                   "impedance": {"ohms": 50, "mode": "coplanar"}}},
+           "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
+    assert "ZC-010" in [f["rule_id"] for f in z.review(hdm)]
+    hdm["net_classes"]["CPW"]["clearance"] = 0.15
+    assert "ZC-010" not in [f["rule_id"] for f in z.review(hdm)]
