@@ -66,7 +66,8 @@ def project_name(base: str, board: str | None) -> str:
 
 
 def publish(
-    base_dir: Path, base: str, dest_dir: Path, name: str, *, board: str | None = None
+    base_dir: Path, base: str, dest_dir: Path, name: str, *, board: str | None = None,
+    footprints_root: Path | None = None,
 ) -> dict[str, Path]:
     """Copy ``base_dir/<base>.kicad_*`` to ``dest_dir/<name>.kicad_*``.
 
@@ -93,12 +94,13 @@ def publish(
         dest = dest_dir / f"{name}{suffix}"
         _write_atomic(dest, data)
         out[suffix.removeprefix(".kicad_")] = dest
-    out.update(_publish_libraries(Path(base_dir), out, dest_dir, board))
+    out.update(_publish_libraries(Path(base_dir), out, dest_dir, board, footprints_root))
     return out
 
 
 def _publish_libraries(
-    pipeline_dir: Path, out: dict[str, Path], dest_dir: Path, board: str | None
+    pipeline_dir: Path, out: dict[str, Path], dest_dir: Path, board: str | None,
+    footprints_root: Path | None = None,
 ) -> dict[str, Path]:
     """Write ``libs/`` and the two tables beside the published project.
 
@@ -115,7 +117,8 @@ def _publish_libraries(
     if "sch" in out:
         sym_nicks = _write_symbol_libs(out["sch"], staging)
     if "pcb" in out:
-        fp_nicks, missing = _write_footprint_libs(out["pcb"], staging, pipeline_dir, board)
+        fp_nicks, missing = _write_footprint_libs(
+            out["pcb"], staging, pipeline_dir, board, footprints_root)
     final = dest_dir / LIBS_DIRNAME
     if final.exists():
         shutil.rmtree(final)
@@ -151,8 +154,15 @@ def _write_symbol_libs(sch_path: Path, libs: Path) -> list[str]:
 
 
 def _write_footprint_libs(
-    pcb_path: Path, libs: Path, pipeline_dir: Path, board: str | None
+    pcb_path: Path, libs: Path, pipeline_dir: Path, board: str | None,
+    footprints_root: Path | None = None,
 ) -> tuple[list[str], list[str]]:
+    """Copy each footprint the board names from where it was built from.
+
+    ``footprints_root``, when given, is the root the board was actually built
+    against (``stage6-plugin --footprints-root``) and is the only place looked:
+    a same-named footprint found through stage6's table instead could differ
+    from the one on the board."""
     tree = sexpr.parse(pcb_path.read_text(encoding="utf-8"))
     wanted = sorted({sexpr.unquote(fp[1]) for fp in sexpr.find_all(tree, "footprint")
                      if len(fp) > 1 and ":" in sexpr.unquote(fp[1])})
@@ -161,8 +171,11 @@ def _write_footprint_libs(
     missing: list[str] = []
     for lib_id in wanted:
         nick, _, name = lib_id.partition(":")
-        uri = uris.get(nick)
-        src = Path(os.path.expandvars(uri)) / f"{name}.kicad_mod" if uri else None
+        if footprints_root is not None:
+            src = Path(footprints_root) / f"{nick}.pretty" / f"{name}.kicad_mod"
+        else:
+            uri = uris.get(nick)
+            src = Path(os.path.expandvars(uri)) / f"{name}.kicad_mod" if uri else None
         if src is None or not src.is_file():
             missing.append(lib_id)
             continue

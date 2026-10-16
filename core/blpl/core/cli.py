@@ -369,7 +369,16 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     # The emitted board is named for what it *is*. On a multi-board project the
     # project name alone would give two boards the same stem and let the second
     # overwrite the first, so the board joins the name when there is one.
-    project_name = proj.name or "project"
+    #
+    # The project name is the HDM's, as stage6 names its schematic and project
+    # file. It was the checkout directory's, so a project whose name differed
+    # from its folder got a board whose stem matched nothing stage6 wrote, even
+    # with --stamp shared, and was never published (Codex, PR #40).
+    import yaml as _yaml
+
+    with hdm_path.open() as f:
+        hdm_data = _yaml.safe_load(f) or {}
+    project_name = (hdm_data.get("project") or {}).get("name") or proj.name or "project"
     board_name = _board(args, proj)
     stem = f"{project_name}_{board_name}" if board_name else project_name
     base = _re.sub(r"[^A-Za-z0-9._-]+", "_", stem.strip()) or "project"
@@ -391,11 +400,8 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     # KiCad's bundled Python doesn't ship with pyyaml; pre-convert to JSON so
     # the plugin reads via the stdlib json module.
     import json as _json
-    import yaml as _yaml
 
     hdm_json_path = _artifact(args, proj, "hdm.plugin")
-    with hdm_path.open() as f:
-        hdm_data = _yaml.safe_load(f) or {}
     with hdm_json_path.open("w") as f:
         _json.dump(hdm_data, f, indent=2)
 
@@ -425,7 +431,11 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     # The other Stage 6, so the same tracked copy — when it is a whole project.
     # Alone it writes only a board, and publish refuses a board without its
     # schematic and project; with --stamp shared with stage6 they are there.
-    _publish(proj, board_name, out_path.stem, "stage6-plugin")
+    # The footprints come from the root the board was built from: an override
+    # resolved through stage6's table could package a same-named footprint
+    # that is not the one on the board (Codex, PR #40).
+    _publish(proj, board_name, out_path.stem, "stage6-plugin",
+             footprints_root=Path(footprints_root) if args.footprints_root else None)
     return 0
 
 
@@ -905,7 +915,8 @@ def _cmd_stage6(args: argparse.Namespace) -> int:
     return 0
 
 
-def _publish(proj: Path, board: str | None, base: str, who: str) -> None:
+def _publish(proj: Path, board: str | None, base: str, who: str,
+             footprints_root: Path | None = None) -> None:
     """Copy the board just written to the fixed names git tracks. See publish.py.
 
     After stage6 and again after a route, so the tracked board is the routed
@@ -919,7 +930,7 @@ def _publish(proj: Path, board: str | None, base: str, who: str) -> None:
     try:
         out = publish.publish(
             project_manifest.pipeline_dir(proj), base, dest, publish.project_name(base, board),
-            board=board,
+            board=board, footprints_root=footprints_root,
         )
     except (OSError, ValueError) as exc:
         print(f"{who}: could not publish the board to {dest}: {exc}", file=sys.stderr)

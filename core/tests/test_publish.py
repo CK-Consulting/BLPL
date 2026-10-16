@@ -134,3 +134,15 @@ def test_a_partial_emit_publishes_nothing(tmp_path, capsys):
     assert publish.publish(tmp_path / "pipe", BASE, tmp_path / "kicad", "ear-tag") == {}
     assert not (tmp_path / "kicad").exists()
     assert "kicad_sch not emitted" in capsys.readouterr().out
+
+
+def test_footprints_come_from_the_root_the_board_was_built_from(tmp_path):
+    # stage6-plugin --footprints-root: the table's same-named footprint is not
+    # the one on the board.
+    pipe = _emit_with_libs(tmp_path)
+    other = tmp_path / "override" / "Resistor_SMD.pretty"
+    other.mkdir(parents=True)
+    (other / "R_0402.kicad_mod").write_text('(footprint "R_0402" (override))\n')
+    publish.publish(pipe, BASE, tmp_path / "kicad", "ear-tag", footprints_root=tmp_path / "override")
+    got = (tmp_path / "kicad" / "libs" / "Resistor_SMD.pretty" / "R_0402.kicad_mod").read_text()
+    assert "(override)" in got
