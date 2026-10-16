@@ -88,6 +88,16 @@ def test_a_pin_two_tables_disagree_about_is_said(tmp_path):
 | U1 | 1 | I2C_SCL |
 """)
     assert any(w["code"] == "STAGE0-007" and "U1 pin 1" in w["summary"] for w in a["warnings"])
+    # And the pin stays on the one net: kept, it sat in two and each emitter
+    # drew whichever it met last.
+    assert _pins(a, "U1")["1"] == "I2C_SDA"
+    nets = {n["name"]: n for n in s4.synthesize(a)["nets"]}
+    assert "I2C_SCL" not in nets
+
+
+def test_stage0_fails_on_a_pin_two_tables_disagree_about(tmp_path):
+    (tmp_path / "board.md").write_text(BOM + "\n| Ref | Pin | Net |\n|---|---|---|\n| U1 | 1 | I2C_SCL |\n")
+    assert cli.main(["stage0-det", "--project-dir", str(tmp_path)]) == 1
 
 
 def test_grouped_bom_references_become_separate_parts():
@@ -95,6 +105,8 @@ def test_grouped_bom_references_become_separate_parts():
     assert s0.split_refs("C1, C1, C2, C3, C2, C3") == ["C1", "C2", "C3"]
     assert s0.split_refs("R1-R6") == ["R1", "R2", "R3", "R4", "R5", "R6"]
     assert s0.split_refs("C1..C3") == ["C1", "C2", "C3"]
+    assert s0.split_refs("R1 - R4") == ["R1", "R2", "R3", "R4"]
+    assert s0.split_refs("R1 to R3, C1") == ["R1", "R2", "R3", "C1"]
     assert s0.split_refs("J_RF_GNSS, J_RF_LRLF") == ["J_RF_GNSS", "J_RF_LRLF"]
     # Not a range: a downward run, or two prefixes.
     assert s0.split_refs("R6-R1") == ["R6-R1"]
@@ -123,6 +135,12 @@ def test_a_placed_part_no_net_reaches_is_an_error(tmp_path):
     errs = [w for w in nets["warnings"] if w["code"] == s4.UNCONNECTED_CODE]
     assert errs and errs[0]["unconnected_parts"] == ["R8", "C6", "D1"]
     assert errs[0]["summary"].startswith("error:")
+
+
+def test_a_net_tie_with_no_nets_is_counted(tmp_path):
+    md = tmp_path / "board.md"
+    md.write_text("| Ref | MPN | Package |\n|---|---|---|\n| NT1 | NetTie | NetTie_2 |\n")
+    assert s4.unconnected_parts(s0.extract([md]), None, {}) == ["NT1"]
 
 
 def test_holes_fiducials_and_unplaced_parts_are_not_counted(tmp_path):

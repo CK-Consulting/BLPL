@@ -167,6 +167,10 @@ def _cmd_stage0_det(args: argparse.Namespace) -> int:
         f"{len(artifact['connectors'])} connectors  ({len(md_files)} .md files)"
     )
     print(f"            wrote {out}")
+    # A pin two tables put on different nets: the artifact is written, with the
+    # Connections row left out, and the stage fails so nobody builds from it.
+    if any(w.get("code") == stage0_deterministic.CONFLICT_CODE for w in artifact.get("warnings", [])):
+        return 1
     return 0
 
 

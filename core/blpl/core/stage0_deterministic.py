@@ -321,6 +321,9 @@ def _infer_project_id(md_files: list[Path]) -> str:
     return parent.replace(".", "-")
 
 
+# A pin two tables put on different nets. An error: stage0-det exits 1.
+CONFLICT_CODE = "STAGE0-007"
+
 _REF_RANGE = re.compile(r"^([A-Za-z_]+?)(\d+)\s*(?:\.\.|–|—|-|to)\s*(?:\1)?(\d+)$")
 
 
@@ -334,6 +337,9 @@ def split_refs(cell: str) -> list[str]:
     a prefix and run upward; anything else is left as the reference it says.
     """
     out: list[str] = []
+    # Close up a spaced range first ("R1 - R6", "R1 to R6"), or splitting on
+    # whitespace makes it three parts, one named "-" (Codex, PR #41).
+    cell = re.sub(r"([A-Za-z_]+\d+)\s*(\.\.|–|—|-|\bto\b)\s*([A-Za-z_]*\d+)\b", r"\1\2\3", cell)
     for piece in re.split(r"[,;\s]+", cell.strip()):
         if not piece:
             continue
@@ -439,17 +445,23 @@ def _absorb_connections_table(
         have = {p["pin"]: p["signal"] for p in entry["pins"]}
         for pin, net in pairs:
             if pin in have and have[pin] != net:
+                # Not applied, and an error. Kept, the pin sat in two nets and
+                # each emitter silently drew whichever it met last, so a typo
+                # became copper while every check passed (Codex, PR #41).
                 warnings.append({
-                    "code": "STAGE0-007",
-                    "summary": (f"{refs[0]} pin {pin} is {have[pin]!r} in one table and "
-                                f"{net!r} in a Connections table; both were kept."),
+                    "code": CONFLICT_CODE,
+                    "summary": (f"error: {refs[0]} pin {pin} is {have[pin]!r} in one table and "
+                                f"{net!r} in a Connections table. The Connections row was not "
+                                "applied."),
                     "fix": "A pin is on one net. Correct whichever table is wrong.",
                     "local_id": refs[0],
                     "source_ref": source_ref,
                 })
+                continue
             if have.get(pin) == net:
                 continue
             entry["pins"].append({"pin": pin, "signal": net})
+            have[pin] = net
         entry["pin_count"] = len(entry["pins"])
     if skipped:
         warnings.append({
