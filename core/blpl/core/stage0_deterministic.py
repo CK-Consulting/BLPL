@@ -200,7 +200,7 @@ def extract(md_files: list[Path]) -> dict:
         for table in tables:
             kind = _md.classify(table)
             if kind == "connections":
-                _absorb_connections_table(table, connectors, warnings)
+                _absorb_connections_table(table, connectors, warnings, refs)
             elif kind == "bom":
                 _absorb_bom_table(table, components)
             elif kind == "pinout":
@@ -438,8 +438,17 @@ def _merge_pins(
     entry["pin_count"] = len(entry["pins"])
 
 
+def _named_part(text: str, known: set[str], self_ref: str) -> str | None:
+    """The first known refdes ``text`` names as a whole word, other than the part itself."""
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text):
+        if token != self_ref and token in known:
+            return token
+    return None
+
+
 def _absorb_connections_table(
-    table: _md.ParsedTable, connectors: dict[str, dict], warnings: list[dict]
+    table: _md.ParsedTable, connectors: dict[str, dict], warnings: list[dict],
+    refs: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     """Pins of named parts onto nets, from a Connections table.
 
@@ -453,11 +462,14 @@ def _absorb_connections_table(
     ref_col = next(headers[h] for h in ("ref", "refdes", "reference") if h in headers)
     pin_cols = {m.group(1): h for hl, h in headers.items() if (m := _md._PIN_N_HEADER.match(hl))}
     long_form = "pin" in headers and "net" in headers
+    used = {ref_col, *pin_cols.values(), *(headers[h] for h in ("pin", "net") if h in headers)}
+    extra_cols = [h for h in table.headers if h not in used]
+    known = set(refs) | set(connectors)
     skipped = []
     for row in table.rows:
         ref = row.get(ref_col, "").strip()
-        refs = split_refs(ref)
-        if len(refs) != 1:
+        names = split_refs(ref)
+        if len(names) != 1:
             # One part per row: two resistors never share both nets, so a
             # grouped row here is a mistake, not a shorthand.
             if ref:
@@ -478,8 +490,15 @@ def _absorb_connections_table(
         if not pairs:
             skipped.append(ref)
             continue
-        _merge_pins(connectors, refs[0], [{"pin": p, "signal": n} for p, n in pairs],
+        _merge_pins(connectors, names[0], [{"pin": p, "signal": n} for p, n in pairs],
                     source_ref, warnings)
+        # Which part this one serves, when its purpose names one ("decoupling,
+        # at U3 pin 8"). Nets cannot say it: a bypass capacitor is on a rail
+        # every IC shares, and C6 is not named after U3. Without it both the
+        # board and the schematic put U3's decoupling wherever there was room.
+        near = _named_part(" ".join(row.get(h, "") for h in extra_cols), known, names[0])
+        if near and "near" not in connectors[names[0]]:
+            connectors[names[0]]["near"] = near
     if skipped:
         warnings.append({
             "code": "STAGE0-008",

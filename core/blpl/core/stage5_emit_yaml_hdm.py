@@ -188,6 +188,50 @@ def _default_placement(index: int, total: int, board_dim: tuple[float, float]) -
     }
 
 
+_PASSIVE_REF = re.compile(r"^(R|C|L|FB)\d", re.IGNORECASE)
+_SI_PREFIX = ((1e-12, "p"), (1e-9, "n"), (1e-6, "µ"), (1e-3, "m"), (1.0, ""), (1e3, "k"), (1e6, "M"))
+
+
+def _display_value(refdes: str, row: dict) -> str:
+    """What the schematic and silkscreen print: ``47µF`` for a passive, else the MPN.
+
+    The MPN as a capacitor's value is right for ordering and wrong everywhere
+    a person reads it: on the schematic ``CL31A476MQHNNWE`` says nothing and
+    is four times as wide as ``47µF``, which is the text that collided across
+    every passive block. The MPN stays on the part in its own field.
+    """
+    mpn = row["mpn"]
+    if not _PASSIVE_REF.match(refdes):
+        return mpn
+    text = " ".join(str(row.get(k) or "") for k in ("value", "description", "notes"))
+    m = _VALUE_TEXT.search(text)
+    if not m:
+        return mpn
+    if m.group(4):  # "4K7", "4R7": the multiplier stands where the decimal point would
+        number = float(f"{m.group(1)}.{m.group(5)}")
+        mult = "" if m.group(4) in ("R", "r") else m.group(4)
+        # It carries no unit; a resistor's or a bead's is ohms, as its prefix says.
+        unit = {"C": "F", "L": "H"}.get(refdes[:1].upper(), "Ω")
+    else:
+        number = float(m.group(1).replace(",", "."))
+        mult = m.group(2) or ""
+        unit = m.group(3).upper()
+    scale = _MULT.get(mult.replace("U", "u").replace("µ", "u"), _MULT.get(mult.lower(), 1.0))
+    unit = "Ω" if unit in ("OHM", "OHMS", "Ω", "R") else unit
+    value = number * scale
+    scale, prefix = max(((sc, pf) for sc, pf in _SI_PREFIX if value >= sc * 0.999), default=(1e-12, "p"))
+    return f"{value / scale:.3g}{prefix}{unit}"
+
+
+_MULT = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "m": 1e-3, "": 1.0, "k": 1e3, "K": 1e3, "M": 1e6, "meg": 1e6}
+# 47UF, 0.1 uF, 4.7K OHM, 4K7, 470 Ohm, 10uH, 1 kΩ — the spellings descriptions use.
+_VALUE_TEXT = re.compile(
+    r"(?<![\w.])(\d+(?:[.,]\d+)?)(?:\s*(p|n|u|U|µ|m|k|K|M|MEG)?\s*(F|H|OHMS?|Ω)\b"
+    r"|(p|n|u|U|µ|m|k|K|M|R)(\d+)\b)",
+    re.IGNORECASE,
+)
+
+
 def _place_components(
     components_out: dict,
     nets_out: dict,
@@ -220,7 +264,12 @@ def _place_components(
             f"boundaries anchors a shape to {', '.join(unknown)}, which is not a part on "
             "this board. A shape anchored to nothing has nowhere to go."
         )
-    hints = (project_config.get("placement") or {}).get("hints") or {}
+    hints = dict((project_config.get("placement") or {}).get("hints") or {})
+    # A part the design says it serves sits beside it, unless project.yaml
+    # already says where it goes: a hint written there is the more deliberate.
+    for ref, comp in components_out.items():
+        if comp.get("near") and ref not in hints:
+            hints[ref] = {"near": comp["near"]}
 
     roots: list[Path] = []
     if project_dir is not None and stock_footprints_root is not None:
@@ -650,7 +699,7 @@ def emit(
             not_placed.append(refdes)
             continue
         comp: dict[str, Any] = {
-            "value": row["mpn"],
+            "value": _display_value(refdes, row),
             "placement": _default_placement(i, len(rows), board_dim),
         }
         # Sourcing fields. bom.json has carried these all along and the HDM threw
@@ -754,6 +803,12 @@ def emit(
     # off the bottom of the board — and a router handed parts that are not on
     # the board can do nothing with them. Done here, after test points, so that
     # synthesized parts are placed too.
+    # Which part each one serves, from its Connections row (see stage 0). Kept
+    # on the component so the schematic draws it in that part's block too.
+    for conn in design_artifact.get("connectors", []):
+        near = conn.get("near")
+        if near and conn["local_id"] in components_out and near in components_out:
+            components_out[conn["local_id"]]["near"] = near
     place_record, geometry_record = _place_components(
         components_out, nets_out, project_config,
         project_dir=project_dir, stock_footprints_root=stock_footprints_root,

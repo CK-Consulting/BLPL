@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from blpl.emitter import sch_layout
 from blpl.emitter import loaders, pcb, pro, sch, sexpr
 
 
@@ -211,9 +212,15 @@ def test_sch_emits_no_global_label_palette() -> None:
     were spaced tighter than their own text — overlapping labels that shorted
     unrelated nets together in the netlist. Each pin carries its own label.
     """
-    out = sch.emit(_minimal_hdm(), symbols_root=_SYMBOLS_ROOT)
-    assert "(global_label" not in out
-    assert '(label "VIN"' in out and '(label "GND"' in out
+    node = sexpr.parse(sch.emit(_minimal_hdm(), symbols_root=_SYMBOLS_ROOT))
+    # Global labels are how a signal is named now, so the test is that each one
+    # hangs off a wire: a palette entry is a label attached to nothing.
+    ends = {(w_pt[1], w_pt[2]) for w in sexpr.find_all(node, "wire")
+            for w_pt in sexpr.find_all(sexpr.find(w, "pts"), "xy")}
+    for lab in sexpr.find_all(node, "global_label"):
+        at = sexpr.find(lab, "at")
+        assert (at[1], at[2]) in ends, f"{sexpr.unquote(lab[1])} is attached to nothing"
+    assert {"VIN", "GND"} <= set(_net_names(node))
 
 
 def test_sch_write_roundtrips(tmp_path: Path) -> None:
@@ -222,17 +229,33 @@ def test_sch_write_roundtrips(tmp_path: Path) -> None:
     sexpr.parse(p.read_text())
 
 
+def _net_names(node) -> list[str]:
+    """Every net name the sheet draws: labels, global labels, power symbols' Values.
+
+    A rail on a small part ends in a power symbol whose Value is the net, a
+    signal in a global label (the board's net names have no ``/``); see
+    sch_layout. A test asking "is VIN on the sheet" asks all three.
+    """
+    names = [sexpr.unquote(l[1]) for l in sexpr.find_all(node, "label")]
+    names += [sexpr.unquote(l[1]) for l in sexpr.find_all(node, "global_label")]
+    for sym in sexpr.find_all(node, "symbol"):
+        lib = sexpr.find(sym, "lib_id")
+        if lib and sexpr.unquote(lib[1]).startswith("power:") and sexpr.unquote(lib[1]) != "power:PWR_FLAG":
+            val = next(pr for pr in sexpr.find_all(sym, "property") if sexpr.unquote(pr[1]) == "Value")
+            names.append(sexpr.unquote(val[2]))
+    return names
+
+
 def test_sch_emits_wire_plus_label_per_connected_pin() -> None:
     """For each pin appearing in a net, emit a wire stub + label with the net name."""
     out = sch.emit(_minimal_hdm(), symbols_root=_SYMBOLS_ROOT)
     # Barrel_Jack has 2 pins, both are in nets (VIN=1, GND=2) via pin_map.
     node = sexpr.parse(out)
     wires = sexpr.find_all(node, "wire")
-    labels = [lab for lab in sexpr.find_all(node, "label")]
     assert len(wires) >= 2
-    label_texts = {sexpr.unquote(lab[1]) for lab in labels if len(lab) > 1 and isinstance(lab[1], str)}
-    assert "VIN" in label_texts
-    assert "GND" in label_texts
+    names = set(_net_names(node))
+    assert "VIN" in names
+    assert "GND" in names
 
 
 def test_a_derived_symbol_reports_the_pins_of_the_parent_it_extends() -> None:
@@ -295,14 +318,14 @@ def test_sch_marks_declared_nc_pins_with_no_connect() -> None:
     assert len(ncs) == 1
     # Sits exactly on pin 2's connection point, on the 1.27mm grid.
     pins = {p["number"]: p for p in loaders.load_symbol_pins("Connector:Barrel_Jack", _SYMBOLS_ROOT)}
-    inst = sexpr.find(node, "symbol")
-    cx, cy = float(sexpr.find(inst, "at")[1]), float(sexpr.find(inst, "at")[2])
-    tip = sch._pin_absolute_tip(cx, cy, pins["2"])
+    inst = next(s for s in sexpr.find_all(node, "symbol")
+                if sexpr.unquote(sexpr.find(s, "lib_id")[1]) == "Connector:Barrel_Jack")
+    cx, cy, rot = (float(v) for v in sexpr.find(inst, "at")[1:4])
+    tx, ty, _ = sch_layout.pin_tip(pins["2"], cx, cy, int(rot))
     at = sexpr.find(ncs[0], "at")
-    assert (float(at[1]), float(at[2])) == (sch._snap(tip[0]), sch._snap(tip[1]))
-    # And the NC pin got no label — only VIN is labelled.
-    labels = [sexpr.unquote(l[1]) for l in sexpr.find_all(node, "label")]
-    assert labels == ["VIN"]
+    assert (float(at[1]), float(at[2])) == (tx, ty)
+    # And the NC pin got no net — only VIN is named.
+    assert _net_names(node) == ["VIN"]
 
 
 def test_sch_without_nc_pins_emits_no_markers() -> None:
@@ -385,9 +408,8 @@ def test_sch_draws_every_unit_of_a_multi_unit_symbol(tmp_path: Path) -> None:
     # They sit in different cells.
     ats = {(sexpr.find(s, "at")[1], sexpr.find(s, "at")[2]) for s in insts}
     assert len(ats) == 2
-    # And unit 2's pin got its label — the whole point.
-    labels = sorted(sexpr.unquote(l[1]) for l in sexpr.find_all(node, "label"))
-    assert labels == ["SIG", "VDD", "VDD"]  # VDD twice: pin stub + PWR_FLAG label
+    # And unit 2's pin got its net — the whole point.
+    assert sorted(_net_names(node)) == ["SIG", "VDD", "VDD"]  # VDD twice: pin + PWR_FLAG
     # The rail audit saw the power_in pin on unit 2 and flagged the rail.
     assert sch.flagged_nets(hdm, symbols_root=[tmp_path, _SYMBOLS_ROOT]) == ["VDD"]
 

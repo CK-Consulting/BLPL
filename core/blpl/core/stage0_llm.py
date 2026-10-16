@@ -271,6 +271,7 @@ def _merge_connections(md_files: list[Path], artifact: dict) -> None:
     from . import markdown_tables as _md_tables, stage0_deterministic as _det
 
     by_ref = {c["local_id"]: c for c in artifact["connectors"]}
+    refs = _det.known_refs([Path(m) for m in md_files])
     warnings: list[dict] = []
     for md_path in md_files:
         md_path = Path(md_path)
@@ -278,7 +279,7 @@ def _merge_connections(md_files: list[Path], artifact: dict) -> None:
             continue
         for table in _md_tables.extract_tables_from_file(md_path):
             if _md_tables.classify(table) == "connections":
-                _det._absorb_connections_table(table, by_ref, warnings)
+                _det._absorb_connections_table(table, by_ref, warnings, refs)
     artifact["connectors"] = list(by_ref.values())
     if warnings:
         artifact.setdefault("warnings", []).extend(warnings)

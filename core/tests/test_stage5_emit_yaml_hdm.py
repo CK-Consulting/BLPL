@@ -183,3 +183,37 @@ def test_a_not_placed_row_becomes_no_copper_and_is_not_dropped_silently() -> Non
     assert hdm["not_placed"] == ["BAT_RTC"]
     # The placed part is untouched.
     assert "J1" in hdm["components"]
+
+
+def _with_bypass_cap(near: str | None) -> tuple[dict, dict, dict]:
+    a, b, n = _design_artifact(), _bom(), _nets()
+    cap = {"local_id": "C1", "pins": [{"pin": "1", "signal": "VIN"}, {"pin": "2", "signal": "GND"}]}
+    if near:
+        cap["near"] = near
+    a["connectors"].append(cap)
+    b["rows"].append({"local_id": "C1", "refdes": "C1", "mpn": "CL05A106MQ5NUNC",
+                      "description": "CAP CER 10UF 6.3V X5R 0402", "package": "0402",
+                      "footprint_hint": "Capacitor_SMD:C_0402_1005Metric", "symbol_hint": "Device:C",
+                      "confidence": 0.9})
+    for net, pin in (("VIN", "1"), ("GND", "2")):
+        next(x for x in n["nets"] if x["name"] == net)["members"].append({"refdes": "C1", "pin": pin})
+    return a, b, n
+
+
+def test_a_part_the_design_says_it_serves_is_placed_beside_it() -> None:
+    # The Connections row's "at J1" reaches the placer as a near hint, and the
+    # schematic through the component.
+    a, b, n = _with_bypass_cap("J1")
+    hdm, _, _ = s5.emit(b, n, a, _project_config())
+    assert hdm["components"]["C1"]["near"] == "J1"
+    assert "C1" in hdm["synthesis"]["placement"]["hinted"]
+    # And it is printed as what it is.
+    assert hdm["components"]["C1"]["value"] == "10µF"
+
+
+def test_a_hint_written_in_project_yaml_outranks_the_design_s() -> None:
+    a, b, n = _with_bypass_cap("J1")
+    cfg = _project_config()
+    cfg["placement"] = {"hints": {"C1": {"x": 90, "y": 70}}}
+    hdm, _, _ = s5.emit(b, n, a, cfg)
+    assert (hdm["components"]["C1"]["placement"]["x"], hdm["components"]["C1"]["placement"]["y"]) == (90, 70)
