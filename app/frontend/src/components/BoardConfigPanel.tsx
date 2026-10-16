@@ -48,6 +48,7 @@ export function BoardConfigPanel({
   projectId,
   board,
   onDirtyChange,
+  onSaved,
 }: {
   projectId: string;
   /** The selected board, or null on a single-board project.
@@ -65,6 +66,11 @@ export function BoardConfigPanel({
    *  drawn here and then "saved" with another panel's button was dropped on
    *  close without a word, and the next run built the old board. */
   onDirtyChange?: (dirty: boolean) => void;
+  /** Told after project.yaml was written, so views of the file elsewhere in
+   *  the app reload. Without it a project.yaml already open in the file view
+   *  kept what it had loaded before the save, and read as a save that had not
+   *  happened. */
+  onSaved?: () => void;
 }) {
   const [data, setData] = useState<BoardConfig | null>(null);
   const [draft, setDraft] = useState<BoardConfig["config"] | null>(null);
@@ -250,6 +256,7 @@ export function BoardConfigPanel({
     try {
       await putJSON(`/api/projects/${projectId}/boards/${target}/config`, { config: draft });
       setNote("Saved. Re-run stage 5 to rebuild the board with it.");
+      onSaved?.();
       const fresh = await getJSON<BoardConfig>(`/api/projects/${projectId}/boards/${target}/config`);
       setData(fresh);
       setDraft(structuredClone(fresh.config));
@@ -423,7 +430,7 @@ export function BoardConfigPanel({
       {note && <p className="muted small">{note}</p>}
 
       <div className="field-row">
-        <button className="btn" onClick={save} disabled={busy}>
+        <button className="btn primary" onClick={save} disabled={busy}>
           {busy ? "Saving…" : "Save board config"}
         </button>
         {dirty && !busy && (

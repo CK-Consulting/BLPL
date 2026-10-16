@@ -197,8 +197,10 @@ export function ProjectPolicyPanel({ projectId }: { projectId: string }) {
         consentText={policy.consent_text}
       />
       <div className="row">
+        {/* Named for what it saves. A bare "Save" at the foot of project
+            settings was taken for the whole dialog's. */}
         <button onClick={save} disabled={busy}>
-          {busy ? "…" : "Save"}
+          {busy ? "…" : "Save library policy"}
         </button>
         {note && <span className="muted note">{note}</span>}
       </div>

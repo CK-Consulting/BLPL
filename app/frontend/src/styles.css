@@ -671,7 +671,15 @@ header .logo-lockup { font-size: 13px; }
 /* Sits in the modal header beside the title, so the section names are visible
    the moment the dialog opens rather than after a scroll. */
 .settings-tabs { margin-left: 1rem; }
-.settings-tabs button { padding: .25rem .6rem; font-size: 12px; }
+.settings-tabs button { padding: .25rem .6rem; font-size: 12px; white-space: nowrap; }
+/* On a narrow screen the tabs cannot sit beside the title and Close: the
+   modal clips what overflows it, so the rightmost tabs were simply out of
+   reach (Codex, PR #39). They take a row of their own under the title, and
+   scroll sideways if even that row is too narrow. */
+@media (max-width: 720px) {
+  .modal-head:has(.settings-tabs) { flex-wrap: wrap; row-gap: .6rem; }
+  .settings-tabs { order: 3; flex: 1 0 100%; min-width: 0; margin-left: 0; overflow-x: auto; }
+}
 
 /* --- left rail --- */
 .rail { display: flex; flex-direction: column; overflow-y: auto; border-right: 1px solid #6b6f75; }

@@ -176,6 +176,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
             projectId={selected}
             board={board}
             onRemoteChanged={() => setGitToken((n) => n + 1)}
+            onFilesChanged={bump}
           />
         )}
         {/* The board every tab below is about, where the eye lands first. On a

@@ -51,3 +51,53 @@ describe("closing project settings", () => {
     expect(screen.queryByLabelText("Width (mm)")).toBeNull();
   });
 });
+
+describe("project settings tabs", () => {
+  // Stacked in one scroll, the library policy's bare "Save" sat at the foot of
+  // the dialog and read as the dialog's Save; board edits "saved" with it were
+  // never written.
+  it("puts each panel on its own tab, with the board first", async () => {
+    stubFetch();
+    render(<ProjectSettings projectId="p" board="core" />);
+    fireEvent.click(screen.getByLabelText("Project settings — p"));
+    const tabs = screen.getAllByRole("tab").map((t) => t.textContent);
+    expect(tabs).toEqual(["Board", "Task routing", "Git", "Library policy"]);
+    expect(await screen.findByLabelText("Width (mm)")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Library policy" }));
+    expect(screen.getByLabelText("Width (mm)")).not.toBeVisible();
+    expect(screen.getByRole("tab", { name: "Library policy" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps board edits across a look at another tab, and marks the Board tab unsaved", async () => {
+    stubFetch();
+    render(<ProjectSettings projectId="p" board="core" />);
+    fireEvent.click(screen.getByLabelText("Project settings — p"));
+    fireEvent.change(await screen.findByLabelText("Width (mm)"), { target: { value: "90" } });
+    expect(screen.getByTitle("Unsaved board changes")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Git" }));
+    fireEvent.click(screen.getByRole("tab", { name: /Board/ }));
+    expect(screen.getByLabelText("Width (mm)")).toHaveValue(90);
+
+    // Closing from another tab still asks.
+    fireEvent.click(screen.getByRole("tab", { name: "Task routing" }));
+    fireEvent.click(screen.getByText("Close"));
+    expect(screen.getByRole("dialog", { name: "Discard board changes?" })).toBeInTheDocument();
+  });
+});
+
+describe("saving the board config", () => {
+  // project.yaml open in the file view kept what it had loaded before the
+  // save, so a save that had happened read as one that had not.
+  it("tells the app its files changed, so open views of project.yaml reload", async () => {
+    stubFetch();
+    const onFilesChanged = vi.fn();
+    render(<ProjectSettings projectId="p" board="core" onFilesChanged={onFilesChanged} />);
+    fireEvent.click(screen.getByLabelText("Project settings — p"));
+    fireEvent.change(await screen.findByLabelText("Width (mm)"), { target: { value: "90" } });
+    expect(onFilesChanged).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Save board config" }));
+    await waitFor(() => expect(onFilesChanged).toHaveBeenCalledTimes(1));
+  });
+});
