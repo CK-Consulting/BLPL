@@ -389,9 +389,10 @@ class _AgentFile:
     saw, so the agent refuses (409) rather than hand over bytes of a file
     replaced or rewritten since: everything sent is one file's bytes, and a
     file classified by its first block is the file the rest comes from. One
-    connection for the whole stream, but the gate only per block: a long
-    download does not hold a seal off, and a seal between blocks ends the
-    download rather than waiting for it.
+    client for the whole stream, but neither a connection to the agent nor
+    the gate is held between blocks: a slow download does not take one of
+    the agent's connection slots or hold a seal off, and a seal between
+    blocks ends the download rather than waiting for it.
     """
 
     BLOCK = 1024 * 1024

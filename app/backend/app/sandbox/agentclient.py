@@ -167,7 +167,12 @@ class AgentClient:
                                 "length": length}
         if expect is not None:
             body["expect"] = expect
-        r = self._check(self._http.post("/fs/read_range", content=json.dumps(body)))
+        # Closed after each block: a download is paced by whoever reads it, and
+        # a connection kept between blocks holds one of the agent's few slots
+        # (serving.Bounded) for as long as the slowest reader takes (Codex,
+        # PR #35).
+        r = self._check(self._http.post("/fs/read_range", content=json.dumps(body),
+                                        headers={"Connection": "close"}))
         return r.content, int(r.headers["X-File-Size"]), r.headers["X-File-Id"]
 
     def write(self, checkout: str, path: str, data: bytes, *, mkdirs: bool = False) -> dict:

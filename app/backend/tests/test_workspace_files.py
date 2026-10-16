@@ -1156,3 +1156,41 @@ def test_an_older_agent_without_ranged_reads_still_serves_blobs(unlocked, via_ag
 
     monkeypatch.setattr(main, "UPLOAD_MAX_BYTES", 16)
     assert unlocked.get("/api/projects/mine/blob", params={"path": "a.pdf"}).status_code == 413
+
+
+def test_a_streamed_blob_holds_no_agent_connection_between_blocks(unlocked, via_agent):
+    """Codex, PR #35: the agent serves at most 32 connections at once. A
+    download kept its connection open while the browser read, so a few slow
+    ones would leave every other operation on the workspace a 503."""
+    import time as _time
+
+    import app.main as main
+    import app.workspace_files as wf
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    proj = main.PROJECTS_ROOT / "mine"
+    data = bytes(range(256)) * (3 * wf._AgentFile.BLOCK // 256 + 7)
+    (proj / "big.bin").write_bytes(data)
+    server = via_agent.server
+
+    def held() -> int:
+        # The agent releases a slot as its handler thread ends, just after
+        # the response: wait for it rather than race it.
+        deadline = _time.monotonic() + 2
+        while _time.monotonic() < deadline:
+            n = server.max_connections - server._slots._value
+            if n == 0:
+                return 0
+            _time.sleep(0.01)
+        return n
+
+    fh = wf._AgentFile(proj, "big.bin")
+    try:
+        assert held() == 0
+        got = b""
+        while chunk := fh.read(256 * 1024):
+            got += chunk
+            assert held() == 0
+    finally:
+        fh.close()
+    assert got == data
