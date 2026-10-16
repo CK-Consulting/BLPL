@@ -5572,7 +5572,7 @@ def move_path(
     }
     try:
         relinked = library_upload.follow_moved_models(checkout, moved_models)
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:  # ValueError: quarantine.LinkRefused
         undo_move()
         raise HTTPException(
             status_code=500,
