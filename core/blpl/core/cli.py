@@ -48,6 +48,13 @@ _STAGE_ORDER = [
     "stage4",
     "stage5",
     "stage6",
+    # Autoroute, as a stage of its own. It ran inside stage6 before, so a range
+    # could neither start at it nor stop short of it, and the app's progress bar
+    # counted its "==> autoroute" header as nothing at all. 6a rather than a
+    # renumber: stage7 and stage8 name the same work in every run log, report
+    # and document written before this, and a renumber would quietly change
+    # what each of those means.
+    "stage6a",
     "stage7",
     "stage8",
 ]
@@ -844,14 +851,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
             rc = _attempt("stage6", lambda: _cmd_stage6(base))
             if rc != 0 and not args.continue_on_error:
                 return rc
+        elif stage == "stage6a":
             # Routing sits between emission and validation so Stage 7's DRC and
             # Stage 8's review see the routed board. A missing router is not a
             # failure of the run — the step records why it did not route, and
             # Stage 8 reads that record — so only an attempted-and-failed route
             # is allowed to stop anything.
-            if not getattr(args, "no_autoroute", False):
+            #
+            # --no-autoroute still announces the stage: the app's progress bar
+            # waits for one header per stage in the range, and a stage that
+            # vanished from the log would leave it short of 100% forever.
+            if getattr(args, "no_autoroute", False):
+                _attempt("stage6a", lambda: 0, note="skipped (--no-autoroute)")
+            else:
                 ns = argparse.Namespace(**vars(base), passes=getattr(args, "passes", 10))
-                rc = _attempt("autoroute", lambda: _cmd_autoroute(ns))
+                rc = _attempt("stage6a", lambda: _cmd_autoroute(ns))
                 if rc != 0 and not args.continue_on_error:
                     return rc
         elif stage == "stage7":
@@ -1555,6 +1569,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser(
         "autoroute",
+        # stage6a is the same command under the name `run` gives it, so a
+        # single-stage run and a range name the stage the same way.
+        aliases=["stage6a"],
         help=(
             "Bulk-route the latest compiled board with Freerouting (needs java and "
             "FREEROUTING_JAR); always writes autoroute_report.json saying what happened."
@@ -1674,7 +1691,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--no-autoroute",
         action="store_true",
-        help="Skip the Freerouting pass that otherwise runs after stage6 when a router is available.",
+        help="Skip stage6a, the Freerouting pass that otherwise runs after stage6 when a router is available.",
     )
     p.add_argument("--passes", type=int, default=10, help="Freerouting optimisation passes (default 10).")
     _add_lifecycle_flags(p)

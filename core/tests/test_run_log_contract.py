@@ -83,3 +83,15 @@ def test_a_halt_notice_is_not_mistakable_for_a_stage_starting(monkeypatch, tmp_p
     err = capsys.readouterr().err
 
     assert "==> stage1 returned 2; halting" in err
+
+
+def test_stage6a_is_announced_even_when_routing_is_skipped(stub_stages, tmp_path, capsys):
+    # The UI's progress bar waits for one header per stage in the range. A
+    # skipped route that printed nothing left it one stage short of done.
+    args = _run_args(tmp_path, "stage6", "stage7")
+    args.no_autoroute = True
+    assert cli._cmd_run(args) == 0
+    err = capsys.readouterr().err
+    headers = [l.split()[1] for l in err.splitlines() if l.startswith("==> ")]
+    assert headers == ["stage6", "stage6a", "stage7"]
+    assert "==> stage6a skipped (--no-autoroute)" in err
