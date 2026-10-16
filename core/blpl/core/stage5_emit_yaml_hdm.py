@@ -201,6 +201,9 @@ def _display_value(refdes: str, row: dict) -> str:
     every passive block. The MPN stays on the part in its own field.
     """
     mpn = row["mpn"]
+    # A module's parts are qualified ("ltc4015-charger.C1"); the designator
+    # is the last segment (Codex, PR #42).
+    refdes = refdes.rsplit(".", 1)[-1]
     if not _PASSIVE_REF.match(refdes):
         return mpn
     text = " ".join(str(row.get(k) or "") for k in ("value", "description", "notes"))

@@ -182,3 +182,12 @@ def test_kicad_reads_every_pin_onto_the_net_the_design_gives_it(tmp_path):
            for net in ET.parse(tmp_path / "n.xml").getroot().iter("net") for n in net.iter("node")}
     want = {(r, str(p)): name for name, net in hdm["nets"].items() for r, p in net["pads"]}
     assert {k: got.get(k) for k in want} == want
+
+
+@pytest.mark.parametrize("n", [1, 12, 13, 49, 60])
+def test_the_sheet_reaches_past_the_last_row_of_power_flags(n):
+    # 49 undriven rails wrap to five rows of PWR_FLAGs; the sheet was sized
+    # for one and cut the others off its bottom edge.
+    first = 100.33
+    last = max(sch._flag_y(first, i) for i in range(n))
+    assert sch._sheet_height(first, n) >= last + 10 * 1.27
