@@ -662,8 +662,17 @@ def place(
             ref = followers[0]
             remaining.remove(ref)
         else:
-            remaining.sort(key=lambda r: (tie(r), r), reverse=True)
-            ref = remaining.pop(0)
+            # A part told to sit near one that is not down yet waits for it.
+            # Taken in netlist order instead, a matching network sharing a net
+            # with its radio was placed beside the radio before the antenna it
+            # was hinted to was on the board, and the hint was dropped without
+            # a word: 41 mm from the antenna it exists to match.
+            waiting = {r for r in remaining
+                       if (hints.get(r) or {}).get("near") in remaining}
+            ready = [r for r in remaining if r not in waiting] or list(remaining)
+            ready.sort(key=lambda r: (tie(r), r), reverse=True)
+            ref = ready[0]
+            remaining.remove(ref)
         w, h = result.extents[ref]
         edge = wants_edge(ref)
 

@@ -404,3 +404,23 @@ def test_nothing_is_placed_into_the_space_a_rotated_part_occupies():
         f"{len(intruders)} part(s) placed inside the rotated connector's real "
         f"courtyard ({jx0},{jy0})-({jx1},{jy1}): {sorted(intruders)[:6]}"
     )
+
+
+def test_a_near_hint_waits_for_its_anchor_to_be_placed():
+    # The real shape: a radio, then a matching network (C8, L1) that shares
+    # its input net with the radio, then the antenna at the far end of the
+    # chain. Taken in netlist order the network went down beside the radio
+    # before the antenna existed, and its near hint was dropped: 41 mm from
+    # the antenna it matches. It now waits for the antenna.
+    comps = {r: _comp() for r in ("U1", "C8", "L1", "ANT", *(f"R{i}" for i in range(6)))}
+    nets = {**{f"N{i}": _net("U1", f"R{i}") for i in range(6)},
+            "RF": _net("U1", "C8"), "M": _net("C8", "L1"), "A": _net("L1", "ANT")}
+    hints = {"C8": {"near": "ANT"}, "L1": {"near": "ANT"}}
+    r = placement.place(comps, nets, (80, 80), hints=hints)
+    assert not r.unplaced
+
+    def dist(a, b):
+        pa, pb = r.placements[a], r.placements[b]
+        return ((pa.x - pb.x) ** 2 + (pa.y - pb.y) ** 2) ** 0.5
+
+    assert dist("C8", "ANT") <= 7.5 and dist("L1", "ANT") <= 7.5
