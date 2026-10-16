@@ -380,7 +380,11 @@ VALID_STAGES = {
     "stage0-det", "stage0-llm", "stage0-compare",
     "stage1", "stage1-synthesize-connectors",
     "stage2", "stage3", "stage4", "stage5",
-    "stage6", "stage6-plugin", "stage7", "stage8",
+    "stage6", "stage6-plugin",
+    # The autoroute, under the stage name `blpl run` gives it. Runnable alone so
+    # a board emitted once can be routed again without re-emitting it.
+    "stage6a",
+    "stage7", "stage8",
 }
 
 # Stages that call an LLM. Only these need a provider key injected; the rest are
@@ -7534,7 +7538,7 @@ async def run_review_panel(
 # command drives 0→8; this is the allowlist the UI's from/to must fall within.
 _PIPELINE_STAGES = [
     "stage0", "stage1", "stage2", "stage3", "stage4",
-    "stage5", "stage6", "stage7", "stage8",
+    "stage5", "stage6", "stage6a", "stage7", "stage8",
 ]
 
 

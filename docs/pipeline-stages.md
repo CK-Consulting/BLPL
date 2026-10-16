@@ -371,13 +371,13 @@ Two implementations, same output shape:
 - **`blpl stage6`** — hand-rolled S-expression emitter. Pure Python stdlib; runs without KiCad installed. Good for CI and headless flows.
 - **`blpl stage6-plugin`** — invokes KiCad's bundled Python interpreter to call the native `pcbnew` API. Produces `.kicad_pcb` via KiCad's own writer (reliable v10 format, real `PCB_SHAPE` Edge.Cuts, native net objects). Schematic side still uses the emitter (v10 has no eeschema Python API).
 
-## Autoroute — between Stage 6 and Stage 7
+## Stage 6a — Autoroute
 
 ```bash
 blpl autoroute --project-dir <proj> [--board <b>] [--passes 10]
 ```
 
-Bulk-routes the latest compiled board with [Freerouting](https://github.com/freerouting/freerouting): Specctra DSN out through KiCad's `pcbnew` Python, the jar, SES back in. `blpl run` does this after Stage 6 unless told `--no-autoroute`, so Stage 7's DRC and Stage 8's review see a routed board. It needs `kicad-cli`, a Python that imports `pcbnew`, `java`, and `FREEROUTING_JAR`; the backend image ships all four.
+Bulk-routes the latest compiled board with [Freerouting](https://github.com/freerouting/freerouting): Specctra DSN out through KiCad's `pcbnew` Python, the jar, SES back in. `blpl run` runs it as `stage6a`, after Stage 6, unless told `--no-autoroute`, so Stage 7's DRC and Stage 8's review see a routed board. It needs `kicad-cli`, a Python that imports `pcbnew`, `java`, and `FREEROUTING_JAR`; the backend image ships all four.
 
 It **always** writes `.pipeline/autoroute_report[.board].json` — `attempted`, `ok`, `reason`, the snapshot taken before routing, how many nets Freerouting left open. A missing router is a reason in that file, not a failed run: Stage 8 reads it to decide whether an unrouted net is a finding about your board or about the tooling. The result is reviewed, never trusted — an autorouter optimises for completing connections, and DRC afterwards decides whether it stays.
 
@@ -451,7 +451,7 @@ Only the last is verification. See [`cli.md`](cli.md#spice) for `blpl spice`, wh
 blpl run --project-dir <proj> --from stage0 --to stage8 [--continue-on-error] [--no-autoroute]
 ```
 
-`--from` / `--to` can be any `stageN` (default `stage0` → `stage8`). With `--continue-on-error`, non-zero exits from a stage don't abort the run — useful when Stage 3 pending prompts or Stage 2 misses shouldn't block Stage 6 emission. The autoroute step runs after Stage 6 whenever a router is available; `--no-autoroute` skips it. On a multi-board project `--board all` runs every board in turn and then the cross-board check.
+`--from` / `--to` can be any `stageN`, or `stage6a` (default `stage0` → `stage8`). With `--continue-on-error`, non-zero exits from a stage don't abort the run — useful when Stage 3 pending prompts or Stage 2 misses shouldn't block Stage 6 emission. Stage 6a, the autoroute, is a stage of its own: `--to stage6` emits without routing, `--from stage6a` routes the board already emitted, and `--no-autoroute` skips it while still announcing it. It is 6a rather than a renumber so that Stage 7 and Stage 8 mean the same work in every run log and report written before it. On a multi-board project `--board all` runs every board in turn and then the cross-board check.
 
 ## Multi-board projects
 

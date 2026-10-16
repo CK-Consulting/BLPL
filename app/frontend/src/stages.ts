@@ -70,6 +70,11 @@ export const STAGE_INFO: Record<string, StageInfo> = {
     detail:
       "Compiles the manifest into a real KiCad project, timestamped into .pipeline/. This is the stage whose output you can open in KiCad.",
   },
+  stage6a: {
+    summary: "Autoroutes the emitted board with Freerouting",
+    detail:
+      "Routes the board Stage 6 just wrote, so Stage 7's DRC and Stage 8's review see a routed board. Always writes autoroute_report.json; with no router available it records why and the run carries on. The result is reviewed, not trusted: DRC decides whether it stays.",
+  },
   stage7: {
     summary: "Validates the generated KiCad project",
     detail:
@@ -97,7 +102,7 @@ export function expandRange(from: string, to: string): string[] {
 
 export const PIPELINE_ORDER = [
   "stage0", "stage1", "stage2", "stage3", "stage4",
-  "stage5", "stage6", "stage7", "stage8",
+  "stage5", "stage6", "stage6a", "stage7", "stage8",
 ];
 
 export function stageSummary(name: string): string {
