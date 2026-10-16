@@ -52,12 +52,16 @@ an entry whatever the outcome, so "no entry" means "never fetched" rather than
 from __future__ import annotations
 
 import errno
+import fcntl
+import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
 import re
 import secrets
+import threading
 import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -417,6 +421,97 @@ def _save(project_dir: str | Path, rows: list[dict], events: list[dict] | None =
         _write(qfd, LEDGER_NAME, (body + "\n").encode("utf-8"), QUARANTINE_DIRNAME)
 
 
+# ------------------------------------------------------------------ transactions
+#
+# The ledger is read, changed and written back whole, and a library placement
+# reads the library it merges into. Two of those at once in one checkout (the
+# workspace agent serves each request on its own thread; uvicorn may run
+# several workers; the chat's datasheet fetch writes the same ledger) built
+# the second write from a read that predated the first: a symbol merged into
+# a flat library by one upload vanished under the other's, or a ledger row was
+# dropped and a vendor file lost its untrusted framing (Codex, PR #32). So
+# every change to the ledger, and the placement or move it records, holds the
+# checkout's quarantine lock for the whole of it.
+
+LOCK_NAME = "quarantine.lock"
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+_HELD = threading.local()
+
+
+def _lock_path(project_dir: str | Path) -> Path:
+    """In the checkout's private git directory, as llm_ignore's lock, so it is
+    never committed and each member's worktree has its own. For a checkout
+    that is not a repository, a file in the temporary directory named for its
+    path: nothing is created in the checkout itself, where a refused upload
+    must leave no trace."""
+    project_dir = Path(project_dir)
+    dot_git = project_dir / ".git"
+    try:
+        if dot_git.is_dir():
+            return dot_git / LOCK_NAME
+        if dot_git.is_file():
+            line = dot_git.read_text(encoding="utf-8").strip()
+            if line.startswith("gitdir:"):
+                gitdir = Path(line[len("gitdir:"):].strip())
+                if not gitdir.is_absolute():
+                    gitdir = project_dir / gitdir
+                if gitdir.is_dir():
+                    return gitdir / LOCK_NAME
+    except OSError:
+        pass
+    import tempfile
+
+    key = hashlib.sha256(str(project_dir.resolve()).encode()).hexdigest()[:24]
+    return Path(tempfile.gettempdir()) / f"blpl-{key}.{LOCK_NAME}"
+
+
+@contextmanager
+def locked(project_dir: str | Path) -> Iterator[None]:
+    """Hold the checkout's quarantine lock for one whole transaction.
+
+    ``flock``, so processes exclude each other, and a threading lock beside
+    it for threads of one process. Re-entrant within a thread: a bundle's
+    accept_upload accepts each of its entries, and a route that holds the lock
+    across a move calls the ledger functions that take it too.
+    """
+    path = str(_lock_path(project_dir).resolve())
+    held = getattr(_HELD, "paths", None)
+    if held is None:
+        held = _HELD.paths = {}
+    if held.get(path):
+        held[path] += 1
+        try:
+            yield
+        finally:
+            held[path] -= 1
+        return
+    with _LOCKS_GUARD:
+        tlock = _LOCKS.setdefault(path, threading.Lock())
+    with tlock:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            held[path] = 1
+            try:
+                yield
+            finally:
+                held.pop(path, None)
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _transaction(fn):
+    """Run fn under ``locked`` for its ``project_dir`` argument."""
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        project_dir = sig.bind(*args, **kwargs).arguments["project_dir"]
+        with locked(project_dir):
+            return fn(*args, **kwargs)
+    return wrapper
+
+
 def record_for(project_dir: str | Path, sha256: str) -> dict | None:
     for row in _load(project_dir):
         if row.get("sha256") == sha256:
@@ -601,6 +696,7 @@ def looks_like_pdf(data: bytes) -> bool:
 _looks_like_pdf = looks_like_pdf
 
 
+@_transaction
 def accept(
     data: bytes,
     project_dir: str | Path,
@@ -683,6 +779,7 @@ def accept(
     return rec
 
 
+@_transaction
 def release(
     project_dir: str | Path, rec: Record, *, as_name: str = "", dest_dirname: str = TRUSTED_DIRNAME
 ) -> Record:
@@ -724,6 +821,7 @@ def release(
     return rec
 
 
+@_transaction
 def accept_and_release(
     data: bytes,
     project_dir: str | Path,
@@ -747,6 +845,7 @@ def accept_and_release(
 HELD_ELSEWHERE = "control-plane"
 
 
+@_transaction
 def note_held_elsewhere(
     project_dir: str | Path,
     *,
@@ -782,6 +881,7 @@ def _upload_suffix(original_name: str) -> str:
     return suffix if re.fullmatch(r"\.[a-z0-9_]{1,15}", suffix) else ""
 
 
+@_transaction
 def accept_upload(
     data: bytes,
     project_dir: str | Path,
@@ -1021,6 +1121,7 @@ def _apply(project_dir: str | Path, change, new_events: list[dict]) -> list[str]
     return touched
 
 
+@_transaction
 def record_library_removal(project_dir: str | Path, rel: str, *, by: str) -> list[str]:
     """``rel`` (a file, or a folder of them) was deleted: the rows stop claiming it."""
     gone = set(library_placements_under(project_dir, rel))
@@ -1038,6 +1139,7 @@ def record_library_removal(project_dir: str | Path, rel: str, *, by: str) -> lis
     ])
 
 
+@_transaction
 def record_library_move(project_dir: str | Path, src: str, dst: str, *, by: str) -> list[str]:
     """``src`` (a file or folder) was moved to ``dst``: the rows follow it."""
     src, dst = _norm(src), _norm(dst)
@@ -1057,6 +1159,7 @@ def record_library_move(project_dir: str | Path, src: str, dst: str, *, by: str)
     ])
 
 
+@_transaction
 def remove_library_symbol(project_dir: str | Path, library: str, symbol: str, *, by: str) -> dict:
     """Take one symbol out of a project library, and record it.
 
