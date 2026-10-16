@@ -424,19 +424,21 @@ def _fake_plugin(project, monkeypatch):
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     (project / ".pipeline").mkdir(exist_ok=True)
-    (project / ".pipeline" / "hdm.base.yaml").write_text("project: {name: x}\n")
+    # Named unlike its folder, as a project can be: stage6 names its files
+    # from this, and so must the plugin.
+    (project / ".pipeline" / "hdm.base.yaml").write_text("project: {name: Ear Tag}\n")
 
 
 def test_stage6_plugin_publishes_when_it_completes_stage6s_project(project, monkeypatch):
     # It returned before the hook, so its board never reached the tracked copy.
     _fake_plugin(project, monkeypatch)
-    stem = f"{project.name}_base_2026-10-16_124325Z"
+    stem = "Ear_Tag_base_2026-10-16_124325Z"
     (project / ".pipeline" / f"{stem}.kicad_sch").write_text("(kicad_sch)\n")
     (project / ".pipeline" / f"{stem}.kicad_pro").write_text("{}")
     rc = cli.main(["stage6-plugin", "--project-dir", str(project), "--board", "base",
                    "--stamp", "2026-10-16_124325Z"])
     assert rc == 0
-    published = project / "base" / "kicad" / f"{project.name}.kicad_pcb"
+    published = project / "base" / "kicad" / "Ear_Tag.kicad_pcb"
     assert published.read_text() == "(kicad_pcb (plugin))\n"
 
 
@@ -446,8 +448,8 @@ def test_stage6_plugin_alone_does_not_pair_its_board_with_an_old_schematic(proje
     _fake_plugin(project, monkeypatch)
     kicad = project / "base" / "kicad"
     kicad.mkdir()
-    (kicad / f"{project.name}.kicad_pcb").write_text("(kicad_pcb (earlier))\n")
+    (kicad / "Ear_Tag.kicad_pcb").write_text("(kicad_pcb (earlier))\n")
     rc = cli.main(["stage6-plugin", "--project-dir", str(project), "--board", "base"])
     assert rc == 0
-    assert (kicad / f"{project.name}.kicad_pcb").read_text() == "(kicad_pcb (earlier))\n"
+    assert (kicad / "Ear_Tag.kicad_pcb").read_text() == "(kicad_pcb (earlier))\n"
     assert "publish: skipped" in capsys.readouterr().out
