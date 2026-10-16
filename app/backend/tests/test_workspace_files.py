@@ -967,10 +967,9 @@ def test_the_library_and_pdf_routes_need_no_project_mount(unlocked, monkeypatch,
 
 
 def test_a_link_in_libraries_stops_library_work_through_the_agent(unlocked, monkeypatch):
-    """library_upload writes with ordinary paths. On the mounted backend the
-    sandbox resolves them; the agent resolves nothing, so a committed link
-    under libraries/ would carry an upload, a relink or a symbol removal
-    wherever it points. Refused, and nothing is written there."""
+    """A committed link under libraries/ would carry an upload, a relink or a
+    symbol removal wherever it points. The agent says so up front; the next
+    test shows the writes refuse it without that check."""
     import app.main as main
     from test_uploads_api import FOOTPRINT, STEP, SYMLIB
 
@@ -995,6 +994,45 @@ def test_a_link_in_libraries_stops_library_work_through_the_agent(unlocked, monk
         assert (proj / src).is_file()
         assert list(outside.iterdir()) == []
         assert "PCM12SMTBR" in (proj / "libraries/symbols/mine.kicad_sym").read_text()
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_a_link_that_appears_after_the_check_is_still_not_written_through(unlocked, monkeypatch):
+    """The agent's libraries/ scan and the write after it are two steps, and a
+    pull, a move, a run or the KiCad desktop can put a link in between (Codex,
+    PR #32). Here the scan sees nothing, as it would have a moment earlier.
+    The writes open their way down without following a link, so the upload and
+    the footprint relink are still refused, the move is put back, and nothing
+    lands where the link points."""
+    import app.main as main
+    from app.sandbox import agent as agent_mod
+    from test_uploads_api import FOOTPRINT, STEP
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    proj = main.PROJECTS_ROOT / "mine"
+    _upload(unlocked, [("PCM12SMTBR.step", STEP, {"kind": "3d_model"})])
+    fp_with_model = FOOTPRINT.replace(
+        b'  (pad "1"', b'  (model "PCM12SMTBR.stp" (offset (xyz 0 0 0)))\n  (pad "1"')
+    assert _upload(unlocked, [("fp.kicad_mod", fp_with_model, {"kind": "footprint"})]).status_code == 200
+    monkeypatch.setattr(agent_mod.Agent, "_libraries_are_real", lambda self, checkout: None)
+    outside = Path(tempfile.mkdtemp(prefix="blpl-outside-"))
+    try:
+        pretty = proj / "libraries" / "footprints" / "mine.pretty"
+        shutil.move(str(pretty), str(outside / "real.pretty"))
+        pretty.symlink_to(outside / "real.pretty")
+        before = sorted(p.name for p in (outside / "real.pretty").iterdir())
+
+        r = _upload(unlocked, [("other.kicad_mod", FOOTPRINT.replace(b"PCM12SMTBR", b"OTHER"),
+                                {"kind": "footprint"})])
+        assert r.status_code == 400 and "link" in r.json()["detail"]
+        src = "libraries/3dmodels/mine.3dshapes/PCM12SMTBR.step"
+        r = unlocked.post("/api/projects/mine/files/move",
+                          json={"path": src, "to": "libraries/3dmodels/v.3dshapes/PCM12SMTBR.step"})
+        assert r.status_code == 500 and "not moved" in r.json()["detail"]
+        assert (proj / src).is_file()
+        assert sorted(p.name for p in (outside / "real.pretty").iterdir()) == before
+        assert src in (outside / "real.pretty" / "PCM12SMTBR.kicad_mod").read_text()
     finally:
         shutil.rmtree(outside, ignore_errors=True)
 

@@ -744,13 +744,12 @@ class Agent:
     def _libraries_are_real(self, checkout: str) -> None:
         """Refuse library work while anything under libraries/ is a link.
 
-        library_upload places, relinks and removes with ordinary paths, as it
-        does on the mounted backend, where the sandbox has already resolved
-        every path. Here nothing has, and a committed ``libraries/footprints ->
-        /somewhere`` would carry an upload, or a footprint rewritten to follow
-        a moved model, wherever it points. Every library operation goes
-        through here first, and nothing else writes the tree while it runs: a
-        run is refused, and the agent is the workspace's only other writer.
+        An early, plain answer, not the guarantee. A check here and a write
+        after it would race whatever else writes the checkout: a pull, a
+        move, a run, the KiCad desktop (Codex, PR #32). The guarantee is in
+        library_upload itself, which opens every file it writes or removes
+        from the project down, one component at a time, never following a
+        link (quarantine.LinkRefused, refused here as 403).
         """
         top = os.path.join(checkout, "libraries")
         try:
@@ -932,7 +931,7 @@ class Agent:
 
         try:
             relinked = library_upload.follow_moved_models(Path(checkout), moved_models)
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:  # ValueError: LinkRefused
             undo_move()
             raise AgentError(500, f"{src_rel} was not moved: the footprints naming its 3D models "
                                   f"could not be updated ({e})", "not_moved") from None
