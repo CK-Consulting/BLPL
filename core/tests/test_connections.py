@@ -231,3 +231,25 @@ def test_the_llm_stage0_carries_connections_tables_too(tmp_path, monkeypatch):
     monkeypatch.setattr(stage0_llm, "extract_one", lambda path, adapter: {"components": [], "connectors": []})
     a = stage0_llm.extract([md], adapter=object())
     assert _pins(a, "R8") == {"1": "I2C_SDA", "2": "VDD_3V3"}
+
+
+def test_doctor_sees_a_grouped_row_s_parts_and_a_connections_only_file(tmp_path):
+    from blpl.core import doctor
+
+    (tmp_path / "board.md").write_text("""\
+| Ref | MPN | Package |
+|-----|-----|---------|
+| SW1, SW2 | TS | SW_SPST |
+
+## SW2 pinout
+
+| Pin | Signal |
+|-----|--------|
+| 1 | BTN_B |
+| 2 | GND |
+""")
+    codes = [f.code for f in doctor.run(tmp_path).findings]
+    assert "DOC-006" not in codes  # "SW2 has a pinout but no BOM row"
+    conn = tmp_path / "wiring.md"
+    conn.write_text("| Ref | Pin 1 | Pin 2 |\n|---|---|---|\n| SW1 | BTN_A | GND |\n")
+    assert conn in doctor._design_files(tmp_path)
