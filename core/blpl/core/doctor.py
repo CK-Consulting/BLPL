@@ -632,8 +632,10 @@ def _design_files(directory: Path) -> list[Path]:
     """Markdown in ``directory`` holding something Stage 0 builds from: a BOM, a
     pinout or a GPIO assignment table (read into gpio_assignments), or a
     ``## Modules`` list."""
+    from . import project_manifest
+
     found = []
-    for md in sorted(directory.glob("*.md")):
+    for md in project_manifest.design_markdown(directory):
         try:
             text = md.read_text(encoding="utf-8")
         except OSError:
@@ -867,13 +869,13 @@ def run(
         # The board asked about is not one Stage 0 will ever build, so
         # anything checked from here would be some other board's documents.
         return report
-    if board is not None:
-        from . import project_manifest
+    from . import project_manifest
 
+    if board is not None:
         md_root = project_manifest.board_dir(
             project_dir, project_manifest.discover(project_dir), board
         )
-    md_files = sorted(md_root.glob("*.md"))
+    md_files = project_manifest.design_markdown(md_root)
     if not md_files:
         report.findings.append(
             Finding(

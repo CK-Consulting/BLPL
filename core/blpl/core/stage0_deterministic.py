@@ -198,7 +198,9 @@ def extract(md_files: list[Path]) -> dict:
 
         for table in tables:
             kind = _md.classify(table)
-            if kind == "bom":
+            if kind == "connections":
+                _absorb_connections_table(table, connectors, warnings)
+            elif kind == "bom":
                 _absorb_bom_table(table, components)
             elif kind == "pinout":
                 connector_ref = _find_connector_for_table(text, table, refs)
@@ -319,53 +321,144 @@ def _infer_project_id(md_files: list[Path]) -> str:
     return parent.replace(".", "-")
 
 
+_REF_RANGE = re.compile(r"^([A-Za-z_]+?)(\d+)\s*(?:\.\.|–|—|-|to)\s*(?:\1)?(\d+)$")
+
+
+def split_refs(cell: str) -> list[str]:
+    """``"C1, C2, C3"``, ``"C1..C3"`` or ``"R1-R6"`` as the parts they name.
+
+    A grouped BOM row is an ordinary way to write a BOM, and was read as one
+    part whose reference was the whole cell: ``R1, R2, R3, R4, R5, R6`` reached
+    the board as a seventh resistor beside the real six, with no connections.
+    Order kept, duplicates dropped. A range only expands when both ends share
+    a prefix and run upward; anything else is left as the reference it says.
+    """
+    out: list[str] = []
+    for piece in re.split(r"[,;\s]+", cell.strip()):
+        if not piece:
+            continue
+        m = _REF_RANGE.match(piece)
+        if m and int(m.group(3)) >= int(m.group(2)) and int(m.group(3)) - int(m.group(2)) < 1000:
+            names = [f"{m.group(1)}{n}" for n in range(int(m.group(2)), int(m.group(3)) + 1)]
+        else:
+            names = [piece]
+        for n in names:
+            if n not in out:
+                out.append(n)
+    return out
+
+
 def _absorb_bom_table(table: _md.ParsedTable, components: dict[str, dict]) -> None:
     source_ref = _make_source_ref(table)
     for row in table.rows:
-        ref = _column_lookup(row, ["Ref", "Reference"]).strip()
-        if not ref:
+        cell = _column_lookup(row, ["Ref", "Reference"]).strip()
+        for ref in split_refs(cell):
+            _absorb_bom_row(row, ref, components, source_ref)
+
+
+def _absorb_bom_row(row: dict, ref: str, components: dict[str, dict], source_ref: dict) -> None:
+    description = _column_lookup(row, ["Description"])
+    package_hint = _column_lookup(row, ["Package"])
+    # A Symbol column, when the design carries one, is the same statement
+    # about schematic symbols that Package is about land patterns: the
+    # designer naming the exact library part, not a hint for a model to
+    # improve on. Added after an LLM paraphrased known-good symbol refs
+    # into plausible stock spellings — two of which named real stock
+    # symbols for the WRONG silicon.
+    symbol_hint = _column_lookup(row, ["Symbol"])
+    part_hint = _column_lookup(row, ["Part Number", "MPN", "Part"])
+    manufacturer_hint = _column_lookup(row, ["Manufacturer"])
+    # Same argument as Symbol above. The designer stated how many pins the
+    # part has; carrying it costs nothing, and dropping it makes Stage 1
+    # re-derive from the MPN alone something the document already said —
+    # for a 216-ball BGA as readily as for an 0402. It usually guesses
+    # right, which is worse than usually wrong: the one that got through
+    # was a fiducial answered as 0 pins, which is physically true, violates
+    # the BOM schema's minimum of 1, and took the whole stage down after
+    # every other row had resolved.
+    pin_count_hint = _column_lookup(row, ["Pin Count", "Pins", "Pin count"])
+    comp = components.setdefault(
+        ref,
+        {"local_id": ref, "description": description or ref, "source_ref": source_ref},
+    )
+    if description and "description" not in comp:
+        comp["description"] = description
+    if package_hint:
+        comp["package_hint"] = package_hint
+    if symbol_hint:
+        comp["symbol_hint"] = symbol_hint
+    if part_hint:
+        comp["part_hint"] = part_hint
+    if manufacturer_hint:
+        comp["manufacturer_hint"] = manufacturer_hint
+    if pin_count_hint and "pin_count_hint" not in comp:
+        try:
+            n = int(str(pin_count_hint).strip())
+        except ValueError:
+            n = 0  # prose where a number was expected; let Stage 1 decide
+        if n >= 1:
+            comp["pin_count_hint"] = n
+
+
+def _absorb_connections_table(
+    table: _md.ParsedTable, connectors: dict[str, dict], warnings: list[dict]
+) -> None:
+    """Pins of named parts onto nets, from a Connections table.
+
+    Recorded exactly as a pinout table's pins are, so Stage 4 joins them into
+    nets with nothing new to learn. Pins are pin numbers, as in a pinout table:
+    for a two-terminal part, 1 and 2 as its symbol numbers them (KiCad's
+    Device:D is 1 = cathode, 2 = anode).
+    """
+    source_ref = _make_source_ref(table)
+    headers = {h.lower().strip(): h for h in table.headers}
+    ref_col = next(headers[h] for h in ("ref", "refdes", "reference") if h in headers)
+    pin_cols = {m.group(1): h for hl, h in headers.items() if (m := _md._PIN_N_HEADER.match(hl))}
+    long_form = "pin" in headers and "net" in headers
+    skipped = []
+    for row in table.rows:
+        ref = row.get(ref_col, "").strip()
+        refs = split_refs(ref)
+        if len(refs) != 1:
+            # One part per row: two resistors never share both nets, so a
+            # grouped row here is a mistake, not a shorthand.
+            if ref:
+                skipped.append(ref)
             continue
-        description = _column_lookup(row, ["Description"])
-        package_hint = _column_lookup(row, ["Package"])
-        # A Symbol column, when the design carries one, is the same statement
-        # about schematic symbols that Package is about land patterns: the
-        # designer naming the exact library part, not a hint for a model to
-        # improve on. Added after an LLM paraphrased known-good symbol refs
-        # into plausible stock spellings — two of which named real stock
-        # symbols for the WRONG silicon.
-        symbol_hint = _column_lookup(row, ["Symbol"])
-        part_hint = _column_lookup(row, ["Part Number", "MPN", "Part"])
-        manufacturer_hint = _column_lookup(row, ["Manufacturer"])
-        # Same argument as Symbol above. The designer stated how many pins the
-        # part has; carrying it costs nothing, and dropping it makes Stage 1
-        # re-derive from the MPN alone something the document already said —
-        # for a 216-ball BGA as readily as for an 0402. It usually guesses
-        # right, which is worse than usually wrong: the one that got through
-        # was a fiducial answered as 0 pins, which is physically true, violates
-        # the BOM schema's minimum of 1, and took the whole stage down after
-        # every other row had resolved.
-        pin_count_hint = _column_lookup(row, ["Pin Count", "Pins", "Pin count"])
-        comp = components.setdefault(
-            ref,
-            {"local_id": ref, "description": description or ref, "source_ref": source_ref},
-        )
-        if description and "description" not in comp:
-            comp["description"] = description
-        if package_hint:
-            comp["package_hint"] = package_hint
-        if symbol_hint:
-            comp["symbol_hint"] = symbol_hint
-        if part_hint:
-            comp["part_hint"] = part_hint
-        if manufacturer_hint:
-            comp["manufacturer_hint"] = manufacturer_hint
-        if pin_count_hint and "pin_count_hint" not in comp:
-            try:
-                n = int(str(pin_count_hint).strip())
-            except ValueError:
-                n = 0  # prose where a number was expected; let Stage 1 decide
-            if n >= 1:
-                comp["pin_count_hint"] = n
+        if long_form:
+            pin, net = row.get(headers["pin"], "").strip(), row.get(headers["net"], "").strip()
+            pairs = [(pin, net)] if pin and net else []
+        else:
+            pairs = [(n, row.get(h, "").strip()) for n, h in sorted(pin_cols.items(), key=lambda x: int(x[0]))]
+            pairs = [(n, v) for n, v in pairs if v]
+        if not pairs:
+            skipped.append(ref)
+            continue
+        entry = connectors.setdefault(
+            refs[0], {"local_id": refs[0], "pins": [], "pin_count": 0, "source_ref": source_ref})
+        have = {p["pin"]: p["signal"] for p in entry["pins"]}
+        for pin, net in pairs:
+            if pin in have and have[pin] != net:
+                warnings.append({
+                    "code": "STAGE0-007",
+                    "summary": (f"{refs[0]} pin {pin} is {have[pin]!r} in one table and "
+                                f"{net!r} in a Connections table; both were kept."),
+                    "fix": "A pin is on one net. Correct whichever table is wrong.",
+                    "local_id": refs[0],
+                    "source_ref": source_ref,
+                })
+            if have.get(pin) == net:
+                continue
+            entry["pins"].append({"pin": pin, "signal": net})
+        entry["pin_count"] = len(entry["pins"])
+    if skipped:
+        warnings.append({
+            "code": "STAGE0-008",
+            "summary": (f"Connections table: {len(skipped)} row(s) not read — each needs exactly "
+                        f"one Ref and at least one net: {', '.join(skipped[:8])}"),
+            "fix": "One part per row, e.g. | R8 | I2C_SDA | VDD_3V3 | under | Ref | Pin 1 | Pin 2 |.",
+            "source_ref": source_ref,
+        })
 
 
 def _absorb_pinout_table(

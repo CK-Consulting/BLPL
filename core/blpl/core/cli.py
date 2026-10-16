@@ -147,7 +147,7 @@ def _md_inputs(project_dir: Path, board: str | None = None) -> list[Path]:
     if board is not None:
         man = project_manifest.discover(root)
         root = project_manifest.board_dir(root, man, board)
-    return [p for p in sorted(root.glob("*.md"))]
+    return project_manifest.design_markdown(root)
 
 
 def _make_adapter(args: argparse.Namespace) -> llm_adapter.LLMAdapter:
@@ -604,6 +604,11 @@ def _cmd_stage4(args: argparse.Namespace) -> int:
     diff_pairs = sum(1 for n in nets["nets"] if "diff_pair_of" in n)
     print(f"stage4: {len(nets['nets'])} nets ({total_members} pad members, {diff_pairs // 2} diff pairs)")
     print(f"        wrote {out}")
+    # A part nothing connects to is an error, not a warning: the board and the
+    # schematic built from these nets are wrong in a way no later stage sees.
+    # nets.json is still written, so the run can continue past it when told to.
+    if any(w["code"] == stage4_synthesize_nets.UNCONNECTED_CODE for w in nets.get("warnings", [])):
+        return 1
     return 0
 
 
