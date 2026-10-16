@@ -422,6 +422,9 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     if result.returncode != 0:
         return result.returncode
     print(f"stage6-plugin: wrote {out_path}", file=sys.stderr)
+    # The other Stage 6, so the same tracked copy. With --stamp shared with
+    # stage6's schematic and project, those are published beside it.
+    _publish(proj, board_name, out_path.stem, "stage6-plugin")
     return 0
 
 

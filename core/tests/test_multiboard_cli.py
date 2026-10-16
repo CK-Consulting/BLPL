@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import pytest
 
@@ -411,3 +412,23 @@ def test_stage6_publishes_a_single_board_project_at_its_root(tmp_path, monkeypat
     (tmp_path / ".pipeline" / "hdm.yaml").write_text("project: {name: solo}\n")
     assert cli.main(["stage6", "--project-dir", str(tmp_path)]) == 0
     assert (tmp_path / "kicad" / "solo.kicad_pcb").read_text() == "(pcb)\n"
+
+
+def test_stage6_plugin_publishes_the_board_too(project, monkeypatch):
+    # The documented alternative Stage 6 returned before the hook, so its
+    # board never reached the tracked copy.
+    (project / ".pipeline").mkdir()
+    (project / ".pipeline" / "hdm.base.yaml").write_text("project: {name: x}\n")
+    monkeypatch.setattr(cli, "_resolve_kicad_python", lambda v: Path("/usr/bin/true"))
+    monkeypatch.setattr(cli, "_resolve_plugin_dir", lambda: project)
+
+    def fake_run(cmd, env=None):
+        Path(cmd[cmd.index("--out") + 1]).write_text("(kicad_pcb (plugin))\n")
+        return argparse.Namespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    rc = cli.main(["stage6-plugin", "--project-dir", str(project), "--board", "base",
+                   "--stamp", "2026-10-16_124325Z"])
+    assert rc == 0
+    published = project / "base" / "kicad" / f"{project.name}.kicad_pcb"
+    assert published.read_text() == "(kicad_pcb (plugin))\n"
