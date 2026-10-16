@@ -345,7 +345,7 @@ will never see. Only then is the design worth spending the LLM stages on.
 
 ## Output contract — the Markdown format Stage 0 parses
 
-Stage 0 is deterministic. It scans for pipe-tables (`| ... |`) and classifies each as "BOM-like" or "pinout-like" by column headers. Match these shapes exactly or Stage 0 drops the table on the floor.
+Stage 0 is deterministic. It scans for pipe-tables (`| ... |`) and classifies each as a BOM, a pinout, a Connections table or a GPIO map by its column headers. Match these shapes exactly or Stage 0 drops the table on the floor.
 
 ### BOM table
 
@@ -391,6 +391,50 @@ recalling one from memory — it is the difference between citing the datasheet
 and approximating it.
 
 **Required columns**: `Pin`, `Signal`. `Function` and `Voltage` are optional but used by the net classifier to suggest net classes.
+
+### Connections table — every part without a pinout table
+
+A pinout table is anchored by its heading, so it describes one part. A
+resistor, capacitor, ferrite bead or diode has no datasheet pinout worth
+writing and would each need a section of its own — so in practice none got
+one, and **no passive in the design was connected to anything**. Stage 4 now
+stops with `STAGE4-007` naming every placed part that no net reaches.
+
+Connect them in one table, keyed by a `Ref` column:
+
+```markdown
+## Connections
+
+| Ref | Pin 1    | Pin 2    | Purpose                         |
+|-----|----------|----------|---------------------------------|
+| R8  | I2C_SDA  | VDD_3V3  | I2C pull-up, 4.7k               |
+| C6  | VDD_3V3  | GND      | U3 HF decoupling, at U3 pin 23  |
+| D1  | VBAT_PROT| VBAT_RAW | reverse block: 1 = K, 2 = A     |
+| R1  | SPI_SCK  | SPI_SCK_R| series damping, MCU side = pin 1|
+```
+
+or one row per pin, for a part with more than two pins:
+
+```markdown
+| Ref | Pin | Net      |
+|-----|-----|----------|
+| Q1  | 1   | LED_EN   |
+| Q1  | 2   | GND      |
+| Q1  | 3   | LED_K    |
+```
+
+Rules Stage 0 holds you to:
+
+- **One part per row.** `R8, R9` is refused (STAGE0-008): two pull-ups never share both nets.
+- **Pin numbers as the symbol numbers them**, as in a pinout table. KiCad's `Device:R`/`Device:C`/`Device:L`/`Device:FerriteBead` are 1 and 2 either way round; `Device:D` and its Schottky/Zener variants are **1 = cathode, 2 = anode**; `Device:C_Polarized` is **1 = +**; `Device:LED` is **1 = cathode**. Check the symbol when in doubt (`library_lookup`) — a reversed diode is a fault the ERC cannot see.
+- **A series part splits a net in two.** A damping resistor between the MCU and the radio means the MCU pin and the radio pin are on *different* nets: keep the source side's name, give the far side a suffix (`SPI_SCK` → `SPI_SCK_R`), and change the far part's pinout row to match. Leave both pins on one name and the resistor is shorted out on the board.
+- **A pin a Connections row and a pinout table disagree about** is reported (STAGE0-007) and both are kept. Fix the one that is wrong.
+
+Draft this table from the design, not from memory: the `design-guidelines` skill's
+reference guide lists each part's required external components with values and
+placement from its datasheet, and the BOM's Role/Notes say what each passive is
+for. Propose it as an edit for the user to confirm; never write nets for a part
+you cannot cite a reason for.
 
 ## Naming conventions that matter
 

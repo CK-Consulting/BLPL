@@ -509,6 +509,19 @@ def discover(project_dir: Path, *, project_id: str | None = None) -> ProjectMani
 PIPELINE_DIRNAME = ".pipeline"
 
 
+# Markdown BLPL itself writes beside the design documents, which is therefore
+# not design intent. lifecycle.md is the distributor lifecycle audit: its
+# table has an MPN column and a Refs column holding "C1, C1, C2, C3", so Stage
+# 0 read it as a BOM and put five bogus, unconnected parts on verdacor-ear-tag
+# named after whole cells of it.
+GENERATED_MARKDOWN = frozenset({"lifecycle.md"})
+
+
+def design_markdown(directory: Path) -> list[Path]:
+    """The design documents directly in ``directory``: its ``*.md``, less BLPL's own."""
+    return [p for p in sorted(Path(directory).glob("*.md")) if p.name not in GENERATED_MARKDOWN]
+
+
 def pipeline_dir(project_dir: Path) -> Path:
     """The one authoritative artifact directory for a project.
 

@@ -170,9 +170,39 @@ _Generated <date> by the design-guidelines skill. Sources: project assets only._
 
 The per-part "Required external components" tables are deliberately shaped
 so a later pass can turn them directly into design-doc BOM rows (with Symbol
-and Package pinned per the hardware-design skill). That later pass is a
-separate task — this skill's output is the reference guide, complete and
-cited; do not start editing the design doc mid-extraction.
+and Package pinned per the hardware-design skill) and **Connections rows**.
+That later pass is a separate task — this skill's output is the reference
+guide, complete and cited; do not start editing the design doc mid-extraction.
+
+## The Connections pass — wiring the passives
+
+Every external component a datasheet requires is two (or three) pins on two
+(or three) nets, and a design that lists them in its BOM without saying which
+nets is a board with the passives placed and connected to nothing. Stage 4
+stops on that (`STAGE4-007`), naming each part.
+
+This pass drafts the design doc's `## Connections` table (format in the
+hardware-design skill) for exactly those parts:
+
+1. **Start from the list Stage 4 printed**, and from the BOM rows: each
+   part's Role and Notes ("4.7k pull-up on I2C_SDA to VDD_3V3", "LR2021 HF
+   decoupling") usually name both nets already.
+2. **Ground every row in a source.** The reference guide's Required external
+   components (value, which pin, placement rule) for the part it serves, the
+   datasheet's typical application circuit, or the design doc's own words.
+   Put the source in the row's Purpose cell. A part you cannot place on nets
+   from any source goes in a list of questions, not in the table.
+3. **Use the nets the design already names.** Look them up in the pinout
+   tables; do not invent `VCC` where the design says `VDD_3V3`. A new net is
+   only ever the far side of a series part (`SPI_SCK` → `SPI_SCK_R`), and
+   then the far part's pinout row changes in the same proposal.
+4. **Decoupling names its pin.** "C6: VDD_3V3–GND, at U3 pin 23" — the pin
+   is what placement uses to put the capacitor next to it.
+5. **Propose, never apply.** One edit to the design doc, through the normal
+   proposal flow, for the user to confirm. List what was not drafted and why.
+6. Re-run Stage 0 and Stage 4 after it is accepted; `STAGE4-007` should be
+   gone, and any `STAGE0-007` (a pin two tables disagree about) is a mistake
+   in the draft or in the doc, to resolve before going further.
 
 ## Working method
 

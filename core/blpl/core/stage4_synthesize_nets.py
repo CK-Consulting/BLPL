@@ -235,6 +235,38 @@ def _resolve_refdes(local_id: str, bom: dict | None) -> str:
     return local_id
 
 
+UNCONNECTED_CODE = "STAGE4-007"
+# Refdes prefixes for parts that are copper or a hole, never a circuit node.
+_MECHANICAL_REF = re.compile(r"^(MH|H|FID|FD|LOGO|MK|NT)\d", re.IGNORECASE)
+
+
+def unconnected_parts(design_artifact: dict, bom: dict | None, nets_by_name: dict[str, dict]) -> list[str]:
+    """Placed parts that no net reaches, in BOM order.
+
+    Measured because it was never measured: on verdacor-ear-tag every passive
+    (C1-C7, R1-R9, FB1, D1) had zero connections, since nothing in the design
+    format could connect a part without a pinout table, and every stage after
+    this one reported success. Mechanical parts (mounting holes, fiducials) and
+    parts marked not_placed are not circuit nodes and are not counted.
+    """
+    from .symbol_resolution import is_not_placed
+
+    reached = {m["refdes"] for net in nets_by_name.values() for m in net["members"]}
+    if bom is not None:
+        parts = [(r.get("refdes") or r.get("local_id"), r.get("package") or r.get("footprint_hint"))
+                 for r in bom.get("rows", [])]
+    else:
+        parts = [(c.get("local_id"), c.get("package_hint")) for c in design_artifact.get("components", [])]
+    out: list[str] = []
+    for ref, package in parts:
+        if not ref or ref in reached or ref in out:
+            continue
+        if _MECHANICAL_REF.match(ref) or is_not_placed(package):
+            continue
+        out.append(ref)
+    return out
+
+
 def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
     """Build a nets.v1 dict from a design_artifact (and optional bom for refdes).
 
@@ -306,6 +338,29 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
                     "listing it in the host's GPIO map or naming its signal in the pinout."
                 ),
                 "unassigned_pins": [u.split(" (")[0] for u in unassigned],
+            }
+        )
+
+    unconnected = unconnected_parts(design_artifact, bom, nets_by_name)
+    if unconnected:
+        warnings.append(
+            {
+                "code": UNCONNECTED_CODE,
+                "summary": (
+                    f"error: {len(unconnected)} placed part(s) have no connection to any net: "
+                    + ", ".join(unconnected[:16])
+                    + (f", … (+{len(unconnected) - 16} more)" if len(unconnected) > 16 else "")
+                    + ". The board places them with nothing to route to, and the schematic "
+                    "can only draw them as a grid."
+                ),
+                "fix": (
+                    "Say which net each pin is on. For passives, a Connections table "
+                    "(| Ref | Pin 1 | Pin 2 |, or | Ref | Pin | Net |) in the design markdown; "
+                    "for a part with a datasheet pinout, a pinout table under its refdes. "
+                    "Ask the agent to draft the Connections table from the design and the "
+                    "datasheets' reference circuits (the design-guidelines skill)."
+                ),
+                "unconnected_parts": unconnected,
             }
         )
 

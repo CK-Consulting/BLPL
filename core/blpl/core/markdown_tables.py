@@ -103,8 +103,31 @@ _PINOUT_HEADER_TOKENS_PIN = {"pin", "ball", "pad"}
 _PINOUT_HEADER_TOKENS_SIGNAL = {"signal", "signal name", "function"}
 
 
+_REF_HEADERS = {"ref", "refdes", "reference"}
+_PIN_N_HEADER = re.compile(r"^pin\s*(\d+)(?:\s*net)?$")
+
+
+def is_connections(table: ParsedTable) -> bool:
+    """A table that says which net each pin of a named part is on.
+
+    Two shapes, both keyed by a ``Ref`` column, because a pinout table is
+    anchored by its heading and so can only describe one part: a resistor,
+    a capacitor and a ferrite bead each needing a ``## R8 — pinout`` section
+    of their own is why no passive in a real design had any connection.
+
+        | Ref | Pin | Net |            one row per pin
+        | Ref | Pin 1 | Pin 2 | ... |  one row per part, a column per pin
+    """
+    header_lower = [h.lower().strip() for h in table.headers]
+    if not any(h in _REF_HEADERS for h in header_lower):
+        return False
+    if "net" in header_lower and "pin" in header_lower:
+        return True
+    return sum(1 for h in header_lower if _PIN_N_HEADER.match(h)) >= 2
+
+
 def classify(table: ParsedTable) -> str:
-    """Return 'bom', 'pinout', 'gpio', or 'other' for a parsed table.
+    """Return 'connections', 'bom', 'pinout', 'gpio', or 'other' for a parsed table.
 
     Relaxed matching: we check whether header cells contain known tokens (case
     insensitive) rather than requiring exact column names.
@@ -115,6 +138,8 @@ def classify(table: ParsedTable) -> str:
     even if a header happens to mention GPIO.
     """
     header_lower = [h.lower() for h in table.headers]
+    if is_connections(table):
+        return "connections"
     has_pin = any(any(tok in h for tok in _PINOUT_HEADER_TOKENS_PIN) for h in header_lower)
     has_signal = any(any(tok in h for tok in _PINOUT_HEADER_TOKENS_SIGNAL) for h in header_lower)
     if has_pin and has_signal:

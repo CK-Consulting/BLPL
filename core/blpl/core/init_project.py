@@ -116,12 +116,12 @@ def build_config(project_dir: Path, *, board: str | None = None) -> InitResult:
     found: list[str] = []
     defaulted: list[str] = []
 
-    sources = sorted(project_dir.glob("*.md"))
-    if board is not None:
-        from . import project_manifest
+    from . import project_manifest
 
+    sources = project_manifest.design_markdown(project_dir)
+    if board is not None:
         man = project_manifest.discover(project_dir)
-        sources += sorted(project_manifest.board_dir(project_dir, man, board).glob("*.md"))
+        sources += project_manifest.design_markdown(project_manifest.board_dir(project_dir, man, board))
 
     for md_path in sources:
         text = md_path.read_text(encoding="utf-8")
