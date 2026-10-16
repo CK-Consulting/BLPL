@@ -410,6 +410,16 @@ class _AgentFile:
     def _fetch(self, offset: int, expect: str | None) -> tuple[bytes, int, str]:
         try:
             with gated(self.checkout):
+                if self._client.version() < 2:
+                    # A workspace an older backend started, not yet replaced
+                    # (agentclient.PROTOCOL): its agent has no ranged read, so
+                    # the file comes whole, as one block, as it did then. Over
+                    # twice the upload limit that is a 413 until it is.
+                    from . import main as m
+
+                    data = self._client.read(str(self.checkout), self.rel,
+                                             max_bytes=m.UPLOAD_MAX_BYTES * 2)
+                    return data, len(data), ""
                 return self._client.read_range(str(self.checkout), self.rel, offset,
                                                self.BLOCK, expect=expect)
         except AgentCallError as exc:

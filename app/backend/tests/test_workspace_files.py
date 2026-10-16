@@ -1123,3 +1123,36 @@ def test_a_pdf_over_the_limit_is_not_judged_through_the_agent(unlocked, monkeypa
     assert v["pdf"] is True and v["too_large"] is True and v["sha256"] is None
     assert v["inline"] is False
     assert unlocked.post("/api/projects/mine/blob/inspect", json={"path": "big.pdf"}).status_code == 413
+
+
+def test_an_older_agent_without_ranged_reads_still_serves_blobs(unlocked, via_agent, monkeypatch):
+    """Codex, PR #35: a workspace an older backend started runs an agent with
+    no /fs/read_range until it is replaced. Asked its version, it gets the
+    whole-file read it has, as before: ranges still cut, a clean PDF still
+    is judged, and only a file over twice the limit is refused."""
+    import app.main as main
+    from app.sandbox import agent as agent_mod
+
+    def no_route(self, b):
+        raise agent_mod.AgentError(404, "no route POST /fs/read_range", "notfound")
+
+    monkeypatch.setattr(agent_mod, "VERSION", 1)
+    monkeypatch.setattr(agent_mod.Agent, "fs_read_range", no_route)
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    proj = main.PROJECTS_ROOT / "mine"
+    data = b"PK\x03\x04" + bytes(range(256)) * 40
+    (proj / "gerbers.zip").write_bytes(data)
+    whole = unlocked.get("/api/projects/mine/blob", params={"path": "gerbers.zip"})
+    assert whole.status_code == 200 and whole.content == data
+    part = unlocked.get("/api/projects/mine/blob", params={"path": "gerbers.zip"},
+                        headers={"Range": "bytes=10-19"})
+    assert part.status_code == 206 and part.content == data[10:20]
+
+    (proj / "a.pdf").write_bytes(BENIGN)
+    unlocked.post("/api/projects/mine/blob/inspect", json={"path": "a.pdf"})
+    r = unlocked.get("/api/projects/mine/blob", params={"path": "a.pdf"})
+    assert r.status_code == 200 and r.content == BENIGN
+    assert r.headers["x-blpl-pdf-verdict"] != "too_large"
+
+    monkeypatch.setattr(main, "UPLOAD_MAX_BYTES", 16)
+    assert unlocked.get("/api/projects/mine/blob", params={"path": "a.pdf"}).status_code == 413

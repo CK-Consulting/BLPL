@@ -74,7 +74,10 @@ from app import serving as _serving  # type: ignore[import-not-found]
 
 logger = logging.getLogger("blpl.wsagent")
 
-VERSION = 1
+# The protocol this agent speaks, reported by /health. Raised with every verb
+# the control plane may call that an older agent does not have, and equal to
+# agentclient.PROTOCOL in the same image. 2: /fs/read_range.
+VERSION = 2
 MAX_BODY = 160 * 1024 * 1024  # an upload's cap plus headroom
 # The most one ranged read returns: a large file goes out as a run of these.
 READ_RANGE_MAX = 8 * 1024 * 1024
