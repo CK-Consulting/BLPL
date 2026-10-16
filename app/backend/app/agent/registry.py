@@ -1707,6 +1707,30 @@ def sim_tools() -> list[ToolSpec]:
 # ---------------------------------------------------------------------------
 
 
+def _packaged_skills() -> dict[str, Path]:
+    """The skills that ship inside the blpl package, by name."""
+    import blpl
+
+    root = Path(blpl.__file__).resolve().parent / "skills"
+    return {d.name: d / "SKILL.md" for d in sorted(root.iterdir()) if (d / "SKILL.md").is_file()}
+
+
+async def _read_skill(ctx: ToolContext, args: dict) -> str:
+    """One packaged skill's instructions, for the agent to follow.
+
+    Only hardware-design is in the system prompt, because it is the contract
+    every document must meet. The others are procedures for one kind of task,
+    and the one that wires passives from datasheet reference circuits
+    (design-guidelines) was out of the agent's reach entirely: it shipped for
+    Claude Code and nothing in the app could load it.
+    """
+    skills = _packaged_skills()
+    name = str(args.get("name") or "").strip()
+    if name not in skills:
+        raise ToolDenied(f"no skill {name!r}; available: {', '.join(skills)}")
+    return skills[name].read_text(encoding="utf-8")
+
+
 def project_tools() -> list[ToolSpec]:
     return [
         ToolSpec(
@@ -2150,6 +2174,25 @@ def parts_tools() -> list[ToolSpec]:
             },
             kind="file_read",
             handler=_suggest_footprint,
+        ),
+        ToolSpec(
+            name="read_skill",
+            description=(
+                "Load one of BLPL's packaged skills — the procedure for a kind of task — and "
+                "follow it. design-guidelines: extract each part's datasheet reference circuit "
+                "and required external components, and draft the Connections table that wires "
+                "the passives (do this when Stage 4 reports STAGE4-007, unconnected parts). "
+                "protection-circuits: ESD, reverse polarity, battery and port protection review. "
+                "controlled-impedance: which nets need it and how to tag them. hardware-design "
+                "is already in your instructions."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "The skill's name."}},
+                "required": ["name"],
+            },
+            kind="query",
+            handler=_read_skill,
         ),
         ToolSpec(
             name="run_doctor",

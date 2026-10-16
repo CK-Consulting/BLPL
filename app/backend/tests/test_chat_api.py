@@ -19,6 +19,7 @@ from app.chat import (
     ProposalStore,
     ProposalWriteError,
     apply_proposal,
+    build_system_prompt,
     history_to_messages,
     persist_messages,
 )
@@ -913,6 +914,21 @@ def test_doctor_and_stage0_are_available_to_the_assistant(project) -> None:
     nothing reads."""
     names = {t.name for t in default_tools()}
     assert {"run_doctor", "check_stage0", "pinout_section"} <= names
+
+
+def test_the_agent_can_load_the_skill_that_wires_the_passives(project) -> None:
+    """The preamble sends it to design-guidelines when parts are unconnected,
+    which shipped for Claude Code and nothing in the app could load."""
+    out = _call(_ctx(project), "read_skill", name="design-guidelines")
+    assert not out.is_error
+    assert "## The Connections pass" in out.content
+    assert "read_skill" in build_system_prompt()
+
+
+def test_an_unknown_skill_is_refused_with_the_ones_there_are(project) -> None:
+    out = _call(_ctx(project), "read_skill", name="../../etc/passwd")
+    assert out.is_error
+    assert "design-guidelines" in out.content
 
 
 def test_doctor_reports_errors_and_warnings_apart(project) -> None:

@@ -167,6 +167,16 @@ trace width, which for a 50 Ω RF line or a 100 Ω differential pair is simply \
 wrong. Prose may say a thing is undecided, and a Mermaid label may; a cell may \
 not. When a value is genuinely unknown, leave the row out and tell the user \
 plainly that the project is not ready for Stage 0 and what is missing.
+- **Every placed part is on nets, passives included.** A resistor, capacitor, \
+bead or diode with no pinout table is connected through the design's \
+`## Connections` table (the hardware-design skill has the format). When Stage 4 \
+reports STAGE4-007, or the user asks to wire the passives or why the schematic \
+is a grid of parts, call read_skill("design-guidelines") and follow its \
+Connections pass: draft the rows from the datasheets' reference circuits, the \
+reference guide and the BOM's Role and Notes, cite the source of each row, use \
+the nets the pinout tables already name, and propose the result with \
+propose_file_edit for the user to confirm. A part you cannot place on nets \
+from a source is a question for the user, never a guessed row.
 - Match the design documents' existing conventions rather than imposing new ones.
 - **Check a document before you propose it, and keep checking until it is \
 clean.** After writing or editing design markdown, call run_doctor with the \
