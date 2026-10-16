@@ -30,6 +30,7 @@ const STAGES = [
   "stage4",
   "stage5",
   "stage6",
+  "stage6a",
   "stage7",
   "stage8",
 ];
@@ -37,7 +38,7 @@ const STAGES = [
 // The stages the whole-pipeline runner spans (the CLI `run` range).
 const PIPELINE_STAGES = [
   "stage0", "stage1", "stage2", "stage3", "stage4",
-  "stage5", "stage6", "stage7", "stage8",
+  "stage5", "stage6", "stage6a", "stage7", "stage8",
 ];
 
 type Props = {

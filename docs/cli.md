@@ -145,8 +145,8 @@ blpl stage8 --project-dir <proj> [--board <b>]
 ```
 The review reads `autoroute_report.json` and `hdm.yaml` to decide what is excused this run and why; every excuse is printed with its reason.
 
-### `autoroute`
-Bulk-route the latest compiled board with Freerouting; runs inside `run` after stage6.
+### `autoroute` (also `stage6a`)
+Bulk-route the latest compiled board with Freerouting; `run` runs it as stage6a, between stage6 and stage7.
 ```
 blpl autoroute --project-dir <proj> [--board <b>] [--passes 10]
 ```
@@ -256,7 +256,7 @@ blpl run --project-dir <proj> [--board <b> | --board all]
     [--stage0 det|llm|both]        # mode for Stage 0; 'both' also runs stage0-compare
     [--auto-fill-gaps]             # forwarded to stage3
     [--continue-on-error]          # don't abort on non-zero stage exit
-    [--no-autoroute] [--passes N]  # the Freerouting pass after stage6
+    [--no-autoroute] [--passes N]  # skip stage6a, the Freerouting pass
     [--lifecycle | --no-lifecycle] # forwarded to stage8
     [--llm-provider ...] [--llm-model ...]
     [--symbols-root ...] [--footprints-root ...]

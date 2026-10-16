@@ -863,6 +863,38 @@ def test_pipeline_rejects_a_backwards_range(client) -> None:
     assert r.status_code == 400
 
 
+def _queued_cmd(project_name: str) -> list:
+    from sqlalchemy import select
+
+    import app.db
+    from app import runqueue
+    from app.models import Project, Run
+
+    with app.db.SessionFactory() as s:
+        project = s.scalar(select(Project).where(Project.name == project_name))
+        run = s.scalars(
+            select(Run)
+            .where(Run.project_id == project.id, Run.status == runqueue.QUEUED)
+            .order_by(Run.created_at.desc())
+        ).first()
+        assert run is not None, f"no run queued for {project_name!r}"
+        return list(run.cmd)
+
+
+def test_autoroute_is_stage6a_in_a_range_and_on_its_own(client) -> None:
+    # It ran inside stage6, so no range could start at the router and the
+    # single-stage list could not offer it at all.
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("routeonly"))
+    enqueue_only(client, "/api/projects/routeonly/pipeline?from_stage=stage6a&to_stage=stage7")
+    cmd = _queued_cmd("routeonly")
+    assert cmd[cmd.index("--from") + 1] == "stage6a"
+
+    client.post("/api/projects/init", json=init_body("routeone"))
+    enqueue_only(client, "/api/projects/routeone/stages/stage6a")
+    assert "stage6a" in _queued_cmd("routeone")
+
+
 def test_pipeline_rejects_an_unknown_stage(client) -> None:
     sign_in(client)
     client.post("/api/projects/init", json=init_body("scratch"))
