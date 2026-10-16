@@ -99,6 +99,15 @@ def test_a_new_class_does_not_inherit_the_default_width() -> None:
     assert new["net_classes"]["RF"] == {"impedance": True}
 
 
+def test_the_first_class_brings_default_with_it() -> None:
+    """A present net_classes must hold Default; a file with none got a section
+    the schema refuses."""
+    bare = {"project": {"name": "p", "dimensions": [50, 40]}}
+    new = board_config.with_impedance(bare, classes={"RF": {"impedance": 50}})
+    assert new["net_classes"] == {"Default": {}, "RF": {"impedance": 50}}
+    assert board_config.errors(new) == []
+
+
 def test_empty_tags_remove_the_list() -> None:
     tagged = board_config.with_impedance(BASE, tags=[{"nets": "^ANT"}])
     assert tagged["controlled_impedance"] == [{"nets": "^ANT"}]

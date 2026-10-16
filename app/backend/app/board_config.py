@@ -153,5 +153,9 @@ def with_impedance(config: dict, *, tags=_UNSET, classes=None) -> dict:
                 else:
                     merged[k] = copy.deepcopy(v)
             net_classes[name] = merged
+        # A present net_classes must hold Default, and a file that had none
+        # gets an empty one rather than a refusal (Codex, PR #34).
+        if net_classes and "Default" not in net_classes:
+            net_classes = {"Default": {}, **net_classes}
         out["net_classes"] = net_classes
     return out

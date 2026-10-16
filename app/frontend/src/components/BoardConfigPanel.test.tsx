@@ -536,6 +536,52 @@ describe("controlled impedance, as fields", () => {
     expect(box.sent.config.controlled_impedance).toEqual([{ nets: "^ANT_" }]);
   });
 
+  it("seeds Default when the first class is added to a file with none", async () => {
+    const { box, onPut } = capture();
+    const { net_classes: _, ...bare } = IMPEDANCE.config;
+    stubWith(bare, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.change(await screen.findByLabelText("New net class name"), { target: { value: "RF" } });
+    fireEvent.click(screen.getByText("Add net class"));
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.net_classes).toEqual({ Default: {}, RF: {} });
+  });
+
+  it("does not land a tighter tag on a looser class, as Stage 5 does not", async () => {
+    stubWith({
+      ...IMPEDANCE.config,
+      net_classes: { Default: {}, RF: { trace_width: 0.29, impedance: 50 } },
+      controlled_impedance: [{ nets: "^ANT_", tolerance_pct: 5 }],
+    });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    // RF is ±10%; a ±5% tag gets its own class, named for its tolerance.
+    expect(await screen.findByText(/Stage 5 makes Z50_SE_T5/)).toBeInTheDocument();
+    expect(screen.queryByText("Lands on RF.")).toBeNull();
+  });
+
+  it("shows a refusal about a class whose name has a dot on that class", async () => {
+    const msg = "net_classes.USB.HS.impedance: 5 is less than the minimum of 10";
+    stubWith(
+      { ...IMPEDANCE.config, net_classes: { Default: {}, USB: {}, "USB.HS": { impedance: 5 } } },
+      { onPut: () => new Response(JSON.stringify({ detail: { errors: [msg] } }), { status: 422 }) },
+    );
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByText("Save board config"));
+    const shown = await screen.findByText(msg);
+    expect(shown.closest(".board-feature")).toContainElement(screen.getByLabelText("USB.HS trace width"));
+  });
+
+  it("keeps a refusal it cannot place in the list by the save button", async () => {
+    const msg = "net_classes.Gone.trace_width: -1 is not greater than 0";
+    stubWith(IMPEDANCE.config, {
+      onPut: () => new Response(JSON.stringify({ detail: { errors: [msg] } }), { status: 422 }),
+    });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByText("Save board config"));
+    expect(await screen.findByRole("alert")).toHaveTextContent(msg);
+  });
+
   it("removing the last tag removes the list", async () => {
     const { box, onPut } = capture();
     stubWith({ ...IMPEDANCE.config, controlled_impedance: [{ nets: "^ANT_" }] }, { onPut });

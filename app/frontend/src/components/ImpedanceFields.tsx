@@ -90,12 +90,26 @@ export function writeImpedance(spec: Spec): Impedance {
 const ohmsOf = (s: Spec) => s.ohms ?? DEFAULT_OHMS;
 const modeOf = (s: Spec): ImpedanceMode => s.mode ?? "single_ended";
 const sameTarget = (a: Spec, b: Spec) => ohmsOf(a) === ohmsOf(b) && modeOf(a) === modeOf(b);
+/** impedance.Spec.meets: whether a class builds what a tag asks for. A tag
+ *  that states a tolerance needs a class at least that tight — a ±10% class
+ *  does not meet ±5%, and Stage 5 makes another class instead. */
+const meets = (cls: Spec, tag: Spec) =>
+  sameTarget(cls, tag) &&
+  (tag.tolerance_pct === undefined || (cls.tolerance_pct ?? DEFAULT_TOLERANCE) <= tag.tolerance_pct + 1e-9);
 const label = (s: Spec) =>
   `${ohmsOf(s)} Ω ${modeOf(s).replace("_", "-")} ±${s.tolerance_pct ?? DEFAULT_TOLERANCE}%`;
 
 /** The class Stage 5 makes for a target no declared class has. */
-export function synthesizedName(s: Spec): string {
-  return `Z${ohmsOf(s)}_${MODE_TAG[modeOf(s)]}`.replace(".", "p");
+export function synthesizedName(s: Spec, taken: string[] = []): string {
+  // impedance.synthesized_name: a tolerance other than the default is in the
+  // name, and a name already declared gets a suffix.
+  let base = `Z${ohmsOf(s)}_${MODE_TAG[modeOf(s)]}`;
+  const tol = s.tolerance_pct ?? DEFAULT_TOLERANCE;
+  if (Math.abs(tol - DEFAULT_TOLERANCE) > 1e-9) base += `_T${tol}`;
+  base = base.replaceAll(".", "p");
+  let name = base;
+  for (let n = 2; taken.includes(name); n++) name = `${base}_${n}`;
+  return name;
 }
 
 /** Which net class a Stage 8 impedance finding is about. The report carries
@@ -109,15 +123,24 @@ export function findingClass(f: ZcFinding): string | null {
 /** Server errors, by the row they are about. Stage 5's messages start with the
  *  path either as the schema spells it (`controlled_impedance.0.nets: ...`)
  *  or as impedance.py does (`controlled_impedance[0].class ...`). */
-export function routeErrors(errors: string[]) {
+export function routeErrors(errors: string[], classNames: string[], tagCount: number) {
   const classes: Record<string, string[]> = {};
   const tags: Record<number, string[]> = {};
   const rest: string[] = [];
+  // Matched against the names that have a row, longest first: a class may be
+  // called USB.HS, and a pattern that stops at the dot filed its error under
+  // a USB row that does not exist, where nobody saw it (Codex, PR #34).
+  const known = [...classNames].sort((a, b) => b.length - a.length);
   for (const e of errors) {
     const t = /^controlled_impedance(?:\.|\[)(\d+)/.exec(e);
-    const c = /^net_classes\.([^.:\s[]+)/.exec(e);
-    if (t) (tags[Number(t[1])] ??= []).push(e);
-    else if (c) (classes[c[1]] ??= []).push(e);
+    const c = e.startsWith("net_classes.")
+      ? known.find((n) => {
+          const after = e.charAt("net_classes.".length + n.length);
+          return e.startsWith(`net_classes.${n}`) && (after === "" || after === "." || after === ":" || after === " ");
+        })
+      : undefined;
+    if (t && Number(t[1]) < tagCount) (tags[Number(t[1])] ??= []).push(e);
+    else if (c !== undefined) (classes[c] ??= []).push(e);
     else rest.push(e);
   }
   return { classes, tags, rest };
@@ -405,7 +428,9 @@ export function ImpedanceFields({
             type="button"
             disabled={!trimmed || !!nameProblem}
             onClick={() => {
-              onChange({ ...netClasses, [trimmed]: {} }, tags);
+              // A file with no net_classes has no Default either, and the
+              // schema wants Default whenever the section exists (Codex, PR #34).
+              onChange({ ...("Default" in netClasses ? {} : { Default: {} }), ...netClasses, [trimmed]: {} }, tags);
               setNewName("");
             }}
           >
@@ -428,14 +453,14 @@ export function ImpedanceFields({
           const chosen = tag.class && specs[tag.class] ? specs[tag.class] : null;
           const own: Spec = { ohms: tag.ohms, mode: tag.mode, tolerance_pct: tag.tolerance_pct };
           const shown = chosen ?? own;
-          const same = names.filter((n) => specs[n] && sameTarget(specs[n], own));
+          const same = names.filter((n) => specs[n] && meets(specs[n], own));
           const lands = tag.class
             ? null
             : same.length === 1
               ? `Lands on ${same[0]}.`
               : same.length > 1
                 ? `${same.join(", ")} all declare ${label(own)}; choose one, or Stage 5 refuses the board.`
-                : `No class declares ${label(own)}, so Stage 5 makes ${synthesizedName(own)} with the Default width, and Stage 8 reports ZC-001 until a class with the stackup's width is declared.`;
+                : `No class declares ${label(own)}, so Stage 5 makes ${synthesizedName(own, names)} with the Default width, and Stage 8 reports ZC-001 until a class with the stackup's width is declared.`;
           const classOptions = names.filter((n) => specs[n]);
           if (tag.class && !classOptions.includes(tag.class)) classOptions.push(tag.class);
           const setOwn = (k: "ohms" | "mode" | "tolerance_pct", v: unknown) => {

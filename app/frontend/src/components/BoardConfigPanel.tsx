@@ -163,7 +163,7 @@ export function BoardConfigPanel({
   const tags = Array.isArray(draft.controlled_impedance) ? draft.controlled_impedance : [];
   // Refusals about a class or a tag are shown on its row; the rest stay in
   // the list by the save button.
-  const routed = routeErrors(errors);
+  const routed = routeErrors(errors, Object.keys(netClasses), tags.length);
   const testPoints: Record<string, unknown> = isMap(draft.test_points) ? draft.test_points : {};
   const built = shaped
     ? tryBuild(outline as ShapeSpec, "board outline", "origin")
