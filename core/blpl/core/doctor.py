@@ -630,8 +630,8 @@ _NOT_BOARD_DIRS = frozenset(
 
 def _design_files(directory: Path) -> list[Path]:
     """Markdown in ``directory`` holding something Stage 0 builds from: a BOM, a
-    pinout or a GPIO assignment table (read into gpio_assignments), or a
-    ``## Modules`` list."""
+    pinout, a Connections table, a GPIO assignment table (read into
+    gpio_assignments), or a ``## Modules`` list."""
     from . import project_manifest
 
     found = []
@@ -641,7 +641,8 @@ def _design_files(directory: Path) -> list[Path]:
         except OSError:
             continue
         if any(
-            _md.classify(t) in ("bom", "pinout", "gpio") for t in _md.extract_tables(text, md.name)
+            _md.classify(t) in ("bom", "pinout", "connections", "gpio")
+            for t in _md.extract_tables(text, md.name)
         ) or _modules_remix.parse_modules_section(text):
             # A '## Modules' list is a whole board's worth of parts: Stage 0
             # expands each named module into its components.
@@ -982,8 +983,14 @@ def run(
                     )
                     if not ref:
                         continue
-                    bom_refs.add(ref)
-                    bom_rows.append((ref, lower, rel, table.line_start))
+                    # Split as Stage 0 does: "SW1, SW2" is two parts, and a
+                    # "## SW2 pinout" for one of them is not a missing BOM row
+                    # (Codex, PR #41).
+                    from .stage0_deterministic import split_refs
+
+                    for one in split_refs(ref):
+                        bom_refs.add(one)
+                        bom_rows.append((one, lower, rel, table.line_start))
                     if not any(lower.get(k) for k in ("mpn", "part number", "part")):
                         report.findings.append(
                             Finding(
