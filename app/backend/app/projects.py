@@ -337,6 +337,12 @@ def check_remote_url(url: str) -> str:
     )
 
 
+def _baseline_rules() -> list[str]:
+    """The baseline's rule lines, without its comments and blank lines."""
+    return [line.strip() for line in BASELINE_GITIGNORE.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
 class Projects:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
@@ -442,6 +448,21 @@ class Projects:
             with f.open("a", encoding="utf-8") as fh:
                 fh.write("\n" + BASELINE_GITIGNORE)
             changed = True
+        else:
+            # The baseline was applied once, and has grown since. Its marker
+            # line being present said nothing about rules added after, so a
+            # project made before `~*.lck` joined it committed KiCad's lock on
+            # any board open while it saved (Codex, PR #40). Append each rule
+            # it lacks, and only those.
+            have = {line.strip() for line in f.read_text(encoding="utf-8").splitlines()}
+            missing = [r for r in _baseline_rules() if r not in have]
+            if missing:
+                text = f.read_text(encoding="utf-8")
+                with f.open("a", encoding="utf-8") as fh:
+                    fh.write(("" if text.endswith("\n") else "\n")
+                             + "\n# Added by BLPL: baseline rules this file did not have yet.\n"
+                             + "".join(r + "\n" for r in missing))
+                changed = True
 
         listed = self._git_allow_fail(d, "ls-files", "--cached", "--ignored", "--exclude-standard")
         untracked = [line for line in listed.splitlines() if line.strip()]
