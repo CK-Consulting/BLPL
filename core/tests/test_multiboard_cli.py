@@ -285,16 +285,33 @@ def test_run_all_boards_is_refused_on_a_single_board_project(tmp_path):
     assert cli.main(["run", "--project-dir", str(tmp_path), "--board", "all", "--to", "stage0"]) == 2
 
 
-def test_run_routes_after_stage6_unless_told_not_to(project, monkeypatch):
+def test_autoroute_is_stage6a_its_own_stage(project, monkeypatch):
+    # It used to run inside stage6, so `--to stage6` routed and no range could
+    # start at the router or stop short of it.
     seen: list[str] = []
     monkeypatch.setattr(cli, "_cmd_stage6", lambda ns: seen.append("stage6") or 0)
     monkeypatch.setattr(cli, "_cmd_autoroute", lambda ns: seen.append(f"autoroute:{ns.passes}") or 0)
-    args = ["run", "--project-dir", str(project), "--board", "base", "--from", "stage6", "--to", "stage6"]
-    assert cli.main([*args, "--passes", "3"]) == 0
-    assert seen == ["stage6", "autoroute:3"]
+    monkeypatch.setattr(cli, "_cmd_stage7", lambda ns: seen.append("stage7") or 0)
+    base = ["run", "--project-dir", str(project), "--board", "base"]
+
+    assert cli.main([*base, "--from", "stage6", "--to", "stage6"]) == 0
+    assert seen == ["stage6"], "stage6 alone emits; it does not route"
     seen.clear()
-    assert cli.main([*args, "--no-autoroute"]) == 0
-    assert seen == ["stage6"]
+    assert cli.main([*base, "--from", "stage6", "--to", "stage7", "--passes", "3"]) == 0
+    assert seen == ["stage6", "autoroute:3", "stage7"]
+    seen.clear()
+    assert cli.main([*base, "--from", "stage6a", "--to", "stage6a"]) == 0
+    assert seen == ["autoroute:10"]
+    seen.clear()
+    assert cli.main([*base, "--from", "stage6", "--to", "stage7", "--no-autoroute"]) == 0
+    assert seen == ["stage6", "stage7"]
+
+
+def test_stage6a_is_the_autoroute_command_by_its_stage_name(project, monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_cmd_autoroute", lambda ns: seen.append(ns.board) or 0)
+    assert cli.main(["stage6a", "--project-dir", str(project), "--board", "base"]) == 0
+    assert seen == ["base"]
 
 
 def test_stage8_reviews_the_board_it_was_asked_about(project, monkeypatch):
