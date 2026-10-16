@@ -657,6 +657,41 @@ def test_a_symbol_removal_the_ledger_cannot_record_is_put_back(tmp_path, monkeyp
     assert quarantine.ledger(tmp_path) == ledger_before
 
 
+def test_two_uploads_into_one_library_at_once_both_land(tmp_path, monkeypatch):
+    """Each read the flat library and wrote it back with its own symbol added,
+    and the slower write dropped the other's symbol; the ledger, read and
+    written whole, could lose a row the same way (Codex, PR #32). Here the
+    read is slowed so the two always overlap without the checkout's lock."""
+    import threading
+    import time
+
+    _up(tmp_path, _symlib(_symbol("FIRST")), "symbol", "first.kicad_sym")
+    real = library_upload.existing_symbols
+
+    def slow(project_dir, library):
+        out = real(project_dir, library)
+        time.sleep(0.2)
+        return out
+
+    monkeypatch.setattr(library_upload, "existing_symbols", slow)
+    results = {}
+
+    def upload(name):
+        results[name] = _up(tmp_path, _symlib(_symbol(name)), "symbol", f"{name}.kicad_sym")
+
+    threads = [threading.Thread(target=upload, args=(n,)) for n in ("A", "B")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert {r.state for r in results.values()} == {quarantine.RELEASED}
+    lib = sexpr.parse((tmp_path / "libraries" / "symbols" / "myproj.kicad_sym").read_text())
+    assert sorted(sexpr.unquote(x[1]) for x in sexpr.find_all(lib, "symbol")
+                  if "_" not in sexpr.unquote(x[1])) == ["A", "B", "FIRST"]
+    names = {r["original_name"] for r in quarantine.ledger(tmp_path)}
+    assert {"first.kicad_sym", "A.kicad_sym", "B.kicad_sym"} <= names
+
+
 def test_a_library_write_never_goes_through_a_link(tmp_path):
     """Nothing checks for links first and then writes by path: that was a race
     with whatever else writes the checkout (Codex, PR #32). Each write opens
