@@ -404,6 +404,109 @@ def _sha256(path: Path) -> str:
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
+def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
+    """The fab's table of impedance-controlled traces, from the HDM the board came from.
+
+    A fab cannot see which traces are meant to be 50 ohms: on the gerbers they
+    are just widths. Without this sheet the controlled lines are etched like
+    any other, and the board measures whatever it measures.
+
+    Not ok when a controlled class has no width from a stackup. That board is
+    not quotable: the fab would be asked to control an impedance on a trace
+    drawn at the Default width, which is the one thing the sheet exists to stop.
+    """
+    import yaml
+
+    from . import impedance
+
+    candidates = ([pipeline / f"hdm.{pcb.stem}.yaml"] if pcb is not None else []) + [pipeline / "hdm.yaml"]
+    hdm_path = next((c for c in candidates if c.is_file()), None)
+    if hdm_path is None:
+        if pcb is not None and pcb.is_file():
+            # A board with no HDM beside it cannot say which of its traces are
+            # controlled, and "nothing found" is not "nothing to control": a
+            # package released that way would drop every impedance requirement
+            # the board was designed with (Codex, PR #31).
+            return Step("impedance", False,
+                        f"no hdm.yaml for {pcb.name}: cannot tell which traces are "
+                        "impedance-controlled; run stage5 for this board")
+        return Step("impedance", True, "no board and no hdm.yaml; nothing to say about impedance")
+    # A hand-edited HDM that does not parse is a refused step, not a crashed
+    # build: the package and its refusal notice are still owed (Codex, PR #31).
+    try:
+        hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        return Step("impedance", False, f"could not read {hdm_path.name}: {exc}")
+    if not isinstance(hdm, dict):
+        return Step("impedance", False, f"{hdm_path.name} is not a mapping")
+    # Review first. A tag that matched nothing leaves no controlled net and so
+    # no table, and returning "nothing to control" before asking would let the
+    # requirement it was meant to carry vanish from a quotable package.
+    # A malformed value in a hand-edited HDM refuses the step; it must not
+    # abort the build and lose the refusal notice (Codex, PR #31).
+    try:
+        errors = sorted({f["rule_id"] for f in impedance.review(hdm) if f["severity"] == "error"})
+        table = impedance.fab_table(hdm)
+    except (impedance.ImpedanceConfigError, TypeError, ValueError, AttributeError) as exc:
+        return Step("impedance", False, f"{hdm_path.name} has impedance settings that do not parse: {exc}")
+    if table is None:
+        if errors:
+            return Step("impedance", False,
+                        f"controlled impedance is not ready for a fab ({', '.join(errors)}); "
+                        "see Stage 8's ZC findings")
+        return Step("impedance", True, "no impedance-controlled nets")
+    dest = out_dir / "fab" / "impedance.md"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(table, encoding="utf-8")
+    # Any impedance error Stage 8 would report blocks the package, not only a
+    # missing number: two complete classes for one pair (ZC-005) fill every
+    # cell of the sheet and still ask the fab for two geometries at once. The
+    # design is judged before the routing: a board cannot be checked against
+    # a sheet that is itself incomplete or contradictory.
+    if "NOT SET" in table or errors:
+        return Step(
+            "impedance", False,
+            "controlled impedance is not ready for a fab"
+            + (f" ({', '.join(errors)})" if errors else "")
+            + "; see fab/impedance.md and Stage 8's ZC findings",
+            [str(dest.relative_to(out_dir))],
+        )
+    # Then what was routed: every controlled net is, at its width, on its
+    # layer, and a coplanar line with its ground copper at its gap.
+    if pcb is not None and pcb.is_file():
+        from blpl.emitter import sexpr
+
+        try:
+            board = sexpr.parse(pcb.read_text(encoding="utf-8"))
+            problems = (
+                [f"{n} is controlled in the HDM but has no routed copper on the board"
+                 for n in impedance.unrouted_controlled(hdm, board)]
+                + [f"{n} on {lay}" for n, lay, _ in impedance.layer_violations(hdm, board)]
+                + [f"{n} at {w:g} mm, not {want:g}"
+                   for n, w, want, _ in impedance.width_violations(hdm, board)]
+                + [f"{cls} has no ground zone on {lay}"
+                   for cls, lay in impedance.coplanar_without_ground(hdm, board)]
+                + impedance.coplanar_gap_problems(hdm, board)
+                + impedance.pair_problems(hdm, board)
+                + [(f"{cls} on {lay} has no reference layer at all" if ref == "none"
+                    else f"{cls} on {lay} has no ground or power plane on {ref} under it")
+                   for cls, lay, ref in impedance.missing_reference(hdm, board)]
+                + impedance.stackup_mismatch(hdm, board)
+            )
+        except Exception as exc:  # an unreadable board cannot be vouched for
+            return Step("impedance", False, f"could not read {pcb.name} to check controlled routing: {exc}",
+                        [str(dest.relative_to(out_dir))])
+        if problems:
+            shown = ", ".join(problems[:6])
+            more = f" and {len(problems) - 6} more" if len(problems) > 6 else ""
+            return Step(
+                "impedance", False,
+                f"the routed board does not build the controlled impedances: {shown}{more}",
+                [str(dest.relative_to(out_dir))],
+            )
+    return Step("impedance", True, "", [str(dest.relative_to(out_dir))])
+
+
 def build(
     project_dir: Path,
     *,
@@ -445,12 +548,16 @@ def build(
         steps.append(Step("bom", False, "no BOM artifact in .pipeline — run stage1/stage2 first"))
 
     steps.append(copy_native_project(project_dir, out_dir))
+    z_step = export_impedance(pipeline, pcbs[0] if pcbs else None, out_dir)
+    steps.append(z_step)
 
     gate = run_gate(pipeline, out_dir)
     gate_ok = bool(gate.get("ok")) and not gate.get("skipped")
+    quotable = gate_ok and z_step.ok
 
-    if not gate_ok:
-        (out_dir / "READ-ME-FIRST.txt").write_text(_refusal_text(gate, steps), encoding="utf-8")
+    if not quotable:
+        (out_dir / "READ-ME-FIRST.txt").write_text(
+            _refusal_text(gate, steps, gate_ok=gate_ok), encoding="utf-8")
 
     files: list[dict] = []
     for path in sorted(p for p in out_dir.rglob("*") if p.is_file()):
@@ -467,7 +574,7 @@ def build(
         "release": name,
         "schema_version": 1,
         "created": stamp,
-        "quotable": gate_ok,
+        "quotable": quotable,
         "gate": gate,
         "steps": [s.to_dict() for s in steps],
         "tools": {"kicad_cli": _tool_version(cli) if cli else "not found"},
@@ -492,12 +599,14 @@ def build(
     return manifest
 
 
-def _refusal_text(gate: dict, steps: list[Step]) -> str:
+def _refusal_text(gate: dict, steps: list[Step], *, gate_ok: bool = False) -> str:
     lines = [
         "THIS PACKAGE IS NOT CLEARED FOR FABRICATION.",
         "",
     ]
-    if gate.get("skipped"):
+    if gate_ok:
+        lines.append("The release gate passed, but the package is not complete (below).")
+    elif gate.get("skipped"):
         lines.append(f"The release gate could not run: {gate.get('reason', 'no reason recorded')}")
         lines.append(
             "That is not the same as passing. Nothing here has been checked against the "
@@ -544,7 +653,10 @@ def main(argv: list[str] | None = None) -> int:
     if manifest["quotable"]:
         print(f"release: gate passed → {manifest['archive']}", flush=True)
         return 0
-    why = gate.get("reason") or "the gate did not pass"
+    if gate.get("ok") and not gate.get("skipped"):
+        why = "incomplete: " + ", ".join(manifest["incomplete"])
+    else:
+        why = gate.get("reason") or "the gate did not pass"
     print(
         f"release: NOT cleared for fabrication ({why}). Package written anyway for inspection: "
         f"{manifest['archive']}",

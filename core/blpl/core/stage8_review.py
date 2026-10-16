@@ -44,7 +44,7 @@ from pathlib import Path
 
 import yaml
 
-from . import board_geometry, schema
+from . import board_geometry, impedance, schema
 from .project_manifest import artifact_path
 
 _PIPELINE_ROOT = Path(__file__).resolve().parent.parent
@@ -1071,7 +1071,10 @@ def run(
 
     # Partition every analyzer finding by provenance.
     emitter_defects: list[dict] = list(crosschecks)
-    design_issues: list[dict] = list(geometry_design)
+    # Controlled impedance: a class meant to hit an impedance with no width
+    # from a stackup, a pair with no gap. The user's to fix in project.yaml.
+    design_issues: list[dict] = list(geometry_design) + (
+        impedance.review(hdm) if isinstance(hdm, dict) else [])
     expected_counts: dict[str, int] = {}
 
     for source in ("schematic", "pcb", "cross", "emc", "spice"):

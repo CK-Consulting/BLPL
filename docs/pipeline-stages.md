@@ -195,6 +195,116 @@ A stock module's own keepout reaches KiCad's DRC, but the placer does not
 model it. To keep parts clear of it while placing, declare it as an anchored
 keepout too.
 
+### Controlled impedance
+
+Which nets need a controlled impedance, and at what, is declared in the board's
+`project.yaml` (`core/blpl/core/impedance.py`). A net class names the target
+its widths are for; `controlled_impedance` tags nets by name. 50 Ω
+single-ended is the default:
+
+```yaml
+net_classes:
+  RF_50Ohm:
+    trace_width: 0.35          # from the fab's impedance calculator, this stackup
+    clearance: 0.2
+    impedance: 50              # true = 50; or {ohms, mode, tolerance_pct}
+  USB2_Diff_90Ohm:
+    trace_width: 0.18
+    diff_pair_gap: 0.15
+    impedance: {ohms: 90, mode: differential}
+controlled_impedance:
+  - nets: "_RF_(IN|OUT)$|^ANT_"
+  - nets: "_USB\\d*_D[PMN]$"
+    ohms: 90
+    mode: differential
+```
+
+Stage 5 moves each tagged net to the class it names, or to the one declared
+class with the same ohms and mode. A tag that states a tolerance needs a class
+at least that tight; a net always records its class's spec, which is what the
+fab sheet prints. A differential tag brings in the net's pair partner.
+Each controlled net then carries `impedance` in the HDM, and so does every net
+Stage 4's name rules put on an impedance class. When no class has the target,
+one is made (`Z50_SE`, `Z90_DIFF`, `Z50_SE_T5` for ±5%; never a declared class's name) with the Default class's geometry, so the
+board still builds. Stage 8 reports that as **ZC-001**, because a Default-width
+trace is not that impedance.
+
+The rest follows from that:
+
+- `.kicad_pro` carries each class's own `diff_pair_gap` and `diff_pair_width`,
+  where it used to write the clearance as the gap.
+- Synthesized test points leave controlled nets alone unless
+  `test_points.include_controlled_impedance` is set, because a pad on a
+  controlled line is a stub.
+- Stage 8 reports four findings:
+  - **ZC-001**: a controlled class has no stackup width.
+  - **ZC-002**: a differential class has no gap.
+  - **ZC-003**: a differential net has no pair partner.
+  - **ZC-004**: a class is named for an impedance, like `RF_50Ohm`, but
+    declares none.
+  - **ZC-005**: the two halves of a pair are on different classes. A half that
+    reaches a differential class on its own brings its partner with it, so this
+    only fires when the halves are put on two different classes.
+  - **ZC-006**: a coplanar class has no `coplanar_gap`, the gap to the ground
+    pour that sets its impedance alongside the width. KiCad keeps the pour the
+    class clearance from the trace, so `.kicad_pro` raises the clearance to a
+    larger gap, and never lowers it to a smaller one.
+  - **ZC-010**: a coplanar gap smaller than the class's own clearance (the
+    emitter's 0.2 mm when the class declares none). The
+    pour cannot come that close without breaking the project's clearance.
+  - **ZC-007**: on a board with more than two copper layers, a class does not
+    say which layer its width is for (`impedance.layers`).
+  - **ZC-008**: a `controlled_impedance` tag matches no net, so its
+    requirement would silently vanish.
+  - **ZC-009**: a single-ended or differential impedance on a one-layer board,
+    which has no layer for the plane it needs. Coplanar is allowed.
+  - **ZC-011**: a net carries its own `impedance` but its class declares none,
+    or one that does not parse. The class is what the board is routed and
+    checked by, so the sheet marks the row NOT SET rather than guessing.
+
+  Every one except ZC-004 is an error.
+- The release build (the app, or `python -m blpl.core.release`) writes
+  `fab/impedance.md` for the board house, naming every controlled net, the
+  layers each width is for, and the plane it was calculated against. A net on
+  a class that declares an impedance is controlled whether or not it carries
+  its own `impedance` mapping. A package is not quotable while any ZC error
+  stands. It is also not quotable while the routed `.kicad_pcb` has any of
+  these:
+  - a controlled net with no routed copper at all: unrouted, renamed since,
+    or named by an `hdm.yaml` from another board. Every other check measures
+    what is there, so a net with nothing there would otherwise pass them all;
+  - a controlled trace on a layer its class's width is not for;
+  - a controlled trace at a width other than the class's;
+  - a coplanar trace without *filled* ground copper on both sides at its
+    declared gap. The gap is measured: the span across it must be clear of
+    ground and ground must begin just past it, so a pour pulled back 0.04 mm
+    or reaching into the gap is a different line and is reported;
+  - a differential pair whose halves are not routed together: on different
+    layers, or not side by side at `diff_pair_gap`;
+  - a controlled trace with no filled ground or power plane under it on its
+    reference layer. By default that is the layer next to an outer trace, or
+    both neighbours of an inner one, by the board's own layer table;
+    `impedance.reference` names it explicitly. Another signal's pour is not a
+    plane, and nor is the trace's own net. The plane must reach three trace
+    widths past each edge; a strip under the trace is not a plane;
+  - a board whose copper layer count differs from the HDM's stackup, or a
+    board with no HDM beside it.
+
+  Coupling and ground are judged by walking each controlled net's routed path
+  every 0.25 mm, along segments and arcs alike, so a curve or a partial
+  overlap is measured the same as a straight run. Only the first and last 2 mm
+  of the routed path, measured along the copper from where it meets a pad of
+  its own net, go unmeasured as breakout — and never more than half the
+  path's reach, so a short pad-to-pad run is measured in its middle. A dead end anywhere else is a stub,
+  and a gap anywhere in between is reported.
+
+  A class width is only the router's default and constrains no layer, so the
+  release reads the board itself. Neither emitter pours ground, so that zone is
+  drawn by hand.
+
+The `controlled-impedance` skill covers choosing targets, routing, termination
+and ordering.
+
 `hdm.yaml` is the single source of truth for Stage 6. A human can read and edit it directly.
 
 Three things Stage 5 adds that no BOM row asked for:

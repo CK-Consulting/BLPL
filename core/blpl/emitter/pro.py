@@ -20,12 +20,22 @@ def build(hdm: dict, *, project_filename: str) -> dict:
         classes.append(
             {
                 "name": name,
-                "clearance": rules.get("clearance", 0.2),
+                # A coplanar line's impedance is set by its gap to the ground
+                # pour beside it, and the pour keeps the class clearance from
+                # the trace. So a larger gap raises the clearance to it. A
+                # smaller one never lowers it: that would let every other net
+                # closer than the project allows (Codex, PR #31). That conflict
+                # is Stage 8's ZC-010 instead.
+                "clearance": max(rules.get("clearance", 0.2), rules.get("coplanar_gap", 0)),
                 "track_width": rules.get("trace_width", 0.25),
                 "via_diameter": rules.get("via_dia", 0.6),
                 "via_drill": rules.get("via_drill", 0.3),
-                "diff_pair_width": rules.get("trace_width", 0.25),
-                "diff_pair_gap": rules.get("clearance", 0.2),
+                # A pair's own width and gap when the class gives them. The
+                # gap used to be the clearance, which for any impedance-
+                # controlled pair is simply a different number: the gap sets a
+                # differential impedance as much as the width does.
+                "diff_pair_width": rules.get("diff_pair_width", rules.get("trace_width", 0.25)),
+                "diff_pair_gap": rules.get("diff_pair_gap", rules.get("clearance", 0.2)),
             }
         )
     if not any(c["name"] == "Default" for c in classes):

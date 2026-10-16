@@ -21,7 +21,7 @@ from typing import Any
 
 import yaml
 
-from . import board_geometry, placement, schema, symbol_resolution
+from . import board_geometry, impedance, placement, schema, symbol_resolution
 from . import stage4_synthesize_nets
 
 
@@ -138,7 +138,11 @@ def ensure_project_config(project_config_path: Path, project_id: str) -> dict:
         # stop the run here too, for the same reason.
         try:
             board_geometry.from_config(config)
-        except board_geometry.BoardGeometryError as exc:
+            # The impedance tags and classes, for the same reason: a class a
+            # tag names that does not exist, or a pattern that is not a regex,
+            # is a file that does not say what it appears to.
+            impedance.tags(config)
+        except (board_geometry.BoardGeometryError, impedance.ImpedanceConfigError) as exc:
             raise InvalidProjectConfigError(
                 f"{project_config_path} is not a valid project config:\n  {exc}"
             ) from exc
@@ -478,6 +482,7 @@ def test_point_config(project_config: dict) -> dict:
         # half of a pair breaks the symmetry the pair exists for. Opting in has
         # to be deliberate.
         "include_diff_pairs": bool(raw.get("include_diff_pairs", False)),
+        "include_controlled_impedance": bool(raw.get("include_controlled_impedance", False)),
     }
 
 
@@ -503,6 +508,11 @@ def _test_point_nets(nets_out: dict, cfg: dict) -> list[str]:
 
     if not cfg.get("include_diff_pairs", False):
         chosen -= {n for n, d in nets_out.items() if d.get("diff_pair_of")}
+
+    # A test pad on an impedance-controlled line is a stub and a capacitive
+    # step, for the reason a pair is left alone above. Off unless asked for.
+    if not cfg.get("include_controlled_impedance", False):
+        chosen -= {n for n, d in nets_out.items() if d.get("impedance")}
 
     for pat in cfg.get("exclude") or []:
         chosen -= {n for n in chosen if pat.search(n)}
@@ -722,6 +732,14 @@ def emit(
             entry["diff_pair_of"] = net["diff_pair_of"]
         nets_out[net["name"]] = entry
 
+    # Controlled impedance, after the name rules and before test points: a
+    # tagged net's class is the one its impedance needs, and a test pad on an
+    # impedance-controlled line is a stub the test-point policy must see.
+    try:
+        z = impedance.resolve(project_config, nets_out)
+    except impedance.ImpedanceConfigError as exc:
+        raise InvalidProjectConfigError(str(exc)) from exc
+
     tp_record = _synthesize_test_points(
         components_out,
         nets_out,
@@ -745,6 +763,11 @@ def emit(
     for key in ("project", "net_classes", "boundaries"):
         if key in project_config:
             hdm[key] = project_config[key]
+    if z.synthesized:
+        # Classes a tag needed and nobody declared. Written into the HDM so
+        # the .kicad_pro names them; Stage 8 says their width is not real.
+        hdm["net_classes"] = {**(hdm.get("net_classes") or {}),
+                              **impedance.synthesized_classes(project_config, z)}
     hdm["components"] = components_out
     hdm["nets"] = nets_out
     # Always written, count 0 included: Stage 8 reads this to tell "no test
@@ -757,6 +780,13 @@ def emit(
     hdm["board_geometry"] = geometry_record
     if class_notes:
         hdm["synthesis"]["net_class_notes"] = class_notes
+    hdm["synthesis"]["controlled_impedance"] = {
+        "nets": len(z.nets),
+        "classes": sorted({cls for cls, _ in z.nets.values()}),
+        "synthesized": sorted(z.synthesized),
+        **({"unmatched": z.unmatched} if z.unmatched else {}),
+        **({"notes": z.notes} if z.notes else {}),
+    }
     if not_placed:
         # Recorded rather than dropped: anyone diffing bom.json against the HDM
         # would otherwise find rows that vanished with nothing saying why.
