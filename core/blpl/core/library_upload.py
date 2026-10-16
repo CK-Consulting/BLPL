@@ -41,6 +41,7 @@ footprint or model is the exception: it is already there, so nothing changes.
 from __future__ import annotations
 
 import io
+import os
 import re
 import stat
 import zipfile
@@ -201,15 +202,36 @@ def _version(node: list) -> int:
         return 0
 
 
-def _write(path: Path, text: str | bytes) -> None:
-    """Write-then-move, so a crash leaves the old library rather than half a new one."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    if isinstance(text, bytes):
-        tmp.write_bytes(text)
-    else:
-        tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+def _write(path: Path, text: str | bytes, *, root: Path) -> None:
+    """Write-then-move, so a crash leaves the old library rather than half a new one.
+
+    Opened from ``root`` (the project) one component at a time, never
+    following a link, with quarantine's own primitives: a link anywhere
+    between the project and the file, or at the file, is refused with
+    quarantine.LinkRefused and nothing is written. Checking for links first
+    and then writing by path was a race (Codex, PR #32): whatever else writes
+    the checkout (a pull, a move, a run, the KiCad desktop) could put a link
+    in between, and the write would land wherever it pointed.
+    """
+    from . import quarantine
+
+    rel = Path(path).relative_to(root)
+    where = rel.parent.as_posix()
+    data = text if isinstance(text, bytes) else text.encode("utf-8")
+    with quarantine._dir(root, where, create=True) as dfd:
+        quarantine._write(dfd, rel.name, data, where)
+
+
+def _unlink(path: Path, *, root: Path) -> None:
+    """Remove a library file, confined as ``_write`` is: never through a link."""
+    from . import quarantine
+
+    rel = Path(path).relative_to(root)
+    where = rel.parent.as_posix()
+    with quarantine._dir(root, where, create=False) as dfd:
+        if dfd is None or not quarantine._refuse_unless_plain(dfd, rel.name, where):
+            raise FileNotFoundError(str(rel))
+        os.unlink(rel.name, dir_fd=dfd)
 
 
 @dataclass
@@ -415,26 +437,27 @@ def place_symbols(data: bytes, project_dir: str | Path, library: str) -> Placed:
     flat = root / f"{library}.kicad_sym"
     symdir = root / f"{library}.kicad_symdir"
     if flat.is_file():
-        return _merge_flat(flat, lib, incoming, names, library)
+        return _merge_flat(flat, lib, incoming, names, library, project_dir)
     if symdir.is_dir():
         written = []
         for node, name in zip(incoming, names):
             target = symdir / f"{name}.kicad_sym"
             if len(_symbols(lib)) == 1:
-                _write(target, data)
+                _write(target, data, root=project_dir)
             else:
                 # One symbol per file is the symdir layout, so a multi-symbol
                 # upload is split — parsed apart, never cut as text — keeping
                 # the file's own version and generator on each piece.
                 header = [c for c in lib[1:] if not (isinstance(c, list) and sexpr.head(c) == "symbol")]
-                _write(target, sexpr.dump_top(["kicad_symbol_lib", *header, node]))
+                _write(target, sexpr.dump_top(["kicad_symbol_lib", *header, node]), root=project_dir)
             written.append(f"{SYMBOLS_DIR}/{symdir.name}/{target.name}")
         return Placed(paths=written, names=names)
-    _write(flat, data)
+    _write(flat, data, root=project_dir)
     return Placed(paths=[f"{SYMBOLS_DIR}/{flat.name}"], names=names, note=f"new library {library}")
 
 
-def _merge_flat(flat: Path, upload: list, incoming: list[list], names: list[str], library: str) -> Placed:
+def _merge_flat(flat: Path, upload: list, incoming: list[list], names: list[str], library: str,
+                project_dir: Path) -> Placed:
     original = flat.read_text(encoding="utf-8")
     existing = sexpr.parse(original)
     # A library already in KiCad's canonical layout diffs as a pure addition.
@@ -452,7 +475,7 @@ def _merge_flat(flat: Path, upload: list, incoming: list[list], names: list[str]
         if isinstance(child, list) and sexpr.head(child) == "version" and new_version:
             merged[i] = ["version", str(new_version)]
             break
-    _write(flat, sexpr.dump_top(merged))
+    _write(flat, sexpr.dump_top(merged), root=project_dir)
     # Counted back from disk, by top-level symbol, because that is the unit the
     # merge changes and the one a broken write would lose.
     after = [
@@ -490,7 +513,8 @@ def remove_symbol(project_dir: str | Path, library: str, name: str) -> dict:
     symbol is its own file, which is deleted. A symbol another one extends is
     refused: its child would load with no pins.
 
-    Returns {"path", "remaining", "file_removed"}.
+    Returns {"path", "remaining", "file_removed", "before"}, the last the
+    file's text before the removal.
     """
     project_dir = Path(project_dir)
     library = library_name(library)
@@ -502,11 +526,14 @@ def remove_symbol(project_dir: str | Path, library: str, name: str) -> dict:
         raise Refused(f"{', '.join(children)} in library {library} extends {name}; remove those first")
     rel, _ = have[name]
     target = project_dir / rel
+    # What was there, for a caller whose bookkeeping fails afterwards to put
+    # back with restore_texts (quarantine.remove_library_symbol).
+    original = target.read_text(encoding="utf-8")
     if target.suffix == ".kicad_sym" and target.parent.suffix == ".kicad_symdir":
-        target.unlink()
+        _unlink(target, root=project_dir)
         remaining = sorted(n for n in have if n != name)
-        return {"path": rel, "remaining": remaining, "file_removed": True}
-    parsed = sexpr.parse(target.read_text(encoding="utf-8"))
+        return {"path": rel, "remaining": remaining, "file_removed": True, "before": original}
+    parsed = sexpr.parse(original)
     before = [sexpr.unquote(s[1]) for s in _symbols(parsed) if len(s) > 1 and isinstance(s[1], str)]
     kept = [
         c for c in parsed
@@ -515,9 +542,9 @@ def remove_symbol(project_dir: str | Path, library: str, name: str) -> dict:
     ]
     expected = [n for n in before if n != name]
     if not expected:
-        target.unlink()
-        return {"path": rel, "remaining": [], "file_removed": True}
-    _write(target, sexpr.dump_top(kept))
+        _unlink(target, root=project_dir)
+        return {"path": rel, "remaining": [], "file_removed": True, "before": original}
+    _write(target, sexpr.dump_top(kept), root=project_dir)
     after = [
         sexpr.unquote(s[1])
         for s in _symbols(sexpr.parse(target.read_text(encoding="utf-8")))
@@ -525,7 +552,7 @@ def remove_symbol(project_dir: str | Path, library: str, name: str) -> dict:
     ]
     if after != expected:
         raise RuntimeError(f"removing {name} from {target} left {len(after)} symbols, expected {len(expected)}")
-    return {"path": rel, "remaining": expected, "file_removed": False}
+    return {"path": rel, "remaining": expected, "file_removed": False, "before": original}
 
 
 # ------------------------------------------------------------------------ footprints
@@ -561,7 +588,7 @@ def place_footprint(data: bytes, project_dir: str | Path, library: str) -> Place
             f"library {library} already has a different footprint {name} ({rel}). "
             "Nothing was replaced: upload it to a different library, or delete the existing one first"
         )
-    _write(target, body)
+    _write(target, body, root=project_dir)
     note = f"3D model linked: {', '.join(new.rsplit('/', 1)[-1] for _, new in changed)}" if changed else ""
     return Placed(paths=[rel], names=[name], note=note)
 
@@ -588,7 +615,7 @@ def place_model(data: bytes, project_dir: str | Path, library: str, original_nam
         if target.read_bytes() == data:
             return Placed(paths=[rel], names=[target.name], note="already in the library, unchanged")
         raise Refused(f"a different model is already at {rel}. Nothing was replaced")
-    _write(target, data)
+    _write(target, data, root=project_dir)
     # Footprints already in the library that name this model but cannot reach
     # it — an archive-relative "x.stp" — are linked to it now, so uploading the
     # model after the footprint works as well as uploading it before.
@@ -603,7 +630,7 @@ def place_model(data: bytes, project_dir: str | Path, library: str, original_nam
                 continue
             changed = _relink(node, library, mine)
             if changed:
-                _write(fp, _dump_relinked(node, changed, fp.name))
+                _write(fp, _dump_relinked(node, changed, fp.name), root=project_dir)
                 relinked.append(fp.relative_to(project_dir).as_posix())
     return Placed(
         paths=[rel],
@@ -654,7 +681,7 @@ def follow_moved_models(project_dir: str | Path, mapping: dict[str, str]) -> lis
             out = _dump_relinked(node, changed, fp.name)
             before.append((rel, text))
             try:
-                _write(fp, out)
+                _write(fp, out, root=project_dir)
             except BaseException:
                 restore_texts(project_dir, before[:-1])
                 raise
@@ -665,8 +692,8 @@ def restore_texts(project_dir: str | Path, saved: list[tuple[str, str]]) -> None
     """Put back files ``follow_moved_models`` changed, best effort."""
     for rel, text in saved:
         try:
-            _write(Path(project_dir) / rel, text)
-        except OSError:
+            _write(Path(project_dir) / rel, text, root=Path(project_dir))
+        except (OSError, ValueError):  # ValueError: quarantine.LinkRefused
             pass
 
 
