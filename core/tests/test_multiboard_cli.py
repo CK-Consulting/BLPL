@@ -8,6 +8,7 @@ which is why they get tests rather than a comment.
 from __future__ import annotations
 
 import argparse
+import json
 
 import pytest
 
@@ -373,3 +374,40 @@ def test_run_reaches_the_real_stage1_and_passes_full_through(project, monkeypatc
     assert cli.main(args) == 0
     assert cli.main([*args, "--full"]) == 0
     assert seen == [False, True]
+
+
+def _fake_stage6(monkeypatch, name):
+    """stage6_compile_kicad.run, writing the three files under a stamped stem."""
+    from blpl.core import stage6_compile_kicad
+
+    def run(hdm, out_dir, *, project_dir=None, board=None, **_):
+        base = f"{name}{'_' + board if board else ''}_2026-10-16_124325Z"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for s in ("pcb", "sch"):
+            (out_dir / f"{base}.kicad_{s}").write_text(f"({s})\n")
+        (out_dir / f"{base}.kicad_pro").write_text(json.dumps({"meta": {"filename": f"{base}.kicad_pro"}}))
+        return {k: out_dir / f"{base}.kicad_{k}" for k in ("sch", "pcb", "pro")} | {"base": base}
+
+    monkeypatch.setattr(stage6_compile_kicad, "run", run)
+
+
+def test_stage6_publishes_the_board_into_its_own_folder(project, monkeypatch):
+    # .pipeline/ is gitignored, so without this no schematic or board ever
+    # reached the project's history.
+    _fake_stage6(monkeypatch, "proj")
+    (project / ".pipeline").mkdir()
+    (project / ".pipeline" / "hdm.base.yaml").write_text("project: {name: proj}\n")
+    assert cli.main(["stage6", "--project-dir", str(project), "--board", "base"]) == 0
+    published = sorted(p.name for p in (project / "base" / "kicad").iterdir())
+    assert published == ["fp-lib-table", "libs", "proj.kicad_pcb", "proj.kicad_pro",
+                         "proj.kicad_sch", "sym-lib-table"]
+    assert not (project / "sensor" / "kicad").exists()
+
+
+def test_stage6_publishes_a_single_board_project_at_its_root(tmp_path, monkeypatch):
+    (tmp_path / "design.md").write_text("# one board\n")
+    _fake_stage6(monkeypatch, "solo")
+    (tmp_path / ".pipeline").mkdir()
+    (tmp_path / ".pipeline" / "hdm.yaml").write_text("project: {name: solo}\n")
+    assert cli.main(["stage6", "--project-dir", str(tmp_path)]) == 0
+    assert (tmp_path / "kicad" / "solo.kicad_pcb").read_text() == "(pcb)\n"
