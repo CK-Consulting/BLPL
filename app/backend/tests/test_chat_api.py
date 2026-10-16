@@ -931,6 +931,20 @@ def test_an_unknown_skill_is_refused_with_the_ones_there_are(project) -> None:
     assert "design-guidelines" in out.content
 
 
+def test_check_stage0_reads_the_files_stage0_reads(project) -> None:
+    """lifecycle.md is BLPL's own audit; its MPN | Refs table is not a BOM."""
+    (project / "board.md").write_text(
+        "# B\n\n## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n| U1 | X | QFN-32 |\n",
+        encoding="utf-8",
+    )
+    (project / "lifecycle.md").write_text(
+        "| MPN | Refs | Status |\n|---|---|---|\n| Y | R1, R2 | active |\n", encoding="utf-8")
+    out = _call(_ctx(project), "check_stage0")
+    assert not out.is_error
+    # One part, U1. Read as a BOM, lifecycle.md made it three.
+    assert json.loads(out.content)["components"] == 1
+
+
 def test_doctor_reports_errors_and_warnings_apart(project) -> None:
     (project / "board.md").write_text(
         "# B\n\n## BOM\n\n| Ref | MPN | Package |\n|---|---|---|\n"

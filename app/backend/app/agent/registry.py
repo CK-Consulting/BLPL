@@ -1236,14 +1236,16 @@ async def _check_stage0(ctx: ToolContext, args: dict) -> str:
     from blpl.core import stage0_deterministic
 
     with _project_under_test(ctx, args) as (proj, board):
+        from blpl.core import project_manifest
+
         root = Path(proj)
         if board:
-            from blpl.core import project_manifest
-
             root = project_manifest.board_dir(
                 root, project_manifest.discover(root), board
             )
-        md_files = sorted(root.glob("*.md"))
+        # The same files Stage 0 reads. A plain glob took lifecycle.md too, so
+        # this preview counted parts the real run does not (Codex, PR #41).
+        md_files = project_manifest.design_markdown(root)
         if not md_files:
             raise FileNotFoundError(
                 "no markdown at the project root — Stage 0 reads *.md there only"
