@@ -166,3 +166,45 @@ def test_stage4_fails_on_an_unconnected_part_and_still_writes_its_nets(tmp_path)
 """)
     assert cli.main(["stage0-det", "--project-dir", str(tmp_path)]) == 0
     assert cli.main(["stage4", "--project-dir", str(tmp_path)]) == 0
+
+
+def test_a_conflict_is_caught_whichever_table_comes_first(tmp_path):
+    # Connections first, pinout after: the pinout used to extend blindly.
+    md = tmp_path / "board.md"
+    md.write_text("""\
+| Ref | MPN | Package |
+|-----|-----|---------|
+| U1 | MCU1 | QFN-32 |
+
+| Ref | Pin | Net |
+|-----|-----|-----|
+| U1 | 1 | I2C_SCL |
+
+## U1 — pinout
+
+| Pin | Signal |
+|-----|--------|
+| 1 | I2C_SDA |
+| 2 | GND |
+""")
+    a = s0.extract([md])
+    assert _pins(a, "U1") == {"1": "I2C_SCL", "2": "GND"}
+    assert any(w["code"] == "STAGE0-007" for w in a["warnings"])
+
+
+def test_each_part_of_a_grouped_row_anchors_its_own_pinout(tmp_path):
+    md = tmp_path / "board.md"
+    md.write_text("""\
+| Ref | MPN | Package |
+|-----|-----|---------|
+| SW1, SW2 | TS | SW_SPST |
+
+## SW2 pinout
+
+| Pin | Signal |
+|-----|--------|
+| 1 | BTN_B |
+| 2 | GND |
+""")
+    assert "SW2" in s0.known_refs([md])
+    assert _pins(s0.extract([md]), "SW2") == {"1": "BTN_B", "2": "GND"}
