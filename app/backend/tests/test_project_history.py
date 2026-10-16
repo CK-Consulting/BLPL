@@ -165,6 +165,22 @@ def test_the_published_board_is_tracked_and_kicads_scratch_beside_it_is_not(tmp_
     assert "kicad/~dev04.kicad_pcb.lck" not in tracked
 
 
+def test_an_existing_baseline_gains_the_rules_added_since(tmp_path: Path) -> None:
+    """The .pipeline/ marker said the baseline was applied, not that it was
+    current: a project made before ~*.lck joined it never got that rule."""
+    projects = Projects(tmp_path / "root")
+    d = projects.init_local("dev04", identity=IDENT)
+    gi = d / ".gitignore"
+    gi.write_text(gi.read_text(encoding="utf-8").replace("~*.lck\n", ""), encoding="utf-8")
+    projects.apply_baseline_gitignore("dev04", identity=IDENT)
+    text = gi.read_text(encoding="utf-8")
+    assert text.count("~*.lck") == 1
+    assert text.count(".pipeline/") == 1
+    # And a second pass adds nothing.
+    projects.apply_baseline_gitignore("dev04", identity=IDENT)
+    assert gi.read_text(encoding="utf-8") == text
+
+
 def test_quarantined_downloads_stay_out_of_history_but_the_ledger_does_not(
     tmp_path: Path,
 ) -> None:
