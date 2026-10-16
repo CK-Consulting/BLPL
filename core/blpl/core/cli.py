@@ -897,7 +897,31 @@ def _cmd_stage6(args: argparse.Namespace) -> int:
     print(f"stage6: compiled KiCad project ({len(file_outputs)} files, base={outputs['base']})")
     for kind, path in file_outputs.items():
         print(f"        {kind}: {path}")
+    _publish(proj, _board(args, proj), outputs["base"], "stage6")
     return 0
+
+
+def _publish(proj: Path, board: str | None, base: str, who: str) -> None:
+    """Copy the board just written to the fixed names git tracks. See publish.py.
+
+    After stage6 and again after a route, so the tracked board is the routed
+    one whenever routing ran. A failure here is reported and not fatal: the
+    emitted files in .pipeline/ are the stage's output, and they exist.
+    """
+    from . import publish
+
+    man = project_manifest.discover(proj)
+    dest = project_manifest.board_dir(proj, man, board or man.boards[0].name) / publish.PUBLISH_DIRNAME
+    try:
+        out = publish.publish(
+            project_manifest.pipeline_dir(proj), base, dest, publish.project_name(base, board),
+            board=board,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"{who}: could not publish the board to {dest}: {exc}", file=sys.stderr)
+        return
+    if out:
+        print(f"        published to {dest} (tracked by git; replaced by the next run)")
 
 
 def _newest_emitted(pipeline_dir: Path, suffix: str, board: str | None) -> Path | None:
@@ -1141,6 +1165,8 @@ def _cmd_autoroute(args: argparse.Namespace) -> int:
     print(f"autoroute: routed {pcb.name} in {result.passes} passes{left}")
     print(f"           snapshot {result.snapshot}")
     print(f"           wrote {report_path}")
+    # The route changed the board in place; the tracked copy follows it.
+    _publish(proj, board, pcb.stem, "autoroute")
     return 0
 
 
