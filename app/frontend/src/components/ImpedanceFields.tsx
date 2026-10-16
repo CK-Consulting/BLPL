@@ -463,8 +463,15 @@ export function ImpedanceFields({
                       // disagree, which Stage 5 refuses.
                       const next: ImpedanceTag = { nets: tag.nets };
                       if (e.target.value) next.class = e.target.value;
-                      else Object.assign(next, Object.fromEntries(
-                        Object.entries(tag).filter(([k]) => k !== "class" && k !== "nets")));
+                      else {
+                        // Back to "by impedance": keep the target it had, which
+                        // was the class's. Starting from the stripped tag would
+                        // quietly make a 90 Ω pair 50 Ω single-ended (Codex, PR #34).
+                        const from = chosen ?? own;
+                        if (from.ohms !== undefined) next.ohms = from.ohms;
+                        if (from.mode && from.mode !== "single_ended") next.mode = from.mode;
+                        if (from.tolerance_pct !== undefined) next.tolerance_pct = from.tolerance_pct;
+                      }
                       setTag(i, next);
                     }}
                   >

@@ -73,6 +73,16 @@ def test_valid_tags_and_classes_have_no_errors() -> None:
     assert board_config.errors(config) == []
 
 
+def test_a_class_rule_naming_a_missing_class_is_refused_on_write() -> None:
+    """Deleting a class in the panel left the rule that names it; the PUT
+    said "Saved" and the next emit stopped on it."""
+    config = _with(net_class_rules=[{"pattern": "^VBAT", "class": "Battery"}])
+    errs = board_config.errors(config)
+    assert len(errs) == 1 and "'Battery'" in errs[0] and "not in net_classes" in errs[0]
+    config["net_classes"]["Battery"] = {"trace_width": 0.6}
+    assert board_config.errors(config) == []
+
+
 # -- editing -------------------------------------------------------------------------
 
 

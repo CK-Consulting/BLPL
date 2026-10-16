@@ -200,7 +200,10 @@ export function BoardConfigPanel({
 
   const setImpedance = (classes: Record<string, NetClass>, list: BoardConfig["config"]["controlled_impedance"] & {}) => {
     const next = structuredClone(draft);
-    next.net_classes = classes;
+    // net_classes is optional, but when present must hold Default; an empty
+    // one (a file with none, and a tag added) would be refused (Codex, PR #34).
+    if (Object.keys(classes).length) next.net_classes = classes;
+    else delete next.net_classes;
     if (list.length) next.controlled_impedance = list;
     else delete next.controlled_impedance;
     setDraft(next);

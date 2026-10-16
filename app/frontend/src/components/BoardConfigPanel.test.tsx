@@ -499,6 +499,43 @@ describe("controlled impedance, as fields", () => {
     expect(box.sent.config.controlled_impedance).toEqual([{ nets: "^USB_D", class: "USB" }]);
   });
 
+  it("keeps a tag's target when its class is cleared", async () => {
+    const { box, onPut } = capture();
+    stubWith(
+      {
+        ...IMPEDANCE.config,
+        net_classes: {
+          Default: {},
+          USB: { trace_width: 0.18, diff_pair_gap: 0.15, impedance: { ohms: 90, mode: "differential" } },
+        },
+        controlled_impedance: [{ nets: "^USB_D", class: "USB" }],
+      },
+      { onPut },
+    );
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.change(await screen.findByLabelText("Tag 1 class"), { target: { value: "" } });
+    expect(screen.getByText("Lands on USB.")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect(box.sent.config.controlled_impedance).toEqual([
+      { nets: "^USB_D", ohms: 90, mode: "differential" },
+    ]);
+  });
+
+  it("does not add an empty net_classes to a file that has none", async () => {
+    // The schema wants Default whenever net_classes is present.
+    const { box, onPut } = capture();
+    const { net_classes: _, ...bare } = IMPEDANCE.config;
+    stubWith(bare, { onPut });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    fireEvent.click(await screen.findByText("Add impedance tag"));
+    fireEvent.change(screen.getByLabelText("Tag 1 nets"), { target: { value: "^ANT_" } });
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(box.sent).not.toBeNull());
+    expect("net_classes" in box.sent.config).toBe(false);
+    expect(box.sent.config.controlled_impedance).toEqual([{ nets: "^ANT_" }]);
+  });
+
   it("removing the last tag removes the list", async () => {
     const { box, onPut } = capture();
     stubWith({ ...IMPEDANCE.config, controlled_impedance: [{ nets: "^ANT_" }] }, { onPut });

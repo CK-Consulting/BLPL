@@ -8,7 +8,9 @@ Two writers change a board's shape — the board panel, through
 polygon that crosses itself, a corner radius bigger than its edge, a cutout
 that is really a notch, dimensions that disagree with the outline), then
 ``impedance.tags``, which catches a controlled-impedance tag naming a class
-that does not exist or asking it for a different target. The write path used
+that does not exist or asking it for a different target (and, on emit,
+``net_class_rules`` naming a class that does not exist, checked here too). The
+write path used
 to run only the first, so a file the form accepted could still stop the next
 build. ``errors`` runs all three, in the same order, so a write refused here is
 exactly a load Stage 5 would refuse.
@@ -21,6 +23,7 @@ import copy
 import yaml
 
 from blpl.core import board_geometry, impedance
+from blpl.core import stage5_emit_yaml_hdm as stage5
 from blpl.core import schema as hdm_schema
 
 HEADER = (
@@ -54,6 +57,13 @@ def errors(config: dict) -> list[str]:
     try:
         impedance.tags(config)
     except impedance.ImpedanceConfigError as exc:
+        return [str(exc)]
+    # And the class table, which Stage 5 reads on emit: deleting a class in
+    # the panel left a net_class_rules entry naming it, the PUT said "Saved",
+    # and the next emit stopped on it (Codex, PR #34).
+    try:
+        stage5._project_class_rules(config)
+    except stage5.NetClassConfigError as exc:
         return [str(exc)]
     return []
 
