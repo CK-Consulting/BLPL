@@ -255,7 +255,33 @@ def extract(
             artifact["source_files"].append(str(md_path.resolve()))
         partial = extract_one(md_path, adapter)
         _merge_into_artifact(partial, md_path, artifact)
+    _merge_connections(md_files, artifact)
     return artifact
+
+
+def _merge_connections(md_files: list[Path], artifact: dict) -> None:
+    """Connections tables, parsed deterministically, into the model's artifact.
+
+    The model is not told about them and has no reason to read a Ref-keyed
+    table as pins, so in llm or both mode a valid table vanished and every
+    passive it wired stayed unconnected (Codex, PR #41). The rows are a
+    deterministic fact; they go in as stage0-det reads them, through the same
+    conflict-aware merge.
+    """
+    from . import markdown_tables as _md_tables, stage0_deterministic as _det
+
+    by_ref = {c["local_id"]: c for c in artifact["connectors"]}
+    warnings: list[dict] = []
+    for md_path in md_files:
+        md_path = Path(md_path)
+        if not md_path.exists():
+            continue
+        for table in _md_tables.extract_tables_from_file(md_path):
+            if _md_tables.classify(table) == "connections":
+                _det._absorb_connections_table(table, by_ref, warnings)
+    artifact["connectors"] = list(by_ref.values())
+    if warnings:
+        artifact.setdefault("warnings", []).extend(warnings)
 
 
 def _infer_project_id(md_files: list[Path]) -> str:

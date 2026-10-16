@@ -208,3 +208,26 @@ def test_each_part_of_a_grouped_row_anchors_its_own_pinout(tmp_path):
 """)
     assert "SW2" in s0.known_refs([md])
     assert _pins(s0.extract([md]), "SW2") == {"1": "BTN_B", "2": "GND"}
+
+
+def test_a_compact_row_with_a_blank_pin_is_refused(tmp_path):
+    # Half a resistor connected counted as connected, so stage 4 passed.
+    a = _artifact(tmp_path, """
+| Ref | Pin 1 | Pin 2 |
+|-----|-------|-------|
+| R8 | I2C_SDA | |
+""")
+    assert _pins(a, "R8") == {}
+    assert any(w["code"] == "STAGE0-008" for w in a["warnings"])
+    assert "R8" in s4.unconnected_parts(a, None, {n["name"]: n for n in s4.synthesize(a)["nets"]})
+
+
+def test_the_llm_stage0_carries_connections_tables_too(tmp_path, monkeypatch):
+    # The model is not told about them, so in llm mode they vanished.
+    from blpl.core import stage0_llm
+
+    md = tmp_path / "board.md"
+    md.write_text(BOM + "\n| Ref | Pin 1 | Pin 2 |\n|---|---|---|\n| R8 | I2C_SDA | VDD_3V3 |\n")
+    monkeypatch.setattr(stage0_llm, "extract_one", lambda path, adapter: {"components": [], "connectors": []})
+    a = stage0_llm.extract([md], adapter=object())
+    assert _pins(a, "R8") == {"1": "I2C_SDA", "2": "VDD_3V3"}
