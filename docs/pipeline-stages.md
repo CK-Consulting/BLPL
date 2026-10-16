@@ -371,6 +371,19 @@ Two implementations, same output shape:
 - **`blpl stage6`** — hand-rolled S-expression emitter. Pure Python stdlib; runs without KiCad installed. Good for CI and headless flows.
 - **`blpl stage6-plugin`** — invokes KiCad's bundled Python interpreter to call the native `pcbnew` API. Produces `.kicad_pcb` via KiCad's own writer (reliable v10 format, real `PCB_SHAPE` Edge.Cuts, native net objects). Schematic side still uses the emitter (v10 has no eeschema Python API).
 
+### The tracked copy: `kicad/`
+
+`.pipeline/` is a build directory and gitignored, so nothing in a project's history held its schematic or board. After every Stage 6, and again after a successful Stage 6a route, the latest emit is published to fixed names beside the board's design markdown:
+
+```
+<board dir>/kicad/<project>.kicad_pro / .kicad_sch / .kicad_pcb
+<board dir>/kicad/libs/            the symbols and footprints this board uses, and nothing else
+<board dir>/kicad/sym-lib-table    ${KIPRJMOD}-relative, so it opens on anyone's machine
+<board dir>/kicad/fp-lib-table
+```
+
+Each run overwrites the last, so git holds one copy per board and its history is the board's history. The folder opens in a stock KiCad with no BLPL libraries installed: ERC and DRC on it match the run in `.pipeline/`, where without its own libraries 91 of verdacor-ear-tag's 145 ERC violations were "symbol not in library". Edits made in KiCad to the copy in `.pipeline/` are not carried over; the next run replaces the published copy.
+
 ## Stage 6a — Autoroute
 
 ```bash

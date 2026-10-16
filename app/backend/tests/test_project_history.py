@@ -147,6 +147,24 @@ def test_a_new_project_ignores_its_own_output(tmp_path: Path) -> None:
     assert not any(t.startswith(".pipeline/") for t in tracked)
 
 
+def test_the_published_board_is_tracked_and_kicads_scratch_beside_it_is_not(tmp_path: Path) -> None:
+    """Stage 6 publishes the latest emit to kicad/ so the board reaches history.
+    Opening it in KiCad leaves a lock and window state beside it, which must not."""
+    projects = Projects(tmp_path / "root")
+    d = projects.init_local("dev04", identity=IDENT)
+    (d / "kicad" / "libs").mkdir(parents=True)
+    for name in ("dev04.kicad_pcb", "dev04.kicad_sch", "dev04.kicad_pro", "fp-lib-table",
+                 "libs/Device.kicad_sym", "dev04.kicad_prl", "~dev04.kicad_pcb.lck"):
+        (d / "kicad" / name).write_text("x", encoding="utf-8")
+    projects.commit_all("dev04", "publish", identity=IDENT)
+    tracked = _git(d, "ls-files").split()
+    for kept in ("dev04.kicad_pcb", "dev04.kicad_sch", "dev04.kicad_pro", "fp-lib-table",
+                 "libs/Device.kicad_sym"):
+        assert f"kicad/{kept}" in tracked
+    assert "kicad/dev04.kicad_prl" not in tracked
+    assert "kicad/~dev04.kicad_pcb.lck" not in tracked
+
+
 def test_quarantined_downloads_stay_out_of_history_but_the_ledger_does_not(
     tmp_path: Path,
 ) -> None:

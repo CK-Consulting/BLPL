@@ -91,9 +91,13 @@ BASELINE_GITIGNORE = """\
 retrieved/*
 !retrieved/quarantine.json
 
-# KiCad's local scratch: window state, autosaves, backups, caches. Per-machine
-# and per-person, never part of the design.
+# KiCad's local scratch: window state, autosaves, backups, caches, and the
+# lock it holds on an open file. Per-machine and per-person, never part of the
+# design. The board itself IS tracked: Stage 6 publishes the latest emit to
+# kicad/ beside the design markdown (core/blpl/core/publish.py), and only
+# KiCad's scratch beside it is ignored.
 *.kicad_prl
+~*.lck
 *-backups/
 fp-info-cache
 *.kicad_sch-bak
