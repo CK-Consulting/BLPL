@@ -512,6 +512,88 @@ async def _propose_board_shape(ctx: ToolContext, args: dict) -> str:
     )
 
 
+async def _propose_controlled_impedance(ctx: ToolContext, args: dict) -> str:
+    """Which nets need controlled impedance, and the class geometry for it, as a
+    proposal to a board's project.yaml.
+
+    A tool rather than propose_file_edit for the same reason as the board
+    shape: the model writes only the part it means to change, and the file is
+    rebuilt around it and checked as Stage 5 checks it — including
+    ``impedance.tags``, which refuses a tag that names a class with no
+    impedance or a different target. A hand-built YAML edit gets that wrong
+    quietly, and the first anyone hears of it is a failed Stage 5.
+    """
+    from .. import board_config
+    from ..chat import ProposalStore, sha_of
+
+    target = _project_file(ctx, str(args.get("path", "")))
+    rel = _rel(ctx, target)
+    if target.name != "project.yaml":
+        raise ToolDenied(f"{rel} is not a board's project.yaml")
+    ctx.sandbox.check_write(target)
+    if not target.is_file():
+        raise ToolDenied(
+            f"{rel} does not exist yet; create it with propose_file_edit (or the board "
+            "panel) first."
+        )
+    if "tags" not in args and not args.get("classes"):
+        raise ToolDenied("give tags, classes, or both")
+    tags = args.get("tags")
+    if "tags" in args and not isinstance(tags, list):
+        raise ToolDenied("tags must be a list ([] removes every tag)")
+    classes = args.get("classes") or {}
+    if not isinstance(classes, dict) or not all(
+            v is None or isinstance(v, dict) for v in classes.values()):
+        raise ToolDenied("classes maps a class name to the fields to set on it, or to null")
+
+    current = target.read_text(encoding="utf-8", errors="replace")
+    try:
+        config = yaml.safe_load(current) or {}
+    except yaml.YAMLError as exc:
+        raise ToolDenied(f"{rel} is not valid YAML, so there is nothing to edit: {exc}")
+    if not isinstance(config, dict):
+        raise ToolDenied(f"{rel} is not a mapping")
+    edits: dict = {"classes": classes}
+    if "tags" in args:
+        edits["tags"] = tags
+    new = board_config.with_impedance(config, **edits)
+    errors = board_config.errors(new)
+    if errors:
+        raise ToolDenied(
+            "Stage 5 would refuse the result, so nothing was proposed:\n  "
+            + "\n  ".join(errors[:8])
+        )
+    new_content = board_config.render(new)
+    if sha_of(new_content) == sha_of(current):
+        raise ToolDenied(f"{rel} already says exactly this")
+
+    proposal = ProposalStore(ctx.project_dir).create(
+        path=rel,
+        new_content=new_content,
+        rationale=str(args.get("rationale", "")),
+        base_sha=sha_of(current),
+        conversation=ctx.conversation,
+    )
+    # Said every time, because it is the mistake this feature exists to catch:
+    # a target with no width from the fab's calculator is a label, not an
+    # impedance.
+    from blpl.core import impedance
+
+    unsized = []
+    for name, rules in sorted((new.get("net_classes") or {}).items()):
+        spec = impedance.parse((rules or {}).get("impedance"), name)
+        if spec is not None and impedance.width_key(rules, spec) not in rules:
+            unsized.append(name)
+    note = (f" Classes {', '.join(unsized)} have an impedance but no trace_width; Stage 8 "
+            "reports ZC-001 until the width from the fab's stackup calculator is added."
+            if unsized else "")
+    return (
+        f"Proposed controlled-impedance changes to {rel} (proposal {proposal.id}). The user "
+        "must accept it before anything is written. Comments in the file are not "
+        "preserved. Re-run Stage 5 after it is accepted." + note
+    )
+
+
 # ---------------------------------------------------------------------------
 # Parts tools
 # ---------------------------------------------------------------------------
@@ -1778,6 +1860,59 @@ def project_tools() -> list[ToolSpec]:
             # Like propose_file_edit: the accept step is the approval.
             kind="file_read",
             handler=_propose_board_shape,
+            path_args=("path",),
+            write_args=("path",),
+        ),
+        ToolSpec(
+            name="propose_controlled_impedance",
+            description=(
+                "Propose which nets need controlled impedance, and the net-class geometry for "
+                "it, in a board's project.yaml. The user reviews it as a diff. Use this rather "
+                "than propose_file_edit for these keys: it changes only what you give and "
+                "checks the result as Stage 5 will, including that every tag's class exists "
+                "and declares the same target.\n\n"
+                "tags replaces the whole controlled_impedance list (read the file first and "
+                "keep the entries you are not changing; [] removes them all). Each tag is "
+                "{nets: <Python regex on net names>, ohms?: 10..200 (default 50), mode?: "
+                "single_ended | differential | coplanar (default single_ended), "
+                "tolerance_pct?: (0, 50] (default 10), class?: <a declared class whose "
+                "impedance matches>}. A tag without class lands on the one declared class "
+                "with the same ohms and mode, or on a class Stage 5 makes (Z50_SE, "
+                "Z90_DIFF) with the Default width, which Stage 8 reports as ZC-001.\n\n"
+                "classes maps a class name to fields merged into it; a field set to null is "
+                "removed, a class set to null is deleted. Impedance fields: impedance (true "
+                "= 50 ohm single-ended, a number of ohms, or {ohms, mode, tolerance_pct, "
+                "layers, reference}, where layers are the copper layers the width is for "
+                "and reference the planes it was calculated against, each a list such as "
+                "[F.Cu] or [In1.Cu]), trace_width, diff_pair_width, diff_pair_gap, "
+                "coplanar_gap (mm). On a board of more than two copper layers give layers, "
+                "or Stage 8 reports ZC-007. Never invent a width or gap: they come from the "
+                "fab's impedance calculator for this board's stackup. If the user has not "
+                "given one, propose the impedance without it and say that Stage 8 will "
+                "report ZC-001 (no width), ZC-002 (a differential class with no "
+                "diff_pair_gap) or ZC-006 (a coplanar class with no coplanar_gap) until "
+                "they add it."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "The board's project.yaml, relative to the project root: "
+                            "project.yaml on a single-board project, <board>/project.yaml "
+                            "on a multi-board one."
+                        ),
+                    },
+                    "tags": {"type": "array", "items": {"type": "object"}},
+                    "classes": {"type": "object"},
+                    "rationale": {"type": "string", "description": "What changed and why, briefly."},
+                },
+                "required": ["path", "rationale"],
+            },
+            # Like propose_file_edit: the accept step is the approval.
+            kind="file_read",
+            handler=_propose_controlled_impedance,
             path_args=("path",),
             write_args=("path",),
         ),

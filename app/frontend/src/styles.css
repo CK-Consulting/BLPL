@@ -973,6 +973,10 @@ header .kicad-launch { margin-left: .4rem; }
 .board-feature { padding: .3rem 0; border-bottom: 1px dashed #30363d; }
 .board-forbid { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; font-size: 12px; }
 .board-config label.inline { flex-direction: row; align-items: center; gap: .25rem; }
+/* The last Stage 8 run's ZC findings, beside the class they are about. */
+.impedance-findings { margin: .4rem 0; padding-left: 1rem; font-size: 12px; }
+.impedance-findings .sev-error { color: #ff9b9b; }
+.impedance-findings .sev-warning { color: #e3b341; }
 /* Errors in the field-qualified form the schema reports them in, so the message
    names the thing to fix rather than describing it. */
 .config-errors { margin: .6rem 0; padding: .5rem .8rem; list-style: disc inside;

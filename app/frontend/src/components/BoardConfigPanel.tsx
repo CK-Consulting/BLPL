@@ -19,13 +19,18 @@
  * should be asked to type. So once there is a shape the size is derived from
  * it, measured the way core measures it, and the width and height fields
  * only report it.
+ *
+ * Net classes and controlled impedance are edited in ImpedanceFields, with
+ * the last Stage 8 run's ZC findings beside the class they are about.
  */
 
 import { useEffect, useState } from "react";
 
-import { getJSON, putJSON, type BoardConfig, type BoardFeature } from "../api";
+import { encodePath, getJSON, putJSON, type BoardConfig, type BoardFeature, type NetClass } from "../api";
+import { boardArtifact } from "../board";
 import { bbox, outlineSize, SHAPE_KINDS, seedShape, type ShapeKind, type ShapeSpec } from "../boardShape";
 import { BoardPreview, ShapeFields, tryBuild } from "./BoardShapeFields";
+import { ImpedanceFields, routeErrors, type ZcFinding } from "./ImpedanceFields";
 
 const FINISHES = ["ENIG", "HASL", "LF-HASL", "OSP", "Immersion Silver", "Immersion Tin", "Hard Gold"];
 const LAYERS = [1, 2, 4, 6, 8, 10, 12];
@@ -71,6 +76,10 @@ export function BoardConfigPanel({
   // on that would be relying on an accident — so ask which board it thinks it
   // has, and name it.
   const [target, setTarget] = useState<string | null>(board);
+  // The last Stage 8 run's impedance findings for this board. They describe
+  // the board as last built, not the draft, and are labelled as such; null
+  // when Stage 8 has not run.
+  const [findings, setFindings] = useState<ZcFinding[] | null>(null);
 
   useEffect(() => {
     if (board) {
@@ -112,6 +121,24 @@ export function BoardConfigPanel({
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setFindings(null);
+    getJSON<{ design_issues?: unknown }>(
+      `/api/projects/${projectId}/artifacts/${encodePath(boardArtifact("review_report.json", board))}`,
+    )
+      .then((r) => {
+        if (cancelled) return;
+        const issues = Array.isArray(r?.design_issues) ? (r.design_issues as ZcFinding[]) : [];
+        setFindings(issues.filter((f) => typeof f?.rule_id === "string" && f.rule_id.startsWith("ZC-")));
+      })
+      // No review yet is the normal state of a new board, not an error.
+      .catch(() => !cancelled && setFindings(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, board]);
+
   if (!data || !draft) return <p className="muted small">Reading board config…</p>;
 
   const dims = draft.project?.dimensions ?? [0, 0];
@@ -132,6 +159,12 @@ export function BoardConfigPanel({
     Array.isArray(v) ? v.map((f) => (isMap(f) ? (f as BoardFeature) : {})) : [];
   const cutouts = features(boundaries.cutouts);
   const keepouts = features(boundaries.keepouts);
+  const netClasses = (isMap(draft.net_classes) ? draft.net_classes : {}) as Record<string, NetClass>;
+  const tags = Array.isArray(draft.controlled_impedance) ? draft.controlled_impedance : [];
+  // Refusals about a class or a tag are shown on its row; the rest stay in
+  // the list by the save button.
+  const routed = routeErrors(errors, Object.keys(netClasses), tags.length);
+  const testPoints: Record<string, unknown> = isMap(draft.test_points) ? draft.test_points : {};
   const built = shaped
     ? tryBuild(outline as ShapeSpec, "board outline", "origin")
     : tryBuild({ shape: "rect", size: dims }, "dimensions", "origin");
@@ -163,6 +196,31 @@ export function BoardConfigPanel({
       // fields and the last good size stays until it is.
     }
     setBoundaries(b, size);
+  };
+
+  const setImpedance = (classes: Record<string, NetClass>, list: BoardConfig["config"]["controlled_impedance"] & {}) => {
+    const next = structuredClone(draft);
+    // net_classes is optional, but when present must hold Default; an empty
+    // one (a file with none, and a tag added) would be refused (Codex, PR #34).
+    if (Object.keys(classes).length) next.net_classes = classes;
+    else delete next.net_classes;
+    if (list.length) next.controlled_impedance = list;
+    else delete next.controlled_impedance;
+    setDraft(next);
+  };
+
+  // Only the one key this form owns; the rest of test_points (policy,
+  // symbol, include/exclude) is left as the file has it. Unticked, the key is
+  // removed rather than written as false: false is the default, and a file
+  // that never said it should not start saying it.
+  const setTestPoints = (on: boolean) => {
+    const next = structuredClone(draft);
+    const tp = { ...testPoints };
+    if (on) tp.include_controlled_impedance = true;
+    else delete tp.include_controlled_impedance;
+    if (Object.keys(tp).length) next.test_points = tp;
+    else delete next.test_points;
+    setDraft(next);
   };
 
   const setFeatures = (key: "cutouts" | "keepouts", list: BoardFeature[]) =>
@@ -338,11 +396,28 @@ export function BoardConfigPanel({
         </label>
       </div>
 
+      <ImpedanceFields
+        netClasses={netClasses}
+        tags={tags}
+        errors={routed}
+        findings={findings}
+        copper={Number(stackup.layers ?? 4)}
+        testPoints={testPoints.include_controlled_impedance === true}
+        onTestPoints={setTestPoints}
+        onChange={setImpedance}
+      />
+
       {errors.length > 0 && (
         <ul className="config-errors" role="alert">
-          {errors.map((msg) => (
+          {routed.rest.map((msg) => (
             <li key={msg}>{msg}</li>
           ))}
+          {routed.rest.length < errors.length && (
+            <li>
+              {errors.length - routed.rest.length} more beside the net class or impedance tag they
+              are about.
+            </li>
+          )}
         </ul>
       )}
       {note && <p className="muted small">{note}</p>}
@@ -362,7 +437,7 @@ export function BoardConfigPanel({
           is still the source of truth. Saying so is cheaper than pretending the
           form is complete. */}
       <p className="muted small">
-        Net classes, copper zones, test-point policy and placement hints live in the same{" "}
+        Copper zones, test-point policy and placement hints live in the same{" "}
         <code>project.yaml</code> and are preserved by this form. Stage 5 validates the
         whole file against <code>schemas/project_config.v1.json</code> every time it reads
         it, however it was edited.
