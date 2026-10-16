@@ -120,3 +120,37 @@ def test_plugin_manager_libraries_no_schematic_uses_are_switched_off_once(tmp_pa
         '(descr "Added by Plugin and Content Manager"))'))
     _run(paths)
     assert _rows(table)["PCM_Unused"] is True
+
+
+def _set(table: Path, name: str, on: bool) -> None:
+    """Tick a row on or off, as Manage Symbol Libraries does."""
+    out = []
+    for line in table.read_text().splitlines():
+        if f'(name "{name}")' in line:
+            line = line.replace(" (disabled)", "")
+            if not on:
+                line = line[: line.rstrip().rfind(")")] + " (disabled))"
+        out.append(line)
+    table.write_text("\n".join(out) + "\n")
+
+
+def test_a_used_library_someone_switched_off_stays_off(tmp_path):
+    """Switching on every used library at each start undid a user's choice to
+    switch one off (Codex, PR #36). Only a library newly in use is switched on."""
+    paths = _tree(tmp_path)
+    sym = _pcm_table(paths)
+    stock = _run(paths)
+    _set(stock, "Transistor_FET", False)
+    _set(sym, "PCM_Used", False)
+    _run(paths)
+    assert _rows(stock)["Transistor_FET"] is False
+    assert _rows(sym)["PCM_Used"] is False
+
+
+def test_a_library_newly_in_use_is_switched_on(tmp_path):
+    paths = _tree(tmp_path)
+    stock = _run(paths)
+    assert _rows(stock)["Amplifier_Audio"] is False
+    sch = paths["projects"] / "board" / "amp.kicad_sch"
+    sch.write_text('(kicad_sch (symbol (lib_id "Amplifier_Audio:LM386")))\n')
+    assert _rows(_run(paths))["Amplifier_Audio"] is True
