@@ -428,7 +428,7 @@ Rules Stage 0 holds you to:
 - **One part per row.** `R8, R9` is refused (STAGE0-008): two pull-ups never share both nets.
 - **Pin numbers as the symbol numbers them**, as in a pinout table. KiCad's `Device:R`/`Device:C`/`Device:L`/`Device:FerriteBead` are 1 and 2 either way round; `Device:D` and its Schottky/Zener variants are **1 = cathode, 2 = anode**; `Device:C_Polarized` is **1 = +**; `Device:LED` is **1 = cathode**. Check the symbol when in doubt (`library_lookup`) — a reversed diode is a fault the ERC cannot see.
 - **A series part splits a net in two.** A damping resistor between the MCU and the radio means the MCU pin and the radio pin are on *different* nets: keep the source side's name, give the far side a suffix (`SPI_SCK` → `SPI_SCK_R`), and change the far part's pinout row to match. Leave both pins on one name and the resistor is shorted out on the board.
-- **A pin a Connections row and a pinout table disagree about** is reported (STAGE0-007) and both are kept. Fix the one that is wrong.
+- **A pin a Connections row and a pinout table disagree about** is an error (STAGE0-007): the Connections row is not applied and stage 0 fails. Fix the one that is wrong.
 
 Draft this table from the design, not from memory: the `design-guidelines` skill's
 reference guide lists each part's required external components with values and

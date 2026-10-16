@@ -237,7 +237,9 @@ def _resolve_refdes(local_id: str, bom: dict | None) -> str:
 
 UNCONNECTED_CODE = "STAGE4-007"
 # Refdes prefixes for parts that are copper or a hole, never a circuit node.
-_MECHANICAL_REF = re.compile(r"^(MH|H|FID|FD|LOGO|MK|NT)\d", re.IGNORECASE)
+# Not NT: a net tie joins two nets, and an unconnected one is exactly the
+# failure this catches (Codex, PR #41).
+_MECHANICAL_REF = re.compile(r"^(MH|H|FID|FD|LOGO|MK)\d", re.IGNORECASE)
 
 
 def unconnected_parts(design_artifact: dict, bom: dict | None, nets_by_name: dict[str, dict]) -> list[str]:
