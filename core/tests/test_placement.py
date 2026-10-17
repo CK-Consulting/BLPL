@@ -424,3 +424,22 @@ def test_a_near_hint_waits_for_its_anchor_to_be_placed():
         return ((pa.x - pb.x) ** 2 + (pa.y - pb.y) ** 2) ** 0.5
 
     assert dist("C8", "ANT") <= 7.5 and dist("L1", "ANT") <= 7.5
+
+
+def test_a_part_is_as_big_as_its_pads_even_where_its_courtyard_is_smaller(tmp_path):
+    # The Wio-LR2021's vendor courtyard stops short of its own pad row, and a
+    # pad was read as its centre point, so the XIAO was placed with its
+    # castellations on the radio's pads. A part is now its courtyard and every
+    # pad's full copper, whichever reaches further.
+    lib = tmp_path / "t.pretty"
+    lib.mkdir()
+    (lib / "TIGHT.kicad_mod").write_text("""(footprint "TIGHT"
+  (fp_rect (start -2 -2) (end 2 2) (layer "F.CrtYd"))
+  (pad "1" smd rect (at 0 2.4) (size 1.0 1.2) (layers "F.Cu"))
+  (pad "2" smd rect (at 3 0 90) (size 0.6 1.6) (layers "F.Cu"))
+)
+""")
+    w, h, dx, dy = placement.footprint_box("t:TIGHT", [tmp_path])
+    # Pad 1 reaches y = 2.4 + 0.6; pad 2, turned, reaches x = 3 + 0.8.
+    assert (round(-2 + h, 3), round(-2 + w, 3)) == (3.0, 3.8)
+    assert (round(dy + h / 2, 3), round(dx + w / 2, 3)) == (3.0, 3.8)
