@@ -20,17 +20,15 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
-from . import runqueue, serverkey
-from . import idlepolicy
+from . import diaglog, idlepolicy, runqueue, serverkey
 from .db import SessionFactory
 from .sandbox import idle as sandbox_idle
 from .sandbox import jobs as sandbox_jobs
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
-)
+diaglog.setup("worker")
 logger = logging.getLogger("blpl.worker")
 
 _DATA = Path(os.environ.get("BLPL_DATA_ROOT", "/app/data"))
@@ -60,61 +58,71 @@ def _handle_signal(*_a) -> None:
 async def _run_job(job: runqueue.Claimed) -> int:
     _LOGS.mkdir(parents=True, exist_ok=True)
     path = runqueue.log_path(_LOGS, job.run_id)
-    last_beat = 0.0
 
     logger.info("running %s (%s)", job.run_id, job.cmd[:3])
     with path.open("w", encoding="utf-8", buffering=1) as log:
-        proc = await asyncio.create_subprocess_exec(
-            *job.cmd,
-            env=job.env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        assert proc.stdout is not None
+        stages = diaglog.StageTimer(log.write, run_id=job.run_id,
+                                    project=getattr(job, "project_name", ""))
+        try:
+            return await _follow(job, stages)
+        finally:
+            stages.close()
 
-        async def beat() -> str:
-            with SessionFactory() as session:
-                status = runqueue.heartbeat(session, job.run_id)
-                session.commit()
-            return status
 
-        # The read is bounded by the heartbeat interval, and that bound is the
-        # whole fix for a real wedge: this loop used to be `async for raw in
-        # proc.stdout`, which only wakes when the stage PRINTS something. A
-        # stage stuck in a network call prints nothing — so the worker never
-        # heartbeat, never saw `cancelling`, and the stop button read as
-        # broken while both sides waited on a nemotron reply that was never
-        # coming. Silence now ticks the same clock output does.
-        while True:
-            try:
-                raw = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=_HEARTBEAT_EVERY
-                )
-            except asyncio.TimeoutError:
-                raw = None
-            if raw:
-                # Line-buffered and flushed as it goes: a reader is tailing
-                # this file, so anything held back is a log that appears to
-                # stall.
-                log.write(raw.decode("utf-8", "replace"))
-            elif raw == b"":
-                break  # EOF: the process closed stdout; collect it below.
+async def _follow(job: runqueue.Claimed, stages: "diaglog.StageTimer") -> int:
+    """Run the job's process, copying its output to the log and heartbeating."""
+    last_beat = 0.0
+    proc = await asyncio.create_subprocess_exec(
+        *job.cmd,
+        env=job.env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    assert proc.stdout is not None
 
-            now = asyncio.get_running_loop().time()
-            if raw is None or now - last_beat > _HEARTBEAT_EVERY:
-                last_beat = now
-                if await beat() == runqueue.CANCELLING:
-                    logger.info("%s was cancelled; terminating", job.run_id)
-                    proc.terminate()
-                    try:
-                        # A process hung hard enough to need cancelling may be
-                        # hung hard enough to ignore SIGTERM.
-                        return await asyncio.wait_for(proc.wait(), timeout=10)
-                    except asyncio.TimeoutError:
-                        logger.warning("%s ignored SIGTERM; killing", job.run_id)
-                        proc.kill()
-                        return await proc.wait()
-        return await proc.wait()
+    async def beat() -> str:
+        with SessionFactory() as session:
+            status = runqueue.heartbeat(session, job.run_id)
+            session.commit()
+        return status
+
+    # The read is bounded by the heartbeat interval, and that bound is the
+    # whole fix for a real wedge: this loop used to be `async for raw in
+    # proc.stdout`, which only wakes when the stage PRINTS something. A
+    # stage stuck in a network call prints nothing — so the worker never
+    # heartbeat, never saw `cancelling`, and the stop button read as
+    # broken while both sides waited on a nemotron reply that was never
+    # coming. Silence now ticks the same clock output does.
+    while True:
+        try:
+            raw = await asyncio.wait_for(
+                proc.stdout.readline(), timeout=_HEARTBEAT_EVERY
+            )
+        except asyncio.TimeoutError:
+            raw = None
+        if raw:
+            # Line-buffered and flushed as it goes: a reader is tailing
+            # this file, so anything held back is a log that appears to
+            # stall.
+            stages.write(raw.decode("utf-8", "replace"))
+        elif raw == b"":
+            break  # EOF: the process closed stdout; collect it below.
+
+        now = asyncio.get_running_loop().time()
+        if raw is None or now - last_beat > _HEARTBEAT_EVERY:
+            last_beat = now
+            if await beat() == runqueue.CANCELLING:
+                logger.info("%s was cancelled; terminating", job.run_id)
+                proc.terminate()
+                try:
+                    # A process hung hard enough to need cancelling may be
+                    # hung hard enough to ignore SIGTERM.
+                    return await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    logger.warning("%s ignored SIGTERM; killing", job.run_id)
+                    proc.kill()
+                    return await proc.wait()
+    return await proc.wait()
 
 
 class _Workspaces:
@@ -234,6 +242,7 @@ class _Workspaces:
         path = runqueue.log_path(_LOGS, job.run_id)
         logger.info("running %s in workspace for %s (%s)", job.run_id, job.project_name,
                     job.cmd[:3])
+        exit_code: int | None = None
 
         async def poll() -> str:
             with SessionFactory() as session:
@@ -242,6 +251,7 @@ class _Workspaces:
             return status
 
         with path.open("w", encoding="utf-8", buffering=1) as log:
+            stages = diaglog.StageTimer(log.write, run_id=job.run_id, project=job.project_name)
             try:
                 # A container per run, .git read-only in it, and only the
                 # invoker's checkout. Never inside the workspace container:
@@ -267,18 +277,24 @@ class _Workspaces:
                         return await asyncio.to_thread(
                             storage.snapshot, job.project_name, label)
 
-                return await sandbox_jobs.run_job_in_container(
+                exit_code = await sandbox_jobs.run_job_in_container(
                     self.driver, self.cfg, project_name=job.project_name,
-                    run_id=job.run_id, cmd=job.cmd, env=job.env, log=log.write,
+                    run_id=job.run_id, cmd=job.cmd, env=job.env, log=stages.write,
                     poll=poll, mark=mark, poll_every=_HEARTBEAT_EVERY,
                     snapshot=snapshot, extra_inject=grant_env,
                     member=self._member(job),
                 )
+                return exit_code
             except Exception as exc:  # noqa: BLE001 - recorded in the run's own log
                 # The member reads this log, so say what failed in the
                 # workspace rather than leaving an empty log and a bare -1.
                 log.write(f"blpl: could not run in the project's workspace: {exc}\n")
+                logger.error("run %s could not run in the workspace: %s", job.run_id, exc,
+                             extra={"event": "run_error", "run_id": job.run_id,
+                                    "project": job.project_name})
                 raise
+            finally:
+                stages.close("" if exit_code == 0 else "failed")
 
     async def sweep_if_due(self) -> None:
         now = asyncio.get_running_loop().time()
@@ -396,11 +412,21 @@ async def main() -> None:
             continue
 
         code = runqueue.INTERRUPTED
+        # Recorded here, around both ways a run executes, so the default
+        # (in this container) and workspace modes log alike (Codex, PR #48).
+        started = time.monotonic()
+        logger.info("run %s started", job.run_id, extra={
+            "event": "run_start", "run_id": job.run_id, "project": job.project_name})
         try:
             code = await (workspaces.run(job) if workspaces else _run_job(job))
         except Exception:  # noqa: BLE001
-            logger.exception("run %s failed to execute", job.run_id)
+            logger.exception("run %s failed to execute", job.run_id, extra={
+                "event": "run_error", "run_id": job.run_id, "project": job.project_name})
         finally:
+            ms = round((time.monotonic() - started) * 1000)
+            logger.info("run %s ended with %s after %d ms", job.run_id, code, ms, extra={
+                "event": "run_end", "run_id": job.run_id, "project": job.project_name,
+                "exit_code": code, "duration_ms": ms})
             # Always recorded, even when the run blew up — a row left RUNNING
             # forever is the state that makes a project permanently unrunnable,
             # since another run cannot start while one is in flight.

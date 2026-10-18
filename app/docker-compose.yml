@@ -56,6 +56,10 @@ services:
     # business reaching it, and the keys it holds are the reason.
 
   backend:
+    # stdout rotated: the durable log is data/logs (see BLPL_LOG_LEVEL).
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
     # Upstream publishes kicad/kicad:10.0.0 for linux/amd64 only — there is no
     # arm64 manifest. This deployment is amd64 Linux, so the pin is a no-op that
     # earns its place by failing loudly rather than silently emulating if the
@@ -104,6 +108,10 @@ services:
       # One data root holds what is not in Postgres: the server key, the
       # declarative config, and the project working copies.
       - BLPL_DATA_ROOT=/app/data
+      # Diagnostic log (docs/diagnostic-logging.md): TRACE, DEBUG, PERF, INFO,
+      # WARNING or ERROR; files under data/logs/<service>/ outlive the container.
+      - BLPL_LOG_LEVEL=${BLPL_LOG_LEVEL:-PERF}
+      - BLPL_LOG_RETAIN_DAYS=${BLPL_LOG_RETAIN_DAYS:-30}
       - BLPL_PROJECTS_ROOT=/app/data/projects
       # Libraries shared across every project, rather than copied into each.
       #
@@ -333,6 +341,10 @@ services:
       start_period: 30s
 
   worker:
+    # stdout rotated: the durable log is data/logs (see BLPL_LOG_LEVEL).
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
     platform: linux/amd64
     container_name: blpl-worker
     build:
@@ -373,6 +385,10 @@ services:
     environment:
       - BLPL_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-blpl}:${POSTGRES_PASSWORD:-blpl}@db:5432/${POSTGRES_DB:-blpl}
       - BLPL_DATA_ROOT=/app/data
+      # Diagnostic log (docs/diagnostic-logging.md): TRACE, DEBUG, PERF, INFO,
+      # WARNING or ERROR; files under data/logs/<service>/ outlive the container.
+      - BLPL_LOG_LEVEL=${BLPL_LOG_LEVEL:-PERF}
+      - BLPL_LOG_RETAIN_DAYS=${BLPL_LOG_RETAIN_DAYS:-30}
       - BLPL_PROJECTS_ROOT=/app/data/projects
       # The same shared library root the backend uses — a stage resolves
       # footprints here, so the two must agree or a run resolves differently

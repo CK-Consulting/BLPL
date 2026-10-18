@@ -3,6 +3,9 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 import "./styles.css";
+import { installDiagnostics } from "./diag";
+
+installDiagnostics();
 
 // Kill the browser's "Backspace navigates back" behaviour when focus is not in a
 // text field. In the board viewer or on a button, a stray backspace would throw

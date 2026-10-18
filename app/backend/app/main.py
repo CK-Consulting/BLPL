@@ -39,6 +39,8 @@ import urllib.request
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import logging
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager, nullcontext
@@ -61,7 +63,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 # Annotations are lazy (from __future__), which hid that these were never
 # imported — Session only ever appeared in a type hint. select() is a runtime
 # call and would have raised NameError on the first clashing project name.
@@ -75,6 +77,7 @@ from . import (
     attachments,
     autopush,
     board_config,
+    diaglog,
     chat as chat_mod,
     clerk_auth,
     components,
@@ -126,6 +129,8 @@ from .references import (
 )
 
 logger = logging.getLogger("blpl.app")
+diaglog.setup("backend")
+_perf = logging.getLogger("blpl.perf")
 
 
 @asynccontextmanager
@@ -306,6 +311,62 @@ def _seal_idle_registry() -> list[str]:
 
 
 app = FastAPI(title="BLPL", version="0.5.0", lifespan=_lifespan)
+
+
+class _TimeRequests:
+    """Every API request at PERF: route, status, time to first byte and to the end.
+
+    Plain ASGI rather than ``@app.middleware("http")``: there ``call_next``
+    returns when the response *starts*, so a file download or an event stream
+    was timed to its headers and looked instant (Codex, PR #48). Timed here to
+    the final body chunk, or to the disconnect if the client goes first.
+
+    The route's template (``/api/projects/{project_id}/files/{name}``), not the
+    path, so the log groups by endpoint and carries no project file names. A
+    request slower than two seconds is also logged at INFO.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "") if scope.get("type") == "http" else ""
+        if not path.startswith("/api/") or path.endswith("/health"):
+            return await self.app(scope, receive, send)
+        start = time.monotonic()
+        state = {"status": 500, "ttfb": None, "done": False}
+
+        def record(note: str = "") -> None:
+            if state["done"]:
+                return
+            state["done"] = True
+            ms = round((time.monotonic() - start) * 1000)
+            template = getattr(scope.get("route"), "path", None) or "(unmatched)"
+            level = logging.INFO if ms >= 2000 else diaglog.PERF
+            extra = {"event": "request", "method": scope.get("method", ""), "path": template,
+                     "status": state["status"], "duration_ms": ms}
+            if state["ttfb"] is not None:
+                extra["ttfb_ms"] = state["ttfb"]
+            if note:
+                extra["detail"] = note
+            _perf.log(level, "%s %s %d %d ms", extra["method"], template, state["status"], ms,
+                      extra=extra)
+
+        async def timed_send(message):
+            if message["type"] == "http.response.start":
+                state["status"] = message.get("status", 500)
+                state["ttfb"] = round((time.monotonic() - start) * 1000)
+            await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body"):
+                record()
+
+        try:
+            await self.app(scope, receive, timed_send)
+        finally:
+            record("ended before the body was complete")
+
+
+app.add_middleware(_TimeRequests)
 
 
 @app.middleware("http")
@@ -2532,6 +2593,8 @@ def open_project(
     _note_workspace_open(session, project_id, PROJECTS_ROOT / project_id, project_key, user.id)
     _drop_placeholder_identity(project_id)
     activity.record(session, project, user, activity.OPENED, "")
+    logger.info("opened %s", project.name, extra={
+        "event": "unseal", "project": project.name, "user_id": user.id})
     return {"ok": True, "already_open": False}
 
 
@@ -2645,7 +2708,8 @@ def _seal_workspace(session: Session, project_id: str, why: list[str] | None = N
     # The row and the wrapped key it carries exist only while the project is
     # unsealed. It is sealed now, so both go.
     openstate.forget(session, project_id)
-    logger.info("sealed %s (%d bytes): %s", project_id, size, reason or "no reason given")
+    logger.info("sealed %s (%d bytes): %s", project_id, size, reason or "no reason given", extra={
+        "event": "seal", "project": project_id, "bytes": size, "reason": reason})
     if project is not None:
         activity.record(session, project, None, activity.SEALED, reason)
     return True
@@ -3410,6 +3474,87 @@ def put_idle_seal(
         "idle_seal_minutes": project.idle_seal_minutes,
         "effective_minutes": project.idle_seal_minutes or idlepolicy.default_minutes(),
     }
+
+
+class ClientEvent(BaseModel):
+    kind: str = Field(max_length=40)
+    level: str = Field(default="error", max_length=10)
+    message: str = Field(default="", max_length=2000)
+    stack: str = Field(default="", max_length=8000)
+    url: str = Field(default="", max_length=2000)
+    duration_ms: int | None = None
+    detail: str = Field(default="", max_length=8000)
+
+
+class ClientEvents(BaseModel):
+    events: list[ClientEvent] = Field(max_length=20)
+
+
+# Read before anything is parsed: nginx allows 100 MB API bodies, and an
+# unauthenticated caller must not make the backend build that (Codex, PR #48).
+_CLIENT_BODY_MAX = 64 * 1024
+_client_lock = threading.Lock()
+
+
+_client_log = logging.getLogger("blpl.frontend")
+_CLIENT_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "info": logging.INFO,
+                  "perf": diaglog.PERF, "debug": logging.DEBUG}
+_client_budget: dict[str, list[float]] = {}
+
+
+@app.post("/api/diag/client")
+async def post_client_events(request: Request) -> dict:
+    """Errors and timings from the browser, into the frontend's diagnostic log.
+
+    Uncaught errors, rejected promises and page-load timings: what a user saw
+    go wrong, which otherwise exists only in their console. Unauthenticated,
+    because a page can fail before sign-in, and so bounded: 60 events a minute
+    per client, every field truncated, and only these fields kept.
+    """
+    # Behind nginx every request comes from nginx, so the browser's address is
+    # the one nginx forwards (X-Real-IP). Spoofable, so a total budget across
+    # all clients bounds what any one caller can write (Codex, PR #48).
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > _CLIENT_BODY_MAX:
+        raise HTTPException(status_code=413, detail="diagnostic report too large")
+    raw = b""
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > _CLIENT_BODY_MAX:
+            raise HTTPException(status_code=413, detail="diagnostic report too large")
+    try:
+        body = ClientEvents.model_validate_json(raw)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="not a diagnostic report")
+    client = (request.headers.get("x-real-ip")
+              or (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+              or (request.client.host if request.client else "?"))[:64]
+    # Taken and updated under one lock: two requests reading the same budget
+    # and writing it back would each pass the check (Codex, PR #48).
+    with _client_lock:
+        now = time.time()
+        total = [t for t in _client_budget.get("*", []) if now - t < 60]
+        window = [t for t in _client_budget.get(client, []) if now - t < 60]
+        allowed = max(0, min(len(body.events), 60 - len(window), 600 - len(total)))
+        window += [now] * allowed
+        total += [now] * allowed
+        _client_budget[client] = window
+        _client_budget["*"] = total
+    kept = 0
+    for ev in body.events[:allowed]:
+        kept += 1
+        level = _CLIENT_LEVELS.get(ev.level, logging.INFO)
+        message = ev.message[:500]
+        # The stack goes in as detail, not as an exception: the browser's
+        # error is not this process's, and no host snapshot describes it.
+        _client_log.log(min(level, logging.WARNING) if level >= logging.ERROR else level,
+                        "%s: %s", ev.kind[:40], message, extra={
+                            "event": "client_" + ev.kind[:40], "service": "frontend",
+                            "kind": ev.kind[:40], "url": ev.url[:300],
+                            "detail": (ev.stack or ev.detail)[:2000], "client": client,
+                            **({"duration_ms": ev.duration_ms} if ev.duration_ms is not None else {}),
+                            "status": ev.level[:10]})
+    return {"ok": True, "kept": kept}
 
 
 class CommitBody(BaseModel):
