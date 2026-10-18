@@ -72,10 +72,11 @@ SEALED_DIR = ".sealed"
 _NONCE_LEN = 12
 _AAD = b"blpl-workspace"
 
-# How long an open workspace may sit untouched before it is sealed again. Long
-# enough to read a datasheet and come back; short enough that a forgotten tab
-# does not leave a project readable all night.
-IDLE_AFTER = timedelta(minutes=30)
+# How long an open workspace may sit untouched before it is sealed again, by
+# default. Long enough to read a datasheet and come back; short enough that a
+# forgotten tab does not leave a project readable all night. A project may set
+# its own (Project settings; see idlepolicy.py).
+IDLE_AFTER = timedelta(minutes=60)
 
 
 class WorkspaceError(VaultError):

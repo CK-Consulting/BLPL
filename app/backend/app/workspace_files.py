@@ -941,7 +941,7 @@ def unseal(project: str, key: bytes) -> None:
 _TRACKER = None
 
 
-async def sweep_and_seal(seal_project) -> list:
+async def sweep_and_seal(seal_project, limit_s=None) -> list:
     """The workspace idle sweep, run where the keys are, sealing what it stops.
 
     The worker's sweep cannot seal: it has no project key. So with workspaces
@@ -961,7 +961,9 @@ async def sweep_and_seal(seal_project) -> list:
         return await access.agent_idle(key.container_name())
 
     try:
-        return await idle.sweep(driver, _TRACKER, idle_after_s=access.run_cfg.idle_after_s,
+        threshold = ((lambda key: limit_s(key.project)) if limit_s is not None
+                     else access.run_cfg.idle_after_s)
+        return await idle.sweep(driver, _TRACKER, idle_after_s=threshold,
                                 activity=activity,
                                 on_stopped=on_stopped_sealer(seal_project),
                                 gate_root=access.run_cfg.projects_root)

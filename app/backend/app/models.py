@@ -475,6 +475,9 @@ class Project(Base):
     #: it as not chosen. No default, because whether unpushed work may sit on
     #: this server alone is the owner's call, made knowingly.
     push_policy: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
+    #: Minutes of inactivity before the project is sealed again; null is the
+    #: default (idlepolicy.DEFAULT_MINUTES).
+    idle_seal_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
     owner: Mapped[User] = relationship(foreign_keys=[owner_id])
     members: Mapped[list["ProjectMember"]] = relationship(

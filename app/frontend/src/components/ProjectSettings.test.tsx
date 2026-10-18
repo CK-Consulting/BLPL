@@ -61,7 +61,7 @@ describe("project settings tabs", () => {
     render(<ProjectSettings projectId="p" board="core" />);
     fireEvent.click(screen.getByLabelText("Project settings — p"));
     const tabs = screen.getAllByRole("tab").map((t) => t.textContent);
-    expect(tabs).toEqual(["Board", "Task routing", "Git", "Library policy"]);
+    expect(tabs).toEqual(["Board", "Task routing", "Git", "Library policy", "Auto-lock"]);
     expect(await screen.findByLabelText("Width (mm)")).toBeVisible();
 
     fireEvent.click(screen.getByRole("tab", { name: "Library policy" }));

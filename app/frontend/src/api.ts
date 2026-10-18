@@ -470,6 +470,9 @@ export type GitStatus = {
   /** auto | manual, or null for a project created before anyone was asked
    *  (it behaves as manual). */
   push_policy?: "auto" | "manual" | null;
+  /** Minutes idle before the project is sealed again; null is the default. */
+  idle_seal_minutes?: number | null;
+  idle_seal_default?: number;
   /** This member's last push, automatic or by hand. A failure stays here
    *  until a later push succeeds. Null when they have never pushed. */
   last_push?: { at: string; ok: boolean; error: string; seq?: number } | null;

@@ -216,7 +216,7 @@ class WorkspaceRunConfig:
     libraries: tuple[Mount, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
     resources: Resources = Resources()
-    idle_after_s: float = 15 * 60
+    idle_after_s: float = 60 * 60
     # Whether this process sees the projects at projects_root. A backend run
     # without the project mount (BLPL_PROJECT_MOUNT=absent) sees an empty,
     # read-only tmpfs there, so it builds specs from names alone: the worker,
@@ -246,7 +246,7 @@ class WorkspaceRunConfig:
                               or host.rstrip("/").rsplit("/", 1)[0] + "/sealed"),
             libraries=libs,
             env=ws_env,
-            idle_after_s=float(env.get("BLPL_SANDBOX_IDLE_S", 15 * 60)),
+            idle_after_s=float(env.get("BLPL_SANDBOX_IDLE_S", 60 * 60)),
             sees_projects=env.get("BLPL_PROJECT_MOUNT", "") != "absent",
         )
 

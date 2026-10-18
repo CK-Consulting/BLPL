@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import diaglog, runqueue, serverkey
+from . import diaglog, idlepolicy, runqueue, serverkey
 from .db import SessionFactory
 from .sandbox import idle as sandbox_idle
 from .sandbox import jobs as sandbox_jobs
@@ -308,8 +308,15 @@ class _Workspaces:
 
                 async def activity(key):
                     return await access.agent_idle(key.container_name())
+            def limit(key) -> float:
+                # The project's own limit, as the backend's sweep uses: a
+                # workspace this sweep stopped early would leave the backend
+                # nothing to seal on time.
+                with SessionFactory() as session:
+                    return 60.0 * idlepolicy.minutes_for(session, key.project)
+
             stopped = await sandbox_idle.sweep(
-                self.driver, self.tracker, idle_after_s=self.cfg.idle_after_s,
+                self.driver, self.tracker, idle_after_s=limit,
                 activity=activity, gate_root=self.cfg.projects_root,
             )
             if stopped:
