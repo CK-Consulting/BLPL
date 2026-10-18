@@ -299,7 +299,10 @@ async def _propose_kicad_edit(ctx: ToolContext, args: dict) -> str:
 
 async def _run_checks_on_edit(ctx: ToolContext, args: dict) -> str:
     target = _edit_file(ctx, str(args.get("path", "")), (".kicad_pcb", ".kicad_sch"))
-    out = ctx.project_dir / ".pipeline" / "edit-checks" / f"{target.name}.json"
+    # One report per check: two conversations checking the same copy at once,
+    # or same-named copies on two boards, wrote one shared path, and each could
+    # read the other's counts (Codex, PR #55). Removed once it has been read.
+    out = ctx.project_dir / ".pipeline" / "edit-checks" / f"{target.name}.{uuid.uuid4().hex[:12]}.json"
     ctx.sandbox.check_write(out)
     # kicad-cli runs in the project's run container (sandbox/toolrun.py), off
     # the event loop and away from the backend's secrets (Codex, PRs #50, #53).
@@ -322,7 +325,10 @@ async def _run_checks_on_edit(ctx: ToolContext, args: dict) -> str:
         return (f"{check} FAILED on {_rel(ctx, target)}: kicad-cli exited "
                 f"{result.get('exit_code')} and wrote no report, so the file probably does "
                 f"not load. {detail[-800:]}")
-    data = json.loads(out.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(out.read_text(encoding="utf-8"))
+    finally:
+        out.unlink(missing_ok=True)
     parity = []
     if check == "DRC":
         violations = data.get("violations") or []

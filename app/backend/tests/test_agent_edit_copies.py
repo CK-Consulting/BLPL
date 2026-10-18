@@ -288,3 +288,23 @@ def test_erc_violations_are_counted_at_the_root_and_on_every_sheet(project, monk
     monkeypatch.setattr(stage7_validate, "_run_erc", fake_erc)
     out = run(edit_copies._run_checks_on_edit(ctx, {"path": "kicad/b_edit.kicad_sch"}))
     assert out.startswith("ERC on kicad/b_edit.kicad_sch: 3 violation(s)")
+
+
+def test_each_check_has_its_own_report_and_leaves_none_behind(project, monkeypatch):
+    from blpl.core import stage7_validate
+
+    ctx = _ctx(project)
+    run(edit_copies._make_edit_copies(ctx, {}))
+    seen = []
+
+    def fake_drc(pcb, out):
+        seen.append(out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text('{"violations": [], "unconnected_items": []}')
+        return {"ok": True, "skipped": False, "exit_code": 0}
+
+    monkeypatch.setattr(stage7_validate, "_run_drc", fake_drc)
+    for _ in range(2):
+        run(edit_copies._run_checks_on_edit(ctx, {"path": "kicad/b_edit.kicad_pcb"}))
+    assert len(set(seen)) == 2
+    assert not any(p.exists() for p in seen)
