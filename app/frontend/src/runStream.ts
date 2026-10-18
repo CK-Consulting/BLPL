@@ -29,10 +29,12 @@ export async function streamRun(
   { onNote, attempts = 5, delayMs = (n) => 1000 * 2 ** (n - 1), read = readSSE }: ReattachOptions,
 ): Promise<void> {
   let runId: string | null = null;
-  let shown = 0;
+  // Every log line shown, so a replay can be checked against it.
+  let lines: string[] = [];
   let finished = false;
   const deliver = (skip: number): OnEvent => {
     let seen = 0;
+    let restarted = false;
     return (event, payload) => {
       if (event === "start") {
         if (runId === null) {
@@ -43,8 +45,16 @@ export async function streamRun(
       }
       if (event === "log") {
         seen += 1;
-        if (seen <= skip) return;
-        shown += 1;
+        if (!restarted && seen <= skip) {
+          if (payload?.line === lines[seen - 1]) return;
+          // The replay is not what was shown: a run requeued from a stale
+          // worker keeps its id and starts its log again. Skipping by count
+          // would hide the new attempt's output, so show it from here.
+          restarted = true;
+          onNote("the run restarted; its log starts again below.");
+          lines = lines.slice(0, seen - 1);
+        }
+        lines.push(payload?.line);
       }
       if (event === "done") finished = true;
       onEvent(event, payload);
@@ -66,7 +76,7 @@ export async function streamRun(
     onNote(`connection lost (${last.message}); the run is still going on the server. Reattaching (${n}/${attempts})…`);
     await new Promise((r) => setTimeout(r, delayMs(n)));
     try {
-      await read(`/api/runs/${runId}/stream`, { method: "GET" }, deliver(shown));
+      await read(`/api/runs/${runId}/stream`, { method: "GET" }, deliver(lines.length));
       if (finished) return;
       last = new Error("the stream ended before the run did");
     } catch (e2) {

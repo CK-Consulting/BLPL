@@ -73,4 +73,20 @@ describe("streamRun", () => {
     expect(got.filter(([e]) => e === "log").map(([, p]) => p.line)).toEqual(["a", "b"]);
     expect(got.at(-1)).toEqual(["done", { exit_code: 0 }]);
   });
+
+  it("shows a restarted run's log rather than skipping it by count", async () => {
+    // A requeued run keeps its id and starts its log again: the replay is not
+    // a prefix of what was shown, and none of it may be skipped.
+    const { read } = scripted([
+      { events: [["start", { run_id: "r4" }], log("old-1"), log("old-2"), log("old-3")], fail: new TypeError("network error") },
+      { events: [["start", { run_id: "r4" }], log("new-1"), log("new-2"), ["done", { exit_code: 0 }]] },
+    ]);
+    const got: Ev[] = [];
+    const notes: string[] = [];
+    await streamRun("/api/x", {}, (e, p) => got.push([e, p]), {
+      onNote: (l) => notes.push(l), delayMs: () => 0, read,
+    });
+    expect(got.filter(([e]) => e === "log").map(([, p]) => p.line)).toEqual(["old-1", "old-2", "old-3", "new-1", "new-2"]);
+    expect(notes.some((n) => /restarted/.test(n))).toBe(true);
+  });
 });
