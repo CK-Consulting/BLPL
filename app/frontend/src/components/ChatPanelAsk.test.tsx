@@ -120,3 +120,21 @@ describe("an Ask made while the pane switches project", () => {
     await waitFor(() => expect(box).toHaveValue("About `board.md`: "));
   });
 });
+
+describe("an Ask whose new conversation cannot be created", () => {
+  it("keeps the reference in the open conversation's box and says so", async () => {
+    const server = fakeServer();
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "POST" && /\/conversations$/.test(String(url))) {
+        return new Response("down", { status: 503 });
+      }
+      return server.fetchMock(url, init);
+    });
+    render(<ChatPanel projectId="p" onApplied={() => {}} />);
+    const box = await screen.findByRole("textbox");
+    await waitFor(() => expect(server.fetchMock).toHaveBeenCalled());
+    await act(async () => askChat("`board.md`", "new"));
+    await waitFor(() => expect(box).toHaveValue("About `board.md`: "));
+    expect(await screen.findByText(/Could not start a new conversation/)).toBeTruthy();
+  });
+});

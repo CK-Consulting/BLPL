@@ -498,7 +498,9 @@ export function askReference(tab: string, openPath: string | null, board: string
     case "modules":
       return "the module library";
     case "reports":
-      return `the reports (${art(".pipeline/review.md")}, ${art(".pipeline/validation_report.json")}, ${art(".pipeline/open_connections.json")})`;
+      // The files the Reports tab shows, so a question is answered from what
+      // is on screen (Codex, PR #50).
+      return `the reports (${art(".pipeline/review_report.json")}, ${art(".pipeline/validation_report.json")}, ${art(".pipeline/review_panel.json")})`;
     case "release":
       return "the release package";
     case "artifacts":

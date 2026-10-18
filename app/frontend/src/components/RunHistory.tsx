@@ -167,8 +167,19 @@ export function writesValidationReport(kind: string): boolean {
 
 /** What "Ask chat agent about this run" says about a run. An all-boards run
  *  wrote one report per board, so it names that pattern rather than a report
- *  for a board called "all boards" (Codex, PR #50). */
-export function runHistoryReference(kind: string, id: string, exitCode: number | null): string {
+ *  for a board called "all boards" (Codex, PR #50).
+ *
+ *  A failed pipeline stops at the stage that failed, so a range that spans
+ *  Stage 7 has not necessarily reached it, and the report on disk may be an
+ *  older run's (Codex, PR #50). ``reachedStage7`` is what the run's own log
+ *  says, when the caller has it; without it a failed range names the report
+ *  only on condition that the log shows Stage 7 ran. */
+export function runHistoryReference(
+  kind: string,
+  id: string,
+  exitCode: number | null,
+  reachedStage7?: boolean,
+): string {
   const log = `the ${kind} run ${id} (exit ${exitCode}; read its log with read_run_log)`;
   if (!writesValidationReport(kind)) return log;
   const board = splitBoard(kind).board;
@@ -176,5 +187,8 @@ export function runHistoryReference(kind: string, id: string, exitCode: number |
     board === "all boards"
       ? "each board's `.pipeline/validation_report.<board>.json`"
       : `\`${boardArtifact(".pipeline/validation_report.json", board)}\``;
-  return `${log} and ${report}`;
+  const certain = reachedStage7 ?? (exitCode === 0 || splitBoard(kind).kind === "stage7");
+  if (certain) return `${log} and ${report}`;
+  if (reachedStage7 === false) return log;
+  return `${log} and, only if that log shows Stage 7 ran, ${report}`;
 }

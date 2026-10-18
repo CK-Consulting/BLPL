@@ -19,7 +19,7 @@ describe("what a failed run asks the chat about", () => {
 describe("board-qualified references", () => {
   it("names the board's own report and published folder", async () => {
     const { askReference } = await import("../App");
-    expect(runReference("run_2", 1, [], "pipeline stage0→stage8 (sb-ant)")).toContain(
+    expect(runReference("run_2", 1, ["==> stage7"], "pipeline stage0→stage8 (sb-ant)")).toContain(
       "`.pipeline/validation_report.sb-ant.json`",
     );
     expect(askReference("board", null, "sb-ant")).toBe("the emitted board under `sb-ant/kicad/`");
@@ -28,7 +28,7 @@ describe("board-qualified references", () => {
   });
 
   it("keeps the all-boards scope the run was launched with", () => {
-    const ref = runReference("run_3", 1, [], "pipeline stage0→stage8 (all boards)");
+    const ref = runReference("run_3", 1, ["==> stage7"], "pipeline stage0→stage8 (all boards)");
     expect(ref).toContain("each board's `.pipeline/validation_report.<board>.json`");
   });
 });
@@ -50,5 +50,28 @@ describe("a run that never ran Stage 7", () => {
     }
     expect(writesValidationReport("pipeline stage5→stage7 (core)")).toBe(true);
     expect(writesValidationReport("pipeline stage8→stage8")).toBe(false);
+  });
+});
+
+describe("a pipeline that stopped before Stage 7", () => {
+  it("names no report when its log never reached Stage 7", () => {
+    const ref = runReference("run_4", 1, ["==> stage0", "==> stage1", "error: boom"], "pipeline stage0→stage8");
+    expect(ref).not.toContain("validation_report");
+  });
+
+  it("names a past failed range's report only on that condition", () => {
+    expect(runHistoryReference("pipeline stage0→stage8", "run_5", 1)).toContain(
+      "only if that log shows Stage 7 ran",
+    );
+    expect(runHistoryReference("pipeline stage0→stage8", "run_6", 0)).not.toContain("only if");
+  });
+
+  it("refers to the files the Reports tab shows", async () => {
+    const { askReference } = await import("../App");
+    const ref = askReference("reports", null, null);
+    for (const f of ["review_report.json", "validation_report.json", "review_panel.json"]) {
+      expect(ref).toContain(f);
+    }
+    expect(ref).not.toContain("review.md");
   });
 });

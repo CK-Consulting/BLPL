@@ -7,7 +7,7 @@ import { RunProgress } from "./RunProgress";
 import { Verbosity, classifyAll, progress } from "../runlog";
 import { expandRange } from "../stages";
 import { withBoard } from "../board";
-import { runHistoryReference } from "./RunHistory";
+import { runHistoryReference, splitBoard } from "./RunHistory";
 
 /**
  * Runs pipeline work and streams its log to the screen as it happens — either a
@@ -275,7 +275,13 @@ export function runReference(
   lines: string[],
   kind: string,
 ): string {
-  if (runId) return runHistoryReference(kind, runId, exitCode);
+  if (runId) {
+    // The log is in hand here, so whether Stage 7 ran is known, not guessed.
+    const reached =
+      splitBoard(kind).kind === "stage7" ||
+      classifyAll(lines).some((l) => l.kind === "stage" && l.stage === "stage7");
+    return runHistoryReference(kind, runId, exitCode, reached);
+  }
   const error = (lines.find((l) => l.startsWith("error:")) ?? "").slice(0, 300);
   return `a pipeline run that failed to start: ${error}`;
 }

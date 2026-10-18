@@ -856,7 +856,16 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   // of being overtaken by it. Never sent: the user writes the question.
   const answerAsk = useRef<(r: AskRequest) => Promise<void>>(async () => {});
   answerAsk.current = async (r: AskRequest) => {
-    if (r.mode === "new") await newConversation();
+    // A failed create must not lose the reference: it was already taken off
+    // the pending slot, and nothing awaits this (Codex, PR #50). The text goes
+    // into the open conversation's box and the failure is shown.
+    if (r.mode === "new") {
+      try {
+        await newConversation();
+      } catch (e) {
+        setError(`Could not start a new conversation: ${(e as Error).message}`);
+      }
+    }
     setInput((cur) => (cur.trim() ? `${cur}\n${r.text}` : r.text));
     requestAnimationFrame(() => {
       const el = textarea.current;
