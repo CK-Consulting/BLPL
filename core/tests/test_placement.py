@@ -443,3 +443,15 @@ def test_a_part_is_as_big_as_its_pads_even_where_its_courtyard_is_smaller(tmp_pa
     # Pad 1 reaches y = 2.4 + 0.6; pad 2, turned, reaches x = 3 + 0.8.
     assert (round(-2 + h, 3), round(-2 + w, 3)) == (3.0, 3.8)
     assert (round(dy + h / 2, 3), round(dx + w / 2, 3)) == (3.0, 3.8)
+
+
+def test_a_pad_turned_just_off_square_is_measured_at_its_real_angle():
+    # Rounding the angle first sent 89.6 degrees down the exact-90 branch,
+    # which swaps width and height and comes out smaller than the copper.
+    import math
+    from blpl.emitter import sexpr
+    pad = sexpr.parse('(pad "1" smd rect (at 0 0 89.6) (size 0.6 1.6) (layers "F.Cu"))')
+    (x0, y0), (x1, y1) = placement._pad_box(pad)
+    c, s = math.cos(math.radians(89.6)), math.sin(math.radians(89.6))
+    assert round(x1 - x0, 4) == round(0.6 * c + 1.6 * s, 4) > 1.6
+    assert round(y1 - y0, 4) == round(0.6 * s + 1.6 * c, 4) > 0.6

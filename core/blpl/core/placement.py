@@ -264,11 +264,11 @@ def _pad_box(pad) -> list[tuple[float, float]] | None:
         angle = float(at[3]) if len(at) > 3 else 0.0
     except (TypeError, IndexError, ValueError):
         return None
-    if round(angle) % 180 == 90:
-        w, h = h, w
-    elif round(angle) % 90:
-        # Turned at an angle: its circumscribed square holds it whichever way.
-        w = h = math.hypot(w, h)
+    # The rotated rectangle's own axis-aligned bounds, from the exact angle.
+    # Rounding first sent 89.6 degrees down the 90-degree branch, which only
+    # swaps width and height and so comes out smaller than the copper.
+    c, s = abs(math.cos(math.radians(angle))), abs(math.sin(math.radians(angle)))
+    w, h = w * c + h * s, w * s + h * c
     return [(x - w / 2, y - h / 2), (x + w / 2, y + h / 2)]
 
 
