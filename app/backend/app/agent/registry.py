@@ -41,6 +41,7 @@ from blpl.agent.tools.parts import fetch_datasheet, search_parts
 
 from .. import llm_ignore
 from ..components import ComponentError
+from .edit_copies import edit_copy_tools
 from .toolspec import ToolContext, ToolDenied, ToolSpec
 
 # Design documents, matching the editor's rule so the assistant can never
@@ -2185,7 +2186,9 @@ def parts_tools() -> list[ToolSpec]:
                 "and required external components, and draft the Connections table that wires "
                 "the passives (do this when Stage 4 reports STAGE4-007, unconnected parts). "
                 "protection-circuits: ESD, reverse polarity, battery and port protection review. "
-                "controlled-impedance: which nets need it and how to tag them. hardware-design "
+                "controlled-impedance: which nets need it and how to tag them. "
+                "erc-drc-resolution: work through a run's open connections, DRC and ERC "
+                "findings with the user, on _edit copies of the emitted files. hardware-design "
                 "is already in your instructions."
             ),
             input_schema={
@@ -2277,5 +2280,6 @@ def default_tools(kicad_url: str | None = None) -> list[ToolSpec]:
         + module_tools()
         + sim_tools()
         + fab_tools()
+        + edit_copy_tools()
         + kicad_tools(kicad_url)
     )

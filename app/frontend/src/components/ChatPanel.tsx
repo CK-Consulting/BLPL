@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError, ChatMessage, ConversationMeta, Proposal, del, getJSON, postJSON, readSSE } from "../api";
 import { onCommitted } from "../commitEvents";
+import { AskRequest, onAskChat, setChatReady, takePending } from "../askChat";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
 import { SlashCommand, SlashPopover, useSlashCommands } from "./SlashCommands";
@@ -287,6 +288,11 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const loadConversation = useCallback(
     async (name: string) => {
       const convo = await fetchConversation(name);
+      // Moved on while it loaded (a new conversation started by "Ask chat
+      // agent about this" while the pane's first load was in flight): a late
+      // answer must not replace the open conversation's transcript with the
+      // one left behind (Codex, PR #50).
+      if (openRef.current !== name) return null;
       setMessages(convo.events);
       const active = convo.active_turn ?? null;
       // No turn running, and the last thing in the transcript is still the
@@ -326,6 +332,13 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   // project so the first message never needs a setup step.
   useEffect(() => {
     let cancelled = false;
+    // Nothing is open until this project's list answers. The old project's
+    // conversation stayed "open" meanwhile, so an Ask arriving in that window
+    // was answered at once, and the list landing afterwards replaced the
+    // conversation the Ask had just created (Codex, PR #50). With nothing
+    // open, an Ask waits and is taken when this load opens one.
+    openRef.current = null;
+    setFilename(null);
     setMessages([]);
     setLiveText("");
     setLiveTools([]);
@@ -836,6 +849,49 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
 
   const fileInput = useRef<HTMLInputElement | null>(null);
   const textarea = useRef<HTMLTextAreaElement | null>(null);
+
+  // "Ask chat agent about this" (askChat.ts): a file, tab or run sent here from
+  // anywhere in the app. Taken only once a conversation is open, so a request
+  // made while the pane was closed waits for the pane's own first load instead
+  // of being overtaken by it. Never sent: the user writes the question.
+  const answerAsk = useRef<(r: AskRequest) => Promise<void>>(async () => {});
+  answerAsk.current = async (r: AskRequest) => {
+    // A failed create must not lose the reference: it was already taken off
+    // the pending slot, and nothing awaits this (Codex, PR #50). The text goes
+    // into the open conversation's box and the failure is shown.
+    if (r.mode === "new") {
+      try {
+        await newConversation();
+      } catch (e) {
+        setError(`Could not start a new conversation: ${(e as Error).message}`);
+      }
+    }
+    setInput((cur) => (cur.trim() ? `${cur}\n${r.text}` : r.text));
+    requestAnimationFrame(() => {
+      const el = textarea.current;
+      if (!el) return;
+      el.focus();
+      const end = el.value.length;
+      el.setSelectionRange(end, end);
+    });
+  };
+  useEffect(() => {
+    setChatReady(!!filename);
+    if (filename) {
+      const waiting = takePending();
+      if (waiting) void answerAsk.current(waiting);
+    }
+    return () => setChatReady(false);
+  }, [filename]);
+  useEffect(
+    () =>
+      onAskChat(() => {
+        if (!openRef.current) return; // the load above takes it
+        const waiting = takePending();
+        if (waiting) void answerAsk.current(waiting);
+      }),
+    [],
+  );
   // Eight lines to start. A design message is a paragraph and a part number,
   // not a chat line, and the height is remembered so this is a decision made
   // once rather than a drag repeated every session.

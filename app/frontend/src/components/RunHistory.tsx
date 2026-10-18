@@ -3,6 +3,9 @@ import { Run, del, getJSON, readSSE } from "../api";
 import { parseTimestamp, stamp } from "../time";
 import { Verbosity, classifyAll } from "../runlog";
 import { RunLog } from "./RunLog";
+import { AskChatButton } from "./AskChatButton";
+import { boardArtifact } from "../board";
+import { PIPELINE_ORDER } from "../stages";
 
 /**
  * A run's kind carries the board it was about in a trailing parenthesis —
@@ -126,6 +129,12 @@ export function RunHistory({ projectId, reloadToken }: Props) {
                 Stop
               </button>
             )}
+            {!r.running && r.exit_code !== null && r.exit_code > 0 && (
+              <AskChatButton
+                reference={runHistoryReference(r.kind, r.id, r.exit_code)}
+                label="Ask chat agent about this run"
+              />
+            )}
             {open === r.id && (
               <RunLog
                 lines={classifyAll(following ? [...lines, "…"] : lines)}
@@ -138,4 +147,48 @@ export function RunHistory({ projectId, reloadToken }: Props) {
       </ul>
     </div>
   );
+}
+
+
+/** Whether a run of this kind ran Stage 7, the only stage that writes
+ *  validation_report: "stage7", or a pipeline range that reaches it. Naming the
+ *  report for a doctor or stage6 run sent the agent to a stale report from some
+ *  other run, or to one that does not exist (Codex, PR #50). */
+export function writesValidationReport(kind: string): boolean {
+  const k = splitBoard(kind).kind;
+  if (k === "stage7") return true;
+  const m = /^pipeline (\S+)→(\S+)$/.exec(k);
+  if (!m) return false;
+  const from = PIPELINE_ORDER.indexOf(m[1]);
+  const to = PIPELINE_ORDER.indexOf(m[2]);
+  const at = PIPELINE_ORDER.indexOf("stage7");
+  return from !== -1 && to !== -1 && from <= at && at <= to;
+}
+
+/** What "Ask chat agent about this run" says about a run. An all-boards run
+ *  wrote one report per board, so it names that pattern rather than a report
+ *  for a board called "all boards" (Codex, PR #50).
+ *
+ *  A failed pipeline stops at the stage that failed, so a range that spans
+ *  Stage 7 has not necessarily reached it, and the report on disk may be an
+ *  older run's (Codex, PR #50). ``reachedStage7`` is what the run's own log
+ *  says, when the caller has it; without it a failed range names the report
+ *  only on condition that the log shows Stage 7 ran. */
+export function runHistoryReference(
+  kind: string,
+  id: string,
+  exitCode: number | null,
+  reachedStage7?: boolean,
+): string {
+  const log = `the ${kind} run ${id} (exit ${exitCode}; read its log with read_run_log)`;
+  if (!writesValidationReport(kind)) return log;
+  const board = splitBoard(kind).board;
+  const report =
+    board === "all boards"
+      ? "each board's `.pipeline/validation_report.<board>.json`"
+      : `\`${boardArtifact(".pipeline/validation_report.json", board)}\``;
+  const certain = reachedStage7 ?? (exitCode === 0 || splitBoard(kind).kind === "stage7");
+  if (certain) return `${log} and ${report}`;
+  if (reachedStage7 === false) return log;
+  return `${log} and, only if that log shows Stage 7 ran, ${report}`;
 }

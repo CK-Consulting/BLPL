@@ -1,11 +1,13 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { del } from "../api";
 import { streamRun } from "../runStream";
+import { AskChatButton } from "./AskChatButton";
 import { RunLog } from "./RunLog";
 import { RunProgress } from "./RunProgress";
 import { Verbosity, classifyAll, progress } from "../runlog";
 import { expandRange } from "../stages";
 import { withBoard } from "../board";
+import { runHistoryReference, splitBoard } from "./RunHistory";
 
 /**
  * Runs pipeline work and streams its log to the screen as it happens — either a
@@ -61,6 +63,12 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
   const [lines, setLines] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
   const [exitCode, setExitCode] = useState<number | null>(null);
+  // The last run's id, kept after it ends, for "Ask chat agent about this".
+  const [lastRun, setLastRun] = useState<string | null>(null);
+  // The run's kind as the server records it, fixed at launch: the board and
+  // scope it ran for, not whichever board is selected by the time someone asks
+  // about it (Codex, PR #50).
+  const [lastKind, setLastKind] = useState("");
   const [verbosity, setVerbosity] = useState<Verbosity>("normal");
   const [explain, setExplain] = useState(false);
   // What was actually launched, not what the controls currently say — changing
@@ -78,6 +86,7 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
 
   const run = useCallback(async () => {
     setLines([]);
+    setLastRun(null);
     setExitCode(null);
     setRunning(true);
 
@@ -85,6 +94,9 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
     const where = allBoards ? " (all boards)" : board ? ` (${board})` : "";
     const label =
       (mode === "single" ? stage : mode === "panel" ? "review panel" : `${from}→${to}`) + where;
+    setLastKind(
+      (mode === "single" ? stage : mode === "panel" ? "review-panel" : `pipeline ${from}→${to}`) + where,
+    );
     // The stages this run will announce, so the progress panel knows what it is
     // waiting for before the first header arrives.
     setRanStages(
@@ -106,7 +118,10 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
         url,
         { method: "POST" },
         (event, payload) => {
-          if (event === "start") runIdRef.current = payload.run_id ?? null;
+          if (event === "start") {
+            runIdRef.current = payload.run_id ?? null;
+            setLastRun(payload.run_id ?? null);
+          }
           else if (event === "log") setLines((l) => [...l, payload.line]);
           else if (event === "done") {
             setExitCode(payload.exit_code);
@@ -237,7 +252,36 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
           onExplainChange={setExplain}
         />
       )}
+      {!running && (exitCode !== null ? exitCode !== 0 : lines.some((l) => l.startsWith("error:"))) && (
+        <p className="ask-chat-row">
+          <AskChatButton
+            reference={runReference(lastRun, exitCode, lines, lastKind)}
+            label="Ask chat agent about this run"
+          />
+        </p>
+      )}
       <RunLog lines={classified} verbosity={verbosity} onVerbosityChange={setVerbosity} />
     </div>
   );
+}
+
+
+/** What "Ask chat agent about this run" refers to. The id is only ever this
+ *  launch's: a launch refused before it started (a 400, a 409) has none, and
+ *  naming the previous run instead pointed the agent at an unrelated one. */
+export function runReference(
+  runId: string | null,
+  exitCode: number | null,
+  lines: string[],
+  kind: string,
+): string {
+  if (runId) {
+    // The log is in hand here, so whether Stage 7 ran is known, not guessed.
+    const reached =
+      splitBoard(kind).kind === "stage7" ||
+      classifyAll(lines).some((l) => l.kind === "stage" && l.stage === "stage7");
+    return runHistoryReference(kind, runId, exitCode, reached);
+  }
+  const error = (lines.find((l) => l.startsWith("error:")) ?? "").slice(0, 300);
+  return `a pipeline run that failed to start: ${error}`;
 }
