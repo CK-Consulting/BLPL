@@ -22,6 +22,13 @@ verdacor-ear-tag's schematic parity errors. A power symbol's net is its
 Value (checked against kicad-cli's netlist), so a rail called VDD_LR2021
 needs no library symbol of its own.
 
+**Parts that serve a pin are wired to it.** Grouping alone still left a
+sheet of parts and labels with not one wire between them. A small part that
+shares a net with one of its anchor's pins hangs off a wire drawn from that
+pin (see ``_hang``): below the wire on a side edge, beside it on a top or
+bottom one, further parts further out. The wire ends in a global label, which
+joins the net to the rest of the sheet and names it as the board does.
+
 Geometry is in schematic millimetres, y down, on the 1.27 mm connection
 grid. Symbols are defined y-up; ``pin_tip`` does that flip and the rotation.
 """
@@ -90,6 +97,33 @@ class Placed:
     y: float
     rot: int
     pins: list[dict]
+    # A small part drawn hanging off one of its anchor's pins: (anchor ref,
+    # anchor unit, anchor pin number, this part's pin number on that wire).
+    hook: tuple[str, int, str, str] | None = None
+
+
+@dataclass
+class WirePath:
+    """The wire from an anchor pin through the parts that hang off it.
+
+    ``points`` are its corners and its taps, in order from the pin; ``taps``
+    are the points a part's pin joins it; the label naming its net is drawn at
+    ``label``, pointing ``direction``.
+    """
+    points: list[tuple[float, float]]
+    taps: set[tuple[float, float]]
+    label: tuple[float, float]
+    direction: int
+
+    def moved(self, dx: float, dy: float) -> "WirePath":
+        def mv(p):
+            return (snap(p[0] + dx), snap(p[1] + dy))
+        return WirePath([mv(p) for p in self.points], {mv(p) for p in self.taps}, mv(self.label), self.direction)
+
+
+# Parts on one row of a pin's wire before it folds back on itself. Seven parts
+# on VBAT in one straight line stretched the XIAO's block down half the sheet.
+ROW_PARTS = 3
 
 
 @dataclass
@@ -98,6 +132,9 @@ class Block:
     anchor: str | None
     members: list[tuple[str, int]] = field(default_factory=list)
     # Filled by layout: the block's own frame, in sheet coordinates.
+    # wire_paths: for each anchor pin that has parts hanging off it, (ref,
+    # unit, pin number) -> WirePath, in sheet coordinates.
+    wire_paths: dict = field(default_factory=dict)
     x0: float = 0.0
     y0: float = 0.0
     x1: float = 0.0
@@ -244,6 +281,91 @@ def assign_blocks(
     return out
 
 
+def single_pins(pins: list[dict], tips: list[tuple[float, float, int]], nets: dict[str, str]) -> set[str]:
+    """Numbers of the pins whose neighbours on their edge are on other nets.
+
+    A run of adjacent pins on one net is tied into one terminal (see
+    sch._same_net_runs); only a pin on its own can carry a wire of its own.
+    """
+    by_edge: dict[tuple[int, float], list[tuple[float, str, str | None]]] = {}
+    for pin, (tx, ty, d) in zip(pins, tips):
+        line = tx if d in (0, 180) else ty
+        along = ty if d in (0, 180) else tx
+        by_edge.setdefault((d, line), []).append((along, pin["number"], nets.get(pin["number"])))
+    out: set[str] = set()
+    for edge in by_edge.values():
+        edge.sort()
+        for i, (_, num, net) in enumerate(edge):
+            if net is None:
+                continue
+            prev = edge[i - 1][2] if i > 0 else None
+            nxt = edge[i + 1][2] if i + 1 < len(edge) else None
+            if net != prev and net != nxt:
+                out.add(num)
+    return out
+
+
+# A part hangs below a wire that runs sideways, and stands to the right of
+# one that runs up or down: its pin on the wire points back at the wire.
+_FACING = {0: 90, 180: 90, 90: 180, 270: 180}
+# The direction a part's pin on the wire points, by the side it hangs (h).
+_TOWARD_WIRE = {(0, 1): 90, (0, -1): 270, (1, 0): 180, (-1, 0): 0}
+
+
+def _hanging_rotation(pins: list[dict], hook_pin: str, facing: int = 90) -> int | None:
+    """The rotation that points ``hook_pin`` at its wire (``facing``), the rest away.
+
+    None when there is none: a part whose other pin cannot point away (a
+    two-way connector, both pins on one side) would put that pin on the wire
+    too, and short its net to the wire's. It stays in the ordinary layout.
+    """
+    away = (facing + 180) % 360
+    for rot in (0, 90, 180, 270):
+        tips = {p["number"]: pin_tip(p, 0, 0, rot)[2] for p in pins}
+        if tips.get(hook_pin) != facing:
+            continue
+        if all(d == away for n, d in tips.items() if n != hook_pin):
+            return rot
+    return None
+
+
+def choose_hooks(
+    anchor_pins: list[tuple[str, int, dict, float, float, int]],
+    smalls: list[tuple[str, int, list[dict]]],
+    pin_nets: dict[str, dict[str, str]],
+) -> dict[tuple[str, int], tuple[tuple[str, int, dict, float, float, int], str]]:
+    """Which anchor pin each small part hangs off, and by which of its own pins.
+
+    ``anchor_pins`` are the anchor's single pins: (ref, unit, pin, x, y,
+    direction). A part hangs off a pin it shares a net
+    with — a signal before a rail, ground never (every part is on it) — so a
+    series resistor sits on the line it is in series with and a decoupling
+    capacitor on the pin it decouples. One part, one wire: a part on two
+    anchor pins hangs off one and labels the other.
+    """
+    hooks = {}
+    for ref, unit, pins in smalls:
+        if len(pins) > 2:
+            continue
+        nets = pin_nets.get(ref, {})
+        best = None
+        for pin in pins:
+            net = nets.get(pin["number"])
+            if not net or net_kind(net) == "ground":
+                continue
+            for ap in anchor_pins:
+                if pin_nets.get(ap[0], {}).get(ap[2]["number"]) != net:
+                    continue
+                if _hanging_rotation(pins, pin["number"], _FACING[ap[5]]) is None:
+                    continue
+                key = (0 if net_kind(net) == "signal" else 1, ap[4], ap[2]["number"])
+                if best is None or key < best[0]:
+                    best = (key, ap, pin["number"])
+        if best:
+            hooks[(ref, unit)] = (best[1], best[2])
+    return hooks
+
+
 def _text_box(texts: tuple[str, str] | None, standing: bool) -> tuple[float, float, float, float]:
     """The room a part's reference and value need beside its body."""
     if not texts:
@@ -262,6 +384,160 @@ def part_extent(pins: list[dict], rot: int, nets: dict[str, str], texts: tuple[s
         tx0, ty0, tx1, ty1 = _text_box(texts, standing)
         x0, y0, x1, y1 = min(x0, tx0), min(y0, ty0), max(x1, tx1), max(y1, ty1)
     return x0, y0, x1, y1
+
+
+def _hang(local, smalls, pin_nets, texts, pad, order):
+    """Hang each small part that serves an anchor pin off a wire from that pin.
+
+    The wire runs straight out from the pin. On a left or right edge each part
+    hangs below it; on a top or bottom edge each stands to its right; either
+    way its pin is on the wire, and the next part is further out. Pins further
+    along the side parts hang towards (lower, or further right) get the space
+    nearest the anchor, so no part stands across another pin's wire. Room is
+    left after each pin's last part for the label that names its net.
+
+    Returns the parts hung (by (ref, unit)), the right edge of everything hung,
+    the boxes of the wires and labels, and where each pin's wire ends.
+    """
+    anchor_pins = []
+    for p in local:
+        nets = pin_nets.get(p.ref, {})
+        tips = [pin_tip(pin, p.x, p.y, p.rot) for pin in p.pins]
+        single = single_pins(p.pins, tips, nets)
+        for pin, (tx, ty, d) in zip(p.pins, tips):
+            if pin["number"] in single and nets.get(pin["number"]):
+                anchor_pins.append((p.ref, p.unit, pin, tx, ty, d))
+    hooks = choose_hooks(anchor_pins, smalls, pin_nets)
+    by_pin: dict[tuple[str, int, str], list] = {}
+    for (ref, unit, pins) in smalls:
+        if (ref, unit) in hooks:
+            ap, own = hooks[(ref, unit)]
+            by_pin.setdefault((ap[0], ap[1], ap[2]["number"]), []).append((ref, unit, pins, own, ap))
+    boxes = [(e[0] + p.x, e[1] + p.y, e[2] + p.x, e[3] + p.y)
+             for p in local for e in [part_extent(p.pins, p.rot, pin_nets.get(p.ref, {}))]]
+    if not boxes:
+        return set(), 0.0, [], {}
+    bx0, by0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+    bx1, by1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+    hung, extra, paths = set(), [], {}
+    placed_boxes: list[tuple[float, float, float, float]] = []
+    mid_x, mid_y = (bx0 + bx1) / 2, (by0 + by1) / 2
+
+    def side(ap) -> tuple[int, int]:
+        """Which way a pin's parts hang: away from the middle of its edge.
+
+        Each half of an edge stacks its pins' parts on its own side, so the
+        two halves grow apart instead of one stack growing the length of
+        both.
+        """
+        _, _, _, tx, ty, d = ap
+        if d in (0, 180):
+            return (0, -1) if ty < mid_y else (0, 1)
+        return (-1, 0) if tx < mid_x else (1, 0)
+
+    # Sideways edges first; a top or bottom edge then starts beyond whatever
+    # those hung, so its parts cannot land on them.
+    for edges in ((0, 180), (90, 270)):
+        # Each edge's cursor is measured along its wires' direction: how far
+        # out from the anchor the next pin's parts start, one per half.
+        base = {0: bx1 + pad, 180: -bx0 + pad, 90: -by0 + pad, 270: by1 + pad}
+        if edges == (90, 270) and placed_boxes:
+            base[90] = max(base[90], -min(b[1] for b in placed_boxes) + pad)
+            base[270] = max(base[270], max(b[3] for b in placed_boxes) + pad)
+        cursor: dict[tuple[int, tuple[int, int]], float] = {}
+        groups = [g for g in by_pin.values() if g[0][4][5] in edges]
+        # Furthest along the hanging side first: nearest the anchor.
+        def reach(g):
+            ap = g[0][4]
+            hx, hy = side(ap)
+            return -(ap[3] * hx + ap[4] * hy)
+        groups.sort(key=reach)
+        for group in groups:
+            ap = group[0][4]
+            _, _, apin, tx, ty, d = ap
+            w = _STEP[d]
+            h = side(ap)
+            key = (d, h)
+            cursor.setdefault(key, base[d])
+
+            def ab(x, y, w=w, h=h):
+                return (x * w[0] + y * w[1], x * h[0] + y * h[1])
+
+            def xy(a, b, w=w, h=h):
+                return (a * w[0] + b * h[0], a * w[1] + b * h[1])
+
+            net = pin_nets.get(ap[0], {}).get(apin["number"], "")
+            members = sorted(group, key=lambda g: order(g[0]))
+            rows = [members[i:i + ROW_PARTS] for i in range(0, len(members), ROW_PARTS)]
+            a_tip, row_b = ab(tx, ty)
+            start_a = cursor[key]
+            far_a = start_a
+            row_taps: list[list[tuple[float, float]]] = []
+            row_bs: list[float] = []
+            region: list[tuple[float, float, float, float]] = []
+            for row in rows:
+                cur = start_a
+                deepest = row_b
+                taps_here = []
+                for ref, unit, pins, own, _ in row:
+                    rot = _hanging_rotation(pins, own, _TOWARD_WIRE[h])
+                    nets = {k: v for k, v in pin_nets.get(ref, {}).items() if k != own}
+                    x0, y0, x1, y1 = part_extent(pins, rot, nets, texts.get(ref))
+                    corners = [ab(x, y) for x in (x0, x1) for y in (y0, y1)]
+                    a_lo, a_hi = min(c[0] for c in corners), max(c[0] for c in corners)
+                    b_hi = max(c[1] for c in corners)
+                    pin_a, pin_b = ab(*pin_tip(next(q for q in pins if q["number"] == own), 0, 0, rot)[:2])
+                    oa, ob = snap(cur - a_lo), row_b - pin_b
+                    px, py = xy(oa, ob)
+                    px, py = snap(px), snap(py)
+                    local.append(Placed(ref, unit, px, py, rot, pins, hook=(ap[0], ap[1], apin["number"], own)))
+                    placed_boxes.append((px + x0, py + y0, px + x1, py + y1))
+                    hung.add((ref, unit))
+                    taps_here.append(xy(oa + pin_a, row_b))
+                    cur = oa + a_hi + pad
+                    deepest = max(deepest, ob + b_hi)
+                    far_a = max(far_a, oa + a_hi)
+                row_taps.append(taps_here)
+                row_bs.append(row_b)
+                row_b = snap(deepest + pad)
+            far_a = snap(far_a + pad)
+            near_a = snap(start_a - 2 * GRID)
+            # The path: out along the first row, then back and forth.
+            pts = [(tx, ty)]
+            for i, (taps_here, b) in enumerate(zip(row_taps, row_bs)):
+                forward = i % 2 == 0
+                ordered = sorted(taps_here, key=lambda t: ab(*t)[0], reverse=not forward)
+                if i > 0:
+                    pts.append(xy(far_a if not forward else near_a, b))
+                pts += ordered
+                if i + 1 < len(row_taps):
+                    pts.append(xy(far_a if forward else near_a, b))
+            label = xy(far_a, row_bs[0])
+            if len(row_taps) == 1:
+                pts.append(label)
+            elif label not in pts:
+                pts.insert(len(row_taps[0]) + 1, label)
+            pts = [(snap(x), snap(y)) for x, y in pts]
+            taps = {(snap(x), snap(y)) for row in row_taps for x, y in row}
+            paths[(ap[0], ap[1], apin["number"])] = WirePath(pts, taps, (snap(label[0]), snap(label[1])), d)
+            # The region the wire, its parts and its label take.
+            lab_a = far_a + len(net) * _CHAR + 2 * GRID
+            corners = [xy(near_a, row_bs[0] - 2 * GRID), xy(lab_a, row_bs[-1] + 2 * GRID)]
+            extra.append((min(c[0] for c in corners), min(c[1] for c in corners),
+                          max(c[0] for c in corners), max(c[1] for c in corners)))
+            cursor[key] = snap(lab_a + pad)
+    right = max([bx1] + [b[2] for b in placed_boxes + extra])
+    return hung, right, extra, paths
+
+
+def placed_extent(p: Placed, pin_nets: dict[str, dict[str, str]], texts: dict | None = None):
+    """A placed part's box on the sheet as drawn: its pin on a wire has no label."""
+    nets = dict(pin_nets.get(p.ref, {}))
+    if p.hook:
+        nets.pop(p.hook[3], None)
+    t = (texts or {}).get(p.ref) if len(p.pins) <= 2 else None
+    x0, y0, x1, y1 = part_extent(p.pins, p.rot, nets, t)
+    return (x0 + p.x, y0 + p.y, x1 + p.x, y1 + p.y)
 
 
 def layout(
@@ -310,14 +586,22 @@ def layout(
             pins = units[(ref, unit)]
             if ref == block.anchor:
                 x0, y0, x1, y1 = part_extent(pins, 0, pin_nets.get(ref, {}))
-                local.append(Placed(ref, unit, -x0, ay - y0, 0, pins))
+                # On the grid from the start: parts hang off this anchor's pin
+                # tips, and must land on exactly the same grid line.
+                local.append(Placed(ref, unit, snap(-x0), snap(ay - y0), 0, pins))
                 anchor_w = max(anchor_w, x1 - x0)
                 ay += (y1 - y0) + pad
             else:
                 smalls.append((ref, unit, pins))
         anchor_h = max(ay - pad, 0.0)
         smalls.sort(key=lambda t: order(t[0]))
+        extra: list[tuple[float, float, float, float]] = []
+        ends: dict[tuple[str, int, str], WirePath] = {}
         sx = anchor_w + (2 * pad if block.anchor else 0.0)
+        if block.anchor:
+            hung, right_end, extra, ends = _hang(local, smalls, pin_nets, texts, pad, order)
+            smalls = [t for t in smalls if (t[0], t[1]) not in hung]
+            sx = max(sx, right_end + pad)
         sy, col_w = 0.0, 0.0
         limit = max(anchor_h, 60.0)
         for ref, unit, pins in smalls:
@@ -332,17 +616,14 @@ def layout(
             sy += h + pad
             col_w = max(col_w, w)
         # Measured from what was placed, not from the bookkeeping.
-        boxes = []
-        for p in local:
-            e = part_extent(p.pins, p.rot, pin_nets.get(p.ref, {}),
-                            texts.get(p.ref) if p.ref != block.anchor else None)
-            boxes.append((e[0] + p.x, e[1] + p.y, e[2] + p.x, e[3] + p.y))
+        boxes = [placed_extent(p, pin_nets, texts if p.ref != block.anchor else None) for p in local]
+        boxes += extra
         box = (min(b[0] for b in boxes), min(b[1] for b in boxes),
                max(b[2] for b in boxes), max(b[3] for b in boxes))
-        measured.append((block, local, box))
+        measured.append((block, local, box, ends))
 
     sizes = [(max(b[2] - b[0], len(blk.title) * 2.54 * 0.85) + 2 * pad, b[3] - b[1] + 2 * pad + title_h)
-             for blk, _, b in measured]
+             for blk, _, b, _ in measured]
 
     def pack(width: float) -> tuple[float, float]:
         """Rows no wider than ``width``: the area they take."""
@@ -375,14 +656,15 @@ def layout(
 
     placed: list[Placed] = []
     cx, cy, row_h = origin[0], origin[1], 0.0
-    for (block, local, (minx, miny, maxx, maxy)), (bw, bh) in zip(measured, sizes):
+    for (block, local, (minx, miny, maxx, maxy), ends), (bw, bh) in zip(measured, sizes):
         if cx > origin[0] and cx + bw > origin[0] + width:
             cx = origin[0]
             cy += row_h + 2 * pad
             row_h = 0.0
-        offx, offy = cx - minx + pad, cy - miny + pad + title_h
+        offx, offy = snap(cx - minx + pad), snap(cy - miny + pad + title_h)
         for p in local:
-            placed.append(Placed(p.ref, p.unit, snap(p.x + offx), snap(p.y + offy), p.rot, p.pins))
+            placed.append(Placed(p.ref, p.unit, snap(p.x + offx), snap(p.y + offy), p.rot, p.pins, p.hook))
+        block.wire_paths = {k: v.moved(offx, offy) for k, v in ends.items()}
         block.x0, block.y0 = snap(cx), snap(cy)
         block.x1, block.y1 = snap(cx + bw), snap(cy + bh)
         cx = block.x1 + 2 * pad

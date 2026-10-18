@@ -125,9 +125,8 @@ def test_nothing_on_the_sheet_overlaps():
     frames = [(b.x0, b.y0, b.x1, b.y1) for b in blocks]
     boxes = []
     for p in placed:
-        x0, y0, x1, y1 = sch_layout.part_extent(p.pins, p.rot, pin_nets.get(p.ref, {}),
-                                                texts.get(p.ref) if len(p.pins) <= 2 else None)
-        boxes.append((p.ref, (p.x + x0, p.y + y0, p.x + x1, p.y + y1)))
+        # As drawn: a part's pin on a wire ends in no label of its own.
+        boxes.append((p.ref, sch_layout.placed_extent(p, pin_nets, texts)))
 
     def overlap(a, b):
         return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
@@ -146,11 +145,10 @@ def test_nets_are_named_as_the_board_names_them():
     node = sexpr.parse(sch.emit(_hdm(*parts), symbols_root=_SYMBOLS_ROOT))
     assert not sexpr.find_all(node, "label")
     assert "SDA" in {sexpr.unquote(g[1]) for g in sexpr.find_all(node, "global_label")}
-    # The capacitor's rail is a power symbol whose Value is the net; U1's
-    # VDD_3V3 pin, on an IC, is a label of the same name.
-    powers = [s for s in sexpr.find_all(node, "symbol") if sexpr.unquote(sexpr.find(s, "lib_id")[1]) == "power:VCC"]
-    values = {sexpr.unquote(next(pr for pr in sexpr.find_all(s, "property") if sexpr.unquote(pr[1]) == "Value")[2]) for s in powers}
-    assert values == {"VDD_3V3"}
+    # The capacitor hangs off U1's VDD_3V3 pin on a wire, and the wire is
+    # named by a global label of the same name, not left to KiCad's
+    # Net-(U1-Pin_n).
+    assert "VDD_3V3" in {sexpr.unquote(g[1]) for g in sexpr.find_all(node, "global_label")}
 
 
 def test_adjacent_pins_on_one_net_share_one_terminal_and_never_jump_a_pin():
@@ -191,3 +189,86 @@ def test_the_sheet_reaches_past_the_last_row_of_power_flags(n):
     first = 100.33
     last = max(sch._flag_y(first, i) for i in range(n))
     assert sch._sheet_height(first, n) >= last + 10 * 1.27
+
+
+def _wires(node):
+    out = []
+    for w in sexpr.find_all(node, "wire"):
+        pts = sexpr.find(w, "pts")
+        out.append(tuple((float(p[1]), float(p[2])) for p in pts[1:]))
+    return out
+
+
+def _connected(wires, a, b):
+    """Whether points a and b are joined by a chain of wires end to end."""
+    seen, todo = {a}, [a]
+    while todo:
+        p = todo.pop()
+        for w in wires:
+            if p in w:
+                for q in w:
+                    if q not in seen:
+                        seen.add(q)
+                        todo.append(q)
+    return b in seen
+
+
+def test_a_part_serving_an_ic_pin_is_wired_to_it():
+    # The schematic used to show parts and labels and not one wire between
+    # them. A pull-up on SDA and a decoupling capacitor on VDD_3V3 now hang
+    # off a wire drawn from U1's pin, and the wire still ends in a label that
+    # names the net.
+    parts = [U_A,
+             _part("R1", "Device:R", {"1": "SDA", "2": "VDD_3V3"}, 11, 11, "4.7kΩ"),
+             _part("C1", "Device:C", {"1": "VDD_3V3", "2": "GND"}, 11, 11, "100nF")]
+    hdm = _hdm(*parts)
+    blocks, placed, pin_nets, _ = _layout(hdm)
+    node = sexpr.parse(sch.emit(hdm, symbols_root=_SYMBOLS_ROOT))
+    wires = _wires(node)
+    by_ref = {p.ref: p for p in placed}
+
+    def tip(ref, number):
+        p = by_ref[ref]
+        pin = next(q for q in p.pins if q["number"] == number)
+        return pin_tip(pin, p.x, p.y, p.rot)[:2]
+
+    assert by_ref["R1"].hook and by_ref["R1"].hook[2] == "3"
+    assert _connected(wires, tip("U1", "3"), tip("R1", "1"))
+    assert by_ref["C1"].hook and by_ref["C1"].hook[2] == "1"
+    assert _connected(wires, tip("U1", "1"), tip("C1", "1"))
+    names = {sexpr.unquote(g[1]) for g in sexpr.find_all(node, "global_label")}
+    assert {"SDA", "VDD_3V3"} <= names
+
+
+def test_a_long_chain_folds_into_rows_instead_of_one_long_wire():
+    # Seven parts on VBAT in a straight line stretched the XIAO's block down
+    # half the sheet. A pin's wire carries a few parts, then turns back.
+    caps = [_part(f"C{i}", "Device:C", {"1": "VDD_3V3", "2": "GND"}, 11, 11, "100nF") for i in range(1, 8)]
+    hdm = _hdm(U_A, *caps)
+    blocks, placed, pin_nets, _ = _layout(hdm)
+    node = sexpr.parse(sch.emit(hdm, symbols_root=_SYMBOLS_ROOT))
+    wires = _wires(node)
+    by_ref = {p.ref: p for p in placed}
+
+    def tip(ref, number):
+        p = by_ref[ref]
+        pin = next(q for q in p.pins if q["number"] == number)
+        return pin_tip(pin, p.x, p.y, p.rot)[:2]
+
+    for i in range(1, 8):
+        assert _connected(wires, tip("U1", "1"), tip(f"C{i}", "1")), f"C{i}"
+    rows = {}
+    for i in range(1, 8):
+        x, y = tip(f"C{i}", "1")
+        rows.setdefault(y, []).append(x)
+    assert len(rows) == 3
+    assert max(len(r) for r in rows.values()) <= sch_layout.ROW_PARTS
+
+
+def test_a_part_whose_pins_share_a_side_is_never_hung_on_a_wire():
+    # Both pins of a two-way connector point the same way: hung by one, the
+    # other would land on the wire too and short its net to the wire's.
+    j = _part("J1", "Connector_Generic:Conn_01x02", {"1": "SDA", "2": "IRQ"}, 11, 11)
+    hdm = _hdm(U_A, j)
+    blocks, placed, pin_nets, _ = _layout(hdm)
+    assert next(p for p in placed if p.ref == "J1").hook is None
