@@ -157,6 +157,20 @@ def _run_drc(pcb_path: Path, output_json: Path) -> dict:
     return result
 
 
+def erc_violation_count(report: dict) -> int:
+    """Every violation in a kicad-cli ERC report.
+
+    KiCad 10 lists them per sheet (``sheets[].violations``) and has no
+    top-level ``violations`` at all, so counting only the top level reported
+    0 while kicad-cli said "Found 6 violations": a count that read as clean
+    on a schematic that was not. Both places are counted, for an older
+    report that puts them at the top.
+    """
+    top = len(report.get("violations") or [])
+    per_sheet = sum(len(sheet.get("violations") or []) for sheet in report.get("sheets") or [])
+    return top + per_sheet
+
+
 def _run_erc(sch_path: Path, output_json: Path) -> dict:
     """Run `kicad-cli sch erc` on the schematic. Same shape of result as _run_drc."""
     cli = _find_kicad_cli()
@@ -200,7 +214,7 @@ def _run_erc(sch_path: Path, output_json: Path) -> dict:
     if output_json.exists():
         try:
             data = json.loads(output_json.read_text())
-            result["violation_count"] = len(data.get("violations", []))
+            result["violation_count"] = erc_violation_count(data)
         except json.JSONDecodeError:
             pass
     return result
