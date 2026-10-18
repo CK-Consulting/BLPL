@@ -81,6 +81,7 @@ from . import (
     egress,
     gitidentity,
     grants,
+    idlepolicy,
     importer,
     keystore,
     llm_ignore,
@@ -273,19 +274,35 @@ async def _seal_idle_workspaces() -> None:
                 with SessionFactory() as session:
                     await workspace_files.sweep_and_seal(
                         lambda name, gate_held=False: _seal_workspace(
-                            session, name, gate_held=gate_held))
+                            session, name, gate_held=gate_held,
+                            reason=f"idle {idlepolicy.minutes_for(session, name)} min "
+                                   "(no file, git or run activity)"),
+                        limit_s=lambda name: 60 * idlepolicy.minutes_for(session, name))
                     session.commit()
-            idle = workspaces.idle()
-            if not idle:
-                continue
-            with SessionFactory() as session:
-                for entry in idle:
-                    _seal_workspace(session, entry.workspace)
-                session.commit()
+            _seal_idle_registry()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — a sweep that fails must not stop the next
             logger.exception("idle workspace sweep failed")
+
+
+def _seal_idle_registry() -> list[str]:
+    """Seal every open workspace idle past its project's own limit.
+
+    Not named after the sweeper above, which it once shared a name with: the
+    later definition replaced the coroutine the lifespan starts, and the
+    backend failed to boot (Codex, PR #47)."""
+    sealed = []
+    with SessionFactory() as session:
+        now = datetime.now(timezone.utc)
+        for entry in workspaces.all_open():
+            limit = idlepolicy.minutes_for(session, entry.workspace)
+            idle_min = (now - entry.last_touched).total_seconds() / 60
+            if idle_min >= limit and _seal_workspace(
+                    session, entry.workspace, reason=f"idle {idle_min:.0f} min (limit {limit})"):
+                sealed.append(entry.workspace)
+        session.commit()
+    return sealed
 
 
 app = FastAPI(title="BLPL", version="0.5.0", lifespan=_lifespan)
@@ -994,7 +1011,8 @@ def auth_lock(
         # one directory tree shared by its members, so sealing on your lock alone
         # would delete the files out from under them mid-edit.
         openstate.release(session, project.name, user.id)
-        if workspaces.release(project.name, user.id) and _seal_workspace(session, project.name):
+        if workspaces.release(project.name, user.id) and _seal_workspace(
+                session, project.name, reason=f"{user.email} locked their session"):
             sealed.append(project.name)
     return {"unlocked": False, "sealed": sealed}
 
@@ -2542,7 +2560,7 @@ def seal_project(
     """Put a project back to sealed now, rather than waiting for the timeout."""
     _project_or_404(session, user, project_id)
     why: list[str] = []
-    sealed = _seal_workspace(session, project_id, why)
+    sealed = _seal_workspace(session, project_id, why, reason=f"sealed by {user.email}")
     # Not sealed because something is using it is said, not left as a bare
     # false: an operation in flight holds the project's gate, and the seal
     # gives up after a few seconds rather than waiting it out.
@@ -2568,8 +2586,12 @@ def _seal_gate(project_id: str, *, sealing: bool):
 
 
 def _seal_workspace(session: Session, project_id: str, why: list[str] | None = None, *,
-                    gate_held: bool = False) -> bool:
+                    gate_held: bool = False, reason: str = "") -> bool:
     """Seal one workspace, unless something is still using it.
+
+    Every seal is recorded in the project's activity with ``reason``. Only
+    unseals were, so how often and why a project re-locked could be told
+    only from container logs, which a redeploy deletes.
 
     Refuses while a run is in flight, and that is not politeness: the worker is
     another container reading those files, and sealing would delete the project
@@ -2623,7 +2645,9 @@ def _seal_workspace(session: Session, project_id: str, why: list[str] | None = N
     # The row and the wrapped key it carries exist only while the project is
     # unsealed. It is sealed now, so both go.
     openstate.forget(session, project_id)
-    logger.info("sealed %s (%d bytes)", project_id, size)
+    logger.info("sealed %s (%d bytes): %s", project_id, size, reason or "no reason given")
+    if project is not None:
+        activity.record(session, project, None, activity.SEALED, reason)
     return True
 
 
@@ -3105,6 +3129,9 @@ def git_status(project_id: str, user: User = Depends(require_onboarded),
         "remote_problem": st.remote_problem,
         # auto | manual | null (never chosen; behaves as manual).
         "push_policy": project.push_policy,
+        # Minutes idle before the project is sealed again; null is the default.
+        "idle_seal_minutes": project.idle_seal_minutes,
+        "idle_seal_default": idlepolicy.default_minutes(),
         # This member's last push, automatic or not: a failure stays here, and
         # in the strip, until a later push succeeds.
         "last_push": autopush.last_push(member),
@@ -3348,6 +3375,40 @@ def put_push_policy(
         "ok": True,
         "push_policy": project.push_policy,
         "warning": autopush.MANUAL_WARNING if project.push_policy == "manual" else "",
+    }
+
+
+class IdleSealBody(BaseModel):
+    minutes: int | None = None
+
+
+@app.put("/api/projects/{project_id}/idle-seal")
+def put_idle_seal(
+    project_id: str,
+    body: IdleSealBody,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope),
+) -> dict:
+    """How long the project may sit idle before it is sealed again. Owner
+    only: it decides how long every member's files stay decrypted on the
+    server after the last of them stops working. Null restores the default."""
+    try:
+        project = projectacl.require_owner(session, user, project_id)
+    except projectacl.NoSuchProject:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    except projectacl.NotTheOwner:
+        raise HTTPException(
+            status_code=403, detail="only the owner can change how long this project stays open"
+        )
+    try:
+        project.idle_seal_minutes = idlepolicy.validate(body.minutes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    session.flush()
+    return {
+        "ok": True,
+        "idle_seal_minutes": project.idle_seal_minutes,
+        "effective_minutes": project.idle_seal_minutes or idlepolicy.default_minutes(),
     }
 
 

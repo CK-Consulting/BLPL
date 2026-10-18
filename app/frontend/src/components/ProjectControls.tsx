@@ -25,6 +25,7 @@ import {
   defaultTokenUser,
 } from "./GitSetup";
 import { ProjectRoutingPanel } from "./ProjectRoutingPanel";
+import { IdleSealPanel } from "./IdleSealPanel";
 
 // The git strip: what state the server's working copy is in, and the three
 // buttons that keep it in sync with the remote you roam through — pull, commit,
@@ -738,13 +739,14 @@ export function NewProject({
  * account; a project gets the wrench and screwdriver, and both say what they
  * are.
  */
-type ProjectSettingsTab = "board" | "routing" | "git" | "policy";
+type ProjectSettingsTab = "board" | "routing" | "git" | "policy" | "lock";
 
 const PROJECT_SETTINGS_TABS: { id: ProjectSettingsTab; label: string }[] = [
   { id: "board", label: "Board" },
   { id: "routing", label: "Task routing" },
   { id: "git", label: "Git" },
   { id: "policy", label: "Library policy" },
+  { id: "lock", label: "Auto-lock" },
 ];
 
 export function ProjectSettings({
@@ -841,6 +843,9 @@ export function ProjectSettings({
           </div>
           <div role="tabpanel" hidden={tab !== "policy"}>
             <ProjectPolicyPanel projectId={projectId} />
+          </div>
+          <div role="tabpanel" hidden={tab !== "lock"}>
+            <IdleSealPanel projectId={projectId} />
           </div>
         </div>
       </div>

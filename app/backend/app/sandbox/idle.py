@@ -30,7 +30,7 @@ logger = logging.getLogger("blpl.sandbox.idle")
 
 # Long enough to read a review and come back; short enough that a project left
 # open over lunch is sealed by the time anyone could walk off with the disk.
-DEFAULT_IDLE_AFTER_S = 15 * 60
+DEFAULT_IDLE_AFTER_S = 60 * 60
 
 
 class IdleTracker:
@@ -80,12 +80,16 @@ async def sweep(
     driver: WorkspaceDriver,
     tracker: IdleTracker,
     *,
-    idle_after_s: float = DEFAULT_IDLE_AFTER_S,
+    idle_after_s: "float | Callable[[WorkspaceKey], float]" = DEFAULT_IDLE_AFTER_S,
     on_stopped: OnStopped | None = None,
     activity: Activity | None = None,
     gate_root: Path | None = None,
 ) -> list[WorkspaceKey]:
     """Stop every running workspace idle longer than idle_after_s.
+
+    ``idle_after_s`` is seconds, or a function of the workspace's key giving
+    them: each project may set its own limit (Project settings), so one
+    number for every workspace is only the default.
 
     Returns the keys it stopped. One workspace failing to stop is logged and
     skipped; it must not leave every other idle workspace running.
@@ -114,14 +118,15 @@ async def sweep(
         if tracker.is_busy(key):
             continue
         idle = tracker.idle_for(key) or 0.0
-        if idle < idle_after_s:
+        limit = idle_after_s(key) if callable(idle_after_s) else idle_after_s
+        if idle < limit:
             continue
         if activity is not None:
             # A second witness can only make a workspace younger: activity this
             # process did not see still counts, and a witness that cannot
             # answer changes nothing.
             other = await activity(key)
-            if other is not None and other < idle_after_s:
+            if other is not None and other < limit:
                 continue
             if other is not None:
                 idle = min(idle, other)
