@@ -24,7 +24,9 @@ const MAX_PER_PAGE = 200;
 
 export function report(ev: ClientEvent, send: typeof fetch = fetch): void {
   if (sent + queue.length >= MAX_PER_PAGE) return;
-  queue.push({ url: location.href, ...ev, message: (ev.message || "").slice(0, 500) });
+  // Origin and path only: an invite link carries its secret in the fragment,
+  // and a query string can carry anything (Codex, PR #48).
+  queue.push({ url: location.origin + location.pathname, ...ev, message: (ev.message || "").slice(0, 500) });
   if (!timer) timer = setTimeout(() => flush(send), 3000);
 }
 

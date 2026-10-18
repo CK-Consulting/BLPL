@@ -62,7 +62,9 @@ FIELDS = (
 
 _DEFAULT_LEVEL = "PERF"
 _STARTED = time.time()
-_configured: dict[str, bool] = {}
+#: service -> (log root, its JSON-lines handler), so a second setup with a
+#: different root replaces the handler instead of leaving it on the old one.
+_configured: dict[str, tuple[Path, "JsonLinesHandler | None"]] = {}
 
 
 def level_from_env() -> int:
@@ -219,6 +221,13 @@ class JsonLinesHandler(logging.Handler):
             out["host_state"] = record.host_state
         return out
 
+    def close(self) -> None:
+        with self.lock:
+            if self._fh is not None:
+                self._fh.close()
+                self._fh = None
+        super().close()
+
     def emit(self, record: logging.LogRecord) -> None:
         try:
             line = json.dumps(self.format_record(record), default=str)
@@ -246,10 +255,24 @@ def setup(service: str, *, root: Path | None = None) -> logging.Logger:
     sampler thread logging the host's state every ``BLPL_LOG_TRACE_INTERVAL``
     seconds (default 30).
     """
-    if _configured.get(service):
-        return logging.getLogger("blpl")
     level = level_from_env()
     root_logger = logging.getLogger()
+    target = Path(root or logs_root())
+    if service in _configured:
+        old_root, old_handler = _configured[service]
+        if old_root == target:
+            return logging.getLogger("blpl")
+        # The data root moved (a reload with a new BLPL_DATA_ROOT, as the
+        # tests do): a handler left on the old root writes to a file nobody
+        # reads, possibly one already deleted (Codex, PR #48).
+        if old_handler is not None:
+            root_logger.removeHandler(old_handler)
+            old_handler.close()
+        handler = JsonLinesHandler(service, target)
+        handler.setLevel(level)
+        root_logger.addHandler(handler)
+        _configured[service] = (target, handler)
+        return logging.getLogger("blpl")
     root_logger.setLevel(min(level, logging.INFO))
     has_stream = any(isinstance(h, logging.StreamHandler) and not isinstance(h, JsonLinesHandler)
                      for h in root_logger.handlers)
@@ -258,11 +281,12 @@ def setup(service: str, *, root: Path | None = None) -> logging.Logger:
         stream.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s [%(name)s] %(message)s"))
         stream.setLevel(logging.INFO)
         root_logger.addHandler(stream)
+    handler = None
     try:
-        handler = JsonLinesHandler(service, root)
+        handler = JsonLinesHandler(service, target)
         handler.setLevel(level)
         root_logger.addHandler(handler)
-        crash = (root or logs_root()) / service / "crash.log"
+        crash = target / service / "crash.log"
         crash.parent.mkdir(parents=True, exist_ok=True)
         faulthandler.enable(open(crash, "a", encoding="utf-8"))  # noqa: SIM115 — lives for the process
     except OSError as exc:
@@ -286,7 +310,7 @@ def setup(service: str, *, root: Path | None = None) -> logging.Logger:
         interval = float(os.environ.get("BLPL_LOG_TRACE_INTERVAL", "30"))
         threading.Thread(target=_sampler, args=(interval,), name="blpl-host-sampler",
                          daemon=True).start()
-    _configured[service] = True
+    _configured[service] = (target, handler)
     logging.getLogger("blpl").info("diagnostic log: %s at %s", service, logging.getLevelName(level),
                                    extra={"event": "log_start"})
     return logging.getLogger("blpl")

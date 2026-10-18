@@ -3414,14 +3414,21 @@ def post_client_events(body: ClientEvents, request: Request) -> dict:
     because a page can fail before sign-in, and so bounded: 60 events a minute
     per client, every field truncated, and only these fields kept.
     """
-    client = request.client.host if request.client else "?"
+    # Behind nginx every request comes from nginx, so the browser's address is
+    # the one nginx forwards (X-Real-IP). Spoofable, so a total budget across
+    # all clients bounds what any one caller can write (Codex, PR #48).
+    client = (request.headers.get("x-real-ip")
+              or (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+              or (request.client.host if request.client else "?"))[:64]
     now = time.time()
+    total = [t for t in _client_budget.get("*", []) if now - t < 60]
     window = [t for t in _client_budget.get(client, []) if now - t < 60]
     kept = 0
     for ev in body.events[:20]:
-        if len(window) >= 60:
+        if len(window) >= 60 or len(total) >= 600:
             break
         window.append(now)
+        total.append(now)
         kept += 1
         level = _CLIENT_LEVELS.get(ev.level, logging.INFO)
         message = ev.message[:500]
@@ -3435,6 +3442,7 @@ def post_client_events(body: ClientEvents, request: Request) -> dict:
                             **({"duration_ms": ev.duration_ms} if ev.duration_ms is not None else {}),
                             "status": ev.level[:10]})
     _client_budget[client] = window
+    _client_budget["*"] = total
     return {"ok": True, "kept": kept}
 
 

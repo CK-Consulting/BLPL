@@ -110,3 +110,26 @@ def test_a_browser_error_lands_in_the_log_bounded(client):
     rec = [x for x in _backend_records() if x.get("event") == "client_error"][-1]
     assert rec["service"] == "frontend" and rec["msg"].endswith("x is undefined")
     assert rec["detail"] == "at f (a.js:1)"
+
+
+def test_setup_follows_a_moved_log_root(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    diaglog.setup("moving", root=a)
+    diaglog.setup("moving", root=b)
+    logging.getLogger("blpl.moving").info("after the move", extra={"event": "moved"})
+    found_b = [json.loads(x) for f in (b / "moving").glob("*.jsonl") for x in f.read_text().splitlines()]
+    assert any(r.get("event") == "moved" for r in found_b)
+    found_a = [json.loads(x) for f in (a / "moving").glob("*.jsonl") for x in f.read_text().splitlines()]
+    assert not any(r.get("event") == "moved" for r in found_a)
+
+
+def test_browser_budgets_are_per_forwarded_client(client):
+    import app.main as main
+
+    main._client_budget.clear()
+    ev = {"events": [{"kind": "error", "level": "error", "message": "m"}] * 20}
+    for _ in range(3):
+        client.post("/api/diag/client", json=ev, headers={"X-Real-IP": "10.0.0.1"})
+    # One browser used its 60; another, behind the same nginx, still has its own.
+    assert client.post("/api/diag/client", json=ev, headers={"X-Real-IP": "10.0.0.1"}).json()["kept"] == 0
+    assert client.post("/api/diag/client", json=ev, headers={"X-Real-IP": "10.0.0.2"}).json()["kept"] == 20
