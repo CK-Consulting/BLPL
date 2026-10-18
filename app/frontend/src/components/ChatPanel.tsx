@@ -288,6 +288,11 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   const loadConversation = useCallback(
     async (name: string) => {
       const convo = await fetchConversation(name);
+      // Moved on while it loaded (a new conversation started by "Ask chat
+      // agent about this" while the pane's first load was in flight): a late
+      // answer must not replace the open conversation's transcript with the
+      // one left behind (Codex, PR #50).
+      if (openRef.current !== name) return null;
       setMessages(convo.events);
       const active = convo.active_turn ?? null;
       // No turn running, and the last thing in the transcript is still the

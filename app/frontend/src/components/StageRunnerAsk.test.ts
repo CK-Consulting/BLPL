@@ -22,3 +22,13 @@ describe("board-qualified references", () => {
     expect(askReference("bom", null, null)).toBe("`.pipeline/bom.json`");
   });
 });
+
+describe("a past all-boards run", () => {
+  it("names each board's report, not one for a board called 'all boards'", async () => {
+    const { runHistoryReference } = await import("./RunHistory");
+    const ref = runHistoryReference("pipeline stage0→stage8 (all boards)", "run_9", 1);
+    expect(ref).toContain("each board's `.pipeline/validation_report.<board>.json`");
+    expect(ref).not.toContain("all boards.json");
+    expect(runHistoryReference("pipeline (core)", "run_8", 1)).toContain("`.pipeline/validation_report.core.json`");
+  });
+});

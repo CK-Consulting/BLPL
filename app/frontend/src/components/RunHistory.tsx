@@ -130,7 +130,7 @@ export function RunHistory({ projectId, reloadToken }: Props) {
             )}
             {!r.running && r.exit_code !== null && r.exit_code > 0 && (
               <AskChatButton
-                reference={`the ${r.kind} run ${r.id} (exit ${r.exit_code}; read its log with read_run_log) and \`${boardArtifact(".pipeline/validation_report.json", splitBoard(r.kind).board)}\``}
+                reference={runHistoryReference(r.kind, r.id, r.exit_code)}
                 label="Ask chat agent about this run"
               />
             )}
@@ -146,4 +146,17 @@ export function RunHistory({ projectId, reloadToken }: Props) {
       </ul>
     </div>
   );
+}
+
+
+/** What "Ask chat agent about this run" says about a past run. An all-boards
+ *  run wrote one report per board, so it names that pattern rather than a
+ *  report for a board called "all boards" (Codex, PR #50). */
+export function runHistoryReference(kind: string, id: string, exitCode: number | null): string {
+  const board = splitBoard(kind).board;
+  const report =
+    board === "all boards"
+      ? "each board's `.pipeline/validation_report.<board>.json`"
+      : `\`${boardArtifact(".pipeline/validation_report.json", board)}\``;
+  return `the ${kind} run ${id} (exit ${exitCode}; read its log with read_run_log) and ${report}`;
 }

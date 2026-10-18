@@ -68,4 +68,26 @@ describe("a file sent to the chat with 'Ask chat agent about this'", () => {
     await waitFor(() => expect(server.created).toEqual(["new1"]));
     await waitFor(() => expect(box).toHaveValue("About `board.md`: "));
   });
+
+  it("keeps the new conversation when the pane's first load answers late", async () => {
+    const server = fakeServer();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      // The first load's transcript fetch for c1 answers only after the new
+      // conversation exists.
+      if (/\/conversations\/c1$/.test(String(url))) {
+        await gate;
+        return json({ events: [{ role: "user", content: "old transcript" }], active_turn: null });
+      }
+      return server.fetchMock(url, init);
+    });
+    askChat("`board.md`", "new");
+    render(<ChatPanel projectId="p" onApplied={() => {}} />);
+    await waitFor(() => expect(server.created).toEqual(["new1"]));
+    await act(async () => release());
+    const box = await screen.findByRole("textbox");
+    await waitFor(() => expect(box).toHaveValue("About `board.md`: "));
+    expect(screen.queryByText("old transcript")).toBeNull();
+  });
 });

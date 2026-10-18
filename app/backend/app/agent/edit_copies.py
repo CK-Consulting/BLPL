@@ -155,9 +155,20 @@ def _net_ref(board: sexpr.Sexp, name: str) -> list:
 
 
 def _has_net(board: sexpr.Sexp, name: str) -> bool:
-    for node in sexpr.find_all(board, "net"):
-        if node and sexpr.unquote(str(node[-1])) == name:
+    """Whether the board has the net, in the net table or on anything.
+
+    Searched through the whole tree: a KiCad 10 board has no net table, and its
+    ``(net "NAME")`` nodes sit inside pads, tracks and zones, so a search of
+    the top level refused every net there (Codex, PR #50).
+    """
+    stack = [board]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, list) or not node:
+            continue
+        if node[0] == "net" and len(node) >= 2 and sexpr.unquote(str(node[-1])) == name:
             return True
+        stack.extend(child for child in node[1:] if isinstance(child, list))
     return False
 
 

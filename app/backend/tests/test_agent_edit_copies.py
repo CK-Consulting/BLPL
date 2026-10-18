@@ -213,3 +213,24 @@ def test_an_edit_copy_that_is_a_link_is_never_written_through(project):
     with pytest.raises(ToolDenied, match="not written through"):
         run(edit_copies._make_edit_copies(_ctx(project), {"overwrite": True}))
     assert (project / "board.md").read_text() == "design"
+
+
+KICAD10_BOARD = """(kicad_pcb (version 20250000) (generator "pcbnew")
+  (footprint "Device:R" (layer "F.Cu") (uuid "f-1") (at 10 10)
+    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "GND"))
+  )
+)
+"""
+
+
+def test_a_kicad10_board_names_nets_on_new_copper(tmp_path):
+    (tmp_path / "kicad").mkdir()
+    (tmp_path / "kicad" / "b.kicad_pcb").write_text(KICAD10_BOARD)
+    ctx = _ctx(tmp_path)
+    run(edit_copies._make_edit_copies(ctx, {}))
+    run(edit_copies._propose_kicad_edit(ctx, {
+        "path": "kicad/b_edit.kicad_pcb", "operations": [{"op": "add_via", "net": "GND", "x": 3, "y": 4}]}))
+    (proposal,) = ProposalStore(tmp_path).pending()
+    via = sexpr.find_all(sexpr.parse(proposal.new_content), "via")[0]
+    assert sexpr.find(via, "net") == ["net", '"GND"']
