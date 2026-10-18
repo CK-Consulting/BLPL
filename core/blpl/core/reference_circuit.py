@@ -59,11 +59,20 @@ def _staged(sch: Path, work: Path) -> Path:
     sheet still asking for "04 Debug & XIAO Header.kicad_sch" then finds
     nothing: kicad-cli exports an empty netlist without a word. Sheets are
     copied under the names the schematic asks for, matched loosely.
+
+    A sheet in a subfolder ("sub/child.kicad_sch") is looked for at that path
+    under the root's folder, and failing that by its file name alone when only
+    one file has it: an upload may have flattened the folders (Codex, PR #53).
     """
     src_dir = sch.parent
-    by_norm = {_norm(p.name): p for p in src_dir.glob("*.kicad_sch")}
+    found = [p for p in src_dir.rglob("*.kicad_sch") if p.is_file() and not p.is_symlink()]
+    by_rel = {_norm(p.relative_to(src_dir).as_posix()): p for p in found}
+    by_base: dict[str, list[Path]] = {}
+    for p in found:
+        by_base.setdefault(_norm(p.name), []).append(p)
     for p in list(src_dir.glob("*.kicad_sch")) + list(src_dir.glob("*.kicad_pro")):
         shutil.copy2(p, work / p.name)
+    root = work.resolve()
     pending = [work / sch.name]
     seen = set()
     while pending:
@@ -73,17 +82,22 @@ def _staged(sch: Path, work: Path) -> Path:
         seen.add(current)
         for wanted in _SHEETFILE.findall(current.read_text(encoding="utf-8", errors="replace")):
             # The name comes from an uploaded file. An absolute path or a ".."
-            # made ``work / wanted`` point anywhere the backend can write, and
+            # made the destination point anywhere the backend can write, and
             # the copy below would have put a schematic there (Codex, PR #53).
-            # Sheets are looked for beside the root and nowhere else.
+            # Sheets are looked for under the root's folder and nowhere else.
             if Path(wanted).is_absolute() or ".." in Path(wanted).parts or "\\" in wanted:
                 raise ReferenceError(f"{sch.name} names sheet {wanted!r} outside its own folder")
-            target = work / wanted
-            if not target.resolve().is_relative_to(work.resolve()):
+            # KiCad reads a sheet path relative to the sheet that names it.
+            target = current.parent / wanted
+            if not target.resolve().is_relative_to(root):
                 raise ReferenceError(f"{sch.name} names sheet {wanted!r} outside its own folder")
             target.parent.mkdir(parents=True, exist_ok=True)
             if not target.exists():
-                match = by_norm.get(_norm(wanted))
+                rel = target.resolve().relative_to(root).as_posix()
+                match = by_rel.get(_norm(rel))
+                if match is None:
+                    same_name = by_base.get(_norm(Path(wanted).name), [])
+                    match = same_name[0] if len(same_name) == 1 else None
                 if match is None:
                     raise ReferenceError(f"{sch.name} needs sheet {wanted!r}, which is not beside it")
                 shutil.copy2(match, target)
@@ -216,12 +230,16 @@ def connections(result: dict, source: str) -> list[dict]:
         # target net on a diode's pin 2 written as Pin 1 reversed its polarity
         # (Codex, PR #53).
         nets = p["pin_nets"]
-        first, second = sorted(nets, key=lambda q: (len(q), q))
-        rows.append({
-            "ref": p["ref"], "value": p["value"], "footprint": p["footprint"],
-            "pin1": nets[first], "pin2": nets[second],
-            "purpose": f"{where}; {p['value']} in {source}",
-        })
+        row = {"ref": p["ref"], "value": p["value"], "footprint": p["footprint"],
+               "terminals": sorted(nets.items(), key=lambda kv: (len(kv[0]), kv[0])),
+               "purpose": f"{where}; {p['value']} in {source}"}
+        # The compact Pin 1 / Pin 2 form only when those are the pins' names.
+        # A diode's A and K, sorted and written as 1 and 2, wired whichever
+        # terminal sorted first to Pin 1 (Codex, PR #53); those parts keep their
+        # names in the long Ref | Pin | Net form.
+        if set(nets) == {"1", "2"}:
+            row["pin1"], row["pin2"] = nets["1"], nets["2"]
+        rows.append(row)
 
     # Signal pins first: a pull-up touches SDA and VDD both, and belongs at
     # SDA, which is what it is for, not at whichever pin came first.
@@ -251,8 +269,15 @@ def markdown(result: dict, source: str) -> str:
                 lines.append(f"    - then {b['ref']} {b['value']} pin {b['pin']}; other end: "
                              f"{', '.join(b['other_nets']) or '-'}")
     rows = connections(result, source)
-    if rows:
+    compact = [r for r in rows if "pin1" in r]
+    named = [r for r in rows if "pin1" not in r]
+    if compact:
         lines += ["", "Candidate Connections rows (nets as the reference names them):", "",
                   "| Ref | Pin 1 | Pin 2 | Purpose |", "|---|---|---|---|"]
-        lines += [f"| {r['ref']} | {r['pin1']} | {r['pin2']} | {r['purpose']} |" for r in rows]
+        lines += [f"| {r['ref']} | {r['pin1']} | {r['pin2']} | {r['purpose']} |" for r in compact]
+    if named:
+        lines += ["", "Candidate rows for parts whose pins are not named 1 and 2 (keep these names):",
+                  "", "| Ref | Pin | Net | Purpose |", "|---|---|---|---|"]
+        lines += [f"| {r['ref']} | {pin} | {net} | {r['purpose']} |"
+                  for r in named for pin, net in r["terminals"]]
     return "\n".join(lines)

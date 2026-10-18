@@ -116,3 +116,25 @@ def test_rows_keep_the_parts_own_terminal_numbers():
 def test_one_pin_parts_make_no_two_column_rows():
     rows = {r["ref"] for r in rc.connections(rc.trace(_parts(), "U1"), "x")}
     assert "TP1" not in rows and {"C1", "R39", "C25"} <= rows
+
+
+def test_pins_not_named_1_and_2_keep_their_names():
+    parts = _parts()
+    parts["D2"] = rc.Part("D2", "BAT54", "SOD323", {"K": ("K", "/VDD"), "A": ("A", "GND")})
+    rows = {r["ref"]: r for r in rc.connections(rc.trace(parts, "U1"), "x")}
+    assert "pin1" not in rows["D2"] and dict(rows["D2"]["terminals"]) == {"A": "GND", "K": "VDD"}
+    md = rc.markdown(rc.trace(parts, "U1"), "x")
+    assert "| D2 | A | GND |" in md and "| D2 | K | VDD |" in md
+    assert "| D2 | VDD" not in md and "| D2 | GND" not in md
+
+
+@pytest.mark.parametrize("flattened", [False, True])
+def test_a_sheet_in_a_subfolder_is_staged_at_its_path(tmp_path, flattened):
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    (src / "root.kicad_sch").write_text('(kicad_sch (sheet (property "Sheetfile" "sub/child.kicad_sch")))')
+    (src if flattened else src / "sub").joinpath("child.kicad_sch").write_text("(kicad_sch child)")
+    work = tmp_path / "work"
+    work.mkdir()
+    rc._staged(src / "root.kicad_sch", work)
+    assert (work / "sub/child.kicad_sch").read_text() == "(kicad_sch child)"
