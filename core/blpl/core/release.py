@@ -192,7 +192,26 @@ def export_fabrication(pcb: Path, out_dir: Path, *, kicad_cli: str | None = None
     return steps
 
 
-def export_bom_csv(bom_json: Path, out_csv: Path) -> Step:
+def _not_bought(pipeline: Path) -> set[str]:
+    """Parts the HDM marks DNP or footprint-only (project.yaml assembly)."""
+    import yaml
+
+    hdm = pipeline / "hdm.yaml"
+    try:
+        doc = yaml.safe_load(hdm.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return set()
+    # A malformed HDM is the release validation's to refuse, with a reason;
+    # crashing here on a list root aborted the release before it got there
+    # (Codex, PR #52).
+    comps = doc.get("components") if isinstance(doc, dict) else None
+    if not isinstance(comps, dict):
+        return set()
+    return {ref for ref, c in comps.items()
+            if isinstance(c, dict) and c.get("assembly") in ("dnp", "footprint_only")}
+
+
+def export_bom_csv(bom_json: Path, out_csv: Path, exclude: "set[str] | None" = None) -> Step:
     """The BOM as a CSV, grouped by identical part.
 
     Grouped because that is what a fab quotes: ten identical 100nF capacitors
@@ -212,6 +231,8 @@ def export_bom_csv(bom_json: Path, out_csv: Path) -> Step:
         if not isinstance(row, dict):
             continue
         ref = str(row.get("refdes") or row.get("local_id") or "").strip()
+        if ref and ref in (exclude or set()):
+            continue  # DNP or footprint-only: not bought (project.yaml assembly)
         mpn = str(row.get("mpn") or row.get("part_hint") or "").strip()
         value = str(row.get("value") or row.get("description") or "").strip()
         footprint = str(row.get("footprint") or row.get("package_hint") or "").strip()
@@ -542,7 +563,7 @@ def build(
         bom_json = pipeline / "bom.json"
     bom_csv = out_dir / "bom" / f"{name}-bom.csv"
     if bom_json.is_file():
-        steps.append(export_bom_csv(bom_json, bom_csv))
+        steps.append(export_bom_csv(bom_json, bom_csv, exclude=_not_bought(pipeline)))
         steps.extend(export_assembly(bom_csv, out_dir, lcsc=lcsc))
     else:
         steps.append(Step("bom", False, "no BOM artifact in .pipeline — run stage1/stage2 first"))

@@ -896,6 +896,70 @@ def _rotated(w: float, h: float, dx: float, dy: float,
     )
 
 
+def audit(result: "Result", board: "tuple[float, float] | board_geometry.Board",
+          hints: dict | None = None, edge_margin: float = DEFAULT_EDGE_MARGIN) -> list[dict]:
+    """Every placed part checked against the board, pinned ones included.
+
+    The placer checks the spots it chooses; a part pinned by an x/y hint is
+    taken as given and was checked by nothing, though a comment here promised
+    Stage 8 would. A pinned part could sit across the board edge, inside the
+    edge margin, in a keepout or on another part, and the first anyone heard of
+    it was DRC. Findings, worst first: off_board, in_cutout, in_edge_margin,
+    in_keepout, overlap. A part that seeks an edge (a connector, an ``edge`` hint) may come
+    as close as the placer lets those, not the full margin.
+    """
+    hints = hints or {}
+    shaped = board if isinstance(board, board_geometry.Board) else None
+    if shaped is not None:
+        outline = shaped.outline.polygon
+        features = list(shaped.features)
+    else:
+        w, h = board
+        outline = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
+        features = []
+    pinned = {r for r, hint in hints.items() if isinstance(hint, dict) and "x" in hint and "y" in hint}
+    boxes = {ref: occupied_box(result, ref) for ref in sorted(result.placements)}
+    out: list[dict] = []
+
+    def finding(ref: str, problem: str, detail: str) -> None:
+        out.append({"ref": ref, "problem": problem, "pinned": ref in pinned, "detail": detail})
+
+    for ref, (x0, y0, x1, y1) in boxes.items():
+        if not board_geometry.box_inside((x0, y0, x1, y1), outline):
+            finding(ref, "off_board", "its courtyard crosses the board outline")
+            continue
+        box = (x0, y0, x1, y1)
+        # A cutout is board edge too: a part across one is off the board, and
+        # one beside it keeps the same margin as from the outline (Codex, PR #52).
+        cut = [f for f in features if f.kind == "cutout" and getattr(f, "anchor", None) != ref]
+        hit = next((f for f in cut if board_geometry.box_overlaps(box, f.shape.polygon)), None)
+        if hit is not None:
+            finding(ref, "in_cutout", f"its courtyard crosses cutout {hit.name or hit.where}")
+            continue
+        hint = hints.get(ref) if isinstance(hints.get(ref), dict) else {}
+        margin = 0.3 if (_wants_edge(ref) or hint.get("edge")) else edge_margin
+        nearest = min([board_geometry.box_clearance(box, outline)]
+                      + [board_geometry.box_clearance(box, f.shape.polygon) for f in cut])
+        if nearest < margin - 1e-6:
+            finding(ref, "in_edge_margin",
+                    f"{nearest:.2f} mm from the edge, inside the {margin:g} mm edge margin")
+        for f in features:
+            if not f.blocks_parts or getattr(f, "anchor", None) == ref:
+                continue
+            if f.kind == "keepout" and board_geometry.box_overlaps(box, f.shape.polygon):
+                finding(ref, "in_keepout", f"inside keepout {f.name or f.where}")
+    refs = list(boxes)
+    for i, a in enumerate(refs):
+        ax0, ay0, ax1, ay1 = boxes[a]
+        for b in refs[i + 1:]:
+            bx0, by0, bx1, by1 = boxes[b]
+            if ax0 < bx1 - 1e-6 and bx0 < ax1 - 1e-6 and ay0 < by1 - 1e-6 and by0 < ay1 - 1e-6:
+                finding(a, "overlap", f"its courtyard overlaps {b}'s")
+    order = {"off_board": 0, "in_cutout": 1, "in_edge_margin": 2, "in_keepout": 3, "overlap": 4}
+    out.sort(key=lambda f: (order[f["problem"]], f["ref"]))
+    return out
+
+
 def occupied_box(result: "Result", ref: str) -> tuple[float, float, float, float]:
     """(x_min, y_min, x_max, y_max) of what ``ref`` actually occupies.
 

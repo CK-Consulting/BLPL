@@ -666,6 +666,14 @@ def _cmd_stage5(args: argparse.Namespace) -> int:
         + (f", {len(synthesized)} test points (policy: {tp.get('policy', '?')})" if synthesized else "")
     )
     print(f"        wrote {out}")
+    audit = ((hdm.get("synthesis") or {}).get("placement") or {}).get("audit") or []
+    if audit:
+        print(f"  placement: {len(audit)} finding(s)")
+        for f in audit[:12]:
+            pin = " (pinned by a hint)" if f.get("pinned") else ""
+            print(f"    {f['ref']}{pin}: {f['problem']} — {f['detail']}")
+        if len(audit) > 12:
+            print(f"    … and {len(audit) - 12} more in hdm.yaml synthesis.placement.audit")
 
     # A placeholder that slips by unnoticed is how you fab a board with the wrong
     # part on it. Make it impossible to miss at the console, not just in a file.
