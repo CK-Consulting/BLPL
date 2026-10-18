@@ -118,6 +118,17 @@ ledgered as containing no design guidance. This level exists because users
 drop files in odd places; the level-2 name patterns are heuristics, and
 level 3 is what makes missing one survivable.
 
+**A vendor reference design in KiCad format is read, not eyeballed.** When
+level 1 or 2 turns up a `.kicad_sch` (a module's own schematic, an
+evaluation board), call `trace_reference_circuit` with the file and the part:
+it exports the netlist (hierarchy included, even when uploaded sheet files
+were renamed) and lists, pin by pin, every part on that pin's net with its
+value and where its other end goes, one step further through series parts,
+plus candidate Connections rows citing the file. It found the XIAO
+nRF54LM20A's 300 pF NFC tuning capacitors behind 0 Ω links, which had been
+traced by hand before. Map its net names to the design's own before using a
+row: they are the reference's names.
+
 Datasheet extraction tooling from the `datasheets` skill (kicad-happy) is
 available in most projects — use it for bulk PDF text extraction rather than
 re-inventing extraction, but verify its output against the pages when a
