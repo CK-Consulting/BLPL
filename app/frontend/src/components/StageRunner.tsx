@@ -6,7 +6,8 @@ import { RunLog } from "./RunLog";
 import { RunProgress } from "./RunProgress";
 import { Verbosity, classifyAll, progress } from "../runlog";
 import { expandRange } from "../stages";
-import { boardArtifact, withBoard } from "../board";
+import { withBoard } from "../board";
+import { runHistoryReference } from "./RunHistory";
 
 /**
  * Runs pipeline work and streams its log to the screen as it happens — either a
@@ -64,6 +65,10 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
   const [exitCode, setExitCode] = useState<number | null>(null);
   // The last run's id, kept after it ends, for "Ask chat agent about this".
   const [lastRun, setLastRun] = useState<string | null>(null);
+  // The run's kind as the server records it, fixed at launch: the board and
+  // scope it ran for, not whichever board is selected by the time someone asks
+  // about it (Codex, PR #50).
+  const [lastKind, setLastKind] = useState("");
   const [verbosity, setVerbosity] = useState<Verbosity>("normal");
   const [explain, setExplain] = useState(false);
   // What was actually launched, not what the controls currently say — changing
@@ -89,6 +94,9 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
     const where = allBoards ? " (all boards)" : board ? ` (${board})` : "";
     const label =
       (mode === "single" ? stage : mode === "panel" ? "review panel" : `${from}→${to}`) + where;
+    setLastKind(
+      (mode === "single" ? stage : mode === "panel" ? "review-panel" : `pipeline ${from}→${to}`) + where,
+    );
     // The stages this run will announce, so the progress panel knows what it is
     // waiting for before the first header arrives.
     setRanStages(
@@ -247,7 +255,7 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
       {!running && (exitCode !== null ? exitCode !== 0 : lines.some((l) => l.startsWith("error:"))) && (
         <p className="ask-chat-row">
           <AskChatButton
-            reference={runReference(lastRun, exitCode, lines, board)}
+            reference={runReference(lastRun, exitCode, lines, lastKind)}
             label="Ask chat agent about this run"
           />
         </p>
@@ -265,11 +273,9 @@ export function runReference(
   runId: string | null,
   exitCode: number | null,
   lines: string[],
-  board: string | null = null,
+  kind: string,
 ): string {
-  if (runId) {
-    return `the pipeline run ${runId}${exitCode !== null ? ` (exit ${exitCode})` : ""} (read its log with read_run_log) and \`${boardArtifact(".pipeline/validation_report.json", board)}\``;
-  }
+  if (runId) return runHistoryReference(kind, runId, exitCode);
   const error = (lines.find((l) => l.startsWith("error:")) ?? "").slice(0, 300);
   return `a pipeline run that failed to start: ${error}`;
 }

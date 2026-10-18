@@ -5,6 +5,7 @@ import { Verbosity, classifyAll } from "../runlog";
 import { RunLog } from "./RunLog";
 import { AskChatButton } from "./AskChatButton";
 import { boardArtifact } from "../board";
+import { PIPELINE_ORDER } from "../stages";
 
 /**
  * A run's kind carries the board it was about in a trailing parenthesis —
@@ -149,14 +150,31 @@ export function RunHistory({ projectId, reloadToken }: Props) {
 }
 
 
-/** What "Ask chat agent about this run" says about a past run. An all-boards
- *  run wrote one report per board, so it names that pattern rather than a
- *  report for a board called "all boards" (Codex, PR #50). */
+/** Whether a run of this kind ran Stage 7, the only stage that writes
+ *  validation_report: "stage7", or a pipeline range that reaches it. Naming the
+ *  report for a doctor or stage6 run sent the agent to a stale report from some
+ *  other run, or to one that does not exist (Codex, PR #50). */
+export function writesValidationReport(kind: string): boolean {
+  const k = splitBoard(kind).kind;
+  if (k === "stage7") return true;
+  const m = /^pipeline (\S+)→(\S+)$/.exec(k);
+  if (!m) return false;
+  const from = PIPELINE_ORDER.indexOf(m[1]);
+  const to = PIPELINE_ORDER.indexOf(m[2]);
+  const at = PIPELINE_ORDER.indexOf("stage7");
+  return from !== -1 && to !== -1 && from <= at && at <= to;
+}
+
+/** What "Ask chat agent about this run" says about a run. An all-boards run
+ *  wrote one report per board, so it names that pattern rather than a report
+ *  for a board called "all boards" (Codex, PR #50). */
 export function runHistoryReference(kind: string, id: string, exitCode: number | null): string {
+  const log = `the ${kind} run ${id} (exit ${exitCode}; read its log with read_run_log)`;
+  if (!writesValidationReport(kind)) return log;
   const board = splitBoard(kind).board;
   const report =
     board === "all boards"
       ? "each board's `.pipeline/validation_report.<board>.json`"
       : `\`${boardArtifact(".pipeline/validation_report.json", board)}\``;
-  return `the ${kind} run ${id} (exit ${exitCode}; read its log with read_run_log) and ${report}`;
+  return `${log} and ${report}`;
 }

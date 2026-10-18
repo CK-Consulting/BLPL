@@ -331,7 +331,12 @@ async def _run_checks_on_edit(ctx: ToolContext, args: dict) -> str:
         # sits in its own list, and was read as clean without it (Codex, PR #50).
         parity = data.get("schematic_parity") or []
     else:
-        violations = [v for s in data.get("sheets") or [] for v in s.get("violations") or []]
+        # Both places: KiCad 10 nests a schematic's violations under each sheet,
+        # and older reports (and the ones stage7 parses) keep them at the root.
+        # Reading only one reported "0 violations" on a failing schematic
+        # (Codex, PR #50).
+        violations = list(data.get("violations") or []) + [
+            v for s in data.get("sheets") or [] for v in s.get("violations") or []]
         unconnected = []
     by_type = Counter(f"{v.get('severity', '?')}:{v.get('type', '?')}" for v in violations)
     lines = [f"{check} on {_rel(ctx, target)}: {len(violations)} violation(s)"

@@ -266,3 +266,22 @@ def test_checks_run_off_the_event_loop(project, monkeypatch):
     monkeypatch.setattr(stage7_validate, "_run_drc", fake_drc)
     run(edit_copies._run_checks_on_edit(ctx, {"path": "kicad/b_edit.kicad_pcb"}))
     assert seen["thread"] is not threading.main_thread()
+
+
+def test_erc_violations_are_counted_at_the_root_and_on_every_sheet(project, monkeypatch):
+    import json as _json
+
+    from blpl.core import stage7_validate
+
+    (project / "kicad/b.kicad_sch").write_text("(kicad_sch)")
+    ctx = _ctx(project)
+    run(edit_copies._make_edit_copies(ctx, {}))
+    v = {"type": "pin_not_connected", "severity": "error", "description": "x", "items": []}
+
+    def fake_erc(sch, out):
+        out.write_text(_json.dumps({"violations": [v], "sheets": [{"violations": [v, v]}]}))
+        return {"ok": False, "skipped": False, "exit_code": 5}
+
+    monkeypatch.setattr(stage7_validate, "_run_erc", fake_erc)
+    out = run(edit_copies._run_checks_on_edit(ctx, {"path": "kicad/b_edit.kicad_sch"}))
+    assert out.startswith("ERC on kicad/b_edit.kicad_sch: 3 violation(s)")
