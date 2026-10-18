@@ -138,3 +138,31 @@ def test_a_sheet_in_a_subfolder_is_staged_at_its_path(tmp_path, flattened):
     work.mkdir()
     rc._staged(src / "root.kicad_sch", work)
     assert (work / "sub/child.kicad_sch").read_text() == "(kicad_sch child)"
+
+
+def test_a_linked_sheet_or_root_is_never_copied(tmp_path, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("victim") / "child.kicad_sch"
+    outside.write_text("(kicad_sch secret)")
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "root.kicad_sch").write_text('(kicad_sch (sheet (property "Sheetfile" "child.kicad_sch")))')
+    (src / "child.kicad_sch").symlink_to(outside)
+    work = tmp_path / "work"
+    work.mkdir()
+    with pytest.raises(rc.ReferenceError, match="not beside it"):
+        rc._staged(src / "root.kicad_sch", work)
+    assert not (work / "child.kicad_sch").exists()
+    (src / "link.kicad_sch").symlink_to(src / "root.kicad_sch")
+    with pytest.raises(rc.ReferenceError, match="link"):
+        rc._staged(src / "link.kicad_sch", tmp_path)
+
+
+def test_sheets_lists_every_file_the_export_reads(tmp_path):
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    (src / "root.kicad_sch").write_text('(kicad_sch (sheet (property "Sheetfile" "sub/a.kicad_sch")))')
+    (src / "sub" / "a.kicad_sch").write_text('(kicad_sch (sheet (property "Sheetfile" "b.kicad_sch")))')
+    (src / "sub" / "b.kicad_sch").write_text("(kicad_sch)")
+    (src / "unused.kicad_sch").write_text("(kicad_sch)")
+    assert [p.relative_to(src).as_posix() for p in rc.sheets(src / "root.kicad_sch")] == [
+        "root.kicad_sch", "sub/a.kicad_sch", "sub/b.kicad_sch"]
