@@ -91,3 +91,32 @@ describe("a file sent to the chat with 'Ask chat agent about this'", () => {
     expect(screen.queryByText("old transcript")).toBeNull();
   });
 });
+
+describe("an Ask made while the pane switches project", () => {
+  it("waits for the new project's load and keeps the conversation it creates", async () => {
+    const server = fakeServer();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const posts: string[] = [];
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      const path = String(url);
+      if ((init?.method ?? "GET") === "POST" && /\/conversations$/.test(path)) posts.push(path);
+      // Project q's conversation list answers late.
+      if (/\/projects\/q\/conversations$/.test(path) && (init?.method ?? "GET") === "GET") await gate;
+      return server.fetchMock(url, init);
+    });
+    const { rerender } = render(<ChatPanel projectId="p" onApplied={() => {}} />);
+    await waitFor(() => expect(server.fetchMock).toHaveBeenCalled());
+    await screen.findByRole("textbox");
+    rerender(<ChatPanel projectId="q" onApplied={() => {}} />);
+    await act(async () => askChat("`board.md`", "new"));
+    // Nothing is created while q's list is still outstanding...
+    expect(server.created).toEqual([]);
+    await act(async () => release());
+    // ...and once it answers, the Ask makes its conversation in q, and keeps it.
+    await waitFor(() => expect(server.created).toEqual(["new1"]));
+    expect(posts.every((u) => u.includes("/projects/q/"))).toBe(true);
+    const box = await screen.findByRole("textbox");
+    await waitFor(() => expect(box).toHaveValue("About `board.md`: "));
+  });
+});

@@ -21,6 +21,7 @@ fix this board. Three tools:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import tempfile
@@ -103,7 +104,10 @@ def _edit_file(ctx: ToolContext, name: str, suffixes: tuple[str, ...]) -> Path:
 
 async def _make_edit_copies(ctx: ToolContext, args: dict) -> str:
     overwrite = bool(args.get("overwrite"))
-    made, kept = [], []
+    # Every source and destination is checked before anything is copied: a
+    # refusal halfway through a batch had already replaced the earlier _edit
+    # files, discarding their edits on a call reported as failed (Codex, PR #50).
+    plan = []
     for src in _emitted(ctx, (str(args.get("board") or "").strip() or None)):
         # A link is refused, and the source is checked as well as the
         # destination: copying follows the link, and a kicad/ file pointing
@@ -118,6 +122,9 @@ async def _make_edit_copies(ctx: ToolContext, args: dict) -> str:
         if dst.is_symlink():
             raise ToolDenied(f"{dst.parent.name}/{dst.name} is a symbolic link; it is not written through")
         ctx.sandbox.check_write(dst)
+        plan.append((src, dst))
+    made, kept = [], []
+    for src, dst in plan:
         if dst.exists() and not overwrite:
             kept.append(_rel(ctx, dst))
             continue
@@ -297,11 +304,13 @@ async def _run_checks_on_edit(ctx: ToolContext, args: dict) -> str:
     target = _edit_file(ctx, str(args.get("path", "")), (".kicad_pcb", ".kicad_sch"))
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "report.json"
+        # kicad-cli runs for up to two minutes; on the event loop that stalls
+        # every request, stream and chat the worker serves (Codex, PR #50).
         if target.suffix == ".kicad_pcb":
-            result = stage7_validate._run_drc(target, out)
+            result = await asyncio.to_thread(stage7_validate._run_drc, target, out)
             check = "DRC"
         else:
-            result = stage7_validate._run_erc(target, out)
+            result = await asyncio.to_thread(stage7_validate._run_erc, target, out)
             check = "ERC"
         if result.get("skipped"):
             return f"{check} did not run: {result.get('reason')}"

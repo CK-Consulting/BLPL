@@ -234,3 +234,35 @@ def test_a_kicad10_board_names_nets_on_new_copper(tmp_path):
     (proposal,) = ProposalStore(tmp_path).pending()
     via = sexpr.find_all(sexpr.parse(proposal.new_content), "via")[0]
     assert sexpr.find(via, "net") == ["net", '"GND"']
+
+
+def test_a_refused_batch_copies_nothing_even_when_overwriting(project, tmp_path_factory):
+    # b sorts before z: a refusal at z used to come after b_edit was replaced.
+    ctx = _ctx(project)
+    run(edit_copies._make_edit_copies(ctx, {}))
+    (project / "kicad/b_edit.kicad_pcb").write_text(BOARD + ";edited")
+    outside = tmp_path_factory.mktemp("outside") / "z.kicad_pcb"
+    outside.write_text("(kicad_pcb)")
+    (project / "kicad/z.kicad_pcb").symlink_to(outside)
+    with pytest.raises(ToolDenied, match="symbolic link"):
+        run(edit_copies._make_edit_copies(ctx, {"overwrite": True}))
+    assert (project / "kicad/b_edit.kicad_pcb").read_text().endswith(";edited")
+
+
+def test_checks_run_off_the_event_loop(project, monkeypatch):
+    import threading
+
+    from blpl.core import stage7_validate
+
+    ctx = _ctx(project)
+    run(edit_copies._make_edit_copies(ctx, {}))
+    seen = {}
+
+    def fake_drc(pcb, out):
+        seen["thread"] = threading.current_thread()
+        out.write_text('{"violations": [], "unconnected_items": []}')
+        return {"ok": True, "skipped": False, "exit_code": 0}
+
+    monkeypatch.setattr(stage7_validate, "_run_drc", fake_drc)
+    run(edit_copies._run_checks_on_edit(ctx, {"path": "kicad/b_edit.kicad_pcb"}))
+    assert seen["thread"] is not threading.main_thread()

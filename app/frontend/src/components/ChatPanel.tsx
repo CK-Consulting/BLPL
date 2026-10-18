@@ -332,6 +332,13 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
   // project so the first message never needs a setup step.
   useEffect(() => {
     let cancelled = false;
+    // Nothing is open until this project's list answers. The old project's
+    // conversation stayed "open" meanwhile, so an Ask arriving in that window
+    // was answered at once, and the list landing afterwards replaced the
+    // conversation the Ask had just created (Codex, PR #50). With nothing
+    // open, an Ask waits and is taken when this load opens one.
+    openRef.current = null;
+    setFilename(null);
     setMessages([]);
     setLiveText("");
     setLiveTools([]);
