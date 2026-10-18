@@ -39,6 +39,7 @@ import urllib.request
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import logging
 from collections.abc import Sequence
@@ -62,7 +63,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 # Annotations are lazy (from __future__), which hid that these were never
 # imported — Session only ever appeared in a type hint. select() is a runtime
 # call and would have raised NameError on the first clashing project name.
@@ -3386,17 +3387,23 @@ def put_push_policy(
 
 
 class ClientEvent(BaseModel):
-    kind: str
-    level: str = "error"
-    message: str = ""
-    stack: str = ""
-    url: str = ""
+    kind: str = Field(max_length=40)
+    level: str = Field(default="error", max_length=10)
+    message: str = Field(default="", max_length=2000)
+    stack: str = Field(default="", max_length=8000)
+    url: str = Field(default="", max_length=2000)
     duration_ms: int | None = None
-    detail: str = ""
+    detail: str = Field(default="", max_length=8000)
 
 
 class ClientEvents(BaseModel):
-    events: list[ClientEvent]
+    events: list[ClientEvent] = Field(max_length=20)
+
+
+# Read before anything is parsed: nginx allows 100 MB API bodies, and an
+# unauthenticated caller must not make the backend build that (Codex, PR #48).
+_CLIENT_BODY_MAX = 64 * 1024
+_client_lock = threading.Lock()
 
 
 _client_log = logging.getLogger("blpl.frontend")
@@ -3406,7 +3413,7 @@ _client_budget: dict[str, list[float]] = {}
 
 
 @app.post("/api/diag/client")
-def post_client_events(body: ClientEvents, request: Request) -> dict:
+async def post_client_events(request: Request) -> dict:
     """Errors and timings from the browser, into the frontend's diagnostic log.
 
     Uncaught errors, rejected promises and page-load timings: what a user saw
@@ -3417,18 +3424,34 @@ def post_client_events(body: ClientEvents, request: Request) -> dict:
     # Behind nginx every request comes from nginx, so the browser's address is
     # the one nginx forwards (X-Real-IP). Spoofable, so a total budget across
     # all clients bounds what any one caller can write (Codex, PR #48).
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > _CLIENT_BODY_MAX:
+        raise HTTPException(status_code=413, detail="diagnostic report too large")
+    raw = b""
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > _CLIENT_BODY_MAX:
+            raise HTTPException(status_code=413, detail="diagnostic report too large")
+    try:
+        body = ClientEvents.model_validate_json(raw)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="not a diagnostic report")
     client = (request.headers.get("x-real-ip")
               or (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
               or (request.client.host if request.client else "?"))[:64]
-    now = time.time()
-    total = [t for t in _client_budget.get("*", []) if now - t < 60]
-    window = [t for t in _client_budget.get(client, []) if now - t < 60]
+    # Taken and updated under one lock: two requests reading the same budget
+    # and writing it back would each pass the check (Codex, PR #48).
+    with _client_lock:
+        now = time.time()
+        total = [t for t in _client_budget.get("*", []) if now - t < 60]
+        window = [t for t in _client_budget.get(client, []) if now - t < 60]
+        allowed = max(0, min(len(body.events), 60 - len(window), 600 - len(total)))
+        window += [now] * allowed
+        total += [now] * allowed
+        _client_budget[client] = window
+        _client_budget["*"] = total
     kept = 0
-    for ev in body.events[:20]:
-        if len(window) >= 60 or len(total) >= 600:
-            break
-        window.append(now)
-        total.append(now)
+    for ev in body.events[:allowed]:
         kept += 1
         level = _CLIENT_LEVELS.get(ev.level, logging.INFO)
         message = ev.message[:500]
@@ -3441,8 +3464,6 @@ def post_client_events(body: ClientEvents, request: Request) -> dict:
                             "detail": (ev.stack or ev.detail)[:2000], "client": client,
                             **({"duration_ms": ev.duration_ms} if ev.duration_ms is not None else {}),
                             "status": ev.level[:10]})
-    _client_budget[client] = window
-    _client_budget["*"] = total
     return {"ok": True, "kept": kept}
 
 

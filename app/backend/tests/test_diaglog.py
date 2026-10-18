@@ -133,3 +133,38 @@ def test_browser_budgets_are_per_forwarded_client(client):
     # One browser used its 60; another, behind the same nginx, still has its own.
     assert client.post("/api/diag/client", json=ev, headers={"X-Real-IP": "10.0.0.1"}).json()["kept"] == 0
     assert client.post("/api/diag/client", json=ev, headers={"X-Real-IP": "10.0.0.2"}).json()["kept"] == 20
+
+
+def test_only_genuine_stage_headers_are_timed(tmp_path):
+    log, _ = _handler(tmp_path)
+    t = diaglog.StageTimer(lambda s: None, run_id="r2", project="p", logger=log)
+    t.write("==> board core\n==> stage0-det\nok\n==> stage1\n==> stage1 returned 1; halting\n"
+            "==> stage6a skipped (--no-autoroute)\n")
+    t.close()
+    stages = [r["stage"] for r in _lines(tmp_path) if r.get("event") == "stage"]
+    assert stages == ["stage0-det", "stage1"]
+
+
+def test_an_oversized_or_overlong_report_is_refused_before_it_is_parsed(client):
+    big = "x" * (70 * 1024)
+    r = client.post("/api/diag/client", content=('{"events": [{"kind": "error", "message": "%s"}]}' % big),
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 413
+    many = {"events": [{"kind": "error"}] * 21}
+    assert client.post("/api/diag/client", json=many).status_code == 422
+
+
+def test_concurrent_reports_cannot_exceed_the_budget(client):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import app.main as main
+
+    main._client_budget.clear()
+    ev = {"events": [{"kind": "error", "message": "m"}] * 20}
+
+    def send(_):
+        return client.post("/api/diag/client", json=ev, headers={"X-Real-IP": "10.9.9.9"}).json()["kept"]
+
+    with ThreadPoolExecutor(8) as pool:
+        kept = sum(pool.map(send, range(16)))
+    assert kept == 60

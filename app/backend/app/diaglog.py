@@ -336,10 +336,17 @@ class StageTimer:
         self._buf += text
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            if line.startswith("==> "):
+            words = line[4:].split() if line.startswith("==> ") else []
+            # A stage header is the stage name alone. The pipeline also writes
+            # "==> stage7 returned 1; halting", "==> stage6a skipped (...)" and
+            # "==> board core": a failure, a skip and a board, none a stage to
+            # time (Codex, PR #48). A board closes the stage before it.
+            if len(words) == 1:
                 self._close()
-                self._stage = line[4:].split()[0] if line[4:].split() else line[4:]
+                self._stage = words[0]
                 self._since = time.monotonic()
+            elif words and words[0] == "board":
+                self._close()
         return self._write(text)
 
     def _close(self, status: str = "") -> None:
