@@ -20,16 +20,15 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
-from . import runqueue, serverkey
+from . import diaglog, runqueue, serverkey
 from .db import SessionFactory
 from .sandbox import idle as sandbox_idle
 from .sandbox import jobs as sandbox_jobs
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
-)
+diaglog.setup("worker")
 logger = logging.getLogger("blpl.worker")
 
 _DATA = Path(os.environ.get("BLPL_DATA_ROOT", "/app/data"))
@@ -232,7 +231,10 @@ class _Workspaces:
         _LOGS.mkdir(parents=True, exist_ok=True)
         path = runqueue.log_path(_LOGS, job.run_id)
         logger.info("running %s in workspace for %s (%s)", job.run_id, job.project_name,
-                    job.cmd[:3])
+                    job.cmd[:3], extra={"event": "run_start", "run_id": job.run_id,
+                                        "project": job.project_name})
+        started = time.monotonic()
+        exit_code: int | None = None
 
         async def poll() -> str:
             with SessionFactory() as session:
@@ -241,6 +243,7 @@ class _Workspaces:
             return status
 
         with path.open("w", encoding="utf-8", buffering=1) as log:
+            stages = diaglog.StageTimer(log.write, run_id=job.run_id, project=job.project_name)
             try:
                 # A container per run, .git read-only in it, and only the
                 # invoker's checkout. Never inside the workspace container:
@@ -266,18 +269,29 @@ class _Workspaces:
                         return await asyncio.to_thread(
                             storage.snapshot, job.project_name, label)
 
-                return await sandbox_jobs.run_job_in_container(
+                exit_code = await sandbox_jobs.run_job_in_container(
                     self.driver, self.cfg, project_name=job.project_name,
-                    run_id=job.run_id, cmd=job.cmd, env=job.env, log=log.write,
+                    run_id=job.run_id, cmd=job.cmd, env=job.env, log=stages.write,
                     poll=poll, mark=mark, poll_every=_HEARTBEAT_EVERY,
                     snapshot=snapshot, extra_inject=grant_env,
                     member=self._member(job),
                 )
+                return exit_code
             except Exception as exc:  # noqa: BLE001 - recorded in the run's own log
                 # The member reads this log, so say what failed in the
                 # workspace rather than leaving an empty log and a bare -1.
                 log.write(f"blpl: could not run in the project's workspace: {exc}\n")
+                logger.error("run %s could not run in the workspace: %s", job.run_id, exc,
+                             extra={"event": "run_error", "run_id": job.run_id,
+                                    "project": job.project_name})
                 raise
+            finally:
+                stages.close("" if exit_code == 0 else "failed")
+                ms = round((time.monotonic() - started) * 1000)
+                logger.info("run %s ended with %s after %d ms", job.run_id, exit_code, ms,
+                            extra={"event": "run_end", "run_id": job.run_id,
+                                   "project": job.project_name, "exit_code": exit_code,
+                                   "duration_ms": ms})
 
     async def sweep_if_due(self) -> None:
         now = asyncio.get_running_loop().time()

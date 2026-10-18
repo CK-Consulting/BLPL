@@ -39,6 +39,7 @@ import urllib.request
 import shutil
 import subprocess
 import sys
+import time
 import logging
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager, nullcontext
@@ -75,6 +76,7 @@ from . import (
     attachments,
     autopush,
     board_config,
+    diaglog,
     chat as chat_mod,
     clerk_auth,
     components,
@@ -125,6 +127,8 @@ from .references import (
 )
 
 logger = logging.getLogger("blpl.app")
+diaglog.setup("backend")
+_perf = logging.getLogger("blpl.perf")
 
 
 @asynccontextmanager
@@ -289,6 +293,33 @@ async def _seal_idle_workspaces() -> None:
 
 
 app = FastAPI(title="BLPL", version="0.5.0", lifespan=_lifespan)
+
+
+@app.middleware("http")
+async def _time_requests(request, call_next):
+    """Every API request at PERF: route, status and how long it took.
+
+    The route's template (``/api/projects/{project_id}/files/{name}``), not the
+    path, so the log groups by endpoint and carries no project file names. A
+    request slower than two seconds is also logged at INFO, where the default
+    file keeps it even when PERF is turned down.
+    """
+    start = time.monotonic()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        path = request.url.path
+        if path.startswith("/api/") and not path.endswith("/health"):
+            route = request.scope.get("route")
+            template = getattr(route, "path", None) or "(unmatched)"
+            ms = round((time.monotonic() - start) * 1000)
+            level = logging.INFO if ms >= 2000 else diaglog.PERF
+            _perf.log(level, "%s %s %d %d ms", request.method, template, status, ms, extra={
+                "event": "request", "method": request.method, "path": template,
+                "status": status, "duration_ms": ms})
 
 
 @app.middleware("http")
@@ -2514,6 +2545,8 @@ def open_project(
     _note_workspace_open(session, project_id, PROJECTS_ROOT / project_id, project_key, user.id)
     _drop_placeholder_identity(project_id)
     activity.record(session, project, user, activity.OPENED, "")
+    logger.info("opened %s", project.name, extra={
+        "event": "unseal", "project": project.name, "user_id": user.id})
     return {"ok": True, "already_open": False}
 
 
@@ -2623,7 +2656,8 @@ def _seal_workspace(session: Session, project_id: str, why: list[str] | None = N
     # The row and the wrapped key it carries exist only while the project is
     # unsealed. It is sealed now, so both go.
     openstate.forget(session, project_id)
-    logger.info("sealed %s (%d bytes)", project_id, size)
+    logger.info("sealed %s (%d bytes)", project_id, size, extra={
+        "event": "seal", "project": project_id, "bytes": size})
     return True
 
 
@@ -3349,6 +3383,59 @@ def put_push_policy(
         "push_policy": project.push_policy,
         "warning": autopush.MANUAL_WARNING if project.push_policy == "manual" else "",
     }
+
+
+class ClientEvent(BaseModel):
+    kind: str
+    level: str = "error"
+    message: str = ""
+    stack: str = ""
+    url: str = ""
+    duration_ms: int | None = None
+    detail: str = ""
+
+
+class ClientEvents(BaseModel):
+    events: list[ClientEvent]
+
+
+_client_log = logging.getLogger("blpl.frontend")
+_CLIENT_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "info": logging.INFO,
+                  "perf": diaglog.PERF, "debug": logging.DEBUG}
+_client_budget: dict[str, list[float]] = {}
+
+
+@app.post("/api/diag/client")
+def post_client_events(body: ClientEvents, request: Request) -> dict:
+    """Errors and timings from the browser, into the frontend's diagnostic log.
+
+    Uncaught errors, rejected promises and page-load timings: what a user saw
+    go wrong, which otherwise exists only in their console. Unauthenticated,
+    because a page can fail before sign-in, and so bounded: 60 events a minute
+    per client, every field truncated, and only these fields kept.
+    """
+    client = request.client.host if request.client else "?"
+    now = time.time()
+    window = [t for t in _client_budget.get(client, []) if now - t < 60]
+    kept = 0
+    for ev in body.events[:20]:
+        if len(window) >= 60:
+            break
+        window.append(now)
+        kept += 1
+        level = _CLIENT_LEVELS.get(ev.level, logging.INFO)
+        message = ev.message[:500]
+        # The stack goes in as detail, not as an exception: the browser's
+        # error is not this process's, and no host snapshot describes it.
+        _client_log.log(min(level, logging.WARNING) if level >= logging.ERROR else level,
+                        "%s: %s", ev.kind[:40], message, extra={
+                            "event": "client_" + ev.kind[:40], "service": "frontend",
+                            "kind": ev.kind[:40], "url": ev.url[:300],
+                            "detail": (ev.stack or ev.detail)[:2000], "client": client,
+                            **({"duration_ms": ev.duration_ms} if ev.duration_ms is not None else {}),
+                            "status": ev.level[:10]})
+    _client_budget[client] = window
+    return {"ok": True, "kept": kept}
 
 
 class CommitBody(BaseModel):
