@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import { del, readSSE } from "../api";
+import { del } from "../api";
+import { streamRun } from "../runStream";
 import { RunLog } from "./RunLog";
 import { RunProgress } from "./RunProgress";
 import { Verbosity, classifyAll, progress } from "../runlog";
@@ -101,14 +102,19 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
     );
 
     try {
-      await readSSE(url, { method: "POST" }, (event, payload) => {
-        if (event === "start") runIdRef.current = payload.run_id ?? null;
-        else if (event === "log") setLines((l) => [...l, payload.line]);
-        else if (event === "done") {
-          setExitCode(payload.exit_code);
-          onFinished(label, payload.exit_code);
-        }
-      });
+      await streamRun(
+        url,
+        { method: "POST" },
+        (event, payload) => {
+          if (event === "start") runIdRef.current = payload.run_id ?? null;
+          else if (event === "log") setLines((l) => [...l, payload.line]);
+          else if (event === "done") {
+            setExitCode(payload.exit_code);
+            onFinished(label, payload.exit_code);
+          }
+        },
+        { onNote: (line) => setLines((l) => [...l, line]) },
+      );
     } catch (e) {
       // A 400 is usually the "no usable LLM provider" guard; a 409 means the
       // project already has a run in flight (see Run history to reattach).
