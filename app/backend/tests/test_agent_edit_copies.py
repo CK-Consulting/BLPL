@@ -177,6 +177,7 @@ def test_schematic_parity_findings_are_reported(project, monkeypatch):
     run(edit_copies._make_edit_copies(ctx, {}))
 
     def fake_drc(pcb, out):
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(_json.dumps({"violations": [], "unconnected_items": [], "schematic_parity": [
             {"type": "missing_footprint", "description": "Missing footprint R5", "items": []}]}))
         return {"ok": False, "skipped": False, "exit_code": 5}
@@ -260,6 +261,7 @@ def test_checks_run_off_the_event_loop(project, monkeypatch):
 
     def fake_drc(pcb, out):
         seen["thread"] = threading.current_thread()
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text('{"violations": [], "unconnected_items": []}')
         return {"ok": True, "skipped": False, "exit_code": 0}
 
@@ -279,6 +281,7 @@ def test_erc_violations_are_counted_at_the_root_and_on_every_sheet(project, monk
     v = {"type": "pin_not_connected", "severity": "error", "description": "x", "items": []}
 
     def fake_erc(sch, out):
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(_json.dumps({"violations": [v], "sheets": [{"violations": [v, v]}]}))
         return {"ok": False, "skipped": False, "exit_code": 5}
 
