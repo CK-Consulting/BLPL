@@ -515,6 +515,31 @@ def _same_net_runs(
     return runs
 
 
+def _hanging_wire(
+    net: str,
+    tip: tuple[float, float, int],
+    taps: list[tuple[float, float]],
+    end: float | None,
+) -> list[sexpr.Node]:
+    """The wire from an anchor pin out through the parts that hang off it.
+
+    One straight run along the pin's row: a segment to each part's pin in
+    turn, a junction where a part joins mid-wire, and a global label at its
+    far end. The label is drawn even when every pin on the net is on this
+    wire: it joins the net to the rest of the sheet when there is more, and
+    names it when there is not — an unlabelled net is ``Net-(U2-Pin_6)`` to
+    KiCad, and no longer matches the board.
+    """
+    tx, ty, d = tip
+    points = [(tx, ty)] + sorted(taps, key=lambda t: abs(t[0] - tx) + abs(t[1] - ty))
+    if end is not None:
+        points.append((end, ty) if d in (0, 180) else (tx, end))
+    out: list[sexpr.Node] = [_wire(*a, *b) for a, b in zip(points, points[1:]) if a != b]
+    out += [_junction(*pt) for pt in points[1:-1]]
+    out.append(_global_label(net, *points[-1], d))
+    return out
+
+
 def _frame(block: "sch_layout.Block") -> list[sexpr.Node]:
     """The dashed box and title that make a block read as one circuit."""
     return [
@@ -807,6 +832,20 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
     for block in blocks:
         node.extend(_frame(block))
 
+    # Parts hung off an anchor's pin: those pins, and the hung parts' own pins
+    # on the wire, are drawn by the wire below rather than ending in a label.
+    on_wire: set[tuple[str, int, str]] = set()
+    taps: dict[tuple[str, int, str], list[tuple[float, float]]] = {}
+    for p in placed:
+        if p.hook:
+            a_ref, a_unit, a_pin, own = p.hook
+            on_wire.add((a_ref, a_unit, a_pin))
+            on_wire.add((p.ref, p.unit, own))
+            pin = next(q for q in p.pins if q["number"] == own)
+            tx, ty, _ = sch_layout.pin_tip(pin, p.x, p.y, p.rot)
+            taps.setdefault((a_ref, a_unit, a_pin), []).append((tx, ty))
+    wire_ends = {k: v for b in blocks for k, v in b.wire_ends.items()}
+
     for p in placed:
         comp = components[p.ref]
         lib_id = comp["lib_symbol"]
@@ -863,8 +902,14 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
         # An IC's pins sit one pitch apart, and a power symbol's name is wider
         # than that: on an anchor every pin ends in a label. Power symbols are
         # for the small parts, where each stands clear of the next.
-        for run in _same_net_runs(p.pins, tips, nets):
+        ended = {k: v for k, v in nets.items() if (p.ref, p.unit, k) not in on_wire}
+        for run in _same_net_runs(p.pins, tips, ended):
             node.extend(run_terminals(run, labels_only=len(p.pins) > 2))
+        for pin, (tx, ty, d) in zip(p.pins, tips):
+            key = (p.ref, p.unit, pin["number"])
+            if key in taps:
+                node.extend(_hanging_wire(nets[pin["number"]], (tx, ty, d), taps[key],
+                                          wire_ends.get(key)))
 
     # PWR_FLAGs, in a row under the blocks: each declares its rail driven, and
     # carries the rail's own power symbol (or label) so it joins that net.

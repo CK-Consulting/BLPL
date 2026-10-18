@@ -146,11 +146,10 @@ def test_nets_are_named_as_the_board_names_them():
     node = sexpr.parse(sch.emit(_hdm(*parts), symbols_root=_SYMBOLS_ROOT))
     assert not sexpr.find_all(node, "label")
     assert "SDA" in {sexpr.unquote(g[1]) for g in sexpr.find_all(node, "global_label")}
-    # The capacitor's rail is a power symbol whose Value is the net; U1's
-    # VDD_3V3 pin, on an IC, is a label of the same name.
-    powers = [s for s in sexpr.find_all(node, "symbol") if sexpr.unquote(sexpr.find(s, "lib_id")[1]) == "power:VCC"]
-    values = {sexpr.unquote(next(pr for pr in sexpr.find_all(s, "property") if sexpr.unquote(pr[1]) == "Value")[2]) for s in powers}
-    assert values == {"VDD_3V3"}
+    # The capacitor hangs off U1's VDD_3V3 pin on a wire, and the wire is
+    # named by a global label of the same name, not left to KiCad's
+    # Net-(U1-Pin_n).
+    assert "VDD_3V3" in {sexpr.unquote(g[1]) for g in sexpr.find_all(node, "global_label")}
 
 
 def test_adjacent_pins_on_one_net_share_one_terminal_and_never_jump_a_pin():
@@ -191,3 +190,52 @@ def test_the_sheet_reaches_past_the_last_row_of_power_flags(n):
     first = 100.33
     last = max(sch._flag_y(first, i) for i in range(n))
     assert sch._sheet_height(first, n) >= last + 10 * 1.27
+
+
+def _wires(node):
+    out = []
+    for w in sexpr.find_all(node, "wire"):
+        pts = sexpr.find(w, "pts")
+        out.append(tuple((float(p[1]), float(p[2])) for p in pts[1:]))
+    return out
+
+
+def _connected(wires, a, b):
+    """Whether points a and b are joined by a chain of wires end to end."""
+    seen, todo = {a}, [a]
+    while todo:
+        p = todo.pop()
+        for w in wires:
+            if p in w:
+                for q in w:
+                    if q not in seen:
+                        seen.add(q)
+                        todo.append(q)
+    return b in seen
+
+
+def test_a_part_serving_an_ic_pin_is_wired_to_it():
+    # The schematic used to show parts and labels and not one wire between
+    # them. A pull-up on SDA and a decoupling capacitor on VDD_3V3 now hang
+    # off a wire drawn from U1's pin, and the wire still ends in a label that
+    # names the net.
+    parts = [U_A,
+             _part("R1", "Device:R", {"1": "SDA", "2": "VDD_3V3"}, 11, 11, "4.7kΩ"),
+             _part("C1", "Device:C", {"1": "VDD_3V3", "2": "GND"}, 11, 11, "100nF")]
+    hdm = _hdm(*parts)
+    blocks, placed, pin_nets, _ = _layout(hdm)
+    node = sexpr.parse(sch.emit(hdm, symbols_root=_SYMBOLS_ROOT))
+    wires = _wires(node)
+    by_ref = {p.ref: p for p in placed}
+
+    def tip(ref, number):
+        p = by_ref[ref]
+        pin = next(q for q in p.pins if q["number"] == number)
+        return pin_tip(pin, p.x, p.y, p.rot)[:2]
+
+    assert by_ref["R1"].hook and by_ref["R1"].hook[2] == "3"
+    assert _connected(wires, tip("U1", "3"), tip("R1", "1"))
+    assert by_ref["C1"].hook and by_ref["C1"].hook[2] == "1"
+    assert _connected(wires, tip("U1", "1"), tip("C1", "1"))
+    names = {sexpr.unquote(g[1]) for g in sexpr.find_all(node, "global_label")}
+    assert {"SDA", "VDD_3V3"} <= names
