@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..emitter import sexpr
+from . import plane_fanout
 from .release import find_kicad_cli
 
 # Freerouting is a jar, not a package. Its location is a deploy decision, so it
@@ -228,6 +229,11 @@ def _import_ses(python: str, pcb: Path, ses: Path) -> subprocess.CompletedProces
         f"ok = pcbnew.ImportSpecctraSES(b, {str(ses)!r})\n"
         "if not ok:\n"
         "    sys.exit(1)\n"
+        # Fill the planes around the tracks just imported, so the board that
+        # is published is the one KiCad would show and DRC would check.
+        "zones = b.Zones()\n"
+        "if len(zones):\n"
+        "    pcbnew.ZONE_FILLER(b).Fill(zones)\n"
         f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
     )
     return _pcbnew(python, code)
@@ -398,6 +404,39 @@ def carry_forward(pcb: Path, work: Path, python: str) -> RouteResult | None:
     )
 
 
+def plane_layers(pcb: Path) -> dict[str, list[str]]:
+    """Net -> the copper layers a zone fills with it: the board's planes.
+
+    Outer layers included: project.yaml may declare a plane on F.Cu or B.Cu,
+    and a B.Cu ground needs vias from front-side pads like any inner plane
+    (Codex, PR #49).
+    """
+    try:
+        board = sexpr.parse(Path(pcb).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — no planes is the safe answer
+        return {}
+    out: dict[str, set[str]] = {}
+    for zone in sexpr.find_all(board, "zone"):
+        if sexpr.find(zone, "keepout") is not None:
+            continue
+        layer = sexpr.find(zone, "layer")
+        name = sexpr.find(zone, "net_name")
+        if name is None:
+            net = sexpr.find(zone, "net")
+            name = net if net is not None and len(net) > 1 and not str(net[1]).isdigit() else None
+        if layer is None or name is None:
+            continue
+        net = sexpr.unquote(str(name[-1]))
+        if net:
+            out.setdefault(net, set()).add(sexpr.unquote(str(layer[1])))
+    return {n: sorted(v) for n, v in sorted(out.items())}
+
+
+def plane_nets(pcb: Path) -> list[str]:
+    """The nets that have a plane."""
+    return sorted(plane_layers(pcb))
+
+
 def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> RouteResult:
     """Route a board in bulk. The PCB is modified in place on success.
 
@@ -418,6 +457,16 @@ def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> Route
     python = find_pcbnew_python()
     jar = find_jar()
     base = RouteResult(False, "", pcb=str(pcb), passes=passes, jar=str(jar))
+
+    # Planes first: Freerouting does not drop vias to them, so their pads get
+    # theirs here, locked, before it sees the board (plane_fanout.py).
+    planes_on = plane_layers(pcb)
+    if planes_on:
+        fan = _pcbnew(python, plane_fanout.script(str(pcb), planes_on))
+        fanout = plane_fanout.parse(fan.stdout)
+        if fan.returncode != 0:
+            fanout["error"] = _msg(fan)
+        base.extra["plane_fanout"] = {"nets": sorted(planes_on), **fanout}
 
     export = _export_dsn(python, pcb, dsn)
     if export.returncode != 0 or not dsn.is_file():

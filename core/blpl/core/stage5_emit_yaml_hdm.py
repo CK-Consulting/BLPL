@@ -21,7 +21,7 @@ from typing import Any
 
 import yaml
 
-from . import board_geometry, impedance, placement, schema, symbol_resolution
+from . import board_geometry, impedance, placement, planes, schema, symbol_resolution
 from . import stage4_synthesize_nets
 
 
@@ -836,6 +836,15 @@ def emit(
     # from this and not from boundaries, because an anchored cutout has a
     # position only after the placement above.
     hdm["board_geometry"] = geometry_record
+    # Ground and supply planes on the inner layers (core/planes.py): without
+    # them a four-layer board routes its rails as traces, and most of what
+    # the router leaves open is ground and power.
+    try:
+        plane_list = planes.resolve(project_config, nets_out, geometry_record["outline"]["polygon"])
+    except planes.PlaneConfigError as exc:
+        raise InvalidProjectConfigError(f"project.yaml: {exc}") from exc
+    if plane_list:
+        geometry_record["planes"] = plane_list
     if class_notes:
         hdm["synthesis"]["net_class_notes"] = class_notes
     hdm["synthesis"]["controlled_impedance"] = {

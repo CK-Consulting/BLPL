@@ -249,6 +249,29 @@ def footprint_box(
     return (w, h, dx, dy)
 
 
+def footprint_pads(ref: str, roots: Sequence[Path | str]) -> dict[str, tuple[float, float]]:
+    """Each pad's centre relative to the footprint origin, by pad number.
+
+    A pad that appears more than once (a thermal pad split into a grid, a
+    connector's two mounting tabs) is the mean of its copies.
+    """
+    try:
+        fp = loaders.load_footprint(ref, roots)
+    except Exception:
+        return {}
+    acc: dict[str, list[tuple[float, float]]] = {}
+    for node in fp:
+        if not (isinstance(node, list) and node and node[0] == "pad" and len(node) > 1):
+            continue
+        at = sexpr.find(node, "at")
+        try:
+            acc.setdefault(sexpr.unquote(str(node[1])), []).append((float(at[1]), float(at[2])))
+        except (TypeError, IndexError, ValueError):
+            continue
+    return {n: (sum(p[0] for p in ps) / len(ps), sum(p[1] for p in ps) / len(ps))
+            for n, ps in acc.items() if n}
+
+
 def _pad_box(pad) -> list[tuple[float, float]] | None:
     """A pad's two opposite corners, from its centre and its size.
 
@@ -564,6 +587,39 @@ def place(
             board_geometry.place_anchored(shaped, ref, p.x, p.y, p.rot, p.side)
 
     offsets: dict[str, tuple[float, float]] = {}
+    pads: dict[str, dict[str, tuple[float, float]]] = {}
+    pad_net: dict[tuple[str, str], str] = {}
+    for name, net in (nets or {}).items():
+        for pad in net.get("pads") or []:
+            if pad and len(pad) > 1:
+                pad_net[(str(pad[0]), str(pad[1]))] = str(name)
+    nets_of: dict[str, set[str]] = {}
+    for (r, _), n in pad_net.items():
+        nets_of.setdefault(r, set()).add(n)
+
+    def pull(ref: str, other: str) -> tuple[float, float]:
+        """The point on a placed part that ``ref`` should sit beside.
+
+        The pads of ``other`` on a net the two share — a signal before a rail,
+        ground never, since every part is on it. Aiming at the other part's
+        origin put the Wio-LR2021's damping resistors in a heap beside the
+        module's corner, where its origin is, 10-20 mm from the pins they
+        serve, packed too tightly for the router to get a trace out of them.
+        Without a shared pad, the middle of the part.
+        """
+        p = result.placements[other]
+        shared = (nets_of.get(ref, set()) & nets_of.get(other, set()))
+        shared = {n for n in shared if not re.match(r"^(A|D|P)?GND\w*$|^VSS\w*$", n, re.I)}
+        signals = {n for n in shared if not _is_global(n)}
+        chosen = signals or shared
+        pts = [pads.get(other, {}).get(num) for (r, num), n in pad_net.items()
+               if r == other and n in chosen]
+        pts = [q for q in pts if q is not None]
+        if pts:
+            return (p.x + sum(q[0] for q in pts) / len(pts), p.y + sum(q[1] for q in pts) / len(pts))
+        dx, dy = offsets.get(other, (0.0, 0.0))
+        return (p.x + dx, p.y + dy)
+
     for ref, comp in components.items():
         fp = comp.get("footprint")
         box = footprint_box(fp, footprint_roots) if fp else None
@@ -590,6 +646,10 @@ def place(
             ext = (rw, rh)
             offsets[ref] = (rdx, rdy)
         result.extents[ref] = ext
+        # Where its pads are, turned the same way: a part is drawn towards the
+        # pad it connects to, not towards its neighbour's origin.
+        local = footprint_pads(fp, footprint_roots) if fp else {}
+        pads[ref] = {n: rotated_geometry(0.0, 0.0, x, y, rot, side)[2:] for n, (x, y) in local.items()}
     result.offsets = offsets
 
     step = max(0.5, min(min(e) for e in result.extents.values()) / 2) if result.extents else 1.0
@@ -626,10 +686,10 @@ def place(
     for ref in majors:
         w, h = result.extents[ref]
         edge = wants_edge(ref)
-        anchors = [result.placements[n] for n in adj[ref] if n in result.placements]
+        anchors = [pull(ref, n) for n in adj[ref] if n in result.placements]
         if anchors:
-            tx = sum(a.x for a in anchors) / len(anchors)
-            ty = sum(a.y for a in anchors) / len(anchors)
+            tx = sum(a[0] for a in anchors) / len(anchors)
+            ty = sum(a[1] for a in anchors) / len(anchors)
         else:
             tx, ty = bw / 2, bh / 2
         spot = next(
@@ -712,19 +772,19 @@ def place(
         w, h = result.extents[ref]
         edge = wants_edge(ref)
 
-        anchors = [result.placements[n] for n in adj[ref] if n in result.placements]
+        anchors = [pull(ref, n) for n in adj[ref] if n in result.placements]
         declared = _declared_anchor(ref, hints, refs)
         if declared and declared in result.placements:
             # A hint outranks the netlist; a name only speaks when the netlist
             # is silent, which for a bypass capacitor is always.
             if (hints.get(ref) or {}).get("near"):
-                anchors = [result.placements[declared]]
+                anchors = [pull(ref, declared)]
             elif not anchors:
-                anchors = [result.placements[declared]]
+                anchors = [pull(ref, declared)]
                 result.notes.append(f"{ref}: anchored to {declared} by name")
         if anchors:
-            tx = sum(a.x for a in anchors) / len(anchors)
-            ty = sum(a.y for a in anchors) / len(anchors)
+            tx = sum(a[0] for a in anchors) / len(anchors)
+            ty = sum(a[1] for a in anchors) / len(anchors)
         else:
             tx, ty = bw / 2, bh / 2
 

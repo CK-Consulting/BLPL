@@ -153,7 +153,29 @@
             }
           }
         },
-        "copper_zones": { "type": "array" }
+        "copper_zones": {
+          "description": "Copper planes. A list of {net, layer} (optionally polygon) is exactly those planes; 'none' is none; 'auto' or an empty list gives a board of four or more layers ground on In1.Cu and its busiest supply rail on In2.Cu (core/planes.py).",
+          "oneOf": [
+            { "enum": ["auto", "none"] },
+            {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["net", "layer"],
+                "additionalProperties": false,
+                "properties": {
+                  "net": { "type": "string", "minLength": 1 },
+                  "layer": { "type": "string", "pattern": "^(F|B|In[0-9]+)\\.Cu$" },
+                  "polygon": {
+                    "type": "array",
+                    "minItems": 3,
+                    "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+                  }
+                }
+              }
+            }
+          ]
+        }
       }
     },
     "test_points": {
