@@ -313,8 +313,12 @@ _TOWARD_WIRE = {(0, 1): 90, (0, -1): 270, (1, 0): 180, (-1, 0): 0}
 
 
 def _hanging_rotation(pins: list[dict], hook_pin: str, facing: int = 90) -> int | None:
-    """The rotation that points ``hook_pin`` at its wire (``facing``), the rest away."""
-    best = None
+    """The rotation that points ``hook_pin`` at its wire (``facing``), the rest away.
+
+    None when there is none: a part whose other pin cannot point away (a
+    two-way connector, both pins on one side) would put that pin on the wire
+    too, and short its net to the wire's. It stays in the ordinary layout.
+    """
     away = (facing + 180) % 360
     for rot in (0, 90, 180, 270):
         tips = {p["number"]: pin_tip(p, 0, 0, rot)[2] for p in pins}
@@ -322,8 +326,7 @@ def _hanging_rotation(pins: list[dict], hook_pin: str, facing: int = 90) -> int 
             continue
         if all(d == away for n, d in tips.items() if n != hook_pin):
             return rot
-        best = rot if best is None else best
-    return best
+    return None
 
 
 def choose_hooks(

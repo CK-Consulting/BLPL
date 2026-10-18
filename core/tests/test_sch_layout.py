@@ -263,3 +263,12 @@ def test_a_long_chain_folds_into_rows_instead_of_one_long_wire():
         rows.setdefault(y, []).append(x)
     assert len(rows) == 3
     assert max(len(r) for r in rows.values()) <= sch_layout.ROW_PARTS
+
+
+def test_a_part_whose_pins_share_a_side_is_never_hung_on_a_wire():
+    # Both pins of a two-way connector point the same way: hung by one, the
+    # other would land on the wire too and short its net to the wire's.
+    j = _part("J1", "Connector_Generic:Conn_01x02", {"1": "SDA", "2": "IRQ"}, 11, 11)
+    hdm = _hdm(U_A, j)
+    blocks, placed, pin_nets, _ = _layout(hdm)
+    assert next(p for p in placed if p.ref == "J1").hook is None
