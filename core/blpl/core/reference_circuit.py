@@ -72,7 +72,16 @@ def _staged(sch: Path, work: Path) -> Path:
             continue
         seen.add(current)
         for wanted in _SHEETFILE.findall(current.read_text(encoding="utf-8", errors="replace")):
+            # The name comes from an uploaded file. An absolute path or a ".."
+            # made ``work / wanted`` point anywhere the backend can write, and
+            # the copy below would have put a schematic there (Codex, PR #53).
+            # Sheets are looked for beside the root and nowhere else.
+            if Path(wanted).is_absolute() or ".." in Path(wanted).parts or "\\" in wanted:
+                raise ReferenceError(f"{sch.name} names sheet {wanted!r} outside its own folder")
             target = work / wanted
+            if not target.resolve().is_relative_to(work.resolve()):
+                raise ReferenceError(f"{sch.name} names sheet {wanted!r} outside its own folder")
+            target.parent.mkdir(parents=True, exist_ok=True)
             if not target.exists():
                 match = by_norm.get(_norm(wanted))
                 if match is None:
@@ -165,6 +174,7 @@ def trace(parts: dict[str, Part], target: str, *, hops: int = 1) -> dict:
             others = sorted({n for q, (_f, n) in p.pins.items() if q != pin})
             out.append({"ref": ref, "value": p.value, "footprint": p.footprint, "pin": pin,
                         "pins": len(p.pins), "other_nets": [_short_net(n) for n in others],
+                        "pin_nets": {q: _short_net(n) for q, (_f, n) in p.pins.items()},
                         "_other_full": others})
         return out
 
@@ -190,19 +200,26 @@ def trace(parts: dict[str, Part], target: str, *, hops: int = 1) -> dict:
 def connections(result: dict, source: str) -> list[dict]:
     """Rows in the shape of a design's Connections table, citing the reference.
 
-    Only the small parts (two pins or fewer) around the target: those are the
-    circuit a design copies. Pin 1 and Pin 2 are the nets as the reference
-    names them; the design must map them to its own net names.
+    Only the two-pin parts around the target: those are the circuit a design
+    copies. Pin 1 and Pin 2 are the part's own terminals, with the nets as the
+    reference names them; the design must map them to its own net names.
     """
     rows, seen = [], set()
 
-    def add(p: dict, near_net: str, where: str) -> None:
-        if p["pins"] > 2 or p["ref"] in seen:
+    def add(p: dict, where: str) -> None:
+        # Two pins exactly: a one-pin part (a test point, an antenna feed) has
+        # no Pin 2, and Stage 0 refuses a row with a blank pin (Codex, PR #53).
+        if p["pins"] != 2 or p["ref"] in seen:
             return
         seen.add(p["ref"])
+        # Pin 1 and Pin 2 are the part's own terminals, not near and far: the
+        # target net on a diode's pin 2 written as Pin 1 reversed its polarity
+        # (Codex, PR #53).
+        nets = p["pin_nets"]
+        first, second = sorted(nets, key=lambda q: (len(q), q))
         rows.append({
             "ref": p["ref"], "value": p["value"], "footprint": p["footprint"],
-            "pin1": near_net, "pin2": p["other_nets"][0] if p["other_nets"] else "",
+            "pin1": nets[first], "pin2": nets[second],
             "purpose": f"{where}; {p['value']} in {source}",
         })
 
@@ -211,12 +228,11 @@ def connections(result: dict, source: str) -> list[dict]:
     for pin in sorted(result["pins"], key=lambda p: p["kind"] != "signal"):
         at = f"at {result['target']} pin {pin['pin']}" + (f" ({pin['function']})" if pin["function"] else "")
         for p in pin["parts"]:
-            add(p, pin["net"], at)
+            add(p, at)
             # The parts one step out: a series resistor's far side is part of
             # the same circuit (the XIAO's NFC tuning capacitors sit behind 0 Ω).
             for b in p.get("beyond", []):
-                far = p["other_nets"][0] if p["other_nets"] else ""
-                add(b, far, f"{at}, beyond {p['ref']}")
+                add(b, f"{at}, beyond {p['ref']}")
     return rows
 
 

@@ -90,3 +90,29 @@ def test_a_real_schematic_is_traced_through_kicad_cli(tmp_path):
     rows = {r["ref"]: r for r in rc.connections(rc.trace(rc.load(path), "MOD"), "ref.kicad_sch")}
     assert rows["C1"]["pin1"] == "VDD" and rows["C1"]["pin2"] == "GND"
     assert rows["R1"]["pin1"] == "SDA" and rows["R1"]["pin2"] == "VDD"
+
+
+@pytest.mark.parametrize("wanted", ["/tmp/evil.kicad_sch", "../evil.kicad_sch", "a/../../evil.kicad_sch"])
+def test_a_sheet_named_outside_the_staging_folder_is_refused(tmp_path, wanted):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "root.kicad_sch").write_text(f'(kicad_sch (sheet (property "Sheetfile" "{wanted}")))')
+    (src / "evil.kicad_sch").write_text("(kicad_sch)")
+    work = tmp_path / "work"
+    work.mkdir()
+    with pytest.raises(rc.ReferenceError, match="outside its own folder"):
+        rc._staged(src / "root.kicad_sch", work)
+    assert not (tmp_path / "evil.kicad_sch").exists()
+
+
+def test_rows_keep_the_parts_own_terminal_numbers():
+    parts = _parts()
+    # The diode meets the target on its pin 2 (cathode).
+    parts["D1"] = rc.Part("D1", "BAT54", "SOD323", {"1": ("A", "GND"), "2": ("K", "/VDD")})
+    rows = {r["ref"]: r for r in rc.connections(rc.trace(parts, "U1"), "x")}
+    assert (rows["D1"]["pin1"], rows["D1"]["pin2"]) == ("GND", "VDD")
+
+
+def test_one_pin_parts_make_no_two_column_rows():
+    rows = {r["ref"] for r in rc.connections(rc.trace(_parts(), "U1"), "x")}
+    assert "TP1" not in rows and {"C1", "R39", "C25"} <= rows
