@@ -52,7 +52,17 @@ def _norm(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", name.lower())
 
 
-def _staged(sch: Path, work: Path) -> Path:
+def _source(p: Path, src_dir: Path) -> bool:
+    """A real file under the root's folder: not a link, not resolving out of it.
+
+    Copying follows a link, so a sheet that was a link to another project's
+    schematic would have been exported and its contents disclosed (Codex, PR
+    #53).
+    """
+    return p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(src_dir.resolve())
+
+
+def _staged(sch: Path, work: Path, sources: list[Path] | None = None) -> Path:
     """The schematic and its sheets in ``work``, under the names it expects.
 
     An upload renames files (spaces and '&' become underscores), and a root
@@ -63,15 +73,25 @@ def _staged(sch: Path, work: Path) -> Path:
     A sheet in a subfolder ("sub/child.kicad_sch") is looked for at that path
     under the root's folder, and failing that by its file name alone when only
     one file has it: an upload may have flattened the folders (Codex, PR #53).
+
+    Only the root, its project file and the sheets the hierarchy names are
+    copied, never a link. ``sources`` receives the file each staged sheet came
+    from, root first: everything whose contents the export reads.
     """
     src_dir = sch.parent
-    found = [p for p in src_dir.rglob("*.kicad_sch") if p.is_file() and not p.is_symlink()]
+    if not _source(sch, src_dir):
+        raise ReferenceError(f"{sch.name} is a link or not a file; it is not read")
+    found = [p for p in src_dir.rglob("*.kicad_sch") if _source(p, src_dir)]
     by_rel = {_norm(p.relative_to(src_dir).as_posix()): p for p in found}
     by_base: dict[str, list[Path]] = {}
     for p in found:
         by_base.setdefault(_norm(p.name), []).append(p)
-    for p in list(src_dir.glob("*.kicad_sch")) + list(src_dir.glob("*.kicad_pro")):
-        shutil.copy2(p, work / p.name)
+    shutil.copy2(sch, work / sch.name)
+    for pro in src_dir.glob("*.kicad_pro"):
+        if _source(pro, src_dir):
+            shutil.copy2(pro, work / pro.name)
+    if sources is not None:
+        sources.append(sch)
     root = work.resolve()
     pending = [work / sch.name]
     seen = set()
@@ -91,7 +111,6 @@ def _staged(sch: Path, work: Path) -> Path:
             target = current.parent / wanted
             if not target.resolve().is_relative_to(root):
                 raise ReferenceError(f"{sch.name} names sheet {wanted!r} outside its own folder")
-            target.parent.mkdir(parents=True, exist_ok=True)
             if not target.exists():
                 rel = target.resolve().relative_to(root).as_posix()
                 match = by_rel.get(_norm(rel))
@@ -100,9 +119,25 @@ def _staged(sch: Path, work: Path) -> Path:
                     match = same_name[0] if len(same_name) == 1 else None
                 if match is None:
                     raise ReferenceError(f"{sch.name} needs sheet {wanted!r}, which is not beside it")
+                target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(match, target)
+                if sources is not None and match not in sources:
+                    sources.append(match)
             pending.append(target)
     return work / sch.name
+
+
+def sheets(sch: Path) -> list[Path]:
+    """Every file the export of ``sch`` would read, root first.
+
+    For the caller to check each of them (an ignore list, where it came from)
+    before anything read from them is shown: a trusted root can name an
+    untrusted sheet (Codex, PR #53).
+    """
+    out: list[Path] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        _staged(Path(sch), Path(tmp), out)
+    return out
 
 
 def load(sch: Path, *, kicad_cli: str = "kicad-cli", timeout: int = 600) -> dict[str, Part]:
