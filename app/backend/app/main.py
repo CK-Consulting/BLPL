@@ -7290,6 +7290,41 @@ async def _stream_run(run_id: str, logs_dir: Path):
         waited += 0.25
 
 
+# How long a run's stream may go without sending anything before it sends a
+# keepalive. Freerouting prints nothing for minutes at a time, and a proxy or
+# tunnel with a 60-100 s idle timeout dropped the connection mid-autoroute: the
+# browser reported a network error and the panel gave up on a run that was
+# still going. Same interval as the chat stream's heartbeat.
+RUN_HEARTBEAT_SECONDS = chat_mod.HEARTBEAT_SECONDS
+
+
+async def _with_heartbeat(events, interval: float):
+    """Pass ``events`` through, yielding ("ping", None) whenever it is quiet.
+
+    The pending read is waited on, never cancelled, so a keepalive cannot cut
+    a log line in half or lose one.
+    """
+    it = events.__aiter__()
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(it.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                yield "ping", None
+                continue
+            try:
+                item = pending.result()
+            except StopAsyncIteration:
+                return
+            pending = None
+            yield item
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+
 def _run_stream_response(run_id: str) -> StreamingResponse:
     """SSE over a run's log.
 
@@ -7300,7 +7335,14 @@ def _run_stream_response(run_id: str) -> StreamingResponse:
     """
 
     async def events():
-        async for ev, payload in _stream_run(run_id, _DATA / "runs"):
+        async for ev, payload in _with_heartbeat(
+            _stream_run(run_id, _DATA / "runs"), RUN_HEARTBEAT_SECONDS
+        ):
+            if ev == "ping":
+                # An SSE comment: keeps every proxy on the path awake, and a
+                # client that does not know about it ignores it.
+                yield ": ping\n\n"
+                continue
             yield f"event: {ev}\ndata: {json.dumps(payload)}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")
