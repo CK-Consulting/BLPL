@@ -313,31 +313,60 @@ def _seal_idle_registry() -> list[str]:
 app = FastAPI(title="BLPL", version="0.5.0", lifespan=_lifespan)
 
 
-@app.middleware("http")
-async def _time_requests(request, call_next):
-    """Every API request at PERF: route, status and how long it took.
+class _TimeRequests:
+    """Every API request at PERF: route, status, time to first byte and to the end.
+
+    Plain ASGI rather than ``@app.middleware("http")``: there ``call_next``
+    returns when the response *starts*, so a file download or an event stream
+    was timed to its headers and looked instant (Codex, PR #48). Timed here to
+    the final body chunk, or to the disconnect if the client goes first.
 
     The route's template (``/api/projects/{project_id}/files/{name}``), not the
     path, so the log groups by endpoint and carries no project file names. A
-    request slower than two seconds is also logged at INFO, where the default
-    file keeps it even when PERF is turned down.
+    request slower than two seconds is also logged at INFO.
     """
-    start = time.monotonic()
-    status = 500
-    try:
-        response = await call_next(request)
-        status = response.status_code
-        return response
-    finally:
-        path = request.url.path
-        if path.startswith("/api/") and not path.endswith("/health"):
-            route = request.scope.get("route")
-            template = getattr(route, "path", None) or "(unmatched)"
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "") if scope.get("type") == "http" else ""
+        if not path.startswith("/api/") or path.endswith("/health"):
+            return await self.app(scope, receive, send)
+        start = time.monotonic()
+        state = {"status": 500, "ttfb": None, "done": False}
+
+        def record(note: str = "") -> None:
+            if state["done"]:
+                return
+            state["done"] = True
             ms = round((time.monotonic() - start) * 1000)
+            template = getattr(scope.get("route"), "path", None) or "(unmatched)"
             level = logging.INFO if ms >= 2000 else diaglog.PERF
-            _perf.log(level, "%s %s %d %d ms", request.method, template, status, ms, extra={
-                "event": "request", "method": request.method, "path": template,
-                "status": status, "duration_ms": ms})
+            extra = {"event": "request", "method": scope.get("method", ""), "path": template,
+                     "status": state["status"], "duration_ms": ms}
+            if state["ttfb"] is not None:
+                extra["ttfb_ms"] = state["ttfb"]
+            if note:
+                extra["detail"] = note
+            _perf.log(level, "%s %s %d %d ms", extra["method"], template, state["status"], ms,
+                      extra=extra)
+
+        async def timed_send(message):
+            if message["type"] == "http.response.start":
+                state["status"] = message.get("status", 500)
+                state["ttfb"] = round((time.monotonic() - start) * 1000)
+            await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body"):
+                record()
+
+        try:
+            await self.app(scope, receive, timed_send)
+        finally:
+            record("ended before the body was complete")
+
+
+app.add_middleware(_TimeRequests)
 
 
 @app.middleware("http")

@@ -168,3 +168,37 @@ def test_concurrent_reports_cannot_exceed_the_budget(client):
     with ThreadPoolExecutor(8) as pool:
         kept = sum(pool.map(send, range(16)))
     assert kept == 60
+
+
+def test_a_streamed_response_is_timed_to_its_last_chunk():
+    import asyncio
+
+    import app.main as main
+
+    async def slow_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await asyncio.sleep(0.2)
+        await send({"type": "http.response.body", "body": b"a", "more_body": True})
+        await asyncio.sleep(0.2)
+        await send({"type": "http.response.body", "body": b"b", "more_body": False})
+
+    sent = []
+
+    async def send(m):
+        sent.append(m)
+
+    async def receive():
+        return {"type": "http.request"}
+
+    captured = []
+    handler = logging.Handler()
+    handler.emit = captured.append
+    perf = logging.getLogger("blpl.perf")
+    perf.addHandler(handler)
+    try:
+        asyncio.run(main._TimeRequests(slow_app)({"type": "http", "path": "/api/x", "method": "GET"},
+                                                 receive, send))
+    finally:
+        perf.removeHandler(handler)
+    rec = [r for r in captured if getattr(r, "event", "") == "request"][-1]
+    assert rec.duration_ms >= 380 and rec.ttfb_ms < 150

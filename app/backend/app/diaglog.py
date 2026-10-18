@@ -57,7 +57,7 @@ logging.addLevelName(PERF, "PERF")
 FIELDS = (
     "event", "project", "run_id", "user_id", "stage", "status", "method", "path",
     "duration_ms", "exit_code", "reason", "idle_min", "limit_min", "bytes", "kind",
-    "url", "client", "detail", "count",
+    "url", "client", "detail", "count", "ttfb_ms",
 )
 
 _DEFAULT_LEVEL = "PERF"

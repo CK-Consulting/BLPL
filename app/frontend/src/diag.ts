@@ -57,7 +57,11 @@ export function installDiagnostics(): void {
     report({ kind: "rejection", level: "error", message: r?.message || String(e.reason), stack: r?.stack || "" });
   });
   window.addEventListener("load", () => {
-    const nav = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
-    if (nav) report({ kind: "page_load", level: "perf", duration_ms: Math.round(nav.duration) });
+    // After the load event has finished: duration is measured to loadEventEnd,
+    // which is set only once this handler returns, so read here it was 0.
+    setTimeout(() => {
+      const nav = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
+      if (nav && nav.duration > 0) report({ kind: "page_load", level: "perf", duration_ms: Math.round(nav.duration) });
+    }, 0);
   });
 }
