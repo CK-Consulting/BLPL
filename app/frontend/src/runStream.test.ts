@@ -58,4 +58,19 @@ describe("streamRun", () => {
     ).rejects.toThrow(/Run history/);
     expect(urls).toEqual(["/api/x", "/api/runs/r2/stream", "/api/runs/r2/stream"]);
   });
+
+  it("reattaches when the stream ends cleanly before the run is done", async () => {
+    // A proxy closing the response cleanly: the reader resolves, no error, no done.
+    const { read, urls } = scripted([
+      { events: [["start", { run_id: "r3" }], log("a")] },
+      { events: [["start", { run_id: "r3" }], log("a"), log("b"), ["done", { exit_code: 0 }]] },
+    ]);
+    const got: Ev[] = [];
+    await streamRun("/api/x", { method: "POST" }, (e, p) => got.push([e, p]), {
+      onNote: () => {}, delayMs: () => 0, read,
+    });
+    expect(urls).toEqual(["/api/x", "/api/runs/r3/stream"]);
+    expect(got.filter(([e]) => e === "log").map(([, p]) => p.line)).toEqual(["a", "b"]);
+    expect(got.at(-1)).toEqual(["done", { exit_code: 0 }]);
+  });
 });

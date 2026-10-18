@@ -51,26 +51,31 @@ export async function streamRun(
     };
   };
 
+  let last: Error;
   try {
     await read(url, init, deliver(0));
-    return;
+    // A proxy that closes the response cleanly ends the reader without an
+    // error and without a done event: that is a drop too, not a finish.
+    if (finished || runId === null) return;
+    last = new Error("the stream ended before the run did");
   } catch (e) {
     if (e instanceof ApiError || runId === null || finished) throw e;
-    let last = e as Error;
-    for (let n = 1; n <= attempts; n++) {
-      onNote(`connection lost (${last.message}); the run is still going on the server. Reattaching (${n}/${attempts})…`);
-      await new Promise((r) => setTimeout(r, delayMs(n)));
-      try {
-        await read(`/api/runs/${runId}/stream`, { method: "GET" }, deliver(shown));
-        if (finished) return;
-      } catch (e2) {
-        if (e2 instanceof ApiError) throw e2;
-        last = e2 as Error;
-      }
-    }
-    throw new Error(
-      `${last.message}. Could not reattach after ${attempts} tries; the run may still be going. ` +
-        `Run history shows it, and can stop it.`,
-    );
+    last = e as Error;
   }
+  for (let n = 1; n <= attempts; n++) {
+    onNote(`connection lost (${last.message}); the run is still going on the server. Reattaching (${n}/${attempts})…`);
+    await new Promise((r) => setTimeout(r, delayMs(n)));
+    try {
+      await read(`/api/runs/${runId}/stream`, { method: "GET" }, deliver(shown));
+      if (finished) return;
+      last = new Error("the stream ended before the run did");
+    } catch (e2) {
+      if (e2 instanceof ApiError) throw e2;
+      last = e2 as Error;
+    }
+  }
+  throw new Error(
+    `${last.message}. Could not reattach after ${attempts} tries; the run may still be going. ` +
+      `Run history shows it, and can stop it.`,
+  );
 }
