@@ -125,6 +125,9 @@ def _run_drc(pcb_path: Path, output_json: Path) -> dict:
         cli,
         "pcb",
         "drc",
+        # Planes are written unfilled; checked unfilled, every pad on one
+        # reads as unconnected and the plane as if it were not there.
+        "--refill-zones",
         "--format",
         "json",
         "--severity-all",
@@ -262,6 +265,28 @@ def run(
         drc_result = {"ok": True, "skipped": True, "reason": "no .kicad_pcb supplied"}
 
     cov_result = _coverage_summary(cov)
+
+    # Why each connection is still open (triage.py), for the reviewer and the
+    # chat agent: the DRC report says only that it is.
+    drc_json = _p("drc_report")
+    if not drc_result.get("skipped") and drc_json.exists():
+        from . import autoroute, triage
+
+        try:
+            drc_data = json.loads(drc_json.read_text(encoding="utf-8"))
+            route_report = _p("autoroute_report")
+            fanout = {}
+            if route_report.exists():
+                fanout = json.loads(route_report.read_text(encoding="utf-8")).get("plane_fanout") or {}
+            open_conn = triage.classify(
+                drc_data,
+                plane_nets=autoroute.plane_nets(pcb_path) if pcb_path else [],
+                fanout_failed=fanout.get("failed"),
+            )
+            _p("open_connections").write_text(json.dumps(open_conn, indent=2) + "\n", encoding="utf-8")
+            drc_result["open_connections"] = {"count": open_conn["count"], "by_kind": open_conn["by_kind"]}
+        except (OSError, ValueError) as exc:
+            drc_result["open_connections"] = {"error": str(exc)}
 
     overall_ok = klc_result["ok"] and erc_result["ok"] and drc_result["ok"] and cov_result["ok"]
     report = {

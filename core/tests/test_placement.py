@@ -10,6 +10,8 @@ properties worth pinning are the ones whose absence was invisible.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from blpl.core import placement
@@ -455,3 +457,33 @@ def test_a_pad_turned_just_off_square_is_measured_at_its_real_angle():
     c, s = math.cos(math.radians(89.6)), math.sin(math.radians(89.6))
     assert round(x1 - x0, 4) == round(0.6 * c + 1.6 * s, 4) > 1.6
     assert round(y1 - y0, 4) == round(0.6 * s + 1.6 * c, 4) > 0.6
+
+
+def test_a_part_is_aimed_at_the_pad_it_serves_not_its_neighbours_origin(tmp_path):
+    # The Wio-LR2021's origin sits outside its body, so damping resistors aimed
+    # at it piled up beside the module's corner, 10-20 mm from the pins they
+    # serve, too tight for the router to get a trace out of them.
+    lib = tmp_path / "t.pretty"
+    lib.mkdir()
+    (lib / "MOD.kicad_mod").write_text("""(footprint "MOD"
+  (fp_rect (start 10 -4) (end 30 4) (layer "F.CrtYd"))
+  (pad "1" smd rect (at 12 -3) (size 1 1) (layers "F.Cu"))
+  (pad "2" smd rect (at 28 3) (size 1 1) (layers "F.Cu"))
+)
+""")
+    (lib / "R.kicad_mod").write_text("""(footprint "R"
+  (fp_rect (start -1 -0.5) (end 1 0.5) (layer "F.CrtYd"))
+  (pad "1" smd rect (at -0.5 0) (size 0.5 0.6) (layers "F.Cu"))
+  (pad "2" smd rect (at 0.5 0) (size 0.5 0.6) (layers "F.Cu"))
+)
+""")
+    comps = {"U2": {"footprint": "t:MOD"}, "R1": {"footprint": "t:R"}}
+    nets = {"SIG": {"pads": [["U2", "2"], ["R1", "1"]]},
+            "OTHER": {"pads": [["R1", "2"]]}}
+    r = placement.place(comps, nets, (80, 40), footprint_roots=[tmp_path],
+                        hints={"U2": {"x": 20, "y": 20}, "R1": {"near": "U2"}})
+    p = r.placements["R1"]
+    pad2 = (20 + 28, 20 + 3)
+    origin = (20, 20)
+    assert math.hypot(p.x - pad2[0], p.y - pad2[1]) < math.hypot(p.x - origin[0], p.y - origin[1])
+    assert math.hypot(p.x - pad2[0], p.y - pad2[1]) < 6

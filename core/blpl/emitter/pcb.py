@@ -928,6 +928,36 @@ def _keepout_zone(feature: dict, copper: set[str]) -> sexpr.Node:
     return node
 
 
+def _plane_zone(plane: dict, ordinals: dict[str, int], copper: set[str]) -> sexpr.Node:
+    """A copper zone filling ``plane["layer"]`` with ``plane["net"]``.
+
+    Unfilled as written: KiCad fills it on load in the editor, Stage 7's DRC
+    refills before checking, and the autoroute refills after importing the
+    route. Pads join it with thermal reliefs, the default a hand-drawn plane
+    gets in the editor.
+    """
+    layer, net = plane["layer"], plane["net"]
+    if layer not in copper:
+        raise ValueError(f"plane for {net} is on {layer}, which this board does not have "
+                         f"(copper: {', '.join(sorted(copper))})")
+    if net not in ordinals:
+        raise ValueError(f"plane for {net}: no such net on this board")
+    return [
+        "zone",
+        ["net", str(ordinals[net])],
+        ["net_name", sexpr.quote(net)],
+        ["layer", sexpr.quote(layer)],
+        ["uuid", _new_uuid()],
+        ["name", sexpr.quote(f"{net} plane")],
+        ["hatch", "edge", "0.5"],
+        ["connect_pads", ["clearance", "0.3"]],
+        ["min_thickness", "0.25"],
+        ["filled_areas_thickness", "no"],
+        ["fill", "yes", ["thermal_gap", "0.5"], ["thermal_bridge_width", "0.5"]],
+        ["polygon", ["pts", *[["xy", *_sheet(p)] for p in plane["polygon"]]]],
+    ]
+
+
 def _board_shapes(hdm: dict, width: float, height: float) -> list[sexpr.Node]:
     """Outline, cutouts and keepouts — from Stage 5's resolved geometry when present.
 
@@ -1012,7 +1042,14 @@ def build(
     """Build a v10 (kicad_pcb ...) node from an HDM dict."""
     project = hdm.get("project", {})
     thickness = project.get("stackup", {}).get("thickness", 1.6)
-    copper_rows = _copper_layers(_copper_count(project))
+    # A layer a plane fills is a power layer, not a signal one: so marked,
+    # KiCad's Specctra export tells Freerouting it is a plane, and the router
+    # reaches it with a via instead of routing other nets across it. Left as
+    # signal, the planes reached Freerouting and changed nothing: 28 open
+    # connections against 26 without them on verdacor-ear-tag.
+    plane_layers = {p["layer"] for p in ((hdm.get("board_geometry") or {}).get("planes") or [])}
+    copper_rows = [[n, name, "power" if name.strip('"') in plane_layers else kind]
+                   for n, name, kind in _copper_layers(_copper_count(project))]
     components = hdm.get("components", {})
     nets = hdm.get("nets", {})
 
@@ -1037,6 +1074,10 @@ def build(
     # Board outline and cutouts on Edge.Cuts; keepouts as rule areas.
     for shape in _board_shapes(hdm, width, height):
         node.append(shape)
+    # Planes: a copper zone per plane, on its net (see core/planes.py).
+    ordinals = {name: ordinal for ordinal, name in net_table}
+    for plane in ((hdm.get("board_geometry") or {}).get("planes") or []):
+        node.append(_plane_zone(plane, ordinals, _copper_names(hdm)))
 
     # Footprints. A component with no loadable footprint used to be skipped
     # silently, so the board simply came out missing parts and nothing said so.
