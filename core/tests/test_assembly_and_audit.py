@@ -97,3 +97,37 @@ def test_a_librarys_dnp_flag_never_unfits_a_part():
     tp = ["footprint", '"TestPoint"', ["attr", "exclude_from_pos_files", "exclude_from_bom"]]
     pcb._set_assembly(tp, None)  # a library's BOM exclusion for a test pad stands
     assert sexpr.find(tp, "attr")[1:] == ["exclude_from_pos_files", "exclude_from_bom"]
+
+
+def test_cutouts_are_board_edge_to_the_audit():
+    board = board_geometry.from_config({
+        "project": {"name": "t", "dimensions": [40, 30]},
+        "boundaries": {"cutouts": [{"shape": "rect", "center": [20, 15], "size": [6, 6]}]},
+    })
+    result = _result({
+        "U1": (20, 15, 2, 2),     # in the cutout (17..23)
+        "C1": (23.9, 15, 1, 1),   # 0.4 mm beside it
+        "R1": (8, 8, 1, 1),       # fine
+    })
+    found = {(f["ref"], f["problem"]) for f in placement.audit(result, board, {}, 1.0)}
+    assert found == {("U1", "in_cutout"), ("C1", "in_edge_margin")}
+
+
+def test_edge_clearance_is_measured_along_the_courtyard_not_at_its_corners():
+    # A V notch whose tip comes to 0.5 mm of the middle of U1's top edge,
+    # while every corner of U1 is several millimetres clear.
+    board = board_geometry.from_config({
+        "project": {"name": "t", "dimensions": [40, 30]},
+        "boundaries": {"board_outline": {"shape": "polygon", "points": [
+            [0, 0], [40, 0], [40, 30], [21, 30], [20, 20.5], [19, 30], [0, 30]]}},
+    })
+    result = _result({"U1": (20, 15, 10, 10)})
+    found = placement.audit(result, board, {}, 1.0)
+    assert [(f["ref"], f["problem"]) for f in found] == [("U1", "in_edge_margin")]
+    assert "0.50 mm" in found[0]["detail"]
+
+
+@pytest.mark.parametrize("text", ["- a\n- b\n", "components: [1, 2]\n", "just text\n"])
+def test_a_malformed_hdm_leaves_the_bom_whole_instead_of_crashing(tmp_path, text):
+    (tmp_path / "hdm.yaml").write_text(text)
+    assert release._not_bought(tmp_path) == set()

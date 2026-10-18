@@ -198,8 +198,14 @@ def _not_bought(pipeline: Path) -> set[str]:
 
     hdm = pipeline / "hdm.yaml"
     try:
-        comps = (yaml.safe_load(hdm.read_text(encoding="utf-8")) or {}).get("components") or {}
+        doc = yaml.safe_load(hdm.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):
+        return set()
+    # A malformed HDM is the release validation's to refuse, with a reason;
+    # crashing here on a list root aborted the release before it got there
+    # (Codex, PR #52).
+    comps = doc.get("components") if isinstance(doc, dict) else None
+    if not isinstance(comps, dict):
         return set()
     return {ref for ref, c in comps.items()
             if isinstance(c, dict) and c.get("assembly") in ("dnp", "footprint_only")}

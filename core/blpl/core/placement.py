@@ -904,8 +904,8 @@ def audit(result: "Result", board: "tuple[float, float] | board_geometry.Board",
     taken as given and was checked by nothing, though a comment here promised
     Stage 8 would. A pinned part could sit across the board edge, inside the
     edge margin, in a keepout or on another part, and the first anyone heard of
-    it was DRC. Findings, worst first: off_board, in_edge_margin, in_keepout,
-    overlap. A part that seeks an edge (a connector, an ``edge`` hint) may come
+    it was DRC. Findings, worst first: off_board, in_cutout, in_edge_margin,
+    in_keepout, overlap. A part that seeks an edge (a connector, an ``edge`` hint) may come
     as close as the placer lets those, not the full margin.
     """
     hints = hints or {}
@@ -928,17 +928,25 @@ def audit(result: "Result", board: "tuple[float, float] | board_geometry.Board",
         if not board_geometry.box_inside((x0, y0, x1, y1), outline):
             finding(ref, "off_board", "its courtyard crosses the board outline")
             continue
+        box = (x0, y0, x1, y1)
+        # A cutout is board edge too: a part across one is off the board, and
+        # one beside it keeps the same margin as from the outline (Codex, PR #52).
+        cut = [f for f in features if f.kind == "cutout" and getattr(f, "anchor", None) != ref]
+        hit = next((f for f in cut if board_geometry.box_overlaps(box, f.shape.polygon)), None)
+        if hit is not None:
+            finding(ref, "in_cutout", f"its courtyard crosses cutout {hit.name or hit.where}")
+            continue
         hint = hints.get(ref) if isinstance(hints.get(ref), dict) else {}
         margin = 0.3 if (_wants_edge(ref) or hint.get("edge")) else edge_margin
-        corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-        nearest = min(board_geometry.distance_to_boundary(c, outline) for c in corners)
+        nearest = min([board_geometry.box_clearance(box, outline)]
+                      + [board_geometry.box_clearance(box, f.shape.polygon) for f in cut])
         if nearest < margin - 1e-6:
             finding(ref, "in_edge_margin",
                     f"{nearest:.2f} mm from the edge, inside the {margin:g} mm edge margin")
         for f in features:
             if not f.blocks_parts or getattr(f, "anchor", None) == ref:
                 continue
-            if f.kind == "keepout" and board_geometry.box_overlaps((x0, y0, x1, y1), f.shape.polygon):
+            if f.kind == "keepout" and board_geometry.box_overlaps(box, f.shape.polygon):
                 finding(ref, "in_keepout", f"inside keepout {f.name or f.where}")
     refs = list(boxes)
     for i, a in enumerate(refs):
@@ -947,7 +955,7 @@ def audit(result: "Result", board: "tuple[float, float] | board_geometry.Board",
             bx0, by0, bx1, by1 = boxes[b]
             if ax0 < bx1 - 1e-6 and bx0 < ax1 - 1e-6 and ay0 < by1 - 1e-6 and by0 < ay1 - 1e-6:
                 finding(a, "overlap", f"its courtyard overlaps {b}'s")
-    order = {"off_board": 0, "in_edge_margin": 1, "in_keepout": 2, "overlap": 3}
+    order = {"off_board": 0, "in_cutout": 1, "in_edge_margin": 2, "in_keepout": 3, "overlap": 4}
     out.sort(key=lambda f: (order[f["problem"]], f["ref"]))
     return out
 

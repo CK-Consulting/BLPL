@@ -606,6 +606,21 @@ def distance_to_boundary(p: Point, poly: list[Point]) -> float:
     return best
 
 
+def box_clearance(box: tuple[float, float, float, float], poly: list[Point]) -> float:
+    """The gap between a box's edges and a polygon's, when neither crosses the other.
+
+    Not the box's corners alone: on a concave outline an inward vertex can
+    reach the middle of a box edge while every corner stays clear (Codex, PR
+    #52). Between two boundaries that do not cross, the nearest pair always has
+    a vertex of one of them in it, so corners against the polygon and the
+    polygon's vertices against the box cover every case.
+    """
+    x0, y0, x1, y1 = box
+    rect = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    return min(min(distance_to_boundary(c, poly) for c in rect),
+               min(distance_to_boundary(v, rect) for v in poly))
+
+
 def polygon_inside(inner: list[Point], outer: list[Point]) -> bool:
     """Whether ``inner`` lies entirely within ``outer``, not touching its edge."""
     if not all(point_in_polygon(p, outer) for p in inner):
