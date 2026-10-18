@@ -74,3 +74,31 @@ def test_the_fanout_answer_is_read_back_and_a_silent_script_is_an_error():
     assert plane_fanout.parse(out) == {"placed": [["C1", "2", "GND"]], "failed": [["U1", "4", "GND"]]}
     assert "error" in plane_fanout.parse("")
     assert "GND" in plane_fanout.script("/x.kicad_pcb", ["GND"])
+
+
+def test_an_outer_layer_plane_is_found_and_scripted_with_its_layer(tmp_path):
+    board = tmp_path / "b.kicad_pcb"
+    board.write_text('(kicad_pcb (zone (net 1) (net_name "GND") (layer "B.Cu")'
+                     ' (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1)))))')
+    assert autoroute.plane_layers(board) == {"GND": ["B.Cu"]}
+    script = plane_fanout.script(str(board), autoroute.plane_layers(board))
+    # Front-side pads still get a via to a B.Cu plane; pads on B.Cu do not.
+    assert "'GND': ['B.Cu']" in script and "IsOnLayer" in script
+
+
+def test_a_skipped_drc_leaves_no_stale_open_connections(tmp_path):
+    from blpl.core import stage7_validate
+
+    pipe = tmp_path / ".pipeline"
+    pipe.mkdir()
+    (pipe / "open_connections.json").write_text('{"count": 9}')
+    stage7_validate.run(tmp_path)  # no board: DRC is skipped
+    assert not (pipe / "open_connections.json").exists()
+
+
+def test_the_fanout_script_is_valid_python():
+    # A str.format template: an unescaped brace in it (a dict literal) broke
+    # the whole autoroute with KeyError before pcbnew ever ran.
+    import ast
+
+    ast.parse(plane_fanout.script("/x.kicad_pcb", {"GND": ["In1.Cu"], "VDD": ["B.Cu"]}))

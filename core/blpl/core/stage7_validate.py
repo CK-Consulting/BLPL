@@ -269,6 +269,9 @@ def run(
     # Why each connection is still open (triage.py), for the reviewer and the
     # chat agent: the DRC report says only that it is.
     drc_json = _p("drc_report")
+    # Gone first: a report from an earlier board must not stand in for this
+    # one when DRC is skipped, since the resolution skill acts on it.
+    _p("open_connections").unlink(missing_ok=True)
     if not drc_result.get("skipped") and drc_json.exists():
         from . import autoroute, triage
 

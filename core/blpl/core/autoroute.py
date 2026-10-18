@@ -404,13 +404,18 @@ def carry_forward(pcb: Path, work: Path, python: str) -> RouteResult | None:
     )
 
 
-def plane_nets(pcb: Path) -> list[str]:
-    """Nets a copper zone fills on an inner layer: the board's planes."""
+def plane_layers(pcb: Path) -> dict[str, list[str]]:
+    """Net -> the copper layers a zone fills with it: the board's planes.
+
+    Outer layers included: project.yaml may declare a plane on F.Cu or B.Cu,
+    and a B.Cu ground needs vias from front-side pads like any inner plane
+    (Codex, PR #49).
+    """
     try:
         board = sexpr.parse(Path(pcb).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — no planes is the safe answer
-        return []
-    out = set()
+        return {}
+    out: dict[str, set[str]] = {}
     for zone in sexpr.find_all(board, "zone"):
         if sexpr.find(zone, "keepout") is not None:
             continue
@@ -421,9 +426,15 @@ def plane_nets(pcb: Path) -> list[str]:
             name = net if net is not None and len(net) > 1 and not str(net[1]).isdigit() else None
         if layer is None or name is None:
             continue
-        if sexpr.unquote(str(layer[1])).startswith("In"):
-            out.add(sexpr.unquote(str(name[-1])))
-    return sorted(n for n in out if n)
+        net = sexpr.unquote(str(name[-1]))
+        if net:
+            out.setdefault(net, set()).add(sexpr.unquote(str(layer[1])))
+    return {n: sorted(v) for n, v in sorted(out.items())}
+
+
+def plane_nets(pcb: Path) -> list[str]:
+    """The nets that have a plane."""
+    return sorted(plane_layers(pcb))
 
 
 def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> RouteResult:
@@ -449,13 +460,13 @@ def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> Route
 
     # Planes first: Freerouting does not drop vias to them, so their pads get
     # theirs here, locked, before it sees the board (plane_fanout.py).
-    nets = plane_nets(pcb)
-    if nets:
-        fan = _pcbnew(python, plane_fanout.script(str(pcb), nets))
+    planes_on = plane_layers(pcb)
+    if planes_on:
+        fan = _pcbnew(python, plane_fanout.script(str(pcb), planes_on))
         fanout = plane_fanout.parse(fan.stdout)
         if fan.returncode != 0:
             fanout["error"] = _msg(fan)
-        base.extra["plane_fanout"] = {"nets": nets, **fanout}
+        base.extra["plane_fanout"] = {"nets": sorted(planes_on), **fanout}
 
     export = _export_dsn(python, pcb, dsn)
     if export.returncode != 0 or not dsn.is_file():
