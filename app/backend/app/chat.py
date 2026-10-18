@@ -1444,7 +1444,8 @@ class ChatSessionManager:
 # writes the same kind of proposal as propose_file_edit; without it here its
 # proposals were created but never shown as a card, so nobody could accept them.
 _PROPOSING_TOOLS = frozenset(
-    {"propose_file_edit", "propose_board_shape", "propose_controlled_impedance"})
+    {"propose_file_edit", "propose_board_shape", "propose_controlled_impedance",
+     "propose_kicad_edit"})
 
 
 def _proposal_id_in(text: str) -> str | None:

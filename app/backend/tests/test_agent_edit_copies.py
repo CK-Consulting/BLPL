@@ -157,3 +157,36 @@ def test_a_run_log_is_readable_for_this_project_only(client, tmp_path, monkeypat
                         conversation="c.jsonl")
     with pytest.raises(ToolDenied, match="no run"):
         run(edit_copies._read_run_log(other, {"run_id": "run_abc"}))
+
+
+def test_a_symlinked_emitted_file_is_never_copied(project, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside") / "secret.kicad_pcb"
+    outside.write_text("(kicad_pcb (secret))")
+    (project / "kicad/leak.kicad_pcb").symlink_to(outside)
+    with pytest.raises(ToolDenied, match="symbolic link"):
+        run(edit_copies._make_edit_copies(_ctx(project), {}))
+    assert not (project / "kicad/leak_edit.kicad_pcb").exists()
+
+
+def test_schematic_parity_findings_are_reported(project, monkeypatch):
+    import json as _json
+
+    from blpl.core import stage7_validate
+
+    ctx = _ctx(project)
+    run(edit_copies._make_edit_copies(ctx, {}))
+
+    def fake_drc(pcb, out):
+        out.write_text(_json.dumps({"violations": [], "unconnected_items": [], "schematic_parity": [
+            {"type": "missing_footprint", "description": "Missing footprint R5", "items": []}]}))
+        return {"ok": False, "skipped": False, "exit_code": 5}
+
+    monkeypatch.setattr(stage7_validate, "_run_drc", fake_drc)
+    out = run(edit_copies._run_checks_on_edit(ctx, {"path": "kicad/b_edit.kicad_pcb"}))
+    assert "1 schematic parity finding(s)" in out and "Missing footprint R5" in out
+
+
+def test_kicad_edit_proposals_are_shown_live():
+    from app import chat
+
+    assert "propose_kicad_edit" in chat._PROPOSING_TOOLS

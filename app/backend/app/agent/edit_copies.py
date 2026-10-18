@@ -80,6 +80,13 @@ async def _make_edit_copies(ctx: ToolContext, args: dict) -> str:
     overwrite = bool(args.get("overwrite"))
     made, kept = [], []
     for src in _emitted(ctx):
+        # A link is refused, and the source is checked as well as the
+        # destination: copying follows the link, and a kicad/ file pointing
+        # outside the project would put that file in a readable copy (Codex,
+        # PR #50).
+        if src.is_symlink():
+            raise ToolDenied(f"kicad/{src.name} is a symbolic link; it is not copied")
+        ctx.sandbox.check_read(src)
         dst = src.with_name(f"{src.stem}{EDIT_SUFFIX}{src.suffix}")
         ctx.sandbox.check_write(dst)
         if dst.exists() and not overwrite:
@@ -267,20 +274,28 @@ async def _run_checks_on_edit(ctx: ToolContext, args: dict) -> str:
                     f"{result.get('exit_code')} and wrote no report, so the file probably does "
                     f"not load. {detail[-800:]}")
         data = json.loads(out.read_text(encoding="utf-8"))
+    parity = []
     if check == "DRC":
         violations = data.get("violations") or []
         unconnected = data.get("unconnected_items") or []
+        # Where the board disagrees with its schematic: a DRC failure that
+        # sits in its own list, and was read as clean without it (Codex, PR #50).
+        parity = data.get("schematic_parity") or []
     else:
         violations = [v for s in data.get("sheets") or [] for v in s.get("violations") or []]
         unconnected = []
     by_type = Counter(f"{v.get('severity', '?')}:{v.get('type', '?')}" for v in violations)
     lines = [f"{check} on {_rel(ctx, target)}: {len(violations)} violation(s)"
-             + (f", {len(unconnected)} unconnected item(s)" if check == "DRC" else "") + "."]
+             + (f", {len(unconnected)} unconnected item(s), {len(parity)} schematic parity "
+                "finding(s)" if check == "DRC" else "") + "."]
     lines += [f"  {n} × {t}" for t, n in by_type.most_common()]
     shown = [v for v in violations if v.get("severity") == "error"][:15] or violations[:15]
     for v in shown:
         items = "; ".join(i.get("description", "") for i in v.get("items") or [])
         lines.append(f"- {v.get('type')}: {v.get('description')} — {items}")
+    for p in parity[:15]:
+        items = "; ".join(i.get("description", "") for i in p.get("items") or [])
+        lines.append(f"- schematic parity: {p.get('type')}: {p.get('description')} — {items}")
     for u in unconnected[:15]:
         items = " ↔ ".join(i.get("description", "") for i in u.get("items") or [])
         lines.append(f"- unconnected: {items}")
