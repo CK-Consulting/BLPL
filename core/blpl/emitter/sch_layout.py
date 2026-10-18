@@ -103,15 +103,38 @@ class Placed:
 
 
 @dataclass
+class WirePath:
+    """The wire from an anchor pin through the parts that hang off it.
+
+    ``points`` are its corners and its taps, in order from the pin; ``taps``
+    are the points a part's pin joins it; the label naming its net is drawn at
+    ``label``, pointing ``direction``.
+    """
+    points: list[tuple[float, float]]
+    taps: set[tuple[float, float]]
+    label: tuple[float, float]
+    direction: int
+
+    def moved(self, dx: float, dy: float) -> "WirePath":
+        def mv(p):
+            return (snap(p[0] + dx), snap(p[1] + dy))
+        return WirePath([mv(p) for p in self.points], {mv(p) for p in self.taps}, mv(self.label), self.direction)
+
+
+# Parts on one row of a pin's wire before it folds back on itself. Seven parts
+# on VBAT in one straight line stretched the XIAO's block down half the sheet.
+ROW_PARTS = 3
+
+
+@dataclass
 class Block:
     title: str
     anchor: str | None
     members: list[tuple[str, int]] = field(default_factory=list)
     # Filled by layout: the block's own frame, in sheet coordinates.
-    # wire_ends: for each anchor pin that has parts hanging off it, (ref,
-    # unit, pin number) -> how far its wire runs: the x of a sideways wire,
-    # the y of one running up or down.
-    wire_ends: dict = field(default_factory=dict)
+    # wire_paths: for each anchor pin that has parts hanging off it, (ref,
+    # unit, pin number) -> WirePath, in sheet coordinates.
+    wire_paths: dict = field(default_factory=dict)
     x0: float = 0.0
     y0: float = 0.0
     x1: float = 0.0
@@ -285,6 +308,8 @@ def single_pins(pins: list[dict], tips: list[tuple[float, float, int]], nets: di
 # A part hangs below a wire that runs sideways, and stands to the right of
 # one that runs up or down: its pin on the wire points back at the wire.
 _FACING = {0: 90, 180: 90, 90: 180, 270: 180}
+# The direction a part's pin on the wire points, by the side it hangs (h).
+_TOWARD_WIRE = {(0, 1): 90, (0, -1): 270, (1, 0): 180, (-1, 0): 0}
 
 
 def _hanging_rotation(pins: list[dict], hook_pin: str, facing: int = 90) -> int | None:
@@ -391,51 +416,125 @@ def _hang(local, smalls, pin_nets, texts, pad, order):
         return set(), 0.0, [], {}
     bx0, by0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
     bx1, by1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
-    hung, extra, ends = set(), [], {}
+    hung, extra, paths = set(), [], {}
     placed_boxes: list[tuple[float, float, float, float]] = []
+    mid_x, mid_y = (bx0 + bx1) / 2, (by0 + by1) / 2
+
+    def side(ap) -> tuple[int, int]:
+        """Which way a pin's parts hang: away from the middle of its edge.
+
+        Each half of an edge stacks its pins' parts on its own side, so the
+        two halves grow apart instead of one stack growing the length of
+        both.
+        """
+        _, _, _, tx, ty, d = ap
+        if d in (0, 180):
+            return (0, -1) if ty < mid_y else (0, 1)
+        return (-1, 0) if tx < mid_x else (1, 0)
+
     # Sideways edges first; a top or bottom edge then starts beyond whatever
     # those hung, so its parts cannot land on them.
     for edges in ((0, 180), (90, 270)):
-        cursor = {0: bx1 + pad, 180: bx0 - pad, 90: by0 - pad, 270: by1 + pad}
+        # Each edge's cursor is measured along its wires' direction: how far
+        # out from the anchor the next pin's parts start, one per half.
+        base = {0: bx1 + pad, 180: -bx0 + pad, 90: -by0 + pad, 270: by1 + pad}
         if edges == (90, 270) and placed_boxes:
-            cursor[90] = min(cursor[90], min(b[1] for b in placed_boxes) - pad)
-            cursor[270] = max(cursor[270], max(b[3] for b in placed_boxes) + pad)
+            base[90] = max(base[90], -min(b[1] for b in placed_boxes) + pad)
+            base[270] = max(base[270], max(b[3] for b in placed_boxes) + pad)
+        cursor: dict[tuple[int, tuple[int, int]], float] = {}
         groups = [g for g in by_pin.values() if g[0][4][5] in edges]
         # Furthest along the hanging side first: nearest the anchor.
-        groups.sort(key=lambda g: -(g[0][4][4] if g[0][4][5] in (0, 180) else g[0][4][3]))
+        def reach(g):
+            ap = g[0][4]
+            hx, hy = side(ap)
+            return -(ap[3] * hx + ap[4] * hy)
+        groups.sort(key=reach)
         for group in groups:
             ap = group[0][4]
             _, _, apin, tx, ty, d = ap
-            sx, sy = _STEP[d]
+            w = _STEP[d]
+            h = side(ap)
+            key = (d, h)
+            cursor.setdefault(key, base[d])
+
+            def ab(x, y, w=w, h=h):
+                return (x * w[0] + y * w[1], x * h[0] + y * h[1])
+
+            def xy(a, b, w=w, h=h):
+                return (a * w[0] + b * h[0], a * w[1] + b * h[1])
+
             net = pin_nets.get(ap[0], {}).get(apin["number"], "")
-            for ref, unit, pins, own, _ in sorted(group, key=lambda g: order(g[0])):
-                rot = _hanging_rotation(pins, own, _FACING[d])
-                nets = {k: v for k, v in pin_nets.get(ref, {}).items() if k != own}
-                x0, y0, x1, y1 = part_extent(pins, rot, nets, texts.get(ref))
-                hx, hy, _ = pin_tip(next(q for q in pins if q["number"] == own), 0, 0, rot)
-                if sx:  # wire runs sideways: the part hangs below it
-                    px = snap(cursor[d] - x0 if sx > 0 else cursor[d] - x1)
-                    py = ty - hy
-                    cursor[d] = (px + x1 + pad) if sx > 0 else (px + x0 - pad)
-                else:   # wire runs up or down: the part stands to its right
-                    px = tx - hx
-                    py = snap(cursor[d] - y0 if sy > 0 else cursor[d] - y1)
-                    cursor[d] = (py + y1 + pad) if sy > 0 else (py + y0 - pad)
-                local.append(Placed(ref, unit, px, py, rot, pins, hook=(ap[0], ap[1], apin["number"], own)))
-                placed_boxes.append((px + x0, py + y0, px + x1, py + y1))
-                hung.add((ref, unit))
-            # The wire ends clear of the last part, where the label that names
-            # its net is drawn.
-            end = snap(cursor[d])
-            ends[(ap[0], ap[1], apin["number"])] = ("x" if sx else "y", end)
-            far = end + (sx or sy) * (len(net) * _CHAR + 2 * GRID)
-            if sx:
-                extra.append((min(tx, far), ty - 2 * GRID, max(tx, far), ty + 2 * GRID))
-            else:
-                extra.append((tx - 2 * GRID, min(ty, far), tx + 2 * GRID, max(ty, far)))
-            cursor[d] = far + (sx or sy) * pad
+            members = sorted(group, key=lambda g: order(g[0]))
+            rows = [members[i:i + ROW_PARTS] for i in range(0, len(members), ROW_PARTS)]
+            a_tip, row_b = ab(tx, ty)
+            start_a = cursor[key]
+            far_a = start_a
+            row_taps: list[list[tuple[float, float]]] = []
+            row_bs: list[float] = []
+            region: list[tuple[float, float, float, float]] = []
+            for row in rows:
+                cur = start_a
+                deepest = row_b
+                taps_here = []
+                for ref, unit, pins, own, _ in row:
+                    rot = _hanging_rotation(pins, own, _TOWARD_WIRE[h])
+                    nets = {k: v for k, v in pin_nets.get(ref, {}).items() if k != own}
+                    x0, y0, x1, y1 = part_extent(pins, rot, nets, texts.get(ref))
+                    corners = [ab(x, y) for x in (x0, x1) for y in (y0, y1)]
+                    a_lo, a_hi = min(c[0] for c in corners), max(c[0] for c in corners)
+                    b_hi = max(c[1] for c in corners)
+                    pin_a, pin_b = ab(*pin_tip(next(q for q in pins if q["number"] == own), 0, 0, rot)[:2])
+                    oa, ob = snap(cur - a_lo), row_b - pin_b
+                    px, py = xy(oa, ob)
+                    px, py = snap(px), snap(py)
+                    local.append(Placed(ref, unit, px, py, rot, pins, hook=(ap[0], ap[1], apin["number"], own)))
+                    placed_boxes.append((px + x0, py + y0, px + x1, py + y1))
+                    hung.add((ref, unit))
+                    taps_here.append(xy(oa + pin_a, row_b))
+                    cur = oa + a_hi + pad
+                    deepest = max(deepest, ob + b_hi)
+                    far_a = max(far_a, oa + a_hi)
+                row_taps.append(taps_here)
+                row_bs.append(row_b)
+                row_b = snap(deepest + pad)
+            far_a = snap(far_a + pad)
+            near_a = snap(start_a - 2 * GRID)
+            # The path: out along the first row, then back and forth.
+            pts = [(tx, ty)]
+            for i, (taps_here, b) in enumerate(zip(row_taps, row_bs)):
+                forward = i % 2 == 0
+                ordered = sorted(taps_here, key=lambda t: ab(*t)[0], reverse=not forward)
+                if i > 0:
+                    pts.append(xy(far_a if not forward else near_a, b))
+                pts += ordered
+                if i + 1 < len(row_taps):
+                    pts.append(xy(far_a if forward else near_a, b))
+            label = xy(far_a, row_bs[0])
+            if len(row_taps) == 1:
+                pts.append(label)
+            elif label not in pts:
+                pts.insert(len(row_taps[0]) + 1, label)
+            pts = [(snap(x), snap(y)) for x, y in pts]
+            taps = {(snap(x), snap(y)) for row in row_taps for x, y in row}
+            paths[(ap[0], ap[1], apin["number"])] = WirePath(pts, taps, (snap(label[0]), snap(label[1])), d)
+            # The region the wire, its parts and its label take.
+            lab_a = far_a + len(net) * _CHAR + 2 * GRID
+            corners = [xy(near_a, row_bs[0] - 2 * GRID), xy(lab_a, row_bs[-1] + 2 * GRID)]
+            extra.append((min(c[0] for c in corners), min(c[1] for c in corners),
+                          max(c[0] for c in corners), max(c[1] for c in corners)))
+            cursor[key] = snap(lab_a + pad)
     right = max([bx1] + [b[2] for b in placed_boxes + extra])
-    return hung, right, extra, ends
+    return hung, right, extra, paths
+
+
+def placed_extent(p: Placed, pin_nets: dict[str, dict[str, str]], texts: dict | None = None):
+    """A placed part's box on the sheet as drawn: its pin on a wire has no label."""
+    nets = dict(pin_nets.get(p.ref, {}))
+    if p.hook:
+        nets.pop(p.hook[3], None)
+    t = (texts or {}).get(p.ref) if len(p.pins) <= 2 else None
+    x0, y0, x1, y1 = part_extent(p.pins, p.rot, nets, t)
+    return (x0 + p.x, y0 + p.y, x1 + p.x, y1 + p.y)
 
 
 def layout(
@@ -494,7 +593,7 @@ def layout(
         anchor_h = max(ay - pad, 0.0)
         smalls.sort(key=lambda t: order(t[0]))
         extra: list[tuple[float, float, float, float]] = []
-        ends: dict[tuple[str, int, str], tuple[str, float]] = {}
+        ends: dict[tuple[str, int, str], WirePath] = {}
         sx = anchor_w + (2 * pad if block.anchor else 0.0)
         if block.anchor:
             hung, right_end, extra, ends = _hang(local, smalls, pin_nets, texts, pad, order)
@@ -514,11 +613,7 @@ def layout(
             sy += h + pad
             col_w = max(col_w, w)
         # Measured from what was placed, not from the bookkeeping.
-        boxes = []
-        for p in local:
-            e = part_extent(p.pins, p.rot, pin_nets.get(p.ref, {}),
-                            texts.get(p.ref) if p.ref != block.anchor else None)
-            boxes.append((e[0] + p.x, e[1] + p.y, e[2] + p.x, e[3] + p.y))
+        boxes = [placed_extent(p, pin_nets, texts if p.ref != block.anchor else None) for p in local]
         boxes += extra
         box = (min(b[0] for b in boxes), min(b[1] for b in boxes),
                max(b[2] for b in boxes), max(b[3] for b in boxes))
@@ -566,7 +661,7 @@ def layout(
         offx, offy = snap(cx - minx + pad), snap(cy - miny + pad + title_h)
         for p in local:
             placed.append(Placed(p.ref, p.unit, snap(p.x + offx), snap(p.y + offy), p.rot, p.pins, p.hook))
-        block.wire_ends = {k: snap(v + (offx if axis == "x" else offy)) for k, (axis, v) in ends.items()}
+        block.wire_paths = {k: v.moved(offx, offy) for k, v in ends.items()}
         block.x0, block.y0 = snap(cx), snap(cy)
         block.x1, block.y1 = snap(cx + bw), snap(cy + bh)
         cx = block.x1 + 2 * pad

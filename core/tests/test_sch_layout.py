@@ -125,9 +125,8 @@ def test_nothing_on_the_sheet_overlaps():
     frames = [(b.x0, b.y0, b.x1, b.y1) for b in blocks]
     boxes = []
     for p in placed:
-        x0, y0, x1, y1 = sch_layout.part_extent(p.pins, p.rot, pin_nets.get(p.ref, {}),
-                                                texts.get(p.ref) if len(p.pins) <= 2 else None)
-        boxes.append((p.ref, (p.x + x0, p.y + y0, p.x + x1, p.y + y1)))
+        # As drawn: a part's pin on a wire ends in no label of its own.
+        boxes.append((p.ref, sch_layout.placed_extent(p, pin_nets, texts)))
 
     def overlap(a, b):
         return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
@@ -239,3 +238,28 @@ def test_a_part_serving_an_ic_pin_is_wired_to_it():
     assert _connected(wires, tip("U1", "1"), tip("C1", "1"))
     names = {sexpr.unquote(g[1]) for g in sexpr.find_all(node, "global_label")}
     assert {"SDA", "VDD_3V3"} <= names
+
+
+def test_a_long_chain_folds_into_rows_instead_of_one_long_wire():
+    # Seven parts on VBAT in a straight line stretched the XIAO's block down
+    # half the sheet. A pin's wire carries a few parts, then turns back.
+    caps = [_part(f"C{i}", "Device:C", {"1": "VDD_3V3", "2": "GND"}, 11, 11, "100nF") for i in range(1, 8)]
+    hdm = _hdm(U_A, *caps)
+    blocks, placed, pin_nets, _ = _layout(hdm)
+    node = sexpr.parse(sch.emit(hdm, symbols_root=_SYMBOLS_ROOT))
+    wires = _wires(node)
+    by_ref = {p.ref: p for p in placed}
+
+    def tip(ref, number):
+        p = by_ref[ref]
+        pin = next(q for q in p.pins if q["number"] == number)
+        return pin_tip(pin, p.x, p.y, p.rot)[:2]
+
+    for i in range(1, 8):
+        assert _connected(wires, tip("U1", "1"), tip(f"C{i}", "1")), f"C{i}"
+    rows = {}
+    for i in range(1, 8):
+        x, y = tip(f"C{i}", "1")
+        rows.setdefault(y, []).append(x)
+    assert len(rows) == 3
+    assert max(len(r) for r in rows.values()) <= sch_layout.ROW_PARTS
