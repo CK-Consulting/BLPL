@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { del } from "../api";
 import { streamRun } from "../runStream";
+import { AskChatButton } from "./AskChatButton";
 import { RunLog } from "./RunLog";
 import { RunProgress } from "./RunProgress";
 import { Verbosity, classifyAll, progress } from "../runlog";
@@ -61,6 +62,8 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
   const [lines, setLines] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
   const [exitCode, setExitCode] = useState<number | null>(null);
+  // The last run's id, kept after it ends, for "Ask chat agent about this".
+  const [lastRun, setLastRun] = useState<string | null>(null);
   const [verbosity, setVerbosity] = useState<Verbosity>("normal");
   const [explain, setExplain] = useState(false);
   // What was actually launched, not what the controls currently say — changing
@@ -106,7 +109,10 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
         url,
         { method: "POST" },
         (event, payload) => {
-          if (event === "start") runIdRef.current = payload.run_id ?? null;
+          if (event === "start") {
+            runIdRef.current = payload.run_id ?? null;
+            setLastRun(payload.run_id ?? null);
+          }
           else if (event === "log") setLines((l) => [...l, payload.line]);
           else if (event === "done") {
             setExitCode(payload.exit_code);
@@ -236,6 +242,14 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
           explain={explain}
           onExplainChange={setExplain}
         />
+      )}
+      {!running && (exitCode !== null ? exitCode !== 0 : lines.some((l) => l.startsWith("error:"))) && (
+        <p className="ask-chat-row">
+          <AskChatButton
+            reference={`the pipeline run${lastRun ? ` ${lastRun}` : ""}${exitCode !== null ? ` (exit ${exitCode})` : ""}: its log and \`.pipeline/validation_report.json\``}
+            label="Ask chat agent about this run"
+          />
+        </p>
       )}
       <RunLog lines={classified} verbosity={verbosity} onVerbosityChange={setVerbosity} />
     </div>

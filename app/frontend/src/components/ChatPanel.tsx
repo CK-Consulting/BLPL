@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError, ChatMessage, ConversationMeta, Proposal, del, getJSON, postJSON, readSSE } from "../api";
 import { onCommitted } from "../commitEvents";
+import { AskRequest, onAskChat, setChatReady, takePending } from "../askChat";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
 import { SlashCommand, SlashPopover, useSlashCommands } from "./SlashCommands";
@@ -836,6 +837,40 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
 
   const fileInput = useRef<HTMLInputElement | null>(null);
   const textarea = useRef<HTMLTextAreaElement | null>(null);
+
+  // "Ask chat agent about this" (askChat.ts): a file, tab or run sent here from
+  // anywhere in the app. Taken only once a conversation is open, so a request
+  // made while the pane was closed waits for the pane's own first load instead
+  // of being overtaken by it. Never sent: the user writes the question.
+  const answerAsk = useRef<(r: AskRequest) => Promise<void>>(async () => {});
+  answerAsk.current = async (r: AskRequest) => {
+    if (r.mode === "new") await newConversation();
+    setInput((cur) => (cur.trim() ? `${cur}\n${r.text}` : r.text));
+    requestAnimationFrame(() => {
+      const el = textarea.current;
+      if (!el) return;
+      el.focus();
+      const end = el.value.length;
+      el.setSelectionRange(end, end);
+    });
+  };
+  useEffect(() => {
+    setChatReady(!!filename);
+    if (filename) {
+      const waiting = takePending();
+      if (waiting) void answerAsk.current(waiting);
+    }
+    return () => setChatReady(false);
+  }, [filename]);
+  useEffect(
+    () =>
+      onAskChat(() => {
+        if (!openRef.current) return; // the load above takes it
+        const waiting = takePending();
+        if (waiting) void answerAsk.current(waiting);
+      }),
+    [],
+  );
   // Eight lines to start. A design message is a paragraph and a part number,
   // not a chat line, and the height is remembered so this is a decision made
   // once rather than a drag repeated every session.

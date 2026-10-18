@@ -3,6 +3,7 @@ import { Run, del, getJSON, readSSE } from "../api";
 import { parseTimestamp, stamp } from "../time";
 import { Verbosity, classifyAll } from "../runlog";
 import { RunLog } from "./RunLog";
+import { AskChatButton } from "./AskChatButton";
 
 /**
  * A run's kind carries the board it was about in a trailing parenthesis —
@@ -125,6 +126,12 @@ export function RunHistory({ projectId, reloadToken }: Props) {
               <button className="link" onClick={() => del(`/api/runs/${r.id}`).then(refresh)}>
                 Stop
               </button>
+            )}
+            {!r.running && r.exit_code !== null && r.exit_code > 0 && (
+              <AskChatButton
+                reference={`the ${r.kind} run ${r.id} (exit ${r.exit_code}): its log and \`.pipeline/validation_report.json\``}
+                label="Ask chat agent about this run"
+              />
             )}
             {open === r.id && (
               <RunLog

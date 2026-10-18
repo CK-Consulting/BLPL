@@ -30,6 +30,8 @@ import { ReleasePanel } from "./components/ReleasePanel";
 import { DiffView } from "./components/DiffView";
 import { Artifacts } from "./components/Artifacts";
 import { ChatPanel } from "./components/ChatPanel";
+import { AskChatButton } from "./components/AskChatButton";
+import { onAskChat } from "./askChat";
 import { NavActions } from "./components/NavActions";
 import { Chat as ChatIcon, Cog, PlusSquare, Share as ShareIcon } from "./components/Icons";
 import { BoardPanel } from "./components/BoardPanel";
@@ -106,6 +108,16 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   // preference sticks per browser once you turn it on.
   const [showChat, setShowChat] = useState(
     () => localStorage.getItem("blpl.showChat") === "1",
+  );
+  // "Ask chat agent about this" from any panel opens the chat pane; the chat
+  // itself takes the request once it has a conversation (askChat.ts).
+  useEffect(
+    () =>
+      onAskChat(() => {
+        localStorage.setItem("blpl.showChat", "1");
+        setShowChat(true);
+      }),
+    [],
   );
   const toggleChat = () => {
     setShowChat((on) => {
@@ -351,6 +363,9 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                 active={tab}
                 onSelect={setTab}
               />
+              <div className="ask-chat-row">
+                <AskChatButton reference={askReference(tab, openFile?.path ?? null)} />
+              </div>
               {tab === "board" && (
                 <DesignView
                   projectId={selected}
@@ -458,4 +473,35 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
       )}
     </div>
   );
+}
+
+
+/** What "Ask chat agent about this" refers to on each tab: the file it shows,
+ *  or the artifact behind it. */
+export function askReference(tab: string, openPath: string | null): string {
+  switch (tab) {
+    case "edit":
+    case "kicad":
+      return openPath ? `\`${openPath}\`` : "";
+    case "board":
+      return "the emitted board under `kicad/`";
+    case "preflight":
+      return "the Preflight checks";
+    case "bom":
+      return "`.pipeline/bom.json`";
+    case "lifecycle":
+      return "`lifecycle.md`";
+    case "modules":
+      return "the module library";
+    case "reports":
+      return "the reports (`.pipeline/review.md`, `.pipeline/validation_report.json`, `.pipeline/open_connections.json`)";
+    case "release":
+      return "the release package";
+    case "artifacts":
+      return "the pipeline artifacts in `.pipeline/`";
+    case "changes":
+      return "the uncommitted changes";
+    default:
+      return "";
+  }
 }
