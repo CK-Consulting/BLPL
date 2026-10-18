@@ -367,11 +367,8 @@ def _remove_plaintext(path: Path) -> None:
                 pass
         func(target)
 
-    # `onexc` from 3.12; 3.11 (still supported) only has `onerror`. Both call
-    # the handler as (function, path, error).
-    hook = "onexc" if sys.version_info >= (3, 12) else "onerror"
     try:
-        shutil.rmtree(path, **{hook: make_writable_and_retry})
+        shutil.rmtree(path, onexc=make_writable_and_retry)
     except OSError as exc:
         raise WorkspaceError(f"could not remove decrypted files at {path}: {exc}") from exc
     if os.path.lexists(path):
