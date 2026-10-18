@@ -271,7 +271,7 @@ commit then makes it stand alone:
   and drop its folder prefix:
   - core — the `core` job: submodules `kicad-symbols kicad-footprints
     kicad-library-utils`, `pip install -e '.[dev]'`, `python -m pytest -q`, on
-    Python 3.11 and 3.13.
+    Python 3.13.
   - plugin — the `plugin` job: `pip install -e '.[dev]'`, `python -m pytest -q`.
   - app — the `app-backend` and `frontend` jobs, with core installed from its
     submodule or pin (above), plus `kcaa-upstream-check.yml` with

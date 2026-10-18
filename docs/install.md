@@ -2,7 +2,7 @@
 
 ## System requirements
 
-- **Python 3.11 or newer.** The pipeline itself runs on 3.11+; KiCad's bundled Python is 3.9 but you only need that for `stage6-plugin` (the PCB plugin path).
+- **Python 3.13 or newer.** The pipeline and the app backend run on 3.13, the version KiCad 10's Docker image ships. The KiCad plugin runs under KiCad's own bundled Python instead, and you only need that for `stage6-plugin` (the PCB plugin path).
 - **KiCad 10.x (optional).** Needed for `stage6-plugin` (native pcbnew API) and for `kicad-cli` validation in Stage 7. Not needed for the S-expression emitter path (`stage6`), which produces v10-format files without KiCad installed.
 - **Git with submodule support.** The KiCad symbol and footprint libraries live as git submodules.
 - **Node 20+ (optional).** Only to build the web frontend.
@@ -30,7 +30,7 @@
 The pipeline is the `blpl` package under `core/`. From the repo root:
 
 ```bash
-uv venv --python 3.11 .venv                # create a virtualenv
+uv venv --python 3.13 .venv                # create a virtualenv
 uv pip install -e "./core[dev]"            # the pipeline + dev deps (pytest, rich)
 ```
 
