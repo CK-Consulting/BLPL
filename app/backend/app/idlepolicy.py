@@ -9,6 +9,8 @@ may choose its own in Project settings.
 
 from __future__ import annotations
 
+import os
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -30,7 +32,18 @@ def validate(minutes: int | None) -> int | None:
     return minutes
 
 
+def default_minutes() -> int:
+    """The deployment's default: BLPL_SANDBOX_IDLE_S when the operator set it,
+    else an hour. A project with no limit of its own follows it."""
+    raw = os.environ.get("BLPL_SANDBOX_IDLE_S", "").strip()
+    try:
+        seconds = float(raw) if raw else 0.0
+    except ValueError:
+        seconds = 0.0
+    return max(1, round(seconds / 60)) if seconds > 0 else DEFAULT_MINUTES
+
+
 def minutes_for(session: Session, project_name: str) -> int:
     """The limit that applies to a project, by its name (the workspace name)."""
     value = session.scalar(select(Project.idle_seal_minutes).where(Project.name == project_name))
-    return int(value) if value else DEFAULT_MINUTES
+    return int(value) if value else default_minutes()

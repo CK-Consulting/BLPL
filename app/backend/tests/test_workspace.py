@@ -875,12 +875,36 @@ def test_the_idle_sweep_seals_by_the_projects_own_limit(unlocked):
     entry = main.workspaces._open["mine"]
 
     entry.last_touched -= timedelta(minutes=90)
-    main._seal_idle_workspaces()
+    main._seal_idle_registry()
     assert (main.PROJECTS_ROOT / "mine").exists(), "90 min idle is inside a 120 min limit"
 
     entry.last_touched -= timedelta(minutes=40)
-    main._seal_idle_workspaces()
+    main._seal_idle_registry()
     assert not (main.PROJECTS_ROOT / "mine").exists()
     with SessionFactory() as s:
         detail = s.scalars(select(ProjectActivity.detail).where(ProjectActivity.kind == "sealed")).all()
     assert detail and "limit 120" in detail[-1]
+
+
+def test_a_project_without_its_own_limit_follows_the_deployment_default(unlocked, monkeypatch):
+    from app import idlepolicy
+
+    monkeypatch.setenv("BLPL_SANDBOX_IDLE_S", "5400")
+    assert idlepolicy.default_minutes() == 90
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    st = unlocked.get("/api/projects/mine/git/status").json()
+    assert st["idle_seal_default"] == 90
+    monkeypatch.delenv("BLPL_SANDBOX_IDLE_S")
+    assert idlepolicy.default_minutes() == 60
+
+
+def test_the_backend_starts_with_its_idle_sweeper(client):
+    # The lifespan starts the sweeper coroutine. A synchronous helper once
+    # took its name, and the backend failed at startup with "a coroutine was
+    # expected" (Codex, PR #47); the TestClient context runs the lifespan.
+    import asyncio
+    import app.main as main
+
+    assert asyncio.iscoroutinefunction(main._seal_idle_workspaces)
+    with client:
+        assert client.get("/api/health").status_code in (200, 404)

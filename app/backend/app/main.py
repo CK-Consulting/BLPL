@@ -279,15 +279,19 @@ async def _seal_idle_workspaces() -> None:
                                    "(no file, git or run activity)"),
                         limit_s=lambda name: 60 * idlepolicy.minutes_for(session, name))
                     session.commit()
-            _seal_idle_workspaces()
+            _seal_idle_registry()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — a sweep that fails must not stop the next
             logger.exception("idle workspace sweep failed")
 
 
-def _seal_idle_workspaces() -> list[str]:
-    """Seal every open workspace idle past its project's own limit."""
+def _seal_idle_registry() -> list[str]:
+    """Seal every open workspace idle past its project's own limit.
+
+    Not named after the sweeper above, which it once shared a name with: the
+    later definition replaced the coroutine the lifespan starts, and the
+    backend failed to boot (Codex, PR #47)."""
     sealed = []
     with SessionFactory() as session:
         now = datetime.now(timezone.utc)
@@ -3127,7 +3131,7 @@ def git_status(project_id: str, user: User = Depends(require_onboarded),
         "push_policy": project.push_policy,
         # Minutes idle before the project is sealed again; null is the default.
         "idle_seal_minutes": project.idle_seal_minutes,
-        "idle_seal_default": idlepolicy.DEFAULT_MINUTES,
+        "idle_seal_default": idlepolicy.default_minutes(),
         # This member's last push, automatic or not: a failure stays here, and
         # in the strip, until a later push succeeds.
         "last_push": autopush.last_push(member),
@@ -3404,7 +3408,7 @@ def put_idle_seal(
     return {
         "ok": True,
         "idle_seal_minutes": project.idle_seal_minutes,
-        "effective_minutes": project.idle_seal_minutes or idlepolicy.DEFAULT_MINUTES,
+        "effective_minutes": project.idle_seal_minutes or idlepolicy.default_minutes(),
     }
 
 
