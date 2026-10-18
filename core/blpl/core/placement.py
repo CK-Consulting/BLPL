@@ -158,6 +158,13 @@ def footprint_box(
 
     courtyard: list[tuple[float, float]] = []
     everything: list[tuple[float, float]] = []
+    # Every pad's full copper, corner to corner. Kept apart from the courtyard
+    # and joined with it at the end, because a vendor courtyard can be drawn
+    # tighter than the pads: the Wio-LR2021's stops at y = 4.49 while its pad
+    # row is centred at 4.72, so a part measured by courtyard alone let the
+    # XIAO's castellations sit on the radio's pads, and KiCad found them
+    # shorted on a board this module had placed as clear.
+    pad_copper: list[tuple[float, float]] = []
 
     def points(node) -> list[tuple[float, float]]:
         """Every coordinate under a shape, including nested ``(pts ...)``.
@@ -197,7 +204,13 @@ def footprint_box(
         if not isinstance(node, list):
             return
         tag = node[0] if node and isinstance(node[0], str) else ""
-        if tag in ("fp_line", "fp_rect", "fp_poly", "fp_circle", "fp_arc", "pad"):
+        if tag == "pad":
+            box = _pad_box(node)
+            if box:
+                pad_copper.extend(box)
+                everything.extend(box)
+            return
+        if tag in ("fp_line", "fp_rect", "fp_poly", "fp_circle", "fp_arc"):
             pts = points(node)
             if tag == "fp_circle" and len(pts) >= 2:
                 # A circle gives a centre and a point on the circumference, not
@@ -216,7 +229,7 @@ def footprint_box(
             walk(child)
 
     walk(fp)
-    pts = courtyard or everything
+    pts = courtyard + pad_copper if courtyard else everything
     if not pts:
         return None
     xs = [p[0] for p in pts]
@@ -234,6 +247,29 @@ def footprint_box(
         # quietly disables the collision check.
         return None
     return (w, h, dx, dy)
+
+
+def _pad_box(pad) -> list[tuple[float, float]] | None:
+    """A pad's two opposite corners, from its centre and its size.
+
+    Read as its centre alone — which is what a pad's ``(at ...)`` is — every
+    pad was a point, and a part measured by its pads came out half a pad
+    smaller on every side than the copper it puts down.
+    """
+    at = sexpr.find(pad, "at")
+    size = sexpr.find(pad, "size")
+    try:
+        x, y = float(at[1]), float(at[2])
+        w, h = float(size[1]), float(size[2])
+        angle = float(at[3]) if len(at) > 3 else 0.0
+    except (TypeError, IndexError, ValueError):
+        return None
+    # The rotated rectangle's own axis-aligned bounds, from the exact angle.
+    # Rounding first sent 89.6 degrees down the 90-degree branch, which only
+    # swaps width and height and so comes out smaller than the copper.
+    c, s = abs(math.cos(math.radians(angle))), abs(math.sin(math.radians(angle)))
+    w, h = w * c + h * s, w * s + h * c
+    return [(x - w / 2, y - h / 2), (x + w / 2, y + h / 2)]
 
 
 def footprint_extent(
