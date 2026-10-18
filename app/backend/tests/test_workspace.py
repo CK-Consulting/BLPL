@@ -818,3 +818,69 @@ def test_an_open_request_holds_the_project_before_the_desktop_has_seen_it(unlock
     old = time.time() - main.KICAD_OPEN_HOLD_S - 5
     os.utime(request, (old, old))
     assert _seal_now(unlocked)["sealed"] is True
+
+
+# ---------------------------------------------------------------- idle limit
+
+
+def test_the_idle_limit_is_the_owners_to_set_and_validated(unlocked):
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    st = unlocked.get("/api/projects/mine/git/status").json()
+    assert st["idle_seal_minutes"] is None and st["idle_seal_default"] == 60
+
+    r = unlocked.put("/api/projects/mine/idle-seal", json={"minutes": 90})
+    assert r.status_code == 200 and r.json()["effective_minutes"] == 90
+    assert unlocked.get("/api/projects/mine/git/status").json()["idle_seal_minutes"] == 90
+
+    assert unlocked.put("/api/projects/mine/idle-seal", json={"minutes": 2}).status_code == 400
+    assert unlocked.put("/api/projects/mine/idle-seal", json={"minutes": 5000}).status_code == 400
+    r = unlocked.put("/api/projects/mine/idle-seal", json={"minutes": None})
+    assert r.json()["effective_minutes"] == 60
+
+
+def test_a_member_cannot_change_the_idle_limit(unlocked, second_user):
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    _share(unlocked, second_user)
+    assert second_user.put("/api/projects/mine/idle-seal", json={"minutes": 90}).status_code == 403
+
+
+def test_every_seal_is_recorded_with_its_reason(unlocked):
+    # Only unseals were recorded, so how often and why a project re-locked
+    # could be read only from container logs, which a redeploy deletes.
+    import app.main as main
+    from app.db import SessionFactory
+    from app.models import Project, ProjectActivity
+    from sqlalchemy import select
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    unlocked.put("/api/projects/mine/files/a.md", json={"content": "x\n"})
+    assert _seal_now(unlocked)["sealed"] is True
+    with SessionFactory() as s:
+        pid = s.scalar(select(Project.id).where(Project.name == "mine"))
+        rows = s.scalars(select(ProjectActivity).where(
+            ProjectActivity.project_id == pid, ProjectActivity.kind == "sealed")).all()
+    assert len(rows) == 1 and rows[0].detail.startswith("sealed by ")
+    assert not (main.PROJECTS_ROOT / "mine").exists()
+
+
+def test_the_idle_sweep_seals_by_the_projects_own_limit(unlocked):
+    import app.main as main
+    from app.db import SessionFactory
+    from app.models import ProjectActivity
+    from sqlalchemy import select
+
+    unlocked.post("/api/projects/init", json=init_body("mine"))
+    unlocked.put("/api/projects/mine/files/a.md", json={"content": "x\n"})
+    unlocked.put("/api/projects/mine/idle-seal", json={"minutes": 120})
+    entry = main.workspaces._open["mine"]
+
+    entry.last_touched -= timedelta(minutes=90)
+    main._seal_idle_workspaces()
+    assert (main.PROJECTS_ROOT / "mine").exists(), "90 min idle is inside a 120 min limit"
+
+    entry.last_touched -= timedelta(minutes=40)
+    main._seal_idle_workspaces()
+    assert not (main.PROJECTS_ROOT / "mine").exists()
+    with SessionFactory() as s:
+        detail = s.scalars(select(ProjectActivity.detail).where(ProjectActivity.kind == "sealed")).all()
+    assert detail and "limit 120" in detail[-1]

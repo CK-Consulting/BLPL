@@ -210,7 +210,7 @@ services:
       - BLPL_PROJECT_MOUNT=${BLPL_PROJECT_MOUNT:-}
       # With the agent on, the backend is what stops and seals idle
       # workspaces, so it reads this rather than the worker.
-      - BLPL_SANDBOX_IDLE_S=${BLPL_SANDBOX_IDLE_S:-900}
+      - BLPL_SANDBOX_IDLE_S=${BLPL_SANDBOX_IDLE_S:-3600}
       # Whether runs leave through Squid. The backend then answers Squid's
       # per-run egress questions on BLPL_EGRESS_SOCKET, and refuses at save an
       # LLM endpoint no run could reach (plain http, a private address).
@@ -428,7 +428,7 @@ services:
       # Reached directly on blpl-egress, not through squid. Neither holds a
       # secret, and clamd does not speak HTTP.
       - BLPL_SANDBOX_NO_PROXY=ollama,clamav,localhost,127.0.0.1
-      - BLPL_SANDBOX_IDLE_S=${BLPL_SANDBOX_IDLE_S:-900}
+      - BLPL_SANDBOX_IDLE_S=${BLPL_SANDBOX_IDLE_S:-3600}
       # Phase 3: workspaces run their agent, and file, git and run requests
       # reach the project through it. Needs BLPL_RUNS_IN_WORKSPACE=1 too.
       # Agent directories (socket, start token) live in data/agents, which

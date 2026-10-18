@@ -546,3 +546,20 @@ def test_only_a_container_that_started_and_finished_reports_its_exit_code():
                    {**done, "Error": "OCI runtime create failed"}, {**done, "StartedAt": ""},
                    {k: v for k, v in done.items() if k != "ExitCode"}):
         assert observed_exit(broken) == -1, broken
+
+
+def test_sweep_takes_each_projects_own_idle_limit():
+    # One number for every workspace was only ever the default: a project may
+    # set its own limit, and the sweep asks per workspace.
+    clock, d = Clock(), FakeDriver()
+    tracker = idle.IdleTracker(clock)
+    short, long_ = WorkspaceKey("short"), WorkspaceKey("long")
+    run(d.ensure(spec(short)))
+    run(d.ensure(spec(long_)))
+    limits = {"short": 60.0, "long": 600.0}
+    by_key = lambda k: limits[k.project]  # noqa: E731
+    assert run(idle.sweep(d, tracker, idle_after_s=by_key)) == []
+    clock.t += 120
+    assert run(idle.sweep(d, tracker, idle_after_s=by_key)) == [short]
+    clock.t += 600
+    assert run(idle.sweep(d, tracker, idle_after_s=by_key)) == [long_]
