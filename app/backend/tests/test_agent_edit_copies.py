@@ -190,3 +190,26 @@ def test_kicad_edit_proposals_are_shown_live():
     from app import chat
 
     assert "propose_kicad_edit" in chat._PROPOSING_TOOLS
+
+
+def test_a_multi_board_project_copies_the_named_boards_published_files(tmp_path):
+    for b in ("core", "sb-ant"):
+        (tmp_path / b / "kicad").mkdir(parents=True)
+        (tmp_path / b / "kicad" / f"{b}.kicad_pcb").write_text(BOARD)
+    ctx = _ctx(tmp_path)
+    with pytest.raises(ToolDenied, match="core, sb-ant"):
+        run(edit_copies._make_edit_copies(ctx, {}))
+    run(edit_copies._make_edit_copies(ctx, {"board": "sb-ant"}))
+    assert (tmp_path / "sb-ant/kicad/sb-ant_edit.kicad_pcb").exists()
+    assert not (tmp_path / "core/kicad/core_edit.kicad_pcb").exists()
+    out = run(edit_copies._propose_kicad_edit(ctx, {
+        "path": "sb-ant/kicad/sb-ant_edit.kicad_pcb", "operations": [{"op": "delete", "uuid": "seg-1"}]}))
+    assert "Proposed an edit to sb-ant/kicad/sb-ant_edit.kicad_pcb" in out
+
+
+def test_an_edit_copy_that_is_a_link_is_never_written_through(project):
+    (project / "board.md").write_text("design")
+    (project / "kicad/b_edit.kicad_pcb").symlink_to(project / "board.md")
+    with pytest.raises(ToolDenied, match="not written through"):
+        run(edit_copies._make_edit_copies(_ctx(project), {"overwrite": True}))
+    assert (project / "board.md").read_text() == "design"

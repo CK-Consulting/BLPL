@@ -12,3 +12,13 @@ describe("what a failed run asks the chat about", () => {
     expect(ref).not.toContain("run_");
   });
 });
+
+describe("board-qualified references", () => {
+  it("names the board's own report and published folder", async () => {
+    const { askReference } = await import("../App");
+    expect(runReference("run_2", 1, [], "sb-ant")).toContain("`.pipeline/validation_report.sb-ant.json`");
+    expect(askReference("board", null, "sb-ant")).toBe("the emitted board under `sb-ant/kicad/`");
+    expect(askReference("bom", null, "sb-ant")).toBe("`.pipeline/bom.sb-ant.json`");
+    expect(askReference("bom", null, null)).toBe("`.pipeline/bom.json`");
+  });
+});

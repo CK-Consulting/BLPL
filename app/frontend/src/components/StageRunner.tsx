@@ -6,7 +6,7 @@ import { RunLog } from "./RunLog";
 import { RunProgress } from "./RunProgress";
 import { Verbosity, classifyAll, progress } from "../runlog";
 import { expandRange } from "../stages";
-import { withBoard } from "../board";
+import { boardArtifact, withBoard } from "../board";
 
 /**
  * Runs pipeline work and streams its log to the screen as it happens — either a
@@ -247,7 +247,7 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
       {!running && (exitCode !== null ? exitCode !== 0 : lines.some((l) => l.startsWith("error:"))) && (
         <p className="ask-chat-row">
           <AskChatButton
-            reference={runReference(lastRun, exitCode, lines)}
+            reference={runReference(lastRun, exitCode, lines, board)}
             label="Ask chat agent about this run"
           />
         </p>
@@ -261,9 +261,14 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
 /** What "Ask chat agent about this run" refers to. The id is only ever this
  *  launch's: a launch refused before it started (a 400, a 409) has none, and
  *  naming the previous run instead pointed the agent at an unrelated one. */
-export function runReference(runId: string | null, exitCode: number | null, lines: string[]): string {
+export function runReference(
+  runId: string | null,
+  exitCode: number | null,
+  lines: string[],
+  board: string | null = null,
+): string {
   if (runId) {
-    return `the pipeline run ${runId}${exitCode !== null ? ` (exit ${exitCode})` : ""} (read its log with read_run_log) and \`.pipeline/validation_report.json\``;
+    return `the pipeline run ${runId}${exitCode !== null ? ` (exit ${exitCode})` : ""} (read its log with read_run_log) and \`${boardArtifact(".pipeline/validation_report.json", board)}\``;
   }
   const error = (lines.find((l) => l.startsWith("error:")) ?? "").slice(0, 300);
   return `a pipeline run that failed to start: ${error}`;

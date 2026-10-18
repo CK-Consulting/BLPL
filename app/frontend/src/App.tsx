@@ -46,6 +46,7 @@ import {
 } from "./components/FileTree";
 import { useResizable } from "./useResizable";
 import { Project, getJSON } from "./api";
+import { boardArtifact } from "./board";
 
 export default function App() {
   // Null means the dashboard. Opening a project is always a deliberate act:
@@ -364,7 +365,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
                 onSelect={setTab}
               />
               <div className="ask-chat-row">
-                <AskChatButton reference={askReference(tab, openFile?.path ?? null)} />
+                <AskChatButton reference={askReference(tab, openFile?.path ?? null, board)} />
               </div>
               {tab === "board" && (
                 <DesignView
@@ -477,24 +478,27 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
 
 
 /** What "Ask chat agent about this" refers to on each tab: the file it shows,
- *  or the artifact behind it. */
-export function askReference(tab: string, openPath: string | null): string {
+ *  or the artifact behind it, qualified by the active board as the panels
+ *  load them (`<board>/kicad/`, `.pipeline/<name>.<board>.json`). */
+export function askReference(tab: string, openPath: string | null, board: string | null = null): string {
+  const art = (name: string) => `\`${boardArtifact(name, board)}\``;
+  const kicad = board ? `\`${board}/kicad/\`` : "`kicad/`";
   switch (tab) {
     case "edit":
     case "kicad":
       return openPath ? `\`${openPath}\`` : "";
     case "board":
-      return "the emitted board under `kicad/`";
+      return `the emitted board under ${kicad}`;
     case "preflight":
       return "the Preflight checks";
     case "bom":
-      return "`.pipeline/bom.json`";
+      return art(".pipeline/bom.json");
     case "lifecycle":
       return "`lifecycle.md`";
     case "modules":
       return "the module library";
     case "reports":
-      return "the reports (`.pipeline/review.md`, `.pipeline/validation_report.json`, `.pipeline/open_connections.json`)";
+      return `the reports (${art(".pipeline/review.md")}, ${art(".pipeline/validation_report.json")}, ${art(".pipeline/open_connections.json")})`;
     case "release":
       return "the release package";
     case "artifacts":

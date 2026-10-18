@@ -47,11 +47,36 @@ def _rel(ctx: ToolContext, p: Path) -> str:
     return p.resolve().relative_to(ctx.project_dir.resolve()).as_posix()
 
 
-def _emitted(ctx: ToolContext) -> list[Path]:
-    """The emitted project's files under kicad/, originals only."""
-    kicad = ctx.project_dir / "kicad"
-    if not kicad.is_dir():
-        raise ToolDenied("there is no emitted project under kicad/ yet: run the pipeline through stage 6")
+def _published_dir(ctx: ToolContext, board: str | None) -> Path:
+    """Where the emitted project is published: kicad/ for a single-board
+    project, <board>/kicad/ for each board of a declared multi-board one.
+
+    Only the root kicad/ was looked at, so every multi-board project was
+    refused after a successful run (Codex, PR #50).
+    """
+    root = ctx.project_dir
+    if board:
+        if "/" in board or "\\" in board or board.startswith("."):
+            raise ToolDenied(f"{board!r} is not a board name")
+        kicad = root / board / "kicad"
+        if not kicad.is_dir():
+            raise ToolDenied(f"board {board!r} has no emitted project under {board}/kicad/ yet")
+        return kicad
+    if (root / "kicad").is_dir():
+        return root / "kicad"
+    boards = sorted(d.name for d in root.iterdir()
+                    if d.is_dir() and not d.name.startswith(".") and (d / "kicad").is_dir())
+    if len(boards) == 1:
+        return root / boards[0] / "kicad"
+    if boards:
+        raise ToolDenied("this project publishes several boards (" + ", ".join(boards)
+                         + "); say which with board")
+    raise ToolDenied("there is no emitted project under kicad/ yet: run the pipeline through stage 6")
+
+
+def _emitted(ctx: ToolContext, board: str | None = None) -> list[Path]:
+    """The emitted project's files, originals only."""
+    kicad = _published_dir(ctx, board)
     return sorted(p for p in kicad.iterdir()
                   if p.suffix in COPYABLE and not p.stem.endswith(EDIT_SUFFIX))
 
@@ -79,15 +104,19 @@ def _edit_file(ctx: ToolContext, name: str, suffixes: tuple[str, ...]) -> Path:
 async def _make_edit_copies(ctx: ToolContext, args: dict) -> str:
     overwrite = bool(args.get("overwrite"))
     made, kept = [], []
-    for src in _emitted(ctx):
+    for src in _emitted(ctx, (str(args.get("board") or "").strip() or None)):
         # A link is refused, and the source is checked as well as the
         # destination: copying follows the link, and a kicad/ file pointing
         # outside the project would put that file in a readable copy (Codex,
         # PR #50).
         if src.is_symlink():
-            raise ToolDenied(f"kicad/{src.name} is a symbolic link; it is not copied")
+            raise ToolDenied(f"{src.parent.name}/{src.name} is a symbolic link; it is not copied")
         ctx.sandbox.check_read(src)
         dst = src.with_name(f"{src.stem}{EDIT_SUFFIX}{src.suffix}")
+        # Nor through a link at the destination: copying follows it, so an
+        # _edit link to board.md would have overwritten board.md (Codex, PR #50).
+        if dst.is_symlink():
+            raise ToolDenied(f"{dst.parent.name}/{dst.name} is a symbolic link; it is not written through")
         ctx.sandbox.check_write(dst)
         if dst.exists() and not overwrite:
             kept.append(_rel(ctx, dst))
@@ -350,14 +379,17 @@ def edit_copy_tools() -> list[ToolSpec]:
         ToolSpec(
             name="make_edit_copies",
             description=(
-                "Copy the latest emitted KiCad project under kicad/ (.kicad_pcb, .kicad_sch, "
-                ".kicad_pro) to <name>_edit.<ext> beside it, for fixing ERC/DRC findings with the "
+                "Copy the latest emitted KiCad project — kicad/, or <board>/kicad/ for a board of "
+                "a multi-board project — (.kicad_pcb, .kicad_sch, .kicad_pro) to <name>_edit.<ext> "
+                "beside it, for fixing ERC/DRC findings with the "
                 "user. Existing copies are kept unless overwrite is true (which discards their "
                 "edits). Follow the erc-drc-resolution skill: edit only the copies, and tell the "
                 "user that re-running the pipeline regenerates the originals with the same "
                 "problems and does not update the copies."
             ),
             input_schema={"type": "object", "properties": {
+                "board": {"type": "string", "description": (
+                    "For a multi-board project, the board whose <board>/kicad/ to copy.")},
                 "overwrite": {"type": "boolean", "description": "Replace existing _edit copies."}}},
             kind="file_mutation",
             handler=_make_edit_copies,
