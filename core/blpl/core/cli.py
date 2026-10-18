@@ -988,7 +988,9 @@ def _cmd_stage7(args: argparse.Namespace) -> int:
             return "skipped"
         if r["ok"]:
             return "ok"
-        return f"fail (exit={r.get('exit_code')})"
+        count = r.get("violation_count")
+        return (f"fail ({count} violations, exit={r.get('exit_code')})" if count is not None
+                else f"fail (exit={r.get('exit_code')})")
 
     klc_label = _label(report["klc_symbols"])
     erc_label = _label(report["erc"])
