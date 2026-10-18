@@ -1717,6 +1717,28 @@ def _packaged_skills() -> dict[str, Path]:
     return {d.name: d / "SKILL.md" for d in sorted(root.iterdir()) if (d / "SKILL.md").is_file()}
 
 
+async def _trace_reference_circuit(ctx: ToolContext, args: dict) -> str:
+    """A part's reference circuit, traced from a KiCad schematic in the project."""
+    import asyncio
+
+    from blpl.core import reference_circuit
+
+    target = _readable_file(ctx, str(args.get("path", "")))
+    rel = _rel(ctx, target)
+    _guard_ignored(ctx, rel, args)
+    if target.suffix != ".kicad_sch":
+        raise ToolDenied(f"{rel} is not a KiCad schematic (.kicad_sch)")
+    part = str(args.get("part") or "").strip()
+    if not part:
+        raise ToolDenied("part is required: the refdes, MPN or value of the part to trace around")
+    try:
+        parts = await asyncio.to_thread(reference_circuit.load, target)
+        result = reference_circuit.trace(parts, part, hops=1 if args.get("hops", 1) else 0)
+    except reference_circuit.ReferenceError as exc:
+        raise ToolDenied(str(exc)) from exc
+    return _framed(ctx, rel, reference_circuit.markdown(result, rel))
+
+
 async def _read_skill(ctx: ToolContext, args: dict) -> str:
     """One packaged skill's instructions, for the agent to follow.
 
@@ -2176,6 +2198,30 @@ def parts_tools() -> list[ToolSpec]:
             },
             kind="file_read",
             handler=_suggest_footprint,
+        ),
+        ToolSpec(
+            name="trace_reference_circuit",
+            description=(
+                "Trace the circuit around a part in a vendor's KiCad reference schematic "
+                "(a module's own .kicad_sch, an evaluation board) in the project: pin by pin, "
+                "every part on that pin's net with its value, footprint and other end, one step "
+                "further through series parts, and candidate Connections rows citing the file. "
+                "Use it instead of reading a schematic file by eye. Net names are the "
+                "reference's: map them to the design's before using a row."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "e.g. references/XIAO_nRF54LM20A.kicad_sch"},
+                    "part": {"type": "string", "description": "Refdes, MPN or value, e.g. U8 or nRF54LM20A."},
+                    "hops": {"type": "integer", "description": "1 (default) follows series parts one step; 0 does not."},
+                    "user_named_file": _USER_NAMED_FILE,
+                },
+                "required": ["path", "part"],
+            },
+            kind="file_read",
+            handler=_trace_reference_circuit,
+            path_args=("path",),
         ),
         ToolSpec(
             name="read_skill",
