@@ -85,7 +85,8 @@ def test_operations_become_a_proposal_that_parses(project):
     assert sexpr.find(fp, "at")[1:3] == ["12.5", "8"]
     assert sexpr.find_all(tree, "via") and not sexpr.find_all(tree, "segment")
     via = sexpr.find_all(tree, "via")[0]
-    assert sexpr.find(via, "net") == ["net", "1", '"GND"']
+    # A board with a net table refers to nets by number only (Codex, PR #50).
+    assert sexpr.find(via, "net") == ["net", "1"]
     # The original copy is untouched until the user accepts.
     assert (project / "kicad/b_edit.kicad_pcb").read_text() == BOARD
 
@@ -114,4 +115,45 @@ def test_the_skill_is_readable_and_the_tools_are_registered():
 
     assert "erc-drc-resolution" in _packaged_skills()
     names = {t.name for t in default_tools()}
-    assert {"make_edit_copies", "propose_kicad_edit", "run_checks_on_edit"} <= names
+    assert {"make_edit_copies", "propose_kicad_edit", "run_checks_on_edit", "read_run_log"} <= names
+
+
+def test_a_check_that_writes_no_report_is_a_failure_not_a_clean_result(project, monkeypatch):
+    from blpl.core import stage7_validate
+
+    ctx = _ctx(project)
+    run(edit_copies._make_edit_copies(ctx, {}))
+    monkeypatch.setattr(stage7_validate, "_run_drc", lambda pcb, out: {
+        "ok": False, "skipped": False, "exit_code": 3, "stderr_tail": "Failed to load board"})
+    out = run(edit_copies._run_checks_on_edit(ctx, {"path": "kicad/b_edit.kicad_pcb"}))
+    assert "FAILED" in out and "exited 3" in out and "Failed to load board" in out
+    assert "0 violation" not in out
+
+
+def test_a_run_log_is_readable_for_this_project_only(client, tmp_path, monkeypatch):
+    from conftest import init_body, sign_in
+
+    from app.db import SessionFactory
+    from app.models import Project, Run
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("mine"))
+    monkeypatch.setenv("BLPL_DATA_ROOT", str(tmp_path))
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs" / "run_abc.log").write_text("==> stage7\nstage7: FAIL drc\n")
+    with SessionFactory() as s:
+        from sqlalchemy import select
+
+        pid = s.scalar(select(Project.id).where(Project.name == "mine"))
+        s.add(Run(id="run_abc", project_id=pid, kind="pipeline", cmd=[], status="done", exit_code=1))
+        s.commit()
+    mine = ToolContext(project_id="mine", project_dir=tmp_path,
+                       sandbox=FilesystemSandbox(manifest=ReferenceManifest(project_id="mine", workspace_root=tmp_path)),
+                       conversation="c.jsonl")
+    out = run(edit_copies._read_run_log(mine, {"run_id": "run_abc"}))
+    assert "exit 1" in out and "stage7: FAIL drc" in out
+    other = ToolContext(project_id="theirs", project_dir=tmp_path,
+                        sandbox=FilesystemSandbox(manifest=ReferenceManifest(project_id="theirs", workspace_root=tmp_path)),
+                        conversation="c.jsonl")
+    with pytest.raises(ToolDenied, match="no run"):
+        run(edit_copies._read_run_log(other, {"run_id": "run_abc"}))

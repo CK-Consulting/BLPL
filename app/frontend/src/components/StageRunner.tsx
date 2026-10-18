@@ -81,6 +81,7 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
 
   const run = useCallback(async () => {
     setLines([]);
+    setLastRun(null);
     setExitCode(null);
     setRunning(true);
 
@@ -246,7 +247,7 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
       {!running && (exitCode !== null ? exitCode !== 0 : lines.some((l) => l.startsWith("error:"))) && (
         <p className="ask-chat-row">
           <AskChatButton
-            reference={`the pipeline run${lastRun ? ` ${lastRun}` : ""}${exitCode !== null ? ` (exit ${exitCode})` : ""}: its log and \`.pipeline/validation_report.json\``}
+            reference={runReference(lastRun, exitCode, lines)}
             label="Ask chat agent about this run"
           />
         </p>
@@ -254,4 +255,16 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
       <RunLog lines={classified} verbosity={verbosity} onVerbosityChange={setVerbosity} />
     </div>
   );
+}
+
+
+/** What "Ask chat agent about this run" refers to. The id is only ever this
+ *  launch's: a launch refused before it started (a 400, a 409) has none, and
+ *  naming the previous run instead pointed the agent at an unrelated one. */
+export function runReference(runId: string | null, exitCode: number | null, lines: string[]): string {
+  if (runId) {
+    return `the pipeline run ${runId}${exitCode !== null ? ` (exit ${exitCode})` : ""} (read its log with read_run_log) and \`.pipeline/validation_report.json\``;
+  }
+  const error = (lines.find((l) => l.startsWith("error:")) ?? "").slice(0, 300);
+  return `a pipeline run that failed to start: ${error}`;
 }

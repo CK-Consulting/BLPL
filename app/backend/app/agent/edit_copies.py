@@ -104,11 +104,17 @@ async def _make_edit_copies(ctx: ToolContext, args: dict) -> str:
 
 
 def _net_ref(board: sexpr.Sexp, name: str) -> list:
-    """How this board names a net: (net N "NAME") before KiCad 10, (net "NAME") after."""
+    """How a track or via on this board names its net.
+
+    A board with a top-level net table (``(net N "NAME")``, BLPL's emitter and
+    KiCad before 10) refers to a net by its number alone — ``(net N)``; the name
+    belongs only in the table, and a track carrying both does not load (Codex,
+    PR #50). A KiCad 10 board has no table and names the net: ``(net "NAME")``.
+    """
     for node in board:
         if isinstance(node, list) and node and node[0] == "net" and len(node) >= 3:
             if sexpr.unquote(str(node[2])) == name:
-                return ["net", str(node[1]), sexpr.quote(name)]
+                return ["net", str(node[1])]
     return ["net", sexpr.quote(name)]
 
 
@@ -252,7 +258,15 @@ async def _run_checks_on_edit(ctx: ToolContext, args: dict) -> str:
             check = "ERC"
         if result.get("skipped"):
             return f"{check} did not run: {result.get('reason')}"
-        data = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {}
+        if not out.exists():
+            # kicad-cli could not load the file, so it wrote no report. That is a
+            # failed check, never a clean one: read as an empty report it said
+            # "0 violations" about a file KiCad cannot open (Codex, PR #50).
+            detail = (result.get("stderr_tail") or result.get("stdout_tail") or "").strip()
+            return (f"{check} FAILED on {_rel(ctx, target)}: kicad-cli exited "
+                    f"{result.get('exit_code')} and wrote no report, so the file probably does "
+                    f"not load. {detail[-800:]}")
+        data = json.loads(out.read_text(encoding="utf-8"))
     if check == "DRC":
         violations = data.get("violations") or []
         unconnected = data.get("unconnected_items") or []
@@ -271,6 +285,46 @@ async def _run_checks_on_edit(ctx: ToolContext, args: dict) -> str:
         items = " ↔ ".join(i.get("description", "") for i in u.get("items") or [])
         lines.append(f"- unconnected: {items}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- run logs
+
+
+def _runs_dir() -> Path:
+    import os
+
+    return Path(os.environ.get("BLPL_DATA_ROOT", "/app/data")) / "runs"
+
+
+async def _read_run_log(ctx: ToolContext, args: dict) -> str:
+    """A pipeline run's log, for a run of this project only.
+
+    Run logs live outside the project (``data/runs``), where the agent's file
+    tools cannot reach, so "Ask chat agent about this run" pointed it at
+    evidence it could not read (Codex, PR #50).
+    """
+    from .. import runqueue
+    from ..db import SessionFactory
+    from ..models import Project, Run
+
+    run_id = str(args.get("run_id") or "").strip()
+    if not run_id:
+        raise ToolDenied("run_id is required (the id shown in Run history, e.g. run_0e01cad37255)")
+    with SessionFactory() as session:
+        run = session.get(Run, run_id)
+        project = session.get(Project, run.project_id) if run is not None else None
+        if run is None or project is None or project.name != ctx.project_id:
+            raise ToolDenied(f"no run {run_id} in this project")
+        header = (f"Run {run.id} ({run.kind}): {run.status}, exit {run.exit_code}, "
+                  f"started {run.started_at}, ended {run.ended_at}")
+    path = runqueue.log_path(_runs_dir(), run_id)
+    if not path.is_file():
+        return header + "\n(no log was written for this run)"
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    limit = max(20, min(int(args.get("tail") or 400), 2000))
+    shown = lines[-limit:]
+    cut = f"(last {len(shown)} of {len(lines)} lines)\n" if len(lines) > len(shown) else ""
+    return header + "\n" + cut + "\n".join(shown)
 
 
 # ---------------------------------------------------------------- specs
@@ -321,6 +375,20 @@ def edit_copy_tools() -> list[ToolSpec]:
             handler=_propose_kicad_edit,
             path_args=("path",),
             write_args=("path",),
+        ),
+        ToolSpec(
+            name="read_run_log",
+            description=(
+                "Read a pipeline run's log by its run id (as shown in Run history), for a run "
+                "of this project: status, exit code and the output, last 400 lines by default. "
+                "Run logs are not project files, so read them with this, not read_project_file."
+            ),
+            input_schema={"type": "object", "properties": {
+                "run_id": {"type": "string"},
+                "tail": {"type": "integer", "description": "Lines from the end, 20-2000."}},
+                "required": ["run_id"]},
+            kind="query",
+            handler=_read_run_log,
         ),
         ToolSpec(
             name="run_checks_on_edit",

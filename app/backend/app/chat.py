@@ -183,7 +183,8 @@ at a report (validation_report, open_connections, drc_report, erc_report, \
 autoroute_report), call read_skill("erc-drc-resolution") and follow it: \
 summarise the findings, then fix them one group at a time with the user, on \
 _edit copies made by make_edit_copies, edited with propose_kicad_edit and \
-measured with run_checks_on_edit. Tell the user these are fixes to copies: \
+measured with run_checks_on_edit. A run named by its id is read with \
+read_run_log. Tell the user these are fixes to copies: \
 re-running the pipeline regenerates the originals with the same problems.
 - Match the design documents' existing conventions rather than imposing new ones.
 - **Check a document before you propose it, and keep checking until it is \

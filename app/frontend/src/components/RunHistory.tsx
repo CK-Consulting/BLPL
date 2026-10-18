@@ -129,7 +129,7 @@ export function RunHistory({ projectId, reloadToken }: Props) {
             )}
             {!r.running && r.exit_code !== null && r.exit_code > 0 && (
               <AskChatButton
-                reference={`the ${r.kind} run ${r.id} (exit ${r.exit_code}): its log and \`.pipeline/validation_report.json\``}
+                reference={`the ${r.kind} run ${r.id} (exit ${r.exit_code}; read its log with read_run_log) and \`.pipeline/validation_report.json\``}
                 label="Ask chat agent about this run"
               />
             )}
