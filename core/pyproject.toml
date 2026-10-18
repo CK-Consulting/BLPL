@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Board Layer Pipe Line — markdown-to-KiCad hardware design pipeline."
 # The headless pipeline: future repository "blpl-core". The LLM agent layer
 # (blpl.agent) ships here too, behind the llm-* extras, for now.
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "pyyaml>=6.0",
     "jsonschema>=4.21",

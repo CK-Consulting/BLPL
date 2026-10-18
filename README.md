@@ -41,7 +41,7 @@ Hardware projects usually live in two disconnected worlds: narrative design docs
 
 ```bash
 # From the repo root
-uv venv --python 3.11 .venv
+uv venv --python 3.13 .venv
 uv pip install -e "./core[dev,all-llm]"
 blpl --help
 ```
