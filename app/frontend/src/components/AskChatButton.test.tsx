@@ -25,3 +25,20 @@ describe("the ask-chat button", () => {
     expect(takePending()).toMatchObject({ mode: "current" });
   });
 });
+
+describe("how the Ask control is drawn", () => {
+  it("is an ordinary button, not a link", () => {
+    render(<AskChatButton reference="`board.md`" />);
+    expect(screen.getByRole("button", { name: "Ask chat agent about this" }).className).not.toMatch(/link/);
+  });
+
+  it("keeps its row to its own height in the viewer", async () => {
+    // jsdom computes no layout, so the rule itself is what is checked: without
+    // it `.viewer > *:not(.tabs)` gave the row half the pane. Read from disk,
+    // because vitest hands a test an empty string for any imported CSS.
+    // @ts-expect-error -- node's fs, present under vitest; the app has no node types
+    const fs = await import("node:fs");
+    const css: string = fs.readFileSync("src/styles.css", "utf8");
+    expect(css).toMatch(/\.viewer > \.ask-chat-row \{ flex: 0 0 auto; \}/);
+  });
+});

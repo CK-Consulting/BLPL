@@ -21,15 +21,15 @@ export function AskChatButton({ reference, label = "Ask chat agent about this" }
   };
   return (
     <span className="ask-chat">
-      <button type="button" className="link small" onClick={click} title={`Ask the chat agent about ${reference}`}>
+      <button type="button" onClick={click} title={`Ask the chat agent about ${reference}`}>
         {label}
       </button>
       {choosing && (
         <span className="ask-chat-choices" role="group" aria-label="Where to ask">
-          <button type="button" className="small" onClick={() => { setChoosing(false); askChat(reference, "current"); }}>
+          <button type="button" onClick={() => { setChoosing(false); askChat(reference, "current"); }}>
             Ask in current conversation
           </button>
-          <button type="button" className="small" onClick={() => { setChoosing(false); askChat(reference, "new"); }}>
+          <button type="button" onClick={() => { setChoosing(false); askChat(reference, "new"); }}>
             Ask in new conversation
           </button>
         </span>
