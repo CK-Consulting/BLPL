@@ -1732,11 +1732,27 @@ async def _trace_reference_circuit(ctx: ToolContext, args: dict) -> str:
     if not part:
         raise ToolDenied("part is required: the refdes, MPN or value of the part to trace around")
     try:
+        # Every sheet the export reads, checked before any of it is read: a
+        # trusted root can name an ignored or uploaded sheet, and its values and
+        # net names reach the model as surely as the root's (Codex, PR #53).
+        sources = await asyncio.to_thread(reference_circuit.sheets, target)
+        rels = []
+        for src in sources:
+            ctx.sandbox.check_read(src)
+            src_rel = _rel(ctx, src.resolve())
+            _guard_ignored(ctx, src_rel, args)
+            rels.append(src_rel)
         parts = await asyncio.to_thread(reference_circuit.load, target)
         result = reference_circuit.trace(parts, part, hops=1 if args.get("hops", 1) else 0)
     except reference_circuit.ReferenceError as exc:
         raise ToolDenied(str(exc)) from exc
-    return _framed(ctx, rel, reference_circuit.markdown(result, rel))
+    text = reference_circuit.markdown(result, rel)
+    if len(rels) > 1:
+        text += "\n\nRead from: " + ", ".join(rels)
+    # Framed as data if any sheet came from outside the project, not only when
+    # the root did.
+    outside = next((r for r in rels if llm_ignore.from_outside(ctx.project_dir, r)), None)
+    return llm_ignore.frame(ctx.project_dir, outside, text) if outside else text
 
 
 async def _read_skill(ctx: ToolContext, args: dict) -> str:
