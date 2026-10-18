@@ -1038,6 +1038,10 @@ header .kicad-launch { margin-left: .4rem; }
 }
 
 /* "Ask chat agent about this" (askChat.ts) */
-.ask-chat-row { display: flex; justify-content: flex-end; padding: 2px 8px; }
+/* Its own height and no more. `.viewer > *:not(.tabs)` gives every child of the
+   viewer a share of the pane, which made this one row take half of it and left
+   the tab underneath almost no room. */
+.viewer > .ask-chat-row { flex: 0 0 auto; }
+.ask-chat-row { display: flex; justify-content: flex-end; padding: 4px 8px; }
 .ask-chat { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .ask-chat-choices { display: inline-flex; gap: 4px; }
