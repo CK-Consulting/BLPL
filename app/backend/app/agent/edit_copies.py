@@ -21,16 +21,15 @@ fix this board. Three tools:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import shutil
-import tempfile
 import uuid
 from collections import Counter
 from pathlib import Path
 
 from blpl.emitter import sexpr
 
+from ..sandbox import toolrun
 from .toolspec import ToolContext, ToolDenied, ToolSpec
 
 #: What an edit copy can be. The project file is JSON, the others s-expressions.
@@ -299,30 +298,31 @@ async def _propose_kicad_edit(ctx: ToolContext, args: dict) -> str:
 
 
 async def _run_checks_on_edit(ctx: ToolContext, args: dict) -> str:
-    from blpl.core import stage7_validate
-
     target = _edit_file(ctx, str(args.get("path", "")), (".kicad_pcb", ".kicad_sch"))
-    with tempfile.TemporaryDirectory() as tmp:
-        out = Path(tmp) / "report.json"
-        # kicad-cli runs for up to two minutes; on the event loop that stalls
-        # every request, stream and chat the worker serves (Codex, PR #50).
-        if target.suffix == ".kicad_pcb":
-            result = await asyncio.to_thread(stage7_validate._run_drc, target, out)
-            check = "DRC"
-        else:
-            result = await asyncio.to_thread(stage7_validate._run_erc, target, out)
-            check = "ERC"
-        if result.get("skipped"):
-            return f"{check} did not run: {result.get('reason')}"
-        if not out.exists():
-            # kicad-cli could not load the file, so it wrote no report. That is a
-            # failed check, never a clean one: read as an empty report it said
-            # "0 violations" about a file KiCad cannot open (Codex, PR #50).
-            detail = (result.get("stderr_tail") or result.get("stdout_tail") or "").strip()
-            return (f"{check} FAILED on {_rel(ctx, target)}: kicad-cli exited "
-                    f"{result.get('exit_code')} and wrote no report, so the file probably does "
-                    f"not load. {detail[-800:]}")
-        data = json.loads(out.read_text(encoding="utf-8"))
+    out = ctx.project_dir / ".pipeline" / "edit-checks" / f"{target.name}.json"
+    ctx.sandbox.check_write(out)
+    # kicad-cli runs in the project's run container (sandbox/toolrun.py), off
+    # the event loop and away from the backend's secrets (Codex, PRs #50, #53).
+    # The report is written in the checkout, the one place both can see.
+    if target.suffix == ".kicad_pcb":
+        check, op, args_ = "DRC", "drc", {"pcb": str(target), "out": str(out)}
+    else:
+        check, op, args_ = "ERC", "erc", {"sch": str(target), "out": str(out)}
+    try:
+        result = await toolrun.call(ctx.project_dir, op, args_, timeout=600)
+    except toolrun.ToolRunError as exc:
+        return f"{check} did not run on {_rel(ctx, target)}: {exc}"
+    if result.get("skipped"):
+        return f"{check} did not run: {result.get('reason')}"
+    if not out.exists():
+        # kicad-cli could not load the file, so it wrote no report. That is a
+        # failed check, never a clean one: read as an empty report it said
+        # "0 violations" about a file KiCad cannot open (Codex, PR #50).
+        detail = (result.get("stderr_tail") or result.get("stdout_tail") or "").strip()
+        return (f"{check} FAILED on {_rel(ctx, target)}: kicad-cli exited "
+                f"{result.get('exit_code')} and wrote no report, so the file probably does "
+                f"not load. {detail[-800:]}")
+    data = json.loads(out.read_text(encoding="utf-8"))
     parity = []
     if check == "DRC":
         violations = data.get("violations") or []

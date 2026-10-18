@@ -40,6 +40,7 @@ from blpl.agent.tools.bom import HOUSES as HOUSES_FOR_SCHEMA
 from blpl.agent.tools.parts import fetch_datasheet, search_parts
 
 from .. import llm_ignore
+from ..sandbox import toolrun
 from ..components import ComponentError
 from .edit_copies import edit_copy_tools
 from .toolspec import ToolContext, ToolDenied, ToolSpec
@@ -1476,8 +1477,6 @@ async def _fab_readiness(ctx: ToolContext, args: dict) -> str:
 
 
 async def _simulate(ctx: ToolContext, args: dict) -> str:
-    from blpl.agent.tools.spice import simulate
-
     review = ctx.project_dir / ".pipeline" / "review"
     schematic_json = review / "schematic.json"
     if not schematic_json.is_file():
@@ -1489,15 +1488,18 @@ async def _simulate(ctx: ToolContext, args: dict) -> str:
     pcb_json = review / "pcb.json"
     mc = int(args.get("monte_carlo") or 0)
     ctx.note("simulating subcircuits" + (f" ({mc} tolerance samples each)" if mc else ""))
-    run = await _to_thread(
-        simulate,
-        schematic_json,
-        review / "spice.json",
-        pcb_json=pcb_json if pcb_json.is_file() else None,
-        types=[str(t) for t in (args.get("types") or [])] or None,
-        monte_carlo=mc,
-    )
-    return json.dumps(run.to_dict(), indent=2)[:20000]
+    # ngspice runs in the project's run container (sandbox/toolrun.py).
+    try:
+        run = await toolrun.call(ctx.project_dir, "simulate", {
+            "schematic_json": str(schematic_json),
+            "out": str(review / "spice.json"),
+            "pcb_json": str(pcb_json) if pcb_json.is_file() else None,
+            "types": [str(t) for t in (args.get("types") or [])] or None,
+            "monte_carlo": mc,
+        }, timeout=3600)
+    except toolrun.ToolRunError as exc:
+        raise ToolDenied(str(exc)) from exc
+    return json.dumps(run, indent=2)[:20000]
 
 
 async def _sourcing_gaps(ctx: ToolContext, args: dict) -> str:
@@ -1551,14 +1553,9 @@ async def _assembly_files(ctx: ToolContext, args: dict) -> str:
 
 
 async def _bulk_route(ctx: ToolContext, args: dict) -> str:
-    from blpl.core import autoroute
-
     pcbs = sorted(ctx.project_dir.glob("*.kicad_pcb"))
     if not pcbs:
         raise ToolDenied("this project has no .kicad_pcb yet — run stage6 first")
-    ok, why = await _to_thread(autoroute.available)
-    if not ok:
-        raise ToolDenied(why)
 
     # Same anchor the interactive KiCad edits use: an autoroute is the single
     # largest change anything can make to a board, and "undo it" has to mean
@@ -1575,10 +1572,18 @@ async def _bulk_route(ctx: ToolContext, args: dict) -> str:
 
     ctx.sandbox.check_write(pcbs[0])
     ctx.note("bulk routing — this can take several minutes")
-    result = await _to_thread(autoroute.route, pcbs[0], passes=int(args.get("passes") or 10))
+    # Freerouting and pcbnew run in the project's run container (sandbox/toolrun.py).
+    try:
+        result = await toolrun.call(ctx.project_dir, "autoroute",
+                                    {"pcb": str(pcbs[0]), "passes": int(args.get("passes") or 10)},
+                                    timeout=3 * 3600)
+    except toolrun.ToolRunError as exc:
+        raise ToolDenied(str(exc)) from exc
+    if "unavailable" in result:
+        raise ToolDenied(result["unavailable"])
     return json.dumps(
         {
-            **result.to_dict(),
+            **result,
             "next": (
                 "run stage7 to DRC the result — an autorouter optimises for completing "
                 "connections, not for a board that works"
@@ -1743,9 +1748,15 @@ async def _trace_reference_circuit(ctx: ToolContext, args: dict) -> str:
             src_rel = _rel(ctx, src.resolve())
             _guard_ignored(ctx, src_rel, args)
             rels.append(src_rel)
-        parts = await asyncio.to_thread(reference_circuit.load, target)
+        # kicad-cli reads the vendor's file in a run container, not here: it
+        # is native code over untrusted input (sandbox/toolrun.py).
+        raw = await toolrun.call(ctx.project_dir, "reference_load", {"sch": str(target)},
+                                 timeout=600)
+        parts = {ref: reference_circuit.Part(ref, p["value"], p["footprint"],
+                                             {pin: tuple(fn_net) for pin, fn_net in p["pins"].items()})
+                 for ref, p in raw.items()}
         result = reference_circuit.trace(parts, part, hops=1 if args.get("hops", 1) else 0)
-    except reference_circuit.ReferenceError as exc:
+    except (reference_circuit.ReferenceError, toolrun.ToolRunError) as exc:
         raise ToolDenied(str(exc)) from exc
     text = reference_circuit.markdown(result, rel)
     if len(rels) > 1:
