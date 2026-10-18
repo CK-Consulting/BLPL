@@ -235,6 +235,29 @@ _VALUE_TEXT = re.compile(
 )
 
 
+def _apply_assembly(components_out: dict, project_config: dict) -> None:
+    """Mark the parts project.yaml says are not simply bought and placed.
+
+    ``assembly.dnp`` — the footprint is on the board, the part is not fitted.
+    ``assembly.footprint_only`` — copper only: nothing is bought or placed
+    (J_DBG's Tag-Connect pads were written into a BOM note as "footprint only,
+    not purchased", which nothing downstream could read). The emitters carry
+    it into KiCad's own flags, and the release BOM leaves both out.
+    """
+    assembly = project_config.get("assembly") or {}
+    seen: dict[str, str] = {}
+    for kind in ("dnp", "footprint_only"):
+        for ref in assembly.get(kind) or []:
+            if ref not in components_out:
+                raise InvalidProjectConfigError(
+                    f"assembly.{kind} names {ref}, which is not a part on this board")
+            if ref in seen:
+                raise InvalidProjectConfigError(
+                    f"{ref} is in both assembly.{seen[ref]} and assembly.{kind}; choose one")
+            seen[ref] = kind
+            components_out[ref]["assembly"] = kind
+
+
 def _place_components(
     components_out: dict,
     nets_out: dict,
@@ -283,7 +306,9 @@ def _place_components(
 
     try:
         result = placement.place(
-            components_out, nets_out, board, footprint_roots=roots, hints=hints
+            components_out, nets_out, board, footprint_roots=roots, hints=hints,
+            edge_margin=float((project_config.get("placement") or {}).get(
+                "edge_margin", placement.DEFAULT_EDGE_MARGIN)),
         )
     except board_geometry.BoardGeometryError as exc:
         # Only a hinted part gets here: the placer checks the shapes of the
@@ -319,6 +344,12 @@ def _place_components(
     record["hinted_positions"] = sorted(
         r for r, h in hints.items() if isinstance(h, dict) and "x" in h
     )
+    # Every part against the board, pinned ones included: a hint is taken as
+    # given, so this is the only check it gets before DRC.
+    findings = placement.audit(result, board, hints, float(
+        (project_config.get("placement") or {}).get("edge_margin", placement.DEFAULT_EDGE_MARGIN)))
+    if findings:
+        record["audit"] = findings
     return record, board_geometry.as_record(board)
 
 
@@ -812,6 +843,7 @@ def emit(
         near = conn.get("near")
         if near and conn["local_id"] in components_out and near in components_out:
             components_out[conn["local_id"]]["near"] = near
+    _apply_assembly(components_out, project_config)
     place_record, geometry_record = _place_components(
         components_out, nets_out, project_config,
         project_dir=project_dir, stock_footprints_root=stock_footprints_root,

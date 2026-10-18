@@ -552,6 +552,31 @@ def _fp_text_to_property(text_node: sexpr.Node, name: str) -> sexpr.Node:
 _COURTYARD_LAYERS = frozenset({"F.CrtYd", "B.CrtYd"})
 
 
+def _set_assembly(fp_node: sexpr.Node, assembly: str | None) -> None:
+    """Mark a footprint that is not bought and placed (project.yaml assembly).
+
+    Both kinds stay on the board and leave the BOM and the placement file;
+    a DNP part is also marked DNP, so the board says the part exists but is
+    not fitted. The footprint's own attr (smd, through_hole) is kept.
+    """
+    attr = sexpr.find(fp_node, "attr")
+    if assembly != "dnp" and attr is not None and "dnp" in attr:
+        # Whether a part is fitted is the design's to say, not its library's:
+        # Seeed's Wio-LR2021 footprint ships marked DNP, which dropped the
+        # radio module from the placement file and the BOM of every board
+        # that used it. Only assembly.dnp marks a part DNP.
+        attr.remove("dnp")
+    if assembly not in ("dnp", "footprint_only"):
+        return
+    flags = ["exclude_from_pos_files", "exclude_from_bom"] + (["dnp"] if assembly == "dnp" else [])
+    if attr is None:
+        fp_node.append(["attr", *flags])
+        return
+    for flag in flags:
+        if flag not in attr[1:]:
+            attr.append(flag)
+
+
 def _drop_degenerate_lines(fp_node: sexpr.Node) -> int:
     """Remove zero-length ``fp_line`` segments from a footprint's courtyard.
 
@@ -1121,6 +1146,7 @@ def build(
 
         _set_reference_and_value(fp_node, refdes, str(comp.get("value", refdes)))
         _replace_uuid(fp_node)
+        _set_assembly(fp_node, comp.get("assembly"))
 
         if comp.get("needs_manual_footprint"):
             # The land pattern under this part is a stand-in, not the real one.

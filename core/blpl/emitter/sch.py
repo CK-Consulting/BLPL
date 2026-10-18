@@ -98,8 +98,13 @@ def _component_instance(
     rot: int = 0,
     ref_at: tuple[float, float, str | None] | None = None,
     value_at: tuple[float, float, str | None] | None = None,
+    assembly: str | None = None,
 ) -> sexpr.Node:
     rx, ry, rj = ref_at or (x, y - 10, None)
+    # project.yaml's assembly: a DNP part is marked DNP; neither it nor a
+    # footprint-only part is bought or placed, so both leave the BOM and the
+    # placement file. Copper stays on the board for both.
+    fitted = assembly not in ("dnp", "footprint_only")
     vx, vy, vj = value_at or (x, y + 10, None)
     # KiCad turns a field with its symbol; turning it back keeps a resistor
     # lying on its side labelled in horizontal text.
@@ -111,10 +116,10 @@ def _component_instance(
         ["unit", str(unit)],
         ["body_style", "1"],
         ["exclude_from_sim", "no"],
-        ["in_bom", "yes"],
+        ["in_bom", "yes" if fitted else "no"],
         ["on_board", "yes"],
-        ["in_pos_files", "yes"],
-        ["dnp", "no"],
+        ["in_pos_files", "yes" if fitted else "no"],
+        ["dnp", "yes" if assembly == "dnp" else "no"],
         ["uuid", _new_uuid()],
         _default_property("Reference", refdes, rx, ry, justify=rj, angle=field_angle),
         _default_property("Value", value, vx, vy, justify=vj, angle=field_angle),
@@ -878,6 +883,7 @@ def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
                 rot=p.rot,
                 ref_at=ref_at,
                 value_at=value_at,
+                assembly=comp.get("assembly"),
             )
         )
         # Physical pin numbers the design declares not-connected (Stage 5 writes

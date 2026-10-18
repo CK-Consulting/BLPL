@@ -194,11 +194,26 @@
         "include_controlled_impedance": { "type": "boolean" }
       }
     },
+    "assembly": {
+      "description": "How each part is built, where it is not simply bought and placed. dnp: the footprint is on the board but the part is not fitted (marked DNP, out of the BOM and the placement file). footprint_only: copper only, nothing is bought or placed — a Tag-Connect pad pattern, a test pad, a jumper made by the board itself.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dnp": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "footprint_only": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+      }
+    },
     "placement": {
       "description": "What the placer cannot infer. A hint is an instruction: someone wrote it knowing something the netlist does not say.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "edge_margin": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10,
+          "description": "Millimetres every part's courtyard keeps from the board edge (default 1.0). Applied to the parts the placer positions and checked for the ones a hint pins."
+        },
         "hints": {
           "type": "object",
           "additionalProperties": {
