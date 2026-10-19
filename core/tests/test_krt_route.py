@@ -229,3 +229,36 @@ def test_an_edge_band_goes_on_before_routing_and_comes_off_after(board, tmp_path
     assert calls[:2] == ["resave", ("band", True, 0.875)]
     assert calls[-2:] == [("band", False, 0), "fill"]
     assert all("route" in c for c in calls[2:-2])
+
+
+def _two_class_board(tmp_path, nets, classes, patterns):
+    pcb = tmp_path / "b.kicad_pcb"
+    pcb.write_text("(kicad_pcb " + " ".join(f'(net {i} "{n}")' for i, n in enumerate(nets, 1)) + ")")
+    pro = pcb.with_suffix(".kicad_pro")
+    pro.write_text(json.dumps({"net_settings": {"classes": classes, "netclass_patterns": patterns}}))
+    return pcb, pro
+
+
+def test_a_differential_class_goes_to_the_differential_router(tmp_path):
+    pcb, pro = _two_class_board(tmp_path, ["USB_P", "USB_N", "SIG"], [
+        {"name": "Default", "track_width": 0.2, "clearance": 0.15, "via_diameter": 0.6, "via_drill": 0.3},
+        {"name": "USB_90R", "track_width": 0.2, "clearance": 0.2, "diff_pair_width": 0.18, "diff_pair_gap": 0.15,
+         "via_diameter": 0.6, "via_drill": 0.3}],
+        [{"pattern": "USB_*", "netclass": "USB_90R"}])
+    steps = krt_route.plan(pcb, pro, {}, ["F.Cu", "B.Cu"])
+    (diff,) = [s for s in steps if s["script"] == "route_diff.py"]
+    a = diff["args"]
+    assert a[a.index("--track-width") + 1] == "0.18" and a[a.index("--diff-pair-gap") + 1] == "0.15"
+    assert krt_route._diff_pairs(["A_P", "A_N", "B"]) == []
+
+
+def test_later_passes_never_take_up_an_earlier_class(board):
+    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, ["F.Cu", "B.Cu"])
+    rest = steps[-1]["args"]
+    assert "!RF_ANT" in rest and "RF_ANT" not in rest
+
+
+def test_vias_stay_off_pads_with_no_planes(board):
+    for step in krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, ["F.Cu", "B.Cu"]):
+        a = step["args"]
+        assert a[a.index("--same-net-pad-clearance") + 1] == "0.15"
