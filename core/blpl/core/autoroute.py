@@ -559,6 +559,7 @@ def run_for(
     passes: int = 10,
     work_dir: Path | None = None,
     carry: bool = True,
+    router: str = "freerouting",
 ) -> RouteResult:
     """The pipeline step: snapshot, route, and always leave a report.
 
@@ -572,7 +573,14 @@ def run_for(
     work = Path(work_dir or report_path.parent / "autoroute")
     work.mkdir(parents=True, exist_ok=True)
 
-    ok, why = available()
+    if router == "kicad-routing-tools":
+        from . import krt_route
+
+        ok, why = krt_route.available()
+    elif router == "freerouting":
+        ok, why = available()
+    else:
+        ok, why = False, f"unknown router {router!r}: freerouting or kicad-routing-tools"
     if not ok:
         result = RouteResult(False, why, attempted=False, pcb=str(pcb), passes=passes)
     elif not pcb.is_file():
@@ -605,10 +613,17 @@ def run_for(
         # and re-running the router to reach the same answer wastes minutes and
         # risks a different one. Only taken when the Specctra export of this
         # board matches the export of the last pre-route snapshot.
-        carried = carry_forward(pcb, work, find_pcbnew_python()) if carry else None
+        # Carrying is Freerouting's: it re-imports a Specctra session, which
+        # the other router never writes.
+        carried = (carry_forward(pcb, work, find_pcbnew_python())
+                   if carry and router == "freerouting" else None)
         if carried is not None:
             result = carried
             result.passes = 0
+        elif router == "kicad-routing-tools":
+            from . import krt_route
+
+            result = krt_route.route(pcb, work_dir=work)
         else:
             result = route(pcb, work_dir=work, passes=passes)
         result.snapshot = str(snapshot)

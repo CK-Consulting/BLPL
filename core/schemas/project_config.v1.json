@@ -239,6 +239,17 @@
         }
       }
     },
+    "routing": {
+      "description": "How Stage 6a routes the board.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "router": {
+          "enum": ["freerouting", "kicad-routing-tools"],
+          "description": "freerouting (the default) or kicad-routing-tools (KiCad Routing Tools, routed class by class at the project's own rules)."
+        }
+      }
+    },
     "review": {
       "description": "How the checks treat this project's findings (core/blpl/core/accept.py).",
       "type": "object",

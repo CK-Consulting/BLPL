@@ -1144,7 +1144,8 @@ def _cmd_stage8(args: argparse.Namespace) -> int:
     routing = report.get("autoroute") or {}
     if routing.get("attempted") and routing.get("ok"):
         left = routing.get("unrouted")
-        print(f"        [route] Freerouting ran" + (f", {left} net(s) still open" if left is not None else ""))
+        who = "KiCad Routing Tools" if routing.get("router") == "kicad-routing-tools" else "Freerouting"
+        print(f"        [route] {who} ran" + (f", {left} net(s) still open" if left is not None else ""))
     else:
         print(f"        [route] not routed — {routing.get('reason', 'autorouting was not attempted')}")
     lc = report.get("lifecycle") or {}
@@ -1171,6 +1172,19 @@ def _cmd_stage8(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def _router(args: argparse.Namespace, proj: Path) -> str:
+    """project.yaml's routing.router, Freerouting when it says nothing."""
+    import yaml
+
+    path = _project_config(args, proj)
+    try:
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return "freerouting"
+    routing = cfg.get("routing") if isinstance(cfg, dict) else None
+    return str((routing or {}).get("router") or "freerouting")
+
+
 def _cmd_autoroute(args: argparse.Namespace) -> int:
     """Bulk-route the most recent compile of a board and leave a record either way.
 
@@ -1191,7 +1205,8 @@ def _cmd_autoroute(args: argparse.Namespace) -> int:
         return 2
     report_path = _artifact(args, proj, "autoroute_report")
     work = pipeline_dir / ("autoroute" if board is None else f"autoroute.{board}")
-    result = autoroute.run_for(pcb, report_path, passes=args.passes, work_dir=work)
+    router = _router(args, proj)
+    result = autoroute.run_for(pcb, report_path, passes=args.passes, work_dir=work, router=router)
     if not result.attempted:
         print(f"autoroute: skipped — {result.reason}")
         print(f"           wrote {report_path}")
@@ -1204,7 +1219,8 @@ def _cmd_autoroute(args: argparse.Namespace) -> int:
     # is routinely larger than the board's net count and saying "nets" makes a
     # board read as far worse than it is.
     left = f", {result.unrouted} connection(s) still open" if result.unrouted is not None else ""
-    print(f"autoroute: routed {pcb.name} in {result.passes} passes{left}")
+    how = "with KiCad Routing Tools" if router == "kicad-routing-tools" else f"in {result.passes} passes"
+    print(f"autoroute: routed {pcb.name} {how}{left}")
     print(f"           snapshot {result.snapshot}")
     print(f"           wrote {report_path}")
     # The route changed the board in place; the tracked copy follows it.
