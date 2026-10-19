@@ -95,3 +95,15 @@ def test_the_schema_takes_the_dielectric_and_refuses_nonsense():
     for bad in ({"er": 1}, {"prepreg": 0}, {"core": 9}):
         with pytest.raises(Exception):
             schema.validate("project_config", cfg(**bad))
+
+
+@pytest.mark.parametrize("copper", [6, 8, 10, 12])
+def test_the_stackup_always_adds_up_to_the_declared_thickness(tmp_path, copper):
+    layers, _ = _layers(pcb.build(_hdm({"layers": copper, "thickness": 1.6}), footprints_root=tmp_path))
+    assert sum(th for _, _, th in layers) == pytest.approx(1.6, abs=1e-3)
+    assert min(th for _, t, th in layers if t in ("prepreg", "core")) >= 0.05
+
+
+def test_a_stackup_that_cannot_fit_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="do not fit"):
+        pcb.build(_hdm({"layers": 12, "thickness": 0.6}), footprints_root=tmp_path)
