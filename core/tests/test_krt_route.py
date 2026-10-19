@@ -38,12 +38,16 @@ def test_nets_are_grouped_by_their_class(board):
 
 
 def test_planes_then_each_class_at_its_width_then_the_rest_with_power_nets(board):
-    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["In1.Cu"]},
-                           ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+    pro = board.with_suffix(".kicad_pro")
+    shared = json.loads(pro.read_text())
+    # Power_Bulk on Default's vias, so it shares the last pass.
+    shared["net_settings"]["classes"][1].update(via_diameter=0.6, via_drill=0.3)
+    pro.write_text(json.dumps(shared))
+    steps = krt_route.plan(board, pro, {"GND": ["In1.Cu"]}, ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
     assert [s["script"] for s in steps] == ["route_planes.py", "route.py", "route.py"]
     planes, rf, rest = (s["args"] for s in steps)
-    # The plane vias at the plane net's own class: 0.25 mm, a 0.9/0.5 via.
-    assert planes[:4] == ["--nets", "GND", "--plane-layers", "In1.Cu"] and "0.25" in planes and "0.9" in planes
+    # The plane vias at the plane net's own class: 0.25 mm.
+    assert planes[:4] == ["--nets", "GND", "--plane-layers", "In1.Cu"] and "0.25" in planes
     # The RF class at 0.35 mm, never escalated below the project's floors.
     assert rf[:2] == ["--nets", "RF_ANT"] and rf[rf.index("--track-width") + 1] == "0.35"
     assert "--escalation" in rf and rf[rf.index("--escalation") + 1] == "off" and "--no-fix-drc-settings" in rf
@@ -262,3 +266,33 @@ def test_vias_stay_off_pads_with_no_planes(board):
     for step in krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, ["F.Cu", "B.Cu"]):
         a = step["args"]
         assert a[a.index("--same-net-pad-clearance") + 1] == "0.15"
+
+
+def test_a_power_class_with_its_own_vias_routes_in_its_own_pass(board):
+    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, ["F.Cu", "B.Cu"])
+    assert [s["script"] for s in steps] == ["route.py", "route.py", "route.py"]
+    _, power, rest = (s["args"] for s in steps)
+    # Power_Bulk's 0.9/0.5 vias, never the Default 0.6/0.3 the shared pass
+    # would apply to every net it selects.
+    assert power[:3] == ["--nets", "GND", "VBAT"] and "!RF_ANT" in power
+    assert power[power.index("--via-size") + 1] == "0.9" and power[power.index("--via-drill") + 1] == "0.5"
+    i = power.index("--power-nets")
+    assert power[i + 1:i + 3] == ["GND", "VBAT"]
+    assert rest[:2] == ["--nets", "SPI_SCK"] and "!GND" in rest and "!VBAT" in rest
+    assert "--power-nets" not in rest and rest[rest.index("--via-size") + 1] == "0.6"
+
+
+def test_a_route_that_laid_no_track_with_connections_open_fails(board, tmp_path, monkeypatch):
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    for fn in ("_resave", "_edge_band", "_fill"):
+        monkeypatch.setattr(krt_route, fn, lambda *a, **k: ok)
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: ok)
+    monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 12, "segments": 0})
+    r = krt_route.route(board, work_dir=tmp_path / "w")
+    assert not r.ok and "no track segments" in r.reason and r.unrouted == 12
+    monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 0})
+    assert krt_route.route(board, work_dir=tmp_path / "w").ok
