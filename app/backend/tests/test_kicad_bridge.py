@@ -274,3 +274,33 @@ def test_a_bulk_autoroute_is_anchored_with_the_users_identity_and_can_be_reverte
     ok, detail = kb.restore(git_project)
     assert ok, detail
     assert pcb.read_text() == "(kicad_pcb original)\n"
+
+
+def test_an_autoroute_that_cannot_run_changes_nothing(git_project, monkeypatch) -> None:
+    # Codex P2 on #55: the refusal came after snapshot(), which stages every
+    # working-tree change, so a route that never ran still altered the repo.
+    import asyncio
+
+    import pytest
+    from blpl.core import autoroute
+
+    from app.agent import registry
+    from app.agent.toolspec import ToolContext, ToolDenied
+    from app.references import FilesystemSandbox, ReferenceManifest
+
+    (git_project / "notes.md").write_text("uncommitted\n", encoding="utf-8")
+    monkeypatch.setattr(autoroute, "available", lambda: (False, "no Freerouting jar"))
+    snapshots: list = []
+    monkeypatch.setattr("app.agent.kicad_bridge.snapshot", lambda *a, **k: snapshots.append(a))
+    ctx = ToolContext(
+        project_id="board", project_dir=git_project,
+        sandbox=FilesystemSandbox(
+            manifest=ReferenceManifest.empty(project_id="board", workspace_root=git_project)),
+        git_identity=WHO,
+    )
+    status = lambda: subprocess.run(["git", "status", "--porcelain"], cwd=git_project,
+                                    capture_output=True, text=True, check=True).stdout
+    before = status()
+    with pytest.raises(ToolDenied, match="no Freerouting jar"):
+        asyncio.run(registry._bulk_route(ctx, {}))
+    assert snapshots == [] and status() == before
