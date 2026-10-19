@@ -296,7 +296,13 @@ def run(
         # was matched on its name to the one-pin Connector:TestPoint, and its
         # second pad, NFC2_ANT, was drawn connected to nothing. Left unmatched,
         # it gets a generic connector with its own pin count.
-        if sym_exempt and sym_match is not None and sym_match["match_type"] != "exact":
+        # Every connector, pinned or not: a pinned symbol that does not exist
+        # left the guess standing, and Stage 5 prefers a coverage match over
+        # the pin, so the same one-pin symbol came back (Codex, PR #57). The
+        # pin is then a miss, which is what an unmet claim should be;
+        # sym_exempt only says whether no match counts against the row.
+        is_connector = str(row.get("local_id", "")).startswith("J")
+        if is_connector and sym_match is not None and sym_match["match_type"] != "exact":
             sym_match = None
 
         fp_exact = _lookup_exact(row.get("footprint_hint"), fp_index)
