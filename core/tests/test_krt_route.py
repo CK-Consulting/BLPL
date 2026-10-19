@@ -124,3 +124,29 @@ def test_the_review_names_the_router_that_ran():
 
     assert routing(router="kicad-routing-tools") == "KiCad Routing Tools ran; 2 net(s) left unrouted."
     assert routing(passes=10) == "Freerouting ran (10 passes); 2 net(s) left unrouted."
+
+
+@pytest.mark.parametrize("yaml_text, installed, expected", [
+    ("routing: {router: freerouting}\n", True, "freerouting"),        # named outright wins
+    ("routing: {router: kicad-routing-tools}\n", False, "kicad-routing-tools"),
+    ("", True, "kicad-routing-tools"),                                 # the default when installed
+    ("", False, "freerouting"),                                        # the backup when it is not
+])
+def test_the_router_stage6a_uses(tmp_path, monkeypatch, yaml_text, installed, expected):
+    import argparse
+
+    from blpl.core import cli
+
+    (tmp_path / "project.yaml").write_text("project: {name: p, dimensions: [10, 10]}\n" + yaml_text)
+    monkeypatch.setattr(krt_route, "available", lambda: (installed, "" if installed else "missing"))
+    assert cli._router(argparse.Namespace(project_dir=str(tmp_path), board=None), tmp_path) == expected
+
+
+def test_the_adapted_skills_ship_and_credit_their_source():
+    from blpl.core import skills_install
+
+    avail = skills_install.available()
+    for name in ("routed-board-review", "plane-mappings"):
+        assert name in avail and name in skills_install.DEFAULT_SET
+        text = (avail[name] / "SKILL.md").read_text()
+        assert "github.com/drandyhaas/KiCadRoutingTools" in text and "ACKNOWLEDGMENTS.md" in text

@@ -247,6 +247,54 @@ In BLPL a termination resistor is a BOM row like any other, with a pinout that
 puts it between the driver pin and the line. Name the nets on each side
 distinctly (`CLK_SRC` → R → `CLK`) so the controlled tag lands on the line.
 
+## Check the width against the stackup
+
+The two checks in this section and the next are adapted from the
+`recommend-stackup` and `find-high-speed-nets` skills in KiCad Routing Tools
+(https://github.com/drandyhaas/KiCadRoutingTools, MIT, drandyhaas and
+contributors). See ACKNOWLEDGMENTS.md.
+
+A class that says `impedance: 50` is a claim; its `trace_width` is what the
+board gets. Before routing, and whenever the stackup or a class changes,
+check each impedance class's width against the stackup it will be built on:
+
+1. **Is there a real stackup?** project.yaml gives the layer count and the
+   finished thickness, not the dielectric under each layer. If the fab's
+   stackup is not known, say so, and state the one you assume (for example
+   the common 1.0 mm four-layer build: ~0.21 mm 7628 prepreg under the outer
+   layers, εr ~4.4, 1 oz copper). Never present an assumed stackup as the fab's.
+2. **Compute the width for that stackup** with a stated formula (IPC-2141
+   surface microstrip for an outer layer over the adjacent plane; stripline
+   for an inner layer between two). Give the impedance across the plausible
+   εr range, not one number.
+3. **Compare with the class.** A width carried over from a two-layer board is
+   the trap: on verdacor-ear-tag the RF classes were 0.55 and 0.6 mm, which is
+   50 Ω over ~1 mm of FR-4 and ~33–35 Ω on the four-layer board they were on;
+   0.35 mm was right.
+4. **Check the class clearance against the parts on the net.** The clearance
+   applies pad to pad as well as to tracks, and an RF module's or an 0402
+   matching part's own pads often sit closer than a generous RF clearance;
+   DRC then fails on the part, not the route.
+5. Write the result into project.yaml with the assumption in a comment, and
+   tell the user the width must be confirmed with the fab's own calculator.
+
+## Find every net that needs it, on the board
+
+Tagging by name works only if every name was thought of. On a board, list the
+nets and classify each one, rather than searching for the ones you expect:
+
+- **RF and antenna feeds:** every net between a radio's RF pin, its matching
+  network and an antenna or RF connector — including the short nodes inside a
+  tee or pi network. 50 Ω single-ended unless the datasheet says otherwise.
+- **Differential pairs by pin function,** not by `_P`/`_N` names: USB D+/D−,
+  Ethernet, MIPI, LVDS, HDMI, PCIe — from the parts' datasheets.
+- **Fast single-ended lines** whose length approaches the critical length for
+  their rise time (see "Does this line need it?").
+
+Then check project.yaml: is each of those nets on an impedance class (Stage 4's
+`nets.json` gives each net's class)? A net that should be controlled and sits
+in Default is the finding. Report it before routing, not after.
+
 ## Verifying it
 
 - Order impedance control from the fab with the `fab/impedance.md` sheet and a
