@@ -1089,7 +1089,7 @@ def build(
         ["general", ["thickness", f"{thickness}"], ["legacy_teardrops", "no"]],
         ["paper", '"A4"'],
         ["layers", *copper_rows, *_NON_COPPER_LAYERS],
-        _default_setup(),
+        _default_setup(_stackup(project, _copper_count(project), float(thickness))),
     ]
 
     # Nets.
@@ -1220,10 +1220,81 @@ def _placeholder_banner(refdes_list: list[str], width: float, height: float) -> 
     ]
 
 
-def _default_setup() -> sexpr.Node:
+#: Outer and inner copper (1 oz, 0.5 oz), solder mask, and the dielectric a
+#: board is built of when project.stackup says no more than its layer count
+#: and thickness: the common 7628 prepreg under the outer layers, FR-4 core
+#: making up the rest. What the controlled-impedance widths assume until the
+#: fab's own stackup is entered.
+_OUTER_CU, _INNER_CU, _MASK = 0.035, 0.0175, 0.01
+_PREPREG, _ER_PREPREG, _ER_CORE, _LOSS = 0.2104, 4.4, 4.5, 0.02
+
+
+def _dielectric(name: str, kind: str, mm: float, er: float) -> sexpr.Node:
+    return ["layer", sexpr.quote(name), ["type", sexpr.quote(kind)], ["thickness", f"{mm:.4g}"],
+            ["material", '"FR4"'], ["epsilon_r", f"{er:g}"], ["loss_tangent", f"{_LOSS:g}"]]
+
+
+def _stackup(project: dict, copper: int, thickness: float) -> sexpr.Node | None:
+    """The board's physical stackup, for the fab and for every tool that reads it.
+
+    None was written, and a board without one has no reference planes as far
+    as anything reading the file knows: the design review (kicad-happy's
+    return-path check) fell back to measuring F.Cu against B.Cu, two layers
+    and a millimetre away, and reported every outer-layer signal on
+    verdacor-ear-tag as having lost its ground plane while In1.Cu's GND sat
+    0.2 mm under it. KiCad's impedance calculator and the fab drawing read
+    the same section.
+
+    ``project.stackup`` may give ``prepreg`` and ``core`` (mm) and ``er``;
+    otherwise the prepreg is 0.21 mm 7628 and the cores share what is left of
+    ``thickness``. Two-layer boards are one core. ``copper_finish`` is the
+    project's ``finish``.
+    """
+    st = project.get("stackup") or {}
+    prepreg = float(st.get("prepreg") or _PREPREG)
+    er_pp = float(st.get("er") or _ER_PREPREG)
+    er_core = float(st.get("er") or _ER_CORE)
+    names = [row[1].strip('"') for row in _copper_layers(copper)]
+    rows: list[sexpr.Node] = [
+        ["layer", '"F.SilkS"', ["type", '"Top Silk Screen"']],
+        ["layer", '"F.Paste"', ["type", '"Top Solder Paste"']],
+        ["layer", '"F.Mask"', ["type", '"Top Solder Mask"'], ["thickness", f"{_MASK:g}"]],
+    ]
+    gaps = len(names) - 1
+    copper_mm = sum(_OUTER_CU if n in ("F.Cu", "B.Cu") else _INNER_CU for n in names)
+    if gaps == 1:
+        kinds = ["core"]
+        cores = 1
+    else:
+        # prepreg / core / prepreg / core ... / prepreg: outer gaps prepreg.
+        kinds = ["prepreg" if i % 2 == 0 else "core" for i in range(gaps)]
+        cores = kinds.count("core")
+    pp_total = prepreg * kinds.count("prepreg")
+    core = st.get("core")
+    core = float(core) if core else max(0.1, (thickness - 2 * _MASK - copper_mm - pp_total) / max(cores, 1))
+    for i, name in enumerate(names):
+        rows.append(["layer", sexpr.quote(name), ["type", '"copper"'],
+                     ["thickness", f"{_OUTER_CU if name in ('F.Cu', 'B.Cu') else _INNER_CU:g}"]])
+        if i < gaps:
+            kind = kinds[i]
+            rows.append(_dielectric(f"dielectric {i + 1}", kind,
+                                    prepreg if kind == "prepreg" else core,
+                                    er_pp if kind == "prepreg" else er_core))
+    rows += [
+        ["layer", '"B.Mask"', ["type", '"Bottom Solder Mask"'], ["thickness", f"{_MASK:g}"]],
+        ["layer", '"B.Paste"', ["type", '"Bottom Solder Paste"']],
+        ["layer", '"B.SilkS"', ["type", '"Bottom Silk Screen"']],
+    ]
+    finish = (project.get("stackup") or {}).get("finish")
+    return ["stackup", *rows, ["copper_finish", sexpr.quote(finish or "None")],
+            ["dielectric_constraints", "no"]]
+
+
+def _default_setup(stackup: sexpr.Node | None = None) -> sexpr.Node:
     """Minimal v10 (setup ...) block. KiCad fills in defaults for anything we omit."""
     return [
         "setup",
+        *([stackup] if stackup else []),
         ["pad_to_mask_clearance", "0"],
         ["allow_soldermask_bridges_in_footprints", "no"],
         ["tenting", ["front", "yes"], ["back", "yes"]],
