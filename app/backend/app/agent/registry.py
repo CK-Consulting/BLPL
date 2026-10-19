@@ -2270,8 +2270,11 @@ def parts_tools() -> list[ToolSpec]:
                 "protection-circuits: ESD, reverse polarity, battery and port protection review. "
                 "controlled-impedance: which nets need it and how to tag them. "
                 "erc-drc-resolution: work through a run's open connections, DRC and ERC "
-                "findings with the user, on _edit copies of the emitted files. hardware-design "
-                "is already in your instructions."
+                "findings with the user, on _edit copies of the emitted files. "
+                "routed-board-review: sign a routed board off stage by stage, with the next "
+                "action for each failure (use before calling a board done or ready to order). "
+                "plane-mappings: which nets get copper planes and on which layers. "
+                "hardware-design is already in your instructions."
             ),
             input_schema={
                 "type": "object",
