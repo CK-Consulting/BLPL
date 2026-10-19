@@ -290,6 +290,15 @@ def run(
             fuzzy = _lookup_fuzzy(tokens, sym_index)
             sym_match = _entry_to_match(fuzzy[0], "fuzzy", fuzzy[1], symbols_root) if fuzzy else None
 
+        # A connector takes a stock symbol only when one was named exactly (a
+        # pinned Symbol cell, or a hint that is a real symbol). A guess from its
+        # MPN or tokens is no claim about its pins: J_NFC, "TestPoint_2Pads",
+        # was matched on its name to the one-pin Connector:TestPoint, and its
+        # second pad, NFC2_ANT, was drawn connected to nothing. Left unmatched,
+        # it gets a generic connector with its own pin count.
+        if sym_exempt and sym_match is not None and sym_match["match_type"] != "exact":
+            sym_match = None
+
         fp_exact = _lookup_exact(row.get("footprint_hint"), fp_index)
         if fp_exact is not None:
             fp_match: dict | None = _entry_to_match(fp_exact, "exact", None, footprints_root)
