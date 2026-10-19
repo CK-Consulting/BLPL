@@ -34,6 +34,18 @@
               "description": "Copper layers. Odd counts are not manufacturable, so the enum is the whole list rather than a range.",
               "enum": [1, 2, 4, 6, 8, 10, 12]
             },
+            "prepreg": {
+              "type": "number", "exclusiveMinimum": 0, "maximum": 2,
+              "description": "Prepreg thickness in mm under each outer layer (default 0.21, 7628). From the fab's stackup when known: it sets every outer-layer impedance."
+            },
+            "core": {
+              "type": "number", "exclusiveMinimum": 0, "maximum": 5,
+              "description": "Core thickness in mm (default: what the finished thickness leaves after copper, mask and prepreg)."
+            },
+            "er": {
+              "type": "number", "minimum": 2, "maximum": 12,
+              "description": "Dielectric constant (default 4.4 prepreg, 4.5 core)."
+            },
             "thickness": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
             "finish": { "enum": ["ENIG", "HASL", "LF-HASL", "OSP", "Immersion Silver", "Immersion Tin", "Hard Gold"] }
           }

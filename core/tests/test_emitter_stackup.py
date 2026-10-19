@@ -83,3 +83,15 @@ def test_kicad_reads_the_stackup(tmp_path):
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     assert "(stackup" in board.read_text() and '"dielectric 2"' in board.read_text()
+
+
+def test_the_schema_takes_the_dielectric_and_refuses_nonsense():
+    from blpl.core import schema
+
+    def cfg(**st):
+        return {"project": {"name": "p", "dimensions": [10, 10], "stackup": {"layers": 4, **st}}}
+
+    schema.validate("project_config", cfg(prepreg=0.1, core=1.2, er=4.2))
+    for bad in ({"er": 1}, {"prepreg": 0}, {"core": 9}):
+        with pytest.raises(Exception):
+            schema.validate("project_config", cfg(**bad))
