@@ -200,7 +200,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
     # Vias off same-net pads on every board, planes or none: the default
     # lets a via into a pad, which wicks solder in reflow (Codex, PR #59).
     held = [*held, "--same-net-pad-clearance", f"{pad_gap:g}"]
-    power: list[tuple[str, float]] = []
+    power: list[tuple[str, str, float]] = []
     # Nets an earlier pass routed, excluded from every later one: KRT rips up
     # and rebuilds a blocking net it was not asked to route, at the current
     # pass's width, so a 0.35 mm RF trace could come back at 0.2 mm (Codex,
@@ -211,7 +211,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
             continue
         c = classes.get(name, {})
         if POWER_CLASS.search(name):
-            power += [(n, c.get("track_width", default.get("track_width", 0.2))) for n in groups[name]]
+            power += [(name, n, c.get("track_width", default.get("track_width", 0.2))) for n in groups[name]]
             continue
         protect = [f"!{n}" for n in done]
         if _diff_pairs(groups[name]):
@@ -227,17 +227,36 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
                 "--nets", *groups[name], *protect, "--track-width", f"{c.get('track_width', 0.2):g}",
                 *rules(c), *held]})
         done += groups[name]
+    def power_args(nets: list[tuple[str, str, float]]) -> list[str]:
+        return ["--power-nets", *[n for _, n, _ in nets], "--power-nets-widths", *[f"{w:g}" for _, _, w in nets]]
+
+    # A power class whose vias differ from Default's gets a pass of its own.
+    # Explicit --via-size/--via-drill apply to every selected net, so routed
+    # with the Default nets a Power_Bulk VBAT asking for a 0.9/0.5 via got
+    # Default's 0.6/0.3 (Codex, PR #59). Still routed as power nets, so the
+    # neck-down into small pads is the same as in the shared pass.
+    def via_of(c: dict) -> tuple:
+        return (c.get("via_diameter", default.get("via_diameter", 0.6)),
+                c.get("via_drill", default.get("via_drill", 0.3)))
+
+    shared = [p for p in power if via_of(classes.get(p[0], {})) == via_of(default)]
+    for name in sorted({p[0] for p in power} - {p[0] for p in shared}):
+        own = [p for p in power if p[0] == name]
+        steps.append({"script": "route.py", "args": [
+            "--nets", *[n for _, n, _ in own], *[f"!{n}" for n in done],
+            "--track-width", f"{default.get('track_width', 0.2):g}",
+            *rules(classes.get(name, {})), *held, *power_args(own)]})
+        done += [n for _, n, _ in own]
     # The last pass names its nets: Default and the power classes, never a
     # special class. Given "*" it re-selected an RF net its own pass had not
     # finished and routed it at the Default width, which an explicit
     # --track-width applies to every selected net (Codex, PR #59).
-    rest = sorted(set(groups.get("Default", [])) | {n for n, _ in power})
+    rest = sorted(set(groups.get("Default", [])) | {n for _, n, _ in shared})
     if rest:
         final = ["--nets", *rest, *[f"!{n}" for n in done], "--track-width", f"{default.get('track_width', 0.2):g}",
                  *rules(default), *held]
-        if power:
-            final += ["--power-nets", *[n for n, _ in power],
-                      "--power-nets-widths", *[f"{w:g}" for _, w in power]]
+        if shared:
+            final += power_args(shared)
         steps.append({"script": "route.py", "args": final})
     return steps
 
@@ -398,7 +417,15 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600):
     if measured is None:
         result.reason = "the routed board could not be measured"
         return result
-    result.ok = True
     result.unrouted = measured.get("unconnected")
     result.segments = measured.get("segments")
+    # KRT finishes normally when it could route nothing and writes the board
+    # back unchanged: no track with connections still open is a failed route,
+    # as it is for Freerouting (Codex, PR #59). A board needing no track at
+    # all is still complete.
+    if not result.segments and result.unrouted:
+        result.reason = (f"the router finished but the board has no track segments and "
+                         f"{result.unrouted} connection(s) still open")
+        return result
+    result.ok = True
     return result
