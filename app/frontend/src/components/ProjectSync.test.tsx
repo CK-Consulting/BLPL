@@ -59,3 +59,25 @@ describe("the push button", () => {
     expect(await screen.findByRole("button", { name: "Commit + Push" })).toBeDisabled();
   });
 });
+
+describe("the strip says which changes are which", () => {
+  it("names unpushed commits as commits, apart from uncommitted changes", async () => {
+    // "uncommitted" in amber beside a plain "↑16" read as sixteen uncommitted
+    // files, when it meant sixteen commits that were only not on the remote.
+    vi.stubGlobal("fetch", status({ dirty: true, ahead: 16, behind: 1 }));
+    render(<ProjectSync projectId="p" onChanged={() => {}} />);
+    const dirty = await screen.findByText("uncommitted changes");
+    const ahead = screen.getByText("16 commits not pushed");
+    expect(dirty).toHaveClass("warn");
+    expect(ahead).toHaveClass("info");
+    expect(ahead).not.toHaveClass("warn");
+    expect(screen.getByText("1 to pull")).toHaveClass("info");
+    expect(screen.queryByText(/↑|↓/)).toBeNull();
+  });
+
+  it("says commit, not commits, for one", async () => {
+    vi.stubGlobal("fetch", status({ ahead: 1 }));
+    render(<ProjectSync projectId="p" onChanged={() => {}} />);
+    expect(await screen.findByText("1 commit not pushed")).toBeInTheDocument();
+  });
+});
