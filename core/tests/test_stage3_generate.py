@@ -534,3 +534,19 @@ def test_a_padless_footprint_needs_no_pin_map(tmp_path: Path) -> None:
     assert not s3._padless("Fiducial:Pad", tmp_path / "fps")
     assert not s3._padless("Fiducial:Missing", tmp_path / "fps")
     assert not s3._padless("no-colon", tmp_path / "fps")
+
+
+def test_a_padless_footprint_found_by_coverage_needs_no_pin_map(tmp_path: Path) -> None:
+    """The BOM row names no Lib:Name footprint; Stage 2 found a fiducial by its
+    MPN. Stage 5 places what coverage matched, so that is what decides
+    (Codex, PR #63)."""
+    fps = tmp_path / "fps" / "Fiducial.pretty"
+    fps.mkdir(parents=True)
+    (fps / "Fid.kicad_mod").write_text('(footprint "Fid" (pad "" smd circle (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask")))')
+    bom_rows = [{"local_id": "FID1", "mpn": "Fiducial_1mm", "package": "fiducial", "pin_count": 1, "confidence": 1.0}]
+    cov_rows = [{"local_id": "FID1", "mpn": "Fiducial_1mm", "status": "hit",
+                 "symbol_match": {"lib": "L", "name": "N", "match_type": "exact"},
+                 "footprint_match": {"lib": "Fiducial", "name": "Fid", "match_type": "mpn"}}]
+    proj, bom, cov = _setup(tmp_path, bom_rows, cov_rows)
+    out = s3.run(cov, bom, proj, auto_generate=False, footprints_root=tmp_path / "fps")
+    assert [g for g in out["gaps"] if g["kind"] == "pin_map"] == []
