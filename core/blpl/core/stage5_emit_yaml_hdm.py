@@ -354,7 +354,7 @@ def _place_components(
         from . import accept
 
         open_, waived = accept.split(findings, accept.entries(project_config),
-                                     rule_key="problem", parts_key="ref")
+                                     rule_key="problem", parts_key="parts")
         record["audit"] = open_
         if waived:
             record["audit_accepted"] = waived

@@ -1130,6 +1130,17 @@ def run(
 
     design_issues, accepted = accept.split(
         design_issues, accept.entries(hdm if isinstance(hdm, dict) else {}))
+    # And the placement findings Stage 5 accepted: its audit (an edge margin,
+    # an overlap) is not repeated here, so without these the waiver vanished
+    # from the record the moment Stage 5 made it (Codex, PR #62).
+    placement_waived = ((((hdm or {}).get("synthesis") or {}).get("placement") or {})
+                        .get("audit_accepted") or []) if isinstance(hdm, dict) else []
+    accepted += [{
+        "source": "placement_audit", "rule_id": f.get("problem", ""), "severity": "warning",
+        "summary": f"{f.get('ref', '')}: {f.get('problem', '')} — {f.get('detail', '')}",
+        "components": f.get("parts") or [f.get("ref", "")], "nets": [],
+        "accepted_reason": f.get("accepted_reason", ""),
+    } for f in placement_waived]
 
     report = {
         # A board is not "ok" if the pipeline mis-emitted it, and it is certainly

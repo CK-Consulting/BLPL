@@ -921,8 +921,11 @@ def audit(result: "Result", board: "tuple[float, float] | board_geometry.Board",
     boxes = {ref: occupied_box(result, ref) for ref in sorted(result.placements)}
     out: list[dict] = []
 
-    def finding(ref: str, problem: str, detail: str) -> None:
-        out.append({"ref": ref, "problem": problem, "pinned": ref in pinned, "detail": detail})
+    def finding(ref: str, problem: str, detail: str, parts: list[str] | None = None) -> None:
+        # ``parts`` is every part the finding is about: an overlap is two, and
+        # a waiver must cover both before it covers the finding (accept.py).
+        out.append({"ref": ref, "problem": problem, "pinned": ref in pinned, "detail": detail,
+                    "parts": parts or [ref]})
 
     for ref, (x0, y0, x1, y1) in boxes.items():
         if not board_geometry.box_inside((x0, y0, x1, y1), outline):
@@ -954,7 +957,7 @@ def audit(result: "Result", board: "tuple[float, float] | board_geometry.Board",
         for b in refs[i + 1:]:
             bx0, by0, bx1, by1 = boxes[b]
             if ax0 < bx1 - 1e-6 and bx0 < ax1 - 1e-6 and ay0 < by1 - 1e-6 and by0 < ay1 - 1e-6:
-                finding(a, "overlap", f"its courtyard overlaps {b}'s")
+                finding(a, "overlap", f"its courtyard overlaps {b}'s", [a, b])
     order = {"off_board": 0, "in_cutout": 1, "in_edge_margin": 2, "in_keepout": 3, "overlap": 4}
     out.sort(key=lambda f: (order[f["problem"]], f["ref"]))
     return out

@@ -41,8 +41,9 @@ def test_accepted_findings_move_aside_with_their_reason():
 
 
 def test_the_placement_audit_reads_a_single_ref():
-    audit = [{"ref": "BT_POS", "problem": "off_board", "detail": "x"}, {"ref": "C9", "problem": "in_edge_margin", "detail": "y"}]
-    open_, waived = accept.split(audit, accept.entries(CFG), rule_key="problem", parts_key="ref")
+    audit = [{"ref": "BT_POS", "problem": "off_board", "detail": "x", "parts": ["BT_POS"]},
+             {"ref": "C9", "problem": "in_edge_margin", "detail": "y", "parts": ["C9"]}]
+    open_, waived = accept.split(audit, accept.entries(CFG), rule_key="problem", parts_key="parts")
     assert [f["ref"] for f in open_] == ["C9"] and waived[0]["ref"] == "BT_POS"
 
 
@@ -64,3 +65,18 @@ def test_the_schema_requires_a_reason():
     schema.validate("project_config", {**base, **CFG})
     with pytest.raises(Exception):
         schema.validate("project_config", {**base, "review": {"accept": [{"rule": "PM-002"}]}})
+
+
+def test_an_accepted_overlap_covers_only_the_pair_it_names():
+    from blpl.core import placement
+
+    entries = accept.entries({"review": {"accept": [{"rule": "overlap", "parts": ["A", "B"], "reason": "stacked on purpose"}]}})
+    r = placement.Result()
+    for ref, (x, y) in {"A": (10, 10), "B": (10.5, 10), "C": (9.5, 10)}.items():
+        r.placements[ref] = placement.Placement(x, y, 0.0, "top")
+        r.extents[ref] = (2, 2)
+        r.offsets[ref] = (0.0, 0.0)
+    findings = [f for f in placement.audit(r, (40, 30), {}, 1.0) if f["problem"] == "overlap"]
+    open_, waived = accept.split(findings, entries, rule_key="problem", parts_key="parts")
+    assert {tuple(sorted(f["parts"])) for f in waived} == {("A", "B")}
+    assert {tuple(sorted(f["parts"])) for f in open_} == {("A", "C"), ("B", "C")}
