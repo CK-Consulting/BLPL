@@ -1556,6 +1556,16 @@ async def _bulk_route(ctx: ToolContext, args: dict) -> str:
     pcbs = sorted(ctx.project_dir.glob("*.kicad_pcb"))
     if not pcbs:
         raise ToolDenied("this project has no .kicad_pcb yet — run stage6 first")
+    ctx.sandbox.check_write(pcbs[0])
+    # Asked before the snapshot, which stages every working-tree change: a
+    # route that cannot run must leave the repository as it found it (Codex,
+    # PR #55).
+    try:
+        can = await toolrun.call(ctx.project_dir, "autoroute_available", {}, timeout=120)
+    except toolrun.ToolRunError as exc:
+        raise ToolDenied(str(exc)) from exc
+    if not can.get("ok"):
+        raise ToolDenied(can.get("reason") or "the autorouter is not available")
 
     # Same anchor the interactive KiCad edits use: an autoroute is the single
     # largest change anything can make to a board, and "undo it" has to mean
@@ -1570,7 +1580,6 @@ async def _bulk_route(ctx: ToolContext, args: dict) -> str:
         ctx.extras["kicad_snapshot"] = commit or "none"
         ctx.note("snapshotted the board before routing" if commit else "no git snapshot available")
 
-    ctx.sandbox.check_write(pcbs[0])
     ctx.note("bulk routing — this can take several minutes")
     # Freerouting and pcbnew run in the project's run container (sandbox/toolrun.py).
     try:

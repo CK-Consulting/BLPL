@@ -55,6 +55,15 @@ def _autoroute(pcb: str, passes: int = 10) -> dict:
     return autoroute.route(Path(pcb), passes=int(passes)).to_dict()
 
 
+def _autoroute_available() -> dict:
+    """Whether the router can run here: asked before anything is changed for
+    it, so a refusal leaves the project as it was."""
+    from blpl.core import autoroute
+
+    ok, why = autoroute.available()
+    return {"ok": ok, "reason": why}
+
+
 def _simulate(schematic_json: str, out: str, pcb_json: str | None = None,
               types: list[str] | None = None, monte_carlo: int = 0) -> dict:
     from blpl.agent.tools.spice import simulate
@@ -69,6 +78,7 @@ OPS: dict[str, Callable[..., Any]] = {
     "drc": _drc,
     "erc": _erc,
     "autoroute": _autoroute,
+    "autoroute_available": _autoroute_available,
     "simulate": _simulate,
 }
 
