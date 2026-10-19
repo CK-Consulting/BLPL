@@ -314,3 +314,77 @@ def test_an_unpinned_connector_symbol_is_not_a_miss(tmp_path):
     # The pinned connector's symbol does not exist in the (empty) libraries:
     # the claim is checked and it fails.
     assert rows["J_SIM"]["status"] == "miss"
+
+
+def test_a_connector_never_takes_a_stock_symbol_by_guess(tmp_path):
+    """J_NFC, MPN "TestPoint_2Pads", was matched on its name to the one-pin
+    Connector:TestPoint, and the pad that carried NFC2_ANT was drawn connected
+    to nothing. A connector keeps only a symbol named exactly."""
+    import json
+    syms = tmp_path / "syms"
+    (syms / "Connector.kicad_symdir").mkdir(parents=True)
+    (syms / "Connector.kicad_symdir" / "TestPoint.kicad_sym").write_text("(kicad_symbol_lib)")
+    fps = tmp_path / "fps"
+    (fps / "TestPoint.pretty").mkdir(parents=True)
+    (fps / "TestPoint.pretty" / "TestPoint_2Pads.kicad_mod").write_text("(footprint)")
+    (fps / "TestPoint.pretty" / "TestPoint_Pad.kicad_mod").write_text("(footprint)")
+    bom_path = tmp_path / "bom.json"
+    bom_path.write_text(json.dumps({
+        "project_id": "p", "schema_version": 1,
+        "rows": [
+            {"local_id": "J_NFC", "mpn": "TestPoint_2Pads", "package": "pkg",
+             "symbol_hint": "Connector:TestPoint_2Pads",  # no such symbol
+             "footprint_hint": "TestPoint:TestPoint_2Pads"},
+            {"local_id": "J_SHP", "mpn": "TestPoint_Pad", "package": "pkg",
+             "symbol_hint": "Connector:TestPoint",  # named exactly: kept
+             "footprint_hint": "TestPoint:TestPoint_Pad"},
+        ],
+    }))
+    report = stage2_library_lookup.run(bom_path, syms, fps, tmp_path / "cov.json")
+    rows = {r["local_id"]: r for r in report["rows"]}
+    assert rows["J_NFC"]["symbol_match"] is None and rows["J_NFC"]["status"] == "hit"
+    assert rows["J_SHP"]["symbol_match"]["name"] == "TestPoint"
+
+
+def test_a_pinned_connector_symbol_that_is_missing_is_a_miss_not_a_guess(tmp_path):
+    import json
+    proj = tmp_path / "proj"
+    (proj / ".pipeline").mkdir(parents=True)
+    (proj / ".pipeline" / "design_artifact.deterministic.json").write_text(json.dumps(
+        {"components": [{"local_id": "J_NFC", "symbol_hint": "Connector:TestPoint_2Pads"}]}))
+    syms = tmp_path / "syms"
+    (syms / "Connector.kicad_symdir").mkdir(parents=True)
+    (syms / "Connector.kicad_symdir" / "TestPoint.kicad_sym").write_text("(kicad_symbol_lib)")
+    fps = tmp_path / "fps"
+    (fps / "TestPoint.pretty").mkdir(parents=True)
+    (fps / "TestPoint.pretty" / "TestPoint_2Pads.kicad_mod").write_text("(footprint)")
+    bom_path = tmp_path / "bom.json"
+    bom_path.write_text(json.dumps({"project_id": "p", "schema_version": 1, "rows": [
+        {"local_id": "J_NFC", "mpn": "TestPoint_2Pads", "package": "pkg",
+         "symbol_hint": "Connector:TestPoint_2Pads", "footprint_hint": "TestPoint:TestPoint_2Pads"}]}))
+    report = stage2_library_lookup.run(bom_path, syms, fps, tmp_path / "cov.json", project_dir=proj)
+    (row,) = report["rows"]
+    assert row["symbol_match"] is None and row["status"] == "miss"
+
+
+def test_a_module_connector_is_a_connector_by_its_designator():
+    assert stage2_library_lookup._is_connector({"local_id": "ltc4015-charger.J1"})
+    assert stage2_library_lookup._is_connector({"local_id": "x", "refdes": "J3"})
+    assert not stage2_library_lookup._is_connector({"local_id": "jumper-board.U1"})
+    assert not stage2_library_lookup._is_connector({"local_id": "U7"})
+
+
+def test_a_module_connector_never_takes_a_guessed_symbol(tmp_path):
+    import json
+    syms = tmp_path / "syms"
+    (syms / "Connector.kicad_symdir").mkdir(parents=True)
+    (syms / "Connector.kicad_symdir" / "TestPoint.kicad_sym").write_text("(kicad_symbol_lib)")
+    fps = tmp_path / "fps"
+    (fps / "TestPoint.pretty").mkdir(parents=True)
+    (fps / "TestPoint.pretty" / "TestPoint_2Pads.kicad_mod").write_text("(footprint)")
+    bom_path = tmp_path / "bom.json"
+    bom_path.write_text(json.dumps({"project_id": "p", "schema_version": 1, "rows": [
+        {"local_id": "charger.J1", "mpn": "TestPoint_2Pads", "package": "pkg",
+         "footprint_hint": "TestPoint:TestPoint_2Pads"}]}))
+    (row,) = stage2_library_lookup.run(bom_path, syms, fps, tmp_path / "cov.json")["rows"]
+    assert row["symbol_match"] is None and row["status"] == "hit"
