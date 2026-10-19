@@ -149,9 +149,13 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
         if isinstance(board.get(key), (int, float)) and board[key] > 0:
             held += [flag, f"{board[key]:g}"]
     if planes:
-        plane_nets = sorted(planes)
-        layers = [planes[n][0] for n in plane_nets]
-        cls = next((classes[c] for c, ns in groups.items() if set(plane_nets) & set(ns) and c in classes), default)
+        # One (net, layer) pair per plane, positionally: a net may be a plane
+        # on more than one layer (GND on In1.Cu and In2.Cu), and taking each
+        # net's first layer poured the second plane nowhere.
+        pairs = sorted((n, l) for n, ls in planes.items() for l in ls)
+        plane_nets = [n for n, _ in pairs]
+        layers = [l for _, l in pairs]
+        cls = next((classes[c] for c, ns in groups.items() if set(planes) & set(ns) and c in classes), default)
         # Plane vias kept off their own pads. Left to it, the router dropped a
         # via into every plane pad it could: 46 untented vias in pads on
         # verdacor, which wick solder away in reflow unless the fab fills and
