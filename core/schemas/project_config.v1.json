@@ -215,6 +215,30 @@
         "footprint_only": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
       }
     },
+    "silkscreen": {
+      "description": "What the board's silkscreen carries (core/blpl/emitter/silk.py).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "references": {
+          "enum": ["fit", "hidden"],
+          "description": "fit (the default): a reference stays in silk only when it fits on its own part. hidden: none in silk; they stay on F.Fab, the assembly drawing."
+        },
+        "labels": {
+          "type": "object",
+          "description": "Silk text a person must read on the finished board, by part: shown where that part's reference would be. Example: {BT_POS: '+', J_RF_GNSS: GNSS}.",
+          "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 16 }
+        },
+        "label_size": {
+          "type": "number", "minimum": 0.8, "maximum": 3,
+          "description": "Label text height in mm (default and minimum 0.8, KiCad's silk minimum)."
+        },
+        "clip_to_copper": {
+          "type": "boolean",
+          "description": "Trim footprints' silk graphics where they cross the footprint's own pads, as the fab's mask clipping would."
+        }
+      }
+    },
     "review": {
       "description": "How the checks treat this project's findings (core/blpl/core/accept.py).",
       "type": "object",

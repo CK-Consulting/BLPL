@@ -235,6 +235,18 @@ _VALUE_TEXT = re.compile(
 )
 
 
+def _apply_silkscreen(hdm: dict, components_out: dict, project_config: dict) -> None:
+    """project.yaml ``silkscreen`` onto the HDM: the policy, and each label on its part."""
+    silk = project_config.get("silkscreen") or {}
+    if not silk:
+        return
+    for ref, text in (silk.get("labels") or {}).items():
+        if ref not in components_out:
+            raise InvalidProjectConfigError(f"silkscreen.labels names {ref}, which is not a part on this board")
+        components_out[ref]["silk_label"] = str(text)
+    hdm["silkscreen"] = {k: v for k, v in silk.items() if k != "labels"}
+
+
 def _apply_assembly(components_out: dict, project_config: dict) -> None:
     """Mark the parts project.yaml says are not simply bought and placed.
 
@@ -868,6 +880,7 @@ def emit(
                               **impedance.synthesized_classes(project_config, z)}
     hdm["components"] = components_out
     hdm["nets"] = nets_out
+    _apply_silkscreen(hdm, components_out, project_config)
     # Always written, count 0 included: Stage 8 reads this to tell "no test
     # points because the policy said so" from "no test points because the
     # pipeline cannot make them".

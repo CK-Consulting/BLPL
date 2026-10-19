@@ -17,7 +17,7 @@ from copy import deepcopy
 from collections.abc import Sequence
 from pathlib import Path
 
-from . import loaders, sexpr
+from . import loaders, sexpr, silk
 
 
 _PCB_VERSION = "20260206"
@@ -1145,6 +1145,9 @@ def build(
         sheet_y = by + _ORIGIN_Y
 
         _set_reference_and_value(fp_node, refdes, str(comp.get("value", refdes)))
+        # project.yaml's silkscreen: which references show, the labels a
+        # person must read, and outlines trimmed off their own pads (silk.py).
+        silk.apply(fp_node, policy=hdm.get("silkscreen"), label=comp.get("silk_label"))
         _replace_uuid(fp_node)
         _set_assembly(fp_node, comp.get("assembly"))
 
