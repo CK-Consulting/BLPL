@@ -870,6 +870,12 @@ def _render_markdown(report: dict) -> str:
             "",
         ]
 
+    if report.get("accepted"):
+        lines += ["## Accepted — intended, per project.yaml review.accept", ""]
+        for d in report["accepted"]:
+            lines.append(f"- **{d.get('rule_id', '')}** — {d['summary']} — *{d['accepted_reason']}*")
+        lines.append("")
+
     if report["expected"]:
         lines += ["## Expected — did not run this time", ""]
         reasons = report.get("expected_reasons") or {}
@@ -1118,6 +1124,23 @@ def run(
 
     _SEV = {"error": 0, "warning": 1, "info": 2}
     design_issues.sort(key=lambda d: _SEV.get(d["severity"], 3))
+    # Findings the project accepts on purpose, with the reason it gave
+    # (project.yaml review.accept, accept.py). Kept on record, not counted.
+    from . import accept
+
+    design_issues, accepted = accept.split(
+        design_issues, accept.entries(hdm if isinstance(hdm, dict) else {}))
+    # And the placement findings Stage 5 accepted: its audit (an edge margin,
+    # an overlap) is not repeated here, so without these the waiver vanished
+    # from the record the moment Stage 5 made it (Codex, PR #62).
+    placement_waived = ((((hdm or {}).get("synthesis") or {}).get("placement") or {})
+                        .get("audit_accepted") or []) if isinstance(hdm, dict) else []
+    accepted += [{
+        "source": "placement_audit", "rule_id": f.get("problem", ""), "severity": "warning",
+        "summary": f"{f.get('ref', '')}: {f.get('problem', '')} — {f.get('detail', '')}",
+        "components": f.get("parts") or [f.get("ref", "")], "nets": [],
+        "accepted_reason": f.get("accepted_reason", ""),
+    } for f in placement_waived]
 
     report = {
         # A board is not "ok" if the pipeline mis-emitted it, and it is certainly
@@ -1132,6 +1155,7 @@ def run(
             "emitter": len(emitter_defects),
             "design": len(design_issues),
             "expected": sum(expected_counts.values()),
+            "accepted": len(accepted),
             "placeholders": len(placeholders),
         },
         "placeholders": placeholders,
@@ -1147,6 +1171,7 @@ def run(
         "test_points": test_points,
         "emitter_defects": emitter_defects,
         "design_issues": design_issues,
+        "accepted": accepted,
         "expected": expected,
         "expected_reasons": ctx.reasons,
         "analyzers": analyzers,
