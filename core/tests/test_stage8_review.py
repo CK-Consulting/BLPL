@@ -184,7 +184,7 @@ def test_emitter_defects_gate_but_design_issues_do_not(tmp_path: Path, monkeypat
     # spice=False keeps this hermetic: simulation shells out to a real binary
     # that may or may not be installed, and this test is about classification.
     report = s8.run(tmp_path, sch_path=sch, pcb_path=None, spice=False, lifecycle=False)
-    assert report["summary"] == {"emitter": 0, "design": 1, "expected": 1, "placeholders": 0}
+    assert report["summary"] == {"emitter": 0, "design": 1, "expected": 1, "accepted": 0, "placeholders": 0}
     assert report["ok"] is True
     md = (pipeline / "review.md").read_text()
     assert "DC-002" in md
@@ -341,3 +341,33 @@ def test_an_autoroute_record_for_another_compile_does_not_count(tmp_path: Path, 
     assert report["autoroute"]["attempted"] is False
     assert "old_2026-01-01" in report["autoroute"]["reason"]
     assert report["expected"] == [{"rule_id": "RT-001", "count": 1}]
+
+
+def test_placement_waivers_stay_on_stage8s_record(tmp_path: Path, monkeypatch) -> None:
+    """A placement finding Stage 5 accepted is not re-checked here, so it must
+    be carried over, or the waiver vanished from the report (Codex, PR #62)."""
+    import yaml
+
+    pipeline = tmp_path / ".pipeline"
+    pipeline.mkdir(parents=True)
+    (pipeline / "bom.json").write_text(json.dumps(_bom([{"local_id": "U1", "mpn": "M", "package": "P"}])))
+    (pipeline / "hdm.yaml").write_text(yaml.safe_dump({"components": {}, "nets": {}, "synthesis": {"placement": {
+        "audit_accepted": [{"ref": "J_NFC", "problem": "in_edge_margin", "detail": "0.85 mm from the edge",
+                            "parts": ["J_NFC"], "accepted_reason": "Wire pads at the edge for soldering."}]}}}))
+    sch = tmp_path / "b.kicad_sch"
+    sch.write_text("(kicad_sch)")
+    monkeypatch.setattr(s8, "_find_kicad_happy", lambda: tmp_path / "kh")
+
+    def _fake_run(script, args, out_path, env=None, timeout=None):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps({"statistics": {"total_components": 1}, "bom_lock": {"components_with_mpn": 1},
+                                        "components": [{"reference": "U1"}], "findings": []}))
+        return {"ok": True, "skipped": False, "exit_code": 0, "report_json": str(out_path)}
+
+    monkeypatch.setattr(s8, "_run_analyzer", _fake_run)
+    report = s8.run(tmp_path, sch_path=sch, pcb_path=None, spice=False, lifecycle=False)
+    (waived,) = report["accepted"]
+    assert waived["rule_id"] == "in_edge_margin" and waived["components"] == ["J_NFC"]
+    assert waived["accepted_reason"] == "Wire pads at the edge for soldering."
+    assert report["summary"]["accepted"] == 1
+    assert "Wire pads at the edge for soldering." in (pipeline / "review.md").read_text()
