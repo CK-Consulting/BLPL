@@ -38,7 +38,8 @@ def test_nets_are_grouped_by_their_class(board):
 
 
 def test_planes_then_each_class_at_its_width_then_the_rest_with_power_nets(board):
-    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["In1.Cu"]})
+    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["In1.Cu"]},
+                           ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
     assert [s["script"] for s in steps] == ["route_planes.py", "route.py", "route.py"]
     planes, rf, rest = (s["args"] for s in steps)
     # The plane vias at the plane net's own class: 0.25 mm, a 0.9/0.5 via.
@@ -150,3 +151,19 @@ def test_the_adapted_skills_ship_and_credit_their_source():
         assert name in avail and name in skills_install.DEFAULT_SET
         text = (avail[name] / "SKILL.md").read_text()
         assert "github.com/drandyhaas/KiCadRoutingTools" in text and "ACKNOWLEDGMENTS.md" in text
+
+
+def test_plane_vias_stay_off_pads_and_signals_off_the_planes(board):
+    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["In1.Cu"], "VBAT": ["In2.Cu"]},
+                           ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+    planes, *routes = (s["args"] for s in steps)
+    assert planes[planes.index("--same-net-pad-clearance") + 1] == "0.25"
+    for args in routes:
+        i = args.index("--layers")
+        assert args[i + 1:i + 3] == ["F.Cu", "B.Cu"]
+
+
+def test_the_copper_layers_are_read_from_the_board(tmp_path):
+    pcb = tmp_path / "b.kicad_pcb"
+    pcb.write_text('(kicad_pcb (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal) (2 "B.Cu" signal) (5 "F.SilkS" user)))')
+    assert krt_route.board_copper(pcb) == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
