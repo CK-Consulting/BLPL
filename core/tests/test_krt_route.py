@@ -47,8 +47,10 @@ def test_planes_then_each_class_at_its_width_then_the_rest_with_power_nets(board
     # The RF class at 0.35 mm, never escalated below the project's floors.
     assert rf[:2] == ["--nets", "RF_ANT"] and rf[rf.index("--track-width") + 1] == "0.35"
     assert "--escalation" in rf and rf[rf.index("--escalation") + 1] == "off" and "--no-fix-drc-settings" in rf
-    # Everything else at Default, the power class as power nets at 0.75 mm.
-    assert rest[:2] == ["--nets", "*"] and rest[rest.index("--track-width") + 1] == "0.2"
+    # Everything else at Default, the power class as power nets at 0.75 mm,
+    # named outright: never the RF net again at the Default width.
+    assert rest[:4] == ["--nets", "GND", "SPI_SCK", "VBAT"] and rest[rest.index("--track-width") + 1] == "0.2"
+    assert "RF_ANT" not in rest and "*" not in rest
     i = rest.index("--power-nets")
     assert rest[i + 1:i + 3] == ["GND", "VBAT"] and rest[rest.index("--power-nets-widths") + 1:][:2] == ["0.75", "0.75"]
 
@@ -186,3 +188,20 @@ def test_a_net_planed_on_two_layers_is_poured_on_both(board):
                                   ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
     a = planes["args"]
     assert a[:6] == ["--nets", "GND", "GND", "--plane-layers", "In1.Cu", "In2.Cu"]
+
+
+def test_each_plane_class_gets_its_own_vias(tmp_path):
+    pcb = tmp_path / "b.kicad_pcb"
+    pcb.write_text('(kicad_pcb (net 1 "GND") (net 2 "VDD") (net 3 "SIG"))')
+    pro = pcb.with_suffix(".kicad_pro")
+    pro.write_text(json.dumps({"net_settings": {"classes": [
+        {"name": "Default", "track_width": 0.2, "clearance": 0.15, "via_diameter": 0.6, "via_drill": 0.3},
+        {"name": "Gnd", "track_width": 0.5, "clearance": 0.2, "via_diameter": 0.9, "via_drill": 0.5},
+        {"name": "Vdd", "track_width": 0.5, "clearance": 0.3, "via_diameter": 1.1, "via_drill": 0.6}],
+        "netclass_patterns": [{"pattern": "GND", "netclass": "Gnd"}, {"pattern": "VDD", "netclass": "Vdd"}]}}))
+    steps = krt_route.plan(pcb, pro, {"GND": ["In1.Cu"], "VDD": ["In2.Cu"]}, ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+    planes = [s["args"] for s in steps if s["script"] == "route_planes.py"]
+    assert len(planes) == 2
+    gnd, vdd = sorted(planes, key=lambda a: a[1])
+    assert gnd[:4] == ["--nets", "GND", "--plane-layers", "In1.Cu"] and gnd[gnd.index("--via-size") + 1] == "0.9"
+    assert vdd[:4] == ["--nets", "VDD", "--plane-layers", "In2.Cu"] and vdd[vdd.index("--via-size") + 1] == "1.1"
