@@ -388,6 +388,12 @@ def carry_forward(pcb: Path, work: Path, python: str) -> RouteResult | None:
     if not same:
         return None
 
+    # The plane vias first, as a fresh route lays them. The session holds only
+    # what Freerouting routed; the fanout vias were on the board before it ran,
+    # so carrying the session alone brought the tracks back and left every
+    # plane pad unconnected: verdacor came back with 57 connections open and
+    # not one locked via where the route it was carried from had 20 (#56).
+    fanout = _fan_out_planes(python, pcb)
     imported = _import_ses(python, pcb, ses)
     if imported.returncode != 0:
         return None
@@ -400,7 +406,8 @@ def carry_forward(pcb: Path, work: Path, python: str) -> RouteResult | None:
         True, "", pcb=str(pcb), ses=str(ses),
         segments=measured.get("segments"),
         unrouted=measured.get("unconnected"),
-        extra={"carried_from": str(ses)},
+        extra={"carried_from": str(ses),
+               **({"plane_fanout": fanout} if fanout is not None else {})},
     )
 
 
@@ -437,6 +444,24 @@ def plane_nets(pcb: Path) -> list[str]:
     return sorted(plane_layers(pcb))
 
 
+def _fan_out_planes(python: str, pcb: Path) -> dict | None:
+    """Give each plane net's pads their vias, locked, in ``pcb``; what was done.
+
+    None when the board has no planes. Both ways a board gets routed need it:
+    a fresh route before Freerouting sees the board, and a carried one before
+    the old session is imported, because the session holds only what the
+    router laid and the fanout vias were on the board before it ran.
+    """
+    planes_on = plane_layers(pcb)
+    if not planes_on:
+        return None
+    fan = _pcbnew(python, plane_fanout.script(str(pcb), planes_on))
+    fanout = plane_fanout.parse(fan.stdout)
+    if fan.returncode != 0:
+        fanout["error"] = _msg(fan)
+    return {"nets": sorted(planes_on), **fanout}
+
+
 def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> RouteResult:
     """Route a board in bulk. The PCB is modified in place on success.
 
@@ -460,13 +485,9 @@ def route(pcb: Path, *, work_dir: Path | None = None, passes: int = 10) -> Route
 
     # Planes first: Freerouting does not drop vias to them, so their pads get
     # theirs here, locked, before it sees the board (plane_fanout.py).
-    planes_on = plane_layers(pcb)
-    if planes_on:
-        fan = _pcbnew(python, plane_fanout.script(str(pcb), planes_on))
-        fanout = plane_fanout.parse(fan.stdout)
-        if fan.returncode != 0:
-            fanout["error"] = _msg(fan)
-        base.extra["plane_fanout"] = {"nets": sorted(planes_on), **fanout}
+    fanout = _fan_out_planes(python, pcb)
+    if fanout is not None:
+        base.extra["plane_fanout"] = fanout
 
     export = _export_dsn(python, pcb, dsn)
     if export.returncode != 0 or not dsn.is_file():

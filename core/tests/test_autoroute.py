@@ -355,6 +355,31 @@ def test_an_unchanged_board_reuses_the_last_route_without_running_the_router(
     assert rep["passes"] == 0
 
 
+def test_a_carried_route_gets_its_plane_vias_before_the_session(monkeypatch, tmp_path) -> None:
+    """The session holds only what Freerouting laid. A fresh route fans the
+    planes out first; a carried one skipped that, and verdacor came back with
+    the old tracks, no plane vias and 57 connections open."""
+    _make_available(monkeypatch, tmp_path)
+    calls = _carry_stub(monkeypatch)
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {"GND": ["In1.Cu"]})
+
+    def fake_fanout(python, pcb):
+        calls.append("fanout")
+        return {"nets": ["GND"], "vias": 9}
+
+    monkeypatch.setattr(autoroute, "_fan_out_planes", fake_fanout)
+    work = tmp_path / ".pipeline" / "autoroute"
+    text = "(kicad_pcb (version 20260206) (footprint A) (footprint B))"
+    _prior_run(work, text)
+    pcb = tmp_path / "board.kicad_pcb"
+    pcb.write_text(text)
+    autoroute.run_for(pcb, tmp_path / "r.json", work_dir=work)
+
+    assert "java" not in calls
+    assert calls.index("fanout") < calls.index("import")
+    assert _report(tmp_path / "r.json")["plane_fanout"] == {"nets": ["GND"], "vias": 9}
+
+
 def test_a_board_that_moved_is_routed_again_rather_than_carried(monkeypatch, tmp_path) -> None:
     """The safety half: an old session's coordinates are only valid for the
     placement they were produced from."""
