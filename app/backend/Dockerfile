@@ -51,6 +51,25 @@ ENV VIRTUAL_ENV=/opt/blpl-venv
 RUN python3 -m venv --system-site-packages $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# KiCad Routing Tools (github.com/drandyhaas/KiCadRoutingTools, MIT), the
+# other router Stage 6a can use (project.yaml routing.router). Pinned by commit
+# and its compiled router by sha256, as the Freerouting jar is: a router that
+# changed under us would change what routes, silently. Its Python half runs in
+# this venv, which is why numpy, scipy and shapely are installed here.
+ARG KRT_VERSION=v0.23.1
+ARG KRT_COMMIT=295f9ee197517e8323726853361eb137cc08ba9e
+ARG KRT_ROUTER_SHA256=d42aa6c682e6ab42f82d2241cf5b2a333effa4ad0b58549b1305b4503ce6bf79
+RUN set -eux; \
+    git clone --quiet --depth 1 --branch "${KRT_VERSION}" \
+        https://github.com/drandyhaas/KiCadRoutingTools /opt/kicad-routing-tools; \
+    test "$(git -C /opt/kicad-routing-tools rev-parse HEAD)" = "${KRT_COMMIT}"; \
+    rm -rf /opt/kicad-routing-tools/.git; \
+    curl -fsSL -o /opt/kicad-routing-tools/rust_router/grid_router.so \
+        "https://github.com/drandyhaas/KiCadRoutingTools/releases/download/${KRT_VERSION}/grid_router-linux-x86_64.so"; \
+    echo "${KRT_ROUTER_SHA256}  /opt/kicad-routing-tools/rust_router/grid_router.so" | sha256sum -c -; \
+    pip install --no-cache-dir "numpy>=1.22" "scipy>=1.7" "shapely>=2.0"
+ENV KRT_HOME=/opt/kicad-routing-tools
+
 COPY app/backend/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
