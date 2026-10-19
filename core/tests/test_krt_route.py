@@ -205,3 +205,27 @@ def test_each_plane_class_gets_its_own_vias(tmp_path):
     gnd, vdd = sorted(planes, key=lambda a: a[1])
     assert gnd[:4] == ["--nets", "GND", "--plane-layers", "In1.Cu"] and gnd[gnd.index("--via-size") + 1] == "0.9"
     assert vdd[:4] == ["--nets", "VDD", "--plane-layers", "In2.Cu"] and vdd[vdd.index("--via-size") + 1] == "1.1"
+
+
+def test_an_edge_band_goes_on_before_routing_and_comes_off_after(board, tmp_path, monkeypatch):
+    pro = board.with_suffix(".kicad_pro")
+    data = json.loads(pro.read_text())
+    data["board"] = {"design_settings": {"rules": {"min_copper_edge_clearance": 0.5}}}
+    pro.write_text(json.dumps(data))
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
+    calls = []
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    monkeypatch.setattr(krt_route, "_resave", lambda *a: calls.append("resave") or ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add: calls.append(("band", add, d)) or ok)
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: calls.append(Path(cmd[1]).name) or ok)
+    monkeypatch.setattr(krt_route, "_fill", lambda *a: calls.append("fill") or ok)
+    monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
+    assert krt_route.route(board, work_dir=tmp_path / "w").ok
+    # Band on after the re-save, before any routing; off before the fill.
+    # Its depth is the edge rule plus half the widest track (0.75 / 2).
+    assert calls[:2] == ["resave", ("band", True, 0.875)]
+    assert calls[-2:] == [("band", False, 0), "fill"]
+    assert all("route" in c for c in calls[2:-2])
