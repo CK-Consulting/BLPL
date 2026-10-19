@@ -1,7 +1,7 @@
 """Stage 6a with KiCad Routing Tools instead of Freerouting.
 
 KiCad Routing Tools (https://github.com/drandyhaas/KiCadRoutingTools, MIT,
-Andy Haas and contributors) routes a ``.kicad_pcb`` directly: a Rust A* grid
+drandyhaas and contributors) routes a ``.kicad_pcb`` directly: a Rust A* grid
 router behind Python CLIs, with plane pours and their vias, no Specctra round
 trip. On verdacor-ear-tag Freerouting stalled at 53 open connections from its
 first pass, while this, given the same placement and the project's own rules,

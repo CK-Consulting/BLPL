@@ -30,6 +30,17 @@ app/frontend/src/components/Visualizer.tsx, app/frontend/src/types/ecad-viewer.d
   Copyright Krishna Swaroop and contributors
   Apache License 2.0 — see LICENSE. Changes are described in ACKNOWLEDGMENTS.md.
 
+core/blpl/skills/routed-board-review/, core/blpl/skills/plane-mappings/,
+and two sections of core/blpl/skills/controlled-impedance/SKILL.md
+  Adapted from skills in KiCad Routing Tools,
+  https://github.com/drandyhaas/KiCadRoutingTools
+  Copyright (c) 2026 drandyhaas
+  MIT License — licenses/kicad-routing-tools.txt. Changes are described in
+  ACKNOWLEDGMENTS.md.
+
+Installed in the container images, not part of this source distribution:
+  KiCad Routing Tools v0.23.1  MIT  https://github.com/drandyhaas/KiCadRoutingTools
+
 Submodules (not part of this distribution; each carries its own license):
   kicad-happy          MIT           https://github.com/CK-Consulting/kicad-happy
                                      (derived from https://github.com/aklofas/kicad-happy)

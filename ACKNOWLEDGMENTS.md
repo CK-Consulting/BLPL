@@ -63,6 +63,29 @@ The design-review analyzers behind `blpl stage8`: schematic and PCB parsing,
 subcircuit detection, EMC pre-compliance, SPICE, thermal. See
 `core/kicad-happy/ATTRIBUTION.md` for the details of our divergence.
 
+## KiCad Routing Tools — MIT
+
+<https://github.com/drandyhaas/KiCadRoutingTools> — drandyhaas and contributors.
+
+A KiCad autorouter: a Rust A* grid router behind Python command-line tools,
+with plane pours and their vias. Two things of theirs are used here:
+
+- **The router itself.** Stage 6a routes with it by default
+  (`core/blpl/core/krt_route.py`), with Freerouting as the backup. It is not
+  vendored: the backend and workspace images install release v0.23.1, its
+  commit and compiled router pinned by hash (`app/backend/Dockerfile`,
+  `app/workspace/Dockerfile`), and BLPL runs its CLIs as separate programs. On
+  verdacor-ear-tag it routed every net where Freerouting stalled at 53 open.
+- **Four of its Claude Code skills, adapted.** `routed-board-review` from
+  `review-routed-board`, `plane-mappings` from `recommend-plane-mappings`, and
+  two checks in `controlled-impedance` from `recommend-stackup` and
+  `find-high-speed-nets` (all under `core/blpl/skills/`). Changes we made: the
+  procedures were rewritten around BLPL's own reports, project.yaml and stages
+  rather than the router's CLIs, and shortened; the methods are theirs. Each
+  adapted skill names its source.
+
+License text in `licenses/kicad-routing-tools.txt`.
+
 ## KiCad — GPL / CC-BY-SA
 
 <https://www.kicad.org> — the KiCad project and its contributors.

@@ -1173,16 +1173,27 @@ def _cmd_stage8(args: argparse.Namespace) -> int:
 
 
 def _router(args: argparse.Namespace, proj: Path) -> str:
-    """project.yaml's routing.router, Freerouting when it says nothing."""
+    """The router Stage 6a uses: project.yaml's routing.router when it names one.
+
+    Otherwise KiCad Routing Tools when it is installed, and Freerouting when it
+    is not. KRT is the default because on verdacor-ear-tag it routed every net
+    where Freerouting stalled at 53 open; Freerouting stays as the backup and
+    can still be named outright.
+    """
     import yaml
+
+    from . import krt_route
 
     path = _project_config(args, proj)
     try:
         cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
-        return "freerouting"
+        cfg = {}
     routing = cfg.get("routing") if isinstance(cfg, dict) else None
-    return str((routing or {}).get("router") or "freerouting")
+    named = (routing or {}).get("router")
+    if named:
+        return str(named)
+    return "kicad-routing-tools" if krt_route.available()[0] else "freerouting"
 
 
 def _cmd_autoroute(args: argparse.Namespace) -> int:

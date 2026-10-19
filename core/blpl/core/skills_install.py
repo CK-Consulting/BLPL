@@ -36,7 +36,7 @@ _PACKAGE_SKILLS = Path(__file__).resolve().parent.parent / "skills"
 # fab-prep skills (distributor APIs, order prep) are opt-in via --all/--skill —
 # they activate on vocabulary common enough that installing them everywhere
 # would make Claude load them on unrelated conversations.
-DEFAULT_SET = ["hardware-design", "protection-circuits", "design-guidelines", "controlled-impedance", "erc-drc-resolution", "kicad", "emc", "bom", "datasheets", "spice"]
+DEFAULT_SET = ["hardware-design", "protection-circuits", "design-guidelines", "controlled-impedance", "erc-drc-resolution", "routed-board-review", "plane-mappings", "kicad", "emc", "bom", "datasheets", "spice"]
 
 _MARKER = ".blpl-installed"
 
@@ -58,7 +58,7 @@ def available(source: Path | None = None) -> dict[str, Path]:
     """
     skills: dict[str, Path] = {}
     for name in ("hardware-design", "protection-circuits", "design-guidelines", "controlled-impedance",
-                 "erc-drc-resolution"):
+                 "erc-drc-resolution", "routed-board-review", "plane-mappings"):
         if (_PACKAGE_SKILLS / name / "SKILL.md").exists():
             skills[name] = _PACKAGE_SKILLS / name
 

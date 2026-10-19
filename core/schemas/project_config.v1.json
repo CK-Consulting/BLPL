@@ -246,7 +246,7 @@
       "properties": {
         "router": {
           "enum": ["freerouting", "kicad-routing-tools"],
-          "description": "freerouting (the default) or kicad-routing-tools (KiCad Routing Tools, routed class by class at the project's own rules)."
+          "description": "kicad-routing-tools (KiCad Routing Tools, routed class by class at the project's own rules; the default when it is installed) or freerouting (the default otherwise)."
         }
       }
     },
