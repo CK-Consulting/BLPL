@@ -81,3 +81,13 @@ describe("the strip says which changes are which", () => {
     expect(await screen.findByText("1 commit not pushed")).toBeInTheDocument();
   });
 });
+
+describe("what the strip promises about unpushed commits", () => {
+  it("does not call them risk-free: until pushed they are only on this server", async () => {
+    vi.stubGlobal("fetch", status({ ahead: 2 }));
+    render(<ProjectSync projectId="p" onChanged={() => {}} />);
+    const badge = await screen.findByText("2 commits not pushed");
+    expect(badge.getAttribute("title")).toMatch(/not yet on the remote/);
+    expect(badge.getAttribute("title")).not.toMatch(/nothing is at risk/i);
+  });
+});

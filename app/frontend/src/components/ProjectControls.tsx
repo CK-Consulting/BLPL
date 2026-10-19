@@ -213,7 +213,7 @@ export function ProjectSync({
       {st.ahead > 0 && (
         <span
           className="badge info"
-          title="Committed here, not yet on the remote. Nothing is at risk; Sync pushes them."
+          title="Saved on this server, not yet on the remote. Sync pushes them, which also keeps a copy off this server."
         >
           {st.ahead} {st.ahead === 1 ? "commit" : "commits"} not pushed
         </span>
