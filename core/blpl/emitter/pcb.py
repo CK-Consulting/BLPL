@@ -1089,7 +1089,7 @@ def build(
         ["general", ["thickness", f"{thickness}"], ["legacy_teardrops", "no"]],
         ["paper", '"A4"'],
         ["layers", *copper_rows, *_NON_COPPER_LAYERS],
-        _default_setup(),
+        _default_setup(_stackup(project, _copper_count(project), float(thickness))),
     ]
 
     # Nets.
@@ -1220,10 +1220,121 @@ def _placeholder_banner(refdes_list: list[str], width: float, height: float) -> 
     ]
 
 
-def _default_setup() -> sexpr.Node:
+#: Outer and inner copper (1 oz, 0.5 oz), solder mask, and the dielectric a
+#: board is built of when project.stackup says no more than its layer count
+#: and thickness: the common 7628 prepreg under the outer layers, FR-4 core
+#: making up the rest. What the controlled-impedance widths assume until the
+#: fab's own stackup is entered.
+_OUTER_CU, _INNER_CU, _MASK = 0.035, 0.0175, 0.01
+_PREPREG, _ER_PREPREG, _ER_CORE, _LOSS = 0.2104, 4.4, 4.5, 0.02
+#: The thinnest dielectric a fab lays (a 1080 prepreg is ~0.07 mm).
+_MIN_DIELECTRIC = 0.05
+
+
+def _dielectric(name: str, kind: str, mm: float, er: float) -> sexpr.Node:
+    return ["layer", sexpr.quote(name), ["type", sexpr.quote(kind)], ["thickness", f"{mm:.4g}"],
+            ["material", '"FR4"'], ["epsilon_r", f"{er:g}"], ["loss_tangent", f"{_LOSS:g}"]]
+
+
+def _stackup(project: dict, copper: int, thickness: float) -> sexpr.Node | None:
+    """The board's physical stackup, for the fab and for every tool that reads it.
+
+    None was written, and a board without one has no reference planes as far
+    as anything reading the file knows: the design review (kicad-happy's
+    return-path check) fell back to measuring F.Cu against B.Cu, two layers
+    and a millimetre away, and reported every outer-layer signal on
+    verdacor-ear-tag as having lost its ground plane while In1.Cu's GND sat
+    0.2 mm under it. KiCad's impedance calculator and the fab drawing read
+    the same section.
+
+    ``project.stackup`` may give ``prepreg`` and ``core`` (mm) and ``er``;
+    otherwise the prepreg is 0.21 mm 7628 and the cores share what is left of
+    ``thickness``. Two-layer boards are one core, so a ``prepreg`` given for
+    one is refused rather than dropped. A one-layer board gets no stackup:
+    the format still lists B.Cu, and a stackup would tell the fab and the
+    review there is bottom copper (Codex, PR #61). ``copper_finish`` is the
+    project's ``finish``.
+    """
+    if copper < 2:
+        return None
+    st = project.get("stackup") or {}
+    prepreg = float(st.get("prepreg") or _PREPREG)
+    er_pp = float(st.get("er") or _ER_PREPREG)
+    er_core = float(st.get("er") or _ER_CORE)
+    names = [row[1].strip('"') for row in _copper_layers(copper)]
+    rows: list[sexpr.Node] = [
+        ["layer", '"F.SilkS"', ["type", '"Top Silk Screen"']],
+        ["layer", '"F.Paste"', ["type", '"Top Solder Paste"']],
+        ["layer", '"F.Mask"', ["type", '"Top Solder Mask"'], ["thickness", f"{_MASK:g}"]],
+    ]
+    gaps = len(names) - 1
+    copper_mm = sum(_OUTER_CU if n in ("F.Cu", "B.Cu") else _INNER_CU for n in names)
+    if gaps == 1:
+        kinds = ["core"]
+        cores = 1
+    else:
+        # prepreg / core / prepreg / core ... / prepreg: outer gaps prepreg.
+        kinds = ["prepreg" if i % 2 == 0 else "core" for i in range(gaps)]
+        cores = kinds.count("core")
+    n_pp = kinds.count("prepreg")
+    room = thickness - 2 * _MASK - copper_mm
+    given_pp, given_core = st.get("prepreg"), st.get("core")
+
+    def refuse(why: str) -> ValueError:
+        return ValueError(f"project.stackup: {why}; the layers must add up to the board's "
+                          f"{thickness:g} mm (copper and mask take {thickness - room:.3f} mm)")
+
+    if given_pp and not n_pp:
+        # The only dielectric is a core: a prepreg emitted nowhere would let
+        # the board contradict the fab's number (Codex, PR #61).
+        raise refuse(f"a {copper}-layer board is one core and has no prepreg; give core, not prepreg")
+    if given_core:
+        # Both given: the designer's numbers stand, but they must add up. A
+        # 1.6 mm board given 0.1 mm prepreg and a 1.2 mm core emitted 1.525 mm
+        # of layers under a 1.6 mm general.thickness (Codex, PR #61).
+        core = float(given_core)
+        total = prepreg * n_pp + core * cores
+        if abs(total - room) > 0.01:
+            raise refuse(f"prepreg {prepreg:g} mm and core {core:g} mm give {total:.3f} mm of "
+                         f"dielectric where {room:.3f} mm is left")
+    else:
+        core = (room - prepreg * n_pp) / max(cores, 1)
+        if core < _MIN_DIELECTRIC:
+            if given_pp:
+                # A fab's prepreg is a fact to keep, not a default to rescale
+                # (Codex, PR #61).
+                raise refuse(f"prepreg {prepreg:g} mm leaves {core:.3f} mm per core")
+            # The default prepreg leaves the cores too little: a 10- or 12-layer
+            # board at 1.6 mm. Every dielectric shares what is left instead, so
+            # the layers still add up to the declared thickness; a floor here
+            # made a 1.6 mm board's stackup 1.68 to 2.03 mm (Codex, PR #61).
+            prepreg = core = room / gaps
+    if min(prepreg, core) < _MIN_DIELECTRIC:
+        raise refuse(f"{copper} copper layers leave {min(prepreg, core):.3f} mm per dielectric; "
+                     "give a thicker board, fewer layers, or prepreg and core from the fab's stackup")
+    for i, name in enumerate(names):
+        rows.append(["layer", sexpr.quote(name), ["type", '"copper"'],
+                     ["thickness", f"{_OUTER_CU if name in ('F.Cu', 'B.Cu') else _INNER_CU:g}"]])
+        if i < gaps:
+            kind = kinds[i]
+            rows.append(_dielectric(f"dielectric {i + 1}", kind,
+                                    prepreg if kind == "prepreg" else core,
+                                    er_pp if kind == "prepreg" else er_core))
+    rows += [
+        ["layer", '"B.Mask"', ["type", '"Bottom Solder Mask"'], ["thickness", f"{_MASK:g}"]],
+        ["layer", '"B.Paste"', ["type", '"Bottom Solder Paste"']],
+        ["layer", '"B.SilkS"', ["type", '"Bottom Silk Screen"']],
+    ]
+    finish = (project.get("stackup") or {}).get("finish")
+    return ["stackup", *rows, ["copper_finish", sexpr.quote(finish or "None")],
+            ["dielectric_constraints", "no"]]
+
+
+def _default_setup(stackup: sexpr.Node | None = None) -> sexpr.Node:
     """Minimal v10 (setup ...) block. KiCad fills in defaults for anything we omit."""
     return [
         "setup",
+        *([stackup] if stackup else []),
         ["pad_to_mask_clearance", "0"],
         ["allow_soldermask_bridges_in_footprints", "no"],
         ["tenting", ["front", "yes"], ["back", "yes"]],
