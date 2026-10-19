@@ -365,3 +365,26 @@ def test_a_pinned_connector_symbol_that_is_missing_is_a_miss_not_a_guess(tmp_pat
     report = stage2_library_lookup.run(bom_path, syms, fps, tmp_path / "cov.json", project_dir=proj)
     (row,) = report["rows"]
     assert row["symbol_match"] is None and row["status"] == "miss"
+
+
+def test_a_module_connector_is_a_connector_by_its_designator():
+    assert stage2_library_lookup._is_connector({"local_id": "ltc4015-charger.J1"})
+    assert stage2_library_lookup._is_connector({"local_id": "x", "refdes": "J3"})
+    assert not stage2_library_lookup._is_connector({"local_id": "jumper-board.U1"})
+    assert not stage2_library_lookup._is_connector({"local_id": "U7"})
+
+
+def test_a_module_connector_never_takes_a_guessed_symbol(tmp_path):
+    import json
+    syms = tmp_path / "syms"
+    (syms / "Connector.kicad_symdir").mkdir(parents=True)
+    (syms / "Connector.kicad_symdir" / "TestPoint.kicad_sym").write_text("(kicad_symbol_lib)")
+    fps = tmp_path / "fps"
+    (fps / "TestPoint.pretty").mkdir(parents=True)
+    (fps / "TestPoint.pretty" / "TestPoint_2Pads.kicad_mod").write_text("(footprint)")
+    bom_path = tmp_path / "bom.json"
+    bom_path.write_text(json.dumps({"project_id": "p", "schema_version": 1, "rows": [
+        {"local_id": "charger.J1", "mpn": "TestPoint_2Pads", "package": "pkg",
+         "footprint_hint": "TestPoint:TestPoint_2Pads"}]}))
+    (row,) = stage2_library_lookup.run(bom_path, syms, fps, tmp_path / "cov.json")["rows"]
+    assert row["symbol_match"] is None and row["status"] == "hit"

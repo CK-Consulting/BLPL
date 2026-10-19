@@ -275,10 +275,8 @@ def run(
         fp_exempt = is_not_placed(
             row.get("footprint_hint") or row.get("package") or ""
         )
-        sym_exempt = (
-            str(row.get("local_id", "")).startswith("J")
-            and "symbol_hint" not in pins.get(row.get("local_id"), {})
-        )
+        is_connector = _is_connector(row)
+        sym_exempt = is_connector and "symbol_hint" not in pins.get(row.get("local_id"), {})
 
         sym_exact = _lookup_exact(row.get("symbol_hint"), sym_index)
         if sym_exact is not None:
@@ -301,7 +299,6 @@ def run(
         # the pin, so the same one-pin symbol came back (Codex, PR #57). The
         # pin is then a miss, which is what an unmet claim should be;
         # sym_exempt only says whether no match counts against the row.
-        is_connector = str(row.get("local_id", "")).startswith("J")
         if is_connector and sym_match is not None and sym_match["match_type"] != "exact":
             sym_match = None
 
@@ -352,6 +349,19 @@ def run(
     schema.validate("coverage_report", report)
     schema.dump_json(output_path, report)
     return report
+
+
+def _is_connector(row: dict) -> bool:
+    """Whether a BOM row is a connector, by its designator.
+
+    The designator, not the ID: a part imported from a reusable module has a
+    qualified ID ("ltc4015-charger.J1", modules_remix.expand), and testing that
+    for a leading J missed every module connector (Codex, PR #57).
+    """
+    ref = row.get("refdes")
+    if not isinstance(ref, str) or not ref:
+        ref = str(row.get("local_id", "")).rsplit(".", 1)[-1]
+    return ref.startswith("J")
 
 
 def _status_of(
