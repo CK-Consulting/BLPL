@@ -1271,24 +1271,38 @@ def _stackup(project: dict, copper: int, thickness: float) -> sexpr.Node | None:
         # prepreg / core / prepreg / core ... / prepreg: outer gaps prepreg.
         kinds = ["prepreg" if i % 2 == 0 else "core" for i in range(gaps)]
         cores = kinds.count("core")
-    pp_total = prepreg * kinds.count("prepreg")
+    n_pp = kinds.count("prepreg")
     room = thickness - 2 * _MASK - copper_mm
-    core = st.get("core")
-    if core:
-        core = float(core)
+    given_pp, given_core = st.get("prepreg"), st.get("core")
+
+    def refuse(why: str) -> ValueError:
+        return ValueError(f"project.stackup: {why}; the layers must add up to the board's "
+                          f"{thickness:g} mm (copper and mask take {thickness - room:.3f} mm)")
+
+    if given_core:
+        # Both given: the designer's numbers stand, but they must add up. A
+        # 1.6 mm board given 0.1 mm prepreg and a 1.2 mm core emitted 1.525 mm
+        # of layers under a 1.6 mm general.thickness (Codex, PR #61).
+        core = float(given_core)
+        total = prepreg * n_pp + core * cores
+        if abs(total - room) > 0.01:
+            raise refuse(f"prepreg {prepreg:g} mm and core {core:g} mm give {total:.3f} mm of "
+                         f"dielectric where {room:.3f} mm is left")
     else:
-        core = (room - pp_total) / max(cores, 1)
+        core = (room - prepreg * n_pp) / max(cores, 1)
         if core < _MIN_DIELECTRIC:
+            if given_pp:
+                # A fab's prepreg is a fact to keep, not a default to rescale
+                # (Codex, PR #61).
+                raise refuse(f"prepreg {prepreg:g} mm leaves {core:.3f} mm per core")
             # The default prepreg leaves the cores too little: a 10- or 12-layer
             # board at 1.6 mm. Every dielectric shares what is left instead, so
             # the layers still add up to the declared thickness; a floor here
             # made a 1.6 mm board's stackup 1.68 to 2.03 mm (Codex, PR #61).
             prepreg = core = room / gaps
     if min(prepreg, core) < _MIN_DIELECTRIC:
-        raise ValueError(
-            f"project.stackup: {copper} copper layers do not fit in {thickness:g} mm "
-            f"(each dielectric would be {min(prepreg, core):.3f} mm); give a thicker board, "
-            "fewer layers, or prepreg and core from the fab's stackup")
+        raise refuse(f"{copper} copper layers leave {min(prepreg, core):.3f} mm per dielectric; "
+                     "give a thicker board, fewer layers, or prepreg and core from the fab's stackup")
     for i, name in enumerate(names):
         rows.append(["layer", sexpr.quote(name), ["type", '"copper"'],
                      ["thickness", f"{_OUTER_CU if name in ('F.Cu', 'B.Cu') else _INNER_CU:g}"]])

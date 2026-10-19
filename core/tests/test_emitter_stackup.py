@@ -43,10 +43,23 @@ def test_a_four_layer_board_has_its_copper_and_dielectric_in_order(tmp_path):
 
 
 def test_the_designer_can_give_the_dielectric(tmp_path):
-    layers, _ = _layers(pcb.build(_hdm({"layers": 4, "thickness": 1.6, "prepreg": 0.1, "core": 1.2, "er": 4.2}),
+    # 1.6 - 0.02 mask - 0.105 copper = 1.475 of dielectric: 2 x 0.1 + 1.275.
+    layers, _ = _layers(pcb.build(_hdm({"layers": 4, "thickness": 1.6, "prepreg": 0.1, "core": 1.275, "er": 4.2}),
                                   footprints_root=tmp_path))
     pp = [th for _, t, th in layers if t == "prepreg"]
-    assert pp == [0.1, 0.1] and [th for _, t, th in layers if t == "core"] == [1.2]
+    assert pp == [0.1, 0.1] and [th for _, t, th in layers if t == "core"] == [1.275]
+
+
+def test_a_given_dielectric_that_does_not_add_up_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="must add up"):
+        pcb.build(_hdm({"layers": 4, "thickness": 1.6, "prepreg": 0.1, "core": 1.2}), footprints_root=tmp_path)
+
+
+def test_a_given_prepreg_is_kept_or_refused_never_rescaled(tmp_path):
+    with pytest.raises(ValueError, match="prepreg 0.2 mm leaves"):
+        pcb.build(_hdm({"layers": 4, "thickness": 0.5, "prepreg": 0.2}), footprints_root=tmp_path)
+    layers, _ = _layers(pcb.build(_hdm({"layers": 4, "thickness": 1.0, "prepreg": 0.2}), footprints_root=tmp_path))
+    assert [th for _, t, th in layers if t == "prepreg"] == [0.2, 0.2]
 
 
 def test_a_two_layer_board_is_one_core(tmp_path):
@@ -105,5 +118,5 @@ def test_the_stackup_always_adds_up_to_the_declared_thickness(tmp_path, copper):
 
 
 def test_a_stackup_that_cannot_fit_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="do not fit"):
+    with pytest.raises(ValueError, match="per dielectric"):
         pcb.build(_hdm({"layers": 12, "thickness": 0.6}), footprints_root=tmp_path)
