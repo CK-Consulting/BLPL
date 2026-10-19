@@ -179,3 +179,10 @@ def test_the_boards_edge_and_hole_rules_reach_every_route(board):
         a = step["args"]
         assert a[a.index("--board-edge-clearance") + 1] == "0.5"
         assert a[a.index("--hole-to-hole-clearance") + 1] == "0.25"
+
+
+def test_a_net_planed_on_two_layers_is_poured_on_both(board):
+    (planes, *_) = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["In1.Cu", "In2.Cu"]},
+                                  ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+    a = planes["args"]
+    assert a[:6] == ["--nets", "GND", "GND", "--plane-layers", "In1.Cu", "In2.Cu"]
