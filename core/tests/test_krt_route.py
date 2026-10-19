@@ -167,3 +167,14 @@ def test_the_copper_layers_are_read_from_the_board(tmp_path):
     pcb = tmp_path / "b.kicad_pcb"
     pcb.write_text('(kicad_pcb (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal) (2 "B.Cu" signal) (5 "F.SilkS" user)))')
     assert krt_route.board_copper(pcb) == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+
+
+def test_the_boards_edge_and_hole_rules_reach_every_route(board):
+    pro = board.with_suffix(".kicad_pro")
+    data = json.loads(pro.read_text())
+    data["board"] = {"design_settings": {"rules": {"min_copper_edge_clearance": 0.5, "min_hole_to_hole": 0.25}}}
+    pro.write_text(json.dumps(data))
+    for step in krt_route.plan(board, pro, {}, ["F.Cu", "B.Cu"]):
+        a = step["args"]
+        assert a[a.index("--board-edge-clearance") + 1] == "0.5"
+        assert a[a.index("--hole-to-hole-clearance") + 1] == "0.25"
