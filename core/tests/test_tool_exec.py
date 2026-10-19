@@ -38,3 +38,11 @@ def test_the_process_prints_its_result_last_and_it_is_found(tmp_path):
 def test_output_with_no_result_is_none():
     assert tool_exec.result_of("Traceback ...\nKilled\n") is None
     assert tool_exec.result_of(tool_exec.MARK + "{not json\n") is None
+
+
+def test_the_router_can_be_asked_whether_it_can_run(monkeypatch):
+    from blpl.core import autoroute
+
+    monkeypatch.setattr(autoroute, "available", lambda: (False, "no Freerouting jar"))
+    assert tool_exec.run_op("autoroute_available", {}) == {
+        "ok": True, "value": {"ok": False, "reason": "no Freerouting jar"}}
