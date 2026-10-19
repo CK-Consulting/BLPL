@@ -157,6 +157,9 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
         # verdacor, which wick solder away in reflow unless the fab fills and
         # caps them.
         gap = f"{cls.get('clearance', default.get('clearance', 0.2)):g}"
+        # The routing passes too: the power-net taps in the last pass dropped
+        # their vias into pads just as the plane step did.
+        held = [*held, "--same-net-pad-clearance", gap]
         steps.append({"script": "route_planes.py",
                       "args": ["--nets", *plane_nets, "--plane-layers", *layers, *rules(cls),
                                "--same-net-pad-clearance", gap]})

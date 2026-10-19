@@ -161,6 +161,7 @@ def test_plane_vias_stay_off_pads_and_signals_off_the_planes(board):
     for args in routes:
         i = args.index("--layers")
         assert args[i + 1:i + 3] == ["F.Cu", "B.Cu"]
+        assert args[args.index("--same-net-pad-clearance") + 1] == "0.25"
 
 
 def test_the_copper_layers_are_read_from_the_board(tmp_path):
