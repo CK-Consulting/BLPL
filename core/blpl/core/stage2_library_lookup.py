@@ -275,10 +275,8 @@ def run(
         fp_exempt = is_not_placed(
             row.get("footprint_hint") or row.get("package") or ""
         )
-        sym_exempt = (
-            str(row.get("local_id", "")).startswith("J")
-            and "symbol_hint" not in pins.get(row.get("local_id"), {})
-        )
+        is_connector = _is_connector(row)
+        sym_exempt = is_connector and "symbol_hint" not in pins.get(row.get("local_id"), {})
 
         sym_exact = _lookup_exact(row.get("symbol_hint"), sym_index)
         if sym_exact is not None:
@@ -289,6 +287,20 @@ def run(
             tokens = _symbol_query_tokens(row)
             fuzzy = _lookup_fuzzy(tokens, sym_index)
             sym_match = _entry_to_match(fuzzy[0], "fuzzy", fuzzy[1], symbols_root) if fuzzy else None
+
+        # A connector takes a stock symbol only when one was named exactly (a
+        # pinned Symbol cell, or a hint that is a real symbol). A guess from its
+        # MPN or tokens is no claim about its pins: J_NFC, "TestPoint_2Pads",
+        # was matched on its name to the one-pin Connector:TestPoint, and its
+        # second pad, NFC2_ANT, was drawn connected to nothing. Left unmatched,
+        # it gets a generic connector with its own pin count.
+        # Every connector, pinned or not: a pinned symbol that does not exist
+        # left the guess standing, and Stage 5 prefers a coverage match over
+        # the pin, so the same one-pin symbol came back (Codex, PR #57). The
+        # pin is then a miss, which is what an unmet claim should be;
+        # sym_exempt only says whether no match counts against the row.
+        if is_connector and sym_match is not None and sym_match["match_type"] != "exact":
+            sym_match = None
 
         fp_exact = _lookup_exact(row.get("footprint_hint"), fp_index)
         if fp_exact is not None:
@@ -337,6 +349,19 @@ def run(
     schema.validate("coverage_report", report)
     schema.dump_json(output_path, report)
     return report
+
+
+def _is_connector(row: dict) -> bool:
+    """Whether a BOM row is a connector, by its designator.
+
+    The designator, not the ID: a part imported from a reusable module has a
+    qualified ID ("ltc4015-charger.J1", modules_remix.expand), and testing that
+    for a leading J missed every module connector (Codex, PR #57).
+    """
+    ref = row.get("refdes")
+    if not isinstance(ref, str) or not ref:
+        ref = str(row.get("local_id", "")).rsplit(".", 1)[-1]
+    return ref.startswith("J")
 
 
 def _status_of(
