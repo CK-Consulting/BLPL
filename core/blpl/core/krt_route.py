@@ -139,7 +139,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
                 "--via-drill", f"{c.get('via_drill', default.get('via_drill', 0.3)):g}"]
 
     steps: list[dict] = []
-    held = ["--escalation", "off", "--no-fix-drc-settings"]
+    held = ["--escalation", "off", "--no-fix-drc-settings", "--keepout", "--keepout-layer", BAND_LAYER]
     # The board's own edge and hole rules, which the router otherwise takes
     # from its defaults: on verdacor it ran VDD_LR2021 0.2 mm from the edge of
     # a board that asks for 0.5, and DRC failed 40 times on it.
@@ -225,6 +225,64 @@ def _resave(python: str, pcb: Path) -> subprocess.CompletedProcess:
     ))
 
 
+#: The User layer the edge band is drawn on, and the stroke width that marks
+#: a shape as BLPL's own band so only those are removed afterwards.
+BAND_LAYER = "Eco2.User"
+_BAND_MARK_NM = 12_345
+
+
+def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool) -> subprocess.CompletedProcess:
+    """Draw (or remove) a keepout band ``depth_mm`` wide inside every board edge.
+
+    KRT holds the board-edge clearance in its main pass but not in all of
+    them: on verdacor a power net's neck-down fallback laid 155 short segments
+    0.2 mm from an angled edge of a board that asks for 0.5 mm. A band drawn
+    on a User layer and handed to it as ``--keepout`` keeps every pass out,
+    and is taken off the board again once routing is done.
+    """
+    from . import autoroute
+
+    if not add:
+        return autoroute._pcbnew(python, (
+            "import pcbnew\n"
+            f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
+            f"lay = b.GetLayerID({BAND_LAYER!r})\n"
+            "for d in list(b.GetDrawings()):\n"
+            f"    if d.GetLayer() == lay and d.GetWidth() == {_BAND_MARK_NM}:\n"
+            "        b.Remove(d)\n"
+            f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
+        ))
+    return autoroute._pcbnew(python, (
+        "import pcbnew\n"
+        f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
+        f"lay = b.GetLayerID({BAND_LAYER!r})\n"
+        "poly = pcbnew.SHAPE_POLY_SET()\n"
+        "b.GetBoardPolygonOutlines(poly, True)\n"
+        f"d = pcbnew.FromMM({depth_mm!r})\n"
+        "for o in range(poly.OutlineCount()):\n"
+        "    ring = poly.Outline(o)\n"
+        "    pts = [ring.CPoint(i) for i in range(ring.PointCount())]\n"
+        "    area = sum(pts[i].x * pts[(i + 1) % len(pts)].y - pts[(i + 1) % len(pts)].x * pts[i].y for i in range(len(pts)))\n"
+        "    sign = 1 if area > 0 else -1\n"
+        "    for i in range(len(pts)):\n"
+        "        a, c = pts[i], pts[(i + 1) % len(pts)]\n"
+        "        dx, dy = c.x - a.x, c.y - a.y\n"
+        "        ln = (dx * dx + dy * dy) ** 0.5\n"
+        "        if ln == 0:\n"
+        "            continue\n"
+        "        nx, ny = -dy / ln * sign, dx / ln * sign\n"
+        "        q = [a, c, pcbnew.VECTOR2I(int(c.x + nx * d), int(c.y + ny * d)), pcbnew.VECTOR2I(int(a.x + nx * d), int(a.y + ny * d))]\n"
+        "        sh = pcbnew.PCB_SHAPE(b)\n"
+        "        sh.SetShape(pcbnew.SHAPE_T_POLY)\n"
+        "        sh.SetPolyPoints(q)\n"
+        "        sh.SetLayer(lay)\n"
+        f"        sh.SetWidth({_BAND_MARK_NM})\n"
+        "        sh.SetFilled(True)\n"
+        "        b.Add(sh)\n"
+        f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
+    ))
+
+
 def _fill(python: str, pcb: Path) -> subprocess.CompletedProcess:
     from . import autoroute
 
@@ -266,6 +324,17 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600):
     if resaved.returncode != 0:
         result.reason = f"pcbnew could not re-save the board: {autoroute._msg(resaved)}"
         return result
+    rules = _board_rules(pro)
+    classes, _ = _classes(pro)
+    edge = rules.get("min_copper_edge_clearance")
+    band = isinstance(edge, (int, float)) and edge > 0
+    if band:
+        widest = max([c.get("track_width", 0.2) for c in classes.values()] or [0.2])
+        banded = _edge_band(python, pcb, edge + widest / 2, add=True)
+        restore_pro()
+        if banded.returncode != 0:
+            result.reason = f"pcbnew could not draw the edge band: {autoroute._msg(banded)}"
+            return result
     steps = plan(pcb, pro, autoroute.plane_layers(pcb))
     result.extra["steps"] = [" ".join([s["script"], *s["args"]]) for s in steps]
     for step in steps:
@@ -279,6 +348,11 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600):
             result.log = "\n".join(log)[-20000:]
             return result
     result.log = "\n".join(log)[-20000:]
+    unbanded = _edge_band(python, pcb, 0, add=False) if band else subprocess.CompletedProcess([], 0, "", "")
+    restore_pro()
+    if unbanded.returncode != 0:
+        result.reason = f"pcbnew could not remove the edge band: {autoroute._msg(unbanded)}"
+        return result
     # The router leaves its zones unfilled, and an unfilled plane connects
     # nothing: measured as it stands, every plane pad would read as open.
     filled = _fill(python, pcb)
