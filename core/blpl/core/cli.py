@@ -674,6 +674,11 @@ def _cmd_stage5(args: argparse.Namespace) -> int:
             print(f"    {f['ref']}{pin}: {f['problem']} — {f['detail']}")
         if len(audit) > 12:
             print(f"    … and {len(audit) - 12} more in hdm.yaml synthesis.placement.audit")
+    waived = ((hdm.get("synthesis") or {}).get("placement") or {}).get("audit_accepted") or []
+    if waived:
+        print(f"  placement: {len(waived)} accepted by project.yaml review.accept")
+        for f in waived[:12]:
+            print(f"    {f['ref']}: {f['problem']} — accepted: {f['accepted_reason']}")
 
     # A placeholder that slips by unnoticed is how you fab a board with the wrong
     # part on it. Make it impossible to miss at the console, not just in a file.
