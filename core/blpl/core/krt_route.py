@@ -149,24 +149,33 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
         if isinstance(board.get(key), (int, float)) and board[key] > 0:
             held += [flag, f"{board[key]:g}"]
     if planes:
+        def class_of(net: str) -> tuple[str, dict]:
+            name = next((c for c, ns in groups.items() if net in ns), "Default")
+            return name, classes.get(name, default)
+
         # One (net, layer) pair per plane, positionally: a net may be a plane
         # on more than one layer (GND on In1.Cu and In2.Cu), and taking each
-        # net's first layer poured the second plane nowhere.
-        pairs = sorted((n, l) for n, ls in planes.items() for l in ls)
-        plane_nets = [n for n, _ in pairs]
-        layers = [l for _, l in pairs]
-        cls = next((classes[c] for c, ns in groups.items() if set(planes) & set(ns) and c in classes), default)
-        # Plane vias kept off their own pads. Left to it, the router dropped a
-        # via into every plane pad it could: 46 untented vias in pads on
-        # verdacor, which wick solder away in reflow unless the fab fills and
-        # caps them.
-        gap = f"{cls.get('clearance', default.get('clearance', 0.2)):g}"
+        # net's first layer poured the second plane nowhere. One call per net
+        # class, so each plane's vias and clearance are its own class's, not
+        # whichever class came first (Codex, PR #59).
+        by_class: dict[str, list[tuple[str, str]]] = {}
+        for net, ls in sorted(planes.items()):
+            by_class.setdefault(class_of(net)[0], []).extend((net, l) for l in ls)
+        gaps = []
+        for name, pairs in sorted(by_class.items()):
+            cls = classes.get(name, default)
+            # Plane vias kept off their own pads. Left to it, the router
+            # dropped a via into every plane pad it could: 46 untented vias in
+            # pads on verdacor, which wick solder away in reflow unless the fab
+            # fills and caps them.
+            gap = cls.get("clearance", default.get("clearance", 0.2))
+            gaps.append(gap)
+            steps.append({"script": "route_planes.py", "args": [
+                "--nets", *[n for n, _ in pairs], "--plane-layers", *[l for _, l in pairs],
+                *rules(cls), "--same-net-pad-clearance", f"{gap:g}"]})
         # The routing passes too: the power-net taps in the last pass dropped
         # their vias into pads just as the plane step did.
-        held = [*held, "--same-net-pad-clearance", gap]
-        steps.append({"script": "route_planes.py",
-                      "args": ["--nets", *plane_nets, "--plane-layers", *layers, *rules(cls),
-                               "--same-net-pad-clearance", gap]})
+        held = [*held, "--same-net-pad-clearance", f"{max(gaps):g}"]
         # Signals stay off the plane layers. Routed on them, the planes were
         # cut into islands (38 for GND on verdacor) and every signal over a
         # cut lost its reference: Stage 8's reference-plane and split findings.
@@ -184,10 +193,18 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
             continue
         steps.append({"script": "route.py", "args": [
             "--nets", *groups[name], "--track-width", f"{c.get('track_width', 0.2):g}", *rules(c), *held]})
-    final = ["--nets", "*", "--track-width", f"{default.get('track_width', 0.2):g}", *rules(default), *held]
-    if power:
-        final += ["--power-nets", *[n for n, _ in power], "--power-nets-widths", *[f"{w:g}" for _, w in power]]
-    steps.append({"script": "route.py", "args": final})
+    # The last pass names its nets: Default and the power classes, never a
+    # special class. Given "*" it re-selected an RF net its own pass had not
+    # finished and routed it at the Default width, which an explicit
+    # --track-width applies to every selected net (Codex, PR #59).
+    rest = sorted(set(groups.get("Default", [])) | {n for n, _ in power})
+    if rest:
+        final = ["--nets", *rest, "--track-width", f"{default.get('track_width', 0.2):g}",
+                 *rules(default), *held]
+        if power:
+            final += ["--power-nets", *[n for n, _ in power],
+                      "--power-nets-widths", *[f"{w:g}" for _, w in power]]
+        steps.append({"script": "route.py", "args": final})
     return steps
 
 
