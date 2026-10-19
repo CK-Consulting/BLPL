@@ -82,6 +82,15 @@ def available() -> tuple[bool, str]:
     return True, ""
 
 
+def _board_rules(pro: Path) -> dict:
+    """The project's board-wide DRC minimums, from .kicad_pro."""
+    try:
+        return ((json.loads(pro.read_text(encoding="utf-8")).get("board") or {})
+                .get("design_settings") or {}).get("rules") or {}
+    except (OSError, ValueError):
+        return {}
+
+
 def _classes(pro: Path) -> tuple[dict[str, dict], list[tuple[str, str]]]:
     """Net classes by name, and the (pattern, class) assignments, from .kicad_pro."""
     try:
@@ -131,6 +140,14 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
 
     steps: list[dict] = []
     held = ["--escalation", "off", "--no-fix-drc-settings"]
+    # The board's own edge and hole rules, which the router otherwise takes
+    # from its defaults: on verdacor it ran VDD_LR2021 0.2 mm from the edge of
+    # a board that asks for 0.5, and DRC failed 40 times on it.
+    board = _board_rules(pro)
+    for key, flag in (("min_copper_edge_clearance", "--board-edge-clearance"),
+                      ("min_hole_to_hole", "--hole-to-hole-clearance")):
+        if isinstance(board.get(key), (int, float)) and board[key] > 0:
+            held += [flag, f"{board[key]:g}"]
     if planes:
         plane_nets = sorted(planes)
         layers = [planes[n][0] for n in plane_nets]
