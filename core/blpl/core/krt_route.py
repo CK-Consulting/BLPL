@@ -105,7 +105,16 @@ def nets_by_class(pcb: Path, pro: Path) -> tuple[dict[str, list[str]], dict[str,
     return out, classes
 
 
-def plan(pcb: Path, pro: Path, planes: dict[str, list[str]]) -> list[dict]:
+def board_copper(pcb: Path) -> list[str]:
+    """The board's copper layers, in stack order, from its layer table."""
+    text = pcb.read_text(encoding="utf-8", errors="replace")
+    found = re.findall(r'\(\s*\d+\s+"((?:F|B|In\d+)\.Cu)"', text)
+    order = {"F.Cu": -1, "B.Cu": 10_000}
+    return sorted(dict.fromkeys(found), key=lambda l: order.get(l, int(l[2:-3]) if l.startswith("In") else 0))
+
+
+def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
+         copper_layers: list[str] | None = None) -> list[dict]:
     """The calls, in order: planes, each special class, then everything else.
 
     Pure, so the order and the rules each call carries can be tested without a
@@ -113,6 +122,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]]) -> list[dict]:
     """
     groups, classes = nets_by_class(pcb, pro)
     default = classes.get("Default", {})
+    copper_layers = copper_layers or board_copper(pcb)
 
     def rules(c: dict) -> list[str]:
         return ["--clearance", f"{c.get('clearance', default.get('clearance', 0.2)):g}",
@@ -120,13 +130,26 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]]) -> list[dict]:
                 "--via-drill", f"{c.get('via_drill', default.get('via_drill', 0.3)):g}"]
 
     steps: list[dict] = []
+    held = ["--escalation", "off", "--no-fix-drc-settings"]
     if planes:
         plane_nets = sorted(planes)
         layers = [planes[n][0] for n in plane_nets]
         cls = next((classes[c] for c, ns in groups.items() if set(plane_nets) & set(ns) and c in classes), default)
+        # Plane vias kept off their own pads. Left to it, the router dropped a
+        # via into every plane pad it could: 46 untented vias in pads on
+        # verdacor, which wick solder away in reflow unless the fab fills and
+        # caps them.
+        gap = f"{cls.get('clearance', default.get('clearance', 0.2)):g}"
         steps.append({"script": "route_planes.py",
-                      "args": ["--nets", *plane_nets, "--plane-layers", *layers, *rules(cls)]})
-    held = ["--escalation", "off", "--no-fix-drc-settings"]
+                      "args": ["--nets", *plane_nets, "--plane-layers", *layers, *rules(cls),
+                               "--same-net-pad-clearance", gap]})
+        # Signals stay off the plane layers. Routed on them, the planes were
+        # cut into islands (38 for GND on verdacor) and every signal over a
+        # cut lost its reference: Stage 8's reference-plane and split findings.
+        plane_layers = {l for ls in planes.values() for l in ls}
+        signal_layers = [l for l in copper_layers if l not in plane_layers]
+        if signal_layers:
+            held = [*held, "--layers", *signal_layers]
     power: list[tuple[str, float]] = []
     for name in sorted(groups):
         if name == "Default":
