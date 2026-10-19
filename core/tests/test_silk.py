@@ -37,7 +37,8 @@ def test_no_policy_changes_nothing():
 def test_hidden_references_leave_the_silk():
     fp = _fp()
     silk.apply(fp, policy={"references": "hidden"}, label=None)
-    assert _props(fp) == {"Reference": True, "Value": True}
+    # Only the references: a Value someone put in silk stays.
+    assert _props(fp) == {"Reference": True, "Value": False}
 
 
 def test_a_label_takes_the_references_place_in_silk():
@@ -62,6 +63,43 @@ def test_outlines_are_trimmed_off_the_pads_and_the_rest_kept():
     assert any(float(sexpr.find(n, "start")[2]) == 3 for n in silk_lines)
     assert not sexpr.find_all(fp, "fp_circle")
     assert any(sexpr.unquote(sexpr.find(n, "layer")[1]) == "F.Fab" for n in sexpr.find_all(fp, "fp_line"))
+
+
+def _clip(body: str) -> list:
+    fp = sexpr.parse(f'(footprint "X" {body})')
+    silk.clip_to_copper(fp)
+    return fp
+
+
+def test_a_rotated_pad_is_tested_in_kicads_frame():
+    # KiCad rotates counter-clockwise on screen with Y down: a 2 x 0.4 pad at
+    # 30 degrees covers (0.78, -0.45), checked against pcbnew's HitTest.
+    pads = silk._pads(sexpr.parse('(footprint "X" (pad "1" smd rect (at 0 0 30) (size 2 0.4) (layers "F.Cu")))'), "F")
+    assert silk._on_pad(0.78, -0.45, pads, 0) and not silk._on_pad(0.78, 0.45, pads, 0)
+
+
+def test_an_arc_clear_of_a_pad_stays_when_its_circle_would_not():
+    # A quarter arc on the right; the pad sits on the left of the same circle.
+    arc = '(fp_arc (start 1 -1) (mid 1.4142 0) (end 1 1) (stroke (width 0.12) (type solid)) (layer "F.SilkS"))'
+    fp = _clip(arc + ' (pad "1" smd rect (at -1.4142 0) (size 0.5 0.5) (layers "F.Cu"))')
+    assert sexpr.find_all(fp, "fp_arc")
+    fp = _clip(arc + ' (pad "1" smd rect (at 1.4142 0) (size 0.5 0.5) (layers "F.Cu"))')
+    assert not sexpr.find_all(fp, "fp_arc")
+
+
+def test_a_custom_pads_primitives_are_copper_too():
+    # FlipProbe's pad 5: a 0.4 mm anchor, a polygon out to 0.6 mm.
+    pad = ('(pad "5" smd custom (at 0 0) (size 0.4 0.4) (layers "F.Cu") (options (clearance outline) (anchor rect))'
+           ' (primitives (gr_poly (pts (xy 0 -0.1) (xy 1.5 -0.1) (xy 1.5 0.1) (xy 0 0.1)) (width 0) (fill yes))))')
+    fp = _clip('(fp_line (start 1.2 -2) (end 1.2 2) (stroke (width 0.12) (type solid)) (layer "F.SilkS")) ' + pad)
+    assert len(sexpr.find_all(fp, "fp_line")) == 2
+
+
+def test_a_filled_graphic_over_a_pad_goes_though_its_outline_is_clear():
+    pad = '(pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu"))'
+    filled = '(fp_rect (start -2 -2) (end 2 2) (stroke (width 0.12) (type solid)) (fill yes) (layer "F.SilkS"))'
+    assert not sexpr.find_all(_clip(filled + " " + pad), "fp_rect")
+    assert sexpr.find_all(_clip(filled.replace("(fill yes)", "(fill no)") + " " + pad), "fp_rect")
 
 
 def test_an_unknown_labelled_part_is_refused():

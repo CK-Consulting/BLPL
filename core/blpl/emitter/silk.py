@@ -65,8 +65,55 @@ def _silk_side(node) -> str | None:
     return None
 
 
-def _pads(fp: list, side: str) -> list[tuple[float, float, float, float, float]]:
-    """(x, y, half_w, half_h, angle) of every copper pad on ``side`` (or through)."""
+def _rotate(x: float, y: float, ang: float) -> tuple[float, float]:
+    """KiCad's rotation by ``ang`` degrees: counter-clockwise on screen, Y down.
+
+    Checked against pcbnew: a 2 x 0.4 mm pad at 30 degrees covers (0.78, -0.45)
+    and not (0.78, 0.45). In a Y-up frame the same equations read as the
+    opposite rotation, which is how they get mistaken for a sign error.
+    """
+    if not ang:
+        return x, y
+    a = math.radians(ang)
+    return x * math.cos(a) + y * math.sin(a), -x * math.sin(a) + y * math.cos(a)
+
+
+def _circle(cx: float, cy: float, r: float, n: int = 24) -> list[tuple[float, float]]:
+    return [(cx + r * math.cos(2 * math.pi * k / n), cy + r * math.sin(2 * math.pi * k / n)) for k in range(n)]
+
+
+def _primitives(pad) -> list[tuple[list[tuple[float, float]], float]]:
+    """A custom pad's primitives as (polygon, half stroke), in the pad's own frame.
+
+    Their copper reaches past the anchor's ``size``: FlipProbe's pad 5 has a
+    0.4 mm anchor and a polygon out to 0.6 mm, and the anchor alone left silk
+    crossing that copper unclipped (Codex, PR #64).
+    """
+    out = []
+    prims = sexpr.find(pad, "primitives")
+    for g in (prims[1:] if prims is not None else []):
+        if not isinstance(g, list):
+            continue
+        tag, half = sexpr.head(g), _stroke(g) / 2 if sexpr.find(g, "width") or sexpr.find(g, "stroke") else 0.0
+        if tag == "gr_poly":
+            pts = [(_num(xy, 1), _num(xy, 2)) for n in sexpr.find_all(g, "pts") for xy in sexpr.find_all(n, "xy")]
+        elif tag == "gr_rect":
+            (ax, ay), (bx, by) = _xy(g, "start") or (0, 0), _xy(g, "end") or (0, 0)
+            pts = [(ax, ay), (bx, ay), (bx, by), (ax, by)]
+        elif tag == "gr_circle":
+            c, e = _xy(g, "center"), _xy(g, "end")
+            pts = _circle(c[0], c[1], math.hypot(e[0] - c[0], e[1] - c[1])) if c and e else []
+        elif tag in ("gr_line", "gr_arc"):
+            pts = [p for p in (_xy(g, "start"), _xy(g, "mid"), _xy(g, "end")) if p]
+        else:
+            continue
+        if pts:
+            out.append((pts, half))
+    return out
+
+
+def _pads(fp: list, side: str) -> list[tuple[list[tuple[float, float]], float]]:
+    """Every copper pad on ``side`` (or through), as (polygon, half stroke) in footprint coordinates."""
     out = []
     for pad in sexpr.find_all(fp, "pad"):
         layers = _layer_names(pad)
@@ -75,19 +122,35 @@ def _pads(fp: list, side: str) -> list[tuple[float, float, float, float, float]]
         at, size = sexpr.find(pad, "at"), sexpr.find(pad, "size")
         if at is None or size is None:
             continue
-        out.append((_num(at, 1), _num(at, 2), _num(size, 1) / 2, _num(size, 2) / 2, _num(at, 3)))
+        px, py, ang = _num(at, 1), _num(at, 2), _num(at, 3)
+        hw, hh = _num(size, 1) / 2, _num(size, 2) / 2
+        shapes = [([(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)], 0.0), *_primitives(pad)]
+        for pts, half in shapes:
+            out.append(([(px + rx, py + ry) for rx, ry in (_rotate(x, y, ang) for x, y in pts)], half))
     return out
 
 
-def _on_pad(x: float, y: float, pads, grow: float) -> bool:
-    for px, py, hw, hh, ang in pads:
-        dx, dy = x - px, y - py
-        if ang:
-            a = math.radians(ang)
-            dx, dy = dx * math.cos(a) - dy * math.sin(a), dx * math.sin(a) + dy * math.cos(a)
-        if abs(dx) <= hw + grow and abs(dy) <= hh + grow:
+def _inside(x: float, y: float, poly) -> bool:
+    hit = False
+    for i in range(len(poly)):
+        (ax, ay), (bx, by) = poly[i], poly[(i + 1) % len(poly)]
+        if (ay > y) != (by > y) and x < ax + (y - ay) * (bx - ax) / (by - ay):
+            hit = not hit
+    return hit
+
+
+def _near(x: float, y: float, poly, d: float) -> bool:
+    for i in range(len(poly)):
+        (ax, ay), (bx, by) = poly[i], poly[(i + 1) % len(poly)]
+        dx, dy = bx - ax, by - ay
+        t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy))) if dx or dy else 0.0
+        if math.hypot(x - ax - t * dx, y - ay - t * dy) <= d:
             return True
     return False
+
+
+def _on_pad(x: float, y: float, pads, grow: float) -> bool:
+    return any((len(poly) > 2 and _inside(x, y, poly)) or _near(x, y, poly, grow + half) for poly, half in pads)
 
 
 def _stroke(node) -> float:
@@ -112,8 +175,17 @@ def _arc_points(node) -> list[tuple[float, float]]:
     ux = ((ax**2 + ay**2) * (by - cy) + (bx**2 + by**2) * (cy - ay) + (cx**2 + cy**2) * (ay - by)) / d
     uy = ((ax**2 + ay**2) * (cx - bx) + (bx**2 + by**2) * (ax - cx) + (cx**2 + cy**2) * (bx - ax)) / d
     r = math.hypot(ax - ux, ay - uy)
-    return [(ux + r * math.cos(t), uy + r * math.sin(t)) for t in
-            (2 * math.pi * k / 72 for k in range(72))] if r > 0 else [s, m, e]
+    if r <= 0:
+        return [s, m, e]
+    # Only the sweep from start through mid to end: the whole circumcircle
+    # deleted a clear arc whenever a pad sat near the part it never draws
+    # (Codex, PR #64).
+    t0, tm, t1 = (math.atan2(py - uy, px - ux) for px, py in (s, m, e))
+    sweep = (t1 - t0) % (2 * math.pi)
+    if (tm - t0) % (2 * math.pi) > sweep:
+        sweep -= 2 * math.pi
+    n = max(2, int(abs(sweep) * r / _STEP))
+    return [(ux + r * math.cos(t0 + sweep * k / n), uy + r * math.sin(t0 + sweep * k / n)) for k in range(n + 1)]
 
 
 def _shape_points(node) -> list[tuple[float, float]]:
@@ -178,6 +250,25 @@ def _trim_line(node, pads, grow: float) -> list[list] | None:
     return out
 
 
+def _filled(node) -> bool:
+    fill = sexpr.find(node, "fill")
+    return fill is not None and len(fill) > 1 and sexpr.unquote(str(fill[1])) in ("yes", "solid")
+
+
+def _hits(node, pads, grow: float) -> bool:
+    """Whether a non-line graphic touches a pad, its filled interior included.
+
+    A solid shape covering a pad has its outline clear of it: tested by its
+    perimeter alone, it stayed printed over the copper (Codex, PR #64).
+    """
+    outline = _shape_points(node)
+    if any(_on_pad(x, y, pads, grow) for x, y in outline):
+        return True
+    if _filled(node) and sexpr.head(node) != "fp_arc" and len(outline) > 2:
+        return any(_inside(x, y, outline) for poly, _ in pads for x, y in poly)
+    return False
+
+
 def clip_to_copper(fp: list) -> int:
     """Trim this footprint's silk graphics off its own pads; how many changed."""
     changed = 0
@@ -197,7 +288,7 @@ def clip_to_copper(fp: list) -> int:
                 changed += 1
                 i += len(pieces)
                 continue
-        elif any(_on_pad(x, y, pads, grow) for x, y in _shape_points(node)):
+        elif _hits(node, pads, grow):
             del fp[i]
             changed += 1
             continue
@@ -224,7 +315,9 @@ def apply(fp: list, *, policy: dict | None, label: str | None) -> None:
             continue
         if name == "Reference":
             anchor = (sexpr.find(prop, "at"), _silk_side(prop))
-        if hidden or (label and name == "Reference"):
+        # The policy hides reference designators; a Value someone put in silk
+        # stays (Codex, PR #64).
+        if name == "Reference" and (hidden or label):
             _hide(prop)
     if label:
         at, side = anchor if anchor and anchor[0] is not None else (["at", "0", "0"], "F")
