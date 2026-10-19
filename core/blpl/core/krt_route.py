@@ -122,6 +122,21 @@ def board_copper(pcb: Path) -> list[str]:
     return sorted(dict.fromkeys(found), key=lambda l: order.get(l, int(l[2:-3]) if l.startswith("In") else 0))
 
 
+_PAIR_SUFFIXES = (("_P", "_N"), ("_DP", "_DN"), ("+", "-"), ("P", "N"))
+
+
+def _diff_pairs(nets: list[str]) -> list[tuple[str, str]]:
+    """The class's nets as (positive, negative) pairs, when every net has its
+    partner; empty when the class is not a set of differential pairs."""
+    names = set(nets)
+    for pos, neg in _PAIR_SUFFIXES:
+        pairs = [(n, n[: -len(pos)] + neg) for n in sorted(names) if n.endswith(pos)]
+        paired = {x for pr in pairs for x in pr}
+        if pairs and paired == names:
+            return pairs
+    return []
+
+
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
          copper_layers: list[str] | None = None) -> list[dict]:
     """The calls, in order: planes, each special class, then everything else.
@@ -140,6 +155,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
 
     steps: list[dict] = []
     held = ["--escalation", "off", "--no-fix-drc-settings", "--keepout", "--keepout-layer", BAND_LAYER]
+    pad_gap = default.get("clearance", 0.2)
     # The board's own edge and hole rules, which the router otherwise takes
     # from its defaults: on verdacor it ran VDD_LR2021 0.2 mm from the edge of
     # a board that asks for 0.5, and DRC failed 40 times on it.
@@ -173,9 +189,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
             steps.append({"script": "route_planes.py", "args": [
                 "--nets", *[n for n, _ in pairs], "--plane-layers", *[l for _, l in pairs],
                 *rules(cls), "--same-net-pad-clearance", f"{gap:g}"]})
-        # The routing passes too: the power-net taps in the last pass dropped
-        # their vias into pads just as the plane step did.
-        held = [*held, "--same-net-pad-clearance", f"{max(gaps):g}"]
+        pad_gap = max(gaps)
         # Signals stay off the plane layers. Routed on them, the planes were
         # cut into islands (38 for GND on verdacor) and every signal over a
         # cut lost its reference: Stage 8's reference-plane and split findings.
@@ -183,7 +197,15 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
         signal_layers = [l for l in copper_layers if l not in plane_layers]
         if signal_layers:
             held = [*held, "--layers", *signal_layers]
+    # Vias off same-net pads on every board, planes or none: the default
+    # lets a via into a pad, which wicks solder in reflow (Codex, PR #59).
+    held = [*held, "--same-net-pad-clearance", f"{pad_gap:g}"]
     power: list[tuple[str, float]] = []
+    # Nets an earlier pass routed, excluded from every later one: KRT rips up
+    # and rebuilds a blocking net it was not asked to route, at the current
+    # pass's width, so a 0.35 mm RF trace could come back at 0.2 mm (Codex,
+    # PR #59). "!NET" protects it.
+    done: list[str] = []
     for name in sorted(groups):
         if name == "Default":
             continue
@@ -191,15 +213,27 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
         if POWER_CLASS.search(name):
             power += [(n, c.get("track_width", default.get("track_width", 0.2))) for n in groups[name]]
             continue
-        steps.append({"script": "route.py", "args": [
-            "--nets", *groups[name], "--track-width", f"{c.get('track_width', 0.2):g}", *rules(c), *held]})
+        protect = [f"!{n}" for n in done]
+        if _diff_pairs(groups[name]):
+            # A differential class goes to the differential router, with the
+            # pair's own leg width and gap: route.py routes each half alone.
+            steps.append({"script": "route_diff.py", "args": [
+                "--nets", *groups[name], *protect,
+                "--track-width", f"{c.get('diff_pair_width', c.get('track_width', 0.2)):g}",
+                "--diff-pair-gap", f"{c.get('diff_pair_gap', c.get('clearance', 0.2)):g}",
+                *rules(c), *held]})
+        else:
+            steps.append({"script": "route.py", "args": [
+                "--nets", *groups[name], *protect, "--track-width", f"{c.get('track_width', 0.2):g}",
+                *rules(c), *held]})
+        done += groups[name]
     # The last pass names its nets: Default and the power classes, never a
     # special class. Given "*" it re-selected an RF net its own pass had not
     # finished and routed it at the Default width, which an explicit
     # --track-width applies to every selected net (Codex, PR #59).
     rest = sorted(set(groups.get("Default", [])) | {n for n, _ in power})
     if rest:
-        final = ["--nets", *rest, "--track-width", f"{default.get('track_width', 0.2):g}",
+        final = ["--nets", *rest, *[f"!{n}" for n in done], "--track-width", f"{default.get('track_width', 0.2):g}",
                  *rules(default), *held]
         if power:
             final += ["--power-nets", *[n for n, _ in power],
