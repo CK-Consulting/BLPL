@@ -49,6 +49,7 @@ header .kicad { margin-left: 0; }
 .link { background: transparent; border: none; color: #8ab4f8; padding: .2rem .4rem; }
 .link:hover:not(:disabled) { text-decoration: underline; }
 .badge.warn { background: #3a2f14; color: #f0c674; }
+.badge.info { background: #1b2a3d; color: #9cc4f0; }
 
 /* --- auth gate --- */
 .gate { display: flex; align-items: center; justify-content: center; height: 100vh; }

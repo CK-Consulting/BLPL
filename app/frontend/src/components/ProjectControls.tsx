@@ -204,16 +204,30 @@ export function ProjectSync({
           className="badge warn"
           title="Design files changed since the last commit. Accepted chat edits and saves from the editor commit themselves; this is everything else — a pipeline run's outputs, a datasheet you dropped in."
         >
-          uncommitted
+          uncommitted changes
         </span>
       )}
-      {st.ahead > 0 && <span className="badge">↑{st.ahead}</span>}
+      {/* Its own words and colour. "↑16" in plain text beside an amber
+          "uncommitted" read as sixteen uncommitted files, when it meant sixteen
+          commits that are safe locally and only not on the remote yet. */}
+      {st.ahead > 0 && (
+        <span
+          className="badge info"
+          title="Saved on this server, not yet on the remote. Sync pushes them, which also keeps a copy off this server."
+        >
+          {st.ahead} {st.ahead === 1 ? "commit" : "commits"} not pushed
+        </span>
+      )}
       {st.has_remote && st.unpublished && (
         <span className="badge" title="This branch has never been pushed to the remote.">
           not pushed yet
         </span>
       )}
-      {st.behind > 0 && <span className="badge">↓{st.behind}</span>}
+      {st.behind > 0 && (
+        <span className="badge info" title="On the remote, not here yet. Sync pulls them.">
+          {st.behind} to pull
+        </span>
+      )}
       {/* Shown instead of a publication state the server could not measure:
           an origin fetching from one repository and pushing to another read as
           "published, nothing ahead" against the wrong one (Codex, PR #10). */}
