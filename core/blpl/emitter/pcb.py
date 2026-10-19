@@ -1249,9 +1249,14 @@ def _stackup(project: dict, copper: int, thickness: float) -> sexpr.Node | None:
 
     ``project.stackup`` may give ``prepreg`` and ``core`` (mm) and ``er``;
     otherwise the prepreg is 0.21 mm 7628 and the cores share what is left of
-    ``thickness``. Two-layer boards are one core. ``copper_finish`` is the
+    ``thickness``. Two-layer boards are one core, so a ``prepreg`` given for
+    one is refused rather than dropped. A one-layer board gets no stackup:
+    the format still lists B.Cu, and a stackup would tell the fab and the
+    review there is bottom copper (Codex, PR #61). ``copper_finish`` is the
     project's ``finish``.
     """
+    if copper < 2:
+        return None
     st = project.get("stackup") or {}
     prepreg = float(st.get("prepreg") or _PREPREG)
     er_pp = float(st.get("er") or _ER_PREPREG)
@@ -1279,6 +1284,10 @@ def _stackup(project: dict, copper: int, thickness: float) -> sexpr.Node | None:
         return ValueError(f"project.stackup: {why}; the layers must add up to the board's "
                           f"{thickness:g} mm (copper and mask take {thickness - room:.3f} mm)")
 
+    if given_pp and not n_pp:
+        # The only dielectric is a core: a prepreg emitted nowhere would let
+        # the board contradict the fab's number (Codex, PR #61).
+        raise refuse(f"a {copper}-layer board is one core and has no prepreg; give core, not prepreg")
     if given_core:
         # Both given: the designer's numbers stand, but they must add up. A
         # 1.6 mm board given 0.1 mm prepreg and a 1.2 mm core emitted 1.525 mm

@@ -67,6 +67,18 @@ def test_a_two_layer_board_is_one_core(tmp_path):
     assert [t for _, t, _ in layers if t in ("prepreg", "core")] == ["core"]
 
 
+def test_a_two_layer_board_refuses_a_prepreg_it_has_nowhere_to_put(tmp_path):
+    with pytest.raises(ValueError, match="no prepreg"):
+        pcb.build(_hdm({"layers": 2, "thickness": 1.6, "prepreg": 0.2, "core": 1.51}), footprints_root=tmp_path)
+    layers, _ = _layers(pcb.build(_hdm({"layers": 2, "thickness": 1.6, "core": 1.51}), footprints_root=tmp_path))
+    assert [(t, th) for _, t, th in layers if t in ("prepreg", "core")] == [("core", 1.51)]
+
+
+def test_a_one_layer_board_claims_no_bottom_copper(tmp_path):
+    setup = sexpr.find(pcb.build(_hdm({"layers": 1, "thickness": 1.6}), footprints_root=tmp_path), "setup")
+    assert sexpr.find(setup, "stackup") is None
+
+
 def test_the_review_finds_each_outer_layers_reference_plane(tmp_path):
     """The point of it: with no stackup the design review measured F.Cu
     against B.Cu, and reported every signal on verdacor as off its plane."""
