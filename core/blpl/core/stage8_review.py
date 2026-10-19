@@ -820,10 +820,9 @@ def _render_markdown(report: dict) -> str:
         lines += ["## Routing", ""]
         if routing.get("attempted") and routing.get("ok"):
             left = routing.get("unrouted")
-            lines.append(
-                f"Freerouting ran ({routing.get('passes', '?')} passes)"
-                + (f"; {left} net(s) left unrouted." if left is not None else ".")
-            )
+            ran = ("KiCad Routing Tools ran" if routing.get("router") == "kicad-routing-tools"
+                   else f"Freerouting ran ({routing.get('passes', '?')} passes)")
+            lines.append(ran + (f"; {left} net(s) left unrouted." if left is not None else "."))
         else:
             lines.append(f"Not routed: {routing.get('reason', 'autorouting was not attempted')}.")
         lines.append("")
