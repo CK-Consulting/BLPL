@@ -310,6 +310,20 @@ def _symbol_exists(ref: str, symbols_root) -> bool:
         return False
 
 
+def _padless(fp_ref: str, footprints_root) -> bool:
+    """Whether a footprint has pads but none with a number: nothing to wire."""
+    if ":" not in fp_ref:
+        return False
+    from ..emitter import loaders, sexpr
+
+    try:
+        fp = loaders.load_footprint(fp_ref, footprints_root)
+    except Exception:  # noqa: BLE001 - an unloadable footprint is another stage's finding
+        return False
+    pads = sexpr.find_all(fp, "pad")
+    return bool(pads) and all(not sexpr.unquote(str(p[1])).strip() for p in pads if len(p) > 1)
+
+
 def _classify_and_resolve_pin_map(
     bom_row: dict,
     paths: Stage3Paths,
@@ -335,6 +349,11 @@ def _classify_and_resolve_pin_map(
     if is_not_placed(bom_row.get("footprint_hint") or bom_row.get("package") or ""):
         # Never on the board, never in the netlist: there are no pins for a
         # pin_map to describe — the same exemption doctor's DOC-011 applies.
+        return None
+    if _padless(bom_row.get("footprint_hint") or bom_row.get("package") or "", footprints_root):
+        # On the board but with nothing to connect: a fiducial's one pad has no
+        # number, and neither has an unplated mounting hole. Asking for its
+        # pin_map left three fiducials as "pending user input" on every run.
         return None
 
     # The design doc's own pinout table, before any classifier guessing: it

@@ -520,3 +520,17 @@ def test_an_unresolvable_connector_hint_is_repaired_to_the_stock_generic(tmp_pat
 
     row = json.loads(bom_path.read_text())["rows"][0]
     assert row["symbol_hint"] == "Connector_Generic:Conn_01x40"
+
+
+def test_a_padless_footprint_needs_no_pin_map(tmp_path: Path) -> None:
+    """A fiducial's one pad has no number: nothing to wire, nothing to ask."""
+    from blpl.core import stage3_generate as s3
+
+    fps = tmp_path / "fps" / "Fiducial.pretty"
+    fps.mkdir(parents=True)
+    (fps / "Fid.kicad_mod").write_text('(footprint "Fid" (pad "" smd circle (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask")))')
+    (fps / "Pad.kicad_mod").write_text('(footprint "Pad" (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu")))')
+    assert s3._padless("Fiducial:Fid", tmp_path / "fps")
+    assert not s3._padless("Fiducial:Pad", tmp_path / "fps")
+    assert not s3._padless("Fiducial:Missing", tmp_path / "fps")
+    assert not s3._padless("no-colon", tmp_path / "fps")
