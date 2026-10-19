@@ -310,6 +310,20 @@ def _symbol_exists(ref: str, symbols_root) -> bool:
         return False
 
 
+def _padless(fp_ref: str, footprints_root) -> bool:
+    """Whether a footprint has pads but none with a number: nothing to wire."""
+    if ":" not in fp_ref:
+        return False
+    from ..emitter import loaders, sexpr
+
+    try:
+        fp = loaders.load_footprint(fp_ref, footprints_root)
+    except Exception:  # noqa: BLE001 - an unloadable footprint is another stage's finding
+        return False
+    pads = sexpr.find_all(fp, "pad")
+    return bool(pads) and all(not sexpr.unquote(str(p[1])).strip() for p in pads if len(p) > 1)
+
+
 def _classify_and_resolve_pin_map(
     bom_row: dict,
     paths: Stage3Paths,
@@ -317,6 +331,7 @@ def _classify_and_resolve_pin_map(
     symbols_root: Path,
     footprints_root: Path,
     doc_pin_maps: dict[str, dict[str, str]] | None = None,
+    selected_footprint: str | None = None,
 ) -> dict | None:
     """Run the component classifier against a BOM row.
 
@@ -335,6 +350,15 @@ def _classify_and_resolve_pin_map(
     if is_not_placed(bom_row.get("footprint_hint") or bom_row.get("package") or ""):
         # Never on the board, never in the netlist: there are no pins for a
         # pin_map to describe — the same exemption doctor's DOC-011 applies.
+        return None
+    # The footprint Stage 2 matched is the one Stage 5 places, and may have
+    # come from MPN or fuzzy matching with no colon-qualified hint in the BOM
+    # (Codex, PR #63); the BOM's own text is the fallback.
+    if any(_padless(ref, footprints_root) for ref in (
+            selected_footprint, bom_row.get("footprint_hint") or bom_row.get("package")) if ref):
+        # On the board but with nothing to connect: a fiducial's one pad has no
+        # number, and neither has an unplated mounting hole. Asking for its
+        # pin_map left three fiducials as "pending user input" on every run.
         return None
 
     # The design doc's own pinout table, before any classifier guessing: it
@@ -570,6 +594,8 @@ def run(
     explicit_pins.apply(bom["rows"], project_dir, board)
     doc_pin_maps = explicit_pins.pin_maps(project_dir, board)
     bom_mutated = False
+    matched_fp = {r["local_id"]: f"{r['footprint_match']['lib']}:{r['footprint_match']['name']}"
+                  for r in coverage.get("rows", []) if r.get("footprint_match")}
     for bom_row in bom["rows"]:
         # A connector hint that names no symbol anywhere is the LLM's
         # invention, and Stage 5 turns it into a "NO REAL SYMBOL" placeholder
@@ -607,6 +633,7 @@ def run(
             symbols_root=symbols_root,
             footprints_root=footprints_root,
             doc_pin_maps=doc_pin_maps,
+            selected_footprint=matched_fp.get(bom_row["local_id"]),
         )
         if pin_map_gap is not None:
             gaps.append(pin_map_gap)
