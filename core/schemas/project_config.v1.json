@@ -203,6 +203,28 @@
         "footprint_only": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
       }
     },
+    "review": {
+      "description": "How the checks treat this project's findings (core/blpl/core/accept.py).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accept": {
+          "type": "array",
+          "description": "Findings that are true and intended. Each moves to an accepted list with its reason, in the Stage 5 placement audit and in Stage 8; none is hidden.",
+          "items": {
+            "type": "object",
+            "required": ["rule", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "rule": { "type": "string", "minLength": 1, "description": "A placement-audit finding (off_board, in_edge_margin, in_keepout, in_cutout, overlap) or a Stage 8 rule id; a glob." },
+              "parts": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Covers a finding only when every part it names is listed." },
+              "nets": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Covers a finding only when every net it names is listed." },
+              "reason": { "type": "string", "minLength": 8, "description": "Why it is intended. Shown beside the finding in every report." }
+            }
+          }
+        }
+      }
+    },
     "placement": {
       "description": "What the placer cannot infer. A hint is an instruction: someone wrote it knowing something the netlist does not say.",
       "type": "object",

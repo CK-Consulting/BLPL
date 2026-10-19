@@ -349,7 +349,15 @@ def _place_components(
     findings = placement.audit(result, board, hints, float(
         (project_config.get("placement") or {}).get("edge_margin", placement.DEFAULT_EDGE_MARGIN)))
     if findings:
-        record["audit"] = findings
+        # Findings the project accepts on purpose move aside with their
+        # reason (accept.py): still on record, no longer reported as open.
+        from . import accept
+
+        open_, waived = accept.split(findings, accept.entries(project_config),
+                                     rule_key="problem", parts_key="ref")
+        record["audit"] = open_
+        if waived:
+            record["audit_accepted"] = waived
     return record, board_geometry.as_record(board)
 
 
@@ -850,7 +858,7 @@ def emit(
     )
 
     hdm: dict[str, Any] = {}
-    for key in ("project", "net_classes", "boundaries"):
+    for key in ("project", "net_classes", "boundaries", "review"):
         if key in project_config:
             hdm[key] = project_config[key]
     if z.synthesized:

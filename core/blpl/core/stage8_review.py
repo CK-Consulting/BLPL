@@ -870,6 +870,12 @@ def _render_markdown(report: dict) -> str:
             "",
         ]
 
+    if report.get("accepted"):
+        lines += ["## Accepted — intended, per project.yaml review.accept", ""]
+        for d in report["accepted"]:
+            lines.append(f"- **{d.get('rule_id', '')}** — {d['summary']} — *{d['accepted_reason']}*")
+        lines.append("")
+
     if report["expected"]:
         lines += ["## Expected — did not run this time", ""]
         reasons = report.get("expected_reasons") or {}
@@ -1118,6 +1124,12 @@ def run(
 
     _SEV = {"error": 0, "warning": 1, "info": 2}
     design_issues.sort(key=lambda d: _SEV.get(d["severity"], 3))
+    # Findings the project accepts on purpose, with the reason it gave
+    # (project.yaml review.accept, accept.py). Kept on record, not counted.
+    from . import accept
+
+    design_issues, accepted = accept.split(
+        design_issues, accept.entries(hdm if isinstance(hdm, dict) else {}))
 
     report = {
         # A board is not "ok" if the pipeline mis-emitted it, and it is certainly
@@ -1132,6 +1144,7 @@ def run(
             "emitter": len(emitter_defects),
             "design": len(design_issues),
             "expected": sum(expected_counts.values()),
+            "accepted": len(accepted),
             "placeholders": len(placeholders),
         },
         "placeholders": placeholders,
@@ -1147,6 +1160,7 @@ def run(
         "test_points": test_points,
         "emitter_defects": emitter_defects,
         "design_issues": design_issues,
+        "accepted": accepted,
         "expected": expected,
         "expected_reasons": ctx.reasons,
         "analyzers": analyzers,
