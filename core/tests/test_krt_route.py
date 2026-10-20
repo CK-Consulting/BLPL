@@ -259,7 +259,7 @@ def test_a_differential_class_goes_to_the_differential_router(tmp_path):
 def test_later_passes_never_take_up_an_earlier_class(board):
     steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, ["F.Cu", "B.Cu"])
     rest = steps[-1]["args"]
-    assert "!RF_ANT" in rest and "RF_ANT" not in rest
+    assert "![R]F_ANT" in rest and "RF_ANT" not in rest
 
 
 def test_vias_stay_off_pads_with_no_planes(board):
@@ -274,11 +274,11 @@ def test_a_power_class_with_its_own_vias_routes_in_its_own_pass(board):
     _, power, rest = (s["args"] for s in steps)
     # Power_Bulk's 0.9/0.5 vias, never the Default 0.6/0.3 the shared pass
     # would apply to every net it selects.
-    assert power[:3] == ["--nets", "GND", "VBAT"] and "!RF_ANT" in power
+    assert power[:3] == ["--nets", "GND", "VBAT"] and "![R]F_ANT" in power
     assert power[power.index("--via-size") + 1] == "0.9" and power[power.index("--via-drill") + 1] == "0.5"
     i = power.index("--power-nets")
     assert power[i + 1:i + 3] == ["GND", "VBAT"]
-    assert rest[:2] == ["--nets", "SPI_SCK"] and "!GND" in rest and "!VBAT" in rest
+    assert rest[:2] == ["--nets", "SPI_SCK"] and "![G]ND" in rest and "![V]BAT" in rest
     assert "--power-nets" not in rest and rest[rest.index("--via-size") + 1] == "0.6"
 
 
@@ -383,3 +383,34 @@ def test_the_plane_skills_point_krt_runs_at_data_it_writes():
     for skill in ("plane-mappings", "erc-drc-resolution"):
         text = (resources.files("blpl") / "skills" / skill / "SKILL.md").read_text()
         assert "kind: plane" in text and "open_connections.json" in text
+
+
+@pytest.mark.parametrize("net, sel, excl", [
+    ("DATA[0]", "DATA[[]0]", "![D]ATA[[]0]"),
+    ("A*B", "A[*]B", "![A][*]B"),
+    ("Q?", "Q[?]", "![Q][?]"),
+    ("!RESET", "\\!RESET", "!!RESET"),
+    ("RESET", "RESET", "![R]ESET"),
+])
+def test_a_net_name_selects_only_itself(net, sel, excl):
+    # KRT reads --nets as fnmatch patterns; checked against its
+    # expand_net_patterns, each of these selects and excludes itself alone.
+    import fnmatch
+
+    assert krt_route._glob(net) == sel and krt_route._not(net) == excl
+    others = ["DATA0", "AXB", "QQ", "!RESET", "RESET", "DATA[0]", "A*B", "Q?"]
+    assert [n for n in others if fnmatch.fnmatchcase(n, krt_route._pat(net))] == [net]
+
+
+def test_every_route_selector_is_escaped(tmp_path):
+    pcb, pro = _two_class_board(
+        tmp_path, ["DATA[0]", "DATA0", "VBAT*", "RF[1]"],
+        [{"name": "Default", "track_width": 0.2, "clearance": 0.15, "via_diameter": 0.6, "via_drill": 0.3},
+         {"name": "Power_Bulk", "track_width": 0.75, "clearance": 0.25, "via_diameter": 0.6, "via_drill": 0.3},
+         {"name": "RF_50R", "track_width": 0.35, "clearance": 0.25, "via_diameter": 0.6, "via_drill": 0.3}],
+        [{"pattern": "VBAT*", "netclass": "Power_Bulk"}, {"pattern": "RF*", "netclass": "RF_50R"}])
+    rf, rest = (s["args"] for s in krt_route.plan(pcb, pro, {}, ["F.Cu", "B.Cu"]))
+    assert rf[:2] == ["--nets", "RF[[]1]"]
+    assert "DATA[[]0]" in rest and "DATA[0]" not in rest and "![R]F[[]1]" in rest
+    i = rest.index("--power-nets")
+    assert rest[i + 1] == "VBAT[*]"
