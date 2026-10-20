@@ -64,6 +64,27 @@ def _python_ok(python: str) -> bool:
     return proc.returncode == 0
 
 
+def _startup_problem(home: Path) -> str | None:
+    """What KRT's own startup check says is wrong with this install, or None.
+
+    A file named grid_router* and importable numpy said nothing about whether
+    the router would start: a stale or wrong-ABI binary, or a dependency below
+    KRT's floor, passed here and KRT then exited on its first call, with
+    Freerouting usable and never chosen (Codex, PR #59). startup_checks.py is
+    the gate every KRT script runs; run on its own it exits 1 with the reason
+    (checked: a version mismatch and a missing module both do).
+    """
+    try:
+        proc = subprocess.run([sys.executable, str(home / "py_router" / "startup_checks.py")],
+                              capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return str(exc)
+    if proc.returncode == 0:
+        return None
+    lines = [l.strip() for l in ((proc.stdout or "") + (proc.stderr or "")).splitlines() if l.strip()]
+    return lines[0] if lines else f"startup_checks.py exited {proc.returncode}"
+
+
 def available() -> tuple[bool, str]:
     from . import autoroute
 
@@ -73,6 +94,8 @@ def available() -> tuple[bool, str]:
         missing.append(f"KiCad Routing Tools (set {HOME_ENV})")
     elif not any((home / "rust_router").glob("grid_router*")):
         missing.append("its compiled router (rust_router/grid_router)")
+    elif (problem := _startup_problem(home)) is not None:
+        missing.append(f"an install that passes its own startup check ({problem})")
     if not _python_ok(sys.executable):
         missing.append("numpy, scipy and shapely")
     if autoroute.find_pcbnew_python() is None:
