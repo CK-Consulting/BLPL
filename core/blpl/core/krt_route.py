@@ -127,14 +127,26 @@ _PAIR_SUFFIXES = (("_P", "_N"), ("_DP", "_DN"), ("+", "-"), ("P", "N"))
 
 def _diff_pairs(nets: list[str]) -> list[tuple[str, str]]:
     """The class's nets as (positive, negative) pairs, when every net has its
-    partner; empty when the class is not a set of differential pairs."""
+    partner; empty when the class is not a set of differential pairs.
+
+    Each net takes the first convention whose partner is in the class, so a
+    class may mix them: USB_DP/USB_DN beside CLK+/CLK-. Testing one
+    convention against the whole class found no pairs there and sent it to
+    the single-ended router (Codex, PR #59).
+    """
     names = set(nets)
-    for pos, neg in _PAIR_SUFFIXES:
-        pairs = [(n, n[: -len(pos)] + neg) for n in sorted(names) if n.endswith(pos)]
-        paired = {x for pr in pairs for x in pr}
-        if pairs and paired == names:
-            return pairs
-    return []
+    pairs: list[tuple[str, str]] = []
+    paired: set[str] = set()
+    for n in sorted(names):
+        if n in paired:
+            continue
+        for pos, neg in _PAIR_SUFFIXES:
+            partner = n[: -len(pos)] + neg
+            if n.endswith(pos) and partner in names and partner not in paired and partner != n:
+                pairs.append((n, partner))
+                paired |= {n, partner}
+                break
+    return pairs if pairs and paired == names else []
 
 
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
@@ -196,13 +208,16 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
                 # it the zone stays and only the stitching vias are added.
                 "--skip-existing-zones"]})
         pad_gap = max(gaps)
-        # Signals stay off the plane layers. Routed on them, the planes were
-        # cut into islands (38 for GND on verdacor) and every signal over a
-        # cut lost its reference: Stage 8's reference-plane and split findings.
-        plane_layers = {l for ls in planes.values() for l in ls}
-        signal_layers = [l for l in copper_layers if l not in plane_layers]
-        if signal_layers:
-            held = [*held, "--layers", *signal_layers]
+    # Signals stay off the plane layers. Routed on them, the planes were cut
+    # into islands (38 for GND on verdacor) and every signal over a cut lost
+    # its reference: Stage 8's reference-plane and split findings. With no
+    # planes every copper layer is named all the same: left out, route_diff.py
+    # falls back to F.Cu and B.Cu and a 4-layer board's inner layers go
+    # unused (Codex, PR #59).
+    plane_layers = {l for ls in planes.values() for l in ls}
+    signal_layers = [l for l in copper_layers if l not in plane_layers]
+    if signal_layers:
+        held = [*held, "--layers", *signal_layers]
     # Vias off same-net pads on every board, planes or none: the default
     # lets a via into a pad, which wicks solder in reflow (Codex, PR #59).
     held = [*held, "--same-net-pad-clearance", f"{pad_gap:g}"]
@@ -317,11 +332,18 @@ def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool) -> subproc
         "poly = pcbnew.SHAPE_POLY_SET()\n"
         "b.GetBoardPolygonOutlines(poly, True)\n"
         f"d = pcbnew.FromMM({depth_mm!r})\n"
+        # Each outline's band runs inward, and each cutout's (a hole in the
+        # outline) outward into the board around it: banding the outlines
+        # alone let routing close in on an internal cutout (Codex, PR #59).
+        "rings = []\n"
         "for o in range(poly.OutlineCount()):\n"
-        "    ring = poly.Outline(o)\n"
+        "    rings.append((poly.Outline(o), 1))\n"
+        "    for h in range(poly.HoleCount(o)):\n"
+        "        rings.append((poly.Hole(o, h), -1))\n"
+        "for ring, side in rings:\n"
         "    pts = [ring.CPoint(i) for i in range(ring.PointCount())]\n"
         "    area = sum(pts[i].x * pts[(i + 1) % len(pts)].y - pts[(i + 1) % len(pts)].x * pts[i].y for i in range(len(pts)))\n"
-        "    sign = 1 if area > 0 else -1\n"
+        "    sign = (1 if area > 0 else -1) * side\n"
         "    for i in range(len(pts)):\n"
         "        a, c = pts[i], pts[(i + 1) % len(pts)]\n"
         "        dx, dy = c.x - a.x, c.y - a.y\n"
