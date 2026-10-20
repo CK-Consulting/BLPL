@@ -160,6 +160,21 @@ def _not(net: str) -> str:
     return "!" + p
 
 
+def impedance_layers(hdm: dict | None) -> dict[str, list[str]]:
+    """Each net class's declared impedance layers, from the HDM.
+
+    Stage 5 resolves them, tags included, onto ``net_classes.<name>.impedance``;
+    the .kicad_pro the router reads has no place for them.
+    """
+    out: dict[str, list[str]] = {}
+    for name, rules in ((hdm or {}).get("net_classes") or {}).items():
+        imp = (rules or {}).get("impedance")
+        layers = imp.get("layers") if isinstance(imp, dict) else None
+        if layers:
+            out[str(name)] = [str(l) for l in layers]
+    return out
+
+
 def _diff_pairs(nets: list[str]) -> list[tuple[str, str]]:
     """The class's nets as (positive, negative) pairs, when every net has its
     partner; empty when the class is not a set of differential pairs.
@@ -190,7 +205,7 @@ def _diff_pairs(nets: list[str]) -> list[tuple[str, str]]:
 
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
          copper_layers: list[str] | None = None, refused: list[dict] | None = None,
-         band: bool | None = None) -> list[dict]:
+         band: bool | None = None, class_layers: dict[str, list[str]] | None = None) -> list[dict]:
     """The calls, in order: planes, each special class, then everything else.
 
     Pure, so the order and the rules each call carries can be tested without a
@@ -265,24 +280,47 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
     # unused (Codex, PR #59).
     plane_layers = {l for ls in planes.values() for l in ls}
     signal_layers = [l for l in copper_layers if l not in plane_layers]
-    if signal_layers:
-        held = [*held, "--layers", *signal_layers]
-    elif planes:
+    # Vias off same-net pads on every board, planes or none: the default
+    # lets a via into a pad, which wicks solder in reflow (Codex, PR #59).
+    held = [*held, "--same-net-pad-clearance", f"{pad_gap:g}"]
+    if not signal_layers and planes:
         # Every copper layer is a plane. Without --layers the router falls
         # back to all of them, routes signals through every pour and splits
-        # it (Codex, PR #59): the planes are poured and the signals left open,
-        # with the reason.
+        # it (Codex, PR #59): the signals are left open, with the reason. The
+        # plane nets still get the route step that welds their pads into the
+        # pour, each on its own plane layers only, so no net cuts another's.
+        for net, ls in sorted(planes.items()):
+            _, cls = class_of(net)
+            steps.append({"script": "route.py", "args": [
+                "--nets", _glob(net), "--track-width",
+                f"{cls.get('track_width', default.get('track_width', 0.2)):g}",
+                *rules(cls), *held, "--layers", *ls]})
         if refused is not None:
-            plane_nets = set(planes)
-            rest = sorted({n for ns in groups.values() for n in ns} - plane_nets)
+            rest = sorted({n for ns in groups.values() for n in ns} - set(planes))
             if rest:
                 refused.append({"class": "*", "nets": rest, "reason": (
                     f"every copper layer ({', '.join(copper_layers)}) carries a plane, so signals "
                     "have no layer to route on that would not cut one")})
         return steps
-    # Vias off same-net pads on every board, planes or none: the default
-    # lets a via into a pad, which wicks solder in reflow (Codex, PR #59).
-    held = [*held, "--same-net-pad-clearance", f"{pad_gap:g}"]
+    layer_args = ["--layers", *signal_layers]
+
+    def layers_for(name: str) -> list[str] | None:
+        """--layers for one class: its declared impedance layers when it has
+        them, which the .kicad_pro does not carry. A width calculated for F.Cu
+        is another impedance on an inner layer, so routing the class on every
+        signal layer could lay it at the wrong one (Codex, PR #59). None when
+        none of its layers is free to route on."""
+        declared = (class_layers or {}).get(name)
+        if not declared:
+            return layer_args
+        usable = [l for l in declared if l in signal_layers]
+        if not usable:
+            if refused is not None:
+                refused.append({"class": name, "nets": sorted(groups[name]), "reason": (
+                    f"its impedance is for {', '.join(declared)}, and none of those is a signal "
+                    f"layer on this board ({', '.join(signal_layers)})")})
+            return None
+        return ["--layers", *usable]
     power: list[tuple[str, str, float]] = []
     # Nets an earlier pass routed, excluded from every later one: KRT rips up
     # and rebuilds a blocking net it was not asked to route, at the current
@@ -297,6 +335,9 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
             power += [(name, n, c.get("track_width", default.get("track_width", 0.2))) for n in groups[name]]
             continue
         protect = [_not(n) for n in done]
+        on = layers_for(name)
+        if on is None:
+            continue
         if _diff_pairs(groups[name]):
             # A differential class goes to the differential router, with the
             # pair's own leg width and gap: route.py routes each half alone.
@@ -317,11 +358,11 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
                 "--nets", *map(_glob, groups[name]), *protect,
                 "--track-width", f"{c.get('diff_pair_width', c.get('track_width', 0.2)):g}",
                 "--diff-pair-gap", f"{gap:g}",
-                *rules(c), *held]})
+                *rules(c), *held, *on]})
         else:
             steps.append({"script": "route.py", "args": [
                 "--nets", *map(_glob, groups[name]), *protect, "--track-width", f"{c.get('track_width', 0.2):g}",
-                *rules(c), *held]})
+                *rules(c), *held, *on]})
         done += groups[name]
     def power_args(nets: list[tuple[str, str, float]]) -> list[str]:
         return ["--power-nets", *[_pat(n) for _, n, _ in nets], "--power-nets-widths", *[f"{w:g}" for _, _, w in nets]]
@@ -341,7 +382,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
         steps.append({"script": "route.py", "args": [
             "--nets", *[_glob(n) for _, n, _ in own], *map(_not, done),
             "--track-width", f"{default.get('track_width', 0.2):g}",
-            *rules(classes.get(name, {})), *held, *power_args(own)]})
+            *rules(classes.get(name, {})), *held, *layer_args, *power_args(own)]})
         done += [n for _, n, _ in own]
     # The last pass names its nets: Default and the power classes, never a
     # special class. Given "*" it re-selected an RF net its own pass had not
@@ -350,7 +391,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
     rest = sorted(set(groups.get("Default", [])) | {n for _, n, _ in shared})
     if rest:
         final = ["--nets", *map(_glob, rest), *map(_not, done), "--track-width", f"{default.get('track_width', 0.2):g}",
-                 *rules(default), *held]
+                 *rules(default), *held, *layer_args]
         if shared:
             final += power_args(shared)
         steps.append({"script": "route.py", "args": final})
@@ -468,7 +509,8 @@ def _fill(python: str, pcb: Path) -> subprocess.CompletedProcess:
     ))
 
 
-def route(pcb: Path, *, work_dir: Path, timeout: int = 3600):
+def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
+          class_layers: dict[str, list[str]] | None = None):
     """Route ``pcb`` in place with KiCad Routing Tools; the board's own measure."""
     from . import autoroute
 
@@ -514,7 +556,8 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600):
             result.reason = f"pcbnew could not draw the edge band: {autoroute._msg(banded)}"
             return result
     refused: list[dict] = []
-    steps = plan(pcb, pro, autoroute.plane_layers(pcb), refused=refused, band=band)
+    steps = plan(pcb, pro, autoroute.plane_layers(pcb), refused=refused, band=band,
+                 class_layers=class_layers)
     if refused:
         result.extra["refused"] = refused
     result.extra["steps"] = [" ".join([s["script"], *s["args"]]) for s in steps]
