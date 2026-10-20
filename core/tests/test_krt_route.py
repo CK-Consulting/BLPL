@@ -296,3 +296,42 @@ def test_a_route_that_laid_no_track_with_connections_open_fails(board, tmp_path,
     assert not r.ok and "no track segments" in r.reason and r.unrouted == 12
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 0})
     assert krt_route.route(board, work_dir=tmp_path / "w").ok
+
+
+def test_plane_calls_keep_the_zones_stage6_poured(board):
+    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["In1.Cu"]},
+                           ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+    planes = [s["args"] for s in steps if s["script"] == "route_planes.py"]
+    assert planes and all("--skip-existing-zones" in a for a in planes)
+
+
+def test_a_failed_route_still_takes_its_edge_band_off(board, tmp_path, monkeypatch):
+    pro = board.with_suffix(".kicad_pro")
+    data = json.loads(pro.read_text())
+    data["board"] = {"design_settings": {"rules": {"min_copper_edge_clearance": 0.5}}}
+    pro.write_text(json.dumps(data))
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
+    calls = []
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add: calls.append(("band", add)) or ok)
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: subprocess.CompletedProcess(cmd, 1, "", "timed out"))
+    r = krt_route.route(board, work_dir=tmp_path / "w")
+    assert not r.ok and "exited 1" in r.reason
+    assert calls == [("band", True), ("band", False)]
+
+
+def test_drawing_the_band_first_clears_any_band_left_behind(tmp_path, monkeypatch):
+    scripts = []
+    monkeypatch.setattr(autoroute, "_pcbnew", lambda py, code: scripts.append(code))
+    krt_route._edge_band("py", tmp_path / "b.kicad_pcb", 0.6, add=True)
+    krt_route._edge_band("py", tmp_path / "b.kicad_pcb", 0, add=False)
+    add, remove = scripts
+    for code in scripts:
+        compile(code, "<band>", "exec")
+    # The add script removes the marked shapes before drawing new ones.
+    assert add.index("b.Remove(d)") < add.index("SHAPE_POLY_SET") and "b.Add(sh)" in add
+    assert "b.Add" not in remove
