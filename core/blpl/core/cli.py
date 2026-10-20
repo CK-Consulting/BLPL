@@ -1217,7 +1217,18 @@ def _cmd_autoroute(args: argparse.Namespace) -> int:
     report_path = _artifact(args, proj, "autoroute_report")
     work = pipeline_dir / ("autoroute" if board is None else f"autoroute.{board}")
     router = _router(args, proj)
-    result = autoroute.run_for(pcb, report_path, passes=args.passes, work_dir=work, router=router)
+    # Each controlled class's impedance layers, which only the HDM carries:
+    # KRT is told to keep such a class on them.
+    class_layers = None
+    hdm_path = _artifact(args, proj, "hdm", suffix="yaml")
+    if router == "kicad-routing-tools" and hdm_path.is_file():
+        import yaml
+
+        from . import krt_route
+
+        class_layers = krt_route.impedance_layers(yaml.safe_load(hdm_path.read_text(encoding="utf-8")))
+    result = autoroute.run_for(pcb, report_path, passes=args.passes, work_dir=work, router=router,
+                               class_layers=class_layers)
     if not result.attempted:
         print(f"autoroute: skipped — {result.reason}")
         print(f"           wrote {report_path}")

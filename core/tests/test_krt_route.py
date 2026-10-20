@@ -449,7 +449,11 @@ def test_signals_are_refused_when_every_copper_layer_is_a_plane(board):
     refused = []
     steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["F.Cu", "B.Cu"]},
                            ["F.Cu", "B.Cu"], refused=refused)
-    assert [s["script"] for s in steps] == ["route_planes.py"]
+    # The pour, then the route step that welds GND's own pads into it, on
+    # GND's layers only; never a signal pass.
+    assert [s["script"] for s in steps] == ["route_planes.py", "route.py"]
+    weld = steps[1]["args"]
+    assert weld[:2] == ["--nets", "GND"] and weld[weld.index("--layers") + 1:][:2] == ["F.Cu", "B.Cu"]
     assert refused[0]["class"] == "*" and refused[0]["nets"] == ["RF_ANT", "SPI_SCK", "VBAT"]
     assert "every copper layer" in refused[0]["reason"]
 
@@ -487,3 +491,49 @@ def test_a_band_layer_the_board_already_uses_is_left_alone(board, tmp_path, monk
     assert r.ok and calls == [True]                      # drawn once, nothing to remove
     assert cmds and all("--keepout" not in c for c in cmds)
     assert "1 shape(s) already on Eco2.User" in r.to_dict()["edge_band"]
+
+
+def test_a_controlled_class_routes_only_on_its_impedance_layers(board):
+    # RF_50R's width is for F.Cu: on In2.Cu or B.Cu it is another impedance.
+    pro = board.with_suffix(".kicad_pro")
+    layers = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+    steps = krt_route.plan(board, pro, {"GND": ["In1.Cu"]}, layers, class_layers={"RF_50R": ["F.Cu"]})
+    (rf,) = [s["args"] for s in steps if s["args"][:2] == ["--nets", "RF_ANT"]]
+    assert rf[rf.index("--layers") + 1:] [:1] == ["F.Cu"] and "In2.Cu" not in rf and "B.Cu" not in rf
+    # Every other pass keeps every signal layer.
+    rest = steps[-1]["args"]
+    assert rest[rest.index("--layers") + 1:][:3] == ["F.Cu", "In2.Cu", "B.Cu"]
+    # Declared only for a layer that is a plane here: refused, with the reason.
+    refused = []
+    steps = krt_route.plan(board, pro, {"GND": ["In1.Cu"]}, layers, refused=refused,
+                           class_layers={"RF_50R": ["In1.Cu"]})
+    assert not any("RF_ANT" in s["args"][:3] for s in steps)
+    assert refused[0]["class"] == "RF_50R" and "In1.Cu" in refused[0]["reason"]
+
+
+def test_impedance_layers_are_read_from_the_hdm():
+    hdm = {"net_classes": {"RF_50R": {"impedance": {"ohms": 50, "layers": ["F.Cu"]}},
+                           "USB": {"impedance": {"ohms": 90, "mode": "differential"}},
+                           "Default": {}}}
+    assert krt_route.impedance_layers(hdm) == {"RF_50R": ["F.Cu"]}
+    assert krt_route.impedance_layers(None) == {}
+
+
+def test_stage6a_hands_krt_the_hdms_impedance_layers(tmp_path, monkeypatch):
+    import argparse
+
+    from blpl.core import cli
+
+    (tmp_path / "project.yaml").write_text("project: {name: p, dimensions: [10, 10]}\n")
+    pipe = tmp_path / ".pipeline"
+    pipe.mkdir()
+    (pipe / "hdm.yaml").write_text("net_classes:\n  RF_50R:\n    impedance: {ohms: 50, layers: [F.Cu]}\n")
+    pcb = pipe / "p.kicad_pcb"
+    pcb.write_text("(kicad_pcb)")
+    seen = {}
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(cli, "_newest_emitted", lambda *a: pcb)
+    monkeypatch.setattr(autoroute, "run_for", lambda *a, **k: seen.update(k) or autoroute.RouteResult(
+        False, "stub", attempted=False, pcb=str(pcb)))
+    assert cli._cmd_autoroute(argparse.Namespace(project_dir=str(tmp_path), board=None, passes=1)) == 0
+    assert seen["router"] == "kicad-routing-tools" and seen["class_layers"] == {"RF_50R": ["F.Cu"]}
