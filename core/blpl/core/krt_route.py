@@ -331,7 +331,12 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
         if name == "Default":
             continue
         c = classes.get(name, {})
-        if POWER_CLASS.search(name):
+        # A power class by name, unless it is a set of pairs or carries its
+        # own impedance layers: "LowPower_USB_90R" is a USB pair, and the
+        # name alone sent it single-ended as power nets, without its pair
+        # width and gap (Codex, PR #59).
+        if (POWER_CLASS.search(name) and not _diff_pairs(groups[name])
+                and not (class_layers or {}).get(name)):
             power += [(name, n, c.get("track_width", default.get("track_width", 0.2))) for n in groups[name]]
             continue
         protect = [_not(n) for n in done]
@@ -443,7 +448,9 @@ def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool) -> subproc
         "ours, others = [], 0\n"
         "for d in list(b.GetDrawings()):\n"
         "    if d.GetLayer() == lay:\n"
-        f"        if d.GetWidth() == {_BAND_MARK_NM}:\n"
+        # Only a shape has a width: text or a dimension on the layer is the
+        # board's own and has none to read (Codex, PR #59).
+        f"        if isinstance(d, pcbnew.PCB_SHAPE) and d.GetWidth() == {_BAND_MARK_NM}:\n"
         "            ours.append(d)\n"
         "        else:\n"
         "            others += 1\n"
@@ -458,7 +465,7 @@ def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool) -> subproc
     taken = (
         "if others:\n"
         f"    pcbnew.SaveBoard({str(pcb)!r}, b)\n"
-        "    print(f'{others} shape(s) already on " + BAND_LAYER + "')\n"
+        "    print(f'{others} drawing(s) already on " + BAND_LAYER + "')\n"
         "    raise SystemExit(3)\n"
     )
     return autoroute._pcbnew(python, remove + taken + (
