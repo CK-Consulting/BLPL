@@ -189,7 +189,7 @@ def _diff_pairs(nets: list[str]) -> list[tuple[str, str]]:
 
 
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
-         copper_layers: list[str] | None = None) -> list[dict]:
+         copper_layers: list[str] | None = None, refused: list[dict] | None = None) -> list[dict]:
     """The calls, in order: planes, each special class, then everything else.
 
     Pure, so the order and the rules each call carries can be tested without a
@@ -277,10 +277,23 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
         if _diff_pairs(groups[name]):
             # A differential class goes to the differential router, with the
             # pair's own leg width and gap: route.py routes each half alone.
+            gap = c.get("diff_pair_gap", c.get("clearance", 0.2))
+            clear = c.get("clearance", default.get("clearance", 0.2))
+            if gap < clear - 1e-9:
+                # route_diff.py widens a gap below the clearance to the
+                # clearance, so the pair would be laid at a different
+                # impedance than its gap was calculated for, under a step that
+                # still claimed the gap (Codex, PR #59). Left unrouted with
+                # the reason, as Stage 8's ZC-012 reports it.
+                if refused is not None:
+                    refused.append({"class": name, "nets": sorted(groups[name]), "reason": (
+                        f"diff_pair_gap {gap:g} mm is below the class clearance {clear:g} mm; "
+                        "the router would widen it to the clearance and change the pair's impedance")})
+                continue
             steps.append({"script": "route_diff.py", "args": [
                 "--nets", *map(_glob, groups[name]), *protect,
                 "--track-width", f"{c.get('diff_pair_width', c.get('track_width', 0.2)):g}",
-                "--diff-pair-gap", f"{c.get('diff_pair_gap', c.get('clearance', 0.2)):g}",
+                "--diff-pair-gap", f"{gap:g}",
                 *rules(c), *held]})
         else:
             steps.append({"script": "route.py", "args": [
@@ -454,7 +467,10 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600):
         if banded.returncode != 0:
             result.reason = f"pcbnew could not draw the edge band: {autoroute._msg(banded)}"
             return result
-    steps = plan(pcb, pro, autoroute.plane_layers(pcb))
+    refused: list[dict] = []
+    steps = plan(pcb, pro, autoroute.plane_layers(pcb), refused=refused)
+    if refused:
+        result.extra["refused"] = refused
     result.extra["steps"] = [" ".join([s["script"], *s["args"]]) for s in steps]
     for step in steps:
         script = str(home / "py_router" / step["script"])

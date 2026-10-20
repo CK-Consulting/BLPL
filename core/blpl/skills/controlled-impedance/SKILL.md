@@ -63,6 +63,7 @@ what the board "probably" carries.
      USB2_Diff_90Ohm:
        trace_width: 0.18
        diff_pair_gap: 0.15
+       clearance: 0.15         # no more than the gap: KiCad holds it between the halves
        impedance: {ohms: 90, mode: differential}
    ```
 
@@ -93,6 +94,11 @@ what the board "probably" carries.
      names in `nets.json`.
    - **ZC-009** — a single-ended or differential impedance on a one-layer
      board, which has nowhere for its reference plane. Coplanar is allowed.
+   - **ZC-012** — a differential class whose `diff_pair_gap` is less than its
+     clearance. KiCad holds the clearance between the two halves, and the
+     router widens the gap to it, so the pair would not be the impedance its
+     gap was calculated for. Fix: set the class clearance to the gap if the fab
+     allows it, or get a width for a gap of at least the clearance.
 
    ZC-003 and every ZC finding except ZC-004 are errors.
 5. **Release.** The release build — the app's release action, or

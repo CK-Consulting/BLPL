@@ -22,6 +22,7 @@ stackup calculator gave for that impedance::
       USB2_Diff_90Ohm:
         trace_width: 0.18
         diff_pair_gap: 0.15
+        clearance: 0.15               # no more than the gap, or ZC-012
         impedance: {ohms: 90, mode: differential, tolerance_pct: 10}
 
 **Tags** say which nets need it, by name, without the designer having to know
@@ -494,6 +495,21 @@ def review(hdm: dict) -> list[dict]:
                 "cannot come that close without breaking the project's own clearance.",
                 f"Set net_classes.{name}.clearance to the coplanar_gap if the fab allows "
                 "it, or get a coplanar width for a gap of at least the clearance.",
+                nets_=members)
+        # The differential twin of ZC-010. KiCad holds the class clearance
+        # between a pair's two halves as between any two nets, and KiCad
+        # Routing Tools widens a gap below it to the clearance, so the pair is
+        # laid at the clearance and its impedance is not the one this gap was
+        # calculated for (Codex, PR #59).
+        if (spec.mode == "differential" and "diff_pair_gap" in rules
+                and float(rules["diff_pair_gap"]) < float(clearance) - 1e-9):
+            finding(
+                "ZC-012", "error",
+                f"Class {name} couples its pair {rules['diff_pair_gap']} mm apart but has a "
+                f"clearance of {clearance} mm, so the two halves cannot come that close "
+                "without breaking the project's own clearance.",
+                f"Set net_classes.{name}.clearance to the diff_pair_gap if the fab allows "
+                "it, or get a differential width for a gap of at least the clearance.",
                 nets_=members)
         if spec.mode == "coplanar" and "coplanar_gap" not in rules:
             finding(

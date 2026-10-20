@@ -246,7 +246,7 @@ def _two_class_board(tmp_path, nets, classes, patterns):
 def test_a_differential_class_goes_to_the_differential_router(tmp_path):
     pcb, pro = _two_class_board(tmp_path, ["USB_P", "USB_N", "SIG"], [
         {"name": "Default", "track_width": 0.2, "clearance": 0.15, "via_diameter": 0.6, "via_drill": 0.3},
-        {"name": "USB_90R", "track_width": 0.2, "clearance": 0.2, "diff_pair_width": 0.18, "diff_pair_gap": 0.15,
+        {"name": "USB_90R", "track_width": 0.2, "clearance": 0.15, "diff_pair_width": 0.18, "diff_pair_gap": 0.15,
          "via_diameter": 0.6, "via_drill": 0.3}],
         [{"pattern": "USB_*", "netclass": "USB_90R"}])
     steps = krt_route.plan(pcb, pro, {}, ["F.Cu", "B.Cu"])
@@ -254,6 +254,33 @@ def test_a_differential_class_goes_to_the_differential_router(tmp_path):
     a = diff["args"]
     assert a[a.index("--track-width") + 1] == "0.18" and a[a.index("--diff-pair-gap") + 1] == "0.15"
     assert krt_route._diff_pairs(["A_P", "A_N", "B"]) == []
+
+
+def test_a_pair_whose_gap_is_under_its_clearance_is_refused_not_widened(tmp_path, monkeypatch):
+    # route_diff.py raises such a gap to the clearance: the pair would be laid
+    # 0.2 mm apart under a step claiming 0.15, at another impedance.
+    pcb, pro = _two_class_board(tmp_path, ["USB_DP", "USB_DM", "SIG"], [
+        {"name": "Default", "track_width": 0.2, "clearance": 0.15, "via_diameter": 0.6, "via_drill": 0.3},
+        {"name": "USB_90R", "track_width": 0.2, "clearance": 0.2, "diff_pair_width": 0.18, "diff_pair_gap": 0.15,
+         "via_diameter": 0.6, "via_drill": 0.3}],
+        [{"pattern": "USB_*", "netclass": "USB_90R"}])
+    refused = []
+    steps = krt_route.plan(pcb, pro, {}, ["F.Cu", "B.Cu"], refused=refused)
+    assert [s["script"] for s in steps] == ["route.py"] and "USB_DP" not in steps[0]["args"]
+    assert refused == [{"class": "USB_90R", "nets": ["USB_DM", "USB_DP"], "reason": refused[0]["reason"]}]
+    assert "0.15" in refused[0]["reason"] and "0.2" in refused[0]["reason"]
+    # route() carries the refusal into its report.
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    for fn in ("_resave", "_edge_band", "_fill"):
+        monkeypatch.setattr(krt_route, fn, lambda *a, **k: ok)
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: ok)
+    monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 2, "segments": 10})
+    r = krt_route.route(pcb, work_dir=tmp_path / "w")
+    assert r.to_dict()["refused"][0]["class"] == "USB_90R"
 
 
 def test_later_passes_never_take_up_an_earlier_class(board):
