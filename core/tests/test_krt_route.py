@@ -339,8 +339,24 @@ def test_drawing_the_band_first_clears_any_band_left_behind(tmp_path, monkeypatc
 
 def test_a_class_may_mix_pair_conventions():
     assert krt_route._diff_pairs(["USB_DP", "USB_DN", "CLK+", "CLK-"]) == [("CLK+", "CLK-"), ("USB_DP", "USB_DN")]
+    assert krt_route._diff_pairs(["USB_DP", "USB_DM", "CLK+", "CLK-"]) == [("CLK+", "CLK-"), ("USB_DP", "USB_DM")]
     # One net without a partner and the class is not a set of pairs.
     assert krt_route._diff_pairs(["USB_DP", "USB_DN", "CLK+"]) == []
+
+
+@pytest.mark.parametrize("nets, pairs", [
+    (["USB_DP", "USB_DM"], [("USB_DP", "USB_DM")]),
+    (["MCU_USB_DP", "MCU_USB_DN"], [("MCU_USB_DP", "MCU_USB_DN")]),
+    (["ETH_TX_P", "ETH_TX_N", "ETH_RX_P", "ETH_RX_N"], [("ETH_RX_P", "ETH_RX_N"), ("ETH_TX_P", "ETH_TX_N")]),
+    (["DSI_CKP", "DSI_CKN"], [("DSI_CKP", "DSI_CKN")]),
+    (["LVDS+", "LVDS-"], [("LVDS+", "LVDS-")]),
+])
+def test_every_pair_stage4_recognises_routes_as_a_pair(nets, pairs):
+    # Stage 4 put these in a differential class; the router must agree.
+    from blpl.core.stage4_synthesize_nets import _diff_pair_complements
+
+    assert all(any(c in nets for c in _diff_pair_complements(n)) for n in nets)
+    assert krt_route._diff_pairs(nets) == pairs
 
 
 def test_every_copper_layer_is_named_when_there_are_no_planes(board):
