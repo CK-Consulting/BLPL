@@ -189,7 +189,8 @@ def _diff_pairs(nets: list[str]) -> list[tuple[str, str]]:
 
 
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
-         copper_layers: list[str] | None = None, refused: list[dict] | None = None) -> list[dict]:
+         copper_layers: list[str] | None = None, refused: list[dict] | None = None,
+         band: bool | None = None) -> list[dict]:
     """The calls, in order: planes, each special class, then everything else.
 
     Pure, so the order and the rules each call carries can be tested without a
@@ -205,7 +206,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
                 "--via-drill", f"{c.get('via_drill', default.get('via_drill', 0.3)):g}"]
 
     steps: list[dict] = []
-    held = ["--escalation", "off", "--no-fix-drc-settings", "--keepout", "--keepout-layer", BAND_LAYER]
+    held = ["--escalation", "off", "--no-fix-drc-settings"]
     pad_gap = default.get("clearance", 0.2)
     # The board's own edge and hole rules, which the router otherwise takes
     # from its defaults: on verdacor it ran VDD_LR2021 0.2 mm from the edge of
@@ -215,6 +216,15 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
                       ("min_hole_to_hole", "--hole-to-hole-clearance")):
         if isinstance(board.get(key), (int, float)) and board[key] > 0:
             held += [flag, f"{board[key]:g}"]
+    # The edge band as a keepout only when it was drawn: KRT blocks every
+    # closed shape on the keepout layer, so with no band the flag turned
+    # whatever else was drawn there into a wall (Codex, PR #59). ``route``
+    # says whether it drew one; planned alone, the edge rule decides.
+    if band is None:
+        edge = board.get("min_copper_edge_clearance")
+        band = isinstance(edge, (int, float)) and edge > 0
+    if band:
+        held += ["--keepout", "--keepout-layer", BAND_LAYER]
     if planes:
         def class_of(net: str) -> tuple[str, dict]:
             name = next((c for c, ns in groups.items() if net in ns), "Default")
@@ -257,6 +267,19 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
     signal_layers = [l for l in copper_layers if l not in plane_layers]
     if signal_layers:
         held = [*held, "--layers", *signal_layers]
+    elif planes:
+        # Every copper layer is a plane. Without --layers the router falls
+        # back to all of them, routes signals through every pour and splits
+        # it (Codex, PR #59): the planes are poured and the signals left open,
+        # with the reason.
+        if refused is not None:
+            plane_nets = set(planes)
+            rest = sorted({n for ns in groups.values() for n in ns} - plane_nets)
+            if rest:
+                refused.append({"class": "*", "nets": rest, "reason": (
+                    f"every copper layer ({', '.join(copper_layers)}) carries a plane, so signals "
+                    "have no layer to route on that would not cut one")})
+        return steps
     # Vias off same-net pads on every board, planes or none: the default
     # lets a via into a pad, which wicks solder in reflow (Codex, PR #59).
     held = [*held, "--same-net-pad-clearance", f"{pad_gap:g}"]
@@ -374,13 +397,30 @@ def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool) -> subproc
         "import pcbnew\n"
         f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
         f"lay = b.GetLayerID({BAND_LAYER!r})\n"
+        # One pass, before anything is removed: KiCad 10's binding cannot
+        # walk GetDrawings() again after a Remove (a TypeError, or a crash).
+        "ours, others = [], 0\n"
         "for d in list(b.GetDrawings()):\n"
-        f"    if d.GetLayer() == lay and d.GetWidth() == {_BAND_MARK_NM}:\n"
-        "        b.Remove(d)\n"
+        "    if d.GetLayer() == lay:\n"
+        f"        if d.GetWidth() == {_BAND_MARK_NM}:\n"
+        "            ours.append(d)\n"
+        "        else:\n"
+        "            others += 1\n"
+        "for d in ours:\n"
+        "    b.Remove(d)\n"
     )
     if not add:
         return autoroute._pcbnew(python, remove + f"pcbnew.SaveBoard({str(pcb)!r}, b)\n")
-    return autoroute._pcbnew(python, remove + (
+    # KRT keeps out of every closed shape on the layer, not only the band's:
+    # a layer someone else drew on is not BLPL's to use (Codex, PR #59). It
+    # exits 3, after saving the stale band's removal, and draws nothing.
+    taken = (
+        "if others:\n"
+        f"    pcbnew.SaveBoard({str(pcb)!r}, b)\n"
+        "    print(f'{others} shape(s) already on " + BAND_LAYER + "')\n"
+        "    raise SystemExit(3)\n"
+    )
+    return autoroute._pcbnew(python, remove + taken + (
         "poly = pcbnew.SHAPE_POLY_SET()\n"
         "b.GetBoardPolygonOutlines(poly, True)\n"
         f"d = pcbnew.FromMM({depth_mm!r})\n"
@@ -464,11 +504,17 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600):
         widest = max([c.get("track_width", 0.2) for c in classes.values()] or [0.2])
         banded = _edge_band(python, pcb, edge + widest / 2, add=True)
         restore_pro()
-        if banded.returncode != 0:
+        if banded.returncode == 3:
+            # The layer is the designer's: route without the band, and say so.
+            band = False
+            result.extra["edge_band"] = (f"not drawn: {BAND_LAYER} already carries the board's own "
+                                         f"drawings ({((banded.stdout or '').strip().splitlines() or ['?'])[-1]}); the router "
+                                         "holds the edge rule unaided")
+        elif banded.returncode != 0:
             result.reason = f"pcbnew could not draw the edge band: {autoroute._msg(banded)}"
             return result
     refused: list[dict] = []
-    steps = plan(pcb, pro, autoroute.plane_layers(pcb), refused=refused)
+    steps = plan(pcb, pro, autoroute.plane_layers(pcb), refused=refused, band=band)
     if refused:
         result.extra["refused"] = refused
     result.extra["steps"] = [" ".join([s["script"], *s["args"]]) for s in steps]
