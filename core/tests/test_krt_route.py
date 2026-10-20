@@ -481,7 +481,7 @@ def test_a_band_layer_the_board_already_uses_is_left_alone(board, tmp_path, monk
     monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
     calls, cmds = [], []
     ok = subprocess.CompletedProcess([], 0, "", "")
-    taken = subprocess.CompletedProcess([], 3, "1 shape(s) already on Eco2.User\n", "")
+    taken = subprocess.CompletedProcess([], 3, "1 drawing(s) already on Eco2.User\n", "")
     monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
     monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add: calls.append(add) or (taken if add else ok))
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: cmds.append(cmd) or ok)
@@ -490,7 +490,7 @@ def test_a_band_layer_the_board_already_uses_is_left_alone(board, tmp_path, monk
     r = krt_route.route(board, work_dir=tmp_path / "w")
     assert r.ok and calls == [True]                      # drawn once, nothing to remove
     assert cmds and all("--keepout" not in c for c in cmds)
-    assert "1 shape(s) already on Eco2.User" in r.to_dict()["edge_band"]
+    assert "1 drawing(s) already on Eco2.User" in r.to_dict()["edge_band"]
 
 
 def test_a_controlled_class_routes_only_on_its_impedance_layers(board):
@@ -537,3 +537,27 @@ def test_stage6a_hands_krt_the_hdms_impedance_layers(tmp_path, monkeypatch):
         False, "stub", attempted=False, pcb=str(pcb)))
     assert cli._cmd_autoroute(argparse.Namespace(project_dir=str(tmp_path), board=None, passes=1)) == 0
     assert seen["router"] == "kicad-routing-tools" and seen["class_layers"] == {"RF_50R": ["F.Cu"]}
+
+
+def test_a_pair_class_named_for_power_is_still_a_pair(tmp_path):
+    pcb, pro = _two_class_board(tmp_path, ["USB_DP", "USB_DM", "VBUS"], [
+        {"name": "Default", "track_width": 0.2, "clearance": 0.15, "via_diameter": 0.6, "via_drill": 0.3},
+        {"name": "LowPower_USB_90R", "track_width": 0.2, "clearance": 0.15, "diff_pair_width": 0.18,
+         "diff_pair_gap": 0.15, "via_diameter": 0.6, "via_drill": 0.3},
+        {"name": "Power_Bulk", "track_width": 0.75, "clearance": 0.25, "via_diameter": 0.6, "via_drill": 0.3}],
+        [{"pattern": "USB_*", "netclass": "LowPower_USB_90R"}, {"pattern": "VBUS", "netclass": "Power_Bulk"}])
+    steps = krt_route.plan(pcb, pro, {}, ["F.Cu", "B.Cu"])
+    (diff,) = [s["args"] for s in steps if s["script"] == "route_diff.py"]
+    assert diff[:3] == ["--nets", "USB_DM", "USB_DP"] and diff[diff.index("--diff-pair-gap") + 1] == "0.15"
+    rest = steps[-1]["args"]
+    i = rest.index("--power-nets")
+    assert rest[i + 1:i + 2] == ["VBUS"] and "USB_DP" not in rest[i:]
+
+
+def test_text_on_the_band_layer_is_the_boards_and_has_no_width(tmp_path, monkeypatch):
+    # Checked in pcbnew: PCB_TEXT has no GetWidth(), and reading one raised
+    # AttributeError before the occupied-layer fallback could run.
+    scripts = []
+    monkeypatch.setattr(autoroute, "_pcbnew", lambda py, code: scripts.append(code))
+    krt_route._edge_band("py", tmp_path / "b.kicad_pcb", 0.6, add=True)
+    assert "isinstance(d, pcbnew.PCB_SHAPE) and d.GetWidth()" in scripts[0]
