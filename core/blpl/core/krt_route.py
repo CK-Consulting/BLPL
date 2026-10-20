@@ -188,7 +188,13 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
             gaps.append(gap)
             steps.append({"script": "route_planes.py", "args": [
                 "--nets", *[n for n, _ in pairs], "--plane-layers", *[l for _, l in pairs],
-                *rules(cls), "--same-net-pad-clearance", f"{gap:g}"]})
+                *rules(cls), "--same-net-pad-clearance", f"{gap:g}",
+                # Stage 6 has already poured each plane, to the outline or to
+                # the polygon boundaries.copper_zones gives. Without this the
+                # router replaces that zone with its own pour, which can put a
+                # plane where the project restricted it (Codex, PR #59); with
+                # it the zone stays and only the stitching vias are added.
+                "--skip-existing-zones"]})
         pad_gap = max(gaps)
         # Signals stay off the plane layers. Routed on them, the planes were
         # cut into islands (38 for GND on verdacor) and every signal over a
@@ -295,20 +301,19 @@ def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool) -> subproc
     """
     from . import autoroute
 
-    if not add:
-        return autoroute._pcbnew(python, (
-            "import pcbnew\n"
-            f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
-            f"lay = b.GetLayerID({BAND_LAYER!r})\n"
-            "for d in list(b.GetDrawings()):\n"
-            f"    if d.GetLayer() == lay and d.GetWidth() == {_BAND_MARK_NM}:\n"
-            "        b.Remove(d)\n"
-            f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
-        ))
-    return autoroute._pcbnew(python, (
+    # Any band already on the board goes first, adding or not: one left by
+    # a run that died before its cleanup must not be doubled by the next.
+    remove = (
         "import pcbnew\n"
         f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
         f"lay = b.GetLayerID({BAND_LAYER!r})\n"
+        "for d in list(b.GetDrawings()):\n"
+        f"    if d.GetLayer() == lay and d.GetWidth() == {_BAND_MARK_NM}:\n"
+        "        b.Remove(d)\n"
+    )
+    if not add:
+        return autoroute._pcbnew(python, remove + f"pcbnew.SaveBoard({str(pcb)!r}, b)\n")
+    return autoroute._pcbnew(python, remove + (
         "poly = pcbnew.SHAPE_POLY_SET()\n"
         "b.GetBoardPolygonOutlines(poly, True)\n"
         f"d = pcbnew.FromMM({depth_mm!r})\n"
@@ -399,6 +404,13 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600):
         if proc.returncode != 0:
             result.reason = f"{step['script']} exited {proc.returncode}: {autoroute._msg(proc)[-800:]}"
             result.log = "\n".join(log)[-20000:]
+            # A failed route still takes its band off: left on, the board
+            # carries BLPL's scaffolding as if it were design (Codex, PR #59).
+            if band:
+                unbanded = _edge_band(python, pcb, 0, add=False)
+                restore_pro()
+                if unbanded.returncode != 0:
+                    result.reason += f"; and pcbnew could not remove the edge band: {autoroute._msg(unbanded)}"
             return result
     result.log = "\n".join(log)[-20000:]
     unbanded = _edge_band(python, pcb, 0, add=False) if band else subprocess.CompletedProcess([], 0, "", "")
