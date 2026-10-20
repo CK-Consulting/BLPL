@@ -122,6 +122,44 @@ def board_copper(pcb: Path) -> list[str]:
     return sorted(dict.fromkeys(found), key=lambda l: order.get(l, int(l[2:-3]) if l.startswith("In") else 0))
 
 
+def _pat(net: str) -> str:
+    """``net`` as an fnmatch pattern that matches that name and no other.
+
+    route.py and route_diff.py read every --nets value, and --power-nets, as
+    an fnmatch pattern, with no exact-name fallback: a bus net DATA[0] selected
+    DATA0 and not itself, and its "!" protection guarded the wrong net (Codex,
+    PR #59). ``*``, ``?`` and ``[`` become one-character classes. route_planes.py
+    takes literal names and is never given these. Checked against KRT's own
+    expand_net_patterns: each of DATA[0], A*B, Q?, !RESET and RESET selects and
+    excludes itself alone. KRT still lets an unqualified name match a sheet
+    path's leaf ("GND" also takes "/Sheet/GND"), by design; BLPL's schematics
+    are flat, so its boards carry no such pair.
+    """
+    return "".join(f"[{c}]" if c in "*?[" else c for c in net)
+
+
+def _glob(net: str) -> str:
+    """A --nets selector for ``net``. A leading "!" is KRT's exclusion mark
+    there, so an active-low net such as !RESET takes KRT's ``\\!`` escape and is
+    routed, not excluded. --power-nets has no exclusion and takes ``_pat``."""
+    out = _pat(net)
+    return "\\" + out if out.startswith("!") else out
+
+
+def _not(net: str) -> str:
+    """The --nets selector that keeps ``net`` out of a pass.
+
+    KRT reads "!X" as including the net "!X" when the board has one, so with
+    an active-low !RESET beside RESET, "!RESET" routed !RESET instead of
+    protecting RESET. A bracketed first character ("![R]ESET") names no net
+    and still matches only RESET.
+    """
+    p = _pat(net)
+    if p and p[0] not in "![":
+        p = f"[{p[0]}]{p[1:]}"
+    return "!" + p
+
+
 def _diff_pairs(nets: list[str]) -> list[tuple[str, str]]:
     """The class's nets as (positive, negative) pairs, when every net has its
     partner; empty when the class is not a set of differential pairs.
@@ -235,22 +273,22 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
         if POWER_CLASS.search(name):
             power += [(name, n, c.get("track_width", default.get("track_width", 0.2))) for n in groups[name]]
             continue
-        protect = [f"!{n}" for n in done]
+        protect = [_not(n) for n in done]
         if _diff_pairs(groups[name]):
             # A differential class goes to the differential router, with the
             # pair's own leg width and gap: route.py routes each half alone.
             steps.append({"script": "route_diff.py", "args": [
-                "--nets", *groups[name], *protect,
+                "--nets", *map(_glob, groups[name]), *protect,
                 "--track-width", f"{c.get('diff_pair_width', c.get('track_width', 0.2)):g}",
                 "--diff-pair-gap", f"{c.get('diff_pair_gap', c.get('clearance', 0.2)):g}",
                 *rules(c), *held]})
         else:
             steps.append({"script": "route.py", "args": [
-                "--nets", *groups[name], *protect, "--track-width", f"{c.get('track_width', 0.2):g}",
+                "--nets", *map(_glob, groups[name]), *protect, "--track-width", f"{c.get('track_width', 0.2):g}",
                 *rules(c), *held]})
         done += groups[name]
     def power_args(nets: list[tuple[str, str, float]]) -> list[str]:
-        return ["--power-nets", *[n for _, n, _ in nets], "--power-nets-widths", *[f"{w:g}" for _, _, w in nets]]
+        return ["--power-nets", *[_pat(n) for _, n, _ in nets], "--power-nets-widths", *[f"{w:g}" for _, _, w in nets]]
 
     # A power class whose vias differ from Default's gets a pass of its own.
     # Explicit --via-size/--via-drill apply to every selected net, so routed
@@ -265,7 +303,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
     for name in sorted({p[0] for p in power} - {p[0] for p in shared}):
         own = [p for p in power if p[0] == name]
         steps.append({"script": "route.py", "args": [
-            "--nets", *[n for _, n, _ in own], *[f"!{n}" for n in done],
+            "--nets", *[_glob(n) for _, n, _ in own], *map(_not, done),
             "--track-width", f"{default.get('track_width', 0.2):g}",
             *rules(classes.get(name, {})), *held, *power_args(own)]})
         done += [n for _, n, _ in own]
@@ -275,7 +313,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
     # --track-width applies to every selected net (Codex, PR #59).
     rest = sorted(set(groups.get("Default", [])) | {n for _, n, _ in shared})
     if rest:
-        final = ["--nets", *rest, *[f"!{n}" for n in done], "--track-width", f"{default.get('track_width', 0.2):g}",
+        final = ["--nets", *map(_glob, rest), *map(_not, done), "--track-width", f"{default.get('track_width', 0.2):g}",
                  *rules(default), *held]
         if shared:
             final += power_args(shared)
