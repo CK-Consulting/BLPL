@@ -441,3 +441,49 @@ def test_every_route_selector_is_escaped(tmp_path):
     assert "DATA[[]0]" in rest and "DATA[0]" not in rest and "![R]F[[]1]" in rest
     i = rest.index("--power-nets")
     assert rest[i + 1] == "VBAT[*]"
+
+
+def test_signals_are_refused_when_every_copper_layer_is_a_plane(board):
+    # GND poured on both sides of a two-layer board: with no --layers the
+    # router would fall back to both and route signals through the pours.
+    refused = []
+    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["F.Cu", "B.Cu"]},
+                           ["F.Cu", "B.Cu"], refused=refused)
+    assert [s["script"] for s in steps] == ["route_planes.py"]
+    assert refused[0]["class"] == "*" and refused[0]["nets"] == ["RF_ANT", "SPI_SCK", "VBAT"]
+    assert "every copper layer" in refused[0]["reason"]
+
+
+def test_the_keepout_flag_goes_out_only_with_a_band(board):
+    pro = board.with_suffix(".kicad_pro")
+    flags = lambda **k: {a for s in krt_route.plan(board, pro, {}, ["F.Cu", "B.Cu"], **k) for a in s["args"]}
+    # No edge rule, no band: an Eco2.User drawing must not become a wall.
+    assert "--keepout" not in flags()
+    assert "--keepout" in flags(band=True) and "--keepout" not in flags(band=False)
+    data = json.loads(pro.read_text())
+    data["board"] = {"design_settings": {"rules": {"min_copper_edge_clearance": 0.5}}}
+    pro.write_text(json.dumps(data))
+    assert "--keepout" in flags() and "--keepout" not in flags(band=False)
+
+
+def test_a_band_layer_the_board_already_uses_is_left_alone(board, tmp_path, monkeypatch):
+    pro = board.with_suffix(".kicad_pro")
+    data = json.loads(pro.read_text())
+    data["board"] = {"design_settings": {"rules": {"min_copper_edge_clearance": 0.5}}}
+    pro.write_text(json.dumps(data))
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
+    calls, cmds = [], []
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    taken = subprocess.CompletedProcess([], 3, "1 shape(s) already on Eco2.User\n", "")
+    monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add: calls.append(add) or (taken if add else ok))
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: cmds.append(cmd) or ok)
+    monkeypatch.setattr(krt_route, "_fill", lambda *a: ok)
+    monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 5})
+    r = krt_route.route(board, work_dir=tmp_path / "w")
+    assert r.ok and calls == [True]                      # drawn once, nothing to remove
+    assert cmds and all("--keepout" not in c for c in cmds)
+    assert "1 shape(s) already on Eco2.User" in r.to_dict()["edge_band"]
