@@ -561,3 +561,33 @@ def test_text_on_the_band_layer_is_the_boards_and_has_no_width(tmp_path, monkeyp
     monkeypatch.setattr(autoroute, "_pcbnew", lambda py, code: scripts.append(code))
     krt_route._edge_band("py", tmp_path / "b.kicad_pcb", 0.6, add=True)
     assert "isinstance(d, pcbnew.PCB_SHAPE) and d.GetWidth()" in scripts[0]
+
+
+def _fake_home(tmp_path, check: str) -> Path:
+    home = tmp_path / "krt"
+    (home / "py_router").mkdir(parents=True)
+    (home / "rust_router").mkdir()
+    (home / "py_router" / "route.py").write_text("")
+    (home / "rust_router" / "grid_router.abi3.so").write_text("")
+    (home / "py_router" / "startup_checks.py").write_text(check)
+    return home
+
+
+def test_an_install_that_fails_its_own_startup_check_is_not_available(tmp_path, monkeypatch):
+    # A stale binary passes a file glob; KRT's startup check is what knows.
+    home = _fake_home(tmp_path, "print('Rust router version mismatch: installed=0.22, Cargo.toml=0.23.1')\n"
+                                "raise SystemExit(1)\n")
+    monkeypatch.setenv("KRT_HOME", str(home))
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(krt_route, "_python_ok", lambda py: True)
+    ok, why = krt_route.available()
+    assert not ok and "version mismatch" in why
+    # And Stage 6a falls back to Freerouting rather than choosing it.
+    import argparse
+
+    from blpl.core import cli
+
+    (tmp_path / "project.yaml").write_text("project: {name: p, dimensions: [10, 10]}\n")
+    assert cli._router(argparse.Namespace(project_dir=str(tmp_path), board=None), tmp_path) == "freerouting"
+    (home / "py_router" / "startup_checks.py").write_text("print('All checks passed.')\n")
+    assert krt_route.available() == (True, "")
