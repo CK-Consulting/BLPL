@@ -122,31 +122,32 @@ def board_copper(pcb: Path) -> list[str]:
     return sorted(dict.fromkeys(found), key=lambda l: order.get(l, int(l[2:-3]) if l.startswith("In") else 0))
 
 
-_PAIR_SUFFIXES = (("_P", "_N"), ("_DP", "_DN"), ("+", "-"), ("P", "N"))
-
-
 def _diff_pairs(nets: list[str]) -> list[tuple[str, str]]:
     """The class's nets as (positive, negative) pairs, when every net has its
     partner; empty when the class is not a set of differential pairs.
 
-    Each net takes the first convention whose partner is in the class, so a
-    class may mix them: USB_DP/USB_DN beside CLK+/CLK-. Testing one
-    convention against the whole class found no pairs there and sent it to
-    the single-ended router (Codex, PR #59).
+    Partners come from Stage 4's own table, the one that put these nets in a
+    differential class: a second, shorter list here knew _DP only with _DN,
+    so the USB_DP/USB_DM spelling Stage 4 pairs went to the single-ended
+    router (Codex, PR #59). Each net takes its first partner present in the
+    class, so a class may mix conventions: USB_DP/USB_DN beside CLK+/CLK-.
     """
+    from .stage4_synthesize_nets import _diff_pair_complements
+
     names = set(nets)
     pairs: list[tuple[str, str]] = []
     paired: set[str] = set()
     for n in sorted(names):
         if n in paired:
             continue
-        for pos, neg in _PAIR_SUFFIXES:
-            partner = n[: -len(pos)] + neg
-            if n.endswith(pos) and partner in names and partner not in paired and partner != n:
-                pairs.append((n, partner))
-                paired |= {n, partner}
-                break
-    return pairs if pairs and paired == names else []
+        partner = next((c for c in _diff_pair_complements(n)
+                        if c in names and c not in paired and c != n), None)
+        if partner is None:
+            continue
+        # Every negative spelling ends N, M or "-"; every positive one P or "+".
+        pairs.append((n, partner) if partner.upper()[-1] in "NM-" else (partner, n))
+        paired |= {n, partner}
+    return sorted(pairs) if pairs and paired == names else []
 
 
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
