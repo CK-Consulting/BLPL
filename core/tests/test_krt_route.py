@@ -335,3 +335,35 @@ def test_drawing_the_band_first_clears_any_band_left_behind(tmp_path, monkeypatc
     # The add script removes the marked shapes before drawing new ones.
     assert add.index("b.Remove(d)") < add.index("SHAPE_POLY_SET") and "b.Add(sh)" in add
     assert "b.Add" not in remove
+
+
+def test_a_class_may_mix_pair_conventions():
+    assert krt_route._diff_pairs(["USB_DP", "USB_DN", "CLK+", "CLK-"]) == [("CLK+", "CLK-"), ("USB_DP", "USB_DN")]
+    # One net without a partner and the class is not a set of pairs.
+    assert krt_route._diff_pairs(["USB_DP", "USB_DN", "CLK+"]) == []
+
+
+def test_every_copper_layer_is_named_when_there_are_no_planes(board):
+    for step in krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]):
+        a = step["args"]
+        i = a.index("--layers")
+        assert a[i + 1:i + 5] == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+
+
+def test_the_band_runs_round_internal_cutouts_too(tmp_path, monkeypatch):
+    # The geometry is checked against pcbnew by hand: a 20 mm board with a
+    # 6 mm cutout gets 4 shapes on its edge and 4 round the cutout, all on
+    # board material. Here, that the script walks the holes and compiles.
+    scripts = []
+    monkeypatch.setattr(autoroute, "_pcbnew", lambda py, code: scripts.append(code))
+    krt_route._edge_band("py", tmp_path / "b.kicad_pcb", 0.6, add=True)
+    compile(scripts[0], "<band>", "exec")
+    assert "poly.HoleCount(o)" in scripts[0] and "poly.Hole(o, h)" in scripts[0]
+
+
+def test_the_plane_skills_point_krt_runs_at_data_it_writes():
+    from importlib import resources
+
+    for skill in ("plane-mappings", "erc-drc-resolution"):
+        text = (resources.files("blpl") / "skills" / skill / "SKILL.md").read_text()
+        assert "kind: plane" in text and "open_connections.json" in text

@@ -38,7 +38,9 @@ This is a session with the user, not a batch job.
 - **Start by reading, then summarising.** Read `validation_report.json`,
   `open_connections.json` (written by Stage 7: every unrouted connection with its
   kind, reason and suggested fix), `erc_report.json`, `drc_report.json` and
-  `autoroute_report.json` (including `plane_fanout`). Tell the user what you
+  `autoroute_report.json` (its `router`, absent for Freerouting, and `plane_fanout` when Freerouting
+  ran; KiCad Routing Tools writes none, and its open plane pads are in
+  `open_connections.json` as `kind: plane`). Tell the user what you
   found in groups — by kind, worst first — with counts. Ask which to take first,
   or propose an order.
 - **One group at a time.** Explain the cause in a sentence, say what you will

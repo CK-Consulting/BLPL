@@ -22,9 +22,12 @@ made once, and it reaches every later emit.
 
 - Copper layer count (`project.stackup.layers`) and what each layer is for.
 - The nets and their pad counts (`.pipeline/nets.json`), and their classes.
-- What `copper_zones` says now, and what Stage 6a did with it last run
-  (`autoroute_report.plane_fanout`: which nets, which pads got vias, which
-  had no room).
+- What `copper_zones` says now, and what Stage 6a did with it last run.
+  `autoroute_report.router` is `kicad-routing-tools` when KiCad Routing Tools
+  ran; a report without it is Freerouting's. Freerouting records its
+  plane vias in `autoroute_report.plane_fanout` (which nets, which pads got
+  vias, which had no room); KiCad Routing Tools records no per-pad result, so
+  for it read the `kind: plane` items in `open_connections.json`.
 
 ## Step 2: Find the plane-worthy nets
 
@@ -64,6 +67,8 @@ boundaries:
 ```
 
 Give the reasoning per assignment in one line each. After it is accepted,
-Stage 5 onward re-run; check `autoroute_report.plane_fanout.failed` for pads
-that found no room for a via — those are placement or rule problems to raise,
-not silently accept.
+Stage 5 onward re-run; check for plane pads that found no room for a via:
+the `kind: plane` items in `open_connections.json`, for either router, and
+`autoroute_report.plane_fanout.failed` as well when Freerouting ran. KiCad
+Routing Tools writes no `plane_fanout`, so its absence is not a clean result.
+Those are placement or rule problems to raise, not silently accept.
