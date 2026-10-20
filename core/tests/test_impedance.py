@@ -226,7 +226,7 @@ def test_stage5_refuses_a_file_whose_tag_names_a_class_that_is_not_there(tmp_pat
 def test_the_schema_accepts_the_documented_forms():
     cfg = _config(
         classes={"RF": {"trace_width": 0.35, "impedance": 50},
-                 "USB": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+                 "USB": {"trace_width": 0.18, "diff_pair_gap": 0.15, "clearance": 0.15,
                          "impedance": {"ohms": 90, "mode": "differential"}}},
         controlled_impedance=[{"nets": "RF"}, {"nets": "USB", "ohms": 90, "mode": "differential"}],
     )
@@ -275,7 +275,7 @@ def test_a_class_named_for_an_impedance_that_declares_none_is_flagged():
 
 
 def test_a_finished_impedance_class_is_quiet():
-    hdm = {"net_classes": {"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+    hdm = {"net_classes": {"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15, "clearance": 0.15,
                                    "impedance": {"ohms": 90, "mode": "differential"}}},
            "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
                     "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}
@@ -350,7 +350,7 @@ def test_the_skill_ships_and_installs_by_default():
 def test_a_pair_half_classed_by_a_rule_brings_its_partner_onto_the_class():
     """A net_class_rules pattern matched _DP and not _DM: the minus half stayed
     on Default, routed with other geometry and missing from the fab sheet."""
-    cfg = _config(classes={"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+    cfg = _config(classes={"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15, "clearance": 0.15,
                                    "impedance": {"ohms": 90, "mode": "differential"}}})
     nets = _nets("USB_DP", "USB_DM", pairs={"USB_DP": "USB_DM"})
     nets["USB_DP"]["class"] = "USB"
@@ -360,9 +360,9 @@ def test_a_pair_half_classed_by_a_rule_brings_its_partner_onto_the_class():
 
 
 def test_a_pair_split_across_two_classes_is_an_error():
-    hdm = {"net_classes": {"A": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+    hdm = {"net_classes": {"A": {"trace_width": 0.18, "diff_pair_gap": 0.15, "clearance": 0.15,
                                  "impedance": {"ohms": 90, "mode": "differential"}},
-                           "B": {"trace_width": 0.2, "diff_pair_gap": 0.1,
+                           "B": {"trace_width": 0.2, "diff_pair_gap": 0.1, "clearance": 0.1,
                                  "impedance": {"ohms": 90, "mode": "differential"}}},
            "nets": {"X_P": {"class": "A", "impedance": {"ohms": 90}, "diff_pair_of": "X_N"},
                     "X_N": {"class": "B", "impedance": {"ohms": 90}, "diff_pair_of": "X_P"}}}
@@ -374,7 +374,7 @@ def test_a_pair_split_across_two_classes_is_an_error():
 def test_the_fab_sheet_gives_the_width_a_pair_is_routed_at():
     """.kicad_pro routes a pair at diff_pair_width; the sheet said trace_width."""
     hdm = {"net_classes": {"USB": {"trace_width": 0.25, "diff_pair_width": 0.18,
-                                   "diff_pair_gap": 0.15,
+                                   "diff_pair_gap": 0.15, "clearance": 0.15,
                                    "impedance": {"ohms": 90, "mode": "differential"}}},
            "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
                     "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}
@@ -382,7 +382,7 @@ def test_the_fab_sheet_gives_the_width_a_pair_is_routed_at():
 
 
 def test_a_pair_width_alone_is_a_stackup_width_for_a_differential_class():
-    hdm = {"net_classes": {"USB": {"diff_pair_width": 0.18, "diff_pair_gap": 0.15,
+    hdm = {"net_classes": {"USB": {"diff_pair_width": 0.18, "diff_pair_gap": 0.15, "clearance": 0.15,
                                    "impedance": {"ohms": 90, "mode": "differential"}}},
            "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
                     "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}
@@ -420,12 +420,29 @@ def test_a_coplanar_gap_raises_the_clearance_but_never_lowers_it():
            "nets": {"ANT": {"class": "CPW", "impedance": {"ohms": 50}}}}
     assert [f["rule_id"] for f in z.review(hdm)] == ["ZC-010"]
 
+def test_a_pair_gap_under_the_class_clearance_is_zc012():
+    """KiCad holds the clearance between a pair's halves, and the router widens
+    the gap to it: the differential twin of ZC-010 (Codex, PR #59)."""
+    def review(**rules):
+        hdm = {"net_classes": {"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15, **rules,
+                                       "impedance": {"ohms": 90, "mode": "differential"}}},
+               "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90, "mode": "differential"},
+                                   "diff_pair_of": "USB_DM"},
+                        "USB_DM": {"class": "USB", "impedance": {"ohms": 90, "mode": "differential"},
+                                   "diff_pair_of": "USB_DP"}}}
+        return [f["rule_id"] for f in z.review(hdm)]
+
+    assert "ZC-012" in review()                       # the emitter's 0.2 mm default
+    assert "ZC-012" in review(clearance=0.2)
+    assert "ZC-012" not in review(clearance=0.15)
+
+
 def test_a_release_with_a_pair_split_across_complete_classes_is_not_quotable(released):
     """Every cell of the sheet is filled, and it still asks for two geometries
     for one coupled pair."""
     proj, build = released
-    full = {"trace_width": 0.18, "diff_pair_gap": 0.15, "impedance": {"ohms": 90, "mode": "differential"}}
-    manifest = build({"net_classes": {"A": full, "B": {**full, "diff_pair_gap": 0.1}},
+    full = {"trace_width": 0.18, "diff_pair_gap": 0.15, "clearance": 0.15, "impedance": {"ohms": 90, "mode": "differential"}}
+    manifest = build({"net_classes": {"A": full, "B": {**full, "diff_pair_gap": 0.1, "clearance": 0.1}},
                       "nets": {"X_P": {"class": "A", "impedance": {"ohms": 90}, "diff_pair_of": "X_N"},
                                "X_N": {"class": "B", "impedance": {"ohms": 90}, "diff_pair_of": "X_P"}}})
     assert not manifest["quotable"]
@@ -459,7 +476,7 @@ def test_a_two_layer_board_needs_no_layer():
 
 
 def test_an_unpaired_differential_net_is_an_error():
-    hdm = {"net_classes": {"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+    hdm = {"net_classes": {"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15, "clearance": 0.15,
                                    "impedance": {"ohms": 90, "mode": "differential"}}},
            "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}}}}
     (f,) = z.review(hdm)
@@ -560,7 +577,7 @@ def test_a_coplanar_class_needs_filled_ground_beside_the_trace():
 
 
 def test_a_tag_naming_a_class_takes_what_it_leaves_out_from_that_class():
-    cfg = _config(classes={"USB90": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+    cfg = _config(classes={"USB90": {"trace_width": 0.18, "diff_pair_gap": 0.15, "clearance": 0.15,
                                      "impedance": {"ohms": 90, "mode": "differential",
                                                    "tolerance_pct": 5}}},
                   controlled_impedance=[{"nets": "USB", "class": "USB90", "tolerance_pct": 10}])
@@ -624,7 +641,7 @@ def test_a_release_with_a_controlled_net_not_on_the_board_is_not_quotable(releas
 # --- a routed pair is coupled at its geometry (Codex, PR #31) ------------------------
 
 
-_PAIR_HDM = {"net_classes": {"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15,
+_PAIR_HDM = {"net_classes": {"USB": {"trace_width": 0.18, "diff_pair_gap": 0.15, "clearance": 0.15,
                                      "impedance": {"ohms": 90, "mode": "differential"}}},
              "nets": {"USB_DP": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DM"},
                       "USB_DM": {"class": "USB", "impedance": {"ohms": 90}, "diff_pair_of": "USB_DP"}}}

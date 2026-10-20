@@ -215,6 +215,7 @@ net_classes:
   USB2_Diff_90Ohm:
     trace_width: 0.18
     diff_pair_gap: 0.15
+    clearance: 0.15            # no more than the gap (ZC-012)
     impedance: {ohms: 90, mode: differential}
 controlled_impedance:
   - nets: "_RF_(IN|OUT)$|^ANT_"
