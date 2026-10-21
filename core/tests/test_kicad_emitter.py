@@ -674,3 +674,27 @@ def test_a_line_with_no_layer_is_not_dropped() -> None:
             ["fp_line", ["start", "0", "0"], ["end", "0", "0"]]]
     assert pcb._drop_degenerate_lines(node) == 0
     assert len(list(sexpr.find_all(node, "fp_line"))) == 1
+
+
+def test_the_same_hdm_emits_the_same_files_every_time() -> None:
+    """uuid4 on every emit rewrote thousands of lines of the committed board
+    and schematic with nothing changed, and the router, which reads them,
+    routed the same placement differently each time (blpl.emitter.ids)."""
+    import re
+
+    hdm = _minimal_hdm()
+    board = pcb.emit(hdm, footprints_root=_FOOTPRINTS_ROOT)
+    assert board == pcb.emit(hdm, footprints_root=_FOOTPRINTS_ROOT)
+    schematic = sch.emit(hdm, symbols_root=_SYMBOLS_ROOT)
+    assert schematic == sch.emit(hdm, symbols_root=_SYMBOLS_ROOT)
+
+    uuid_re = r'\(uuid "([0-9a-f-]{36})"\)'
+    board_ids, sch_ids = re.findall(uuid_re, board), re.findall(uuid_re, schematic)
+    assert board_ids and len(set(board_ids)) == len(board_ids)
+    assert not set(board_ids) & set(sch_ids)
+
+    # Another project gets its own: only what a library footprint carries in
+    # from its file is shared, and that was never generated here.
+    other = {**hdm, "project": {**hdm["project"], "name": "another"}}
+    other_ids = set(re.findall(uuid_re, pcb.emit(other, footprints_root=_FOOTPRINTS_ROOT)))
+    assert other_ids - set(board_ids)
