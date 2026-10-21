@@ -12,12 +12,11 @@ they carry the real library geometry so DRC results are meaningful.
 from __future__ import annotations
 
 import math
-import uuid as _uuid
 from copy import deepcopy
 from collections.abc import Sequence
 from pathlib import Path
 
-from . import loaders, sexpr, silk
+from . import ids, loaders, sexpr, silk
 
 
 _PCB_VERSION = "20260206"
@@ -118,7 +117,7 @@ def _copper_names(hdm: dict) -> set[str]:
 
 
 def _new_uuid() -> str:
-    return f'"{_uuid.uuid4()}"'
+    return f'"{ids.new()}"'
 
 
 def _resolve_pin_map(hdm_components: dict, refdes: str) -> dict[str, str]:
@@ -1090,7 +1089,21 @@ def build(
     *,
     footprints_root: Path | str | Sequence[Path | str],
 ) -> sexpr.Node:
-    """Build a v10 (kicad_pcb ...) node from an HDM dict."""
+    """Build a v10 (kicad_pcb ...) node from an HDM dict.
+
+    Its UUIDs are seeded from the project (ids.py): the same HDM emits the
+    same board, so re-emitting changes nothing it should not, and the router
+    gets the same input it was tried on.
+    """
+    with ids.seeded(ids.key_for("pcb", hdm)):
+        return _build(hdm, footprints_root=footprints_root)
+
+
+def _build(
+    hdm: dict,
+    *,
+    footprints_root: Path | str | Sequence[Path | str],
+) -> sexpr.Node:
     project = hdm.get("project", {})
     thickness = project.get("stackup", {}).get("thickness", 1.6)
     # A layer a plane fills is a power layer, not a signal one: so marked,

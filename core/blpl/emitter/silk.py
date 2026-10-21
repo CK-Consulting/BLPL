@@ -23,9 +23,8 @@ says what the board should carry instead:
 from __future__ import annotations
 
 import math
-import uuid
 
-from . import sexpr
+from . import ids, sexpr
 
 #: Silk keeps this far from a pad's copper, beyond half its own stroke: the
 #: solder-mask expansion a fab opens around a pad.
@@ -245,7 +244,7 @@ def _trim_line(node, pads, grow: float) -> list[list] | None:
             elif isinstance(c, list) and sexpr.head(c) == "end":
                 piece[i] = ["end", f"{b[0]:.4f}", f"{b[1]:.4f}"]
             elif isinstance(c, list) and sexpr.head(c) == "uuid":
-                piece[i] = ["uuid", sexpr.quote(str(uuid.uuid4()))]
+                piece[i] = ["uuid", sexpr.quote(ids.new())]
         out.append(piece)
     return out
 
@@ -326,6 +325,6 @@ def apply(fp: list, *, policy: dict | None, label: str | None) -> None:
         if side == "B":
             effects.append(["justify", "mirror"])
         fp.append(["fp_text", "user", sexpr.quote(label), [*at], ["layer", sexpr.quote(layer)],
-                   ["uuid", sexpr.quote(str(uuid.uuid4()))], effects])
+                   ["uuid", sexpr.quote(ids.new())], effects])
     if policy.get("clip_to_copper"):
         clip_to_copper(fp)

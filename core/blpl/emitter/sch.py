@@ -20,11 +20,10 @@ from __future__ import annotations
 
 import math
 import re
-import uuid as _uuid
 from copy import deepcopy
 from pathlib import Path
 
-from . import loaders, sch_layout, sexpr
+from . import ids, loaders, sch_layout, sexpr
 
 
 _SCH_VERSION = "20260306"
@@ -33,7 +32,7 @@ _SCHEMATIC_UUID = None  # Set per-run in build().
 
 
 def _new_uuid() -> str:
-    return f'"{_uuid.uuid4()}"'
+    return f'"{ids.new()}"'
 
 
 def _mm(v: float) -> str:
@@ -620,7 +619,13 @@ def _all_unit_pins(units_by_lib_id: dict[str, dict[int, list[dict]]]) -> dict[st
 
 
 def build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
-    """Build a v10 (kicad_sch ...) node from an HDM dict."""
+    """Build a v10 (kicad_sch ...) node from an HDM dict, its UUIDs seeded
+    from the project (ids.py) so the same HDM emits the same schematic."""
+    with ids.seeded(ids.key_for("sch", hdm)):
+        return _build(hdm, symbols_root=symbols_root)
+
+
+def _build(hdm: dict, *, symbols_root: Path) -> sexpr.Node:
     project = hdm.get("project", {})
     project_name = str(project.get("name", "HDM_Project"))
     components = hdm.get("components", {})
