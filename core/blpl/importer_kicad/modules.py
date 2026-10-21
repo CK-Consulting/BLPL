@@ -271,6 +271,21 @@ def _lib_table(directory: Path | None, table: str) -> dict[str, Path]:
     return out
 
 
+def _table_symbol(path: Path | None, name: str) -> list | None:
+    """``name`` from the one library a sym-lib-table entry points at, if it is there."""
+    if path is None:
+        return None
+    try:
+        if path.is_dir():  # a v10 .kicad_symdir: one symbol per file
+            one = path / f"{name}.kicad_sym"
+            return sexpr.find(sexpr.parse(one.read_text(encoding="utf-8")), "symbol") if one.is_file() else None
+        if path.is_file():
+            return loaders._find_named_symbol(sexpr.parse(path.read_text(encoding="utf-8")), name)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def _port_kind(net_name: str) -> str:
     upper = net_name.upper()
     if any(upper.startswith(p) for p in ("VCC", "VDD", "VBAT", "VBUS", "VIN", "VSYS", "3V3", "5V", "12V")):
@@ -317,28 +332,29 @@ def write_module(
     # Grouped by their source library, and written under that library's name, so
     # the module directory is itself a valid library root.
     wanted_symbols = sorted({row["symbol"] for row in spec.bom if row.get("symbol")})
-    # A sym-lib-table entry names a file; its directory is a root as long as the
-    # file carries the nickname, which is how load_symbol_def looks it up.
-    table_sym_roots = [
-        p.parent for nick, p in _lib_table(spec.source_dir, "sym-lib-table").items()
-        if p.name in (f"{nick}.kicad_sym", f"{nick}.kicad_symdir")
-    ]
-    symbol_roots = list(dict.fromkeys([*table_sym_roots, *(symbol_roots or [])]))
+    # A sym-lib-table entry maps a nickname to one file, whatever that file is
+    # called, so each nickname is read from its own file first. Treating the
+    # entries as directory roots instead dropped any whose file was not named
+    # after its nickname, and let a sibling library shadow another's mapping.
+    sym_table = _lib_table(spec.source_dir, "sym-lib-table")
+    symbol_roots = list(dict.fromkeys(symbol_roots or []))
     by_lib: dict[str, list[str]] = {}
     for ref in wanted_symbols:
-        if not symbol_roots:
-            notes.append(f"no libraries to copy symbols from, so {ref} was not copied")
-            continue
         try:
             lib, name = loaders.split_ref(ref)
         except ValueError:
             notes.append(f"unparseable symbol reference: {ref}")
             continue
-        try:
-            node = loaders.load_symbol_def(ref, symbol_roots)
-        except (loaders.LibraryMiss, OSError, ValueError):
-            notes.append(f"symbol not found in the configured libraries: {ref}")
-            continue
+        node = _table_symbol(sym_table.get(lib), name)
+        if node is None:
+            if not symbol_roots:
+                notes.append(f"no libraries to copy symbols from, so {ref} was not copied")
+                continue
+            try:
+                node = loaders.load_symbol_def(ref, symbol_roots)
+            except (loaders.LibraryMiss, OSError, ValueError):
+                notes.append(f"symbol not found in the configured libraries: {ref}")
+                continue
         # load_symbol_def qualifies the name for a schematic's lib_symbols cache;
         # inside a library file the bare name is what KiCad looks for.
         body = ["symbol", f'"{name}"', *node[2:]]
