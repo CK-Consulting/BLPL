@@ -37,9 +37,21 @@ def test_all_lists_every_part_once_with_how_it_is_assembled():
 
 
 def test_purchase_keeps_only_what_a_supplier_ships_grouped_with_a_quantity():
-    rows = _rows(bom_export.to_csv(bom_export.parts(None, HDM), "purchase"))
-    assert [(r["Designators"], r["Quantity"], r["MPN"]) for r in rows] == [
-        ("U1", "1", "102010"), ("R2,R10", "2", "RC0402FR-07470RL")]
+    text = bom_export.to_csv(bom_export.parts(None, HDM), "purchase")
+    assert text.splitlines()[0] == "MPN,MFG,QTY"
+    assert [tuple(r.values()) for r in _rows(text)] == [
+        ("102010", "Seeed", "1"), ("RC0402FR-07470RL", "Yageo", "2")]
+
+
+def test_a_bought_part_with_no_mpn_still_gets_a_line_that_says_so():
+    hdm = {"components": {
+        "R5": {"value": "10k", "footprint": "Resistor_SMD:R_0402"},
+        "R6": {"value": "10k", "footprint": "Resistor_SMD:R_0402"},
+        "C1": {"value": "1u", "mpn": "GRM", "manufacturer": "Murata", "footprint": "C_0402"},
+        "C2": {"value": "1u", "mpn": "grm", "manufacturer": "MURATA", "footprint": "C_0402"},
+    }}
+    rows = [tuple(r.values()) for r in _rows(bom_export.to_csv(bom_export.parts(None, hdm), "purchase"))]
+    assert rows == [("GRM", "Murata", "2"), ("NO MPN: 10k Resistor_SMD:R_0402 (R5,R6)", "", "2")]
 
 
 def test_a_cell_a_spreadsheet_would_run_is_written_as_text():
