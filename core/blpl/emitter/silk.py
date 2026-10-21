@@ -268,8 +268,13 @@ def _hits(node, pads, grow: float) -> bool:
     return False
 
 
-def clip_to_copper(fp: list) -> int:
-    """Trim this footprint's silk graphics off its own pads; how many changed."""
+def clip_to_copper(fp: list, *, extra: dict | None = None, own: bool = True) -> int:
+    """Trim this footprint's silk graphics off its own pads; how many changed.
+
+    ``extra`` adds other pads by silk side ("F"/"B"), already in this
+    footprint's frame (clip_to_neighbours); ``own=False`` leaves its own out,
+    for a footprint whose own pads were trimmed against before it was placed.
+    """
     changed = 0
     i = 0
     while i < len(fp):
@@ -278,7 +283,10 @@ def clip_to_copper(fp: list) -> int:
         if side is None:
             i += 1
             continue
-        pads = _pads(fp, side)
+        pads = (_pads(fp, side) if own else []) + list((extra or {}).get(side, ()))
+        if not pads:
+            i += 1
+            continue
         grow = PAD_MARGIN + _stroke(node) / 2
         if sexpr.head(node) == "fp_line":
             pieces = _trim_line(node, pads, grow)
@@ -292,6 +300,76 @@ def clip_to_copper(fp: list) -> int:
             changed += 1
             continue
         i += 1
+    return changed
+
+
+def _placed_at(fp: list) -> tuple[float, float, float]:
+    at = sexpr.find(fp, "at")
+    return (_num(at, 1), _num(at, 2), _num(at, 3)) if at is not None else (0.0, 0.0, 0.0)
+
+
+def _board_pads(fp: list, side: str) -> list[tuple[list[tuple[float, float]], float]]:
+    """A placed footprint's pads on ``side``, in board coordinates.
+
+    Not _pads moved by the footprint's position: once placed, a pad's angle in
+    the file is absolute, the footprint's own turn already added (pcb.py's
+    _orient_footprint), and only its position is in the footprint's frame.
+    """
+    fx, fy, frot = _placed_at(fp)
+    out = []
+    for pad in sexpr.find_all(fp, "pad"):
+        if not any(l in (f"{side}.Cu", "*.Cu") for l in _layer_names(pad)):
+            continue
+        at, size = sexpr.find(pad, "at"), sexpr.find(pad, "size")
+        if at is None or size is None:
+            continue
+        cx, cy = _rotate(_num(at, 1), _num(at, 2), frot)
+        cx, cy, ang = cx + fx, cy + fy, _num(at, 3)
+        hw, hh = _num(size, 1) / 2, _num(size, 2) / 2
+        for pts, half in [([(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)], 0.0), *_primitives(pad)]:
+            out.append(([(cx + rx, cy + ry) for rx, ry in (_rotate(x, y, ang) for x, y in pts)], half))
+    return out
+
+
+def clip_to_neighbours(footprints: list[list]) -> int:
+    """Trim each placed footprint's silk off every other footprint's pads.
+
+    clip_to_copper runs as each part is emitted and sees only that part's own
+    pads, so an outline reaching over a neighbour stayed printed on its
+    copper: on verdacor, U1's outline (the XIAO's USB end) across C1's and
+    C2's pads, seven silk_over_copper warnings. Run once all parts are
+    placed: each one's neighbours' pads, on the same side, are brought into
+    its frame and its silk is trimmed against them the same way.
+    """
+    sides = ("F", "B")
+    board = {id(fp): {s: _board_pads(fp, s) for s in sides} for fp in footprints}
+    changed = 0
+    for fp in footprints:
+        fx, fy, frot = _placed_at(fp)
+        silk = [n for n in fp if isinstance(n, list) and sexpr.head(n) in _GRAPHICS and _silk_side(n)]
+        if not silk:
+            continue
+        pts = [p for n in silk
+               for p in ([q for q in (_xy(n, "start"), _xy(n, "end")) if q]
+                         if sexpr.head(n) == "fp_line" else _shape_points(n))]
+        if not pts:
+            continue
+        # Only pads near this part's silk: the outline's box in board
+        # coordinates, with a margin, so a 50-part board is not 50 x 50.
+        board_pts = [(fx + bx, fy + by) for bx, by in (_rotate(x, y, frot) for x, y in pts)]
+        x0 = min(p[0] for p in board_pts) - 2.0
+        x1 = max(p[0] for p in board_pts) + 2.0
+        y0 = min(p[1] for p in board_pts) - 2.0
+        y1 = max(p[1] for p in board_pts) + 2.0
+        extra: dict[str, list] = {}
+        for side in sides:
+            near = [(poly, half) for other in footprints if other is not fp
+                    for poly, half in board[id(other)][side]
+                    if any(x0 <= x <= x1 and y0 <= y <= y1 for x, y in poly)]
+            if near:
+                extra[side] = [([_rotate(x - fx, y - fy, -frot) for x, y in poly], half) for poly, half in near]
+        if extra:
+            changed += clip_to_copper(fp, extra=extra, own=False)
     return changed
 
 

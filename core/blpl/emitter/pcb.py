@@ -1232,6 +1232,12 @@ def _build(
         fp_node.extend(_anchored_keepouts(hdm, refdes))
         node.append(fp_node)
 
+    # Each part's silk was trimmed off its own pads as it was emitted; only
+    # now are its neighbours placed, and an outline reaching across one of
+    # them is trimmed off that too (silk.clip_to_neighbours).
+    if ((hdm.get("silkscreen") or {}) if isinstance(hdm.get("silkscreen"), dict) else {}).get("clip_to_copper"):
+        silk.clip_to_neighbours([n for n in node if isinstance(n, list) and sexpr.head(n) == "footprint"])
+
     placeholders = sorted(r for r, c in components.items() if c.get("needs_manual_footprint"))
     if placeholders:
         node.append(_placeholder_banner(placeholders, width, height))

@@ -117,3 +117,25 @@ def test_the_schema_takes_the_policy():
         "references": "hidden", "labels": {"BT_POS": "+"}, "label_size": 0.8, "clip_to_copper": True}})
     with pytest.raises(Exception):
         schema.validate("project_config", {**base, "silkscreen": {"label_size": 0.5}})
+
+
+def test_an_outline_is_trimmed_off_a_neighbours_pads_once_both_are_placed():
+    """clip_to_copper saw only a part's own pads, so U1's outline on the ear
+    tag stayed printed across C1's and C2's: seven silk_over_copper warnings."""
+    # A sits at (10, 10) turned 90; its local (x, 2) is board (12, 10 - x)...
+    a = sexpr.parse('''(footprint "A" (layer "F.Cu") (at 10 10 90)
+      (fp_line (start -3 2) (end 3 2) (stroke (width 0.12) (type solid)) (layer "F.SilkS") (uuid "a1"))
+      (fp_line (start -3 -2) (end 3 -2) (stroke (width 0.12) (type solid)) (layer "F.SilkS") (uuid "a2")))''')
+    # ...so B's pad at board (12, 10) lies on A's first line, and only there.
+    b = sexpr.parse('''(footprint "B" (layer "F.Cu") (at 12 10)
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask")))''')
+    # A pad on the back does not trim front silk.
+    c = sexpr.parse('''(footprint "C" (layer "B.Cu") (at 8 10)
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "B.Cu" "B.Mask")))''')
+    assert silk.clip_to_neighbours([a, b, c]) == 1
+    lines = [(float(sexpr.find(n, "start")[1]), float(sexpr.find(n, "end")[1]), float(sexpr.find(n, "start")[2]))
+             for n in sexpr.find_all(a, "fp_line")]
+    on_b = sorted(l[:2] for l in lines if l[2] == 2)
+    assert len(on_b) == 2 and on_b[0][0] == -3 and on_b[1][1] == 3
+    assert all(abs(x) > 0.5 + silk.PAD_MARGIN for span in on_b for x in span if abs(x) < 3)
+    assert (-3.0, 3.0, -2.0) in lines

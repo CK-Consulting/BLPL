@@ -653,6 +653,50 @@ def _snap_terminals(python: str, pcb: Path, clearance_mm: float = 0.0) -> subpro
     ))
 
 
+#: The longest dangling track removed after routing. Longer, it is a partial
+#: route worth keeping for whoever finishes the board by hand.
+_STUB_MAX_MM = 1.0
+
+
+def _trim_dangling(python: str, pcb: Path) -> subprocess.CompletedProcess:
+    """Remove the short track stubs the router leaves connected at one end only.
+
+    KRT leaves a few: on verdacor 0.02 to 0.26 mm of GND, VDD_3V3 and
+    VBAT_PROT ending in nothing, each a track_dangling warning in DRC and none
+    carrying anything. Judged after the zones are filled, with KiCad's own
+    test, because a stub into a pour is what connects its pad to the plane,
+    and before the fill it looks dangling too. Removed until none is left
+    (taking one can leave the next dangling), then the zones refilled around
+    the copper that remains. Prints how many it removed.
+    """
+    from . import autoroute
+
+    return autoroute._pcbnew(python, (
+        "import pcbnew\n"
+        f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
+        f"limit = pcbnew.FromMM({_STUB_MAX_MM})\n"
+        "def fill():\n"
+        "    zones = b.Zones()\n"
+        "    if len(zones):\n"
+        "        pcbnew.ZONE_FILLER(b).Fill(zones)\n"
+        "    b.BuildConnectivity()\n"
+        "fill()\n"
+        "removed = 0\n"
+        "while True:\n"
+        "    conn = b.GetConnectivity()\n"
+        "    stubs = [t for t in b.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T\n"
+        "             and t.GetLength() <= limit and conn.TestTrackEndpointDangling(t, False)]\n"
+        "    if not stubs:\n"
+        "        break\n"
+        "    for t in stubs:\n"
+        "        b.Remove(t)\n"
+        "    removed += len(stubs)\n"
+        "    fill()\n"
+        f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
+        "print(removed)\n"
+    ))
+
+
 def _fill(python: str, pcb: Path) -> subprocess.CompletedProcess:
     from . import autoroute
 
@@ -760,6 +804,14 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     if filled.returncode != 0:
         result.reason = f"pcbnew could not fill the zones: {autoroute._msg(filled)}"
         return result
+    trimmed = _trim_dangling(python, pcb)
+    restore_pro()
+    if trimmed.returncode != 0:
+        result.reason = f"pcbnew could not remove dangling track stubs: {autoroute._msg(trimmed)}"
+        return result
+    stubs = ((trimmed.stdout or "").strip().splitlines() or ["0"])[-1]
+    if stubs.isdigit() and int(stubs):
+        result.extra["stubs_removed"] = int(stubs)
     measured = autoroute._measure_board(python, pcb)
     if measured is None:
         result.reason = "the routed board could not be measured"

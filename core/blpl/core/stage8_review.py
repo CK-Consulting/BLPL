@@ -620,6 +620,13 @@ def _board_geometry_check(hdm: dict) -> tuple[list[dict], list[dict]]:
                 if f.get("kind") == "cutout"
                 or {"footprints", "pads"} & set(f.get("forbid") or [])]
 
+    comps = hdm.get("components") or {}
+
+    def side_of(ref: str) -> str:
+        c = comps.get(ref)
+        placed = c.get("placement") if isinstance(c, dict) else None
+        return str((placed or {}).get("side") or "top") if isinstance(placed, dict) else "top"
+
     off: dict[bool, list[str]] = {True: [], False: []}
     inside: dict[bool, list[str]] = {True: [], False: []}
     for ref, box in sorted(boxes.items()):
@@ -628,7 +635,10 @@ def _board_geometry_check(hdm: dict) -> tuple[list[dict], list[dict]]:
         if not board_geometry.box_inside(box, outline):
             off[by_hint].append(ref)
         elif any(board_geometry.box_overlaps(box, [tuple(p) for p in f["polygon"]])
-                 for f in blockers if f.get("anchor") != ref):
+                 for f in blockers if f.get("anchor") != ref
+                 # A keepout only on F.Cu says nothing about a part on the back,
+                 # as the placer's own audit already judges it.
+                 and board_geometry.blocks_side(f.get("kind", ""), f.get("layers") or (), side_of(ref))):
             # A part's own anchored shapes are exempt: a keepout under a
             # module's antenna or a slot through its courtyard overlaps the
             # module on purpose, and the placer allows exactly that.

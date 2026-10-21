@@ -69,3 +69,14 @@ def test_the_board_rules_drc_applies_are_written_out_for_the_router():
     assert rules["min_copper_edge_clearance"] == 0.5
     assert rules["min_hole_clearance"] == 0.25
     assert rules["min_hole_to_hole"] == 0.25
+
+
+def test_clipping_silk_turns_off_the_library_mismatch_check_and_only_that():
+    """Every footprint clip_to_copper trims differs from its library copy by
+    design: 28 lib_footprint_mismatch warnings on verdacor said only that."""
+    from blpl.emitter import pro
+
+    clipped = pro.build({"silkscreen": {"clip_to_copper": True}}, project_filename="x.kicad_pro")
+    assert clipped["board"]["design_settings"]["rule_severities"] == {"lib_footprint_mismatch": "ignore"}
+    plain = pro.build({}, project_filename="x.kicad_pro")
+    assert "rule_severities" not in plain["board"]["design_settings"]
