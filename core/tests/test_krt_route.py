@@ -657,16 +657,20 @@ def test_the_npth_ring_is_drawn_by_the_band_script(tmp_path, monkeypatch):
 def test_a_track_ending_in_a_chamfered_corner_is_joined_to_its_pad(tmp_path):
     """KRT ends a track on a pad's bounding rectangle; on verdacor's U1 pad 23,
     a chamfered castellation, it ended in the cut-away corner and the net
-    stayed open. A track ending on the pad's copper is left alone."""
+    stayed open. A track ending on the pad's copper is left alone, and so is
+    one whose stub would pass another net or that ends too far off the copper
+    to be a near miss (Codex, PR #69)."""
     import pcbnew
 
     board = pcbnew.BOARD()
-    net = pcbnew.NETINFO_ITEM(board, "SIG")
+    net = pcbnew.NETINFO_ITEM(board, "SIG", 1)
     board.Add(net)
+    other = pcbnew.NETINFO_ITEM(board, "OTHER", 2)
+    board.Add(other)
     fp = pcbnew.FOOTPRINT(board)
     board.Add(fp)
     mm = pcbnew.FromMM
-    for number, x in (("1", 10.0), ("2", 20.0)):
+    for number, x in (("1", 10.0), ("2", 20.0), ("3", 30.0), ("4", 40.0)):
         pad = pcbnew.PAD(fp)
         pad.SetNumber(number)
         pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
@@ -679,28 +683,46 @@ def test_a_track_ending_in_a_chamfered_corner_is_joined_to_its_pad(tmp_path):
         pad.SetNet(net)
         fp.Add(pad)
 
-    def track(a, b):
+    def track(a, b, n=net):
         t = pcbnew.PCB_TRACK(board)
         t.SetStart(pcbnew.VECTOR2I(mm(a[0]), mm(a[1])))
         t.SetEnd(pcbnew.VECTOR2I(mm(b[0]), mm(b[1])))
         t.SetWidth(mm(0.2))
         t.SetLayer(pcbnew.F_Cu)
-        t.SetNet(net)
         board.Add(t)
+        t.SetNet(n)
 
     # Into pad 1's cut-away bottom-left corner: inside its box, off its copper.
     track((5.0, 12.0), (9.445, 10.35))
     # Onto pad 2's copper, near its centre.
     track((25.0, 12.0), (20.1, 10.0))
+    # The same near miss on pad 3, with another net 0.18 mm from the stub.
+    track((25.0, 13.0), (29.445, 10.35))
+    track((29.1, 10.2), (29.1, 8.0), other)
+    # Into pad 4's very corner: 0.2 mm off its copper, beyond a near miss.
+    track((35.0, 12.0), (39.384, 10.475))
     pcb = tmp_path / "b.kicad_pcb"
     pcbnew.SaveBoard(str(pcb), board)
+    # pcbnew saves every track of a board built from Python under its first
+    # net, whatever the track carries in memory, so the blocker is put on its
+    # own net in the file.
+    from blpl.emitter import sexpr
 
-    proc = krt_route._snap_terminals(sys.executable, pcb)
+    tree = sexpr.parse(pcb.read_text())
+    for seg in sexpr.find_all(tree, "segment"):
+        name = "OTHER" if sexpr.find(seg, "start")[1:] == ["29.1", "10.2"] else "SIG"
+        at = next(i for i, n in enumerate(seg) if isinstance(n, list) and n and n[0] == "net")
+        seg[at] = ["net", sexpr.quote(name)]
+    pcb.write_text(sexpr.dump_top(tree))
+    nets = sorted(t.GetNetname() for t in pcbnew.LoadBoard(str(pcb)).GetTracks())
+    assert nets == ["OTHER"] + ["SIG"] * 4
+
+    proc = krt_route._snap_terminals(sys.executable, pcb, 0.2)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip().splitlines()[-1] == "1"
     after = pcbnew.LoadBoard(str(pcb))
     tracks = [t for t in after.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T]
-    assert len(tracks) == 3
+    assert len(tracks) == 6
 
     def ends(t):
         return {(round(pcbnew.ToMM(p.x), 3), round(pcbnew.ToMM(p.y), 3)) for p in (t.GetStart(), t.GetEnd())}

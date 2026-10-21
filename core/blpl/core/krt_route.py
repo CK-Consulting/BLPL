@@ -560,16 +560,28 @@ def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool,
     ))
 
 
-def _snap_terminals(python: str, pcb: Path) -> subprocess.CompletedProcess:
+#: How far off a pad's copper a track end may be and still be joined to it: a
+#: near miss on a chamfer, not a track that merely ends inside the pad's box.
+_SNAP_REACH_MM = 0.15
+
+
+def _snap_terminals(python: str, pcb: Path, clearance_mm: float = 0.0) -> subprocess.CompletedProcess:
     """Join a track end the router left inside a pad's box but off its copper.
 
     KRT lands a track on a pad's bounding rectangle. On a chamfered or rounded
     pad, the XIAO's castellations among them, the corner it picks can be the
     one the chamfer cut away: on verdacor's U1 pad 23 GNSS_RXD ended 0.06 mm
     off the copper and the net stayed open on every run, as did others on
-    the same pads. A dangling end of the pad's own net, inside its box and
-    not touching it, gets a stub to the pad's centre, which lies on copper of
-    the same net. Prints how many it joined.
+    the same pads. A dangling end of the pad's own net that misses its copper
+    by no more than ``_SNAP_REACH_MM`` gets a stub to the pad's centre, which
+    lies on copper of the same net. The box alone is not enough: a rotated or
+    concave pad's box holds space well away from its copper, where another
+    net may run (Codex, PR #69). So the whole stub is checked against every
+    other net's pads and tracks at the track's own clearance, and against any
+    keepout that forbids tracks, and an end it would not clear is left open.
+    ``clearance_mm`` is the project's floor, passed in rather than trusted to
+    pcbnew, which reads 0 for a board loaded without its project file.
+    Prints how many it joined.
     """
     from . import autoroute
 
@@ -578,6 +590,22 @@ def _snap_terminals(python: str, pcb: Path) -> subprocess.CompletedProcess:
         f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
         "tracks = [t for t in b.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T]\n"
         "vias = {(v.GetPosition().x, v.GetPosition().y) for v in b.GetTracks() if v.Type() == pcbnew.PCB_VIA_T}\n"
+        "others = [t for t in b.GetTracks() if t.Type() in (pcbnew.PCB_TRACE_T, pcbnew.PCB_VIA_T, pcbnew.PCB_ARC_T)]\n"
+        "pads = [p for fp in b.GetFootprints() for p in fp.Pads()]\n"
+        "areas = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowTracks()]\n"
+        f"reach = pcbnew.FromMM({_SNAP_REACH_MM})\n"
+        f"floor = pcbnew.FromMM({float(clearance_mm)!r})\n"
+        "def clear(stub, layer, net, gap):\n"
+        "    for o in others:\n"
+        "        if o.GetNetCode() != net and o.IsOnLayer(layer) and o.GetEffectiveShape(layer).Collide(stub, gap):\n"
+        "            return False\n"
+        "    for o in pads:\n"
+        "        if o.GetNetCode() != net and o.IsOnLayer(layer) and o.GetEffectiveShape(layer).Collide(stub, gap):\n"
+        "            return False\n"
+        "    for z in areas:\n"
+        "        if z.IsOnLayer(layer) and z.Outline().Collide(stub, 0):\n"
+        "            return False\n"
+        "    return True\n"
         "ends = {}\n"
         "for t in tracks:\n"
         "    for p in (t.GetStart(), t.GetEnd()):\n"
@@ -604,7 +632,11 @@ def _snap_terminals(python: str, pcb: Path) -> subprocess.CompletedProcess:
         "                    if not (box.GetLeft() - half <= p.x <= box.GetRight() + half\n"
         "                            and box.GetTop() - half <= p.y <= box.GetBottom() + half):\n"
         "                        continue\n"
-        "                    if poly.Collide(pcbnew.VECTOR2I(p.x, p.y), half):\n"
+        "                    at = pcbnew.VECTOR2I(p.x, p.y)\n"
+        "                    if poly.Collide(at, half) or not poly.Collide(at, half + reach):\n"
+        "                        continue\n"
+        "                    gap = max(floor, b.GetDesignSettings().m_MinClearance, t.GetOwnClearance(layer))\n"
+        "                    if not clear(pcbnew.SHAPE_SEGMENT(at, pad.GetPosition(), t.GetWidth()), layer, net, gap):\n"
         "                        continue\n"
         "                    stub = pcbnew.PCB_TRACK(b)\n"
         "                    stub.SetStart(pcbnew.VECTOR2I(p.x, p.y))\n"
@@ -613,6 +645,7 @@ def _snap_terminals(python: str, pcb: Path) -> subprocess.CompletedProcess:
         "                    stub.SetLayer(layer)\n"
         "                    stub.SetNetCode(net)\n"
         "                    b.Add(stub)\n"
+        "                    others.append(stub)\n"
         "                    ends[(layer, p.x, p.y)] = 2\n"
         "                    joined += 1\n"
         f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
@@ -710,7 +743,9 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     if unbanded.returncode != 0:
         result.reason = f"pcbnew could not remove the edge band: {autoroute._msg(unbanded)}"
         return result
-    snapped = _snap_terminals(python, pcb)
+    floor = max([v for v in (rules.get("min_clearance"), classes.get("Default", {}).get("clearance"))
+                 if isinstance(v, (int, float))] or [0.0])
+    snapped = _snap_terminals(python, pcb, floor)
     restore_pro()
     if snapped.returncode != 0:
         result.reason = f"pcbnew could not join track ends to their pads: {autoroute._msg(snapped)}"
