@@ -143,13 +143,14 @@ class Feature:
 
         KiCad applies a rule area's footprint rule to footprints on one of its
         layers, and a footprint is on F.Cu or B.Cu, so an F.Cu-only keepout says
-        nothing about a part on the back. A cutout, a keepout with no layers
-        and a ``*.Cu`` one block both sides.
+        nothing about a part on the back. A cutout, a keepout with no layers,
+        and a ``*.Cu`` or ``F&B.Cu`` one (the two outer layers) block both
+        sides.
         """
         if self.kind == "cutout" or not self.layers:
             return True
         prefix = "B." if side == "bottom" else "F."
-        return any(layer.startswith(("*", prefix)) for layer in self.layers)
+        return any(layer.startswith(("*", "F&B.", prefix)) for layer in self.layers)
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {

@@ -123,6 +123,8 @@ def test_a_part_on_the_back_is_judged_by_the_back_sides_rules():
              "layers": ["F.Cu"], "forbid": ["footprints"]},
             {"name": "both", "shape": "rect", "center": [30, 15], "size": [8, 8],
              "layers": ["*.Cu"], "forbid": ["footprints"]},
+            {"name": "outer pair", "shape": "rect", "center": [30, 25], "size": [6, 6],
+             "layers": ["F&B.Cu"], "forbid": ["footprints"]},
         ]},
     })
     result = _result({
@@ -130,11 +132,13 @@ def test_a_part_on_the_back_is_judged_by_the_back_sides_rules():
         "J2": (30, 15, 2, 2),   # under the both-sides keepout, on the back
         "R1": (20, 5, 2, 2),    # on the front
         "J3": (20, 5, 2, 2),    # directly under R1, on the back
+        "J4": (30, 25, 2, 2),   # under the F&B.Cu keepout, on the back
+        "R2": (31, 24, 1, 1),   # under the same keepout, on the front
     })
-    for ref in ("J1", "J2", "J3"):
+    for ref in ("J1", "J2", "J3", "J4"):
         result.placements[ref].side = "bottom"
     found = {(f["ref"], f["problem"]) for f in placement.audit(result, board, {}, 1.0)}
-    assert found == {("J2", "in_keepout")}
+    assert found == {("J2", "in_keepout"), ("J4", "in_keepout"), ("R2", "in_keepout")}
 
     result.placements["J1"].side = "top"
     found = {(f["ref"], f["problem"]) for f in placement.audit(result, board, {}, 1.0)}
