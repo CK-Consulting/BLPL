@@ -1359,12 +1359,16 @@ async def _extract_module(ctx: ToolContext, args: dict) -> str:
     dest_root = ctx.project_dir
     ctx.sandbox.check_write(dest_root / "modules")
     symbol_roots = [p for p, _ in search_path(ctx.project_dir, _DEFAULT_SYMBOLS)]
+    # The source board's own fp-lib-table is searched first (write_module does
+    # that); these are the fallbacks. Stock alone missed every project and
+    # vendor footprint, which are the ones a module most needs to carry.
+    footprint_roots = [ctx.project_dir / "libraries" / "footprints", _DEFAULT_FOOTPRINTS]
     path, notes = await _to_thread(
         write_module,
         spec,
         dest_root,
         symbol_roots=symbol_roots,
-        footprint_root=_DEFAULT_FOOTPRINTS,
+        footprint_roots=footprint_roots,
         overwrite=bool(args.get("overwrite")),
     )
     ctx.note(f"wrote module {name}")

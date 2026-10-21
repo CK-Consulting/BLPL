@@ -279,3 +279,239 @@ def test_a_design_with_no_modules_section_is_completely_unaffected(tmp_path) -> 
     artifact = stage0_deterministic.extract([project / "design.md"])
     assert "modules" not in artifact
     assert [c["local_id"] for c in artifact["components"]] == ["U1"]
+
+
+# -- the gaps the first trial extraction found --------------------------------
+
+
+def test_a_module_records_every_parts_pins_on_its_nets(board_dir) -> None:
+    """The wiring a carrier needs. Without it a module arrived as loose parts."""
+    spec = plan_module(read_project(board_dir), ["U1", "C1"], name="charger")
+    bom = {row["refdes"]: row for row in spec.bom}
+    assert bom["U1"]["pins"] == {"1": "VBAT", "2": "SDA", "3": "CHG_INT"}
+    assert bom["C1"]["pins"] == {"1": "VBAT", "2": "CHG_INT"}
+
+
+def test_a_pad_kicad_calls_unconnected_is_nc_not_a_private_net(tmp_path) -> None:
+    d = tmp_path / "b"
+    d.mkdir()
+    (d / "b.kicad_pcb").write_text(
+        '(kicad_pcb (footprint "X:Y" (property "Reference" "U1")'
+        ' (pad "1" smd rect (net 1 "VDD")) (pad "2" smd rect (net 2 "unconnected-(U1-NC-Pad2)")))'
+        ' (footprint "X:Z" (property "Reference" "U2") (pad "1" smd rect (net 1 "VDD"))))',
+        encoding="utf-8",
+    )
+    spec = plan_module(read_project(d), ["U1"], name="m")
+    assert spec.bom[0]["pins"] == {"1": "VDD", "2": "NC"}
+    assert spec.internal_nets == [] and [p.name for p in spec.ports] == ["VDD"]
+
+
+def _carrier_with(module_project_board: Path, tmp_path: Path, refs: list[str], md_extra: str = "") -> dict:
+    project = tmp_path / "carrier"
+    project.mkdir()
+    write_module(plan_module(read_project(module_project_board), refs, name="chg"), project)
+    (project / "design.md").write_text(
+        "# Carrier\n\n## Modules\n\n- chg\n\n" + md_extra, encoding="utf-8"
+    )
+    return stage0_deterministic.extract([project / "design.md"])
+
+
+def test_naming_a_module_brings_its_wiring_ports_by_name_internals_prefixed(board_dir, tmp_path) -> None:
+    artifact = _carrier_with(
+        board_dir, tmp_path, ["U1", "C1"],
+        "## BOM\n\n| Ref | Description |\n| --- | --- |\n| R1 | pull-up |\n\n"
+        "## Connections\n\n| Ref | Pin 1 | Pin 2 |\n| --- | --- | --- |\n| R1 | SDA | VBAT |\n",
+    )
+    from blpl.core import schema
+
+    schema.validate("design_artifact", artifact)
+    pins = {c["local_id"]: {p["pin"]: p["signal"] for p in c["pins"]} for c in artifact["connectors"]}
+    # Ports keep their names, which is how the carrier's R1 joins them.
+    assert pins["chg.U1"] == {"1": "VBAT", "2": "SDA", "3": "chg.CHG_INT"}
+    assert pins["chg.C1"] == {"1": "VBAT", "2": "chg.CHG_INT"}
+    assert pins["R1"] == {"1": "SDA", "2": "VBAT"}
+
+
+def test_two_modules_internal_nets_never_merge(board_dir, tmp_path) -> None:
+    board = read_project(board_dir)
+    project = tmp_path / "carrier"
+    project.mkdir()
+    for name in ("a", "b"):
+        write_module(plan_module(board, ["U1", "C1"], name=name), project)
+    (project / "design.md").write_text("# C\n\n## Modules\n\n- a\n- b\n", encoding="utf-8")
+    artifact = stage0_deterministic.extract([project / "design.md"])
+    signals = {p["signal"] for c in artifact["connectors"] for p in c["pins"]}
+    assert {"a.CHG_INT", "b.CHG_INT", "VBAT", "SDA"} <= signals
+
+
+def test_kicads_generated_net_names_stay_distinct_through_stage4(board_dir, tmp_path) -> None:
+    """``Net-(U1-A)`` and ``Net-(U1-B)`` both normalised to ``m.Net-`` in
+    Stage 4, which drops a trailing parenthesis, and merged into one net."""
+    from blpl.core import stage4_synthesize_nets as s4
+
+    project = tmp_path / "carrier"
+    project.mkdir()
+    path, _ = write_module(plan_module(read_project(board_dir), ["U1", "C1"], name="m"), project)
+    rows = json.loads((path / "bom.json").read_text())
+    nets = {"U1": {"1": "Net-(U1-A)", "2": "Net-(U1-B)", "3": "Net-U1-A"},
+            "C1": {"1": "Net-(U1-A)", "2": "Net-(U1-B)"}}
+    for row in rows:
+        row["pins"] = nets[row["refdes"]]
+    (path / "bom.json").write_text(json.dumps(rows))
+    (project / "design.md").write_text("# C\n\n## Modules\n\n- m\n", encoding="utf-8")
+    artifact = stage0_deterministic.extract([project / "design.md"])
+    pins = {c["local_id"]: {p["pin"]: p["signal"] for p in c["pins"]} for c in artifact["connectors"]}
+    after = {pin: s4._normalize_signal(sig) for pin, sig in pins["m.U1"].items()}
+    assert len(set(after.values())) == 3, after
+    # The same source net is still one net across parts.
+    assert pins["m.C1"] == {"1": pins["m.U1"]["1"], "2": pins["m.U1"]["2"]}
+
+
+def test_a_private_net_keeps_the_class_its_source_name_earns(board_dir, tmp_path) -> None:
+    """Stage 4's class rules are anchored at the start of a name, so m.VDD lost
+    Power_Bulk and m.USB_D+ its diff-pair class once the module prefixed them."""
+    from blpl.core import stage4_synthesize_nets as s4
+
+    project = tmp_path / "carrier"
+    project.mkdir()
+    path, _ = write_module(plan_module(read_project(board_dir), ["U1", "C1"], name="m"), project)
+    rows = json.loads((path / "bom.json").read_text())
+    nets = {"U1": {"1": "VDD", "2": "USB_D+", "3": "USB_D-"}, "C1": {"1": "VDD", "2": "RF_IN"}}
+    for row in rows:
+        row["pins"] = nets[row["refdes"]]
+    (path / "bom.json").write_text(json.dumps(rows))
+    (project / "design.md").write_text("# C\n\n## Modules\n\n- m\n", encoding="utf-8")
+    artifact = stage0_deterministic.extract([project / "design.md"])
+    classes = {n["name"]: n["class"] for n in s4.synthesize(artifact)["nets"]}
+    for raw in ("VDD", "USB_D+", "USB_D-", "RF_IN"):
+        assert f"m.{raw}" in classes, classes
+        assert classes[f"m.{raw}"] == s4._assign_class(raw) != "Default", raw
+
+
+def test_library_tables_are_read_beside_the_project_file_not_the_search_root(tmp_path) -> None:
+    """A published board lives in kicad/, with its tables beside it."""
+    root = tmp_path / "published"
+    (root / "kicad").mkdir(parents=True)
+    (root / "kicad" / "ear.kicad_pro").write_text("{}", encoding="utf-8")
+    (root / "kicad" / "ear.kicad_pcb").write_text(_PCB, encoding="utf-8")
+    board = read_project(root)
+    assert board.name == "ear"
+    assert board.source_dir == root / "kicad"
+
+
+def test_a_module_extracted_before_pins_were_recorded_says_its_parts_are_unwired(board_dir, tmp_path) -> None:
+    project = tmp_path / "carrier"
+    project.mkdir()
+    path, _ = write_module(plan_module(read_project(board_dir), ["U1"], name="old"), project)
+    rows = json.loads((path / "bom.json").read_text())
+    for row in rows:
+        row.pop("pins", None)
+    (path / "bom.json").write_text(json.dumps(rows))
+    (project / "design.md").write_text("# C\n\n## Modules\n\n- old\n", encoding="utf-8")
+    artifact = stage0_deterministic.extract([project / "design.md"])
+    assert any(w["code"] == "STAGE0-009" and "U1" in w["summary"] for w in artifact["warnings"])
+    assert not artifact["connectors"]
+
+
+def test_a_symbol_nickname_is_read_from_the_file_its_table_entry_names(board_dir, tmp_path) -> None:
+    """``Alias`` mapped to ``actual.kicad_sym`` was dropped, because the file
+    was not named after the nickname, and a sibling ``Alias.kicad_sym`` won."""
+    libs = board_dir / "libs"
+    libs.mkdir()
+    (libs / "actual.kicad_sym").write_text(
+        '(kicad_symbol_lib (symbol "Part" (property "Value" "right")))', encoding="utf-8")
+    (libs / "Alias.kicad_sym").write_text(
+        '(kicad_symbol_lib (symbol "Part" (property "Value" "shadow")))', encoding="utf-8")
+    (board_dir / "sym-lib-table").write_text(
+        '(sym_lib_table (version 7) (lib (name "Alias") (type "KiCad")'
+        ' (uri "${KIPRJMOD}/libs/actual.kicad_sym") (options "") (descr "")))',
+        encoding="utf-8",
+    )
+    spec = plan_module(read_project(board_dir), ["U1"], name="m")
+    for row in spec.bom:
+        row["symbol"] = "Alias:Part"
+    project = tmp_path / "p"
+    project.mkdir()
+    path, notes = write_module(spec, project, symbol_roots=[libs])
+    text = (path / "Alias.kicad_sym").read_text()
+    assert '"right"' in text and '"shadow"' not in text
+    assert not any("Alias:Part" in n for n in notes)
+
+
+def test_footprints_come_from_the_boards_own_library_table(board_dir, tmp_path) -> None:
+    """The stock root alone missed every project and vendor footprint: on the
+    ear tag, the battery contacts, the backup cap, the GNSS and LoRa modules."""
+    libs = board_dir / "libs" / "Package_QFN.pretty"
+    libs.mkdir(parents=True)
+    (libs / "QFN-28.kicad_mod").write_text('(footprint "QFN-28")', encoding="utf-8")
+    (board_dir / "fp-lib-table").write_text(
+        '(fp_lib_table (version 7) (lib (name "Package_QFN") (type "KiCad")'
+        ' (uri "${KIPRJMOD}/libs/Package_QFN.pretty") (options "") (descr "")))',
+        encoding="utf-8",
+    )
+    project = tmp_path / "p"
+    project.mkdir()
+    path, notes = write_module(plan_module(read_project(board_dir), ["U1"], name="m"), project)
+    assert (path / "Package_QFN.pretty" / "QFN-28.kicad_mod").is_file()
+    assert not any("QFN-28" in n for n in notes)
+
+
+def test_footprint_roots_are_searched_in_order(board_dir, tmp_path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    for root, body in ((first, "first"), (second, "second")):
+        (root / "Package_QFN.pretty").mkdir(parents=True)
+        (root / "Package_QFN.pretty" / "QFN-28.kicad_mod").write_text(body, encoding="utf-8")
+    project = tmp_path / "p"
+    project.mkdir()
+    path, _ = write_module(plan_module(read_project(board_dir), ["U1"], name="m"), project,
+                           footprint_roots=[first, second])
+    assert (path / "Package_QFN.pretty" / "QFN-28.kicad_mod").read_text() == "first"
+
+
+def test_hidden_directories_are_not_part_of_the_design(board_dir) -> None:
+    """A BLPL project keeps every earlier emit under .pipeline/; reading those
+    merged past revisions of the board into one."""
+    old = board_dir / ".pipeline"
+    old.mkdir()
+    (old / "old.kicad_pcb").write_text(
+        '(kicad_pcb (footprint "X:Y" (property "Reference" "U9") (pad "1" smd rect (net 1 "OLD"))))',
+        encoding="utf-8",
+    )
+    board = read_project(board_dir)
+    assert "U9" not in board.components and "OLD" not in board.nets
+
+
+def test_a_board_is_named_after_its_project_file(tmp_path) -> None:
+    d = tmp_path / "kicad"
+    d.mkdir()
+    (d / "ear-tag.kicad_pro").write_text("{}", encoding="utf-8")
+    (d / "ear-tag.kicad_pcb").write_text(_PCB, encoding="utf-8")
+    assert read_project(d).name == "ear-tag"
+
+
+def _git(cwd: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
+def test_provenance_records_the_commit_and_whether_the_tree_was_clean(board_dir) -> None:
+    _git(board_dir, "init", "-q")
+    _git(board_dir, "add", ".")
+    _git(board_dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x")
+    sha = _git(board_dir, "rev-parse", "HEAD")
+
+    clean = plan_module(read_project(board_dir), ["U1"], name="m").to_manifest()["provenance"]
+    assert clean["source_sha"] == sha and clean["source_dirty"] is False
+
+    (board_dir / "dev.03.kicad_pcb").write_text(_PCB + "\n", encoding="utf-8")
+    spec = plan_module(read_project(board_dir), ["U1"], name="m")
+    assert spec.to_manifest()["provenance"]["source_dirty"] is True
+    assert any("uncommitted" in w for w in spec.warnings)
+
+
+def test_a_board_outside_git_says_no_commit_was_recorded(board_dir) -> None:
+    spec = plan_module(read_project(board_dir), ["U1"], name="m")
+    assert spec.source_sha == "" and "source_dirty" not in spec.to_manifest()["provenance"]
+    assert any("not in a git repository" in w for w in spec.warnings)

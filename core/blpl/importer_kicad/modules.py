@@ -15,7 +15,8 @@ review in a diff, and commit:
                            boundary, which is what makes it composable
       <SourceLib>.kicad_sym    every symbol the block uses, copied in
       <SourceLib>.pretty/      every footprint, copied in
-      bom.json             the parts, with MPNs where the source knew them
+      bom.json             the parts, with MPNs where the source knew them,
+                           and each part's pins on the module's nets
 
 The libraries keep the names they had on the source board rather than being
 merged into one. That is what lets the module directory serve directly as a
@@ -51,6 +52,12 @@ MODULES_DIRNAME = "modules"
 # block would otherwise declare GND as its defining interface.
 _UBIQUITOUS = {"GND", "AGND", "DGND", "PGND", "VSS", "EARTH"}
 
+# What KiCad names the net of a pad nothing connects to. Such a pad is open,
+# not a one-member net, and goes into the module as NC: carried over as a net
+# it became an internal net named after one pad of the source board.
+_UNCONNECTED_PREFIX = "unconnected-"
+NC = "NC"
+
 
 @dataclass
 class Port:
@@ -83,16 +90,30 @@ class ModuleSpec:
     internal_nets: list[str] = field(default_factory=list)
     bom: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # refdes -> pad -> net, for every part inside. The wiring a carrier needs:
+    # a module that brought only its parts arrived as loose components.
+    pins: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Whether the source's tree had uncommitted changes when this was cut.
+    # None when git could not say (no repository, no git).
+    source_dirty: bool | None = None
+    source_remote: str = ""
+    # Not in the manifest: a path on this machine.
+    source_dir: Path | None = None
 
     def to_manifest(self) -> dict:
+        provenance = {
+            "source_board": self.source_board,
+            "source_sha": self.source_sha,
+            "extracted_by": "blpl",
+        }
+        if self.source_dirty is not None:
+            provenance["source_dirty"] = self.source_dirty
+        if self.source_remote:
+            provenance["source_remote"] = self.source_remote
         return {
             "module": self.name,
             "description": self.description,
-            "provenance": {
-                "source_board": self.source_board,
-                "source_sha": self.source_sha,
-                "extracted_by": "blpl",
-            },
+            "provenance": provenance,
             # The contract a carrier board must satisfy.
             "interface": [p.to_dict() for p in self.ports],
             "internal_nets": self.internal_nets,
@@ -123,7 +144,10 @@ def plan_module(
         source_board=board.name,
         source_sha=source_sha,
         components=sorted(selected),
+        source_dir=board.source_dir,
     )
+    if not source_sha and board.source_dir is not None:
+        _record_git(spec, board.source_dir)
     missing = sorted(set(refdes) - set(selected))
     if missing:
         spec.warnings.append(f"not on this board, ignored: {', '.join(missing)}")
@@ -136,6 +160,12 @@ def plan_module(
         members_inside = [(r, p) for r, p in net.members if r in inside]
         if not members_inside:
             continue
+        if net.name.startswith(_UNCONNECTED_PREFIX):
+            for r, p in members_inside:
+                spec.pins.setdefault(r, {})[p] = NC
+            continue
+        for r, p in members_inside:
+            spec.pins.setdefault(r, {})[p] = net.name
         members_outside = sorted({r for r, _ in net.members if r not in inside})
 
         if members_outside or net.name.upper() in _UBIQUITOUS:
@@ -163,6 +193,8 @@ def plan_module(
             row["footprint"] = component.footprint
         if component.lib_id:
             row["symbol"] = component.lib_id
+        if spec.pins.get(ref):
+            row["pins"] = dict(sorted(spec.pins[ref].items(), key=lambda kv: _pad_key(kv[0])))
         spec.bom.append(row)
 
     no_mpn = [r["refdes"] for r in spec.bom if not r.get("mpn")]
@@ -179,6 +211,79 @@ def plan_module(
             "which usually means the wrong parts were chosen"
         )
     return spec
+
+
+def _pad_key(pad: str) -> tuple:
+    """Pads in the order a person reads them: 2 before 10, A1 before A10."""
+    head = pad.rstrip("0123456789")
+    tail = pad[len(head):]
+    return (head, int(tail) if tail else -1, pad)
+
+
+def _record_git(spec: ModuleSpec, directory: Path) -> None:
+    """The commit the source board was read at, and whether its tree was dirty.
+
+    Scoped to the board's directory, as library provenance is: an unrelated
+    edit elsewhere in the repository does not make this board any less the
+    committed one.
+    """
+    from ..core.provenance import describe_root
+
+    git = describe_root(directory).get("git")
+    if not git:
+        spec.warnings.append("source board is not in a git repository: no commit recorded")
+        return
+    spec.source_sha = git["commit"]
+    spec.source_dirty = git["dirty"]
+    spec.source_remote = git.get("remote", "")
+    if git["dirty"]:
+        spec.warnings.append(
+            f"source board had {git['changed_files']} uncommitted change(s) when extracted: "
+            "the recorded commit is not exactly what this module came from"
+        )
+
+
+def _lib_table(directory: Path | None, table: str) -> dict[str, Path]:
+    """Nickname -> library path from a board's own sym-/fp-lib-table.
+
+    The board's table is the authority on where its parts came from: the stock
+    footprint root alone missed every project and vendor footprint, which on a
+    real board are the parts most worth carrying into a module.
+    """
+    if directory is None:
+        return {}
+    path = Path(directory) / table
+    if not path.is_file():
+        return {}
+    try:
+        tree = sexpr.parse(path.read_text(encoding="utf-8"))
+    except (OSError, sexpr.ParseError):
+        return {}
+    out: dict[str, Path] = {}
+    for lib in sexpr.find_all(tree, "lib"):
+        name, uri = sexpr.find(lib, "name"), sexpr.find(lib, "uri")
+        if not name or not uri:
+            continue
+        raw = sexpr.unquote(uri[1]).replace("${KIPRJMOD}", str(directory))
+        if "${" in raw:
+            continue  # an environment variable this process cannot resolve
+        out[sexpr.unquote(name[1])] = Path(raw)
+    return out
+
+
+def _table_symbol(path: Path | None, name: str) -> list | None:
+    """``name`` from the one library a sym-lib-table entry points at, if it is there."""
+    if path is None:
+        return None
+    try:
+        if path.is_dir():  # a v10 .kicad_symdir: one symbol per file
+            one = path / f"{name}.kicad_sym"
+            return sexpr.find(sexpr.parse(one.read_text(encoding="utf-8")), "symbol") if one.is_file() else None
+        if path.is_file():
+            return loaders._find_named_symbol(sexpr.parse(path.read_text(encoding="utf-8")), name)
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def _port_kind(net_name: str) -> str:
@@ -198,6 +303,7 @@ def write_module(
     *,
     symbol_roots: list[Path] | None = None,
     footprint_root: Path | None = None,
+    footprint_roots: list[Path] | None = None,
     overwrite: bool = False,
 ) -> tuple[Path, list[str]]:
     """Write the module directory. Returns (path, notes).
@@ -207,6 +313,10 @@ def write_module(
     is recorded for anything that could not be copied, because a module missing
     a symbol still has value and should not be refused outright, but must never
     look complete when it is not.
+
+    Libraries are looked for first in the source board's own lib tables, then
+    in ``symbol_roots`` / ``footprint_roots`` (and the single ``footprint_root``
+    older callers pass), in that order.
     """
     dest = Path(dest_root) / MODULES_DIRNAME / spec.name
     if dest.exists() and not overwrite:
@@ -222,21 +332,29 @@ def write_module(
     # Grouped by their source library, and written under that library's name, so
     # the module directory is itself a valid library root.
     wanted_symbols = sorted({row["symbol"] for row in spec.bom if row.get("symbol")})
+    # A sym-lib-table entry maps a nickname to one file, whatever that file is
+    # called, so each nickname is read from its own file first. Treating the
+    # entries as directory roots instead dropped any whose file was not named
+    # after its nickname, and let a sibling library shadow another's mapping.
+    sym_table = _lib_table(spec.source_dir, "sym-lib-table")
+    symbol_roots = list(dict.fromkeys(symbol_roots or []))
     by_lib: dict[str, list[str]] = {}
     for ref in wanted_symbols:
-        if not symbol_roots:
-            notes.append(f"no libraries to copy symbols from, so {ref} was not copied")
-            continue
         try:
             lib, name = loaders.split_ref(ref)
         except ValueError:
             notes.append(f"unparseable symbol reference: {ref}")
             continue
-        try:
-            node = loaders.load_symbol_def(ref, symbol_roots)
-        except (loaders.LibraryMiss, OSError, ValueError):
-            notes.append(f"symbol not found in the configured libraries: {ref}")
-            continue
+        node = _table_symbol(sym_table.get(lib), name)
+        if node is None:
+            if not symbol_roots:
+                notes.append(f"no libraries to copy symbols from, so {ref} was not copied")
+                continue
+            try:
+                node = loaders.load_symbol_def(ref, symbol_roots)
+            except (loaders.LibraryMiss, OSError, ValueError):
+                notes.append(f"symbol not found in the configured libraries: {ref}")
+                continue
         # load_symbol_def qualifies the name for a schematic's lib_symbols cache;
         # inside a library file the bare name is what KiCad looks for.
         body = ["symbol", f'"{name}"', *node[2:]]
@@ -254,17 +372,22 @@ def write_module(
 
     # -- footprints ----------------------------------------------------------
     wanted_fps = sorted({row["footprint"] for row in spec.bom if row.get("footprint")})
+    fp_table = _lib_table(spec.source_dir, "fp-lib-table")
+    fp_roots = [Path(r) for r in [*(footprint_roots or []), *([footprint_root] if footprint_root else [])]]
     for ref in wanted_fps:
-        if not footprint_root:
-            notes.append(f"no footprint library configured, so {ref} was not copied")
-            continue
         try:
             lib, fp_name = loaders.split_ref(ref)
         except ValueError:
             notes.append(f"unparseable footprint reference: {ref}")
             continue
-        source = Path(footprint_root) / f"{lib}.pretty" / f"{fp_name}.kicad_mod"
-        if not source.is_file():
+        candidates = ([fp_table[lib] / f"{fp_name}.kicad_mod"] if lib in fp_table else []) + [
+            r / f"{lib}.pretty" / f"{fp_name}.kicad_mod" for r in fp_roots
+        ]
+        if not candidates:
+            notes.append(f"no footprint library configured, so {ref} was not copied")
+            continue
+        source = next((c for c in candidates if c.is_file()), None)
+        if source is None:
             notes.append(f"footprint not found: {ref}")
             continue
         pretty = dest / f"{lib}.pretty"
