@@ -248,11 +248,21 @@ def read_project(directory: Path, *, name: str = "") -> ImportedBoard:
     # board lives in kicad/, and "kicad" told a module nothing about its origin.
     pros = _design_files("*.kicad_pro")
     default_name = pros[0].stem if len(pros) == 1 else directory.name
-    board = ImportedBoard(name=name or default_name, source_dir=directory)
+    # Library tables and ${KIPRJMOD} are relative to the project file, not to
+    # where the search started: a published board's tables are in kicad/, and
+    # reading the root missed them and its kicad/libs/ with them.
+    pcbs = _design_files("*.kicad_pcb")
+    if len(pros) == 1:
+        project_dir = pros[0].parent
+    elif not pros and len(pcbs) == 1:
+        project_dir = pcbs[0].parent
+    else:
+        project_dir = directory
+    board = ImportedBoard(name=name or default_name, source_dir=project_dir)
 
     for sch in _design_files("*.kicad_sch"):
         read_schematic(sch, board)
-    for pcb in _design_files("*.kicad_pcb"):
+    for pcb in pcbs:
         read_pcb(pcb, board)
 
     if not board.source_files:

@@ -367,6 +367,38 @@ def test_kicads_generated_net_names_stay_distinct_through_stage4(board_dir, tmp_
     assert pins["m.C1"] == {"1": pins["m.U1"]["1"], "2": pins["m.U1"]["2"]}
 
 
+def test_a_private_net_keeps_the_class_its_source_name_earns(board_dir, tmp_path) -> None:
+    """Stage 4's class rules are anchored at the start of a name, so m.VDD lost
+    Power_Bulk and m.USB_D+ its diff-pair class once the module prefixed them."""
+    from blpl.core import stage4_synthesize_nets as s4
+
+    project = tmp_path / "carrier"
+    project.mkdir()
+    path, _ = write_module(plan_module(read_project(board_dir), ["U1", "C1"], name="m"), project)
+    rows = json.loads((path / "bom.json").read_text())
+    nets = {"U1": {"1": "VDD", "2": "USB_D+", "3": "USB_D-"}, "C1": {"1": "VDD", "2": "RF_IN"}}
+    for row in rows:
+        row["pins"] = nets[row["refdes"]]
+    (path / "bom.json").write_text(json.dumps(rows))
+    (project / "design.md").write_text("# C\n\n## Modules\n\n- m\n", encoding="utf-8")
+    artifact = stage0_deterministic.extract([project / "design.md"])
+    classes = {n["name"]: n["class"] for n in s4.synthesize(artifact)["nets"]}
+    for raw in ("VDD", "USB_D+", "USB_D-", "RF_IN"):
+        assert f"m.{raw}" in classes, classes
+        assert classes[f"m.{raw}"] == s4._assign_class(raw) != "Default", raw
+
+
+def test_library_tables_are_read_beside_the_project_file_not_the_search_root(tmp_path) -> None:
+    """A published board lives in kicad/, with its tables beside it."""
+    root = tmp_path / "published"
+    (root / "kicad").mkdir(parents=True)
+    (root / "kicad" / "ear.kicad_pro").write_text("{}", encoding="utf-8")
+    (root / "kicad" / "ear.kicad_pcb").write_text(_PCB, encoding="utf-8")
+    board = read_project(root)
+    assert board.name == "ear"
+    assert board.source_dir == root / "kicad"
+
+
 def test_a_module_extracted_before_pins_were_recorded_says_its_parts_are_unwired(board_dir, tmp_path) -> None:
     project = tmp_path / "carrier"
     project.mkdir()

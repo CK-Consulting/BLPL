@@ -181,7 +181,15 @@ def _normalize_signal(signal: str) -> str:
     return s
 
 
-def _assign_class(name: str) -> str:
+def _assign_class(name: str, modules: tuple[str, ...] = ()) -> str:
+    # A module's private net is named "<module>.<net>" (modules_remix), and the
+    # rules below are anchored at the start of the name: m.USB_D+ came out
+    # Default instead of a diff pair, m.VDD lost Power_Bulk. Classify the net
+    # as the source board named it.
+    for module in modules:
+        if name.startswith(f"{module}."):
+            name = name[len(module) + 1:]
+            break
     upper = name.upper()
     if _SENSE_NODE.match(upper):
         # Named after the rail it measures, but not that rail. See _SENSE_NODE.
@@ -283,6 +291,7 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
         schema.validate("bom", bom)
 
     nets_by_name: dict[str, dict] = {}
+    modules = tuple(design_artifact.get("modules") or ())
 
     for conn in design_artifact.get("connectors", []):
         refdes = _resolve_refdes(conn["local_id"], bom)
@@ -295,7 +304,7 @@ def synthesize(design_artifact: dict, bom: dict | None = None) -> dict:
                 signal,
                 {
                     "name": signal,
-                    "class": _assign_class(signal),
+                    "class": _assign_class(signal, modules),
                     "members": [],
                     "source_refs": [],
                 },
