@@ -80,8 +80,30 @@ To use one, name it in the design document:
 
 Stage 0 expands each module's parts into the artifact with the module name
 prefixed onto every refdes (`ltc4015-charger.U1`), because two modules on one
-carrier will both bring a `U1`. A module that cannot be found is a warning naming
-where it was looked for — never a quietly shorter BOM.
+carrier will both bring a `U1`. It brings the module's wiring too: every part's
+pins, recorded at extraction in `bom.json`, go in as connections.
+
+- A **port** keeps its name, and that is how the carrier connects to it: a net
+  of the same name on the carrier joins it. Name your carrier's nets after the
+  module's ports, or bridge them with a part.
+- An **internal** net is prefixed (`ltc4015-charger.CHG_INT`), so two modules'
+  private nets never merge.
+- A pad KiCad called `unconnected-…` on the source board arrives as NC.
+
+A module that cannot be found is a warning naming where it was looked for, never
+a quietly shorter BOM, and one extracted before pins were recorded is a warning
+(STAGE0-009) that its parts came in unconnected.
+
+Extraction copies each footprint from the source board's own `fp-lib-table`
+first, then the project's `libraries/footprints`, then stock; symbols likewise
+from its `sym-lib-table` first. Point it at the directory holding the board,
+such as a published `kicad/`. Hidden directories (`.pipeline/` and its old
+emits) are never read. The manifest records the board's name (its `.kicad_pro`),
+the commit it was read at, and whether that tree had uncommitted changes.
+
+A module carries the circuit, not its layout. For an RF match or a switching
+supply the layout is half the design; until placement is carried, copy it by
+hand from the source board.
 
 Symbol resolution goes: project `libraries/` → project `modules/` → shared modules
 → `generated/` → stock. A symbol you drew for this project always wins.

@@ -21,6 +21,20 @@ prefixed onto the refdes (``ltc4015-charger.U1``), because two modules on one
 carrier will both have a U1 and silently merging them would be a wiring error
 nobody would see until the board came back.
 
+Expansion brings the module's wiring as well as its parts. Each part's pins
+go into the artifact as connections, the same record a Connections table
+makes, so Stage 4 joins them into nets with nothing new to learn:
+
+- a **port** (a net in the manifest's ``interface``) keeps its name, and that
+  is how the carrier connects to it: the carrier's own net of that name joins
+  it, exactly as two pins on one named net join on any board;
+- an **internal** net is prefixed with the module name
+  (``lrhf-chip-antenna.RF_LRHF_M``), so two modules' private nets can never
+  merge, as their refdes cannot.
+
+Parts-only expansion was the first version, and it left a carrier holding a
+module's components with nothing connecting them.
+
 Nothing is dropped silently: a module that cannot be found, or whose BOM is
 unreadable, becomes a warning naming the module and where it was looked for.
 """
@@ -30,6 +44,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
+import yaml
 
 from ..importer_kicad.modules import MODULES_DIRNAME
 
@@ -90,6 +106,8 @@ def expand(artifact: dict, project_dir: Path, names: list[str]) -> None:
 
     components: list[dict] = artifact.setdefault("components", [])
     existing = {c.get("local_id") for c in components}
+    connectors: list[dict] = artifact.setdefault("connectors", [])
+    wired = {c.get("local_id") for c in connectors}
     warnings: list[dict] = artifact.setdefault("warnings", [])
     used: list[str] = []
 
@@ -125,7 +143,10 @@ def expand(artifact: dict, project_dir: Path, names: list[str]) -> None:
             )
             continue
 
+        ports = _ports(module_dir)
+        private: dict[str, str] = {}
         added = 0
+        unwired: list[str] = []
         for row in rows if isinstance(rows, list) else []:
             refdes = str(row.get("refdes", "")).strip()
             if not refdes:
@@ -146,6 +167,41 @@ def expand(artifact: dict, project_dir: Path, names: list[str]) -> None:
             existing.add(local_id)
             added += 1
 
+            pins = row.get("pins")
+            if not isinstance(pins, dict) or not pins:
+                unwired.append(refdes)
+                continue
+            if local_id in wired:
+                continue
+            connectors.append(
+                {
+                    "local_id": local_id,
+                    "pins": [
+                        {"pin": str(pin), "signal": _net_name(name, str(net), ports, private)}
+                        for pin, net in pins.items()
+                    ],
+                    "pin_count": len(pins),
+                    "source_ref": {"file": str(bom_path)},
+                }
+            )
+            wired.add(local_id)
+
+        if unwired:
+            warnings.append(
+                {
+                    "code": "STAGE0-009",
+                    "summary": (
+                        f"module {name!r} carries no wiring for {', '.join(unwired[:8])}"
+                        + (" …" if len(unwired) > 8 else "")
+                        + ": its parts were added unconnected."
+                    ),
+                    "fix": (
+                        "Re-extract the module: modules extracted before pins were recorded "
+                        "list their parts only."
+                    ),
+                }
+            )
+
         used.append(name)
         if not added:
             warnings.append(
@@ -160,3 +216,34 @@ def expand(artifact: dict, project_dir: Path, names: list[str]) -> None:
         artifact["modules"] = used
     if not warnings:
         artifact.pop("warnings", None)
+
+
+def _ports(module_dir: Path) -> set[str]:
+    """The nets the manifest declares as the module's interface."""
+    try:
+        data = yaml.safe_load((module_dir / "module.yaml").read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return set()
+    return {str(p.get("port")) for p in data.get("interface") or [] if isinstance(p, dict) and p.get("port")}
+
+
+def _net_name(module: str, net: str, ports: set[str], private: dict[str, str]) -> str:
+    """A port keeps its name so the carrier joins it; anything else is private.
+
+    A private name must survive Stage 4, which drops a trailing parenthesised
+    comment from every signal. KiCad's own names are exactly that shape:
+    ``Net-(U1-A)`` and ``Net-(U1-B)`` both came out as ``m.Net-`` and were
+    merged into one net, shorting two nodes of the module. Parentheses are
+    dropped here instead, and a name two nets would share is numbered.
+    """
+    from .stage4_synthesize_nets import is_no_connect  # noqa: PLC0415
+
+    if net in ports or is_no_connect(net):
+        return net
+    if net not in private:
+        base = f"{module}." + re.sub(r"[()]", "", net).strip()
+        candidate, n = base, 2
+        while candidate in private.values():
+            candidate, n = f"{base}_{n}", n + 1
+        private[net] = candidate
+    return private[net]

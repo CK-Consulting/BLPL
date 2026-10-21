@@ -81,6 +81,10 @@ class ImportedBoard:
     nets: dict[str, ImportedNet] = field(default_factory=dict)
     source_files: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Where the board was read from. Not serialised: it is a path on this
+    # machine, and module manifests must not carry one. Extraction uses it to
+    # find the board's own library tables and its git commit.
+    source_dir: Path | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -231,11 +235,34 @@ def read_project(directory: Path, *, name: str = "") -> ImportedBoard:
     about connectivity and placement, and later reads only fill gaps.
     """
     directory = Path(directory)
-    board = ImportedBoard(name=name or directory.name)
+    # Hidden directories hold copies, not the design: a BLPL project keeps every
+    # earlier emit under .pipeline/, and reading those too merged a dozen past
+    # revisions of the board into one, with nets that no single revision had.
+    def _design_files(pattern: str) -> list[Path]:
+        return sorted(
+            p for p in directory.rglob(pattern)
+            if not any(part.startswith(".") for part in p.relative_to(directory).parts[:-1])
+        )
 
-    for sch in sorted(directory.rglob("*.kicad_sch")):
+    # Named after its project file when there is exactly one: a published BLPL
+    # board lives in kicad/, and "kicad" told a module nothing about its origin.
+    pros = _design_files("*.kicad_pro")
+    default_name = pros[0].stem if len(pros) == 1 else directory.name
+    # Library tables and ${KIPRJMOD} are relative to the project file, not to
+    # where the search started: a published board's tables are in kicad/, and
+    # reading the root missed them and its kicad/libs/ with them.
+    pcbs = _design_files("*.kicad_pcb")
+    if len(pros) == 1:
+        project_dir = pros[0].parent
+    elif not pros and len(pcbs) == 1:
+        project_dir = pcbs[0].parent
+    else:
+        project_dir = directory
+    board = ImportedBoard(name=name or default_name, source_dir=project_dir)
+
+    for sch in _design_files("*.kicad_sch"):
         read_schematic(sch, board)
-    for pcb in sorted(directory.rglob("*.kicad_pcb")):
+    for pcb in pcbs:
         read_pcb(pcb, board)
 
     if not board.source_files:
