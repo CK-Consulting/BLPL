@@ -20,7 +20,9 @@ import io
 import re
 
 ALL_COLUMNS = ["Designator", "Value", "MPN", "Manufacturer", "Footprint", "Assembly", "Description"]
-PURCHASE_COLUMNS = ["Designators", "Quantity", "Value", "Footprint", "MPN", "Manufacturer"]
+#: Exactly these, in this order: a quote or a distributor's BOM upload is
+#: searched by part number, and anything else on the line is noise to it.
+PURCHASE_COLUMNS = ["MPN", "MFG", "QTY"]
 
 #: Assembly states that mean nothing is bought for the part.
 NOT_BOUGHT = ("dnp", "footprint_only")
@@ -97,8 +99,8 @@ def _cell(value) -> str:
 
 
 def to_csv(records: list[dict], purpose: str) -> str:
-    """``purpose`` "all": one row per part. "purchase": bought parts only,
-    grouped by identical part (MPN, value, footprint) with a quantity."""
+    """``purpose`` "all": one row per part. "purchase": bought parts only, one
+    line per part number and maker: MPN, MFG, QTY."""
     buf = io.StringIO()
     if purpose == "all":
         w = csv.writer(buf)
@@ -109,18 +111,24 @@ def to_csv(records: list[dict], purpose: str) -> str:
         return buf.getvalue()
     if purpose != "purchase":
         raise ValueError(f"purpose must be 'all' or 'purchase', not {purpose!r}")
+    # One line per part number and maker. A part with no MPN still gets a line,
+    # grouped by value and footprint, with the gap said in the MPN cell: left
+    # out, it would be missing from the quote and nobody would notice.
     grouped: dict[tuple, dict] = {}
     for p in records:
         if not bought(p):
             continue
-        entry = grouped.setdefault((p["mpn"], p["value"], p["footprint"]), {
-            "refs": [], "value": p["value"], "footprint": p["footprint"],
-            "mpn": p["mpn"], "manufacturer": p["manufacturer"]})
+        if p["mpn"]:
+            key = ("mpn", p["mpn"].upper(), p["manufacturer"].upper())
+        else:
+            key = ("none", p["value"], p["footprint"])
+        entry = grouped.setdefault(key, {"mpn": p["mpn"], "mfg": p["manufacturer"], "refs": [],
+                                         "value": p["value"], "footprint": p["footprint"]})
         entry["refs"].append(p["ref"])
     w = csv.writer(buf)
     w.writerow(PURCHASE_COLUMNS)
-    for e in sorted(grouped.values(), key=lambda e: (e["mpn"], e["value"])):
+    for key, e in sorted(grouped.items(), key=lambda kv: (kv[0][0] == "none", kv[1]["mpn"].upper(), kv[1]["value"])):
         refs = sorted(e["refs"], key=_natural)
-        w.writerow([",".join(_cell(r) for r in refs), len(refs), _cell(e["value"]), _cell(e["footprint"]),
-                    _cell(e["mpn"]), _cell(e["manufacturer"])])
+        mpn = e["mpn"] or "NO MPN: " + " ".join(x for x in (e["value"], e["footprint"], f"({','.join(refs)})") if x)
+        w.writerow([_cell(mpn), _cell(e["mfg"]), len(refs)])
     return buf.getvalue()
