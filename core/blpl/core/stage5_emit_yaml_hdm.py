@@ -685,6 +685,10 @@ def _synthesize_test_points(
             "pin_map": {"1": "1"},
             "synthesized": "test_point",
             "net": net_name,
+            # A bare pad: nothing is bought or placed. Left out, the symbol went
+            # into the BOM while KiCad's TestPoint footprint left it, and the
+            # parity check flagged every test point on the board.
+            "assembly": "footprint_only",
         }
         nets_out[net_name]["pads"].append([refdes, "1"])
         record["count"] += 1

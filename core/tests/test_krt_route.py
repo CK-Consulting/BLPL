@@ -78,6 +78,7 @@ def test_the_project_file_survives_every_step(board, tmp_path, monkeypatch):
         return clobber()
 
     monkeypatch.setattr(krt_route, "_resave", clobber)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: clobber())
     monkeypatch.setattr(krt_route, "_fill", clobber)
     monkeypatch.setattr(krt_route, "_run", run)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 3, "segments": 400})
@@ -94,6 +95,7 @@ def test_a_failing_step_stops_the_route_and_says_which(board, tmp_path, monkeypa
     monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
     ok = subprocess.CompletedProcess([], 0, "", "")
     monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: ok)
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: subprocess.CompletedProcess(cmd, 2, "", "boom"))
     r = krt_route.route(board, work_dir=tmp_path / "w")
     assert not r.ok and r.reason.startswith("route.py exited 2")
@@ -223,7 +225,7 @@ def test_an_edge_band_goes_on_before_routing_and_comes_off_after(board, tmp_path
     calls = []
     ok = subprocess.CompletedProcess([], 0, "", "")
     monkeypatch.setattr(krt_route, "_resave", lambda *a: calls.append("resave") or ok)
-    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add: calls.append(("band", add, d)) or ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add, **kw: calls.append(("band", add, d)) or ok)
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: calls.append(Path(cmd[1]).name) or ok)
     monkeypatch.setattr(krt_route, "_fill", lambda *a: calls.append("fill") or ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
@@ -344,7 +346,7 @@ def test_a_failed_route_still_takes_its_edge_band_off(board, tmp_path, monkeypat
     calls = []
     ok = subprocess.CompletedProcess([], 0, "", "")
     monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
-    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add: calls.append(("band", add)) or ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add, **kw: calls.append(("band", add)) or ok)
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: subprocess.CompletedProcess(cmd, 1, "", "timed out"))
     r = krt_route.route(board, work_dir=tmp_path / "w")
     assert not r.ok and "exited 1" in r.reason
@@ -461,7 +463,10 @@ def test_signals_are_refused_when_every_copper_layer_is_a_plane(board):
 def test_the_keepout_flag_goes_out_only_with_a_band(board):
     pro = board.with_suffix(".kicad_pro")
     flags = lambda **k: {a for s in krt_route.plan(board, pro, {}, ["F.Cu", "B.Cu"], **k) for a in s["args"]}
-    # No edge rule, no band: an Eco2.User drawing must not become a wall.
+    # An edge rule of 0, no band: an Eco2.User drawing must not become a wall.
+    data = json.loads(pro.read_text())
+    data["board"] = {"design_settings": {"rules": {"min_copper_edge_clearance": 0}}}
+    pro.write_text(json.dumps(data))
     assert "--keepout" not in flags()
     assert "--keepout" in flags(band=True) and "--keepout" not in flags(band=False)
     data = json.loads(pro.read_text())
@@ -483,7 +488,7 @@ def test_a_band_layer_the_board_already_uses_is_left_alone(board, tmp_path, monk
     ok = subprocess.CompletedProcess([], 0, "", "")
     taken = subprocess.CompletedProcess([], 3, "1 drawing(s) already on Eco2.User\n", "")
     monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
-    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add: calls.append(add) or (taken if add else ok))
+    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add, **kw: calls.append(add) or (taken if add else ok))
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: cmds.append(cmd) or ok)
     monkeypatch.setattr(krt_route, "_fill", lambda *a: ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 5})
@@ -591,3 +596,48 @@ def test_an_install_that_fails_its_own_startup_check_is_not_available(tmp_path, 
     assert cli._router(argparse.Namespace(project_dir=str(tmp_path), board=None), tmp_path) == "freerouting"
     (home / "py_router" / "startup_checks.py").write_text("print('All checks passed.')\n")
     assert krt_route.available() == (True, "")
+
+
+def test_a_project_file_with_no_edge_or_hole_rule_routes_to_kicads_defaults(board):
+    """KiCad's DRC applies its defaults when the .kicad_pro names none, and the
+    router's own default edge is 0 mm. On verdacor that put tracks 0.2 mm from
+    a 0.5 mm edge and DRC failed on all of them."""
+    pro = board.with_suffix(".kicad_pro")
+    data = json.loads(pro.read_text())
+    data.pop("board", None)
+    pro.write_text(json.dumps(data))
+    for step in krt_route.plan(board, pro, {}, ["F.Cu", "B.Cu"]):
+        a = step["args"]
+        assert a[a.index("--board-edge-clearance") + 1] == "0.5"
+        assert a[a.index("--hole-to-hole-clearance") + 1] == "0.25"
+        assert "--keepout" in a
+
+
+def test_the_band_rings_npth_holes_at_the_hole_clearance(board, tmp_path, monkeypatch):
+    """The router has no copper-to-hole rule; it held 0.21 mm to J_DBG's
+    alignment holes where DRC asks 0.25."""
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    seen = []
+    monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add, **k: seen.append((add, d, k)) or ok)
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: ok)
+    monkeypatch.setattr(krt_route, "_fill", lambda *a: ok)
+    monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
+    krt_route.route(board, work_dir=tmp_path / "w")
+    add, depth, kw = seen[0]
+    widest = max(c.get("track_width", 0.2) for c in krt_route._classes(board.with_suffix(".kicad_pro"))[0].values())
+    assert add and kw["hole_ring_mm"] == pytest.approx(0.25 + widest / 2)
+    assert depth == pytest.approx(0.5 + widest / 2)
+
+
+def test_the_npth_ring_is_drawn_by_the_band_script(tmp_path, monkeypatch):
+    from blpl.core import autoroute as ar
+
+    scripts = []
+    monkeypatch.setattr(ar, "_pcbnew", lambda py, s: scripts.append(s) or subprocess.CompletedProcess([], 0, "", ""))
+    krt_route._edge_band("py", tmp_path / "b.kicad_pcb", 0.6, add=True, hole_ring_mm=0.35)
+    assert "PAD_ATTRIB_NPTH" in scripts[0] and "FromMM(0.35)" in scripts[0]

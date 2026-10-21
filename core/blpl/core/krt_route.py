@@ -106,12 +106,21 @@ def available() -> tuple[bool, str]:
 
 
 def _board_rules(pro: Path) -> dict:
-    """The project's board-wide DRC minimums, from .kicad_pro."""
+    """The project's board-wide DRC minimums, from .kicad_pro.
+
+    KiCad's defaults stand in for any the file leaves out, because they are
+    what its DRC applies then. The router's own default for the edge is 0 mm:
+    on a board whose .kicad_pro named no edge rule it routed to the edge and
+    DRC failed on every track near it.
+    """
+    from ..emitter.pro import BOARD_RULE_DEFAULTS
+
     try:
-        return ((json.loads(pro.read_text(encoding="utf-8")).get("board") or {})
-                .get("design_settings") or {}).get("rules") or {}
+        rules = ((json.loads(pro.read_text(encoding="utf-8")).get("board") or {})
+                 .get("design_settings") or {}).get("rules") or {}
     except (OSError, ValueError):
-        return {}
+        rules = {}
+    return {**BOARD_RULE_DEFAULTS, **rules}
 
 
 def _classes(pro: Path) -> tuple[dict[str, dict], list[tuple[str, str]]]:
@@ -449,7 +458,8 @@ BAND_LAYER = "Eco2.User"
 _BAND_MARK_NM = 12_345
 
 
-def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool) -> subprocess.CompletedProcess:
+def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool,
+               hole_ring_mm: float = 0.0) -> subprocess.CompletedProcess:
     """Draw (or remove) a keepout band ``depth_mm`` wide inside every board edge.
 
     KRT holds the board-edge clearance in its main pass but not in all of
@@ -457,6 +467,10 @@ def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool) -> subproc
     0.2 mm from an angled edge of a board that asks for 0.5 mm. A band drawn
     on a User layer and handed to it as ``--keepout`` keeps every pass out,
     and is taken off the board again once routing is done.
+
+    ``hole_ring_mm`` also rings every NPTH hole, that far beyond its edge.
+    The router has no copper-to-hole rule: it held a track's ordinary
+    clearance to J_DBG's alignment holes, 0.21 mm where DRC asks 0.25.
     """
     from . import autoroute
 
@@ -522,6 +536,26 @@ def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool) -> subproc
         f"        sh.SetWidth({_BAND_MARK_NM})\n"
         "        sh.SetFilled(True)\n"
         "        b.Add(sh)\n"
+        # A ring around each NPTH as a 24-sided polygon, the shape KRT is
+        # known to block; an oval hole takes its longer axis.
+        f"r_extra = pcbnew.FromMM({hole_ring_mm!r})\n"
+        "import math\n"
+        "if r_extra > 0:\n"
+        "    for fp in b.GetFootprints():\n"
+        "        for pad in fp.Pads():\n"
+        "            if pad.GetAttribute() != pcbnew.PAD_ATTRIB_NPTH:\n"
+        "                continue\n"
+        "            ds = pad.GetDrillSize()\n"
+        "            r = max(ds.x, ds.y) / 2 + r_extra\n"
+        "            c = pad.GetPosition()\n"
+        "            q = [pcbnew.VECTOR2I(int(c.x + r * math.cos(2 * math.pi * k / 24)), int(c.y + r * math.sin(2 * math.pi * k / 24))) for k in range(24)]\n"
+        "            sh = pcbnew.PCB_SHAPE(b)\n"
+        "            sh.SetShape(pcbnew.SHAPE_T_POLY)\n"
+        "            sh.SetPolyPoints(q)\n"
+        "            sh.SetLayer(lay)\n"
+        f"            sh.SetWidth({_BAND_MARK_NM})\n"
+        "            sh.SetFilled(True)\n"
+        "            b.Add(sh)\n"
         f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
     ))
 
@@ -574,7 +608,9 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     band = isinstance(edge, (int, float)) and edge > 0
     if band:
         widest = max([c.get("track_width", 0.2) for c in classes.values()] or [0.2])
-        banded = _edge_band(python, pcb, edge + widest / 2, add=True)
+        hole = rules.get("min_hole_clearance")
+        ring = (hole + widest / 2) if isinstance(hole, (int, float)) and hole > 0 else 0.0
+        banded = _edge_band(python, pcb, edge + widest / 2, add=True, hole_ring_mm=ring)
         restore_pro()
         if banded.returncode == 3:
             # The layer is the designer's: route without the band, and say so.

@@ -58,3 +58,14 @@ def test_kicad_applies_the_emitted_classes(tmp_path):
     proc = subprocess.run([autoroute.find_pcbnew_python(), "-c", code], capture_output=True, text=True, timeout=120)
     line = next(l for l in proc.stdout.splitlines() if l.startswith("CLR "))
     assert json.loads(line[4:]) == {"VBUS": 0.25, "SPI_SCK": 0.15}
+
+
+def test_the_board_rules_drc_applies_are_written_out_for_the_router():
+    """Left implicit, KiCad's DRC used its defaults and the router, reading the
+    file, used none."""
+    from blpl.emitter import pro
+
+    rules = pro.build({"nets": {}}, project_filename="x.kicad_pro")["board"]["design_settings"]["rules"]
+    assert rules["min_copper_edge_clearance"] == 0.5
+    assert rules["min_hole_clearance"] == 0.25
+    assert rules["min_hole_to_hole"] == 0.25

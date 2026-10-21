@@ -819,6 +819,32 @@ def _set_reference_and_value(
                 prop[2] = sexpr.quote(value)
 
 
+def _set_part_fields(fp_node: sexpr.Node, comp: dict) -> None:
+    """MPN and Manufacturer on the footprint, hidden, as the schematic has them.
+
+    The schematic carried them and the board did not, so KiCad's parity check
+    flagged every bought part, and anything reading the board alone (a fab's
+    BOM-from-board import) found no part numbers.
+    """
+    for name, key in (("MPN", "mpn"), ("Manufacturer", "manufacturer")):
+        value = str(comp.get(key) or "").strip()
+        if not value:
+            continue
+        existing = next((p for p in sexpr.find_all(fp_node, "property")
+                         if len(p) >= 3 and sexpr.unquote(p[1]) == name), None)
+        if existing is not None:
+            existing[2] = sexpr.quote(value)
+            _hide(existing)
+            continue
+        at_index = next((i for i, n in enumerate(fp_node) if isinstance(n, list) and n and n[0] == "property"), 2)
+        fp_node.insert(at_index, [
+            "property", sexpr.quote(name), sexpr.quote(value),
+            ["at", "0", "0", "0"], ["layer", '"F.Fab"'], ["hide", "yes"],
+            ["uuid", _new_uuid()],
+            ["effects", ["font", ["size", "1", "1"], ["thickness", "0.15"]]],
+        ])
+
+
 def _replace_uuid(node: sexpr.Node) -> None:
     """Regenerate the top-level ``(uuid ...)`` of a node (used for footprints and pads)."""
     uuid_node = sexpr.find(node, "uuid")
@@ -1145,6 +1171,7 @@ def build(
         sheet_y = by + _ORIGIN_Y
 
         _set_reference_and_value(fp_node, refdes, str(comp.get("value", refdes)))
+        _set_part_fields(fp_node, comp)
         # project.yaml's silkscreen: which references show, the labels a
         # person must read, and outlines trimmed off their own pads (silk.py).
         silk.apply(fp_node, policy=hdm.get("silkscreen"), label=comp.get("silk_label"))

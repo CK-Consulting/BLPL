@@ -43,6 +43,21 @@ def test_the_schematic_and_board_carry_kicads_own_flags():
     assert sexpr.find(fp2, "attr")[1:] == ["exclude_from_pos_files", "exclude_from_bom"]
 
 
+def test_the_board_carries_the_part_number_hidden_as_the_schematic_does():
+    fp = ["footprint", '"X"', ["property", '"Reference"', '"R1"'],
+          ["property", '"MPN"', '"OLD"']]
+    pcb._set_part_fields(fp, {"mpn": "RC0402FR-07470RL", "manufacturer": "Yageo"})
+    props = {sexpr.unquote(p[1]): p for p in sexpr.find_all(fp, "property")}
+    assert sexpr.unquote(props["MPN"][2]) == "RC0402FR-07470RL"
+    assert sexpr.unquote(props["Manufacturer"][2]) == "Yageo"
+    assert sexpr.find(props["Manufacturer"], "hide")[1] == "yes"
+    assert len(props) == 3  # the stale MPN was updated, not doubled
+
+    bare = ["footprint", '"TP"']
+    pcb._set_part_fields(bare, {"mpn": "", "manufacturer": None})
+    assert sexpr.find_all(bare, "property") == []
+
+
 def test_the_release_bom_leaves_out_parts_that_are_not_bought(tmp_path):
     import csv
     import json
