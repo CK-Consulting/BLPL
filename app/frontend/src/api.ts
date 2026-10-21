@@ -173,6 +173,28 @@ export async function del(path: string): Promise<void> {
   if (!res.ok) await fail(res);
 }
 
+/**
+ * Fetch a file the server offers as a download and hand it to the browser.
+ *
+ * A plain link cannot carry the bearer token, so the file is fetched like any
+ * other request and saved from a blob, under the name the server gives in
+ * Content-Disposition (or `fallback`).
+ */
+export async function download(path: string, fallback: string): Promise<void> {
+  const res = await request(path);
+  if (!res.ok) await fail(res);
+  const blob = await res.blob();
+  const named = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "");
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = named ? named[1] : fallback;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 /** A DELETE whose answer matters — the body when there is one, else null. */
 export async function delJSON<T>(path: string): Promise<T | null> {
   const res = await request(path, { method: "DELETE" });

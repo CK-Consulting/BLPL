@@ -225,6 +225,7 @@ button.danger { background: #3a1a1d; border-color: #5a2a2e; color: #ff8e8e; }
 .bom { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .bom-bar { display: flex; align-items: center; gap: .7rem; padding: .6rem .8rem; border-bottom: 1px solid #6b6f75; }
 .bom-bar input { background: #0f1115; color: #e6e6e6; border: 1px solid #6b6f75; border-radius: 6px; padding: .35rem .55rem; font: inherit; min-width: 220px; }
+.bom-exports { margin-left: auto; display: flex; gap: .5rem; flex-wrap: wrap; }
 .bom-scroll { flex: 1; overflow: auto; }
 .bom-table { border-collapse: collapse; width: 100%; font-size: 13px; }
 .bom-table th { position: sticky; top: 0; background: #191c22; text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #6b6f75; color: #9ea8b3; font-weight: 600; white-space: nowrap; }

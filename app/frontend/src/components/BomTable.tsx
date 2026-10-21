@@ -1,11 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
-import { encodePath, getJSON } from "../api";
-import { boardArtifact } from "../board";
+import { download, encodePath, getJSON } from "../api";
+import { boardArtifact, withBoard } from "../board";
 
 // The bill of materials as a table, from Stage 1's bom.json. This is the sourcing
 // view — refdes, MPN, manufacturer, package — plus the library hints and the
 // per-row confidence Stage 1 attached, so a low-confidence guess is visible
 // rather than buried. Filterable, because a 46-row board is a lot to scan.
+//
+// Two CSV exports, because a BOM is asked two questions: every part on the
+// board, test pads and fiducials included, and only what has to be bought,
+// grouped with quantities for a quote. The server builds both from the board
+// as Stage 5 left it (blpl.core.bom_export), which knows what this table does
+// not: which parts project.yaml marks footprint-only or DNP.
 
 type Row = {
   local_id: string;
@@ -34,6 +40,23 @@ export function BomTable({
 }) {
   const [bom, setBom] = useState<Bom | null | "missing">(null);
   const [q, setQ] = useState("");
+  const [exporting, setExporting] = useState<"all" | "purchase" | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  async function exportCsv(purpose: "all" | "purchase") {
+    setExporting(purpose);
+    setExportError(null);
+    try {
+      await download(
+        withBoard(`/api/projects/${projectId}/bom.csv?purpose=${purpose}`, board),
+        purpose === "all" ? "bom.csv" : "bom-purchase.csv",
+      );
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(null);
+    }
+  }
 
   useEffect(() => {
     setBom(null);
@@ -64,7 +87,18 @@ export function BomTable({
       <div className="bom-bar">
         <input placeholder="Filter parts…" value={q} onChange={(e) => setQ(e.target.value)} />
         <span className="muted">{rows.length} of {bom.rows.length} parts</span>
+        <span className="bom-exports">
+          <button type="button" disabled={exporting !== null} onClick={() => exportCsv("all")}
+            title="Every part on the board, one row each, with how it is assembled">
+            {exporting === "all" ? "Exporting…" : "Export BOM to CSV"}
+          </button>
+          <button type="button" disabled={exporting !== null} onClick={() => exportCsv("purchase")}
+            title="Only the parts that are bought, grouped with quantities: no test pads, fiducials, footprint-only or DNP parts">
+            {exporting === "purchase" ? "Exporting…" : "Export BOM for purchasing / quotes"}
+          </button>
+        </span>
       </div>
+      {exportError && <div className="error pad">{exportError}</div>}
       <div className="bom-scroll">
         <table className="bom-table">
           <thead>

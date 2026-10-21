@@ -279,6 +279,39 @@ def test_read_artifact_returns_parsed_json(unlocked) -> None:
     assert r.json()["project_id"] == "alpha"
 
 
+def test_bom_csv_exports_every_part_or_only_what_is_bought(unlocked) -> None:
+    import csv
+    import io
+
+    proj = _seed_project(unlocked)
+    (proj / "design.md").write_text("# alpha\n")
+    (proj / ".pipeline" / "hdm.yaml").write_text(
+        "components:\n"
+        "  R1: {value: 10k, mpn: RC0402, manufacturer: Yageo, footprint: 'Resistor_SMD:R_0402'}\n"
+        "  R2: {value: 10k, mpn: RC0402, manufacturer: Yageo, footprint: 'Resistor_SMD:R_0402'}\n"
+        "  J_DBG: {value: TC2030, footprint: 'Connector:TC2030', assembly: footprint_only}\n"
+        "  FID1: {value: Fiducial, footprint: 'Fiducial:Fiducial_1mm'}\n"
+    )
+    r = unlocked.get("/api/projects/alpha/bom.csv")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/csv")
+    assert 'filename="alpha-bom.csv"' in r.headers["content-disposition"]
+    assert [row["Designator"] for row in csv.DictReader(io.StringIO(r.text))] == ["FID1", "J_DBG", "R1", "R2"]
+
+    r = unlocked.get("/api/projects/alpha/bom.csv?purpose=purchase")
+    assert 'filename="alpha-bom-purchase.csv"' in r.headers["content-disposition"]
+    rows = list(csv.DictReader(io.StringIO(r.text)))
+    assert [(row["Designators"], row["Quantity"]) for row in rows] == [("R1,R2", "2")]
+
+    assert unlocked.get("/api/projects/alpha/bom.csv?purpose=quotes").status_code == 400
+
+
+def test_bom_csv_says_so_when_there_is_no_bom(unlocked) -> None:
+    proj = _seed_project(unlocked)
+    (proj / "design.md").write_text("# alpha\n")
+    r = unlocked.get("/api/projects/alpha/bom.csv")
+    assert r.status_code == 404 and "stage1" in r.json()["detail"]
+
+
 def test_read_artifact_refuses_path_escape(unlocked, tmp_path: Path) -> None:
     _seed_project(unlocked)
     secret = tmp_path / "secret.txt"
