@@ -1,0 +1,5 @@
+# The image runs `npm ci` itself. A local node_modules, a directory or a
+# symlink a worktree used to share one, must never reach the build context:
+# a committed self-referencing link made `COPY . .` fail outright.
+node_modules
+dist
