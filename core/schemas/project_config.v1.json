@@ -212,7 +212,24 @@
       "additionalProperties": false,
       "properties": {
         "dnp": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
-        "footprint_only": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+        "footprint_only": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "attrition": {
+          "description": "Extra parts to order for assembly losses, by MPN, where a part's package class default (blpl.core.bom_export.ATTRITION) is wrong for it. A number is a percent of the placed quantity; an object gives the percent and a minimum number of extra parts, and the larger applies. Example: {GRM155R60J475ME47D: 10, 102010: {percent: 0, min_extra: 1}}.",
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "number", "minimum": 0, "maximum": 100 },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "percent": { "type": "number", "minimum": 0, "maximum": 100 },
+                  "min_extra": { "type": "integer", "minimum": 0 }
+                }
+              }
+            ]
+          }
+        }
       }
     },
     "silkscreen": {

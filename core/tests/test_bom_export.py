@@ -38,9 +38,57 @@ def test_all_lists_every_part_once_with_how_it_is_assembled():
 
 def test_purchase_keeps_only_what_a_supplier_ships_grouped_with_a_quantity():
     text = bom_export.to_csv(bom_export.parts(None, HDM), "purchase")
-    assert text.splitlines()[0] == "MPN,MFG,QTY"
+    assert text.splitlines()[0] == "MPN,MFG,QTY,ATTRITION_%,ORDER_QTY"
     assert [tuple(r.values()) for r in _rows(text)] == [
-        ("102010", "Seeed", "1"), ("RC0402FR-07470RL", "Yageo", "2")]
+        # the XIAO is a module: 2 %, at least 2 spare
+        ("102010", "Seeed", "1", "2", "3"),
+        # 0402 passives: 5 %, at least 50 spare (PCBWay's rule)
+        ("RC0402FR-07470RL", "Yageo", "2", "5", "52")]
+
+
+def test_a_build_of_many_boards_orders_for_all_of_them():
+    rows = _rows(bom_export.to_csv(bom_export.parts(None, HDM), "purchase", boards=1000))
+    assert [(r["MPN"], r["QTY"], r["ORDER_QTY"]) for r in rows] == [
+        ("102010", "1000", "1020"), ("RC0402FR-07470RL", "2000", "2100")]
+    with pytest.raises(ValueError):
+        bom_export.to_csv([], "purchase", boards=0)
+
+
+def test_project_yaml_sets_attrition_by_mpn():
+    overrides = {"102010": 0, "RC0402FR-07470RL": {"percent": 1, "min_extra": 3}}
+    rows = _rows(bom_export.to_csv(bom_export.parts(None, HDM), "purchase", boards=10,
+                                   attrition=overrides))
+    assert [(r["MPN"], r["ATTRITION_%"], r["ORDER_QTY"]) for r in rows] == [
+        ("102010", "0", "10"), ("RC0402FR-07470RL", "1", "23")]
+
+
+@pytest.mark.parametrize("footprint, cls", [
+    ("Resistor_SMD:R_0402_1005Metric", "tiny_passive"),
+    ("Diode_SMD:D_MiniMELF", "tiny_passive"),
+    ("Capacitor_SMD:C_0603_1608Metric", "chip_passive"),
+    ("Capacitor_SMD:C_1206_3216Metric", "large_passive"),
+    ("Package_TO_SOT_SMD:SOT-23", "small_discrete"),
+    ("Diode_SMD:D_SOD-323", "small_discrete"),
+    ("Package_DFN_QFN:QFN-28-1EP_4x4mm_P0.4mm", "ic"),
+    ("Connector_Coaxial:U.FL_Hirose_U.FL-R-SMT-1_Vertical", "ic"),
+    ("Battery:BatteryHolder_Keystone_206", "through_hole"),
+    ("", "other"),
+])
+def test_package_classes(footprint, cls):
+    assert bom_export.package_class(footprint) == cls
+
+
+def test_a_part_kept_off_the_board_is_still_bought():
+    """Stage 5 leaves a not_placed part out of the HDM's components and lists
+    it in not_placed; the purchase export lost it (Codex, PR #70)."""
+    hdm = {"components": {"U1": {"mpn": "102010", "manufacturer": "Seeed", "footprint": "Seeed:XIAO"}},
+           "not_placed": ["BAT_RTC"]}
+    bom = {"rows": [{"local_id": "U1", "mpn": "102010"},
+                    {"local_id": "BAT_RTC", "mpn": "ML1220", "manufacturer": "Panasonic",
+                     "package": "not_placed"}]}
+    records = bom_export.parts(bom, hdm)
+    assert [(p["ref"], p["assembly"]) for p in records] == [("BAT_RTC", "not_placed"), ("U1", "")]
+    assert [r["MPN"] for r in _rows(bom_export.to_csv(records, "purchase"))] == ["102010", "ML1220"]
 
 
 def test_a_bought_part_with_no_mpn_still_gets_a_line_that_says_so():
@@ -50,7 +98,7 @@ def test_a_bought_part_with_no_mpn_still_gets_a_line_that_says_so():
         "C1": {"value": "1u", "mpn": "GRM", "manufacturer": "Murata", "footprint": "C_0402"},
         "C2": {"value": "1u", "mpn": "grm", "manufacturer": "MURATA", "footprint": "C_0402"},
     }}
-    rows = [tuple(r.values()) for r in _rows(bom_export.to_csv(bom_export.parts(None, hdm), "purchase"))]
+    rows = [(r["MPN"], r["MFG"], r["QTY"]) for r in _rows(bom_export.to_csv(bom_export.parts(None, hdm), "purchase"))]
     assert rows == [("GRM", "Murata", "2"), ("NO MPN: 10k Resistor_SMD:R_0402 (R5,R6)", "", "2")]
 
 
