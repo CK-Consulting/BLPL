@@ -34,6 +34,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import re
 import os
 import urllib.request
 import shutil
@@ -113,7 +114,7 @@ from .appconfig import AppConfig
 from .db import SessionFactory, session_scope
 from .models import Project, ProjectInvitation, ProjectPolicy, Run, User
 from .sandbox.gate import GateBusy as _GateBusy
-from blpl.core import library_upload, limits, project_manifest, quarantine
+from blpl.core import bom_export, library_upload, limits, project_manifest, quarantine
 from . import conversations as conversations_mod
 from .conversations import Conversation, list_conversations
 from .projects import ProjectError, Projects, check_remote_url
@@ -5854,6 +5855,50 @@ def read_artifact(project_id: str, name: str, user: User = Depends(require_onboa
         except json.JSONDecodeError:
             pass
     return PlainTextResponse(text)
+
+
+@app.get("/api/projects/{project_id}/bom.csv")
+def bom_csv(project_id: str, purpose: str = "all", board: str | None = None,
+    user: User = Depends(require_onboarded),
+    session: Session = Depends(session_scope)) -> Response:
+    """The BOM as a CSV download: every part, or only what is bought.
+
+    ``purpose=all`` is every part on the board with how it is assembled;
+    ``purpose=purchase`` is what a supplier ships, grouped with quantities,
+    for a quote (blpl.core.bom_export). Built from the board's HDM, or from
+    Stage 1's BOM before Stage 5 has run.
+    """
+    if purpose not in ("all", "purchase"):
+        raise HTTPException(status_code=400, detail="purpose must be 'all' or 'purchase'")
+    proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+    resolved = _resolve_board(proj, board)
+
+    def read(name: str, suffix: str) -> str | None:
+        fname = f"{name}.{suffix}" if resolved is None else f"{name}.{resolved}.{suffix}"
+        if workspace_files.enabled():
+            data = workspace_files.read_artifact(proj, fname)
+            return None if data is None else data.decode("utf-8", errors="replace")
+        target = proj / ".pipeline" / fname
+        return target.read_text(encoding="utf-8", errors="replace") if target.is_file() else None
+
+    hdm = bom = None
+    try:
+        text = read("hdm", "yaml")
+        hdm = yaml.safe_load(text) if text else None
+    except yaml.YAMLError:
+        hdm = None
+    try:
+        text = read("bom", "json")
+        bom = json.loads(text) if text else None
+    except json.JSONDecodeError:
+        bom = None
+    records = bom_export.parts(bom, hdm)
+    if not records:
+        raise HTTPException(status_code=404, detail="no BOM yet — run stage1")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", proj.name) + (f"-{resolved}" if resolved else "")
+    filename = f"{stem}-bom{'-purchase' if purpose == 'purchase' else ''}.csv"
+    return Response(bom_export.to_csv(records, purpose), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.get("/api/projects/{project_id}/design")
