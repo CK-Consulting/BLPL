@@ -129,6 +129,8 @@ def test_default_policy_is_power_and_the_record_says_so() -> None:
     assert tps["TP1"]["net"] == "GND" and tps["TP1"]["value"] == "TP_GND"
     assert tps["TP2"]["net"] == "VDD"
     assert tps["TP1"]["pin_map"] == {"1": "1"}
+    # A bare pad is not bought: out of the BOM, as KiCad's footprint has it.
+    assert all(c["assembly"] == "footprint_only" for c in tps.values())
     assert ["TP1", "1"] in hdm["nets"]["GND"]["pads"]
     assert ["TP2", "1"] in hdm["nets"]["VDD"]["pads"]
     # Signal nets untouched under `power`.

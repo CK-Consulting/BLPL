@@ -29,6 +29,15 @@ _KICAD10_CLASS_FIELDS = {
 }
 
 
+#: KiCad 10's defaults for the board-wide rules a router must also hold.
+#: Shared with the router so both read one number (krt_route).
+BOARD_RULE_DEFAULTS = {
+    "min_copper_edge_clearance": 0.5,
+    "min_hole_clearance": 0.25,
+    "min_hole_to_hole": 0.25,
+}
+
+
 def build(hdm: dict, *, project_filename: str) -> dict:
     net_classes_in = hdm.get("net_classes", {}) or {}
     nets_in = hdm.get("nets", {}) or {}
@@ -101,6 +110,12 @@ def build(hdm: dict, *, project_filename: str) -> dict:
                 "rules": {
                     "min_clearance": 0.1,
                     "min_track_width": 0.1,
+                    # KiCad's own defaults, written out. Left implicit, DRC
+                    # applied them and the router, reading this file, found
+                    # nothing and held 0 mm to the edge: verdacor came back
+                    # with tracks 0.2 mm from its edge and 0.21 mm from a
+                    # debug pad's NPTH, 18 DRC errors on a "finished" route.
+                    **BOARD_RULE_DEFAULTS,
                 }
             }
         },
