@@ -5858,18 +5858,22 @@ def read_artifact(project_id: str, name: str, user: User = Depends(require_onboa
 
 
 @app.get("/api/projects/{project_id}/bom.csv")
-def bom_csv(project_id: str, purpose: str = "all", board: str | None = None,
+def bom_csv(project_id: str, purpose: str = "all", board: str | None = None, boards: int = 1,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> Response:
     """The BOM as a CSV download: every part, or only what is bought.
 
     ``purpose=all`` is every part on the board with how it is assembled;
-    ``purpose=purchase`` is what a supplier ships, grouped with quantities,
-    for a quote (blpl.core.bom_export). Built from the board's HDM, or from
-    Stage 1's BOM before Stage 5 has run.
+    ``purpose=purchase`` is what a supplier ships, for a build of ``boards``:
+    MPN, MFG, QTY, ATTRITION_%, ORDER_QTY, with project.yaml's
+    assembly.attrition overriding the package-class allowance by MPN
+    (blpl.core.bom_export). Built from the board's HDM, or from Stage 1's BOM
+    before Stage 5 has run.
     """
     if purpose not in ("all", "purchase"):
         raise HTTPException(status_code=400, detail="purpose must be 'all' or 'purchase'")
+    if not 1 <= boards <= 1_000_000:
+        raise HTTPException(status_code=400, detail="boards must be between 1 and 1,000,000")
     proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
     resolved = _resolve_board(proj, board)
 
@@ -5895,9 +5899,24 @@ def bom_csv(project_id: str, purpose: str = "all", board: str | None = None,
     records = bom_export.parts(bom, hdm)
     if not records:
         raise HTTPException(status_code=404, detail="no BOM yet — run stage1")
+    # The board's project.yaml beside its markdown, as the config routes find
+    # it. A config that does not parse gives no overrides rather than a 500:
+    # the class defaults still make a usable list, and Stage 5 is what says
+    # the file is broken.
+    attrition: dict = {}
+    if purpose == "purchase":
+        cfg_path = (proj / "project.yaml" if resolved is None
+                    else _board_config_path(proj, project_id, resolved))
+        try:
+            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else None
+        except (OSError, yaml.YAMLError):
+            cfg = None
+        found = ((cfg or {}).get("assembly") or {}).get("attrition") if isinstance(cfg, dict) else None
+        attrition = found if isinstance(found, dict) else {}
     stem = re.sub(r"[^A-Za-z0-9._-]+", "-", proj.name) + (f"-{resolved}" if resolved else "")
-    filename = f"{stem}-bom{'-purchase' if purpose == 'purchase' else ''}.csv"
-    return Response(bom_export.to_csv(records, purpose), media_type="text/csv",
+    filename = (f"{stem}-bom-purchase-x{boards}.csv" if purpose == "purchase" else f"{stem}-bom.csv")
+    return Response(bom_export.to_csv(records, purpose, boards=boards, attrition=attrition),
+                    media_type="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 

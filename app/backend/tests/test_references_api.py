@@ -297,9 +297,16 @@ def test_bom_csv_exports_every_part_or_only_what_is_bought(unlocked) -> None:
     assert 'filename="alpha-bom.csv"' in r.headers["content-disposition"]
     assert [row["Designator"] for row in csv.DictReader(io.StringIO(r.text))] == ["FID1", "J_DBG", "R1", "R2"]
 
-    r = unlocked.get("/api/projects/alpha/bom.csv?purpose=purchase")
-    assert 'filename="alpha-bom-purchase.csv"' in r.headers["content-disposition"]
-    assert r.text.splitlines() == ["MPN,MFG,QTY", "RC0402,Yageo,2"]
+    r = unlocked.get("/api/projects/alpha/bom.csv?purpose=purchase&boards=100")
+    assert 'filename="alpha-bom-purchase-x100.csv"' in r.headers["content-disposition"]
+    # 200 placed 0402s: 5 % is 10, under the 50-spare minimum.
+    assert r.text.splitlines() == ["MPN,MFG,QTY,ATTRITION_%,ORDER_QTY", "RC0402,Yageo,200,5,250"]
+
+    (proj / "project.yaml").write_text("assembly:\n  attrition:\n    RC0402: 1\n")
+    r = unlocked.get("/api/projects/alpha/bom.csv?purpose=purchase&boards=100")
+    assert r.text.splitlines()[1] == "RC0402,Yageo,200,1,202"
+
+    assert unlocked.get("/api/projects/alpha/bom.csv?purpose=purchase&boards=0").status_code == 400
 
     assert unlocked.get("/api/projects/alpha/bom.csv?purpose=quotes").status_code == 400
 

@@ -8,8 +8,9 @@ import { boardArtifact, withBoard } from "../board";
 // rather than buried. Filterable, because a 46-row board is a lot to scan.
 //
 // Two CSV exports, because a BOM is asked two questions: every part on the
-// board, test pads and fiducials included, and only what has to be bought,
-// as MPN, MFG, QTY for a quote. The server builds both from the board
+// board, test pads and fiducials included, and only what has to be bought
+// for a build of N boards, as MPN, MFG, QTY, ATTRITION_%, ORDER_QTY for a
+// quote: attrition by package class, or by MPN from project.yaml. The server builds both from the board
 // as Stage 5 left it (blpl.core.bom_export), which knows what this table does
 // not: which parts project.yaml marks footprint-only or DNP.
 
@@ -42,14 +43,17 @@ export function BomTable({
   const [q, setQ] = useState("");
   const [exporting, setExporting] = useState<"all" | "purchase" | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [boards, setBoards] = useState("1");
+  const buildQty = /^\d+$/.test(boards) && Number(boards) >= 1 ? Number(boards) : null;
 
   async function exportCsv(purpose: "all" | "purchase") {
     setExporting(purpose);
     setExportError(null);
     try {
+      const query = purpose === "purchase" ? `purpose=purchase&boards=${buildQty}` : "purpose=all";
       await download(
-        withBoard(`/api/projects/${projectId}/bom.csv?purpose=${purpose}`, board),
-        purpose === "all" ? "bom.csv" : "bom-purchase.csv",
+        withBoard(`/api/projects/${projectId}/bom.csv?${query}`, board),
+        purpose === "all" ? "bom.csv" : `bom-purchase-x${buildQty}.csv`,
       );
     } catch (e) {
       setExportError(e instanceof Error ? e.message : String(e));
@@ -92,8 +96,13 @@ export function BomTable({
             title="Every part on the board, one row each, with how it is assembled">
             {exporting === "all" ? "Exporting…" : "Export BOM to CSV"}
           </button>
-          <button type="button" disabled={exporting !== null} onClick={() => exportCsv("purchase")}
-            title="MPN, MFG, QTY for the parts that are bought: no test pads, fiducials, footprint-only or DNP parts">
+          <label className="bom-build" title="How many boards the purchase export orders for">
+            Boards
+            <input type="number" min={1} step={1} inputMode="numeric" value={boards}
+              aria-label="Boards to build" onChange={(e) => setBoards(e.target.value)} />
+          </label>
+          <button type="button" disabled={exporting !== null || buildQty === null} onClick={() => exportCsv("purchase")}
+            title="MPN, MFG, QTY, ATTRITION_%, ORDER_QTY for the parts that are bought: no test pads, fiducials, footprint-only or DNP parts">
             {exporting === "purchase" ? "Exporting…" : "Export BOM for purchasing / quotes"}
           </button>
         </span>

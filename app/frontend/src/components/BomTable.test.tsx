@@ -19,9 +19,23 @@ describe("the BOM tab's exports", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Export BOM for purchasing / quotes" }));
     expect(download).toHaveBeenLastCalledWith(
-      "/api/projects/p/bom.csv?purpose=purchase&board=base",
-      "bom-purchase.csv",
+      "/api/projects/p/bom.csv?purpose=purchase&boards=1&board=base",
+      "bom-purchase-x1.csv",
     );
+  });
+
+  it("orders the purchase export for the build quantity, and refuses a bad one", async () => {
+    vi.spyOn(api, "getJSON").mockResolvedValue(BOM);
+    const download = vi.spyOn(api, "download").mockResolvedValue();
+    render(<BomTable projectId="p" board={null} reloadToken={0} />);
+    const qty = await screen.findByLabelText("Boards to build");
+    await userEvent.clear(qty);
+    await userEvent.type(qty, "250");
+    await userEvent.click(screen.getByRole("button", { name: "Export BOM for purchasing / quotes" }));
+    expect(download).toHaveBeenLastCalledWith("/api/projects/p/bom.csv?purpose=purchase&boards=250", "bom-purchase-x250.csv");
+
+    await userEvent.clear(qty);
+    expect((screen.getByRole("button", { name: "Export BOM for purchasing / quotes" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("says why an export failed", async () => {
