@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -79,6 +81,7 @@ def test_the_project_file_survives_every_step(board, tmp_path, monkeypatch):
 
     monkeypatch.setattr(krt_route, "_resave", clobber)
     monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: clobber())
+    monkeypatch.setattr(krt_route, "_snap_terminals", clobber)
     monkeypatch.setattr(krt_route, "_fill", clobber)
     monkeypatch.setattr(krt_route, "_run", run)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 3, "segments": 400})
@@ -227,14 +230,17 @@ def test_an_edge_band_goes_on_before_routing_and_comes_off_after(board, tmp_path
     monkeypatch.setattr(krt_route, "_resave", lambda *a: calls.append("resave") or ok)
     monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add, **kw: calls.append(("band", add, d)) or ok)
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: calls.append(Path(cmd[1]).name) or ok)
+    monkeypatch.setattr(krt_route, "_snap_terminals", lambda *a: calls.append("snap") or ok)
     monkeypatch.setattr(krt_route, "_fill", lambda *a: calls.append("fill") or ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
     assert krt_route.route(board, work_dir=tmp_path / "w").ok
     # Band on after the re-save, before any routing; off before the fill.
     # Its depth is the edge rule plus half the widest track (0.75 / 2).
+    # Track ends are joined to their pads once the band is off, before the
+    # fill and the measure.
     assert calls[:2] == ["resave", ("band", True, 0.875)]
-    assert calls[-2:] == [("band", False, 0), "fill"]
-    assert all("route" in c for c in calls[2:-2])
+    assert calls[-3:] == [("band", False, 0), "snap", "fill"]
+    assert all("route" in c for c in calls[2:-3])
 
 
 def _two_class_board(tmp_path, nets, classes, patterns):
@@ -277,7 +283,7 @@ def test_a_pair_whose_gap_is_under_its_clearance_is_refused_not_widened(tmp_path
     monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
     monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
     ok = subprocess.CompletedProcess([], 0, "", "")
-    for fn in ("_resave", "_edge_band", "_fill"):
+    for fn in ("_resave", "_edge_band", "_snap_terminals", "_fill"):
         monkeypatch.setattr(krt_route, fn, lambda *a, **k: ok)
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 2, "segments": 10})
@@ -317,7 +323,7 @@ def test_a_route_that_laid_no_track_with_connections_open_fails(board, tmp_path,
     monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
     monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
     ok = subprocess.CompletedProcess([], 0, "", "")
-    for fn in ("_resave", "_edge_band", "_fill"):
+    for fn in ("_resave", "_edge_band", "_snap_terminals", "_fill"):
         monkeypatch.setattr(krt_route, fn, lambda *a, **k: ok)
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 12, "segments": 0})
@@ -490,6 +496,7 @@ def test_a_band_layer_the_board_already_uses_is_left_alone(board, tmp_path, monk
     monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
     monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add, **kw: calls.append(add) or (taken if add else ok))
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: cmds.append(cmd) or ok)
+    monkeypatch.setattr(krt_route, "_snap_terminals", lambda *a: ok)
     monkeypatch.setattr(krt_route, "_fill", lambda *a: ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 5})
     r = krt_route.route(board, work_dir=tmp_path / "w")
@@ -625,6 +632,7 @@ def test_the_band_rings_npth_holes_at_the_hole_clearance(board, tmp_path, monkey
     monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
     monkeypatch.setattr(krt_route, "_edge_band", lambda py, pcb, d, add, **k: seen.append((add, d, k)) or ok)
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: ok)
+    monkeypatch.setattr(krt_route, "_snap_terminals", lambda *a: ok)
     monkeypatch.setattr(krt_route, "_fill", lambda *a: ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
     krt_route.route(board, work_dir=tmp_path / "w")
@@ -641,3 +649,82 @@ def test_the_npth_ring_is_drawn_by_the_band_script(tmp_path, monkeypatch):
     monkeypatch.setattr(ar, "_pcbnew", lambda py, s: scripts.append(s) or subprocess.CompletedProcess([], 0, "", ""))
     krt_route._edge_band("py", tmp_path / "b.kicad_pcb", 0.6, add=True, hole_ring_mm=0.35)
     assert "PAD_ATTRIB_NPTH" in scripts[0] and "FromMM(0.35)" in scripts[0]
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_a_track_ending_in_a_chamfered_corner_is_joined_to_its_pad(tmp_path):
+    """KRT ends a track on a pad's bounding rectangle; on verdacor's U1 pad 23,
+    a chamfered castellation, it ended in the cut-away corner and the net
+    stayed open. A track ending on the pad's copper is left alone, and so is
+    one whose stub would pass another net or that ends too far off the copper
+    to be a near miss (Codex, PR #69)."""
+    import pcbnew
+
+    board = pcbnew.BOARD()
+    net = pcbnew.NETINFO_ITEM(board, "SIG", 1)
+    board.Add(net)
+    other = pcbnew.NETINFO_ITEM(board, "OTHER", 2)
+    board.Add(other)
+    fp = pcbnew.FOOTPRINT(board)
+    board.Add(fp)
+    mm = pcbnew.FromMM
+    for number, x in (("1", 10.0), ("2", 20.0), ("3", 30.0), ("4", 40.0)):
+        pad = pcbnew.PAD(fp)
+        pad.SetNumber(number)
+        pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+        pad.SetLayerSet(pad.SMDMask())
+        pad.SetShape(pcbnew.F_Cu, pcbnew.PAD_SHAPE_CHAMFERED_RECT)
+        pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(1.232), mm(0.95)))
+        pad.SetChamferRectRatio(pcbnew.F_Cu, 0.45)
+        pad.SetChamferPositions(pcbnew.F_Cu, 4)  # RECT_CHAMFER_BOTTOM_LEFT; not exported by SWIG
+        pad.SetPosition(pcbnew.VECTOR2I(mm(x), mm(10.0)))
+        pad.SetNet(net)
+        fp.Add(pad)
+
+    def track(a, b, n=net):
+        t = pcbnew.PCB_TRACK(board)
+        t.SetStart(pcbnew.VECTOR2I(mm(a[0]), mm(a[1])))
+        t.SetEnd(pcbnew.VECTOR2I(mm(b[0]), mm(b[1])))
+        t.SetWidth(mm(0.2))
+        t.SetLayer(pcbnew.F_Cu)
+        board.Add(t)
+        t.SetNet(n)
+
+    # Into pad 1's cut-away bottom-left corner: inside its box, off its copper.
+    track((5.0, 12.0), (9.445, 10.35))
+    # Onto pad 2's copper, near its centre.
+    track((25.0, 12.0), (20.1, 10.0))
+    # The same near miss on pad 3, with another net 0.18 mm from the stub.
+    track((25.0, 13.0), (29.445, 10.35))
+    track((29.1, 10.2), (29.1, 8.0), other)
+    # Into pad 4's very corner: 0.2 mm off its copper, beyond a near miss.
+    track((35.0, 12.0), (39.384, 10.475))
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+    # pcbnew saves every track of a board built from Python under its first
+    # net, whatever the track carries in memory, so the blocker is put on its
+    # own net in the file.
+    from blpl.emitter import sexpr
+
+    tree = sexpr.parse(pcb.read_text())
+    for seg in sexpr.find_all(tree, "segment"):
+        name = "OTHER" if sexpr.find(seg, "start")[1:] == ["29.1", "10.2"] else "SIG"
+        at = next(i for i, n in enumerate(seg) if isinstance(n, list) and n and n[0] == "net")
+        seg[at] = ["net", sexpr.quote(name)]
+    pcb.write_text(sexpr.dump_top(tree))
+    nets = sorted(t.GetNetname() for t in pcbnew.LoadBoard(str(pcb)).GetTracks())
+    assert nets == ["OTHER"] + ["SIG"] * 4
+
+    proc = krt_route._snap_terminals(sys.executable, pcb, 0.2)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "1"
+    after = pcbnew.LoadBoard(str(pcb))
+    tracks = [t for t in after.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T]
+    assert len(tracks) == 6
+
+    def ends(t):
+        return {(round(pcbnew.ToMM(p.x), 3), round(pcbnew.ToMM(p.y), 3)) for p in (t.GetStart(), t.GetEnd())}
+
+    assert {(9.445, 10.35), (10.0, 10.0)} in [ends(t) for t in tracks]
