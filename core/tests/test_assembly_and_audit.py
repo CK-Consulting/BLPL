@@ -113,6 +113,38 @@ def test_cutouts_are_board_edge_to_the_audit():
     assert found == {("U1", "in_cutout"), ("C1", "in_edge_margin")}
 
 
+def test_a_part_on_the_back_is_judged_by_the_back_sides_rules():
+    """The ear tag's debug pads, moved under the cell on B.Cu, were reported as
+    inside the pocket's F.Cu-only footprint keepouts and on the parts above."""
+    board = board_geometry.from_config({
+        "project": {"name": "t", "dimensions": [40, 30]},
+        "boundaries": {"keepouts": [
+            {"name": "front only", "shape": "rect", "center": [10, 15], "size": [8, 8],
+             "layers": ["F.Cu"], "forbid": ["footprints"]},
+            {"name": "both", "shape": "rect", "center": [30, 15], "size": [8, 8],
+             "layers": ["*.Cu"], "forbid": ["footprints"]},
+            {"name": "outer pair", "shape": "rect", "center": [30, 25], "size": [6, 6],
+             "layers": ["F&B.Cu"], "forbid": ["footprints"]},
+        ]},
+    })
+    result = _result({
+        "J1": (10, 15, 2, 2),   # under the front-only keepout, on the back
+        "J2": (30, 15, 2, 2),   # under the both-sides keepout, on the back
+        "R1": (20, 5, 2, 2),    # on the front
+        "J3": (20, 5, 2, 2),    # directly under R1, on the back
+        "J4": (30, 25, 2, 2),   # under the F&B.Cu keepout, on the back
+        "R2": (31, 24, 1, 1),   # under the same keepout, on the front
+    })
+    for ref in ("J1", "J2", "J3", "J4"):
+        result.placements[ref].side = "bottom"
+    found = {(f["ref"], f["problem"]) for f in placement.audit(result, board, {}, 1.0)}
+    assert found == {("J2", "in_keepout"), ("J4", "in_keepout"), ("R2", "in_keepout")}
+
+    result.placements["J1"].side = "top"
+    found = {(f["ref"], f["problem"]) for f in placement.audit(result, board, {}, 1.0)}
+    assert ("J1", "in_keepout") in found
+
+
 def test_edge_clearance_is_measured_along_the_courtyard_not_at_its_corners():
     # A V notch whose tip comes to 0.5 mm of the middle of U1's top edge,
     # while every corner of U1 is several millimetres clear.
