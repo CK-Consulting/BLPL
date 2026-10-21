@@ -9,7 +9,7 @@ import { boardArtifact, withBoard } from "../board";
 //
 // Two CSV exports, because a BOM is asked two questions: every part on the
 // board, test pads and fiducials included, and only what has to be bought,
-// grouped with quantities for a quote. The server builds both from the board
+// as MPN, MFG, QTY for a quote. The server builds both from the board
 // as Stage 5 left it (blpl.core.bom_export), which knows what this table does
 // not: which parts project.yaml marks footprint-only or DNP.
 
@@ -93,7 +93,7 @@ export function BomTable({
             {exporting === "all" ? "Exporting…" : "Export BOM to CSV"}
           </button>
           <button type="button" disabled={exporting !== null} onClick={() => exportCsv("purchase")}
-            title="Only the parts that are bought, grouped with quantities: no test pads, fiducials, footprint-only or DNP parts">
+            title="MPN, MFG, QTY for the parts that are bought: no test pads, fiducials, footprint-only or DNP parts">
             {exporting === "purchase" ? "Exporting…" : "Export BOM for purchasing / quotes"}
           </button>
         </span>

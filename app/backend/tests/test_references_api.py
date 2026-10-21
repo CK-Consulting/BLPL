@@ -299,8 +299,7 @@ def test_bom_csv_exports_every_part_or_only_what_is_bought(unlocked) -> None:
 
     r = unlocked.get("/api/projects/alpha/bom.csv?purpose=purchase")
     assert 'filename="alpha-bom-purchase.csv"' in r.headers["content-disposition"]
-    rows = list(csv.DictReader(io.StringIO(r.text)))
-    assert [(row["Designators"], row["Quantity"]) for row in rows] == [("R1,R2", "2")]
+    assert r.text.splitlines() == ["MPN,MFG,QTY", "RC0402,Yageo,2"]
 
     assert unlocked.get("/api/projects/alpha/bom.csv?purpose=quotes").status_code == 400
 
