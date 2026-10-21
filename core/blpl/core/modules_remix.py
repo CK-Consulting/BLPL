@@ -144,6 +144,7 @@ def expand(artifact: dict, project_dir: Path, names: list[str]) -> None:
             continue
 
         ports = _ports(module_dir)
+        private: dict[str, str] = {}
         added = 0
         unwired: list[str] = []
         for row in rows if isinstance(rows, list) else []:
@@ -176,7 +177,7 @@ def expand(artifact: dict, project_dir: Path, names: list[str]) -> None:
                 {
                     "local_id": local_id,
                     "pins": [
-                        {"pin": str(pin), "signal": _net_name(name, str(net), ports)}
+                        {"pin": str(pin), "signal": _net_name(name, str(net), ports, private)}
                         for pin, net in pins.items()
                     ],
                     "pin_count": len(pins),
@@ -226,10 +227,23 @@ def _ports(module_dir: Path) -> set[str]:
     return {str(p.get("port")) for p in data.get("interface") or [] if isinstance(p, dict) and p.get("port")}
 
 
-def _net_name(module: str, net: str, ports: set[str]) -> str:
-    """A port keeps its name so the carrier joins it; anything else is private."""
+def _net_name(module: str, net: str, ports: set[str], private: dict[str, str]) -> str:
+    """A port keeps its name so the carrier joins it; anything else is private.
+
+    A private name must survive Stage 4, which drops a trailing parenthesised
+    comment from every signal. KiCad's own names are exactly that shape:
+    ``Net-(U1-A)`` and ``Net-(U1-B)`` both came out as ``m.Net-`` and were
+    merged into one net, shorting two nodes of the module. Parentheses are
+    dropped here instead, and a name two nets would share is numbered.
+    """
     from .stage4_synthesize_nets import is_no_connect  # noqa: PLC0415
 
     if net in ports or is_no_connect(net):
         return net
-    return f"{module}.{net}"
+    if net not in private:
+        base = f"{module}." + re.sub(r"[()]", "", net).strip()
+        candidate, n = base, 2
+        while candidate in private.values():
+            candidate, n = f"{base}_{n}", n + 1
+        private[net] = candidate
+    return private[net]

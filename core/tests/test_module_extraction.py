@@ -344,6 +344,29 @@ def test_two_modules_internal_nets_never_merge(board_dir, tmp_path) -> None:
     assert {"a.CHG_INT", "b.CHG_INT", "VBAT", "SDA"} <= signals
 
 
+def test_kicads_generated_net_names_stay_distinct_through_stage4(board_dir, tmp_path) -> None:
+    """``Net-(U1-A)`` and ``Net-(U1-B)`` both normalised to ``m.Net-`` in
+    Stage 4, which drops a trailing parenthesis, and merged into one net."""
+    from blpl.core import stage4_synthesize_nets as s4
+
+    project = tmp_path / "carrier"
+    project.mkdir()
+    path, _ = write_module(plan_module(read_project(board_dir), ["U1", "C1"], name="m"), project)
+    rows = json.loads((path / "bom.json").read_text())
+    nets = {"U1": {"1": "Net-(U1-A)", "2": "Net-(U1-B)", "3": "Net-U1-A"},
+            "C1": {"1": "Net-(U1-A)", "2": "Net-(U1-B)"}}
+    for row in rows:
+        row["pins"] = nets[row["refdes"]]
+    (path / "bom.json").write_text(json.dumps(rows))
+    (project / "design.md").write_text("# C\n\n## Modules\n\n- m\n", encoding="utf-8")
+    artifact = stage0_deterministic.extract([project / "design.md"])
+    pins = {c["local_id"]: {p["pin"]: p["signal"] for p in c["pins"]} for c in artifact["connectors"]}
+    after = {pin: s4._normalize_signal(sig) for pin, sig in pins["m.U1"].items()}
+    assert len(set(after.values())) == 3, after
+    # The same source net is still one net across parts.
+    assert pins["m.C1"] == {"1": pins["m.U1"]["1"], "2": pins["m.U1"]["2"]}
+
+
 def test_a_module_extracted_before_pins_were_recorded_says_its_parts_are_unwired(board_dir, tmp_path) -> None:
     project = tmp_path / "carrier"
     project.mkdir()
@@ -356,6 +379,31 @@ def test_a_module_extracted_before_pins_were_recorded_says_its_parts_are_unwired
     artifact = stage0_deterministic.extract([project / "design.md"])
     assert any(w["code"] == "STAGE0-009" and "U1" in w["summary"] for w in artifact["warnings"])
     assert not artifact["connectors"]
+
+
+def test_a_symbol_nickname_is_read_from_the_file_its_table_entry_names(board_dir, tmp_path) -> None:
+    """``Alias`` mapped to ``actual.kicad_sym`` was dropped, because the file
+    was not named after the nickname, and a sibling ``Alias.kicad_sym`` won."""
+    libs = board_dir / "libs"
+    libs.mkdir()
+    (libs / "actual.kicad_sym").write_text(
+        '(kicad_symbol_lib (symbol "Part" (property "Value" "right")))', encoding="utf-8")
+    (libs / "Alias.kicad_sym").write_text(
+        '(kicad_symbol_lib (symbol "Part" (property "Value" "shadow")))', encoding="utf-8")
+    (board_dir / "sym-lib-table").write_text(
+        '(sym_lib_table (version 7) (lib (name "Alias") (type "KiCad")'
+        ' (uri "${KIPRJMOD}/libs/actual.kicad_sym") (options "") (descr "")))',
+        encoding="utf-8",
+    )
+    spec = plan_module(read_project(board_dir), ["U1"], name="m")
+    for row in spec.bom:
+        row["symbol"] = "Alias:Part"
+    project = tmp_path / "p"
+    project.mkdir()
+    path, notes = write_module(spec, project, symbol_roots=[libs])
+    text = (path / "Alias.kicad_sym").read_text()
+    assert '"right"' in text and '"shadow"' not in text
+    assert not any("Alias:Part" in n for n in notes)
 
 
 def test_footprints_come_from_the_boards_own_library_table(board_dir, tmp_path) -> None:
