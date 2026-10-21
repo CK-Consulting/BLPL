@@ -905,7 +905,8 @@ def audit(result: "Result", board: "tuple[float, float] | board_geometry.Board",
     Stage 8 would. A pinned part could sit across the board edge, inside the
     edge margin, in a keepout or on another part, and the first anyone heard of
     it was DRC. Findings, worst first: off_board, in_cutout, in_edge_margin,
-    in_keepout, overlap. A part that seeks an edge (a connector, an ``edge`` hint) may come
+    in_keepout, overlap. Keepouts and overlaps are judged per side, as KiCad
+    judges them. A part that seeks an edge (a connector, an ``edge`` hint) may come
     as close as the placer lets those, not the full margin.
     """
     hints = hints or {}
@@ -946,8 +947,11 @@ def audit(result: "Result", board: "tuple[float, float] | board_geometry.Board",
         if nearest < margin - 1e-6:
             finding(ref, "in_edge_margin",
                     f"{nearest:.2f} mm from the edge, inside the {margin:g} mm edge margin")
+        side = result.placements[ref].side
         for f in features:
             if not f.blocks_parts or getattr(f, "anchor", None) == ref:
+                continue
+            if not f.blocks_side(side):
                 continue
             if f.kind == "keepout" and board_geometry.box_overlaps(box, f.shape.polygon):
                 finding(ref, "in_keepout", f"inside keepout {f.name or f.where}")
@@ -955,6 +959,10 @@ def audit(result: "Result", board: "tuple[float, float] | board_geometry.Board",
     for i, a in enumerate(refs):
         ax0, ay0, ax1, ay1 = boxes[a]
         for b in refs[i + 1:]:
+            # Courtyards collide only on the same side: a part on the back
+            # may sit under one on the front, as KiCad checks them.
+            if result.placements[a].side != result.placements[b].side:
+                continue
             bx0, by0, bx1, by1 = boxes[b]
             if ax0 < bx1 - 1e-6 and bx0 < ax1 - 1e-6 and ay0 < by1 - 1e-6 and by0 < ay1 - 1e-6:
                 finding(a, "overlap", f"its courtyard overlaps {b}'s", [a, b])
