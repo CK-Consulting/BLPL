@@ -154,3 +154,22 @@ def test_a_symlink_out_of_the_project_does_not_widen_the_read(board_dir, tmp_pat
     (project / "elsewhere").symlink_to(board_dir)
     with pytest.raises(ToolDenied):
         asyncio.run(_tool("read_kicad_design").handler(_ctx(project), {"directory": "elsewhere"}))
+
+
+def test_extraction_copies_a_footprint_from_the_projects_own_libraries(board_dir, tmp_path) -> None:
+    """Stock was the only footprint root the tool passed, so every project
+    footprint a module used was left behind with a 'not found' note."""
+    import asyncio
+
+    project = tmp_path / "carrier"
+    project.mkdir()
+    shutil.copytree(board_dir, project / "src")
+    fp = project / "libraries" / "footprints" / "Package_QFN.pretty"
+    fp.mkdir(parents=True)
+    (fp / "QFN-28.kicad_mod").write_text('(footprint "QFN-28")', encoding="utf-8")
+    ctx = _ctx(project)
+    asyncio.run(_tool("read_kicad_design").handler(ctx, {"directory": "src"}))
+
+    out = json.loads(asyncio.run(_tool("extract_module").handler(ctx, {"refdes": ["U1"], "name": "chg"})))
+    assert (project / "modules" / "chg" / "Package_QFN.pretty" / "QFN-28.kicad_mod").is_file()
+    assert not any("QFN-28" in n for n in out["notes"])
