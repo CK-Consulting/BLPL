@@ -1016,3 +1016,94 @@ def test_stitching_keeps_each_pads_own_plane_net_every_layer_and_cutout_clear(tm
     beside_cut = [v for v in new if at(v, 30, 20) <= mm(1.0)]
     assert len(beside_cut) == 1 and beside_cut[0].GetNetname() == "GND"
     assert at(beside_cut[0], 31.2, 20) >= mm(1.0 + 0.5 + 0.3) - 1
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_no_stitching_via_floats_off_a_partial_plane_or_links_across_a_track_keepout(tmp_path):
+    """Codex, PR #72: a via outside a partial plane connected nothing, and a
+    capacitor's link could cross a keepout that forbids tracks."""
+    import pcbnew
+
+    from blpl.emitter import sexpr
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    board.SetCopperLayerCount(4)
+    for name in ("GND", "SIG"):
+        board.Add(pcbnew.NETINFO_ITEM(board, name))
+    edge = pcbnew.PCB_SHAPE(board)
+    edge.SetShape(pcbnew.SHAPE_T_RECTANGLE)
+    edge.SetStart(pcbnew.VECTOR2I(0, 0))
+    edge.SetEnd(pcbnew.VECTOR2I(mm(40), mm(30)))
+    edge.SetLayer(pcbnew.Edge_Cuts)
+    edge.SetWidth(mm(0.1))
+    board.Add(edge)
+    zone = pcbnew.ZONE(board)                      # GND on In1, left half only
+    board.Add(zone)
+    zone.SetLayer(pcbnew.In1_Cu)
+    zone.Outline().NewOutline()
+    for x, y in ((1, 1), (18, 1), (18, 29), (1, 29)):
+        zone.Outline().Append(mm(x), mm(y))
+    keepout = pcbnew.ZONE(board)                   # no tracks around C3's ground pad
+    board.Add(keepout)
+    keepout.SetIsRuleArea(True)
+    keepout.SetDoNotAllowTracks(True)
+    keepout.SetDoNotAllowVias(False)
+    keepout.SetDoNotAllowPads(False)
+    keepout.SetDoNotAllowFootprints(False)
+    keepout.SetDoNotAllowZoneFills(False)
+    keepout.SetLayer(pcbnew.F_Cu)
+    keepout.Outline().NewOutline()
+    for x, y in ((10.6, 18.0), (13.0, 18.0), (13.0, 22.0), (10.6, 22.0)):
+        keepout.Outline().Append(mm(x), mm(y))
+    fp = pcbnew.FOOTPRINT(board)
+    fp.SetReference("C3")
+    board.Add(fp)
+    for number, x in (("1", 10.0), ("2", 11.5)):
+        pad = pcbnew.PAD(fp)
+        pad.SetNumber(number)
+        pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+        pad.SetLayerSet(pad.SMDMask())
+        pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(0.6), mm(0.6)))
+        pad.SetPosition(pcbnew.VECTOR2I(mm(x), mm(20.0)))
+        fp.Add(pad)
+    via = pcbnew.PCB_VIA(board)                    # outside the plane
+    board.Add(via)
+    via.SetPosition(pcbnew.VECTOR2I(mm(30), mm(10)))
+    via.SetWidth(mm(0.6))
+    via.SetDrill(mm(0.3))
+    via.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+
+    tree = sexpr.parse(pcb.read_text())
+    top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
+
+    def set_net(node, name):
+        for i, c in enumerate(node):
+            if isinstance(c, list) and sexpr.head(c) == "net":
+                node[i] = ["net", sexpr.quote(name)]
+                return
+        node.append(["net", sexpr.quote(name)])
+
+    for node in top:
+        if not isinstance(node, list):
+            continue
+        tag = sexpr.head(node)
+        if tag == "via":
+            set_net(node, "SIG")
+        elif tag == "zone" and sexpr.find(node, "keepout") is None:
+            set_net(node, "GND")
+        elif tag == "footprint":
+            for pad in sexpr.find_all(node, "pad"):
+                set_net(pad, "GND" if sexpr.unquote(pad[1]) == "2" else "SIG")
+    pcb.write_text(sexpr.dump_top(tree))
+
+    proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
+                             edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "0 2"
+    after = pcbnew.LoadBoard(str(pcb))
+    assert not [t for t in after.GetTracks() if t.GetNetname() == "GND"]

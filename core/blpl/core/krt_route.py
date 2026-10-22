@@ -721,8 +721,11 @@ def _stitch(python: str, pcb: Path, *, via_mm: float, drill_mm: float, clearance
     of the two items' class clearances, never under ``clearance_mm`` (as DRC
     judges a pair), stays off every pad (no via in a pad), keeps ``edge_mm``
     from the board edge and its cutouts, the hole clearances from
-    every hole, and is in no keepout that forbids vias. A capacitor's via is
-    joined to its pad by a track that has to clear the same way. Where no spot
+    every hole, is in no keepout that forbids vias, and is inside one of its
+    net's inner-layer zones (and, after the refill, in that zone's fill, or it
+    is taken out again: a via outside a partial plane would float). A
+    capacitor's via is joined to its pad by a track that has to clear the same
+    way and cross no keepout that forbids tracks. Where no spot
     clears, nothing is placed: an unstitched via is a review finding, a via
     shorted to a neighbour is a scrapped board. The zones are refilled
     afterwards. Prints "placed missed".
@@ -766,6 +769,16 @@ def _stitch(python: str, pcb: Path, *, via_mm: float, drill_mm: float, clearance
         "        best = d if best is None or d < best else best\n"
         "    return best if best is not None else 0\n"
         "keepouts = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowVias()]\n"
+        "no_tracks = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowTracks()]\n"
+        "plane_zones = [z for z in b.Zones() if not z.GetIsRuleArea() and z.GetNetCode() in planes]\n"
+        "def in_plane(at, net):\n"
+        "    # Inside one of the net's own inner-layer zones: a partial plane is\n"
+        "    # allowed, and a via outside it would float (Codex, PR #72).\n"
+        "    return any(z.GetNetCode() == net and any(z.IsOnLayer(l) and z.Outline().Contains(at) for l in inner)\n"
+        "               for z in plane_zones)\n"
+        "def link_ok(link, layer):\n"
+        "    # A link crosses no keepout that forbids tracks, as _snap_terminals checks.\n"
+        "    return not any(z.IsOnLayer(layer) and z.Outline().Collide(link, 0) for z in no_tracks)\n"
         "pads = [p for fp in b.GetFootprints() for p in fp.Pads()]\n"
         "items = [t for t in b.GetTracks()]\n"
         "holes = [(v.GetPosition(), v.GetDrillValue() // 2) for v in items if v.Type() == pcbnew.PCB_VIA_T]\n"
@@ -804,6 +817,8 @@ def _stitch(python: str, pcb: Path, *, via_mm: float, drill_mm: float, clearance
         "def spot_ok(at, net):\n"
         "    if not outline.Contains(at) or edge_distance(at) < EDGE + VR:\n"
         "        return False\n"
+        "    if not in_plane(at, net):\n"
+        "        return False\n"
         "    for z in keepouts:\n"
         "        if z.Outline().Collide(pcbnew.VECTOR2I(at), VR):\n"
         "            return False\n"
@@ -820,18 +835,20 @@ def _stitch(python: str, pcb: Path, *, via_mm: float, drill_mm: float, clearance
         "    v.SetPosition(at); v.SetWidth(2 * VR); v.SetDrill(2 * DR)\n"
         "    v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu); v.SetNetCode(net)\n"
         "    items.append(v); holes.append((at, DR))\n"
+        "    added.append([v])\n"
         "    if link_from is not None:\n"
         "        t = pcbnew.PCB_TRACK(b)\n"
         "        b.Add(t)\n"
         "        t.SetStart(link_from); t.SetEnd(at); t.SetWidth(width)\n"
         "        t.SetLayer(link_layer); t.SetNetCode(net)\n"
-        "        items.append(t)\n"
+        "        items.append(t); added[-1].append(t)\n"
         "def ring(c, radii):\n"
         "    for r in radii:\n"
         "        for k in range(24):\n"
         "            a = 2 * math.pi * k / 24\n"
         "            yield pcbnew.VECTOR2I(int(c.x + r * math.cos(a)), int(c.y + r * math.sin(a)))\n"
         "placed = missed = 0\n"
+        "added = []\n"
         "for v in [t for t in items if t.Type() == pcbnew.PCB_VIA_T and t.GetNetCode() not in planes\n"
         "          and t.GetNetCode() > 0]:\n"
         "    c = v.GetPosition()\n"
@@ -857,12 +874,27 @@ def _stitch(python: str, pcb: Path, *, via_mm: float, drill_mm: float, clearance
         "    lo = half + VR + mm(0.05)\n"
         "    for at in ring(c, [r for r in (lo, lo + mm(0.1), REACH) if r <= REACH]):\n"
         "        link = pcbnew.SHAPE_SEGMENT(c, at, width)\n"
-        "        if spot_ok(at, net) and clears(link, (link_layer,), net, False):\n"
+        "        if spot_ok(at, net) and clears(link, (link_layer,), net, False) and link_ok(link, link_layer):\n"
         "            place(at, net, c, width, link_layer); placed += 1; break\n"
         "    else:\n"
         "        missed += 1\n"
         "zones = b.Zones()\n"
         "if len(zones):\n"
+        "    pcbnew.ZONE_FILLER(b).Fill(zones)\n"
+        "# Kept only where the fill actually connects it, by KiCad's own reckoning\n"
+        "# (a via joins through thermal spokes, its centre in a gap of the fill):\n"
+        "# a via inside the zone's outline can still sit in a void, and float.\n"
+        "b.BuildConnectivity()\n"
+        "conn = b.GetConnectivity()\n"
+        "def filled(v):\n"
+        "    return any(it.Type() == pcbnew.PCB_ZONE_T and it.GetNetCode() == v.GetNetCode()\n"
+        "               for it in conn.GetConnectedItems(v))\n"
+        "orphans = [group for group in added if not filled(group[0])]\n"
+        "for group in orphans:\n"
+        "    for item in group:\n"
+        "        b.Remove(item)\n"
+        "placed -= len(orphans); missed += len(orphans)\n"
+        "if orphans and len(zones):\n"
         "    pcbnew.ZONE_FILLER(b).Fill(zones)\n"
         f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
         "print(placed, missed)\n"
