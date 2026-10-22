@@ -363,9 +363,13 @@ def clip_to_neighbours(footprints: list[list]) -> int:
         y1 = max(p[1] for p in board_pts) + 2.0
         extra: dict[str, list] = {}
         for side in sides:
+            # By overlapping boxes, not by a pad corner inside this one: a
+            # long pad crossing the silk with every corner outside it was
+            # dropped and the silk left on its copper (Codex, PR #72).
             near = [(poly, half) for other in footprints if other is not fp
                     for poly, half in board[id(other)][side]
-                    if any(x0 <= x <= x1 and y0 <= y <= y1 for x, y in poly)]
+                    if min(x for x, _ in poly) - half <= x1 and max(x for x, _ in poly) + half >= x0
+                    and min(y for _, y in poly) - half <= y1 and max(y for _, y in poly) + half >= y0]
             if near:
                 extra[side] = [([_rotate(x - fx, y - fy, -frot) for x, y in poly], half) for poly, half in near]
         if extra:

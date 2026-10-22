@@ -898,3 +898,121 @@ def test_ground_vias_go_beside_signal_vias_and_decoupling_pads_where_they_clear(
         assert not v.GetEffectiveShape(pcbnew.F_Cu).Collide(sig_track.GetEffectiveShape(pcbnew.F_Cu), mm(0.2))
     link = [t for t in after.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() == "GND"]
     assert len(link) == 1   # C1's pad joined to its via
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_stitching_keeps_each_pads_own_plane_net_every_layer_and_cutout_clear(tmp_path):
+    """Codex, PR #72: a VDD pad got a GND link, a through via was checked on
+    the outer layers only, and a cutout's edge was not board edge."""
+    import pcbnew
+
+    from blpl.emitter import sexpr
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    board.SetCopperLayerCount(4)
+    for name in ("GND", "VDD", "SIG", "WALL"):
+        board.Add(pcbnew.NETINFO_ITEM(board, name))
+
+    def shape(kind, a, b):
+        s = pcbnew.PCB_SHAPE(board)
+        s.SetShape(kind)
+        s.SetStart(pcbnew.VECTOR2I(mm(a[0]), mm(a[1])))
+        s.SetEnd(pcbnew.VECTOR2I(mm(b[0]), mm(b[1])))
+        s.SetLayer(pcbnew.Edge_Cuts)
+        s.SetWidth(mm(0.1))
+        board.Add(s)
+
+    shape(pcbnew.SHAPE_T_RECTANGLE, (0, 0), (40, 30))
+    shape(pcbnew.SHAPE_T_CIRCLE, (31.2, 20), (32.2, 20))      # a 1 mm cutout beside the via at (30, 20)
+    for layer in (pcbnew.In1_Cu, pcbnew.In2_Cu):
+        zone = pcbnew.ZONE(board)
+        board.Add(zone)
+        zone.SetLayer(layer)
+        zone.Outline().NewOutline()
+        for x, y in ((1, 1), (39, 1), (39, 29), (1, 29)):
+            zone.Outline().Append(mm(x), mm(y))
+    fp = pcbnew.FOOTPRINT(board)
+    fp.SetReference("C2")
+    board.Add(fp)
+    for number, x in (("1", 10.0), ("2", 11.0)):
+        pad = pcbnew.PAD(fp)
+        pad.SetNumber(number)
+        pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+        pad.SetLayerSet(pad.SMDMask())
+        pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(0.6), mm(0.6)))
+        pad.SetPosition(pcbnew.VECTOR2I(mm(x), mm(20.0)))
+        fp.Add(pad)
+
+    def via(x, y):
+        v = pcbnew.PCB_VIA(board)
+        board.Add(v)
+        v.SetPosition(pcbnew.VECTOR2I(mm(x), mm(y)))
+        v.SetWidth(mm(0.6))
+        v.SetDrill(mm(0.3))
+        v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+
+    via(30, 10)                       # walled in on In2 only: no room
+    for y in (9.0, 11.0):
+        t = pcbnew.PCB_TRACK(board)
+        board.Add(t)
+        t.SetStart(pcbnew.VECTOR2I(mm(28.5), mm(y)))
+        t.SetEnd(pcbnew.VECTOR2I(mm(31.5), mm(y)))
+        t.SetWidth(mm(1.0))
+        t.SetLayer(pcbnew.In2_Cu)
+    for x in (29.0, 31.0):
+        t = pcbnew.PCB_TRACK(board)
+        board.Add(t)
+        t.SetStart(pcbnew.VECTOR2I(mm(x), mm(8.5)))
+        t.SetEnd(pcbnew.VECTOR2I(mm(x), mm(11.5)))
+        t.SetWidth(mm(1.0))
+        t.SetLayer(pcbnew.In2_Cu)
+    via(30, 20)                       # beside the cutout: only its far side clears
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+
+    tree = sexpr.parse(pcb.read_text())
+    top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
+
+    def set_net(node, name):
+        for i, c in enumerate(node):
+            if isinstance(c, list) and sexpr.head(c) == "net":
+                node[i] = ["net", sexpr.quote(name)]
+                return
+        node.append(["net", sexpr.quote(name)])
+
+    for node in top:
+        if not isinstance(node, list):
+            continue
+        tag = sexpr.head(node)
+        if tag == "via":
+            set_net(node, "SIG")
+        elif tag == "segment":
+            set_net(node, "WALL")
+        elif tag == "zone":
+            set_net(node, "GND" if sexpr.unquote(sexpr.find(node, "layer")[1]) == "In1.Cu" else "VDD")
+        elif tag == "footprint":
+            for pad in sexpr.find_all(node, "pad"):
+                set_net(pad, "VDD" if sexpr.unquote(pad[1]) == "1" else "GND")
+    pcb.write_text(sexpr.dump_top(tree))
+
+    proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
+                             edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "3 1"
+
+    after = pcbnew.LoadBoard(str(pcb))
+    new = [v for v in after.GetTracks() if v.Type() == pcbnew.PCB_VIA_T and v.GetNetname() in ("GND", "VDD")]
+    at = lambda v, x, y: (v.GetPosition() - pcbnew.VECTOR2I(mm(x), mm(y))).EuclideanNorm()
+    # Each capacitor pad stitched to its own plane net, never the other's.
+    assert any(v.GetNetname() == "VDD" and at(v, 10, 20) <= mm(1.0) for v in new)
+    assert any(v.GetNetname() == "GND" and at(v, 11, 20) <= mm(1.0) for v in new)
+    links = {t.GetNetname() for t in after.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T and t.GetLayer() == pcbnew.F_Cu}
+    assert links == {"VDD", "GND"}
+    # Nothing through the In2 wall; the cutout via's ground via keeps the edge rule from the cutout.
+    assert not any(at(v, 30, 10) <= mm(1.0) for v in new)
+    beside_cut = [v for v in new if at(v, 30, 20) <= mm(1.0)]
+    assert len(beside_cut) == 1 and beside_cut[0].GetNetname() == "GND"
+    assert at(beside_cut[0], 31.2, 20) >= mm(1.0 + 0.5 + 0.3) - 1

@@ -139,3 +139,16 @@ def test_an_outline_is_trimmed_off_a_neighbours_pads_once_both_are_placed():
     assert len(on_b) == 2 and on_b[0][0] == -3 and on_b[1][1] == 3
     assert all(abs(x) > 0.5 + silk.PAD_MARGIN for span in on_b for x in span if abs(x) < 3)
     assert (-3.0, 3.0, -2.0) in lines
+
+
+def test_a_long_neighbouring_pad_with_no_corner_near_the_silk_still_trims_it():
+    """A 10 x 1 mm pad crossing a short silk line has every corner outside the
+    line's box; selected by corners, it was skipped (Codex, PR #72)."""
+    a = sexpr.parse('''(footprint "A" (layer "F.Cu") (at 10 10)
+      (fp_line (start 0 -1) (end 0 1) (stroke (width 0.12) (type solid)) (layer "F.SilkS") (uuid "a1")))''')
+    b = sexpr.parse('''(footprint "B" (layer "F.Cu") (at 10 10)
+      (pad "1" smd rect (at 0 0) (size 10 1) (layers "F.Cu" "F.Mask")))''')
+    assert silk.clip_to_neighbours([a, b]) == 1
+    for n in sexpr.find_all(a, "fp_line"):
+        ys = (float(sexpr.find(n, "start")[2]), float(sexpr.find(n, "end")[2]))
+        assert all(abs(y) > 0.5 for y in ys)
