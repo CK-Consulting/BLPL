@@ -83,6 +83,8 @@ def test_the_project_file_survives_every_step(board, tmp_path, monkeypatch):
     monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: clobber())
     monkeypatch.setattr(krt_route, "_snap_terminals", clobber)
     monkeypatch.setattr(krt_route, "_fill", clobber)
+    monkeypatch.setattr(krt_route, "_trim_dangling", clobber)
+    monkeypatch.setattr(krt_route, "_stitch", lambda *a, **k: clobber())
     monkeypatch.setattr(krt_route, "_run", run)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 3, "segments": 400})
     r = krt_route.route(board, work_dir=tmp_path / "w")
@@ -232,15 +234,18 @@ def test_an_edge_band_goes_on_before_routing_and_comes_off_after(board, tmp_path
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: calls.append(Path(cmd[1]).name) or ok)
     monkeypatch.setattr(krt_route, "_snap_terminals", lambda *a: calls.append("snap") or ok)
     monkeypatch.setattr(krt_route, "_fill", lambda *a: calls.append("fill") or ok)
+    monkeypatch.setattr(krt_route, "_trim_dangling", lambda *a: calls.append("trim") or ok)
+    monkeypatch.setattr(krt_route, "_stitch", lambda *a, **k: calls.append("stitch") or ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
     assert krt_route.route(board, work_dir=tmp_path / "w").ok
     # Band on after the re-save, before any routing; off before the fill.
     # Its depth is the edge rule plus half the widest track (0.75 / 2).
     # Track ends are joined to their pads once the band is off, before the
-    # fill and the measure.
+    # fill; stubs come off after it, when a stub into a pour is seen to
+    # connect; ground vias go in last, around the copper that stays.
     assert calls[:2] == ["resave", ("band", True, 0.875)]
-    assert calls[-3:] == [("band", False, 0), "snap", "fill"]
-    assert all("route" in c for c in calls[2:-3])
+    assert calls[-5:] == [("band", False, 0), "snap", "fill", "trim", "stitch"]
+    assert all("route" in c for c in calls[2:-5])
 
 
 def _two_class_board(tmp_path, nets, classes, patterns):
@@ -283,7 +288,7 @@ def test_a_pair_whose_gap_is_under_its_clearance_is_refused_not_widened(tmp_path
     monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
     monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
     ok = subprocess.CompletedProcess([], 0, "", "")
-    for fn in ("_resave", "_edge_band", "_snap_terminals", "_fill"):
+    for fn in ("_resave", "_edge_band", "_snap_terminals", "_fill", "_trim_dangling", "_stitch"):
         monkeypatch.setattr(krt_route, fn, lambda *a, **k: ok)
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 2, "segments": 10})
@@ -323,7 +328,7 @@ def test_a_route_that_laid_no_track_with_connections_open_fails(board, tmp_path,
     monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
     monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
     ok = subprocess.CompletedProcess([], 0, "", "")
-    for fn in ("_resave", "_edge_band", "_snap_terminals", "_fill"):
+    for fn in ("_resave", "_edge_band", "_snap_terminals", "_fill", "_trim_dangling", "_stitch"):
         monkeypatch.setattr(krt_route, fn, lambda *a, **k: ok)
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 12, "segments": 0})
@@ -498,6 +503,8 @@ def test_a_band_layer_the_board_already_uses_is_left_alone(board, tmp_path, monk
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: cmds.append(cmd) or ok)
     monkeypatch.setattr(krt_route, "_snap_terminals", lambda *a: ok)
     monkeypatch.setattr(krt_route, "_fill", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_trim_dangling", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_stitch", lambda *a, **k: ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 5})
     r = krt_route.route(board, work_dir=tmp_path / "w")
     assert r.ok and calls == [True]                      # drawn once, nothing to remove
@@ -634,6 +641,8 @@ def test_the_band_rings_npth_holes_at_the_hole_clearance(board, tmp_path, monkey
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: ok)
     monkeypatch.setattr(krt_route, "_snap_terminals", lambda *a: ok)
     monkeypatch.setattr(krt_route, "_fill", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_trim_dangling", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_stitch", lambda *a, **k: ok)
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
     krt_route.route(board, work_dir=tmp_path / "w")
     add, depth, kw = seen[0]
@@ -728,3 +737,373 @@ def test_a_track_ending_in_a_chamfered_corner_is_joined_to_its_pad(tmp_path):
         return {(round(pcbnew.ToMM(p.x), 3), round(pcbnew.ToMM(p.y), 3)) for p in (t.GetStart(), t.GetEnd())}
 
     assert {(9.445, 10.35), (10.0, 10.0)} in [ends(t) for t in tracks]
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_short_dangling_stubs_come_off_and_a_connection_stays(tmp_path):
+    """KRT leaves 0.02 to 0.26 mm stubs ending in nothing, each a DRC warning.
+    A short one goes, a longer partial route stays, and a track between two
+    pads is untouched."""
+    import pcbnew
+
+    board = pcbnew.BOARD()
+    board.Add(pcbnew.NETINFO_ITEM(board, "SIG"))
+    fp = pcbnew.FOOTPRINT(board)
+    board.Add(fp)
+    mm = pcbnew.FromMM
+    for number, x in (("1", 10.0), ("2", 20.0)):
+        pad = pcbnew.PAD(fp)
+        pad.SetNumber(number)
+        pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+        pad.SetLayerSet(pad.SMDMask())
+        pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(1.0), mm(1.0)))
+        pad.SetPosition(pcbnew.VECTOR2I(mm(x), mm(10.0)))
+        fp.Add(pad)
+        pad.SetNet(board.FindNet("SIG"))
+
+    def track(a, b):
+        t = pcbnew.PCB_TRACK(board)
+        t.SetStart(pcbnew.VECTOR2I(mm(a[0]), mm(a[1])))
+        t.SetEnd(pcbnew.VECTOR2I(mm(b[0]), mm(b[1])))
+        t.SetWidth(mm(0.2))
+        t.SetLayer(pcbnew.F_Cu)
+        board.Add(t)
+        t.SetNet(board.FindNet("SIG"))
+
+    track((10.0, 10.0), (20.0, 10.0))   # pad to pad: stays
+    track((10.0, 10.0), (10.0, 11.2))   # 1.2 mm off pad 1, ends in nothing: a partial route, stays
+    track((20.0, 10.0), (20.0, 10.7))   # 0.7 mm off pad 2, ends in nothing: a stub, goes
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+
+    proc = krt_route._trim_dangling(sys.executable, pcb)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "1"
+    lengths = sorted(round(pcbnew.ToMM(t.GetLength()), 2) for t in pcbnew.LoadBoard(str(pcb)).GetTracks())
+    assert lengths == [1.2, 10.0]
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_ground_vias_go_beside_signal_vias_and_decoupling_pads_where_they_clear(tmp_path):
+    """RP-001 and DC-003 on verdacor: 18 signal vias with no ground via within
+    1 mm, and U3's decoupling reaching ground only through a long track."""
+    import pcbnew
+
+    from blpl.emitter import sexpr
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    board.SetCopperLayerCount(4)
+    for name in ("GND", "SIG", "WALL"):
+        board.Add(pcbnew.NETINFO_ITEM(board, name))
+    edge = pcbnew.PCB_SHAPE(board)
+    edge.SetShape(pcbnew.SHAPE_T_RECTANGLE)
+    edge.SetStart(pcbnew.VECTOR2I(0, 0))
+    edge.SetEnd(pcbnew.VECTOR2I(mm(40), mm(30)))
+    edge.SetLayer(pcbnew.Edge_Cuts)
+    edge.SetWidth(mm(0.1))
+    board.Add(edge)
+    zone = pcbnew.ZONE(board)
+    board.Add(zone)
+    layers = pcbnew.LSET()
+    layers.AddLayer(pcbnew.In1_Cu)
+    layers.AddLayer(pcbnew.In2_Cu)
+    zone.SetLayerSet(layers)
+    zone.Outline().NewOutline()
+    for x, y in ((1, 1), (39, 1), (39, 29), (1, 29)):
+        zone.Outline().Append(mm(x), mm(y))
+    fp = pcbnew.FOOTPRINT(board)
+    fp.SetReference("C1")
+    board.Add(fp)
+    for number, x in (("1", 30.0), ("2", 31.0)):
+        pad = pcbnew.PAD(fp)
+        pad.SetNumber(number)
+        pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+        pad.SetLayerSet(pad.SMDMask())
+        pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(0.6), mm(0.6)))
+        pad.SetPosition(pcbnew.VECTOR2I(mm(x), mm(20.0)))
+        fp.Add(pad)
+
+    def via(x, y):
+        v = pcbnew.PCB_VIA(board)
+        board.Add(v)
+        v.SetPosition(pcbnew.VECTOR2I(mm(x), mm(y)))
+        v.SetWidth(mm(0.6))
+        v.SetDrill(mm(0.3))
+        v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+
+    def track(a, b, width=0.2):
+        t = pcbnew.PCB_TRACK(board)
+        board.Add(t)
+        t.SetStart(pcbnew.VECTOR2I(mm(a[0]), mm(a[1])))
+        t.SetEnd(pcbnew.VECTOR2I(mm(b[0]), mm(b[1])))
+        t.SetWidth(mm(width))
+        t.SetLayer(pcbnew.F_Cu)
+
+    via(10, 10)                       # open: a ground via fits beside it
+    track((10, 10), (20, 10))         # its track, which the new via must clear
+    via(20, 20)                       # boxed in by another net on F.Cu: no room
+    for y in (19.0, 21.0):
+        track((18.5, y), (21.5, y), 1.0)
+    for x in (19.0, 21.0):
+        track((x, 18.5), (x, 21.5), 1.0)
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+
+    # Nets set in the file: pcbnew saves a Python-built board's items under
+    # its first net whatever they carry in memory.
+    tree = sexpr.parse(pcb.read_text())
+    top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
+
+    def set_net(node, name):
+        for i, c in enumerate(node):
+            if isinstance(c, list) and sexpr.head(c) == "net":
+                node[i] = ["net", sexpr.quote(name)]
+                return
+        node.append(["net", sexpr.quote(name)])
+
+    for node in top:
+        if not isinstance(node, list):
+            continue
+        tag = sexpr.head(node)
+        if tag == "via":
+            set_net(node, "SIG")
+        elif tag == "segment":
+            width = float(sexpr.find(node, "width")[1])
+            set_net(node, "WALL" if width > 0.5 else "SIG")
+        elif tag == "zone":
+            set_net(node, "GND")
+        elif tag == "footprint":
+            for pad in sexpr.find_all(node, "pad"):
+                set_net(pad, "GND" if sexpr.unquote(pad[1]) == "2" else "SIG")
+    pcb.write_text(sexpr.dump_top(tree))
+
+    proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
+                             edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "2 1"   # the open via and C1, not the boxed one
+
+    after = pcbnew.LoadBoard(str(pcb))
+    gnd = [v for v in after.GetTracks() if v.Type() == pcbnew.PCB_VIA_T and v.GetNetname() == "GND"]
+    assert len(gnd) == 2
+    near = lambda v, x, y: (v.GetPosition() - pcbnew.VECTOR2I(mm(x), mm(y))).EuclideanNorm() <= mm(1.0)
+    assert any(near(v, 10, 10) for v in gnd) and any(near(v, 31, 20) for v in gnd)
+    assert not any(near(v, 20, 20) for v in gnd)
+    sig_track = next(t for t in after.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() == "SIG")
+    for v in gnd:
+        assert not v.GetEffectiveShape(pcbnew.F_Cu).Collide(sig_track.GetEffectiveShape(pcbnew.F_Cu), mm(0.2))
+    link = [t for t in after.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() == "GND"]
+    assert len(link) == 1   # C1's pad joined to its via
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_stitching_keeps_each_pads_own_plane_net_every_layer_and_cutout_clear(tmp_path):
+    """Codex, PR #72: a VDD pad got a GND link, a through via was checked on
+    the outer layers only, and a cutout's edge was not board edge."""
+    import pcbnew
+
+    from blpl.emitter import sexpr
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    board.SetCopperLayerCount(4)
+    for name in ("GND", "VDD", "SIG", "WALL"):
+        board.Add(pcbnew.NETINFO_ITEM(board, name))
+
+    def shape(kind, a, b):
+        s = pcbnew.PCB_SHAPE(board)
+        s.SetShape(kind)
+        s.SetStart(pcbnew.VECTOR2I(mm(a[0]), mm(a[1])))
+        s.SetEnd(pcbnew.VECTOR2I(mm(b[0]), mm(b[1])))
+        s.SetLayer(pcbnew.Edge_Cuts)
+        s.SetWidth(mm(0.1))
+        board.Add(s)
+
+    shape(pcbnew.SHAPE_T_RECTANGLE, (0, 0), (40, 30))
+    shape(pcbnew.SHAPE_T_CIRCLE, (31.2, 20), (32.2, 20))      # a 1 mm cutout beside the via at (30, 20)
+    for layer in (pcbnew.In1_Cu, pcbnew.In2_Cu):
+        zone = pcbnew.ZONE(board)
+        board.Add(zone)
+        zone.SetLayer(layer)
+        zone.Outline().NewOutline()
+        for x, y in ((1, 1), (39, 1), (39, 29), (1, 29)):
+            zone.Outline().Append(mm(x), mm(y))
+    fp = pcbnew.FOOTPRINT(board)
+    fp.SetReference("C2")
+    board.Add(fp)
+    for number, x in (("1", 10.0), ("2", 11.0)):
+        pad = pcbnew.PAD(fp)
+        pad.SetNumber(number)
+        pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+        pad.SetLayerSet(pad.SMDMask())
+        pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(0.6), mm(0.6)))
+        pad.SetPosition(pcbnew.VECTOR2I(mm(x), mm(20.0)))
+        fp.Add(pad)
+
+    def via(x, y):
+        v = pcbnew.PCB_VIA(board)
+        board.Add(v)
+        v.SetPosition(pcbnew.VECTOR2I(mm(x), mm(y)))
+        v.SetWidth(mm(0.6))
+        v.SetDrill(mm(0.3))
+        v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+
+    via(30, 10)                       # walled in on In2 only: no room
+    for y in (9.0, 11.0):
+        t = pcbnew.PCB_TRACK(board)
+        board.Add(t)
+        t.SetStart(pcbnew.VECTOR2I(mm(28.5), mm(y)))
+        t.SetEnd(pcbnew.VECTOR2I(mm(31.5), mm(y)))
+        t.SetWidth(mm(1.0))
+        t.SetLayer(pcbnew.In2_Cu)
+    for x in (29.0, 31.0):
+        t = pcbnew.PCB_TRACK(board)
+        board.Add(t)
+        t.SetStart(pcbnew.VECTOR2I(mm(x), mm(8.5)))
+        t.SetEnd(pcbnew.VECTOR2I(mm(x), mm(11.5)))
+        t.SetWidth(mm(1.0))
+        t.SetLayer(pcbnew.In2_Cu)
+    via(30, 20)                       # beside the cutout: only its far side clears
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+
+    tree = sexpr.parse(pcb.read_text())
+    top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
+
+    def set_net(node, name):
+        for i, c in enumerate(node):
+            if isinstance(c, list) and sexpr.head(c) == "net":
+                node[i] = ["net", sexpr.quote(name)]
+                return
+        node.append(["net", sexpr.quote(name)])
+
+    for node in top:
+        if not isinstance(node, list):
+            continue
+        tag = sexpr.head(node)
+        if tag == "via":
+            set_net(node, "SIG")
+        elif tag == "segment":
+            set_net(node, "WALL")
+        elif tag == "zone":
+            set_net(node, "GND" if sexpr.unquote(sexpr.find(node, "layer")[1]) == "In1.Cu" else "VDD")
+        elif tag == "footprint":
+            for pad in sexpr.find_all(node, "pad"):
+                set_net(pad, "VDD" if sexpr.unquote(pad[1]) == "1" else "GND")
+    pcb.write_text(sexpr.dump_top(tree))
+
+    proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
+                             edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "3 1"
+
+    after = pcbnew.LoadBoard(str(pcb))
+    new = [v for v in after.GetTracks() if v.Type() == pcbnew.PCB_VIA_T and v.GetNetname() in ("GND", "VDD")]
+    at = lambda v, x, y: (v.GetPosition() - pcbnew.VECTOR2I(mm(x), mm(y))).EuclideanNorm()
+    # Each capacitor pad stitched to its own plane net, never the other's.
+    assert any(v.GetNetname() == "VDD" and at(v, 10, 20) <= mm(1.0) for v in new)
+    assert any(v.GetNetname() == "GND" and at(v, 11, 20) <= mm(1.0) for v in new)
+    links = {t.GetNetname() for t in after.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T and t.GetLayer() == pcbnew.F_Cu}
+    assert links == {"VDD", "GND"}
+    # Nothing through the In2 wall; the cutout via's ground via keeps the edge rule from the cutout.
+    assert not any(at(v, 30, 10) <= mm(1.0) for v in new)
+    beside_cut = [v for v in new if at(v, 30, 20) <= mm(1.0)]
+    assert len(beside_cut) == 1 and beside_cut[0].GetNetname() == "GND"
+    assert at(beside_cut[0], 31.2, 20) >= mm(1.0 + 0.5 + 0.3) - 1
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_no_stitching_via_floats_off_a_partial_plane_or_links_across_a_track_keepout(tmp_path):
+    """Codex, PR #72: a via outside a partial plane connected nothing, and a
+    capacitor's link could cross a keepout that forbids tracks."""
+    import pcbnew
+
+    from blpl.emitter import sexpr
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    board.SetCopperLayerCount(4)
+    for name in ("GND", "SIG"):
+        board.Add(pcbnew.NETINFO_ITEM(board, name))
+    edge = pcbnew.PCB_SHAPE(board)
+    edge.SetShape(pcbnew.SHAPE_T_RECTANGLE)
+    edge.SetStart(pcbnew.VECTOR2I(0, 0))
+    edge.SetEnd(pcbnew.VECTOR2I(mm(40), mm(30)))
+    edge.SetLayer(pcbnew.Edge_Cuts)
+    edge.SetWidth(mm(0.1))
+    board.Add(edge)
+    zone = pcbnew.ZONE(board)                      # GND on In1, left half only
+    board.Add(zone)
+    zone.SetLayer(pcbnew.In1_Cu)
+    zone.Outline().NewOutline()
+    for x, y in ((1, 1), (18, 1), (18, 29), (1, 29)):
+        zone.Outline().Append(mm(x), mm(y))
+    keepout = pcbnew.ZONE(board)                   # no tracks around C3's ground pad
+    board.Add(keepout)
+    keepout.SetIsRuleArea(True)
+    keepout.SetDoNotAllowTracks(True)
+    keepout.SetDoNotAllowVias(False)
+    keepout.SetDoNotAllowPads(False)
+    keepout.SetDoNotAllowFootprints(False)
+    keepout.SetDoNotAllowZoneFills(False)
+    keepout.SetLayer(pcbnew.F_Cu)
+    keepout.Outline().NewOutline()
+    for x, y in ((10.6, 18.0), (13.0, 18.0), (13.0, 22.0), (10.6, 22.0)):
+        keepout.Outline().Append(mm(x), mm(y))
+    fp = pcbnew.FOOTPRINT(board)
+    fp.SetReference("C3")
+    board.Add(fp)
+    for number, x in (("1", 10.0), ("2", 11.5)):
+        pad = pcbnew.PAD(fp)
+        pad.SetNumber(number)
+        pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+        pad.SetLayerSet(pad.SMDMask())
+        pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(0.6), mm(0.6)))
+        pad.SetPosition(pcbnew.VECTOR2I(mm(x), mm(20.0)))
+        fp.Add(pad)
+    via = pcbnew.PCB_VIA(board)                    # outside the plane
+    board.Add(via)
+    via.SetPosition(pcbnew.VECTOR2I(mm(30), mm(10)))
+    via.SetWidth(mm(0.6))
+    via.SetDrill(mm(0.3))
+    via.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+
+    tree = sexpr.parse(pcb.read_text())
+    top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
+
+    def set_net(node, name):
+        for i, c in enumerate(node):
+            if isinstance(c, list) and sexpr.head(c) == "net":
+                node[i] = ["net", sexpr.quote(name)]
+                return
+        node.append(["net", sexpr.quote(name)])
+
+    for node in top:
+        if not isinstance(node, list):
+            continue
+        tag = sexpr.head(node)
+        if tag == "via":
+            set_net(node, "SIG")
+        elif tag == "zone" and sexpr.find(node, "keepout") is None:
+            set_net(node, "GND")
+        elif tag == "footprint":
+            for pad in sexpr.find_all(node, "pad"):
+                set_net(pad, "GND" if sexpr.unquote(pad[1]) == "2" else "SIG")
+    pcb.write_text(sexpr.dump_top(tree))
+
+    proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
+                             edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "0 2"
+    after = pcbnew.LoadBoard(str(pcb))
+    assert not [t for t in after.GetTracks() if t.GetNetname() == "GND"]

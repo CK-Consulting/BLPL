@@ -116,6 +116,19 @@ class Shape:
         return (min(xs), min(ys), max(xs), max(ys))
 
 
+def blocks_side(kind: str, layers, side: str) -> bool:
+    """Whether a cutout or keepout on ``layers`` blocks a part on ``side``.
+
+    Shared by the placer's audit (Feature.blocks_side) and Stage 8's check of
+    the HDM, which sees features as dicts: the two disagreeing is how J_DBG on
+    the back was cleared by one and flagged by the other.
+    """
+    if kind == "cutout" or not layers:
+        return True
+    prefix = "B." if side == "bottom" else "F."
+    return any(str(layer).startswith(("*", "F&B.", prefix)) for layer in layers)
+
+
 @dataclass
 class Feature:
     """A cutout or a keepout: a shape plus what it means."""
@@ -147,10 +160,7 @@ class Feature:
         and a ``*.Cu`` or ``F&B.Cu`` one (the two outer layers) block both
         sides.
         """
-        if self.kind == "cutout" or not self.layers:
-            return True
-        prefix = "B." if side == "bottom" else "F."
-        return any(layer.startswith(("*", "F&B.", prefix)) for layer in self.layers)
+        return blocks_side(self.kind, self.layers, side)
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {

@@ -95,6 +95,18 @@ def build(hdm: dict, *, project_filename: str) -> dict:
             c["priority"] = rank
             rank += 1
 
+    # silkscreen.clip_to_copper trims each footprint's silk off pads, so every
+    # trimmed footprint differs from its library copy by design and DRC said
+    # so: 28 lib_footprint_mismatch warnings on verdacor, each a part whose
+    # silk was shortened and nothing else. The check finds a board whose parts
+    # are stale against an updated library; BLPL re-emits every footprint
+    # from its library on every run, so with clipping on it can only ever
+    # report the clipping. Off, the check stays as KiCad sets it.
+    rule_severities: dict[str, str] = {}
+    silk = hdm.get("silkscreen") if isinstance(hdm.get("silkscreen"), dict) else {}
+    if silk.get("clip_to_copper"):
+        rule_severities["lib_footprint_mismatch"] = "ignore"
+
     net_class_patterns = []
     for net_name, net_def in nets_in.items():
         cls = net_def.get("class") or "Default"
@@ -116,7 +128,8 @@ def build(hdm: dict, *, project_filename: str) -> dict:
                     # with tracks 0.2 mm from its edge and 0.21 mm from a
                     # debug pad's NPTH, 18 DRC errors on a "finished" route.
                     **BOARD_RULE_DEFAULTS,
-                }
+                },
+                **({"rule_severities": rule_severities} if rule_severities else {}),
             }
         },
         "net_settings": {

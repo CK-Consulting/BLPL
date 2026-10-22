@@ -615,3 +615,19 @@ def test_an_integral_float_layer_count_is_the_same_count():
     cfg["project"]["stackup"] = {"layers": 4.0}
     out = pcb.emit(_hdm(cfg), footprints_root=_FOOTPRINTS_ROOT)
     assert [n for _, n in _copper_rows(out)] == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+
+
+def test_stage8_judges_a_part_on_the_back_by_the_back_sides_keepouts():
+    """The ear tag's J_DBG on the back, under the pocket's F.Cu-only keepouts,
+    was cleared by the placer's audit and flagged here."""
+    board = bg.from_config(_config(keepouts=[
+        {"shape": "rect", "origin": [0, 0], "size": [10, 10], "layers": ["F.Cu"], "forbid": ["footprints"]}]))
+    hdm = {
+        "board_geometry": bg.as_record(board),
+        "synthesis": {"placement": {"boxes": {"J1": [2, 2, 4, 4], "R1": [5, 5, 6, 6]},
+                                    "hinted_positions": ["J1", "R1"]}},
+        "components": {"J1": {"placement": {"x": 3, "y": 3, "side": "bottom"}},
+                       "R1": {"placement": {"x": 5.5, "y": 5.5, "side": "top"}}},
+    }
+    _, design = s8._board_geometry_check(hdm)
+    assert [(d["rule_id"], d["components"]) for d in design] == [("placed_in_keepout", ["R1"])]

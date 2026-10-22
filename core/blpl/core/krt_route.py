@@ -653,6 +653,254 @@ def _snap_terminals(python: str, pcb: Path, clearance_mm: float = 0.0) -> subpro
     ))
 
 
+#: The longest dangling track removed after routing. Longer, it is a partial
+#: route worth keeping for whoever finishes the board by hand.
+_STUB_MAX_MM = 1.0
+
+
+def _trim_dangling(python: str, pcb: Path) -> subprocess.CompletedProcess:
+    """Remove the short track stubs the router leaves connected at one end only.
+
+    KRT leaves a few: on verdacor 0.02 to 0.26 mm of GND, VDD_3V3 and
+    VBAT_PROT ending in nothing, each a track_dangling warning in DRC and none
+    carrying anything. Judged after the zones are filled, with KiCad's own
+    test, because a stub into a pour is what connects its pad to the plane,
+    and before the fill it looks dangling too. Removed until none is left
+    (taking one can leave the next dangling), then the zones refilled around
+    the copper that remains. Prints how many it removed.
+    """
+    from . import autoroute
+
+    return autoroute._pcbnew(python, (
+        "import pcbnew\n"
+        f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
+        f"limit = pcbnew.FromMM({_STUB_MAX_MM})\n"
+        "def fill():\n"
+        "    zones = b.Zones()\n"
+        "    if len(zones):\n"
+        "        pcbnew.ZONE_FILLER(b).Fill(zones)\n"
+        "    b.BuildConnectivity()\n"
+        "fill()\n"
+        "removed = 0\n"
+        "while True:\n"
+        "    conn = b.GetConnectivity()\n"
+        "    stubs = [t for t in b.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T\n"
+        "             and t.GetLength() <= limit and conn.TestTrackEndpointDangling(t, False)]\n"
+        "    if not stubs:\n"
+        "        break\n"
+        "    for t in stubs:\n"
+        "        b.Remove(t)\n"
+        "    removed += len(stubs)\n"
+        "    fill()\n"
+        f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
+        "print(removed)\n"
+    ))
+
+
+#: How close a ground via must be to the signal via or capacitor pad it
+#: stitches, centre to centre: what Stage 8's RP-001 asks for.
+_STITCH_REACH_MM = 1.0
+
+
+def _stitch(python: str, pcb: Path, *, via_mm: float, drill_mm: float, clearance_mm: float,
+            edge_mm: float, hole_mm: float, hole_to_hole_mm: float) -> subprocess.CompletedProcess:
+    """Put a plane-net via beside each signal via, and beside each capacitor's plane pad.
+
+    A signal that changes layer through a via changes reference plane with
+    it, and its return current needs a way between the planes close by: on
+    verdacor, with both inner layers GND, 18 signal vias had none within
+    1 mm (RP-001), and C6 and C7, U3's decoupling, reached a ground via only
+    through a long track (DC-003). The router does not place these.
+
+    The plane nets are those with a zone on an inner layer. A signal via is
+    stitched to the ground one; a capacitor pad on a plane net to its own net.
+    For each signal via with no plane-net via, and each such pad with no via of
+    its own net, within ``_STITCH_REACH_MM``, candidate spots on rings around it are tried
+    nearest first; a via goes in the first that clears every other net's
+    tracks, vias and pads on every copper layer the via passes, at the larger
+    of the two items' class clearances, never under ``clearance_mm`` (as DRC
+    judges a pair), stays off every pad (no via in a pad), keeps ``edge_mm``
+    from the board edge and its cutouts, the hole clearances from
+    every hole, is in no keepout that forbids vias, and is inside one of its
+    net's inner-layer zones (and, after the refill, in that zone's fill, or it
+    is taken out again: a via outside a partial plane would float). A
+    capacitor's via is joined to its pad by a track that has to clear the same
+    way and cross no keepout that forbids tracks. Where no spot
+    clears, nothing is placed: an unstitched via is a review finding, a via
+    shorted to a neighbour is a scrapped board. The zones are refilled
+    afterwards. Prints "placed missed".
+    """
+    from . import autoroute
+
+    return autoroute._pcbnew(python, (
+        "import math, pcbnew\n"
+        f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
+        "mm = pcbnew.FromMM\n"
+        f"VR, DR = mm({via_mm} / 2), mm({drill_mm} / 2)\n"
+        f"CLR, EDGE, HOLE, H2H = mm({clearance_mm}), mm({edge_mm}), mm({hole_mm}), mm({hole_to_hole_mm})\n"
+        f"REACH = mm({_STITCH_REACH_MM})\n"
+        "copper = list(b.GetEnabledLayers().CuStack())\n"
+        "inner = [l for l in copper if l not in (pcbnew.F_Cu, pcbnew.B_Cu)]\n"
+        "planes = {z.GetNetCode() for z in b.Zones() if not z.GetIsRuleArea() and z.GetNetCode() > 0\n"
+        "          and any(z.IsOnLayer(l) for l in inner)}\n"
+        "if not planes:\n"
+        "    print('0 0'); raise SystemExit(0)\n"
+        "names = {c: b.GetNetInfo().GetNetItem(c).GetNetname() for c in planes}\n"
+        "# A signal via is stitched to ground. A capacitor pad keeps its own\n"
+        "# plane net: GND to GND, VDD to VDD, never one onto the other (Codex, PR #72).\n"
+        "GROUND = sorted(planes, key=lambda c: (not names[c].upper().startswith(\n"
+        "    ('GND', 'VSS', 'AGND', 'DGND', 'PGND')), c))[0]\n"
+        "outline = pcbnew.SHAPE_POLY_SET()\n"
+        "b.GetBoardPolygonOutlines(outline, True)\n"
+        "edges = []\n"
+        "for i in range(outline.OutlineCount()):\n"
+        "    # Cutouts too: they are board edge, as the routing band treats them.\n"
+        "    for ch in [outline.Outline(i)] + [outline.Hole(i, j) for j in range(outline.HoleCount(i))]:\n"
+        "        pts = [ch.CPoint(k) for k in range(ch.PointCount())]\n"
+        "        edges += [(pts[k], pts[(k + 1) % len(pts)]) for k in range(len(pts))]\n"
+        "def edge_distance(at):\n"
+        "    # SHAPE_POLY_SET's distance is 0 anywhere inside: the edge, measured here.\n"
+        "    best = None\n"
+        "    for a, c in edges:\n"
+        "        dx, dy = c.x - a.x, c.y - a.y\n"
+        "        L = dx * dx + dy * dy\n"
+        "        t = 0.0 if L == 0 else max(0.0, min(1.0, ((at.x - a.x) * dx + (at.y - a.y) * dy) / L))\n"
+        "        d = math.hypot(at.x - a.x - t * dx, at.y - a.y - t * dy)\n"
+        "        best = d if best is None or d < best else best\n"
+        "    return best if best is not None else 0\n"
+        "keepouts = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowVias()]\n"
+        "no_tracks = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowTracks()]\n"
+        "plane_zones = [z for z in b.Zones() if not z.GetIsRuleArea() and z.GetNetCode() in planes]\n"
+        "def in_plane(at, net):\n"
+        "    # Inside one of the net's own inner-layer zones: a partial plane is\n"
+        "    # allowed, and a via outside it would float (Codex, PR #72).\n"
+        "    return any(z.GetNetCode() == net and any(z.IsOnLayer(l) and z.Outline().Contains(at) for l in inner)\n"
+        "               for z in plane_zones)\n"
+        "def link_ok(link, layer):\n"
+        "    # A link crosses no keepout that forbids tracks, as _snap_terminals checks.\n"
+        "    return not any(z.IsOnLayer(layer) and z.Outline().Collide(link, 0) for z in no_tracks)\n"
+        "pads = [p for fp in b.GetFootprints() for p in fp.Pads()]\n"
+        "items = [t for t in b.GetTracks()]\n"
+        "holes = [(v.GetPosition(), v.GetDrillValue() // 2) for v in items if v.Type() == pcbnew.PCB_VIA_T]\n"
+        "holes += [(p.GetPosition(), max(p.GetDrillSize().x, p.GetDrillSize().y) // 2) for p in pads\n"
+        "          if p.GetDrillSize().x > 0]\n"
+        "own_cache = {}\n"
+        "def own(code):\n"
+        "    # A net's own class clearance (GND in Power_Bulk at 0.25 on verdacor,\n"
+        "    # over the Default 0.15): DRC takes the larger of the two items' clearances.\n"
+        "    if code not in own_cache:\n"
+        "        probe = pcbnew.PCB_VIA(b)\n"
+        "        b.Add(probe)\n"
+        "        probe.SetNetCode(code)\n"
+        "        own_cache[code] = max(CLR, probe.GetOwnClearance(pcbnew.F_Cu))\n"
+        "        b.Remove(probe)\n"
+        "    return own_cache[code]\n"
+        "def stitched(at, nets):\n"
+        "    return any(v.Type() == pcbnew.PCB_VIA_T and v.GetNetCode() in nets\n"
+        "               and (v.GetPosition() - at).EuclideanNorm() <= REACH for v in items)\n"
+        "def clears(shape, layers, net, pads_same_too):\n"
+        "    gap = own(net)\n"
+        "    for t in items:\n"
+        "        if t.GetNetCode() == net:\n"
+        "            continue\n"
+        "        for l in layers:\n"
+        "            if t.IsOnLayer(l) and t.GetEffectiveShape(l).Collide(shape, max(gap, t.GetOwnClearance(l))):\n"
+        "                return False\n"
+        "    for p in pads:\n"
+        "        same = p.GetNetCode() == net\n"
+        "        if same and not pads_same_too:\n"
+        "            continue\n"
+        "        for l in layers:\n"
+        "            if p.IsOnLayer(l) and p.GetEffectiveShape(l).Collide(shape, 0 if same else max(gap, p.GetOwnClearance(l))):\n"
+        "                return False\n"
+        "    return True\n"
+        "def spot_ok(at, net):\n"
+        "    if not outline.Contains(at) or edge_distance(at) < EDGE + VR:\n"
+        "        return False\n"
+        "    if not in_plane(at, net):\n"
+        "        return False\n"
+        "    for z in keepouts:\n"
+        "        if z.Outline().Collide(pcbnew.VECTOR2I(at), VR):\n"
+        "            return False\n"
+        "    for c, r in holes:\n"
+        "        d = (c - at).EuclideanNorm()\n"
+        "        if d < r + DR + H2H or d < r + VR + HOLE:\n"
+        "            return False\n"
+        "    # A through via is copper on every layer it passes: an inner signal\n"
+        "    # layer's tracks count as much as the outer ones' (Codex, PR #72).\n"
+        "    return clears(pcbnew.SHAPE_CIRCLE(at, VR), copper, net, True)\n"
+        "def place(at, net, link_from=None, width=0, link_layer=None):\n"
+        "    v = pcbnew.PCB_VIA(b)\n"
+        "    b.Add(v)\n"
+        "    v.SetPosition(at); v.SetWidth(2 * VR); v.SetDrill(2 * DR)\n"
+        "    v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu); v.SetNetCode(net)\n"
+        "    items.append(v); holes.append((at, DR))\n"
+        "    added.append([v])\n"
+        "    if link_from is not None:\n"
+        "        t = pcbnew.PCB_TRACK(b)\n"
+        "        b.Add(t)\n"
+        "        t.SetStart(link_from); t.SetEnd(at); t.SetWidth(width)\n"
+        "        t.SetLayer(link_layer); t.SetNetCode(net)\n"
+        "        items.append(t); added[-1].append(t)\n"
+        "def ring(c, radii):\n"
+        "    for r in radii:\n"
+        "        for k in range(24):\n"
+        "            a = 2 * math.pi * k / 24\n"
+        "            yield pcbnew.VECTOR2I(int(c.x + r * math.cos(a)), int(c.y + r * math.sin(a)))\n"
+        "placed = missed = 0\n"
+        "added = []\n"
+        "for v in [t for t in items if t.Type() == pcbnew.PCB_VIA_T and t.GetNetCode() not in planes\n"
+        "          and t.GetNetCode() > 0]:\n"
+        "    c = v.GetPosition()\n"
+        "    if stitched(c, planes):\n"
+        "        continue\n"
+        "    lo = v.GetWidth(pcbnew.F_Cu) // 2 + VR + max(own(GROUND), v.GetOwnClearance(pcbnew.F_Cu))\n"
+        "    for at in ring(c, [r for r in (lo, lo + mm(0.1), REACH) if r <= REACH]):\n"
+        "        if spot_ok(at, GROUND):\n"
+        "            place(at, GROUND); placed += 1; break\n"
+        "    else:\n"
+        "        missed += 1\n"
+        "for p in pads:\n"
+        "    fp = p.GetParentFootprint()\n"
+        "    net = p.GetNetCode()\n"
+        "    if net not in planes or not fp.GetReference().startswith('C') or p.GetDrillSize().x > 0:\n"
+        "        continue\n"
+        "    c = p.GetPosition()\n"
+        "    if stitched(c, {net}):\n"
+        "        continue\n"
+        "    link_layer = pcbnew.F_Cu if p.IsOnLayer(pcbnew.F_Cu) else pcbnew.B_Cu\n"
+        "    half = max(p.GetSize(link_layer).x, p.GetSize(link_layer).y) // 2\n"
+        "    width = min(p.GetSize(link_layer).x, p.GetSize(link_layer).y, mm(0.3))\n"
+        "    lo = half + VR + mm(0.05)\n"
+        "    for at in ring(c, [r for r in (lo, lo + mm(0.1), REACH) if r <= REACH]):\n"
+        "        link = pcbnew.SHAPE_SEGMENT(c, at, width)\n"
+        "        if spot_ok(at, net) and clears(link, (link_layer,), net, False) and link_ok(link, link_layer):\n"
+        "            place(at, net, c, width, link_layer); placed += 1; break\n"
+        "    else:\n"
+        "        missed += 1\n"
+        "zones = b.Zones()\n"
+        "if len(zones):\n"
+        "    pcbnew.ZONE_FILLER(b).Fill(zones)\n"
+        "# Kept only where the fill actually connects it, by KiCad's own reckoning\n"
+        "# (a via joins through thermal spokes, its centre in a gap of the fill):\n"
+        "# a via inside the zone's outline can still sit in a void, and float.\n"
+        "b.BuildConnectivity()\n"
+        "conn = b.GetConnectivity()\n"
+        "def filled(v):\n"
+        "    return any(it.Type() == pcbnew.PCB_ZONE_T and it.GetNetCode() == v.GetNetCode()\n"
+        "               for it in conn.GetConnectedItems(v))\n"
+        "orphans = [group for group in added if not filled(group[0])]\n"
+        "for group in orphans:\n"
+        "    for item in group:\n"
+        "        b.Remove(item)\n"
+        "placed -= len(orphans); missed += len(orphans)\n"
+        "if orphans and len(zones):\n"
+        "    pcbnew.ZONE_FILLER(b).Fill(zones)\n"
+        f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
+        "print(placed, missed)\n"
+    ))
+
+
 def _fill(python: str, pcb: Path) -> subprocess.CompletedProcess:
     from . import autoroute
 
@@ -760,6 +1008,30 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     if filled.returncode != 0:
         result.reason = f"pcbnew could not fill the zones: {autoroute._msg(filled)}"
         return result
+    trimmed = _trim_dangling(python, pcb)
+    restore_pro()
+    if trimmed.returncode != 0:
+        result.reason = f"pcbnew could not remove dangling track stubs: {autoroute._msg(trimmed)}"
+        return result
+    stubs = ((trimmed.stdout or "").strip().splitlines() or ["0"])[-1]
+    if stubs.isdigit() and int(stubs):
+        result.extra["stubs_removed"] = int(stubs)
+    # Ground vias beside signal vias and decoupling pads, at the project's own
+    # rules: the default class's via and the board's clearances.
+    default_class = classes.get("Default", {})
+    stitched = _stitch(
+        python, pcb,
+        via_mm=default_class.get("via_diameter", 0.6), drill_mm=default_class.get("via_drill", 0.3),
+        clearance_mm=floor,
+        edge_mm=edge if isinstance(edge, (int, float)) else 0.5,
+        hole_mm=rules.get("min_hole_clearance", 0.25), hole_to_hole_mm=rules.get("min_hole_to_hole", 0.25))
+    restore_pro()
+    if stitched.returncode != 0:
+        result.reason = f"pcbnew could not place ground stitching vias: {autoroute._msg(stitched)}"
+        return result
+    counts = ((stitched.stdout or "").strip().splitlines() or ["0 0"])[-1].split()
+    if len(counts) == 2 and all(c.isdigit() for c in counts):
+        result.extra["stitching_vias"] = {"placed": int(counts[0]), "no_room": int(counts[1])}
     measured = autoroute._measure_board(python, pcb)
     if measured is None:
         result.reason = "the routed board could not be measured"
