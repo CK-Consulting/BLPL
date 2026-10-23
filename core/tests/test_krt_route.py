@@ -1199,3 +1199,22 @@ def test_a_failed_route_still_takes_its_via_bands_off(layered, tmp_path, monkeyp
     monkeypatch.setattr(krt_route, "_run", lambda cmd, t: next(runs, ok))
     result = krt_route.route(board, work_dir=tmp_path / "w", class_layers={"RF_50R": ["F.Cu"]})
     assert not result.ok and calls == [("bands", True), ("bands", False)]
+
+
+def test_the_via_band_geometry_goes_in_a_file_not_the_command_line(tmp_path, monkeypatch):
+    """2,400 rectangles in the script's source overflowed Linux's limit on one
+    argument (Codex, PR #78); the script reads them from a file instead."""
+    pcb = tmp_path / "b.kicad_pcb"
+    seen = {}
+
+    def fake(python, code, timeout=600):
+        seen["code"] = code
+        geometry = pcb.with_name(pcb.name + ".via-bands.json")
+        seen["rects"] = json.loads(geometry.read_text())
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(autoroute, "_pcbnew", fake)
+    rects = [[(float(i), 0.0), (i + 1.0, 0.0), (i + 1.0, 1.0), (float(i), 1.0)] for i in range(2400)]
+    assert krt_route._via_band_areas("/usr/bin/python3", pcb, rects).returncode == 0
+    assert len(seen["code"]) < 4000 and len(seen["rects"]) == 2400
+    assert not pcb.with_name(pcb.name + ".via-bands.json").exists()

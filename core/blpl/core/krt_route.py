@@ -609,18 +609,28 @@ def via_bands(pcb_text: str, nets: list[str], *, via_mm: float, clearance_mm: fl
 
 def _via_band_areas(python: str, pcb: Path, rects: list | None) -> subprocess.CompletedProcess:
     """Write ``rects`` as rule areas forbidding vias on every copper layer, or
-    with None take every one this module drew off the board again."""
+    with None take every one this module drew off the board again.
+
+    The rectangles go to the script in a file beside the board, not in its
+    source: a sample every 0.25 mm makes 2,400 of them for 600 mm of
+    controlled trace, and a script carrying them all was more than Linux
+    takes as one ``python -c`` argument (Codex, PR #78)."""
+    import json
+
     from . import autoroute
 
+    geometry = pcb.with_name(pcb.name + ".via-bands.json")
     code = (
-        "import pcbnew\n"
+        "import json, pcbnew\n"
         f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
         f"for z in [z for z in b.Zones() if z.GetIsRuleArea() and z.GetZoneName() == {VIA_BAND_NAME!r}]:\n"
         "    b.Remove(z)\n"
     )
     if rects:
+        geometry.write_text(json.dumps([[(round(x, 4), round(y, 4)) for x, y in r] for r in rects]),
+                            encoding="utf-8")
         code += (
-            f"for r in {[[(round(x, 4), round(y, 4)) for x, y in r] for r in rects]!r}:\n"
+            f"for r in json.load(open({str(geometry)!r}, encoding='utf-8')):\n"
             "    z = pcbnew.ZONE(b)\n"
             "    z.SetIsRuleArea(True)\n"
             f"    z.SetZoneName({VIA_BAND_NAME!r})\n"
@@ -637,7 +647,10 @@ def _via_band_areas(python: str, pcb: Path, rects: list | None) -> subprocess.Co
             "    b.Add(z)\n"
         )
     code += f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
-    return autoroute._pcbnew(python, code)
+    try:
+        return autoroute._pcbnew(python, code)
+    finally:
+        geometry.unlink(missing_ok=True)
 
 
 #: How far off a pad's copper a track end may be and still be joined to it: a
