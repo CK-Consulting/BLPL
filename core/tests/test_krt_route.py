@@ -1107,3 +1107,95 @@ def test_no_stitching_via_floats_off_a_partial_plane_or_links_across_a_track_kee
     assert proc.stdout.strip().splitlines()[-1] == "0 2"
     after = pcbnew.LoadBoard(str(pcb))
     assert not [t for t in after.GetTracks() if t.GetNetname() == "GND"]
+
+
+# --- via bands beside controlled traces ---------------------------------------
+
+
+def test_controlled_classes_route_first_and_the_via_bands_follow_them(tmp_path):
+    """Once the impedance-controlled nets are down, every later pass routes
+    with the bands that keep its vias out of their reference plane."""
+    pro = dict(PRO)
+    pro["net_settings"] = {**PRO["net_settings"], "classes": [
+        *PRO["net_settings"]["classes"],
+        {"name": "AA_SPI", "track_width": 0.2, "clearance": 0.15, "via_diameter": 0.6, "via_drill": 0.3}],
+        "netclass_patterns": [*PRO["net_settings"]["netclass_patterns"], {"pattern": "SPI_*", "netclass": "AA_SPI"}]}
+    pcb = tmp_path / "b.kicad_pcb"
+    pcb.write_text(BOARD)
+    pcb.with_suffix(".kicad_pro").write_text(json.dumps(pro))
+    steps = krt_route.plan(pcb, pcb.with_suffix(".kicad_pro"), {"GND": ["In1.Cu"]},
+                           ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"], class_layers={"RF_50R": ["F.Cu"]})
+    order = [(s["script"], s["args"][1] if s["script"] != krt_route.VIA_BANDS else tuple(s["args"])) for s in steps]
+    # Alphabetically AA_SPI would go first and lay its vias where it liked.
+    assert order[1:4] == [("route.py", "RF_ANT"), (krt_route.VIA_BANDS, ("RF_ANT",)), ("route.py", "SPI_SCK")]
+    # No controlled class, no bands.
+    plain = krt_route.plan(pcb, pcb.with_suffix(".kicad_pro"), {"GND": ["In1.Cu"]}, ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+    assert krt_route.VIA_BANDS not in [s["script"] for s in plain]
+
+
+def test_a_via_band_covers_the_plane_margin_and_the_hole_a_via_cuts():
+    seg = ('(segment (start 0 0) (end 20 0) (width 0.35) (layer "F.Cu") (net "RF_ANT")) '
+           '(footprint "J" (at 0 0) (pad "1" smd rect (at 0 0) (size 0.5 0.5) (net "RF_ANT"))) '
+           '(footprint "U" (at 20 0) (pad "1" smd rect (at 0 0) (size 0.5 0.5) (net "RF_ANT")))')
+    rects = krt_route.via_bands(f"(kicad_pcb {seg})", ["RF_ANT"], via_mm=0.9, clearance_mm=0.25)
+    assert rects
+    ys = [y for r in rects for _, y in r]
+    xs = [x for r in rects for x, _ in r]
+    # 0.175 half-width + 3 widths of plane margin + a 0.45 via radius + 0.25.
+    assert max(ys) == pytest.approx(0.175 + 3 * 0.35 + 0.45 + 0.25)
+    assert min(ys) == pytest.approx(-max(ys))
+    # The breakouts stay free: no band within the release's allowance of an end.
+    assert min(xs) > 1.5 and max(xs) < 18.5
+    assert krt_route.via_bands(f"(kicad_pcb {seg})", ["OTHER"], via_mm=0.9, clearance_mm=0.25) == []
+
+
+@pytest.fixture
+def layered(board):
+    """The board with a 4-layer table, so its signals have layers to route on."""
+    board.write_text(BOARD.replace("(kicad_pcb", '(kicad_pcb (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) '
+                                   '(6 "In2.Cu" signal) (2 "B.Cu" signal))', 1))
+    return board
+
+
+def test_the_via_bands_come_off_before_the_ground_stitching(layered, tmp_path, monkeypatch):
+    board = layered
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {"GND": ["In1.Cu"]})
+    calls = []
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: ok)
+    monkeypatch.setattr(krt_route, "via_bands", lambda text, nets, **k: [[(0, 0), (1, 0), (1, 1)]])
+    monkeypatch.setattr(krt_route, "_via_band_areas",
+                        lambda py, pcb, rects: calls.append(("bands", rects is not None)) or ok)
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: calls.append(Path(cmd[1]).name) or ok)
+    for name in ("_snap_terminals", "_fill", "_trim_dangling"):
+        monkeypatch.setattr(krt_route, name, lambda *a, n=name: calls.append(n) or ok)
+    monkeypatch.setattr(krt_route, "_stitch", lambda *a, **k: calls.append("stitch") or ok)
+    monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
+    result = krt_route.route(board, work_dir=tmp_path / "w", class_layers={"RF_50R": ["F.Cu"]})
+    assert result.ok and result.extra["via_bands"] == 1
+    on, off = calls.index(("bands", True)), calls.index(("bands", False))
+    assert calls[on - 1] == "route.py" and "route.py" in calls[on + 1:off]
+    assert off < calls.index("stitch")
+
+
+def test_a_failed_route_still_takes_its_via_bands_off(layered, tmp_path, monkeypatch):
+    board = layered
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {"GND": ["In1.Cu"]})
+    calls = []
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    runs = iter([ok, ok, subprocess.CompletedProcess([], 1, "", "boom")])
+    monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: ok)
+    monkeypatch.setattr(krt_route, "via_bands", lambda text, nets, **k: [[(0, 0), (1, 0), (1, 1)]])
+    monkeypatch.setattr(krt_route, "_via_band_areas",
+                        lambda py, pcb, rects: calls.append(("bands", rects is not None)) or ok)
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: next(runs, ok))
+    result = krt_route.route(board, work_dir=tmp_path / "w", class_layers={"RF_50R": ["F.Cu"]})
+    assert not result.ok and calls == [("bands", True), ("bands", False)]

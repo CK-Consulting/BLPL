@@ -359,7 +359,11 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
     # pass's width, so a 0.35 mm RF trace could come back at 0.2 mm (Codex,
     # PR #59). "!NET" protects it.
     done: list[str] = []
-    for name in sorted(groups):
+    controlled_last = None
+    # The impedance-controlled classes first: once they are down, the via
+    # bands beside them (VIA_BANDS) keep every later pass's vias out of the
+    # plane they are measured against.
+    for name in sorted(groups, key=lambda n: (n not in (class_layers or {}), n)):
         if name == "Default":
             continue
         c = classes.get(name, {})
@@ -401,6 +405,11 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
                 "--nets", *map(_glob, groups[name]), *protect, "--track-width", f"{c.get('track_width', 0.2):g}",
                 *rules(c), *held, *on]})
         done += groups[name]
+        if name in (class_layers or {}):
+            controlled_last = len(steps)
+    if controlled_last is not None:
+        steps.insert(controlled_last, {"script": VIA_BANDS, "args": sorted(
+            n for name in (class_layers or {}) for n in groups.get(name, []))})
     def power_args(nets: list[tuple[str, str, float]]) -> list[str]:
         return ["--power-nets", *[_pat(n) for _, n, _ in nets], "--power-nets-widths", *[f"{w:g}" for _, _, w in nets]]
 
@@ -558,6 +567,77 @@ def _edge_band(python: str, pcb: Path, depth_mm: float, *, add: bool,
         "            b.Add(sh)\n"
         f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
     ))
+
+
+#: A step in ``plan`` that is not a router call: draw the via bands.
+VIA_BANDS = "@via-bands"
+#: The rule areas' name, by which they are found and taken off again.
+VIA_BAND_NAME = "BLPL via band"
+
+
+def via_bands(pcb_text: str, nets: list[str], *, via_mm: float, clearance_mm: float) -> list[list[tuple[float, float]]]:
+    """Rectangles beside every measured sample of the controlled nets, inside
+    which no other net's via may go.
+
+    The release holds a controlled trace to filled plane under it out to
+    ``impedance._PLANE_MARGIN_W`` widths past each edge, on its reference
+    layer. Another net's via through that plane cuts a hole its radius plus
+    the plane's clearance wide, and the router, routing the rest afterwards,
+    put them there: on the ear tag VDD_LR2021's vias straddled RF_LRLF and
+    left both of its edges over no plane. The band is that margin plus that
+    hole, on the samples the release measures: the breakouts by the pads,
+    which it does not measure, stay free for a dense part's fan-out.
+    """
+    from blpl.emitter import sexpr
+
+    from . import impedance
+
+    board = sexpr.parse(pcb_text)
+    _, _, lines, arcs = impedance._routed(board)
+    pads = impedance._pads(board)
+    out = []
+    for net in nets:
+        for _lay, pt, nrm, w, step, _end in impedance._measured(net, lines, arcs, pads.get(net)):
+            half_w = w / 2 + impedance._PLANE_MARGIN_W * w + via_mm / 2 + clearance_mm
+            half_l = step / 2 + 0.05  # overlapping, so a run has no gaps
+            tx, ty = -nrm[1], nrm[0]
+            out.append([(pt[0] + sx * tx * half_l + sy * nrm[0] * half_w,
+                         pt[1] + sx * ty * half_l + sy * nrm[1] * half_w)
+                        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
+    return out
+
+
+def _via_band_areas(python: str, pcb: Path, rects: list | None) -> subprocess.CompletedProcess:
+    """Write ``rects`` as rule areas forbidding vias on every copper layer, or
+    with None take every one this module drew off the board again."""
+    from . import autoroute
+
+    code = (
+        "import pcbnew\n"
+        f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
+        f"for z in [z for z in b.Zones() if z.GetIsRuleArea() and z.GetZoneName() == {VIA_BAND_NAME!r}]:\n"
+        "    b.Remove(z)\n"
+    )
+    if rects:
+        code += (
+            f"for r in {[[(round(x, 4), round(y, 4)) for x, y in r] for r in rects]!r}:\n"
+            "    z = pcbnew.ZONE(b)\n"
+            "    z.SetIsRuleArea(True)\n"
+            f"    z.SetZoneName({VIA_BAND_NAME!r})\n"
+            "    z.SetDoNotAllowVias(True)\n"
+            "    z.SetDoNotAllowTracks(False)\n"
+            "    z.SetDoNotAllowZoneFills(False)\n"
+            "    z.SetDoNotAllowPads(False)\n"
+            "    z.SetDoNotAllowFootprints(False)\n"
+            "    z.SetLayerSet(pcbnew.LSET.AllCuMask())\n"
+            "    ol = z.Outline()\n"
+            "    ol.NewOutline()\n"
+            "    for x, y in r:\n"
+            "        ol.Append(pcbnew.FromMM(x), pcbnew.FromMM(y))\n"
+            "    b.Add(z)\n"
+        )
+    code += f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
+    return autoroute._pcbnew(python, code)
 
 
 #: How far off a pad's copper a track end may be and still be joined to it: a
@@ -968,14 +1048,39 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     if refused:
         result.extra["refused"] = refused
     result.extra["steps"] = [" ".join([s["script"], *s["args"]]) for s in steps]
+    bands = False
+    widest_via = max([c.get("via_diameter", 0.6) for c in classes.values()] or [0.6])
+    widest_gap = max([c.get("clearance", 0.2) for c in classes.values()] + [rules.get("min_clearance") or 0.0])
+
+    def unband() -> str:
+        if not bands:
+            return ""
+        off = _via_band_areas(python, pcb, None)
+        restore_pro()
+        return "" if off.returncode == 0 else f"pcbnew could not remove the via bands: {autoroute._msg(off)}"
+
     for step in steps:
+        if step["script"] == VIA_BANDS:
+            rects = via_bands(pcb.read_text(encoding="utf-8"), step["args"],
+                              via_mm=widest_via, clearance_mm=widest_gap)
+            drawn = _via_band_areas(python, pcb, rects)
+            restore_pro()
+            bands = True
+            if drawn.returncode != 0:
+                left = unband()
+                result.reason = f"pcbnew could not draw the via bands: {autoroute._msg(drawn)}" + (f"; and {left}" if left else "")
+                return result
+            result.extra["via_bands"] = len(rects)
+            log.append(f"$ via bands beside {', '.join(step['args'])}: {len(rects)} area(s)")
+            continue
         script = str(home / "py_router" / step["script"])
         target = [str(pcb), str(pcb)] if step["script"] == "route_planes.py" else [str(pcb), "-O"]
         proc = _run([sys.executable, script, *target, *step["args"]], timeout)
         restore_pro()
         log.append(f"$ {step['script']} {' '.join(step['args'])}\n{(proc.stdout or '')[-4000:]}{(proc.stderr or '')[-2000:]}")
         if proc.returncode != 0:
-            result.reason = f"{step['script']} exited {proc.returncode}: {autoroute._msg(proc)[-800:]}"
+            left = unband()
+            result.reason = f"{step['script']} exited {proc.returncode}: {autoroute._msg(proc)[-800:]}" + (f"; and {left}" if left else "")
             result.log = "\n".join(log)[-20000:]
             # A failed route still takes its band off: left on, the board
             # carries BLPL's scaffolding as if it were design (Codex, PR #59).
@@ -986,6 +1091,12 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
                     result.reason += f"; and pcbnew could not remove the edge band: {autoroute._msg(unbanded)}"
             return result
     result.log = "\n".join(log)[-20000:]
+    # Off before the stitching pass: a ground via beside an RF trace is what
+    # the band is for, not what it keeps out.
+    unbanded_vias = unband()
+    if unbanded_vias:
+        result.reason = unbanded_vias
+        return result
     unbanded = _edge_band(python, pcb, 0, add=False) if band else subprocess.CompletedProcess([], 0, "", "")
     restore_pro()
     if unbanded.returncode != 0:
