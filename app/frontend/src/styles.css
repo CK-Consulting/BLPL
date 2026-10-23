@@ -1068,6 +1068,10 @@ header .kicad-launch { margin-left: .4rem; }
 .app.phone > header .active-board { padding: .15rem .25rem .15rem .45rem; gap: .3rem; }
 .app.phone > header .active-board-label { display: none; }
 .app.phone > header .active-board select { max-width: 30vw; }
+/* What the header carries only on a wide screen: More has it on a phone. The
+   project settings button goes too, but not its dialog, which is the same
+   component and must survive the layout changing. */
+.app.phone > header .wide-only, .app.phone > header > .proj-settings { display: none; }
 .phone-panes { display: flex; flex: 1; min-height: 0; }
 .phone-panes > * { flex: 1; min-width: 0; width: 100%; }
 .phone-panes > .rail { border-right: 0; padding: .5rem; }
@@ -1075,8 +1079,8 @@ header .kicad-launch { margin-left: .4rem; }
 /* 16px in fields, or iOS zooms the page in on focus and never zooms back. */
 .app.phone input, .app.phone textarea, .app.phone select { font-size: 16px; }
 .more-pane { display: flex; flex-direction: column; overflow-y: auto; }
-.more-pane .git-strip { flex-wrap: wrap; row-gap: .4rem; padding: .7rem 1rem; }
-.more-pane .git-strip .note { max-width: 100%; white-space: normal; }
+.app.phone .sync-slot .git-strip { flex-wrap: wrap; row-gap: .4rem; padding: .7rem 1rem; }
+.app.phone .sync-slot .git-strip .note { max-width: 100%; white-space: normal; }
 .more-list { display: flex; flex-direction: column; padding: .4rem 0; }
 .more-item { display: flex; align-items: center; gap: .75rem; width: 100%; min-height: 48px; padding: .7rem 1rem; background: none; border: 0; border-bottom: 1px solid #23272f; border-radius: 0; color: #e6e6e6; text-align: left; text-decoration: none; font-size: 15px; }
 .more-item:hover, .more-item:active { background: #1c2027; }

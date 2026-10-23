@@ -768,7 +768,7 @@ export function ProjectSettings({
   board,
   onRemoteChanged,
   onFilesChanged,
-  label,
+  openRef,
 }: {
   projectId: string;
   /** Called after the remote is added or changed, for the git strip. */
@@ -781,11 +781,12 @@ export function ProjectSettings({
    *  is implicit — the panel resolves that itself rather than being withheld,
    *  because such a project still has a root project.yaml to edit. */
   board?: string | null;
-  /** Shown beside the icon, where there is room for words: the phone layout's
-   *  menu of everything the header holds on a wide screen. */
-  label?: string;
+  /** Set to a function that opens the dialog, for a control elsewhere: the
+   *  phone layout's More tab, where this component's own button is hidden. */
+  openRef?: React.MutableRefObject<(() => void) | null>;
 }) {
   const [open, setOpen] = useState(false);
+  if (openRef) openRef.current = () => setOpen(true);
   const [tab, setTab] = useState<ProjectSettingsTab>("board");
   const [boardDirty, setBoardDirty] = useState(false);
   const [asking, setAsking] = useState(false);
@@ -800,13 +801,12 @@ export function ProjectSettings({
   if (!open)
     return (
       <button
-        className={label ? "more-item" : "nav-icon proj-settings"}
+        className="nav-icon proj-settings"
         aria-label={`Project settings — ${projectId}`}
         title={`Project settings — ${projectId}`}
         onClick={() => setOpen(true)}
       >
         <ProjectIcon size={18} />
-        {label && <span>{label}</span>}
       </button>
     );
   return (

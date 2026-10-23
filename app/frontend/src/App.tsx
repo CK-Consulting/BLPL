@@ -33,7 +33,7 @@ import { ChatPanel } from "./components/ChatPanel";
 import { AskChatButton } from "./components/AskChatButton";
 import { onAskChat } from "./askChat";
 import { NavActions, useMediaQuery } from "./components/NavActions";
-import { Chat as ChatIcon, Cog, Ellipsis, Folder, Panels, PlusSquare, Share as ShareIcon } from "./components/Icons";
+import { Chat as ChatIcon, Cog, Ellipsis, Folder, Panels, PlusSquare, ProjectIcon, Share as ShareIcon } from "./components/Icons";
 import { BoardPanel } from "./components/BoardPanel";
 import { RailToggle, Section } from "./components/Rail";
 import {
@@ -209,16 +209,24 @@ export function Workspace({ projectId, onLeave }: { projectId: string; onLeave: 
       fab={projects.find((p) => p.id === selected)?.fab}
     />
   );
-  const projectSettings = (label?: string) =>
+  const openProjectSettings = useRef<(() => void) | null>(null);
+  const projectSettings = () =>
     selected && (
       <ProjectSettings
         projectId={selected}
         board={board}
         onRemoteChanged={() => setGitToken((n) => n + 1)}
         onFilesChanged={bump}
-        label={label}
+        openRef={openProjectSettings}
       />
     );
+  // The chat stays mounted once it has been on screen, and is hidden rather
+  // than removed when closed: so its draft survives the layout changing, and
+  // closing the pane on a wide screen no longer throws a draft away either.
+  const [chatMounted, setChatMounted] = useState(false);
+  useEffect(() => {
+    if (phone || showChat) setChatMounted(true);
+  }, [phone, showChat]);
 
   const railBody = selected && (
     <>
@@ -424,171 +432,180 @@ export function Workspace({ projectId, onLeave }: { projectId: string; onLeave: 
     </div>
   );
 
-  if (phone) {
-    return (
-      <div className="app phone">
-        <Invitations onChanged={refresh} />
-        <header>
-          {backToProjects}
-          {projectPicker}
-          {activeBoard}
-        </header>
-        {selected ? (
-          <main className="phone-panes">
-            <aside className="rail" hidden={pane !== "files"}>
-              {railBody}
-            </aside>
-            <section className="viewer" hidden={pane !== "view"}>
-              {viewerBody}
-            </section>
-            <aside className="chat-dock" hidden={pane !== "chat"}>
-              {chatBody}
-            </aside>
-            <section className="more-pane" hidden={pane !== "more"}>
-              {/* Commit status first: it is the one thing here that changes
-                  while you work, and the reason to come to this tab. */}
-              <ProjectSync projectId={selected} onChanged={bump} reloadToken={gitToken} />
-              <div className="more-list">
-                {projectSettings("Project settings")}
-                <button className="more-item" onClick={() => setShowSharing(true)}>
-                  <ShareIcon size={18} />
-                  <span>Share project</span>
-                </button>
-                <button className="more-item" onClick={() => setShowNewProject(true)}>
-                  <PlusSquare size={18} />
-                  <span>New project</span>
-                </button>
-                <button className="more-item" onClick={() => setShowSettings(true)}>
-                  <Cog size={18} />
-                  <span>Account &amp; app settings</span>
-                </button>
-                <LaunchKicad className="more-item kicad-launch" version={kicad} projectId={selected} board={board} />
-                <button
-                  className="more-item"
-                  onClick={() => unsaved.guard(onLeave, "going back to all projects")}
-                >
-                  <span>← All projects</span>
-                </button>
-                <div className="more-account">
-                  <UserControl />
-                  <span className="muted small">Account</span>
-                </div>
-              </div>
-            </section>
-          </main>
-        ) : (
-          noProjects
-        )}
-        {selected && (
-          <nav className="phone-tabs" aria-label="Panes">
-            {PHONE_PANES.map(({ id, label, icon }) => (
-              <button
-                key={id}
-                className={pane === id ? "on" : ""}
-                aria-pressed={pane === id}
-                onClick={() => setPane(id)}
-              >
-                {icon}
-                <span>{label}</span>
-              </button>
-            ))}
-          </nav>
-        )}
-        {dialogs}
-      </div>
-    );
-  }
-
+  // One tree for both layouts, every long-lived panel keyed in one place:
+  // the breakpoint changes classes and what is hidden, never which components
+  // exist. Two trees, one per layout, remounted the editor and the chat when
+  // a window was resized across the line or a tablet turned, and an unsaved
+  // edit went with them without a word (Codex, PR #79).
   return (
-    <div className="app">
+    <div className={phone ? "app phone" : "app"}>
       <Invitations onChanged={refresh} />
       <header>
         {backToProjects}
-        <span className="sep">/</span>
+        <span className="sep wide-only">/</span>
         {projectPicker}
+        {/* One instance, here, on both layouts. On a phone its button is
+            hidden and More opens it, so a dialog with board edits in it
+            survives the layout changing under it. */}
         {projectSettings()}
         {activeBoard}
-        <span className="spacer" />
-        <LaunchKicad className="link kicad-launch" version={kicad} projectId={selected} board={board} />
-        <NavActions
-          actions={[
-            {
-              id: "new-project",
-              label: "New project",
-              icon: <PlusSquare />,
-              onSelect: () => setShowNewProject(true),
-              title: "Clone a git remote, or start a local project",
-            },
-            {
-              id: "chat",
-              label: "Chat",
-              icon: <ChatIcon />,
-              onSelect: toggleChat,
-              active: showChat,
-            },
-            {
-              id: "share",
-              label: "Share project",
-              icon: <ShareIcon />,
-              onSelect: () => setShowSharing(true),
-              disabled: !selected,
-              title: selected ? `Invite someone to ${selected}` : "Select a project first",
-            },
-            {
-              id: "settings",
-              label: "Account & app settings",
-              icon: <Cog />,
-              onSelect: () => setShowSettings(true),
-              title: "Endpoints, task routing, git credentials, passkeys — your defaults across every project",
-            },
-          ]}
-        />
+        <span className="spacer wide-only" />
+        <span className="wide-only">
+          <LaunchKicad className="link kicad-launch" version={kicad} projectId={selected} board={board} />
+        </span>
+        <span className="wide-only">
+          <NavActions
+            actions={[
+              {
+                id: "new-project",
+                label: "New project",
+                icon: <PlusSquare />,
+                onSelect: () => setShowNewProject(true),
+                title: "Clone a git remote, or start a local project",
+              },
+              {
+                id: "chat",
+                label: "Chat",
+                icon: <ChatIcon />,
+                onSelect: toggleChat,
+                active: showChat,
+              },
+              {
+                id: "share",
+                label: "Share project",
+                icon: <ShareIcon />,
+                onSelect: () => setShowSharing(true),
+                disabled: !selected,
+                title: selected ? `Invite someone to ${selected}` : "Select a project first",
+              },
+              {
+                id: "settings",
+                label: "Account & app settings",
+                icon: <Cog />,
+                onSelect: () => setShowSettings(true),
+                title: "Endpoints, task routing, git credentials, passkeys — your defaults across every project",
+              },
+            ]}
+          />
+        </span>
         {/* Clerk owns sign-out, the account menu, and everything under it, so
             there is nothing here for the app to reimplement. */}
-        <UserControl />
+        <span className="wide-only">
+          <UserControl />
+        </span>
       </header>
 
       {selected ? (
         <>
-          <ProjectSync projectId={selected} onChanged={bump} reloadToken={gitToken} />
-          <main>
-            {railCollapsed ? (
+          {/* The commit strip under the header on a wide screen; on a phone
+              the head of the More tab. Same place in the tree either way, so
+              a commit dialog it has open is not lost to a rotation. */}
+          <div className="sync-slot" hidden={phone && pane !== "more"}>
+            <ProjectSync projectId={selected} onChanged={bump} reloadToken={gitToken} />
+          </div>
+          <main className={phone ? "phone-panes" : undefined}>
+            {!phone && railCollapsed && (
               // A gutter, not nothing: the control that brings the rail back
               // has to stay somewhere you can click.
-              <div className="rail-gutter">
+              <div key="rail-gutter" className="rail-gutter">
                 <RailToggle collapsed onToggle={toggleRail} />
               </div>
-            ) : (
-              <>
-                <aside className="rail" style={{ width: sidebar.width }}>
+            )}
+            {(phone || !railCollapsed) && (
+              <aside
+                key="rail"
+                className="rail"
+                style={phone ? undefined : { width: sidebar.width }}
+                hidden={phone && pane !== "files"}
+              >
+                {!phone && (
                   <div className="rail-top">
                     <RailToggle collapsed={false} onToggle={toggleRail} />
                   </div>
-                  {railBody}
-                </aside>
-                <div
-                  className="resizer"
-                  onMouseDown={sidebar.onMouseDown}
-                  onDoubleClick={sidebar.reset}
-                  title="Drag to resize · double-click to reset"
-                />
-              </>
+                )}
+                {railBody}
+              </aside>
             )}
-            <section className="viewer">{viewerBody}</section>
-            {showChat && (
-              <>
-                <div
-                  className="resizer"
-                  onMouseDown={chat.onMouseDown}
-                  onDoubleClick={chat.reset}
-                  title="Drag to resize · double-click to reset"
-                />
-                <aside className="chat-dock" style={{ width: chat.width }}>
-                  {chatBody}
-                </aside>
-              </>
+            {!phone && !railCollapsed && (
+              <div
+                key="rail-resizer"
+                className="resizer"
+                onMouseDown={sidebar.onMouseDown}
+                onDoubleClick={sidebar.reset}
+                title="Drag to resize · double-click to reset"
+              />
+            )}
+            <section key="viewer" className="viewer" hidden={phone && pane !== "view"}>
+              {viewerBody}
+            </section>
+            {!phone && showChat && (
+              <div
+                key="chat-resizer"
+                className="resizer"
+                onMouseDown={chat.onMouseDown}
+                onDoubleClick={chat.reset}
+                title="Drag to resize · double-click to reset"
+              />
+            )}
+            {chatMounted && (
+              <aside
+                key="chat"
+                className="chat-dock"
+                style={phone ? undefined : { width: chat.width }}
+                hidden={phone ? pane !== "chat" : !showChat}
+              >
+                {chatBody}
+              </aside>
+            )}
+            {phone && (
+              <section key="more" className="more-pane" hidden={pane !== "more"}>
+                <div className="more-list">
+                  <button className="more-item" onClick={() => openProjectSettings.current?.()}>
+                    <ProjectIcon size={18} />
+                    <span>Project settings</span>
+                  </button>
+                  <button className="more-item" onClick={() => setShowSharing(true)}>
+                    <ShareIcon size={18} />
+                    <span>Share project</span>
+                  </button>
+                  <button className="more-item" onClick={() => setShowNewProject(true)}>
+                    <PlusSquare size={18} />
+                    <span>New project</span>
+                  </button>
+                  <button className="more-item" onClick={() => setShowSettings(true)}>
+                    <Cog size={18} />
+                    <span>Account &amp; app settings</span>
+                  </button>
+                  <LaunchKicad className="more-item kicad-launch" version={kicad} projectId={selected} board={board} />
+                  <button
+                    className="more-item"
+                    onClick={() => unsaved.guard(onLeave, "going back to all projects")}
+                  >
+                    <span>← All projects</span>
+                  </button>
+                  <div className="more-account">
+                    <UserControl />
+                    <span className="muted small">Account</span>
+                  </div>
+                </div>
+              </section>
             )}
           </main>
+          {phone && (
+            <nav className="phone-tabs" aria-label="Panes">
+              {PHONE_PANES.map(({ id, label, icon }) => (
+                <button
+                  key={id}
+                  className={pane === id ? "on" : ""}
+                  aria-pressed={pane === id}
+                  onClick={() => setPane(id)}
+                >
+                  {icon}
+                  <span>{label}</span>
+                </button>
+              ))}
+            </nav>
+          )}
         </>
       ) : (
         noProjects
