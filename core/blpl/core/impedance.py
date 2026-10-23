@@ -1153,7 +1153,14 @@ def _barred(areas: dict, layer: str, pt: tuple) -> bool:
     """Whether a pour on ``layer`` is forbidden at ``pt``, by any area naming it."""
     from .board_geometry import point_in_polygon
 
-    on = areas.get(layer, []) + (areas.get("*.Cu", []) if layer.endswith(".Cu") else [])
+    # KiCad's selectors as well as layer names: "*.Cu" for every copper layer,
+    # and "F&B.Cu" for both outer ones, which the emitter writes for a
+    # two-sided keepout (Codex, PR #77).
+    on = list(areas.get(layer, []))
+    if layer.endswith(".Cu"):
+        on += areas.get("*.Cu", [])
+    if layer in ("F.Cu", "B.Cu"):
+        on += areas.get("F&B.Cu", [])
     return any(point_in_polygon(pt, poly) for poly in on)
 
 
