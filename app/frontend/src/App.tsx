@@ -32,8 +32,8 @@ import { Artifacts } from "./components/Artifacts";
 import { ChatPanel } from "./components/ChatPanel";
 import { AskChatButton } from "./components/AskChatButton";
 import { onAskChat } from "./askChat";
-import { NavActions } from "./components/NavActions";
-import { Chat as ChatIcon, Cog, PlusSquare, Share as ShareIcon } from "./components/Icons";
+import { NavActions, useMediaQuery } from "./components/NavActions";
+import { Chat as ChatIcon, Cog, Ellipsis, Folder, Panels, PlusSquare, ProjectIcon, Share as ShareIcon } from "./components/Icons";
 import { BoardPanel } from "./components/BoardPanel";
 import { RailToggle, Section } from "./components/Rail";
 import {
@@ -64,7 +64,7 @@ export default function App() {
   );
 }
 
-function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => void }) {
+export function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selected, setSelected] = useState<string | null>(projectId);
   const [kicad, setKicad] = useState<string | null>(null);
@@ -155,296 +155,247 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
   // "local only" and disabled the push the new remote was waiting for.
   const [gitToken, setGitToken] = useState(0);
 
-  return (
-    <div className="app">
-      <Invitations onChanged={refresh} />
-      <header>
-        <button
-          className="link dash-back"
-          onClick={() => unsaved.guard(onLeave, "going back to all projects")}
-          title="All projects"
-        >
-          ← <Logo size={30} />
-        </button>
-        <span className="sep">/</span>
-        <select
-          value={selected ?? ""}
-          onChange={(e) => {
-            // Controlled, so the select shows the old project until the
-            // switch actually happens: Cancel leaves it where it was.
-            const next = e.target.value;
-            if (next !== selected) unsaved.guard(() => setSelected(next), `switching to ${next}`);
+  // On a phone the three panes cannot sit side by side, so they become one
+  // screen each behind a bar of tabs at the bottom, and a fourth holds what
+  // the header carries on a wide screen. Every pane stays mounted and only
+  // the active one is shown: unmounted, the editor would drop an unsaved
+  // draft and the chat a reply still streaming.
+  const phone = useMediaQuery(PHONE_QUERY);
+  const [pane, setPane] = useState<PhonePane>("view");
+  const toView = () => phone && setPane("view");
+  useEffect(() => (phone ? onAskChat(() => setPane("chat")) : undefined), [phone]);
+
+  const projectPicker = (
+    <select
+      aria-label="Project"
+      value={selected ?? ""}
+      onChange={(e) => {
+        // Controlled, so the select shows the old project until the
+        // switch actually happens: Cancel leaves it where it was.
+        const next = e.target.value;
+        if (next !== selected) unsaved.guard(() => setSelected(next), `switching to ${next}`);
+      }}
+      disabled={projects.length === 0}
+    >
+      {projects.map((p) => (
+        <option key={p.id} value={p.id}>
+          {p.fab?.blocked ? "⚠ " : ""}
+          {p.id} ({p.markdown_files} md{p.has_pcb ? ", board" : ""})
+        </option>
+      ))}
+    </select>
+  );
+  const backToProjects = (
+    <button
+      className="link dash-back"
+      onClick={() => unsaved.guard(onLeave, "going back to all projects")}
+      title="All projects"
+    >
+      ← <Logo size={phone ? 24 : 30} />
+    </button>
+  );
+  // The board every tab below is about, where the eye lands first. On a
+  // project with seven boards "which one am I building" is the question
+  // behind every stage run, and a highlighted item in the rail did not
+  // answer it loudly enough. The board's fabricability hangs under this
+  // selector rather than floating in the bar: it is a fact about one board,
+  // and a permanent warning beside the account menu reads as a property of
+  // the application.
+  const activeBoard = selected && (
+    <ActiveBoard
+      projectId={selected}
+      board={board}
+      onBoard={setBoard}
+      fab={projects.find((p) => p.id === selected)?.fab}
+    />
+  );
+  const openProjectSettings = useRef<(() => void) | null>(null);
+  const projectSettings = () =>
+    selected && (
+      <ProjectSettings
+        projectId={selected}
+        board={board}
+        onRemoteChanged={() => setGitToken((n) => n + 1)}
+        onFilesChanged={bump}
+        openRef={openProjectSettings}
+      />
+    );
+  // The chat stays mounted once it has been on screen, and is hidden rather
+  // than removed when closed: so its draft survives the layout changing, and
+  // closing the pane on a wide screen no longer throws a draft away either.
+  const [chatMounted, setChatMounted] = useState(false);
+  useEffect(() => {
+    if (phone || showChat) setChatMounted(true);
+  }, [phone, showChat]);
+
+  const railBody = selected && (
+    <>
+      {/* Board first: it scopes everything under it. A stage run, a BOM and a
+          file are all statements about one board, so the control that decides
+          which board sits above them. */}
+      <BoardPanel projectId={selected} board={board} onBoard={setBoard} />
+      <Section id="files" title="Files">
+        <FileTree
+          projectId={selected}
+          reloadToken={reloadToken}
+          onChanged={refresh}
+          // The open file follows a rename and closes on a delete;
+          // otherwise the editor would save the old name back into
+          // existence on the next keystroke.
+          onMoved={(from, to) => {
+            if (openFile && (openFile.path === from || openFile.path.startsWith(`${from}/`))) {
+              setRenamedFrom(openFile.path);
+            }
+            setOpenFile((f) => {
+              if (!f) return f;
+              if (f.path === from) return { ...f, path: to, name: to.split("/").pop() ?? to };
+              if (f.path.startsWith(`${from}/`)) return { ...f, path: to + f.path.slice(from.length) };
+              return f;
+            });
           }}
-          disabled={projects.length === 0}
-        >
-          {projects.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.fab?.blocked ? "⚠ " : ""}
-              {p.id} ({p.markdown_files} md{p.has_pcb ? ", board" : ""})
-            </option>
-          ))}
-        </select>
-        {selected && (
-          <ProjectSettings
-            projectId={selected}
-            board={board}
-            onRemoteChanged={() => setGitToken((n) => n + 1)}
-            onFilesChanged={bump}
-          />
-        )}
-        {/* The board every tab below is about, where the eye lands first. On a
-            project with seven boards "which one am I building" is the question
-            behind every stage run, and a highlighted item in the rail did not
-            answer it loudly enough. The board's fabricability now hangs under
-            this selector rather than floating in the bar: it is a fact about
-            one board, and a permanent warning beside the account menu reads as
-            a property of the application. */}
-        {selected && (
-          <ActiveBoard
-            projectId={selected}
-            board={board}
-            onBoard={setBoard}
-            fab={projects.find((p) => p.id === selected)?.fab}
-          />
-        )}
-        <span className="spacer" />
-        <LaunchKicad className="link kicad-launch" version={kicad} projectId={selected} board={board} />
-        <NavActions
-          actions={[
-            {
-              id: "new-project",
-              label: "New project",
-              icon: <PlusSquare />,
-              onSelect: () => setShowNewProject(true),
-              title: "Clone a git remote, or start a local project",
-            },
-            {
-              id: "chat",
-              label: "Chat",
-              icon: <ChatIcon />,
-              onSelect: toggleChat,
-              active: showChat,
-            },
-            {
-              id: "share",
-              label: "Share project",
-              icon: <ShareIcon />,
-              onSelect: () => setShowSharing(true),
-              disabled: !selected,
-              title: selected ? `Invite someone to ${selected}` : "Select a project first",
-            },
-            {
-              id: "settings",
-              label: "Account & app settings",
-              icon: <Cog />,
-              onSelect: () => setShowSettings(true),
-              title: "Endpoints, task routing, git credentials, passkeys — your defaults across every project",
-            },
-          ]}
+          canMove={(from, to) =>
+            moveRefusalForDraft(openFile?.path ?? null, editorDirty, from, to, editorSaving)
+          }
+          canDelete={(path) =>
+            deleteRefusalForDraft(openFile?.path ?? null, editorDirty, path, editorSaving)
+          }
+          onDeleted={(path) =>
+            setOpenFile((f) =>
+              f && (f.path === path || f.path.startsWith(`${path}/`)) ? null : f,
+            )
+          }
+          onOpen={(n) =>
+            // Text and PDFs go to View/Edit (a PDF to the pane that says
+            // whether the server will let it render), a KiCad file to its
+            // renderer, anything else to the browser. Each pane switch asks
+            // first if there are unsaved edits; see openFromTree. On a phone
+            // the file is on another screen, so that screen comes forward.
+            openFromTree(n, openFile?.path ?? null, unsaved.guard, {
+              pane: (node, where) => {
+                setRenamedFrom(null);
+                setOpenFile(node);
+                setTab(where);
+                toView();
+              },
+              browser: (node) =>
+                window.open(
+                  `/api/projects/${selected}/blob?path=${encodeURIComponent(node.path)}`,
+                  "_blank",
+                ),
+            })
+          }
         />
-        {/* Clerk owns sign-out, the account menu, and everything under it, so
-            there is nothing here for the app to reimplement. */}
-        <UserControl />
-      </header>
+      </Section>
+      <Section id="pipeline" title="Pipeline" defaultOpen={false}>
+        <StageRunner
+          projectId={selected}
+          board={board}
+          onFinished={() => {
+            bump();
+            refresh();
+          }}
+        />
+      </Section>
+      <Section id="runs" title="Runs" defaultOpen={false}>
+        <RunHistory projectId={selected} reloadToken={reloadToken} />
+      </Section>
+    </>
+  );
 
-      {selected ? (
-        <>
-          <ProjectSync projectId={selected} onChanged={bump} reloadToken={gitToken} />
-          <main>
-            {railCollapsed ? (
-              // A gutter, not nothing: the control that brings the rail back
-              // has to stay somewhere you can click.
-              <div className="rail-gutter">
-                <RailToggle collapsed onToggle={toggleRail} />
-              </div>
-            ) : (
-              <>
-                <aside className="rail" style={{ width: sidebar.width }}>
-                  <div className="rail-top">
-                    <RailToggle collapsed={false} onToggle={toggleRail} />
-                  </div>
-                  {/* Board first: it scopes everything under it. A stage run, a
-                      BOM and a file are all statements about one board, so the
-                      control that decides which board sits above them. */}
-                  <BoardPanel projectId={selected} board={board} onBoard={setBoard} />
-                  <Section id="files" title="Files">
-                    <FileTree
-                      projectId={selected}
-                      reloadToken={reloadToken}
-                      onChanged={refresh}
-                      // The open file follows a rename and closes on a delete;
-                      // otherwise the editor would save the old name back into
-                      // existence on the next keystroke.
-                      onMoved={(from, to) => {
-                        if (openFile && (openFile.path === from || openFile.path.startsWith(`${from}/`))) {
-                          setRenamedFrom(openFile.path);
-                        }
-                        setOpenFile((f) => {
-                          if (!f) return f;
-                          if (f.path === from) return { ...f, path: to, name: to.split("/").pop() ?? to };
-                          if (f.path.startsWith(`${from}/`)) return { ...f, path: to + f.path.slice(from.length) };
-                          return f;
-                        });
-                      }}
-                      canMove={(from, to) =>
-                        moveRefusalForDraft(openFile?.path ?? null, editorDirty, from, to, editorSaving)
-                      }
-                      canDelete={(path) =>
-                        deleteRefusalForDraft(openFile?.path ?? null, editorDirty, path, editorSaving)
-                      }
-                      onDeleted={(path) =>
-                        setOpenFile((f) =>
-                          f && (f.path === path || f.path.startsWith(`${path}/`)) ? null : f,
-                        )
-                      }
-                      onOpen={(n) =>
-                        // Text and PDFs go to View/Edit (a PDF to the pane
-                        // that says whether the server will let it render),
-                        // a KiCad file to its renderer, anything else to the
-                        // browser. Each pane switch asks first if there are
-                        // unsaved edits; see openFromTree.
-                        openFromTree(n, openFile?.path ?? null, unsaved.guard, {
-                          pane: (node, where) => {
-                            setRenamedFrom(null);
-                            setOpenFile(node);
-                            setTab(where);
-                          },
-                          browser: (node) =>
-                            window.open(
-                              `/api/projects/${selected}/blob?path=${encodeURIComponent(node.path)}`,
-                              "_blank",
-                            ),
-                        })
-                      }
-                    />
-                  </Section>
-                  <Section id="pipeline" title="Pipeline" defaultOpen={false}>
-                    <StageRunner
-                      projectId={selected}
-                      board={board}
-                      onFinished={() => {
-                        bump();
-                        refresh();
-                      }}
-                    />
-                  </Section>
-                  <Section id="runs" title="Runs" defaultOpen={false}>
-                    <RunHistory projectId={selected} reloadToken={reloadToken} />
-                  </Section>
-                </aside>
-                <div
-                  className="resizer"
-                  onMouseDown={sidebar.onMouseDown}
-                  onDoubleClick={sidebar.reset}
-                  title="Drag to resize · double-click to reset"
-                />
-              </>
-            )}
-            <section className="viewer">
-              <TabBar
-                items={[
-                  { id: "board", label: "Board" },
-                  { id: "preflight", label: "Preflight" },
-                  // Only while a KiCad file is open. A tab that is empty most
-                  // of the time is a tab people learn to skip past, and the
-                  // Board tab already answers "show me this project's board" —
-                  // this one answers "show me the file I just clicked".
-                  ...(openFile && destinationFor(openFile) === "kicad"
-                    ? [{ id: "kicad" as const, label: "KiCad" }]
-                    : []),
-                  { id: "edit", label: "View/Edit" },
-                  { id: "bom", label: "BOM" },
-                  { id: "lifecycle", label: "Lifecycle" },
-                  { id: "modules", label: "Modules" },
-                  { id: "reports", label: "Reports" },
-                  { id: "release", label: "Release" },
-                  { id: "artifacts", label: "Artifacts" },
-                  { id: "changes", label: "Changes" },
-                ]}
-                active={tab}
-                onSelect={setTab}
-              />
-              <div className="ask-chat-row">
-                <AskChatButton reference={askReference(tab, openFile?.path ?? null, board)} />
-              </div>
-              {tab === "board" && (
-                <DesignView
-                  projectId={selected}
-                  board={board}
-                  reloadToken={reloadToken}
-                  highlight={highlight}
-                />
-              )}
-              {tab === "preflight" && (
-                <Preflight projectId={selected} board={board} reloadToken={reloadToken} />
-              )}
-              {tab === "edit" && openFile && destinationFor(openFile) === "pdf" && (
-                <PdfView projectId={selected} path={openFile.path} />
-              )}
-              {tab === "edit" && !(openFile && destinationFor(openFile) === "pdf") && (
-                <FileView
-                  projectId={selected}
-                  onSaved={refresh}
-                  reloadToken={reloadToken}
-                  path={
-                    openFile && destinationFor(openFile) === "text" ? openFile.path : null
-                  }
-                  renamedFrom={renamedFrom}
-                  onDirtyChange={setEditorDirty}
-                  onSavingChange={setEditorSaving}
-                  saveHandle={editorSave}
-                />
-              )}
-              {tab === "kicad" && openFile && (
-                <KicadFileView projectId={selected} path={openFile.path} />
-              )}
-              {tab === "bom" && (
-                <BomTable projectId={selected} board={board} reloadToken={reloadToken} />
-              )}
-              {tab === "lifecycle" && (
-                <LifecycleTable projectId={selected} reloadToken={reloadToken} />
-              )}
-              {tab === "modules" && <ModuleLibrary projectId={selected} reloadToken={reloadToken} />}
-              {tab === "reports" && (
-                <Reports projectId={selected} board={board} reloadToken={reloadToken} />
-              )}
-              {tab === "release" && <ReleasePanel projectId={selected} board={board} reloadToken={reloadToken} />}
-              {tab === "artifacts" && (
-                <Artifacts projectId={selected} board={board} reloadToken={reloadToken} />
-              )}
-              {tab === "changes" && <DiffView projectId={selected} reloadToken={reloadToken} />}
-            </section>
-            {showChat && (
-              <>
-                <div
-                  className="resizer"
-                  onMouseDown={chat.onMouseDown}
-                  onDoubleClick={chat.reset}
-                  title="Drag to resize · double-click to reset"
-                />
-                <aside className="chat-dock" style={{ width: chat.width }}>
-                  <ChatPanel
-                    projectId={selected}
-                    onApplied={() => {
-                      bump();
-                      refresh();
-                    }}
-                    onHighlight={(designators, nets) => {
-                      setHighlight((h) => ({ designators, nets, seq: (h?.seq ?? 0) + 1 }));
-                      setTab("board");
-                    }}
-                  />
-                </aside>
-              </>
-            )}
-          </main>
-        </>
-      ) : (
-        <div className="empty">
-          No projects yet. Use <strong>+ Project</strong> to clone a git remote or start a local one.
-        </div>
+  const viewerBody = selected && (
+    <>
+      <TabBar
+        items={[
+          { id: "board", label: "Board" },
+          { id: "preflight", label: "Preflight" },
+          // Only while a KiCad file is open. A tab that is empty most
+          // of the time is a tab people learn to skip past, and the
+          // Board tab already answers "show me this project's board" —
+          // this one answers "show me the file I just clicked".
+          ...(openFile && destinationFor(openFile) === "kicad"
+            ? [{ id: "kicad" as const, label: "KiCad" }]
+            : []),
+          { id: "edit", label: "View/Edit" },
+          { id: "bom", label: "BOM" },
+          { id: "lifecycle", label: "Lifecycle" },
+          { id: "modules", label: "Modules" },
+          { id: "reports", label: "Reports" },
+          { id: "release", label: "Release" },
+          { id: "artifacts", label: "Artifacts" },
+          { id: "changes", label: "Changes" },
+        ]}
+        active={tab}
+        onSelect={setTab}
+      />
+      <div className="ask-chat-row">
+        <AskChatButton reference={askReference(tab, openFile?.path ?? null, board)} />
+      </div>
+      {tab === "board" && (
+        <DesignView
+          projectId={selected}
+          board={board}
+          reloadToken={reloadToken}
+          highlight={highlight}
+        />
       )}
+      {tab === "preflight" && (
+        <Preflight projectId={selected} board={board} reloadToken={reloadToken} />
+      )}
+      {tab === "edit" && openFile && destinationFor(openFile) === "pdf" && (
+        <PdfView projectId={selected} path={openFile.path} />
+      )}
+      {tab === "edit" && !(openFile && destinationFor(openFile) === "pdf") && (
+        <FileView
+          projectId={selected}
+          onSaved={refresh}
+          reloadToken={reloadToken}
+          path={
+            openFile && destinationFor(openFile) === "text" ? openFile.path : null
+          }
+          renamedFrom={renamedFrom}
+          onDirtyChange={setEditorDirty}
+          onSavingChange={setEditorSaving}
+          saveHandle={editorSave}
+        />
+      )}
+      {tab === "kicad" && openFile && (
+        <KicadFileView projectId={selected} path={openFile.path} />
+      )}
+      {tab === "bom" && (
+        <BomTable projectId={selected} board={board} reloadToken={reloadToken} />
+      )}
+      {tab === "lifecycle" && (
+        <LifecycleTable projectId={selected} reloadToken={reloadToken} />
+      )}
+      {tab === "modules" && <ModuleLibrary projectId={selected} reloadToken={reloadToken} />}
+      {tab === "reports" && (
+        <Reports projectId={selected} board={board} reloadToken={reloadToken} />
+      )}
+      {tab === "release" && <ReleasePanel projectId={selected} board={board} reloadToken={reloadToken} />}
+      {tab === "artifacts" && (
+        <Artifacts projectId={selected} board={board} reloadToken={reloadToken} />
+      )}
+      {tab === "changes" && <DiffView projectId={selected} reloadToken={reloadToken} />}
+    </>
+  );
 
+  const chatBody = selected && (
+    <ChatPanel
+      projectId={selected}
+      onApplied={() => {
+        bump();
+        refresh();
+      }}
+      onHighlight={(designators, nets) => {
+        setHighlight((h) => ({ designators, nets, seq: (h?.seq ?? 0) + 1 }));
+        setTab("board");
+        toView();
+      }}
+    />
+  );
+
+  const dialogs = (
+    <>
       {showNewProject && (
         <NewProject
           onClose={() => setShowNewProject(false)}
@@ -472,9 +423,211 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
           </div>
         </div>
       )}
+    </>
+  );
+
+  const noProjects = (
+    <div className="empty">
+      No projects yet. Use <strong>+ Project</strong> to clone a git remote or start a local one.
+    </div>
+  );
+
+  // One tree for both layouts, every long-lived panel keyed in one place:
+  // the breakpoint changes classes and what is hidden, never which components
+  // exist. Two trees, one per layout, remounted the editor and the chat when
+  // a window was resized across the line or a tablet turned, and an unsaved
+  // edit went with them without a word (Codex, PR #79).
+  return (
+    <div className={phone ? "app phone" : "app"}>
+      <Invitations onChanged={refresh} />
+      <header>
+        {backToProjects}
+        <span className="sep wide-only">/</span>
+        {projectPicker}
+        {/* One instance, here, on both layouts. On a phone its button is
+            hidden and More opens it, so a dialog with board edits in it
+            survives the layout changing under it. */}
+        {projectSettings()}
+        {activeBoard}
+        <span className="spacer wide-only" />
+        <span className="wide-only">
+          <LaunchKicad className="link kicad-launch" version={kicad} projectId={selected} board={board} />
+        </span>
+        <span className="wide-only">
+          <NavActions
+            actions={[
+              {
+                id: "new-project",
+                label: "New project",
+                icon: <PlusSquare />,
+                onSelect: () => setShowNewProject(true),
+                title: "Clone a git remote, or start a local project",
+              },
+              {
+                id: "chat",
+                label: "Chat",
+                icon: <ChatIcon />,
+                onSelect: toggleChat,
+                active: showChat,
+              },
+              {
+                id: "share",
+                label: "Share project",
+                icon: <ShareIcon />,
+                onSelect: () => setShowSharing(true),
+                disabled: !selected,
+                title: selected ? `Invite someone to ${selected}` : "Select a project first",
+              },
+              {
+                id: "settings",
+                label: "Account & app settings",
+                icon: <Cog />,
+                onSelect: () => setShowSettings(true),
+                title: "Endpoints, task routing, git credentials, passkeys — your defaults across every project",
+              },
+            ]}
+          />
+        </span>
+        {/* Clerk owns sign-out, the account menu, and everything under it, so
+            there is nothing here for the app to reimplement. */}
+        <span className="wide-only">
+          <UserControl />
+        </span>
+      </header>
+
+      {selected ? (
+        <>
+          {/* The commit strip under the header on a wide screen; on a phone
+              the head of the More tab. Same place in the tree either way, so
+              a commit dialog it has open is not lost to a rotation. */}
+          <div className="sync-slot" hidden={phone && pane !== "more"}>
+            <ProjectSync projectId={selected} onChanged={bump} reloadToken={gitToken} />
+          </div>
+          <main className={phone ? "phone-panes" : undefined}>
+            {!phone && railCollapsed && (
+              // A gutter, not nothing: the control that brings the rail back
+              // has to stay somewhere you can click.
+              <div key="rail-gutter" className="rail-gutter">
+                <RailToggle collapsed onToggle={toggleRail} />
+              </div>
+            )}
+            {(phone || !railCollapsed) && (
+              <aside
+                key="rail"
+                className="rail"
+                style={phone ? undefined : { width: sidebar.width }}
+                hidden={phone && pane !== "files"}
+              >
+                {!phone && (
+                  <div className="rail-top">
+                    <RailToggle collapsed={false} onToggle={toggleRail} />
+                  </div>
+                )}
+                {railBody}
+              </aside>
+            )}
+            {!phone && !railCollapsed && (
+              <div
+                key="rail-resizer"
+                className="resizer"
+                onMouseDown={sidebar.onMouseDown}
+                onDoubleClick={sidebar.reset}
+                title="Drag to resize · double-click to reset"
+              />
+            )}
+            <section key="viewer" className="viewer" hidden={phone && pane !== "view"}>
+              {viewerBody}
+            </section>
+            {!phone && showChat && (
+              <div
+                key="chat-resizer"
+                className="resizer"
+                onMouseDown={chat.onMouseDown}
+                onDoubleClick={chat.reset}
+                title="Drag to resize · double-click to reset"
+              />
+            )}
+            {chatMounted && (
+              <aside
+                key="chat"
+                className="chat-dock"
+                style={phone ? undefined : { width: chat.width }}
+                hidden={phone ? pane !== "chat" : !showChat}
+              >
+                {chatBody}
+              </aside>
+            )}
+            {phone && (
+              <section key="more" className="more-pane" hidden={pane !== "more"}>
+                <div className="more-list">
+                  <button className="more-item" onClick={() => openProjectSettings.current?.()}>
+                    <ProjectIcon size={18} />
+                    <span>Project settings</span>
+                  </button>
+                  <button className="more-item" onClick={() => setShowSharing(true)}>
+                    <ShareIcon size={18} />
+                    <span>Share project</span>
+                  </button>
+                  <button className="more-item" onClick={() => setShowNewProject(true)}>
+                    <PlusSquare size={18} />
+                    <span>New project</span>
+                  </button>
+                  <button className="more-item" onClick={() => setShowSettings(true)}>
+                    <Cog size={18} />
+                    <span>Account &amp; app settings</span>
+                  </button>
+                  <LaunchKicad className="more-item kicad-launch" version={kicad} projectId={selected} board={board} />
+                  <button
+                    className="more-item"
+                    onClick={() => unsaved.guard(onLeave, "going back to all projects")}
+                  >
+                    <span>← All projects</span>
+                  </button>
+                  <div className="more-account">
+                    <UserControl />
+                    <span className="muted small">Account</span>
+                  </div>
+                </div>
+              </section>
+            )}
+          </main>
+          {phone && (
+            <nav className="phone-tabs" aria-label="Panes">
+              {PHONE_PANES.map(({ id, label, icon }) => (
+                <button
+                  key={id}
+                  className={pane === id ? "on" : ""}
+                  aria-pressed={pane === id}
+                  onClick={() => setPane(id)}
+                >
+                  {icon}
+                  <span>{label}</span>
+                </button>
+              ))}
+            </nav>
+          )}
+        </>
+      ) : (
+        noProjects
+      )}
+      {dialogs}
     </div>
   );
 }
+
+type PhonePane = "files" | "view" | "chat" | "more";
+
+/** The width at which the panes stop sitting side by side. A phone in either
+ *  orientation, not a narrow desktop window: that keeps its panes and folds its
+ *  tabs (TabBar) and header actions (NavActions) instead. */
+export const PHONE_QUERY = "(max-width: 720px), (max-height: 500px) and (pointer: coarse)";
+
+const PHONE_PANES: { id: PhonePane; label: string; icon: React.ReactNode }[] = [
+  { id: "files", label: "Files", icon: <Folder size={20} /> },
+  { id: "view", label: "View", icon: <Panels size={20} /> },
+  { id: "chat", label: "Chat", icon: <ChatIcon size={20} /> },
+  { id: "more", label: "More", icon: <Ellipsis size={20} /> },
+];
 
 
 /** What "Ask chat agent about this" refers to on each tab: the file it shows,
