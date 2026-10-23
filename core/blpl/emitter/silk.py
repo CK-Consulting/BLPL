@@ -410,3 +410,28 @@ def apply(fp: list, *, policy: dict | None, label: str | None) -> None:
                    ["uuid", sexpr.quote(ids.new())], effects])
     if policy.get("clip_to_copper"):
         clip_to_copper(fp)
+
+
+def marking(policy: dict | None, *, origin: tuple[float, float]) -> list | None:
+    """The board's own silk text, a ``gr_text``: its name and revision.
+
+    A fab's release check looks for both (kicad-happy's ``revision_marking``
+    and ``board_name``), and a person holding two spins of a board has nothing
+    else to tell them apart. Every other silk text BLPL writes belongs to a
+    part, so this had no way onto a board at all. ``at`` is board-local, like
+    every placement in project.yaml; on the back it is mirrored, as KiCad
+    writes back-side text, so it reads correctly from that side.
+    """
+    mark = (policy or {}).get("marking")
+    if not mark:
+        return None
+    size = max(MIN_TEXT, float(mark.get("size") or 1.0))
+    back = mark.get("side", "back") == "back"
+    x, y = mark["at"]
+    effects = ["effects", ["font", ["size", f"{size:g}", f"{size:g}"], ["thickness", f"{max(0.1, size * 0.15):.3g}"]]]
+    if back:
+        effects.append(["justify", "mirror"])
+    return ["gr_text", sexpr.quote(mark["text"]),
+            ["at", f"{origin[0] + float(x):.3f}", f"{origin[1] + float(y):.3f}", f"{float(mark.get('rotation') or 0):g}"],
+            ["layer", sexpr.quote("B.SilkS" if back else "F.SilkS")],
+            ["uuid", sexpr.quote(ids.new())], effects]

@@ -253,6 +253,22 @@
         "clip_to_copper": {
           "type": "boolean",
           "description": "Trim footprints' silk graphics where they cross the footprint's own pads, as the fab's mask clipping would."
+        },
+        "marking": {
+          "type": "object",
+          "description": "The board's own silk text: its name and revision, which a fab's release check looks for. Example: {text: 'VQT0P1 REV 0', at: [44, 46]}.",
+          "required": ["text", "at"],
+          "additionalProperties": false,
+          "properties": {
+            "text": { "type": "string", "minLength": 1, "maxLength": 40 },
+            "at": {
+              "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2,
+              "description": "Centre of the text in board-local mm, as placement pins are."
+            },
+            "side": { "enum": ["back", "front"], "description": "back (the default) or front." },
+            "size": { "type": "number", "minimum": 0.8, "maximum": 3, "description": "Text height in mm (default 1.0)." },
+            "rotation": { "type": "number", "description": "Degrees (default 0)." }
+          }
         }
       }
     },
