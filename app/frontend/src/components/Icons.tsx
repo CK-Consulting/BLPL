@@ -129,6 +129,20 @@ export const ExternalLink = (p: IconProps = {}) =>
     p,
   );
 
+/** Folder — the files and runs pane, on a phone. Feather's "folder". */
+export const Folder = (p: IconProps = {}) =>
+  svg(<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />, p);
+
+/** Panels — the centre pane and its tabs, on a phone. Feather's "layout". */
+export const Panels = (p: IconProps = {}) =>
+  svg(
+    <>
+      <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+      <path d="M3 9h18M9 21V9" />
+    </>,
+    p,
+  );
+
 /** Overflow — the rest of the bar, when the bar has run out of room. */
 export const Ellipsis = (p: IconProps = {}) =>
   svg(

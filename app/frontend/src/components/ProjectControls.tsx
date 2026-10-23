@@ -768,6 +768,7 @@ export function ProjectSettings({
   board,
   onRemoteChanged,
   onFilesChanged,
+  label,
 }: {
   projectId: string;
   /** Called after the remote is added or changed, for the git strip. */
@@ -780,6 +781,9 @@ export function ProjectSettings({
    *  is implicit — the panel resolves that itself rather than being withheld,
    *  because such a project still has a root project.yaml to edit. */
   board?: string | null;
+  /** Shown beside the icon, where there is room for words: the phone layout's
+   *  menu of everything the header holds on a wide screen. */
+  label?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<ProjectSettingsTab>("board");
@@ -796,12 +800,13 @@ export function ProjectSettings({
   if (!open)
     return (
       <button
-        className="nav-icon proj-settings"
+        className={label ? "more-item" : "nav-icon proj-settings"}
         aria-label={`Project settings — ${projectId}`}
         title={`Project settings — ${projectId}`}
         onClick={() => setOpen(true)}
       >
         <ProjectIcon size={18} />
+        {label && <span>{label}</span>}
       </button>
     );
   return (
