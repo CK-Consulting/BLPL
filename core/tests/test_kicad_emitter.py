@@ -698,3 +698,11 @@ def test_the_same_hdm_emits_the_same_files_every_time() -> None:
     other = {**hdm, "project": {**hdm["project"], "name": "another"}}
     other_ids = set(re.findall(uuid_re, pcb.emit(other, footprints_root=_FOOTPRINTS_ROOT)))
     assert other_ids - set(board_ids)
+
+
+def test_project_yaml_s_board_marking_is_on_the_emitted_board() -> None:
+    hdm = _minimal_hdm()
+    hdm["silkscreen"] = {"marking": {"text": "VQT0P1 REV 0", "at": [5, 5]}}
+    texts = [n for n in sexpr.parse(pcb.emit(hdm, footprints_root=_FOOTPRINTS_ROOT)) if sexpr.head(n) == "gr_text"]
+    assert [sexpr.unquote(t[1]) for t in texts] == ["VQT0P1 REV 0"]
+    assert "gr_text" not in pcb.emit(_minimal_hdm(), footprints_root=_FOOTPRINTS_ROOT)
