@@ -13,6 +13,9 @@ export default defineConfig({
     globals: true,
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
+    // The app's own stylesheet, processed, so a test can read a layout rule
+    // that jsdom cannot lay out (ReleasePanel's log). Others stay empty.
+    css: { include: [/src\/styles\.css/] },
   },
   server: {
     port: 5173,
