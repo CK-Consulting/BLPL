@@ -408,7 +408,7 @@ function Workspace({ projectId, onLeave }: { projectId: string; onLeave: () => v
               {tab === "reports" && (
                 <Reports projectId={selected} board={board} reloadToken={reloadToken} />
               )}
-              {tab === "release" && <ReleasePanel projectId={selected} reloadToken={reloadToken} />}
+              {tab === "release" && <ReleasePanel projectId={selected} board={board} reloadToken={reloadToken} />}
               {tab === "artifacts" && (
                 <Artifacts projectId={selected} board={board} reloadToken={reloadToken} />
               )}

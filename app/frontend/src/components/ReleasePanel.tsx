@@ -1,14 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { del, getJSON, readSSE } from "../api";
+import { withBoard } from "../board";
 
 /**
  * The last screen before a board leaves for a fab.
  *
  * Its job is to make one fact impossible to miss: whether this package may be
- * sent. A BLPL board ships with every net unrouted and still opens and renders
- * perfectly, so "it looks finished" is worth nothing here — the gate's verdict
+ * sent. A board that opens and renders perfectly can still fail fabrication
+ * checks, so "it looks finished" is worth nothing here — the gate's verdict
  * is the headline, and the download sits underneath it wearing the same
  * verdict, because the zip is what actually gets emailed to a board house.
+ *
+ * Everything the release takes is a control here, not a flag: the board on
+ * screen, and whether to look up JLCPCB part numbers. The package used to be
+ * reachable only as `blpl release --lcsc`, and its refusals told the user to
+ * re-run it that way — from a shell nobody using the app has.
  */
 
 type Manifest = {
@@ -33,21 +39,24 @@ function human(bytes: number): string {
 
 export function ReleasePanel({
   projectId,
+  board,
   reloadToken,
 }: {
   projectId: string;
+  board: string | null;
   reloadToken: number;
 }) {
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [lines, setLines] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
+  const [lcsc, setLcsc] = useState(false);
   const runIdRef = useRef<string | null>(null);
 
   const load = useCallback(() => {
-    getJSON<Manifest>(`/api/projects/${projectId}/release`)
+    getJSON<Manifest>(withBoard(`/api/projects/${projectId}/release`, board))
       .then(setManifest)
       .catch(() => setManifest({ exists: false }));
-  }, [projectId]);
+  }, [projectId, board]);
 
   useEffect(load, [load, reloadToken]);
 
@@ -55,7 +64,8 @@ export function ReleasePanel({
     setLines([]);
     setRunning(true);
     try {
-      await readSSE(`/api/projects/${projectId}/release`, { method: "POST" }, (event, payload) => {
+      const url = withBoard(`/api/projects/${projectId}/release${lcsc ? "?lcsc=true" : ""}`, board);
+      await readSSE(url, { method: "POST" }, (event, payload) => {
         if (event === "start") runIdRef.current = payload.run_id ?? null;
         else if (event === "log") setLines((l) => [...l, payload.line]);
         else if (event === "done") load();
@@ -84,8 +94,12 @@ export function ReleasePanel({
           {running ? "Building…" : "Build release package"}
         </button>
         {running && <button onClick={stop}>Stop</button>}
+        <label title="Fill the assembly BOM's LCSC column from JLCPCB's catalogue, for an order assembled there">
+          <input type="checkbox" checked={lcsc} disabled={running} onChange={(e) => setLcsc(e.target.checked)} />{" "}
+          Look up LCSC part numbers
+        </label>
         {manifest?.exists && (
-          <a className="link" href={`/api/projects/${projectId}/release/latest.zip`}>
+          <a className="link" href={withBoard(`/api/projects/${projectId}/release/latest.zip`, board)}>
             Download latest.zip
           </a>
         )}
@@ -172,7 +186,7 @@ export function ReleasePanel({
 
       {!manifest?.exists && !running && (
         <p className="muted pad">
-          No release yet. Building one runs the fabrication gate over the Stage 8 analysis, then
+          No release yet{board ? ` for ${board}` : ""}. Building one runs the fabrication gate over the Stage 8 analysis, then
           exports gerbers, drill files, placement, a grouped BOM, and the native KiCad project —
           checksummed, in one zip.
         </p>
