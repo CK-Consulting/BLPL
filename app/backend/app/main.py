@@ -7694,7 +7694,8 @@ async def run_stage(
 
 
 @app.post("/api/projects/{project_id}/release")
-async def build_release(project_id: str, user: User = Depends(require_onboarded),
+async def build_release(project_id: str, board: str | None = None, lcsc: bool = False,
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> StreamingResponse:
     """Build the package a contract fab quotes from, gate included.
 
@@ -7704,15 +7705,27 @@ async def build_release(project_id: str, user: User = Depends(require_onboarded)
     """
     # Nothing is read here: the run reads the project, in its run container.
     proj = _project_dir(session, user, project_id, agent_ready=workspace_files.enabled())
+    resolved = _resolve_board(proj, board)
     cmd = [sys.executable, "-m", "blpl.core.release", "--project-dir", str(proj)]
-    return _start_run(session, user, project_id, "release", cmd, dict(os.environ))
+    if resolved:
+        cmd += ["--board", resolved]
+    if lcsc:
+        # JLCPCB orders by LCSC number. Looking them up needs the network, so
+        # it is the user's choice, from the Release tab rather than a command line.
+        cmd.append("--lcsc")
+    return _start_run(session, user, project_id,
+                      "release" if resolved is None else f"release ({resolved})", cmd, dict(os.environ))
 
 
 @app.get("/api/projects/{project_id}/release")
-def latest_release(project_id: str, user: User = Depends(require_onboarded),
+def latest_release(project_id: str, board: str | None = None,
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> dict:
     """The manifest of the most recent release, or why there is none."""
-    manifest = _project_dir(session, user, project_id) / "release" / "latest.json"
+    from blpl.core.release import release_dir
+
+    proj = _project_dir(session, user, project_id)
+    manifest = release_dir(proj, _resolve_board(proj, board)) / "latest.json"
     if not manifest.is_file():
         return {"exists": False}
     try:
@@ -7788,7 +7801,8 @@ def preflight(project_id: str, user: User = Depends(require_onboarded),
 
 
 @app.get("/api/projects/{project_id}/release/latest.zip")
-def download_release(project_id: str, user: User = Depends(require_onboarded),
+def download_release(project_id: str, board: str | None = None,
+    user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> Response:
     """The package itself.
 
@@ -7796,13 +7810,18 @@ def download_release(project_id: str, user: User = Depends(require_onboarded),
     READ-ME-FIRST saying so, which is more useful than a download that silently
     does not exist.
     """
-    archive = _project_dir(session, user, project_id) / "release" / "latest.zip"
+    from blpl.core.release import release_dir
+
+    proj = _project_dir(session, user, project_id)
+    resolved = _resolve_board(proj, board)
+    archive = release_dir(proj, resolved) / "latest.zip"
     if not archive.is_file():
         raise HTTPException(status_code=404, detail="no release has been built for this project")
+    name = project_id if resolved is None else f"{project_id}-{resolved}"
     return Response(
         content=archive.read_bytes(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{project_id}-release.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{name}-release.zip"'},
     )
 
 
