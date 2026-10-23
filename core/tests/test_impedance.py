@@ -859,6 +859,27 @@ def test_a_controlled_trace_needs_a_filled_plane_on_its_reference_layer():
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {wrong})")) == []
 
 
+def test_no_plane_is_owed_where_the_project_forbids_one():
+    """A chip antenna's feed runs into the antenna's ground clearance, a rule
+    area barring a pour on every copper layer. Under it the trace is
+    unreferenced by design; past it the plane is owed as before."""
+    from blpl.emitter import sexpr
+
+    hdm = {"project": {"stackup": {"layers": 4}},
+           "net_classes": {"RF": {"trace_width": 0.35, "impedance": {"ohms": 50, "layers": ["F.Cu"]}}},
+           "nets": {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}}
+    seg = '(segment (start 0 0) (end 20 0) (width 0.35) (layer "F.Cu") (net "ANT"))'
+    plane = _filled('(net "GND")', "In1.Cu", (-5, -5, 14, 5))  # stops 6 mm short
+    clearance = ('(footprint "ANT" (zone (layers "F.Cu" "In1.Cu") (name "antenna clearance") '
+                 '(keepout (tracks allowed) (vias not_allowed) (copperpour not_allowed)) '
+                 '(polygon (pts (xy 14 -5) (xy 25 -5) (xy 25 5) (xy 14 5)))))')
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {plane})")) == [("RF", "F.Cu", "In1.Cu")]
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {plane} {clearance})")) == []
+    # An area that allows a pour excuses nothing.
+    allowed = clearance.replace("(copperpour not_allowed)", "(copperpour allowed)")
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {plane} {allowed})")) == [("RF", "F.Cu", "In1.Cu")]
+
+
 def test_an_inner_trace_needs_planes_on_both_sides():
     assert z.copper_order(4) == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
     from blpl.emitter import sexpr

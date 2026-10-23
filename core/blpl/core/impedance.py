@@ -1121,6 +1121,42 @@ def copper_order(copper: int) -> list[str]:
 _PLANE_MARGIN_W = 3.0
 
 
+def _no_pour_areas(pcb: list) -> dict[str, list[list[tuple[float, float]]]]:
+    """Rule areas that forbid a pour, per copper layer: the board's own and
+    those a footprint carries (an antenna's ground clearance among them),
+    which KiCad saves in board coordinates like any other zone."""
+    from blpl.emitter import sexpr
+
+    zones = list(sexpr.find_all(pcb, "zone"))
+    for fp in sexpr.find_all(pcb, "footprint"):
+        zones += sexpr.find_all(fp, "zone")
+    out: dict[str, list[list[tuple[float, float]]]] = {}
+    for zone in zones:
+        keep = sexpr.find(zone, "keepout")
+        pour = sexpr.find(keep, "copperpour") if keep is not None else None
+        if pour is None or len(pour) < 2 or str(pour[1]) != "not_allowed":
+            continue
+        named = sexpr.find(zone, "layers") or sexpr.find(zone, "layer")
+        layers = [sexpr.unquote(str(l)) for l in (named or [])[1:]]
+        for outline in sexpr.find_all(zone, "polygon"):
+            pts = sexpr.find(outline, "pts")
+            poly = [(float(xy[1]), float(xy[2])) for xy in (pts or [])[1:]
+                    if isinstance(xy, list) and xy and xy[0] == "xy"]
+            if len(poly) < 3:
+                continue
+            for lay in layers:
+                out.setdefault(lay, []).append(poly)
+    return out
+
+
+def _barred(areas: dict, layer: str, pt: tuple) -> bool:
+    """Whether a pour on ``layer`` is forbidden at ``pt``, by any area naming it."""
+    from .board_geometry import point_in_polygon
+
+    on = areas.get(layer, []) + (areas.get("*.Cu", []) if layer.endswith(".Cu") else [])
+    return any(point_in_polygon(pt, poly) for poly in on)
+
+
 def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     """(class, routed layer, reference layer) where a controlled trace has no
     filled plane under it.
@@ -1137,6 +1173,12 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
     width of the trace is not the plane the width was calculated against
     (Codex, PR #31). The plane must reach ``_PLANE_MARGIN_W`` trace widths past
     each edge; probes across that span must all be copper.
+
+    Except where the project forbids that plane: a sample inside a rule area
+    that bars a pour on the reference layer is unreferenced by design, not by
+    accident. A chip antenna's feed runs into the antenna's own ground
+    clearance, which its datasheet requires empty on every layer, and was
+    reported as a controlled trace with no plane under it.
     """
     from .board_geometry import point_in_polygon
 
@@ -1146,6 +1188,7 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
         return []
     pads = _pads(pcb)
     planes = _filled_ground(pcb, ground_only=False, by_net=True)
+    barred = _no_pour_areas(pcb)
     nets = hdm.get("nets") or {}
 
     def is_return(zone_net: str) -> bool:
@@ -1181,6 +1224,8 @@ def missing_reference(hdm: dict, pcb: list) -> list[tuple[str, str, str]]:
             # the plane its width was calculated over (Codex, PR #31).
             own = {net, (nets.get(net) or {}).get("diff_pair_of")}
             for ref in refs:
+                if _barred(barred, ref, pt):
+                    continue
                 polys = [poly for zone_net, poly in planes.get(ref, [])
                          if zone_net not in own and is_return(zone_net)]
                 if not all(any(point_in_polygon(sp, poly) for poly in polys) for sp in span):
