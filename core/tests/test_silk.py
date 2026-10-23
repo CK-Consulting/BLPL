@@ -117,6 +117,24 @@ def test_the_schema_takes_the_policy():
         "references": "hidden", "labels": {"BT_POS": "+"}, "label_size": 0.8, "clip_to_copper": True}})
     with pytest.raises(Exception):
         schema.validate("project_config", {**base, "silkscreen": {"label_size": 0.5}})
+    schema.validate("project_config", {**base, "silkscreen": {"marking": {"text": "VQT0P1 REV 0", "at": [44, 46]}}})
+    with pytest.raises(Exception):
+        schema.validate("project_config", {**base, "silkscreen": {"marking": {"text": "VQT0P1"}}})
+
+
+def test_the_board_marking_is_board_text_on_the_back_mirrored():
+    """Board-level text is what a fab's check reads for a name and revision;
+    every other silk text BLPL wrote belonged to a part."""
+    node = silk.marking({"marking": {"text": "VQT0P1 REV 0", "at": [44, 46]}}, origin=(12.5, 12.5))
+    assert sexpr.head(node) == "gr_text" and sexpr.unquote(node[1]) == "VQT0P1 REV 0"
+    assert sexpr.find(node, "at")[1:] == ["56.500", "58.500", "0"]
+    assert sexpr.unquote(sexpr.find(node, "layer")[1]) == "B.SilkS"
+    assert sexpr.find(sexpr.find(node, "effects"), "justify") == ["justify", "mirror"]
+
+    front = silk.marking({"marking": {"text": "X1", "at": [0, 0], "side": "front", "size": 1.5}}, origin=(0, 0))
+    assert sexpr.unquote(sexpr.find(front, "layer")[1]) == "F.SilkS"
+    assert sexpr.find(sexpr.find(front, "effects"), "justify") is None
+    assert silk.marking({"references": "hidden"}, origin=(0, 0)) is None
 
 
 def test_an_outline_is_trimmed_off_a_neighbours_pads_once_both_are_placed():

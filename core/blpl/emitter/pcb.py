@@ -1238,6 +1238,11 @@ def _build(
     if ((hdm.get("silkscreen") or {}) if isinstance(hdm.get("silkscreen"), dict) else {}).get("clip_to_copper"):
         silk.clip_to_neighbours([n for n in node if isinstance(n, list) and sexpr.head(n) == "footprint"])
 
+    mark = silk.marking(hdm.get("silkscreen") if isinstance(hdm.get("silkscreen"), dict) else None,
+                        origin=(_ORIGIN_X, _ORIGIN_Y))
+    if mark:
+        node.append(mark)
+
     placeholders = sorted(r for r, c in components.items() if c.get("needs_manual_footprint"))
     if placeholders:
         node.append(_placeholder_banner(placeholders, width, height))
