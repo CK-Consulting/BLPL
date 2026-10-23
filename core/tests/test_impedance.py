@@ -301,7 +301,8 @@ def test_the_fab_sheet_lists_each_controlled_class_and_says_when_a_width_is_miss
 def released(tmp_path: Path, monkeypatch):
     proj = tmp_path / "dev"
     (proj / ".pipeline").mkdir(parents=True)
-    (proj / "dev.kicad_pcb").write_text("(kicad_pcb)\n")
+    (proj / "kicad").mkdir()  # where Stage 6 publishes the board
+    (proj / "kicad" / "dev.kicad_pcb").write_text("(kicad_pcb)\n")
     (proj / ".pipeline" / "bom_resolved.json").write_text(json.dumps([]))
     monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
     monkeypatch.setattr(release, "run_gate", lambda *_a, **_k: {"ok": True})
@@ -314,7 +315,7 @@ def released(tmp_path: Path, monkeypatch):
 
 def test_a_release_carries_the_fab_sheet(released):
     proj, build = released
-    (proj / "dev.kicad_pcb").write_text(
+    (proj / "kicad" / "dev.kicad_pcb").write_text(
         '(kicad_pcb (segment (start 0 0) (end 10 0) (width 0.35) (layer "F.Cu") (net "ANT")) '
         + _filled('(net "GND")', "B.Cu", (-5, -5, 15, 5)) + ')\n')
     manifest = build({"net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
@@ -512,7 +513,7 @@ def test_a_controlled_trace_routed_off_its_layer_is_found_in_either_net_syntax(p
 
 def test_a_release_with_a_controlled_trace_off_its_layer_is_not_quotable(released):
     proj, build = released
-    (proj / "dev.kicad_pcb").write_text(
+    (proj / "kicad" / "dev.kicad_pcb").write_text(
         '(kicad_pcb (segment (start 0 0) (end 1 0) (width 0.35) (layer "B.Cu") (net "ANT")))\n')
     manifest = build(_four_layer({"trace_width": 0.35, "impedance": {"ohms": 50, "layers": ["F.Cu"]}},
                                  {"ANT": {"class": "RF", "impedance": {"ohms": 50}}}))
@@ -587,7 +588,7 @@ def test_a_tag_naming_a_class_takes_what_it_leaves_out_from_that_class():
 
 def test_a_release_with_a_coplanar_line_and_no_ground_is_not_quotable(released):
     proj, build = released
-    (proj / "dev.kicad_pcb").write_text(
+    (proj / "kicad" / "dev.kicad_pcb").write_text(
         '(kicad_pcb (segment (start 0 0) (end 10 0) (width 0.3) (layer "F.Cu") (net "ANT")))\n')
     manifest = build({"net_classes": {"CPW": {"trace_width": 0.3, "clearance": 0.15, "coplanar_gap": 0.15,
                                               "impedance": {"ohms": 50, "mode": "coplanar"}}},
@@ -628,7 +629,7 @@ def test_a_release_with_a_controlled_net_not_on_the_board_is_not_quotable(releas
     renamed, or another board's — passed every routing check by having nothing
     to measure."""
     proj, build = released
-    (proj / "dev.kicad_pcb").write_text(
+    (proj / "kicad" / "dev.kicad_pcb").write_text(
         '(kicad_pcb (segment (start 0 0) (end 10 0) (width 0.35) (layer "F.Cu") (net "OTHER")) '
         + _filled('(net "GND")', "B.Cu", (-5, -5, 15, 5)) + ')\n')
     manifest = build({"net_classes": {"RF": {"trace_width": 0.35, "impedance": 50}},
@@ -681,7 +682,7 @@ def test_a_pair_split_across_layers_is_found():
 
 def test_a_release_with_an_uncoupled_pair_is_not_quotable(released):
     proj, build = released
-    (proj / "dev.kicad_pcb").write_text(
+    (proj / "kicad" / "dev.kicad_pcb").write_text(
         "(kicad_pcb " + _seg("USB_DP", 0, 0, 20, 0) + _seg("USB_DM", 0, 0.43, 20, 0.43) + ")\n")
     manifest = build(_PAIR_HDM)
     assert not manifest["quotable"]
@@ -955,7 +956,8 @@ def test_other_nets_are_not_ground(name):
 def test_a_board_released_without_its_hdm_is_not_quotable(tmp_path, monkeypatch):
     proj = tmp_path / "dev"
     (proj / ".pipeline").mkdir(parents=True)
-    (proj / "dev.kicad_pcb").write_text("(kicad_pcb)\n")
+    (proj / "kicad").mkdir()  # where Stage 6 publishes the board
+    (proj / "kicad" / "dev.kicad_pcb").write_text("(kicad_pcb)\n")
     monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
     monkeypatch.setattr(release, "run_gate", lambda *_a, **_k: {"ok": True})
     manifest = release.build(proj, now="2026-10-15_130000Z")
