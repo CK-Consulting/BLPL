@@ -51,6 +51,7 @@ export function ReleasePanel({
   const [running, setRunning] = useState(false);
   const [lcsc, setLcsc] = useState(false);
   const runIdRef = useRef<string | null>(null);
+  const logRef = useRef<HTMLPreElement | null>(null);
 
   const load = useCallback(() => {
     getJSON<Manifest>(withBoard(`/api/projects/${projectId}/release`, board))
@@ -59,6 +60,10 @@ export function ReleasePanel({
   }, [projectId, board]);
 
   useEffect(load, [load, reloadToken]);
+  // Follow the build as it logs: the newest line is the one being waited on.
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [lines]);
 
   const build = async () => {
     setLines([]);
@@ -192,7 +197,7 @@ export function ReleasePanel({
         </p>
       )}
 
-      {lines.length > 0 && <pre className="log">{lines.join("\n")}</pre>}
+      {lines.length > 0 && <pre className="log" ref={logRef}>{lines.join("\n")}</pre>}
     </div>
   );
 }

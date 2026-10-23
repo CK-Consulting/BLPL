@@ -535,6 +535,11 @@ body.resizing-y * { pointer-events: none; }
 
 /* --- release --- */
 .release { display: flex; flex-direction: column; gap: .7rem; padding: .7rem; overflow: auto; min-height: 0; }
+/* The panel scrolls, not its sections: as flex items they shrank to fit, and
+   the build log, whose own overflow lets it shrink to nothing, came down to
+   less than one line with nothing left to scroll. Ten lines at least. */
+.release > * { flex-shrink: 0; }
+.release .log { min-height: calc(10 * 1.45em + 1.4rem); }
 .artifact-list.wide { width: auto; }
 .artifact-list.wide li { padding: .25rem .4rem; }
 
