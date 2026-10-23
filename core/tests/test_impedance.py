@@ -875,6 +875,13 @@ def test_no_plane_is_owed_where_the_project_forbids_one():
                  '(polygon (pts (xy 14 -5) (xy 25 -5) (xy 25 5) (xy 14 5)))))')
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {plane})")) == [("RF", "F.Cu", "In1.Cu")]
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {plane} {clearance})")) == []
+    # KiCad's two-sided selector is both outer layers (Codex, PR #77).
+    hdm["net_classes"]["RF"]["impedance"]["reference"] = ["B.Cu"]
+    under = _filled('(net "GND")', "B.Cu", (-5, -5, 14, 5))
+    both = clearance.replace('(layers "F.Cu" "In1.Cu")', '(layers "F&B.Cu")')
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {under})")) == [("RF", "F.Cu", "B.Cu")]
+    assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {under} {both})")) == []
+    del hdm["net_classes"]["RF"]["impedance"]["reference"]
     # An area that allows a pour excuses nothing.
     allowed = clearance.replace("(copperpour not_allowed)", "(copperpour allowed)")
     assert z.missing_reference(hdm, sexpr.parse(f"(kicad_pcb {seg} {plane} {allowed})")) == [("RF", "F.Cu", "In1.Cu")]
