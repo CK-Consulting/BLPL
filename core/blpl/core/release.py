@@ -192,11 +192,11 @@ def export_fabrication(pcb: Path, out_dir: Path, *, kicad_cli: str | None = None
     return steps
 
 
-def _not_bought(pipeline: Path) -> set[str]:
+def _not_bought(pipeline: Path, hdm: Path | None = None) -> set[str]:
     """Parts the HDM marks DNP or footprint-only (project.yaml assembly)."""
     import yaml
 
-    hdm = pipeline / "hdm.yaml"
+    hdm = hdm or pipeline / "hdm.yaml"
     try:
         doc = yaml.safe_load(hdm.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):
@@ -272,7 +272,8 @@ def export_bom_csv(bom_json: Path, out_csv: Path, exclude: "set[str] | None" = N
     return Step("bom", True, detail, [out_csv.name])
 
 
-def export_assembly(bom_csv: Path, out_dir: Path, *, lcsc: bool = False) -> list[Step]:
+def export_assembly(bom_csv: Path, out_dir: Path, *, lcsc: bool = False,
+                    footprint_roots: list[Path] | None = None) -> list[Step]:
     """Per-house assembly uploads, beside the generic BOM.
 
     The grouped CSV above is what a *human* reads. Neither JLCPCB nor PCBWay
@@ -296,36 +297,54 @@ def export_assembly(bom_csv: Path, out_dir: Path, *, lcsc: bool = False) -> list
             positions if positions.is_file() else None,
             out_dir / "assembly",
             house=house,
-            footprint_roots=[_DEFAULT_FOOTPRINTS],
+            # The board's own libraries first: its project and vendor
+            # footprints are not in the stock set, and looked up there alone
+            # 28 of the ear tag's lines had no SMD/THT type.
+            footprint_roots=[*(footprint_roots or []), _DEFAULT_FOOTPRINTS],
             lcsc=lcsc,
         )
+        detail = pkg.reason or "; ".join(pkg.warnings)
+        if not lcsc:
+            # The app's own words for it: there is a box on the Release tab.
+            detail = detail.replace("Re-run with --lcsc to look them up",
+                                    "Tick \"Look up LCSC part numbers\" on the Release tab and build again")
         steps.append(
             Step(
                 f"assembly-{house}",
                 pkg.ok,
-                pkg.reason or "; ".join(pkg.warnings),
+                detail,
                 [str(Path(f.path).relative_to(out_dir)) for f in pkg.files],
             )
         )
     return steps
 
 
-def copy_native_project(project_dir: Path, out_dir: Path) -> Step:
+def copy_native_project(kicad_dir: Path | None, out_dir: Path) -> Step:
     """The KiCad project itself, which is what a fab with KiCad would rather have.
 
     Gerbers are a lossy render of a board; the native project is the board.
     Several houses (PCBWay among them) accept it directly, and it costs nothing
-    to include.
+    to include. It is the project Stage 6 publishes (publish.py): the board's
+    files with ``libs/`` and the two library tables beside them, so it opens
+    with every symbol and footprint on another machine. This used to look in
+    the project root, where nothing has ever been written.
     """
     native = out_dir / "kicad"
-    native.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
-    for pattern in ("*.kicad_pcb", "*.kicad_sch", "*.kicad_pro", "*.kicad_prl"):
-        for src in sorted(Path(project_dir).glob(pattern)):
-            shutil.copy2(src, native / src.name)
-            copied.append(src.name)
+    if kicad_dir is not None and Path(kicad_dir).is_dir():
+        for src in sorted(Path(kicad_dir).iterdir()):
+            if src.is_file() and (src.suffix in (".kicad_pcb", ".kicad_sch", ".kicad_pro", ".kicad_prl")
+                                  or src.name in ("sym-lib-table", "fp-lib-table")):
+                native.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, native / src.name)
+                copied.append(src.name)
+        libs = Path(kicad_dir) / "libs"
+        if libs.is_dir() and copied:
+            shutil.copytree(libs, native / "libs", dirs_exist_ok=True)
+            copied.append("libs/")
     if not copied:
-        return Step("native", False, "no KiCad files in the project root")
+        return Step("native", False, "no published KiCad project for this board yet: run the pipeline "
+                                     "through Stage 6 (it publishes to kicad/)")
     return Step("native", True, "", copied)
 
 
@@ -334,7 +353,7 @@ def copy_native_project(project_dir: Path, out_dir: Path) -> Step:
 # ---------------------------------------------------------------------------
 
 
-def run_gate(pipeline_dir: Path, out_dir: Path) -> dict:
+def run_gate(pipeline_dir: Path, out_dir: Path, board: str | None = None) -> dict:
     """kicad-happy's fabrication gate, over the analyzer JSON Stage 8 wrote.
 
     The gate reads analyzer output rather than the board, so it can only answer
@@ -348,16 +367,19 @@ def run_gate(pipeline_dir: Path, out_dir: Path) -> dict:
     if base is None:
         return {"ok": False, "skipped": True, "reason": "kicad-happy is not available"}
 
-    sch = Path(pipeline_dir) / "review" / "schematic.json"
-    pcb = Path(pipeline_dir) / "review" / "pcb.json"
+    # Where Stage 8 writes it: review/, or review.<board>/ on a multi-board project.
+    review = Path(pipeline_dir) / ("review" if board is None else f"review.{board}")
+    sch = review / "schematic.json"
+    pcb = review / "pcb.json"
     missing = [p.name for p in (sch, pcb) if not p.is_file()]
     if missing:
         return {
             "ok": False,
             "skipped": True,
             "reason": (
-                f"no analyzer output ({', '.join(missing)}) — run stage8 first. Without it the "
-                "gate cannot tell a clean board from an unexamined one"
+                f"no analyzer output ({', '.join(missing)}): run the pipeline through Stage 8 "
+                "(Review) first. Without it the gate cannot tell a clean board from an "
+                "unexamined one"
             ),
         }
 
@@ -425,7 +447,8 @@ def _sha256(path: Path) -> str:
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
-def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
+def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path,
+                     hdm: Path | None = None) -> Step:
     """The fab's table of impedance-controlled traces, from the HDM the board came from.
 
     A fab cannot see which traces are meant to be 50 ohms: on the gerbers they
@@ -440,7 +463,8 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
 
     from . import impedance
 
-    candidates = ([pipeline / f"hdm.{pcb.stem}.yaml"] if pcb is not None else []) + [pipeline / "hdm.yaml"]
+    candidates = ([hdm] if hdm is not None else []) + (
+        [pipeline / f"hdm.{pcb.stem}.yaml"] if pcb is not None else []) + [pipeline / "hdm.yaml"]
     hdm_path = next((c for c in candidates if c.is_file()), None)
     if hdm_path is None:
         if pcb is not None and pcb.is_file():
@@ -450,7 +474,7 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
             # the board was designed with (Codex, PR #31).
             return Step("impedance", False,
                         f"no hdm.yaml for {pcb.name}: cannot tell which traces are "
-                        "impedance-controlled; run stage5 for this board")
+                        "impedance-controlled; run the pipeline through Stage 5 for this board")
         return Step("impedance", True, "no board and no hdm.yaml; nothing to say about impedance")
     # A hand-edited HDM that does not parse is a refused step, not a crashed
     # build: the package and its refusal notice are still owed (Codex, PR #31).
@@ -528,12 +552,54 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path) -> Step:
     return Step("impedance", True, "", [str(dest.relative_to(out_dir))])
 
 
+def board_files(project_dir: Path, board: str | None = None) -> dict:
+    """Where this board's released files come from, as the pipeline leaves them.
+
+    The board, schematic and native project are the ones Stage 6 publishes,
+    and the router republishes once it has routed: ``<board dir>/kicad/``.
+    Nothing is ever written to the project root, which is where this used to
+    look, so every release came out with no fabrication files at all. A board
+    published nowhere falls back to its newest emit in ``.pipeline/``. The
+    BOM, HDM and Stage 8 output carry the board in their names on a
+    multi-board project, as every stage writes them.
+    """
+    from . import project_manifest, publish
+
+    project_dir = Path(project_dir)
+    man = project_manifest.discover(project_dir)
+    if man.implicit:
+        if board and board != man.boards[0].name:
+            raise ValueError(f"{project_dir.name} is a single-board project; it has no board {board!r}")
+        qual, name = None, man.boards[0].name
+    else:
+        names = [b.name for b in man.boards]
+        if not board:
+            raise ValueError(f"{project_dir.name} has more than one board ({', '.join(names)}); say which")
+        if board not in names:
+            raise ValueError(f"{project_dir.name} has no board {board!r} ({', '.join(names)})")
+        qual = name = board
+    pipeline = project_manifest.pipeline_dir(project_dir)
+    kicad_dir = project_manifest.board_dir(project_dir, man, name) / publish.PUBLISH_DIRNAME
+    pcbs = sorted(kicad_dir.glob("*.kicad_pcb")) if kicad_dir.is_dir() else []
+    pcb = pcbs[0] if pcbs else None
+    if pcb is None:
+        from .cli import _newest_emitted
+
+        pcb = _newest_emitted(pipeline, ".kicad_pcb", qual)
+    art = lambda stem, suffix="json": project_manifest.artifact_path(project_dir, stem, board=qual, suffix=suffix)
+    bom = art("bom_resolved") if art("bom_resolved").is_file() else art("bom")
+    return {"board": qual, "pipeline": pipeline, "pcb": pcb,
+            "kicad_dir": kicad_dir if kicad_dir.is_dir() else None,
+            "bom": bom, "hdm": art("hdm", "yaml")}
+
+
 def build(
     project_dir: Path,
     *,
     now: str = "",
     kicad_cli: str | None = None,
     lcsc: bool = False,
+    board: str | None = None,
 ) -> dict:
     """Build the release package. Returns the manifest.
 
@@ -543,36 +609,39 @@ def build(
     happen is a rejected board packaged so it looks accepted.
     """
     project_dir = Path(project_dir)
-    pipeline = project_dir / ".pipeline"
+    src = board_files(project_dir, board)
+    pipeline = src["pipeline"]
+    qual = src["board"]
     stamp = now or datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%SZ")
-    name = _UNSAFE.sub("-", project_dir.name) or "board"
+    name = _UNSAFE.sub("-", project_dir.name + (f"-{qual}" if qual else "")) or "board"
 
-    release_root = project_dir / "release"
+    release_root = release_dir(project_dir, qual)
     out_dir = release_root / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
 
     steps: list[Step] = []
-    pcbs = sorted(project_dir.glob("*.kicad_pcb"))
-    if pcbs:
-        steps.extend(export_fabrication(pcbs[0], out_dir, kicad_cli=kicad_cli))
+    pcb = src["pcb"]
+    if pcb is not None:
+        steps.extend(export_fabrication(pcb, out_dir, kicad_cli=kicad_cli))
     else:
-        steps.append(Step("fabrication", False, "no .kicad_pcb in the project — run stage6 first"))
+        steps.append(Step("fabrication", False, "no board for this project yet: run the pipeline "
+                                                "through Stage 6 (Build PCB), and Stage 6a to route it"))
 
-    bom_json = pipeline / "bom_resolved.json"
-    if not bom_json.is_file():
-        bom_json = pipeline / "bom.json"
+    bom_json = src["bom"]
     bom_csv = out_dir / "bom" / f"{name}-bom.csv"
     if bom_json.is_file():
-        steps.append(export_bom_csv(bom_json, bom_csv, exclude=_not_bought(pipeline)))
-        steps.extend(export_assembly(bom_csv, out_dir, lcsc=lcsc))
+        steps.append(export_bom_csv(bom_json, bom_csv, exclude=_not_bought(pipeline, src["hdm"])))
+        libs = src["kicad_dir"] / "libs" if src["kicad_dir"] is not None else None
+        steps.extend(export_assembly(bom_csv, out_dir, lcsc=lcsc,
+                                     footprint_roots=[libs] if libs is not None and libs.is_dir() else None))
     else:
-        steps.append(Step("bom", False, "no BOM artifact in .pipeline — run stage1/stage2 first"))
+        steps.append(Step("bom", False, "no BOM yet: run the pipeline through Stage 1"))
 
-    steps.append(copy_native_project(project_dir, out_dir))
-    z_step = export_impedance(pipeline, pcbs[0] if pcbs else None, out_dir)
+    steps.append(copy_native_project(src["kicad_dir"], out_dir))
+    z_step = export_impedance(pipeline, pcb, out_dir, src["hdm"])
     steps.append(z_step)
 
-    gate = run_gate(pipeline, out_dir)
+    gate = run_gate(pipeline, out_dir, qual)
     gate_ok = bool(gate.get("ok")) and not gate.get("skipped")
     quotable = gate_ok and z_step.ok
 
@@ -620,6 +689,14 @@ def build(
     return manifest
 
 
+def release_dir(project_dir: Path, board: str | None = None) -> Path:
+    """Where a board's releases go: ``release/``, or ``release/<board>/`` when
+    the project has more than one, so two boards' packages never overwrite
+    each other's ``latest``."""
+    root = Path(project_dir) / "release"
+    return root if board is None else root / board
+
+
 def _refusal_text(gate: dict, steps: list[Step], *, gate_ok: bool = False) -> str:
     lines = [
         "THIS PACKAGE IS NOT CLEARED FOR FABRICATION.",
@@ -647,8 +724,8 @@ def _refusal_text(gate: dict, steps: list[Step], *, gate_ok: bool = False) -> st
     lines += [
         "",
         "The files are included because they are worth inspecting. They are not worth sending",
-        "to a board house: a BLPL board ships with every net unrouted, and it opens and renders",
-        "perfectly in that state, which is exactly what makes shipping one by accident easy.",
+        "to a board house: a board opens and renders perfectly with nets left unrouted or checks",
+        "failed, which is exactly what makes shipping one by accident easy.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -658,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(prog="blpl-release")
     parser.add_argument("--project-dir", required=True)
+    parser.add_argument("--board", default=None, help="Which board, on a multi-board project.")
     parser.add_argument(
         "--lcsc",
         action="store_true",
@@ -665,7 +743,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    manifest = build(Path(args.project_dir), lcsc=args.lcsc)
+    try:
+        manifest = build(Path(args.project_dir), lcsc=args.lcsc, board=args.board)
+    except ValueError as exc:
+        print(f"release: {exc}", file=sys.stderr, flush=True)
+        return 2
     for step in manifest["steps"]:
         state = "ok" if step["ok"] else f"FAILED — {step['detail']}"
         print(f"  {step['step']}: {state}", flush=True)

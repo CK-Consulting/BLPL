@@ -22,9 +22,14 @@ from blpl.core import release
 def project(tmp_path: Path) -> Path:
     proj = tmp_path / "dev04"
     (proj / ".pipeline").mkdir(parents=True)
-    (proj / "dev04.kicad_pcb").write_text("(kicad_pcb)\n", encoding="utf-8")
-    (proj / "dev04.kicad_sch").write_text("(kicad_sch)\n", encoding="utf-8")
-    (proj / "dev04.kicad_pro").write_text("{}\n", encoding="utf-8")
+    (proj / "design.md").write_text("# dev04\n", encoding="utf-8")
+    # Where Stage 6 publishes a board (publish.py), not the project root.
+    kicad = proj / "kicad"
+    (kicad / "libs" / "Device.pretty").mkdir(parents=True)
+    (kicad / "dev04.kicad_pcb").write_text("(kicad_pcb)\n", encoding="utf-8")
+    (kicad / "dev04.kicad_sch").write_text("(kicad_sch)\n", encoding="utf-8")
+    (kicad / "dev04.kicad_pro").write_text("{}\n", encoding="utf-8")
+    (kicad / "fp-lib-table").write_text("(fp_lib_table)\n", encoding="utf-8")
     (proj / ".pipeline" / "bom_resolved.json").write_text(
         json.dumps([
             {"refdes": "C1", "value": "100nF", "mpn": "CL10B104KB8NNNC", "footprint": "C_0402"},
@@ -72,9 +77,12 @@ def test_an_unreadable_bom_is_a_failed_step_not_an_empty_csv(project) -> None:
 def test_the_native_kicad_project_travels_with_the_package(project) -> None:
     """Gerbers are a lossy render of a board; the project is the board, and
     several houses take it directly."""
-    step = release.copy_native_project(project, project / "out")
+    step = release.copy_native_project(project / "kicad", project / "out")
     assert step.ok
-    assert set(step.outputs) == {"dev04.kicad_pcb", "dev04.kicad_sch", "dev04.kicad_pro"}
+    # With its libraries and table, so it opens with every footprint elsewhere.
+    assert set(step.outputs) == {"dev04.kicad_pcb", "dev04.kicad_sch", "dev04.kicad_pro",
+                                 "fp-lib-table", "libs/"}
+    assert (project / "out" / "kicad" / "libs" / "Device.pretty").is_dir()
 
 
 # -- the gate -----------------------------------------------------------------
@@ -85,7 +93,7 @@ def test_a_gate_that_could_not_run_is_never_read_as_a_pass(project) -> None:
     be confused here."""
     gate = release.run_gate(project / ".pipeline", project)
     assert gate["skipped"] and not gate["ok"]
-    assert "stage8" in gate["reason"] or "kicad-happy" in gate["reason"]
+    assert "Stage 8" in gate["reason"] or "kicad-happy" in gate["reason"]
 
 
 def test_an_unrecognised_gate_shape_defaults_to_not_passed() -> None:
@@ -113,7 +121,7 @@ def test_a_package_that_did_not_pass_says_so_inside_the_zip(project, monkeypatch
         assert "READ-ME-FIRST.txt" in names
         readme = zf.read("READ-ME-FIRST.txt").decode()
     assert "NOT CLEARED FOR FABRICATION" in readme
-    assert "every net unrouted" in readme
+    assert "opens and renders perfectly" in readme
 
 
 def test_a_missing_kicad_cli_is_reported_not_silently_skipped(project, monkeypatch) -> None:
@@ -131,7 +139,7 @@ def test_every_file_in_the_package_is_checksummed(project, monkeypatch) -> None:
     manifest = release.build(project, now="2026-08-12_120000Z")
     assert manifest["files"]
     assert all(len(f["sha256"]) == 64 for f in manifest["files"])
-    assert any(f["path"].endswith("dev04.kicad_pcb") for f in manifest["files"])
+    assert any(f["path"] == "kicad/dev04.kicad_pcb" for f in manifest["files"])
     assert any(f["path"].endswith("-bom.csv") for f in manifest["files"])
 
 
@@ -169,7 +177,8 @@ def test_a_project_with_no_board_still_produces_a_package_that_explains_itself(
     assert not manifest["quotable"]
     assert sorted(manifest["incomplete"]) == ["bom", "fabrication", "native"]
     readme = (empty / "release" / "2026-08-12_120000Z" / "READ-ME-FIRST.txt").read_text()
-    assert "stage6" in readme and "stage1" in readme
+    # In the app's terms: a pipeline stage to run, not a command to type.
+    assert "Stage 6" in readme and "Stage 1" in readme
 
 
 # -- bulk autorouting ---------------------------------------------------------
@@ -252,3 +261,47 @@ def test_a_board_with_no_layer_table_fails_the_gerber_step(tmp_path, monkeypatch
     (gerbers,) = [s for s in steps if s.name == "gerbers"]
     assert not gerbers.ok and "copper layer table" in gerbers.detail
     assert layers == []
+
+
+def test_a_release_takes_the_board_stage6_published_with_its_libraries(project, monkeypatch) -> None:
+    """The release looked for a board in the project root, where nothing is
+    ever written: every package came out with no fabrication files and no
+    native project, however finished the board was."""
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    src = release.board_files(project)
+    assert src["pcb"] == project / "kicad" / "dev04.kicad_pcb"
+    manifest = release.build(project, now="2026-08-12_120000Z")
+    native = next(s for s in manifest["steps"] if s["step"] == "native")
+    assert native["ok"] and "libs/" in native["outputs"]
+
+
+def test_each_board_of_a_multi_board_project_releases_its_own_files(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    proj = tmp_path / "shield"
+    (proj / ".pipeline").mkdir(parents=True)
+    (proj / "project.md").write_text("# shield\n\n## Boards\n\n- base\n- sensor (optional)\n", encoding="utf-8")
+    for board in ("base", "sensor"):
+        (proj / board / "kicad").mkdir(parents=True)
+        (proj / board / "kicad" / "shield.kicad_pcb").write_text(f"({board})\n", encoding="utf-8")
+        (proj / ".pipeline" / f"bom.{board}.json").write_text(json.dumps([{"refdes": "R1", "mpn": board}]))
+    with pytest.raises(ValueError, match="more than one board"):
+        release.board_files(proj)
+    src = release.board_files(proj, "sensor")
+    assert src["pcb"] == proj / "sensor" / "kicad" / "shield.kicad_pcb"
+    assert src["bom"] == proj / ".pipeline" / "bom.sensor.json"
+    manifest = release.build(proj, board="sensor", now="2026-08-12_120000Z")
+    assert manifest["release"] == "shield-sensor"
+    assert (proj / "release" / "sensor" / "latest.zip").is_file()
+
+
+def test_the_gate_reads_stage8s_output_for_the_board_asked_about(tmp_path, monkeypatch) -> None:
+    from blpl.agent import kicad_happy
+
+    monkeypatch.setattr(kicad_happy, "find_kicad_happy", lambda: tmp_path / "kh")
+    (tmp_path / "pipe" / "review.sensor").mkdir(parents=True)
+    gate = release.run_gate(tmp_path / "pipe", tmp_path, "sensor")
+    assert gate["skipped"] and "schematic.json" in gate["reason"]
+    for name in ("schematic.json", "pcb.json"):
+        (tmp_path / "pipe" / "review.sensor" / name).write_text("{}")
+    gate = release.run_gate(tmp_path / "pipe", tmp_path, "sensor")
+    assert "no analyzer output" not in str(gate.get("reason", ""))
