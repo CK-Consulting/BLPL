@@ -751,6 +751,11 @@ def _snap_terminals(python: str, pcb: Path, clearance_mm: float = 0.0) -> subpro
 _STUB_MAX_MM = 1.0
 
 
+#: Removal rounds before the trim stops: taking a stub can leave the next one
+#: dangling, so it repeats, but a chain longer than this is not a stub.
+_STUB_ROUNDS = 20
+
+
 def _trim_dangling(python: str, pcb: Path) -> subprocess.CompletedProcess:
     """Remove the short track stubs the router leaves connected at one end only.
 
@@ -760,34 +765,56 @@ def _trim_dangling(python: str, pcb: Path) -> subprocess.CompletedProcess:
     test, because a stub into a pour is what connects its pad to the plane,
     and before the fill it looks dangling too. Removed until none is left
     (taking one can leave the next dangling), then the zones refilled around
-    the copper that remains. Prints how many it removed.
+    the copper that remains. The returned stdout's last line is how many.
+
+    pcbnew only finds them. Removing a track through KiCad 10's binding
+    leaves the process unable to walk the board again, or to load another
+    (a TypeError, an AttributeError, then a segfault): one round was all the
+    ear tag needed, and pathfinder's core, needing a second, failed its route
+    there. So each round is its own process that reports the stubs' UUIDs,
+    and they come out of the file through the s-expression parser.
     """
+    import json
+
+    from blpl.emitter import sexpr
+
     from . import autoroute
 
-    return autoroute._pcbnew(python, (
-        "import pcbnew\n"
+    find = (
+        "import json, pcbnew\n"
         f"b = pcbnew.LoadBoard({str(pcb)!r})\n"
         f"limit = pcbnew.FromMM({_STUB_MAX_MM})\n"
-        "def fill():\n"
-        "    zones = b.Zones()\n"
-        "    if len(zones):\n"
-        "        pcbnew.ZONE_FILLER(b).Fill(zones)\n"
-        "    b.BuildConnectivity()\n"
-        "fill()\n"
-        "removed = 0\n"
-        "while True:\n"
-        "    conn = b.GetConnectivity()\n"
-        "    stubs = [t for t in b.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T\n"
-        "             and t.GetLength() <= limit and conn.TestTrackEndpointDangling(t, False)]\n"
-        "    if not stubs:\n"
-        "        break\n"
-        "    for t in stubs:\n"
-        "        b.Remove(t)\n"
-        "    removed += len(stubs)\n"
-        "    fill()\n"
-        f"pcbnew.SaveBoard({str(pcb)!r}, b)\n"
-        "print(removed)\n"
-    ))
+        "zones = b.Zones()\n"
+        "if len(zones):\n"
+        "    pcbnew.ZONE_FILLER(b).Fill(zones)\n"
+        "b.BuildConnectivity()\n"
+        "conn = b.GetConnectivity()\n"
+        "stubs = [t.m_Uuid.AsString() for t in b.GetTracks() if t.Type() == pcbnew.PCB_TRACE_T\n"
+        "         and t.GetLength() <= limit and conn.TestTrackEndpointDangling(t, False)]\n"
+        "if not stubs:\n"
+        # Nothing left: the board is saved filled around what remains.
+        f"    pcbnew.SaveBoard({str(pcb)!r}, b)\n"
+        "print('STUBS ' + json.dumps(stubs))\n"
+    )
+    removed = 0
+    for _ in range(_STUB_ROUNDS):
+        proc = autoroute._pcbnew(python, find)
+        line = next((l for l in reversed((proc.stdout or "").splitlines()) if l.startswith("STUBS ")), None)
+        if proc.returncode != 0 or line is None:
+            return proc
+        stubs = set(json.loads(line[len("STUBS "):]))
+        if not stubs:
+            break
+        board = sexpr.parse(pcb.read_text(encoding="utf-8"))
+        kept = [n for n in board if not (
+            isinstance(n, list) and sexpr.head(n) == "segment"
+            and sexpr.unquote(str((sexpr.find(n, "uuid") or [None, ""])[1])) in stubs)]
+        gone = len(board) - len(kept)
+        if gone == 0:
+            break  # nothing matched: stop rather than loop on the same answer
+        pcb.write_text(sexpr.dump_top(kept), encoding="utf-8")
+        removed += gone
+    return subprocess.CompletedProcess(proc.args, 0, f"{removed}\n", proc.stderr)
 
 
 #: How close a ground via must be to the signal via or capacitor pad it
@@ -979,9 +1006,35 @@ def _stitch(python: str, pcb: Path, *, via_mm: float, drill_mm: float, clearance
         "# a via inside the zone's outline can still sit in a void, and float.\n"
         "b.BuildConnectivity()\n"
         "conn = b.GetConnectivity()\n"
-        "def filled(v):\n"
+        "def joined(v):\n"
         "    return any(it.Type() == pcbnew.PCB_ZONE_T and it.GetNetCode() == v.GetNetCode()\n"
         "               for it in conn.GetConnectedItems(v))\n"
+        # And anchored on two layers or more: a via touching one plane and
+        # nothing else connects nothing, and DRC calls it dangling. On
+        # pathfinder's core GND is a plane on In1.Cu alone (In2.Cu is 3V3), and
+        # 130 such vias went in. Counted from what touches the via, not from
+        # GetConnectedItems, which answers with the whole connected net.
+        "def anchors(v):\n"
+        "    at, code, r = v.GetPosition(), v.GetNetCode(), v.GetWidth(pcbnew.F_Cu) // 2\n"
+        "    layers, plane = set(), False\n"
+        "    for z in plane_zones:\n"
+        "        if z.GetNetCode() != code:\n"
+        "            continue\n"
+        "        for l in z.GetLayerSet().Seq():\n"
+        "            if v.IsOnLayer(l) and z.HitTestFilledArea(l, at, r):\n"
+        "                layers.add(l)\n"
+        "                plane = True\n"
+        # The tracks as listed before any probe was added and taken away (a
+        # board is not walked again after a Remove), and the links placed here.
+        "    for t in items + [it for g in added for it in g]:\n"
+        "        if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetCode() == code and at in (t.GetStart(), t.GetEnd()):\n"
+        "            layers.add(t.GetLayer())\n"
+        "    for p in pads:\n"
+        "        if p.GetNetCode() == code and p.HitTest(at):\n"
+        "            layers.update(l for l in p.GetLayerSet().Seq() if pcbnew.IsCopperLayer(l) and v.IsOnLayer(l))\n"
+        "    return plane and len(layers) >= 2\n"
+        "def filled(v):\n"
+        "    return joined(v) and anchors(v)\n"
         "orphans = [group for group in added if not filled(group[0])]\n"
         "for group in orphans:\n"
         "    for item in group:\n"

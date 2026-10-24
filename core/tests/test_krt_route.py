@@ -934,6 +934,14 @@ def test_stitching_keeps_each_pads_own_plane_net_every_layer_and_cutout_clear(tm
         zone.Outline().NewOutline()
         for x, y in ((1, 1), (39, 1), (39, 29), (1, 29)):
             zone.Outline().Append(mm(x), mm(y))
+    # GND poured on B.Cu over the right half too, so a ground via there joins
+    # two planes: with In1.Cu alone it would join one and float.
+    zone = pcbnew.ZONE(board)
+    board.Add(zone)
+    zone.SetLayer(pcbnew.B_Cu)
+    zone.Outline().NewOutline()
+    for x, y in ((20, 1), (39, 1), (39, 29), (20, 29)):
+        zone.Outline().Append(mm(x), mm(y))
     fp = pcbnew.FOOTPRINT(board)
     fp.SetReference("C2")
     board.Add(fp)
@@ -992,7 +1000,7 @@ def test_stitching_keeps_each_pads_own_plane_net_every_layer_and_cutout_clear(tm
         elif tag == "segment":
             set_net(node, "WALL")
         elif tag == "zone":
-            set_net(node, "GND" if sexpr.unquote(sexpr.find(node, "layer")[1]) == "In1.Cu" else "VDD")
+            set_net(node, "VDD" if sexpr.unquote(sexpr.find(node, "layer")[1]) == "In2.Cu" else "GND")
         elif tag == "footprint":
             for pad in sexpr.find_all(node, "pad"):
                 set_net(pad, "VDD" if sexpr.unquote(pad[1]) == "1" else "GND")
@@ -1218,3 +1226,100 @@ def test_the_via_band_geometry_goes_in_a_file_not_the_command_line(tmp_path, mon
     assert krt_route._via_band_areas("/usr/bin/python3", pcb, rects).returncode == 0
     assert len(seen["code"]) < 4000 and len(seen["rects"]) == 2400
     assert not pcb.with_name(pcb.name + ".via-bands.json").exists()
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_a_stub_chain_that_needs_a_second_round_comes_off(tmp_path):
+    """Removing one stub can leave the next dangling. A second round through
+    KiCad's binding failed after its first Remove (a TypeError, then a
+    segfault), and pathfinder's core lost its whole route to it; the stubs
+    now come out of the file between rounds."""
+    import pcbnew
+
+    board = pcbnew.BOARD()
+    board.Add(pcbnew.NETINFO_ITEM(board, "SIG"))
+    fp = pcbnew.FOOTPRINT(board)
+    board.Add(fp)
+    mm = pcbnew.FromMM
+    pad = pcbnew.PAD(fp)
+    pad.SetNumber("1")
+    pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+    pad.SetLayerSet(pad.SMDMask())
+    pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(1.0), mm(1.0)))
+    pad.SetPosition(pcbnew.VECTOR2I(mm(20.0), mm(10.0)))
+    fp.Add(pad)
+    pad.SetNet(board.FindNet("SIG"))
+    for a, b in (((20.0, 10.0), (20.0, 10.6)), ((20.0, 10.6), (20.6, 10.6))):
+        t = pcbnew.PCB_TRACK(board)
+        t.SetStart(pcbnew.VECTOR2I(mm(a[0]), mm(a[1])))
+        t.SetEnd(pcbnew.VECTOR2I(mm(b[0]), mm(b[1])))
+        t.SetWidth(mm(0.2))
+        t.SetLayer(pcbnew.F_Cu)
+        board.Add(t)
+        t.SetNet(board.FindNet("SIG"))
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+
+    proc = krt_route._trim_dangling(sys.executable, pcb)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "2"
+    assert "(segment" not in pcb.read_text()
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_no_stitching_via_where_ground_is_one_plane(tmp_path):
+    """On pathfinder's core GND is a plane on In1.Cu alone (In2.Cu is 3V3). A
+    ground via beside a signal via there touches one plane and nothing else:
+    it connects nothing, and DRC called 130 of them dangling."""
+    import pcbnew
+
+    from blpl.emitter import sexpr
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    board.SetCopperLayerCount(4)
+    for name in ("GND", "VDD", "SIG"):
+        board.Add(pcbnew.NETINFO_ITEM(board, name))
+    s = pcbnew.PCB_SHAPE(board)
+    s.SetShape(pcbnew.SHAPE_T_RECTANGLE)
+    s.SetStart(pcbnew.VECTOR2I(0, 0))
+    s.SetEnd(pcbnew.VECTOR2I(mm(40), mm(30)))
+    s.SetLayer(pcbnew.Edge_Cuts)
+    s.SetWidth(mm(0.1))
+    board.Add(s)
+    for layer in (pcbnew.In1_Cu, pcbnew.In2_Cu):
+        zone = pcbnew.ZONE(board)
+        board.Add(zone)
+        zone.SetLayer(layer)
+        zone.Outline().NewOutline()
+        for x, y in ((1, 1), (39, 1), (39, 29), (1, 29)):
+            zone.Outline().Append(mm(x), mm(y))
+    v = pcbnew.PCB_VIA(board)
+    board.Add(v)
+    v.SetPosition(pcbnew.VECTOR2I(mm(20), mm(15)))
+    v.SetWidth(mm(0.6))
+    v.SetDrill(mm(0.3))
+    v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+    tree = sexpr.parse(pcb.read_text())
+    for node in tree:
+        if not isinstance(node, list):
+            continue
+        if sexpr.head(node) in ("via", "zone"):
+            name = ("SIG" if sexpr.head(node) == "via"
+                    else "GND" if sexpr.unquote(sexpr.find(node, "layer")[1]) == "In1.Cu" else "VDD")
+            node[:] = [c for c in node if not (isinstance(c, list) and sexpr.head(c) == "net")] + [
+                ["net", sexpr.quote(name)]]
+    pcb.write_text(sexpr.dump_top(tree))
+
+    proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
+                             edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "0 1"
+    after = pcbnew.LoadBoard(str(pcb))
+    assert [t.GetNetname() for t in after.GetTracks() if t.Type() == pcbnew.PCB_VIA_T] == ["SIG"]
