@@ -146,6 +146,9 @@ class LcscPart:
     stock: int = 0
     manufacturer: str = ""
     description: str = ""
+    #: JLCPCB's library: "base" (Basic, no loading fee) or "expand" (Extended,
+    #: a fee per unique part). Empty when the answer came from elsewhere.
+    library: str = ""
 
     @property
     def orderable(self) -> bool:
@@ -158,12 +161,59 @@ class LcscPart:
             "stock": self.stock,
             "manufacturer": self.manufacturer,
             "description": self.description,
+            "library": self.library,
             "orderable": self.orderable,
         }
 
 
+def _same_mpn(a: str, b: str) -> bool:
+    """One MPN, however it is spaced or cased."""
+    return "".join(a.split()).upper() == "".join(b.split()).upper()
+
+
+#: JLCPCB's own parts search, the catalogue its assembly service builds from.
+_JLCPCB_SEARCH = "https://jlcpcb.com/api/overseas-pcb-order/v1/shoppingCart/smtGood/selectSmtComponentList"
+
+
+def jlcpcb_search(mpn: str, *, timeout: int = 30) -> LcscPart | None:
+    """The part JLCPCB lists under exactly this MPN, or None.
+
+    Asked first because it is JLCPCB's own answer to the question the BOM is
+    for. The community index it replaces found none of the ear tag's 26 MPNs
+    and answered ten with unrelated parts. Any other listing the search
+    returns is ignored, and a network failure is None: the caller says the
+    line is unresolved rather than guessing.
+    """
+    import urllib.request
+
+    body = json.dumps({"keyword": mpn, "currentPage": 1, "pageSize": 10}).encode()
+    req = urllib.request.Request(_JLCPCB_SEARCH, data=body, headers={
+        "content-type": "application/json", "User-Agent": "Mozilla/5.0 (BLPL release)"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+        listed = ((data.get("data") or {}).get("componentPageInfo") or {}).get("list") or []
+    except Exception:
+        return None
+    exact = [c for c in listed if isinstance(c, dict) and c.get("componentCode")
+             and _same_mpn(str(c.get("componentModelEn") or ""), mpn)]
+    if not exact:
+        return None
+    # Several listings of one MPN (reels, cut tape): the one with most stock.
+    best = max(exact, key=lambda c: int(c.get("stockCount") or 0))
+    return LcscPart(
+        mpn=mpn,
+        lcsc=str(best["componentCode"]),
+        stock=int(best.get("stockCount") or 0),
+        manufacturer=str(best.get("componentBrandEn") or ""),
+        description=str(best.get("describe") or ""),
+        library=str(best.get("componentLibraryType") or ""),
+    )
+
+
 def resolve_lcsc(
-    mpns: list[str], *, creds: CredResolver | None = None, timeout: int = 60
+    mpns: list[str], *, creds: CredResolver | None = None, timeout: int = 60,
+    rejected: list[tuple[str, str, str]] | None = None,
 ) -> dict[str, LcscPart]:
     """Map each MPN to its LCSC part number and stock.
 
@@ -171,17 +221,30 @@ def resolve_lcsc(
     is the one distributor lookup that always works. An MPN that resolves to
     nothing is simply absent from the result; the caller reports it rather than
     substituting a guess.
+
+    So is one that resolves to a *different* part. The search behind it falls
+    back to its first fuzzy result when nothing matches exactly, and for C7 on
+    the ear tag (GRM155R60J475ME47D, a 4.7 uF capacitor) that was C7435348, a
+    Zener diode — which went into the JLCPCB BOM as C7's part. A result is used
+    only when its MPN is the one asked for; the rest go to ``rejected`` as
+    (asked, returned, lcsc), for the caller to say so.
     """
     creds = creds or CredResolver()
     found: dict[str, LcscPart] = {}
     try:
         path = script_path("lcsc", "fetch_datasheet_lcsc.py")
     except KicadHappyMissing:
-        return found
-    if not path.is_file():
-        return found
+        path = None
+    if path is not None and not path.is_file():
+        path = None
 
     for mpn in dict.fromkeys(m for m in mpns if m):
+        part = jlcpcb_search(mpn)
+        if part is not None:
+            found[mpn] = part
+            continue
+        if path is None:
+            continue
         try:
             res = run_script(
                 path,
@@ -193,6 +256,11 @@ def resolve_lcsc(
             continue
         data = res.data if isinstance(res.data, dict) else None
         if not data or not data.get("lcsc"):
+            continue
+        returned = str(data.get("mpn") or "")
+        if not _same_mpn(returned, mpn):
+            if rejected is not None:
+                rejected.append((mpn, returned, str(data["lcsc"])))
             continue
         try:
             stock = int(data.get("in_stock") or 0)
@@ -206,6 +274,41 @@ def resolve_lcsc(
             description=str(data.get("description") or ""),
         )
     return found
+
+
+def comment_with_mpn(bom_csv: Path) -> int:
+    """Put each line's MPN in a JLCPCB BOM's Comment, after the value, in place.
+
+    JLCPCB's BOM tool matches a line to a part by its Comment as well as by
+    its LCSC number, and compares the two. With the value alone it warned on
+    lines it had matched by MPN: "The comment (3.9nH) of this part does not
+    match the one (LRC0402CS3N9GV001T) provided in your BOM", for L2 on the ear
+    tag. With the MPN in the Comment, a line JLCPCB finds no LCSC number for
+    can still be matched by it. Returns how many Comments changed; one that
+    already carries its MPN, or a line with no MPN, is left as it is.
+    """
+    bom_csv = Path(bom_csv)
+    with bom_csv.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return 0
+    try:
+        col_comment = rows[0].index("Comment")
+        col_mpn = rows[0].index("MPN")
+    except ValueError:
+        return 0
+    changed = 0
+    for row in rows[1:]:
+        if len(row) <= max(col_comment, col_mpn):
+            continue
+        comment, mpn = row[col_comment].strip(), row[col_mpn].strip()
+        if not mpn or mpn.lower() in comment.lower():
+            continue
+        row[col_comment] = f"{comment} {mpn}" if comment else mpn
+        changed += 1
+    with bom_csv.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+    return changed
 
 
 def fill_lcsc_column(bom_csv: Path, parts: dict[str, LcscPart]) -> tuple[int, list[str]]:
@@ -365,11 +468,18 @@ def build_assembly(
             return AssemblyPackage(False, house, reason=str(exc))
         if not bom_out.is_file():
             return AssemblyPackage(False, house, reason=f"BOM translation failed: {res.error}")
+        comment_with_mpn(bom_out)
         pkg.files.append(FabFile("jlcpcb-bom", str(bom_out), _row_count(bom_out)))
 
         if lcsc:
             rows = read_bom_csv(bom_csv)
-            parts = resolve_lcsc([r.mpn for r in rows if r.mpn], creds=creds)
+            rejected: list[tuple[str, str, str]] = []
+            parts = resolve_lcsc([r.mpn for r in rows if r.mpn], creds=creds, rejected=rejected)
+            if rejected:
+                shown = "; ".join(f"{a} → {b or '?'} ({c})" for a, b, c in rejected[:6]) + (
+                    f"; +{len(rejected) - 6} more" if len(rejected) > 6 else "")
+                pkg.warnings.append(
+                    f"{len(rejected)} LCSC search(es) returned a different part, not used: {shown}")
             filled, unbuildable = fill_lcsc_column(bom_out, parts)
             pkg.lcsc = [p.to_dict() for p in parts.values()]
             if unbuildable:
