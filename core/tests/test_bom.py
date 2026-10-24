@@ -235,6 +235,27 @@ def test_jlcpcb_without_lcsc_says_the_bom_is_not_buildable(board: Path, tmp_path
 
 
 @needs_translator
+def test_jlcpcbs_comment_carries_the_mpn_after_the_value(board: Path, tmp_path: Path) -> None:
+    """JLCPCB matches a line by its Comment too, and warned that "3.9nH" did not
+    match the part it found by MPN. The MPN goes after the value; a line with
+    no MPN keeps its value alone."""
+    bom.build_assembly(board / "board-bom.csv", None, tmp_path, house="jlcpcb")
+    comments = {r["Designator"]: r["Comment"] for r in _rows(tmp_path / "jlcpcb" / "bom.csv")}
+    assert comments["C1,C2,C5"] == "100nF 16V X7R GRM155R71C104KA88D"
+    assert comments["U1"] == "ESP32-S3 ESP32-S3-WROOM-1-N16R8"
+    assert comments["J1"] == "USB-C"
+
+
+def test_a_comment_that_already_names_its_mpn_is_left_alone(tmp_path: Path) -> None:
+    out = tmp_path / "bom.csv"
+    out.write_text("Comment,Designator,Footprint,LCSC Part #,MPN,Manufacturer,Quantity,Notes\n"
+                   "MAX-M10S-00B,U3,,,MAX-M10S-00B,u-blox,1,\n"
+                   ",U9,,,TPS22919DCKT,TI,1,\n", encoding="utf-8")
+    assert bom.comment_with_mpn(out) == 1
+    assert [r["Comment"] for r in _rows(out)] == ["MAX-M10S-00B", "TPS22919DCKT"]
+
+
+@needs_translator
 def test_placement_rows_with_no_bom_line_are_dropped_and_reported(
     board: Path, tmp_path: Path
 ) -> None:
@@ -272,6 +293,59 @@ def test_the_two_houses_get_different_boms(board: Path, tmp_path: Path) -> None:
     assert jlc != pcb
     assert "LCSC Part #" in jlc
     assert "Line#" in pcb
+
+
+def test_an_lcsc_result_for_another_part_is_not_used(monkeypatch, tmp_path: Path) -> None:
+    """The search falls back to its first fuzzy result: asked for a Murata
+    capacitor it answered with a Zener diode, whose C-number then went into the
+    BOM against C7. Only a result naming the MPN asked for is taken."""
+    script = tmp_path / "fetch_datasheet_lcsc.py"
+    script.write_text("")
+    monkeypatch.setattr(bom, "script_path", lambda *a: script)
+    answers = {
+        "GRM155R60J475ME47D": {"mpn": "SMA2Z9.1A", "lcsc": "C7435348", "in_stock": 708},
+        "RC0402FR-07470RL": {"mpn": "rc0402fr-07470rl", "lcsc": "C25117", "in_stock": 9},
+    }
+    monkeypatch.setattr(bom, "jlcpcb_search", lambda mpn, **kw: None)
+    monkeypatch.setattr(bom, "run_script",
+                        lambda path, args, **kw: type("R", (), {"data": answers[args[1]]})())
+    rejected: list = []
+    found = bom.resolve_lcsc(list(answers), rejected=rejected)
+    assert list(found) == ["RC0402FR-07470RL"] and found["RC0402FR-07470RL"].lcsc == "C25117"
+    assert rejected == [("GRM155R60J475ME47D", "SMA2Z9.1A", "C7435348")]
+
+
+def test_jlcpcbs_own_listing_is_asked_first_and_must_name_the_mpn(monkeypatch) -> None:
+    """JLCPCB's search answers with its own C-number, stock and library; a
+    listing under another MPN is not taken, and the old search is the fallback."""
+    listings = {
+        "RC0402FR-07470RL": [
+            {"componentCode": "C99", "componentModelEn": "RC0402FR-0747RL", "stockCount": 5},
+            {"componentCode": "C114877", "componentModelEn": "RC0402FR-07470RL", "stockCount": 626521,
+             "componentBrandEn": "YAGEO", "componentLibraryType": "expand"},
+        ],
+        "LRC0402CS3N9GV001T": [{"componentCode": "C1", "componentModelEn": "SOMETHING-ELSE", "stockCount": 9}],
+    }
+
+    class Resp:
+        def __init__(self, body):
+            self.body = body
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return self.body
+
+    def fake_urlopen(req, timeout=0):
+        asked = json.loads(req.data)["keyword"]
+        return Resp(json.dumps({"data": {"componentPageInfo": {"list": listings[asked]}}}).encode())
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    part = bom.jlcpcb_search("RC0402FR-07470RL")
+    assert (part.lcsc, part.stock, part.library) == ("C114877", 626521, "expand")
+    assert bom.jlcpcb_search("LRC0402CS3N9GV001T") is None
 
 
 @needs_translator
