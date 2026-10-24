@@ -305,3 +305,15 @@ def test_the_gate_reads_stage8s_output_for_the_board_asked_about(tmp_path, monke
         (tmp_path / "pipe" / "review.sensor" / name).write_text("{}")
     gate = release.run_gate(tmp_path / "pipe", tmp_path, "sensor")
     assert "no analyzer output" not in str(gate.get("reason", ""))
+
+
+def test_the_manifest_records_what_was_left_for_fitting_by_hand(project, monkeypatch) -> None:
+    """So that regenerating the assembly files from this package (blpl
+    bom-assembly) leaves out the same parts (Codex, PR #82)."""
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    (project / ".pipeline" / "hdm.yaml").write_text(
+        "components:\n  C9: {assembly: hand_fit}\n  R1: {}\n", encoding="utf-8")
+    manifest = release.build(project, now="2026-08-12_120000Z")
+    assert manifest["hand_fit"] == ["C9"]
+    on_disk = json.loads((Path(manifest["archive"]).parent / "2026-08-12_120000Z" / "manifest.json").read_text())
+    assert on_disk["hand_fit"] == ["C9"]

@@ -640,12 +640,13 @@ def build(
 
     bom_json = src["bom"]
     bom_csv = out_dir / "bom" / f"{name}-bom.csv"
+    hand_fit = _hand_fit(pipeline, src["hdm"])
     if bom_json.is_file():
         steps.append(export_bom_csv(bom_json, bom_csv, exclude=_not_bought(pipeline, src["hdm"])))
         libs = src["kicad_dir"] / "libs" if src["kicad_dir"] is not None else None
         steps.extend(export_assembly(bom_csv, out_dir, lcsc=lcsc,
                                      footprint_roots=[libs] if libs is not None and libs.is_dir() else None,
-                                     hand_fit=_hand_fit(pipeline, src["hdm"])))
+                                     hand_fit=hand_fit))
     else:
         steps.append(Step("bom", False, "no BOM yet: run the pipeline through Stage 1"))
 
@@ -682,6 +683,9 @@ def build(
         "tools": {"kicad_cli": _tool_version(cli) if cli else "not found"},
         "files": files,
         "incomplete": [s.name for s in steps if not s.ok],
+        # What the assembly files left for fitting by hand, so regenerating
+        # them from this package (blpl bom-assembly) leaves out the same parts.
+        "hand_fit": sorted(hand_fit),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
