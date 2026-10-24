@@ -256,6 +256,25 @@ def test_a_comment_that_already_names_its_mpn_is_left_alone(tmp_path: Path) -> N
 
 
 @needs_translator
+@pytest.mark.parametrize("house", ["jlcpcb", "pcbway"])
+def test_a_hand_fitted_part_leaves_the_houses_files_and_is_named(board: Path, tmp_path: Path, house) -> None:
+    """C9 on the ear tag is a 25 F capacitor JLCPCB does not stock: bought and
+    fitted by hand, so not the house's to place. Its line loses it, the
+    placement file drops it, and only R99 is reported as missing a BOM line."""
+    pkg = bom.build_assembly(board / "board-bom.csv", board / "positions.csv", tmp_path / "out",
+                             house=house, hand_fit={"C2"})
+    rows = _rows(tmp_path / "out" / house / "bom.csv")
+    caps = next(r for r in rows if "C1" in json.dumps(r))
+    assert "C2" not in json.dumps(caps) and "C5" in json.dumps(caps)
+    cpl = _rows(tmp_path / "out" / house / "cpl.csv")
+    assert not any("C2" in r.values() for r in cpl) and any("C5" in r.values() for r in cpl)
+    assert any("C2 left out for fitting by hand" in w for w in pkg.warnings)
+    assert any(w.startswith("1 placed part(s) are absent") for w in pkg.warnings)
+    # The release's own BOM is untouched.
+    assert "C2" in (board / "board-bom.csv").read_text()
+
+
+@needs_translator
 def test_placement_rows_with_no_bom_line_are_dropped_and_reported(
     board: Path, tmp_path: Path
 ) -> None:
@@ -434,6 +453,28 @@ def test_cli_assembly_writes_both_houses(tmp_path: Path, capsys) -> None:
     assert "jlcpcb:" in out and "pcbway:" in out
     assert (stamp / "assembly" / "jlcpcb" / "bom.csv").is_file()
     assert (stamp / "assembly" / "pcbway" / "bom.csv").is_file()
+
+
+@needs_translator
+def test_cli_assembly_leaves_out_what_the_package_left_for_hand_fitting(tmp_path: Path, capsys) -> None:
+    """The release BOM keeps a hand-fitted part, since it is bought. Re-run
+    from the package, the houses' files put it back on the order (Codex, PR
+    #82); the package's manifest says which parts it left out, and the re-run
+    leaves out the same."""
+    from blpl.core import cli
+
+    stamp = tmp_path / "release" / "2026-08-12_000000Z"
+    (stamp / "bom").mkdir(parents=True)
+    (stamp / "placement").mkdir(parents=True)
+    (stamp / "bom" / "board-bom.csv").write_text(RELEASE_BOM, encoding="utf-8")
+    (stamp / "placement" / "positions.csv").write_text(POSITIONS, encoding="utf-8")
+    (stamp / "manifest.json").write_text(json.dumps({"hand_fit": ["C2"]}), encoding="utf-8")
+
+    assert cli.main(["bom-assembly", "--project-dir", str(tmp_path)]) == 0
+    assert "C2 left out for fitting by hand" in capsys.readouterr().out
+    for house in ("jlcpcb", "pcbway"):
+        assert "C2" not in (stamp / "assembly" / house / "bom.csv").read_text()
+        assert "C2" not in (stamp / "assembly" / house / "cpl.csv").read_text()
 
 
 def test_assembly_package_serialises(board: Path, tmp_path: Path) -> None:

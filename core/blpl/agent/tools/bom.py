@@ -438,6 +438,45 @@ def write_pcbway_bom(rows: list[BomRow], out_csv: Path, *, footprint_roots: list
     return FabFile("pcbway-bom", str(out_csv), _row_count(out_csv), "; ".join(notes))
 
 
+def _without(bom_csv: Path, refs: set[str], out: Path) -> tuple[Path, list[str]]:
+    """A copy of the grouped release BOM with ``refs`` taken off their lines,
+    and which of them it carried. A line left with no designator goes."""
+    with Path(bom_csv).open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+        rows = list(reader)
+    removed: list[str] = []
+    kept = []
+    for row in rows:
+        desig = [d.strip() for d in (row.get("Designators") or "").split(",") if d.strip()]
+        gone = [d for d in desig if d in refs]
+        if gone:
+            removed += gone
+            desig = [d for d in desig if d not in refs]
+            if not desig:
+                continue
+            row["Designators"] = ",".join(desig)
+            if "Quantity" in row:
+                row["Quantity"] = str(len(desig))
+        kept.append(row)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(kept)
+    return out, sorted(removed)
+
+
+def _placed(positions_csv: Path | None, refs: list[str]) -> int:
+    """How many of ``refs`` the placement file has a row for."""
+    if not refs or not positions_csv or not Path(positions_csv).is_file():
+        return 0
+    with Path(positions_csv).open(newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    want = set(refs)
+    return sum(1 for r in rows[1:] if r and r[0].strip() in want)
+
+
 def build_assembly(
     bom_csv: Path,
     positions_csv: Path | None,
@@ -447,8 +486,15 @@ def build_assembly(
     footprint_roots: list[Path] | None = None,
     lcsc: bool = False,
     creds: CredResolver | None = None,
+    hand_fit: set[str] | None = None,
 ) -> AssemblyPackage:
-    """Write one house's upload files. Never raises for a missing input."""
+    """Write one house's upload files. Never raises for a missing input.
+
+    ``hand_fit`` names parts fitted by hand after assembly (project.yaml
+    ``assembly.hand_fit``): bought, on the board and in the release BOM, but
+    not this house's to place. They leave its BOM and so its placement file,
+    and the package says which, so the order is not read as complete.
+    """
     if house not in HOUSES:
         return AssemblyPackage(False, house, reason=f"unknown assembly house {house!r}")
     bom_csv = Path(bom_csv)
@@ -459,6 +505,16 @@ def build_assembly(
     out_dir = Path(out_dir) / house
     out_dir.mkdir(parents=True, exist_ok=True)
     pkg = AssemblyPackage(True, house)
+    hand_fit = set(hand_fit or ())
+    import tempfile
+    scratch = tempfile.TemporaryDirectory()
+    left_out: list[str] = []
+    if hand_fit:
+        bom_csv, left_out = _without(bom_csv, hand_fit, Path(scratch.name) / bom_csv.name)
+    if left_out:
+        pkg.warnings.append(
+            f"{', '.join(left_out)} left out for fitting by hand after assembly "
+            "(project.yaml assembly.hand_fit): order separately and fit before test")
 
     if house == "jlcpcb":
         try:
@@ -535,7 +591,9 @@ def build_assembly(
             return pkg
         if cpl_out.is_file():
             stats = res.data if isinstance(res.data, dict) else {}
-            orphans = int(stats.get("filtered_orphans") or 0)
+            # The hand-fit parts are placed on the board and absent from the
+            # BOM by intent; only the rest are a finding.
+            orphans = max(0, int(stats.get("filtered_orphans") or 0) - _placed(positions_csv, left_out))
             pkg.files.append(
                 FabFile(
                     f"{house}-cpl",

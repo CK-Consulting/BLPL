@@ -1423,6 +1423,19 @@ def _cmd_bom_assembly(args: argparse.Namespace) -> int:
 
     positions = out_dir / "placement" / "positions.csv"
     houses = HOUSES if args.house == "both" else (args.house,)
+    # The parts the package left for fitting by hand. The release BOM keeps
+    # them, since they are bought, so without this list a re-run put them
+    # back on the houses' orders (Codex, PR #82). The package's own record
+    # first; a package older than it, from the board's HDM as it is now.
+    try:
+        hand_fit = set(json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))["hand_fit"])
+    except (OSError, ValueError, KeyError, TypeError):
+        from .release import _hand_fit, board_files
+        try:
+            src = board_files(proj)
+            hand_fit = _hand_fit(src["pipeline"], src["hdm"])
+        except Exception:
+            hand_fit = set()
     rc = 0
     for house in houses:
         pkg = build_assembly(
@@ -1432,6 +1445,7 @@ def _cmd_bom_assembly(args: argparse.Namespace) -> int:
             house=house,
             footprint_roots=[_DEFAULT_FOOTPRINTS],
             lcsc=args.lcsc,
+            hand_fit=hand_fit,
         )
         if not pkg.ok:
             print(f"{house}: failed — {pkg.reason}", file=sys.stderr)
