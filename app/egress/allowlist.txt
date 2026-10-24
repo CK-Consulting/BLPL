@@ -16,12 +16,14 @@ api.together.xyz
 api.fireworks.ai
 api.deepinfra.com
 generativelanguage.googleapis.com
-# Distributor APIs, exactly the hosts kicad-happy's scripts call: part search
+# Distributor APIs, exactly the hosts kicad-happy's scripts and BLPL's own
+# JLCPCB lookup (core/blpl/agent/tools/bom.py) call: part search
 # and lifecycle data, not document downloads.
 api.digikey.com
 api.mouser.com
 api.element14.com
 jlcsearch.tscircuit.com
+jlcpcb.com
 wmsc.lcsc.com
 identity.nexar.com
 api.nexar.com
