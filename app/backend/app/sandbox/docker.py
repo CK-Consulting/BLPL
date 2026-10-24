@@ -167,11 +167,17 @@ def observed_exit(state: dict) -> int:
     return int(state["ExitCode"])
 
 
-def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig) -> dict[str, Any]:
+def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig,
+                      image_id: str | None = None) -> dict[str, Any]:
     """The exact ``POST /containers/create`` body for a workspace.
 
     Every confinement property is stated here rather than left to a daemon
     default, because a default is whatever the next Docker release decides.
+
+    ``image_id`` is what the image's tag resolves to now. It goes into the
+    spec digest, not the body: a rebuild keeps the tag, so with the tag alone a
+    container from the old build matched the new spec and was restarted on the
+    old code after every redeploy.
     """
     labels = labels_for(spec.key, cfg)
     clash = set(spec.extra_labels) & (set(labels) | {LABEL_SPEC})
@@ -222,7 +228,8 @@ def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig) -> dict[str, Any]:
     }
     if spec.command:
         body["Cmd"] = list(spec.command)
-    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    digest = hashlib.sha256(json.dumps({**body, "_image_id": image_id or ""},
+                                       sort_keys=True).encode()).hexdigest()
     body["Labels"] = {**labels, LABEL_SPEC: digest[:16]}
     return body
 
@@ -350,9 +357,27 @@ class DockerDriver:
 
     # -- the interface ----------------------------------------------------
 
+    async def _image_id(self, image: str) -> str | None:
+        """What ``image`` resolves to now, or None when the daemon cannot say."""
+        try:
+            resp = await self._req("GET", f"/images/{image}/json", ok=(200, 404))
+        except DriverError:
+            # A proxy without the route answers with a refusal, and the digest
+            # is then of the tag alone. That can at worst replace a STOPPED
+            # container needlessly (ensure leaves a running one alone, and its
+            # storage is a separate volume), never interrupt one in use.
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            ident = resp.json().get("Id")
+        except ValueError:
+            return None
+        return ident if isinstance(ident, str) and ident else None
+
     async def ensure(self, spec: WorkspaceSpec) -> WorkspaceStatus:
         key = spec.key
-        body = build_create_body(spec, self.cfg)
+        body = build_create_body(spec, self.cfg, await self._image_id(spec.image))
         want = body["Labels"][LABEL_SPEC]
         info = await self._inspect(key)
         status = self._status_from(key, info, want)

@@ -184,6 +184,7 @@ class MockDaemon:
     def __init__(self, owner_labels: dict | None = None):
         self.containers: dict[str, dict] = {}
         self.volumes: dict[str, dict] = {}
+        self.images: dict[str, str] = {}  # tag -> the id it resolves to now
         self.calls: list[tuple[str, str]] = []
         self.owner_labels = owner_labels
 
@@ -191,6 +192,10 @@ class MockDaemon:
         path = request.url.path.split("/", 2)[2]  # strip /v1.44
         self.calls.append((request.method, "/" + path))
         parts = path.split("/")
+        if parts[0] == "images":
+            ident = self.images.get(parts[1])
+            return httpx.Response(200, json={"Id": ident}) if ident else httpx.Response(
+                404, json={"message": "no such image"})
         if parts[0] == "volumes":
             if request.method == "POST":
                 body = json.loads(request.content)
@@ -251,6 +256,31 @@ def test_docker_ensure_recreates_a_stale_stopped_workspace_but_not_a_running_one
     st = run(d.ensure(newer))
     assert st.state is State.RUNNING and not st.stale
     assert ("DELETE", f"/containers/{'c' * 64}") in daemon.calls
+
+
+def test_a_rebuilt_image_under_the_same_tag_makes_the_workspace_stale():
+    """A redeploy rebuilds blpl-workspace:dev under the same tag. Compared by
+    tag, the old container matched and was restarted on the old code."""
+    daemon = MockDaemon()
+    daemon.images["blpl-workspace:dev"] = "sha256:" + "1" * 64
+    d = driver_for(daemon)
+    run(d.ensure(spec()))
+    assert not run(d.ensure(spec())).stale              # nothing rebuilt: current
+    daemon.images["blpl-workspace:dev"] = "sha256:" + "2" * 64
+    st = run(d.ensure(spec()))
+    assert st.state is State.RUNNING and st.stale       # rebuilt, running: left alone
+    run(d.stop(KEY))
+    daemon.calls.clear()
+    st = run(d.ensure(spec()))
+    assert st.state is State.RUNNING and not st.stale   # stopped: recreated on the new build
+    assert ("DELETE", f"/containers/{'c' * 64}") in daemon.calls
+
+
+def test_an_image_the_daemon_cannot_resolve_falls_back_to_the_tag():
+    daemon = MockDaemon()                                 # no images: every lookup is a 404
+    d = driver_for(daemon)
+    run(d.ensure(spec()))
+    assert not run(d.ensure(spec())).stale
 
 
 def test_docker_refuses_a_container_squatting_our_name():

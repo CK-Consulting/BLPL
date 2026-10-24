@@ -688,6 +688,9 @@ _ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("GET", re.compile(rf"/exec/{_ID}/json"), "exec_inspect"),
     ("POST", re.compile(r"/volumes/create"), "volume_create"),
     ("GET", re.compile(rf"/volumes/{_ID}"), "volume_inspect"),
+    # An image's id, for the driver to tell a rebuilt image from the one a
+    # container was created from. Only images the policy lets it create.
+    ("GET", re.compile(r"/images/(?P<id>[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,255})/json"), "image_inspect"),
 ]
 _VERSION = re.compile(r"^/v1\.(?P<minor>\d{1,3})(?P<rest>/.*)$")
 

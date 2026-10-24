@@ -200,6 +200,12 @@ class DockerProxy:
                 raise Refused(f"volume {r.ident} is not managed by this deployment")
             return Forward("GET", f"/{v}/volumes/{r.ident}", {})
 
+        if r.action == "image_inspect":
+            assert r.ident is not None
+            if r.ident not in p.images:
+                raise Refused(f"image {r.ident} is not permitted")
+            return Forward("GET", f"/{v}/images/{r.ident}/json", {})
+
         if r.action in ("exec_start", "exec_inspect"):
             assert r.ident is not None
             status, info = await self.upstream.get_json(f"/{v}/exec/{r.ident}/json")
