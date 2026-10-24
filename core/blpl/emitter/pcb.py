@@ -267,6 +267,26 @@ def _angle_of(at: sexpr.Node) -> float:
     return _num(at[3]) if len(at) >= 4 else 0.0
 
 
+def _modern_at(text: sexpr.Node) -> sexpr.Node | None:
+    """A text's ``at``, with KiCad 7's ``(at x y unlocked)`` made KiCad 10's
+    ``(at x y)`` and ``(unlocked yes)`` beside it.
+
+    Footprints from vendor libraries still carry the old form (Molex's
+    1042240820_MOL among them). Read as written, ``unlocked`` was taken for
+    the angle, and Stage 6 failed on sb-ant with "could not convert string to
+    float: 'unlocked'". Dropped instead, it would lose "keep upright: off".
+    """
+    at = sexpr.find(text, "at")
+    if at is None:
+        return None
+    flags = [t for t in at[3:] if isinstance(t, str) and sexpr.unquote(t) == "unlocked"]
+    if flags:
+        at[:] = [t for t in at if t not in flags]
+        if sexpr.find(text, "unlocked") is None:
+            text.append(["unlocked", "yes"])
+    return at
+
+
 def _set_angle(at: sexpr.Node, angle: float) -> None:
     angle = angle % 360.0
     if abs(angle - 360.0) < 1e-9:
@@ -307,7 +327,7 @@ def _orient_text(text: sexpr.Node, rot: float, bottom: bool) -> None:
     ``PCB_TEXT::KeepUpright``; leaving it out puts every reference on a
     flipped part upside-down.
     """
-    at = sexpr.find(text, "at")
+    at = _modern_at(text)
     if at is None:
         return
     a = _angle_of(at)

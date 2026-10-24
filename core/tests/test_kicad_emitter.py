@@ -706,3 +706,18 @@ def test_project_yaml_s_board_marking_is_on_the_emitted_board() -> None:
     texts = [n for n in sexpr.parse(pcb.emit(hdm, footprints_root=_FOOTPRINTS_ROOT)) if sexpr.head(n) == "gr_text"]
     assert [sexpr.unquote(t[1]) for t in texts] == ["VQT0P1 REV 0"]
     assert "gr_text" not in pcb.emit(_minimal_hdm(), footprints_root=_FOOTPRINTS_ROOT)
+
+
+def test_kicad_7s_unlocked_text_is_read_as_kicad_10_writes_it() -> None:
+    """Vendor footprints still write (at x y unlocked). Read as written, the
+    flag was taken for the angle and sb-ant's Stage 6 failed; dropped, it
+    would lose "keep upright: off"."""
+    text = sexpr.parse('(fp_text reference "REF**" (at 0 0.65 unlocked) (layer "F.SilkS"))')
+    pcb._orient_text(text, 90.0, False)
+    assert sexpr.find(text, "at")[1:] == ["0", "0.65", "90"]
+    assert sexpr.find(text, "unlocked") == ["unlocked", "yes"]
+
+    flipped = sexpr.parse('(fp_text reference "REF**" (at 0 0.65 unlocked) (layer "B.SilkS"))')
+    pcb._orient_text(flipped, 180.0, True)
+    # Unlocked: no keep-upright half-turn, so the angle stays at -(0 + 180).
+    assert sexpr.find(flipped, "at")[3] == "180"
