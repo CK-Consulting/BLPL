@@ -56,7 +56,7 @@ def test_every_host_the_catalog_names_is_a_default():
 
 def test_the_distributor_apis_kicad_happy_calls_are_defaults():
     for host in ("api.digikey.com", "api.mouser.com", "api.element14.com",
-                 "jlcsearch.tscircuit.com", "wmsc.lcsc.com", "api.nexar.com",
+                 "jlcsearch.tscircuit.com", "wmsc.lcsc.com", "api.nexar.com", "jlcpcb.com",
                  "identity.nexar.com", "github.com"):
         assert egress.matches(host, egress.defaults()), host
     # A document host is not: documents come through the control plane.
