@@ -1026,8 +1026,11 @@ def _stitch(python: str, pcb: Path, *, via_mm: float, drill_mm: float, clearance
         "                plane = True\n"
         # The tracks as listed before any probe was added and taken away (a
         # board is not walked again after a Remove), and the links placed here.
+        # Anywhere along a track counts, not only its ends: spot_ok lets a
+        # via land partway along a same-net track, and that joins its layer
+        # as surely as an end does (Codex, PR #83).
         "    for t in items + [it for g in added for it in g]:\n"
-        "        if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetCode() == code and at in (t.GetStart(), t.GetEnd()):\n"
+        "        if t.Type() in (pcbnew.PCB_TRACE_T, pcbnew.PCB_ARC_T) and t.GetNetCode() == code and t.HitTest(at, r):\n"
         "            layers.add(t.GetLayer())\n"
         "    for p in pads:\n"
         "        if p.GetNetCode() == code and p.HitTest(at):\n"

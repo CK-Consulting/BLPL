@@ -1268,13 +1268,10 @@ def test_a_stub_chain_that_needs_a_second_round_comes_off(tmp_path):
     assert "(segment" not in pcb.read_text()
 
 
-@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
-    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
-    reason="needs KiCad's pcbnew")
-def test_no_stitching_via_where_ground_is_one_plane(tmp_path):
-    """On pathfinder's core GND is a plane on In1.Cu alone (In2.Cu is 3V3). A
-    ground via beside a signal via there touches one plane and nothing else:
-    it connects nothing, and DRC called 130 of them dangling."""
+def _one_plane_board(tmp_path, ground_loop: bool):
+    """GND a plane on In1.Cu alone, VDD on In2.Cu, a SIG via at (20, 15); with
+    ``ground_loop``, a square of GND track on F.Cu round it, 0.85 mm out, so
+    every spot the stitching tries lands partway along one of its sides."""
     import pcbnew
 
     from blpl.emitter import sexpr
@@ -1304,22 +1301,63 @@ def test_no_stitching_via_where_ground_is_one_plane(tmp_path):
     v.SetWidth(mm(0.6))
     v.SetDrill(mm(0.3))
     v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+    if ground_loop:
+        h = 0.85
+        corners = [(20 - h, 15 - h), (20 + h, 15 - h), (20 + h, 15 + h), (20 - h, 15 + h)]
+        for a, b in zip(corners, corners[1:] + corners[:1]):
+            t = pcbnew.PCB_TRACK(board)
+            board.Add(t)
+            t.SetStart(pcbnew.VECTOR2I(mm(a[0]), mm(a[1])))
+            t.SetEnd(pcbnew.VECTOR2I(mm(b[0]), mm(b[1])))
+            t.SetWidth(mm(0.4))
+            t.SetLayer(pcbnew.F_Cu)
     pcb = tmp_path / "b.kicad_pcb"
     pcbnew.SaveBoard(str(pcb), board)
     tree = sexpr.parse(pcb.read_text())
     for node in tree:
         if not isinstance(node, list):
             continue
-        if sexpr.head(node) in ("via", "zone"):
-            name = ("SIG" if sexpr.head(node) == "via"
+        tag = sexpr.head(node)
+        if tag in ("via", "zone", "segment"):
+            name = ("SIG" if tag == "via" else "GND" if tag == "segment"
                     else "GND" if sexpr.unquote(sexpr.find(node, "layer")[1]) == "In1.Cu" else "VDD")
             node[:] = [c for c in node if not (isinstance(c, list) and sexpr.head(c) == "net")] + [
                 ["net", sexpr.quote(name)]]
     pcb.write_text(sexpr.dump_top(tree))
+    return pcb
 
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_no_stitching_via_where_ground_is_one_plane(tmp_path):
+    """On pathfinder's core GND is a plane on In1.Cu alone (In2.Cu is 3V3). A
+    ground via beside a signal via there touches one plane and nothing else:
+    it connects nothing, and DRC called 130 of them dangling."""
+    import pcbnew
+
+    pcb = _one_plane_board(tmp_path, ground_loop=False)
     proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
                              edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip().splitlines()[-1] == "0 1"
     after = pcbnew.LoadBoard(str(pcb))
     assert [t.GetNetname() for t in after.GetTracks() if t.Type() == pcbnew.PCB_VIA_T] == ["SIG"]
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_a_stitching_via_partway_along_a_ground_track_is_kept(tmp_path):
+    """A via may land partway along a same-net track, and then it joins the
+    track's layer to the plane: two layers, kept. Counting only track ends,
+    the check called it one plane and took it out (Codex, PR #83)."""
+    import pcbnew
+
+    pcb = _one_plane_board(tmp_path, ground_loop=True)
+    proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
+                             edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "1 0"
+    after = pcbnew.LoadBoard(str(pcb))
+    assert sorted(t.GetNetname() for t in after.GetTracks() if t.Type() == pcbnew.PCB_VIA_T) == ["GND", "SIG"]
