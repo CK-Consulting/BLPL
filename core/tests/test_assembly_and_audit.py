@@ -23,6 +23,29 @@ def test_assembly_marks_parts_and_refuses_unknown_or_doubled_ones():
         stage5_emit_yaml_hdm._apply_assembly(_comps("R1"), {"assembly": {"dnp": ["R1"], "footprint_only": ["R1"]}})
 
 
+def test_a_hand_fitted_part_is_marked_and_stays_fitted_on_the_board():
+    """Bought and fitted, by hand after assembly: KiCad's own flags keep it in
+    the BOM and the placement file, as any fitted part."""
+    comps = _comps("C9", "R1")
+    stage5_emit_yaml_hdm._apply_assembly(comps, {"assembly": {"hand_fit": ["C9"]}})
+    assert comps["C9"]["assembly"] == "hand_fit"
+    with pytest.raises(stage5_emit_yaml_hdm.InvalidProjectConfigError, match="both"):
+        stage5_emit_yaml_hdm._apply_assembly(_comps("C9"), {"assembly": {"dnp": ["C9"], "hand_fit": ["C9"]}})
+    part = sch._component_instance("C9", "Device:C", "25F", "", 0, 0, "p", '"u"', assembly="hand_fit")
+    assert {n: sexpr.find(part, n)[1] for n in ("in_bom", "in_pos_files", "dnp")} == {
+        "in_bom": "yes", "in_pos_files": "yes", "dnp": "no"}
+    fp = ["footprint", '"X"', ["attr", "through_hole"]]
+    pcb._set_assembly(fp, "hand_fit")
+    assert sexpr.find(fp, "attr")[1:] == ["through_hole"]
+
+
+def test_the_schema_takes_hand_fit():
+    from blpl.core import schema
+
+    schema.validate("project_config", {"project": {"name": "p", "dimensions": [10, 10]},
+                                       "assembly": {"hand_fit": ["C9"]}})
+
+
 def test_the_schematic_and_board_carry_kicads_own_flags():
     def flags(node, *names):
         return {n: sexpr.find(node, n)[1] for n in names}
@@ -178,3 +201,21 @@ def test_edge_clearance_is_measured_along_the_courtyard_not_at_its_corners():
 def test_a_malformed_hdm_leaves_the_bom_whole_instead_of_crashing(tmp_path, text):
     (tmp_path / "hdm.yaml").write_text(text)
     assert release._not_bought(tmp_path) == set()
+
+
+def test_the_release_reads_the_hand_fitted_parts_from_the_boards_hdm(tmp_path):
+    hdm = tmp_path / "hdm.verdacor-ear-tag.yaml"
+    hdm.write_text("components:\n  C9: {assembly: hand_fit}\n  R9: {assembly: dnp}\n  R1: {}\n")
+    assert release._hand_fit(tmp_path, hdm) == {"C9"}
+    assert release._not_bought(tmp_path, hdm) == {"R9"}
+
+
+def test_a_hand_fitted_part_is_still_ordered():
+    from blpl.core import bom_export
+
+    hdm = {"components": {"C9": {"value": "25F", "mpn": "HSH0814-3R8256-R", "manufacturer": "Eaton",
+                                 "footprint": "CP_Radial", "assembly": "hand_fit"}}}
+    import csv
+    import io
+    rows = list(csv.DictReader(io.StringIO(bom_export.to_csv(bom_export.parts(None, hdm), "purchase"))))
+    assert [r["MPN"] for r in rows] == ["HSH0814-3R8256-R"]

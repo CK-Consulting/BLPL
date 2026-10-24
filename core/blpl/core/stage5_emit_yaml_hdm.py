@@ -255,10 +255,12 @@ def _apply_assembly(components_out: dict, project_config: dict) -> None:
     (J_DBG's Tag-Connect pads were written into a BOM note as "footprint only,
     not purchased", which nothing downstream could read). The emitters carry
     it into KiCad's own flags, and the release BOM leaves both out.
+    ``assembly.hand_fit`` — bought and fitted, by hand after assembly: the
+    board and the BOMs keep it, the assembly houses' files do not (release.py).
     """
     assembly = project_config.get("assembly") or {}
     seen: dict[str, str] = {}
-    for kind in ("dnp", "footprint_only"):
+    for kind in ("dnp", "footprint_only", "hand_fit"):
         for ref in assembly.get(kind) or []:
             if ref not in components_out:
                 raise InvalidProjectConfigError(

@@ -194,6 +194,15 @@ def export_fabrication(pcb: Path, out_dir: Path, *, kicad_cli: str | None = None
 
 def _not_bought(pipeline: Path, hdm: Path | None = None) -> set[str]:
     """Parts the HDM marks DNP or footprint-only (project.yaml assembly)."""
+    return _assembled_as(pipeline, hdm, ("dnp", "footprint_only"))
+
+
+def _hand_fit(pipeline: Path, hdm: Path | None = None) -> set[str]:
+    """Parts bought but fitted by hand after assembly (project.yaml assembly)."""
+    return _assembled_as(pipeline, hdm, ("hand_fit",))
+
+
+def _assembled_as(pipeline: Path, hdm: Path | None, kinds: tuple[str, ...]) -> set[str]:
     import yaml
 
     hdm = hdm or pipeline / "hdm.yaml"
@@ -208,7 +217,7 @@ def _not_bought(pipeline: Path, hdm: Path | None = None) -> set[str]:
     if not isinstance(comps, dict):
         return set()
     return {ref for ref, c in comps.items()
-            if isinstance(c, dict) and c.get("assembly") in ("dnp", "footprint_only")}
+            if isinstance(c, dict) and c.get("assembly") in kinds}
 
 
 def export_bom_csv(bom_json: Path, out_csv: Path, exclude: "set[str] | None" = None) -> Step:
@@ -273,7 +282,8 @@ def export_bom_csv(bom_json: Path, out_csv: Path, exclude: "set[str] | None" = N
 
 
 def export_assembly(bom_csv: Path, out_dir: Path, *, lcsc: bool = False,
-                    footprint_roots: list[Path] | None = None) -> list[Step]:
+                    footprint_roots: list[Path] | None = None,
+                    hand_fit: "set[str] | None" = None) -> list[Step]:
     """Per-house assembly uploads, beside the generic BOM.
 
     The grouped CSV above is what a *human* reads. Neither JLCPCB nor PCBWay
@@ -302,6 +312,7 @@ def export_assembly(bom_csv: Path, out_dir: Path, *, lcsc: bool = False,
             # 28 of the ear tag's lines had no SMD/THT type.
             footprint_roots=[*(footprint_roots or []), _DEFAULT_FOOTPRINTS],
             lcsc=lcsc,
+            hand_fit=hand_fit,
         )
         detail = pkg.reason or "; ".join(pkg.warnings)
         if not lcsc:
@@ -633,7 +644,8 @@ def build(
         steps.append(export_bom_csv(bom_json, bom_csv, exclude=_not_bought(pipeline, src["hdm"])))
         libs = src["kicad_dir"] / "libs" if src["kicad_dir"] is not None else None
         steps.extend(export_assembly(bom_csv, out_dir, lcsc=lcsc,
-                                     footprint_roots=[libs] if libs is not None and libs.is_dir() else None))
+                                     footprint_roots=[libs] if libs is not None and libs.is_dir() else None,
+                                     hand_fit=_hand_fit(pipeline, src["hdm"])))
     else:
         steps.append(Step("bom", False, "no BOM yet: run the pipeline through Stage 1"))
 
