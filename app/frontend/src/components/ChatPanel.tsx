@@ -1698,7 +1698,7 @@ function ApprovalCard({
           className="link"
           disabled={busy}
           onClick={() => decide(true)}
-          title="Let the assistant run this tool call. Network access is asked once per session; anything that spends money or edits a board, every time."
+          title="Let the assistant run this tool call. Some tools then stay allowed for the rest of this conversation; others ask every time."
         >
           Allow
         </button>
