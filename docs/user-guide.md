@@ -107,11 +107,12 @@ There are two ways to drive it:
 
 ## Getting access
 
-You need three things from whoever runs the BLPL server:
+You need four things before you start:
 
 1. **The address**, usually `http://<host>:1800` (or `https://<host>:1443`).
 2. **An account.** Sign-in is Clerk: sign up with your email, or use the invitation link you were sent. An invitation link works once and expires after 24 hours; sign up with the same address it was sent to.
-3. **A model to use.** Either your own API key (Anthropic, OpenAI or an OpenAI-compatible service) or the address of a local model server (Ollama, or an OpenAI-compatible server that needs no key). There is no shared server key.
+3. **An empty git repository and an access token** for each new project (GitHub, GitLab, Gitea, Forgejo or Codeberg). Importing files needs neither.
+4. **A model to use.** Either your own API key (Anthropic, OpenAI or an OpenAI-compatible service) or the address of a local model server (Ollama, or an OpenAI-compatible server that needs no key). There is no shared server key.
 
 If the page says "The server is not answering", the backend is down or still starting; that is not a sign-in problem and the page retries by itself. If you can sign in but then see "this server rejected the session", the server's configuration is wrong; tell the operator.
 
@@ -123,7 +124,7 @@ If the page says "The server is not answering", the backend is down or still sta
 
 After the first sign-in you see **"Two things before you start"**, then **Set up your account**. Everything on that page is required:
 
-- **Passphrase** (at least 10 characters, typed twice). This is not your sign-in password. It derives the key that encrypts your API keys and git credentials. **The server keeps no copy and cannot reset it.** Write it down somewhere safe. If you lose it, your stored keys are gone and you re-enter them; your projects are not lost.
+- **Passphrase** (at least 10 characters, typed twice). This is not your sign-in password. It derives the key that encrypts your API keys and git credentials. **The server keeps no copy and cannot reset it.** Write it down somewhere safe, and add a passkey as a second way in (see below). **If you forget it and have no passkey, there is no recovery.** The same key also holds the private key that opens your encrypted projects, so you lose your provider keys, your git credentials and your access to every project at once, and the account cannot be set up again with a new passphrase. What survives is what was pushed to a git remote, which can be cloned again, and projects another member can still open.
 - **Provider, model, API key, base URL.** Pick the provider, paste the key (or the base URL of a local server), and choose a model from the suggestions. A "Need a key?" link takes you to the provider's sign-up page.
 
 Press **Finish setup**.
@@ -140,9 +141,9 @@ From the dashboard, press **+ Project**. Three ways in:
 
 | Mode | Use it when |
 |---|---|
-| **New** | Starting a design. Optionally give an empty remote repository URL and a token so the project is pushed off the server; **Test connection** checks it. "How do I set this up?" explains GitHub, GitLab and Gitea/Forgejo/Codeberg tokens. |
+| **New** | Starting a design. **Requires an empty remote repository**: create one first (on GitHub, GitLab, Gitea, Forgejo or Codeberg), then give its URL and an access token. **Test connection** checks both before anything is created. "How do I set this up?" explains the tokens for each host. |
 | **Clone git remote** | The design already lives in git. Give the clone URL and branch. |
-| **Import files** | You have markdown (or a .zip of a project) on your machine. |
+| **Import files** | You have markdown (or a .zip of a project) on your machine. No remote is needed; you can add one later under Project settings > Git. |
 
 For New and Clone you also set:
 
@@ -699,7 +700,7 @@ A project can point at external folders (a vendor reference design, a prior iter
 What you need to know as a user; the full model is in [security.md](security.md).
 
 - **Sign-in** is through Clerk. There is no other way in.
-- **Your passphrase (or passkey) unlocks your own master key.** That key seals your provider API keys and git credentials. It is never stored. If you forget the passphrase, those keys cannot be recovered; re-enter them. Adding a passkey gives a second door to the same key; it re-encrypts nothing.
+- **Your passphrase (or passkey) unlocks your own master key.** That key seals your provider API keys, your git credentials and the private key that opens your projects. It is never stored and cannot be reset. Forget the passphrase with no passkey enrolled and all of those are lost together: only work pushed to a git remote, or a project another member can still open, survives. Adding a passkey gives a second door to the same key and re-encrypts nothing, which makes it the only practical safeguard.
 - **Provider keys are per user.** There is no shared server key. Add yours under Settings, or route tasks to a keyless local model.
 - **Projects are sealed when nobody has them open**: on lock, after 30 minutes idle, never during a run. Opening a project unseals it without a separate step.
 - **Sharing** wraps the project key to each member. Removing a member stops future access but cannot unread what they already saw. An invitation link for someone without an account is valid for 24 hours.
