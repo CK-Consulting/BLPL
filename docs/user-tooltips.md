@@ -40,7 +40,7 @@ These are the places a new user is most likely to lose data or get stuck.
 | `Sharing.tsx:151` | Remove (member) | Stops their future access. It cannot take back what they have already seen. |
 | `Sharing.tsx:170` | Withdraw (invitation) | Cancels the invitation; the link stops working. |
 | `Sharing.tsx:190` | Email input | The address they sign in with. They must have signed in here once; otherwise you get a 24-hour invitation link. |
-| `ChatPanel.tsx:1686` | Allow | Let the assistant run this tool call once. Network access is asked once per session; anything that spends money or edits a board is asked every time. |
+| `ChatPanel.tsx:1686` | Allow | Let the assistant run this tool call. Some tools then stay allowed for the rest of this conversation; others ask every time. (The card knows the tool's kind, not its approval rule, so it cannot say which.) |
 | `ChatPanel.tsx:1686` | Deny | Refuse this tool call. The assistant is told and continues without it. |
 | `ProposalCard.tsx:151` | Accept | Write this change to the file and commit it. Refused if the file changed since the proposal was made. |
 | `ProposalCard.tsx:151` | Reject | Discard this proposal. The file is not touched. |

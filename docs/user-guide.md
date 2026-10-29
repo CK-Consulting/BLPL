@@ -278,7 +278,7 @@ Mermaid diagrams (in files and in chat) can be panned by dragging and zoomed wit
 - **Composer**: Enter sends, Shift+Enter is a new line. Paste, drop or use **+** to attach PNG, JPEG, GIF, WebP images or PDFs. Drag the grip above the box to resize it.
 - **Slash commands** (type `/` in an empty box): `/files`, `/read`, `/artifact`, `/fab`, `/sourcing`, `/modules`, `/part`, `/datasheet`, `/review`. Each inserts editable text; nothing sends until you press Send.
 - **While an answer is streaming**: keep typing and press **Queue**; queued messages send one per answer when it finishes cleanly. If the answer fails or you stop it, the queue is held with the reason, and you choose **Send now** or **Discard**. **Stop** cancels the answer.
-- **Approval cards**: **Allow** or **Deny** a tool call (network access, spending money, changing a board).
+- **Approval cards**: **Allow** or **Deny** a tool call that needs your say, such as changing a board. Some tools stay allowed for the rest of the conversation once allowed; others ask every time.
 - **Proposal cards**: a diff with **Accept** or **Reject**. Accepting writes and commits the file.
 - **Lost answers**: if the provider was busy or an answer was lost, a banner offers **Ask again**. A message that was never answered is marked and not sent with later messages; you can remove it.
 - Long conversations are summarised to fit the model's context; the files and git history are untouched.
@@ -622,7 +622,7 @@ The chat panel can read the project's documents and pipeline artifacts, search f
 How it behaves, and how to get the best from it:
 
 - **Edits are proposals.** Each is a diff recorded under `.blpl/proposals/` against the file version it was based on. Accept or reject it. If the file changed since, accepting is refused rather than merged, so the chat cannot overwrite an edit you were in the middle of.
-- **Approvals by kind.** Reads run automatically. Network access asks once per session. Anything that spends money or changes a board asks every time. Paths are checked against the project's sandbox before you are asked.
+- **Approvals per tool.** Each tool has its own rule, and most run without asking: reads, part searches, datasheet fetches, and datasheet extraction (which spends money on a vision model). Some ask once and are then allowed for the rest of the conversation, such as writing assembly files, running simulations, and routing or moving footprints on a board. A few ask every time, such as extracting a module, bulk autorouting, changing the board outline or adding a zone. Paths are checked against the project's sandbox before you are asked.
 - **Start with a diagram.** Describe the product; ask the chat to draw the block diagram and correct it before any table is written. It is faster to fix a diagram than a BOM.
 - **Let it cite datasheets.** Ask it to look the part up in the component library first (`library_lookup`), then fetch and extract the datasheet, then render the pinout with `pinout_section`. A pinout typed from memory is an approximation.
 - **Ask it to run doctor on its own draft.** The skill requires every Preflight error to be fixed and every warning explained before a document is proposed as finished.
