@@ -110,6 +110,7 @@ where and how.
 
 ## Documentation map
 
+- [User guide](docs/user-guide.md): start here to use BLPL, in the web app or on the command line
 - [Install](docs/install.md) — system requirements and setup
 - [Tutorial](docs/tutorial.md) — end-to-end on a 2-chip example
 - [Pipeline stages](docs/pipeline-stages.md) — one section per stage with inputs, outputs, and commands

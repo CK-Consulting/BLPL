@@ -105,7 +105,209 @@ There are two ways to drive it:
 
 ---
 
-<!-- UI-SECTIONS -->
+## Getting access
+
+You need three things from whoever runs the BLPL server:
+
+1. **The address**, usually `http://<host>:1800` (or `https://<host>:1443`).
+2. **An account.** Sign-in is Clerk: sign up with your email, or use the invitation link you were sent. An invitation link works once and expires after 24 hours; sign up with the same address it was sent to.
+3. **A model to use.** Either your own API key (Anthropic, OpenAI or an OpenAI-compatible service) or the address of a local model server (Ollama, or an OpenAI-compatible server that needs no key). There is no shared server key.
+
+If the page says "The server is not answering", the backend is down or still starting; that is not a sign-in problem and the page retries by itself. If you can sign in but then see "this server rejected the session", the server's configuration is wrong; tell the operator.
+
+---
+
+## First session in the web app
+
+### 1. Set up your account (once)
+
+After the first sign-in you see **"Two things before you start"**, then **Set up your account**. Everything on that page is required:
+
+- **Passphrase** (at least 10 characters, typed twice). This is not your sign-in password. It derives the key that encrypts your API keys and git credentials. **The server keeps no copy and cannot reset it.** Write it down somewhere safe. If you lose it, your stored keys are gone and you re-enter them; your projects are not lost.
+- **Provider, model, API key, base URL.** Pick the provider, paste the key (or the base URL of a local server), and choose a model from the suggestions. A "Need a key?" link takes you to the provider's sign-up page.
+
+Press **Finish setup**.
+
+### 2. Unlock (after every server restart)
+
+When the server restarts, your data is locked again and you see **Unlock your data**. Type the passphrase, or press **Unlock with a passkey**. Being signed in to Clerk and being unlocked are two different things: Clerk says who you are, the passphrase opens what only you can read. If this happens mid-session, the unlock screen appears on top of your work and nothing unsaved is lost.
+
+Tip: add a passkey (Touch ID, Windows Hello, or a recent security key) under **Settings > Data security** so you do not have to type the passphrase each time. A passkey is a second door to the same key; removing one never locks you out of your data.
+
+### 3. Create or open a project
+
+From the dashboard, press **+ Project**. Three ways in:
+
+| Mode | Use it when |
+|---|---|
+| **New** | Starting a design. Optionally give an empty remote repository URL and a token so the project is pushed off the server; **Test connection** checks it. "How do I set this up?" explains GitHub, GitLab and Gitea/Forgejo/Codeberg tokens. |
+| **Clone git remote** | The design already lives in git. Give the clone URL and branch. |
+| **Import files** | You have markdown (or a .zip of a project) on your machine. |
+
+For New and Clone you also set:
+
+- **Commit name and email** for this project ("Also use as my default" saves it for every project). Commits are refused until an identity is set.
+- **Push policy**: push automatically after every commit (recommended), or push manually. Manual means commits stay only on the server until you push.
+- **Library policy**: whether this project may contribute parts to your shared component library, and whether it may use parts from it without asking.
+
+### 4. Write or import the design, then run Preflight
+
+Open the **Preflight** tab. It reads your markdown and reports what the pipeline would lose. "Nothing blocking" plus "No findings" means the markdown parses exactly as written.
+
+### 5. Set the board up
+
+Open **Project settings** (the wrench next to the project name) > **Board**. Set the outline, stackup and net classes, and press **Save board config**. This writes `project.yaml`. The page predicts which `ZC-*` impedance findings Stage 8 will report, before you run anything.
+
+### 6. Run the pipeline
+
+In the left rail open **Pipeline**, choose **Pipeline**, from `stage0` to `stage8`, and press **Run pipeline**. Watch the progress bar and log. Then open **Board** to see the result and **Reports** to read the review.
+
+---
+
+## A tour of the web app
+
+### The layout
+
+On a wide screen the workspace has three panes:
+
+```
+┌────────────┬──────────────────────────────────────┬────────────┐
+│  Rail      │  Viewer tabs                         │  Chat      │
+│  Boards    │  Board | Preflight | View/Edit | BOM │            │
+│  Files     │  Lifecycle | Modules | Reports       │            │
+│  Pipeline  │  Release | Artifacts | Changes       │            │
+│  Runs      │                                      │            │
+└────────────┴──────────────────────────────────────┴────────────┘
+```
+
+- Drag the borders between panes to resize them; double-click a border to reset it. `«` / `»` collapses the rail. The chat icon in the header shows or hides the chat. These choices are remembered in your browser.
+- Tabs that do not fit fold into **More ▾**.
+- Above every tab, **Ask chat agent about this** puts a reference to what you are looking at into the chat box (it never sends by itself).
+- On a phone the app shows one pane at a time behind four bottom tabs: **Files**, **View**, **Chat**, **More**. Opening a file jumps to View; "Ask chat" jumps to Chat. Settings, sharing, new project and the KiCad link live under More.
+
+### Header
+
+| Control | What it does |
+|---|---|
+| `←` and logo | Back to all projects (asks first if you have unsaved edits). |
+| Project picker | Switch project. A `⚠` marks a project with a problem. |
+| Wrench | **Project settings**: Board, Task routing, Git, Library policy, Auto-lock. |
+| Active board (multi-board projects) | The board every tab and run is about. Next to it: **fabricable**, or **not fabricable** with the count of placeholder parts and emitter defects. |
+| **Open KiCad in New Tab** | A full KiCad desktop running on the server, for drawing a symbol or footprint the libraries do not have. It opens the current board. |
+| New project, Chat, Share, Settings | As named. On narrower screens they fold into `⋯`. |
+| Your avatar | Account menu and sign-out. |
+
+### The git strip
+
+Under the header, a strip shows the project's git state:
+
+| Badge | Meaning |
+|---|---|
+| `⎇ main` | Current branch. |
+| **uncommitted changes** | Files changed since the last commit, usually pipeline outputs or a dropped-in datasheet. (Editor saves and accepted chat edits commit themselves.) |
+| **N commits not pushed** | Saved on the server only. Pushing keeps a copy off the server. |
+| **N to pull** | Someone pushed to the remote. |
+| **no commit identity** | Commits are refused until you set a name and email (Project settings > Git, or Settings > Commit identity). |
+| **local only** | No remote. History lives on this server only. |
+| **push failed**, **remote needs fixing** | Hover for the reason. |
+
+**Pull** and **Commit + Push** do what they say; Commit asks for a message.
+
+### Rail: Files
+
+Files are grouped: Design, Diagrams, KiCad, Datasheets, References, Pipeline, Notes, Other, Quarantine.
+
+- **+ File** creates a `.md`, `.yaml` or `.yml` file (the types the workbench edits). **+ Folder** creates a folder. **+ Upload** opens the upload dialog.
+- Type in **Filter…** to search. **Show hidden** reveals dotfiles.
+- Keyboard: Enter opens, F2 renames, Delete deletes, arrows move, typing jumps. Drag to move. Right-click for Open, New file here, New folder here, Rename, Delete, and (on a symbol library) Remove a symbol.
+- Deleting asks first, and says whether the file is in git history (recoverable) or not (permanent).
+- A KiCad file opens in the KiCad tab, a PDF in the PDF viewer, text in View/Edit, anything else downloads.
+- The **LLM ignore** badge marks files the assistant will not read.
+
+**Upload** takes up to 20 files at a time. For each, choose a kind:
+
+| Kind | Lands in | Notes |
+|---|---|---|
+| Datasheet | `datasheets/` | Optionally give the MPN; the file is named after it. |
+| Reference | `references/` | |
+| KiCad symbol (`.kicad_sym`), footprint (`.kicad_mod`), 3D model (`.step`, `.wrl`), library bundle (`.zip`) | `libraries/` | Give the library name it belongs in. |
+
+PDFs are inspected before the browser will open them. A file that fails inspection is **held** in `retrieved/` (quarantine) rather than added.
+
+### Rail: Pipeline
+
+Three modes:
+
+- **Single stage**: pick one of `doctor`, `init`, `stage0-det` ... `stage8`, `stage6a`, and press **Run**.
+- **Pipeline**: pick **from** and **to**, and on a multi-board project the scope (one board, or all boards then the cross-board check). Press **Run pipeline**.
+- **Review panel**: run every reviewer routed to `review_panel` over the current board.
+
+While a run is going you see the current stage, what it does (tick **Explain the active stage** for more), a progress bar, and each stage as waiting, running, done, skipped, or with errors. **Stop** stops it. Runs are durable: closing the tab does not stop a run, and you can come back to it from Runs on any machine. Only one run per project at a time.
+
+The log has three levels: **Milestones** (stage headers, results, anything wrong), **Normal** (plus each stage's output), **Everything** (plus indented detail). It follows the end while you are scrolled to the bottom.
+
+A failed run offers **Ask chat agent about this run**.
+
+### Rail: Runs
+
+Every run, newest first, with board, start time, duration and status (`running`, `ok`, `stopped`, `exit N`). Click a row to replay its log; a running row follows live and can be stopped.
+
+### Viewer tabs
+
+| Tab | Shows | Key actions |
+|---|---|---|
+| **Board** | The emitted board (schematic, PCB and 3D) in the built-in viewer. Chat replies that name a part or net highlight it. | If Stage 6 has no current output, an archived board is shown with a banner. |
+| **Preflight** | The doctor report: what Stage 0 sees (tables used, tables discarded), findings grouped by code with file, line and fix. On multi-board projects, also "Where the boards meet". | Fix each error in the markdown, then check the tab again. |
+| **KiCad** | A `.kicad_sch` or `.kicad_pcb` you opened from the file tree. | **Open the raw file**. |
+| **View/Edit** | Text files rendered (Markdown with math and diagrams, JSON, YAML, code). | **Source** shows line numbers, matching what doctor cites. **Edit** and **Save** (Ctrl/⌘+S) for design documents (`.md`, `.yaml`, `.mmd`). Others are read-only. |
+| **BOM** | `bom.json`: Ref, MPN, manufacturer, package, pins, symbol and footprint hints, Stage 1 confidence. | Filter. **Export BOM to CSV** (every part). **Export BOM for purchasing / quotes** for N **Boards** (MPN, MFG, QTY, attrition, order quantity; bought parts only). |
+| **Lifecycle** | Each part's lifecycle status from distributor data, and your own finding. | **edit** a row: what you found, when, a reference someone else can check, notes. **Acknowledge** accepts a part whose lifecycle could not be established. A finding without a reference is not counted. |
+| **Modules** | Modules available to this project, with their ports. | Ask the chat to read a KiCad design and plan an extraction. |
+| **Reports** | Fab banner, Stage 7 pills (KLC, ERC, DRC, coverage), simulation, Stage 8 findings by provenance, and the review panel. | Expand a design-issue group to read it. |
+| **Release** | The release builder and the latest package. | **Build release package**, **Look up LCSC part numbers**, **Download latest.zip**. |
+| **Artifacts** | Every file in `.pipeline/`, with a readable view for the main ones (design artifact, nets with a filter, coverage). | Files over 1.5 MB open raw. |
+| **Changes** | Everything changed since the last commit, as diffs. | Click a file to expand it. |
+
+Mermaid diagrams (in files and in chat) can be panned by dragging and zoomed with Ctrl/⌘ + scroll, `−`, `+` and **Fit**.
+
+### Chat
+
+- **Model picker**: which endpoint answers this turn ("routed" uses your task routing). Not saved.
+- **Session ▾**: switch conversation, start a **New session**, show archived ones, archive this one (kept, not deleted), and set message order.
+- **Composer**: Enter sends, Shift+Enter is a new line. Paste, drop or use **+** to attach PNG, JPEG, GIF, WebP images or PDFs. Drag the grip above the box to resize it.
+- **Slash commands** (type `/` in an empty box): `/files`, `/read`, `/artifact`, `/fab`, `/sourcing`, `/modules`, `/part`, `/datasheet`, `/review`. Each inserts editable text; nothing sends until you press Send.
+- **While an answer is streaming**: keep typing and press **Queue**; queued messages send one per answer when it finishes cleanly. If the answer fails or you stop it, the queue is held with the reason, and you choose **Send now** or **Discard**. **Stop** cancels the answer.
+- **Approval cards**: **Allow** or **Deny** a tool call (network access, spending money, changing a board).
+- **Proposal cards**: a diff with **Accept** or **Reject**. Accepting writes and commits the file.
+- **Lost answers**: if the provider was busy or an answer was lost, a banner offers **Ask again**. A message that was never answered is marked and not sent with later messages; you can remove it.
+- Long conversations are summarised to fit the model's context; the files and git history are untouched.
+
+### Project settings (wrench)
+
+| Tab | What you set |
+|---|---|
+| **Board** | Outline (rectangle, circle, polygon, trapezoid) with a live preview, cutouts and keepouts (optionally following a part), stackup, net classes with optional controlled impedance, impedance tags, test points on controlled nets. Saves `project.yaml`; re-run Stage 5 afterwards. |
+| **Task routing** | Per-project overrides of which endpoint handles chat, stage0, stage1, vision and the review panel. |
+| **Git** | Remote, your token for its host, commit identity, push policy. |
+| **Library policy** | Contribute to and consume from your component library. |
+| **Auto-lock** | Minutes idle before the project is sealed (5 to 1440). |
+
+### Account and app settings (cog)
+
+| Tab | What you set |
+|---|---|
+| **AI model providers/endpoints** | Add named endpoints (kind, model, key or base URL, whether it reads images). **list models** asks the endpoint what it offers. Capability chips show what each model can do (vision, tools, thinking). |
+| **Task routing** | Your default endpoint order per task. The first is tried first; later ones are fallbacks. `review_panel` runs all of them. A task that needs vision skips endpoints that cannot see. |
+| **Git endpoints/accounts** | Saved tokens or SSH keys per git host, with presets for GitHub, GitLab and others. |
+| **Commit identity** | Your default commit name and email. |
+| **Data security** | Passkeys: add one per device, remove with `×`. |
+| **Admin: Network access** | (Administrators only.) Which hosts pipeline runs may reach. |
+
+### Sharing
+
+**Share** (header) lists who can open the project. The owner can invite by sign-in email; someone without an account gets a one-time link valid for 24 hours, sent only after you type the address twice. Pending invitations can be withdrawn and members removed. Invitations to you appear on the dashboard and in a banner, with **Accept** and **Decline**.
+
+---
 
 ## Writing design markdown that the pipeline reads
 
