@@ -116,12 +116,15 @@ export function Sharing({ projectId }: { projectId: string }) {
             type="email"
             autoFocus
             placeholder="type the email address again"
+            aria-label="Confirm email address"
+            title="Type the address again, so a typo does not send a working link to a stranger"
             value={confirmEmail}
             onChange={(e) => setConfirmEmail(e.target.value)}
           />
           <button
             type="submit"
             disabled={busy || confirmEmail.trim().toLowerCase() !== needsAccount}
+            title="Email a one-time link, valid for 24 hours"
           >
             {busy ? "Sending…" : "Send invitation"}
           </button>
@@ -132,7 +135,7 @@ export function Sharing({ projectId }: { projectId: string }) {
           </div>
         )}
         {error && <div className="gate-error">{error}</div>}
-        <button className="link" onClick={() => setNeedsAccount(null)}>
+        <button className="link" title="Back to the member list without sending anything" onClick={() => setNeedsAccount(null)}>
           ← Back
         </button>
       </section>
@@ -159,7 +162,11 @@ export function Sharing({ projectId }: { projectId: string }) {
                 has nobody who can share it, delete it, or grant access, so the
                 server refuses it and offering the button would only mislead. */}
             {data.owned_by_me && m.role !== "owner" && (
-              <button className="link" onClick={() => remove(m.id)}>
+              <button
+                className="link"
+                title="Stop their future access. It cannot take back what they have already seen."
+                onClick={() => remove(m.id)}
+              >
                 Remove
               </button>
             )}
@@ -177,7 +184,7 @@ export function Sharing({ projectId }: { projectId: string }) {
                 <span className="chip">pending</span>
                 <span className="spacer" />
                 {data.owned_by_me && (
-                  <button className="link" onClick={() => revoke(inv.id)}>
+                  <button className="link" title="Cancel the invitation; the link stops working" onClick={() => revoke(inv.id)}>
                     Withdraw
                   </button>
                 )}
@@ -192,10 +199,12 @@ export function Sharing({ projectId }: { projectId: string }) {
           <input
             type="email"
             placeholder="their sign-in email"
+            aria-label="Their sign-in email"
+            title="The address they sign in with. With no account here yet, you get a 24-hour invitation link instead."
             value={email}
             onChange={(e) => setEmail(e.target.value)}
           />
-          <button type="submit" disabled={busy || !email}>
+          <button type="submit" disabled={busy || !email} title="Give this person access to the project">
             {busy ? "…" : "Share"}
           </button>
         </form>

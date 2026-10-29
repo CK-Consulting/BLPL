@@ -218,7 +218,7 @@ function size(bytes?: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-type MenuItem = { label: string; run: () => void; danger?: boolean };
+type MenuItem = { label: string; run: () => void; danger?: boolean; hint?: string };
 type MenuState = { item: Item; x: number; y: number };
 /** Each dialog carries the project it was opened for, and acts on that one or
  *  on none: clearing it when the project changes is an effect, which runs a
@@ -477,15 +477,17 @@ export function FileTree({
   const menuItems = (item: Item): MenuItem[] => {
     const out: MenuItem[] = [];
     const n = item.node;
-    if (item.kind === "file" && n) out.push({ label: "Open", run: () => onOpen(n) });
+    if (item.kind === "file" && n) out.push({ label: "Open", run: () => onOpen(n), hint: "Open this file in the viewer" });
     if (!locked(item.dir)) {
       out.push({
         label: "New file here…",
         run: () => setDialog({ kind: "new-file", dir: item.dir, project: projectId }),
+        hint: "New .md, .yaml or .yml file in this folder",
       });
       out.push({
         label: "New folder here…",
         run: () => setDialog({ kind: "new-folder", dir: item.dir, project: projectId }),
+        hint: "New folder inside this one",
       });
     }
     const library = item.kind === "file" ? symbolLibraryOf(item.path) : null;
@@ -495,11 +497,17 @@ export function FileTree({
         label: "Remove a symbol…",
         run: () => setDialog({ kind: "remove-symbol", library, project: projectId }),
         danger: true,
+        hint: "Remove one symbol from this library. Boards that use it lose it at their next Stage 5.",
       });
     }
     if (item.kind !== "group" && !locked(item.path)) {
-      out.push({ label: "Rename", run: () => void treeRef.current?.edit(item.id) });
-      out.push({ label: "Delete…", run: () => askDelete(item), danger: true });
+      out.push({ label: "Rename", run: () => void treeRef.current?.edit(item.id), hint: "Rename in place (F2)" });
+      out.push({
+        label: "Delete…",
+        run: () => askDelete(item),
+        danger: true,
+        hint: "Delete and commit the delete. A file not yet in git cannot be recovered.",
+      });
     }
     return out;
   };
@@ -536,13 +544,25 @@ export function FileTree({
   return (
     <div className="file-tree">
       <div className="tree-actions">
-        <button className="link" onClick={() => setDialog({ kind: "new-file", dir: "", project: projectId })}>
+        <button
+          className="link"
+          title="New .md, .yaml or .yml file: the types the workbench edits"
+          onClick={() => setDialog({ kind: "new-file", dir: "", project: projectId })}
+        >
           + File
         </button>
-        <button className="link" onClick={() => setDialog({ kind: "new-folder", dir: "", project: projectId })}>
+        <button
+          className="link"
+          title="New folder in the project"
+          onClick={() => setDialog({ kind: "new-folder", dir: "", project: projectId })}
+        >
           + Folder
         </button>
-        <button className="link" onClick={() => setUploading(projectId)}>
+        <button
+          className="link"
+          title="Add datasheets, references or KiCad library files, up to 20 at a time"
+          onClick={() => setUploading(projectId)}
+        >
           + Upload
         </button>
       </div>
@@ -630,7 +650,7 @@ export function FileTree({
         </div>
       </RowContext.Provider>
       {hiddenCount > 0 && (
-        <label className="tree-hidden-toggle">
+        <label className="tree-hidden-toggle" title="Show dotfiles and folders such as .blpl and .pipeline">
           <input
             type="checkbox"
             checked={showHidden}
@@ -921,6 +941,7 @@ function ContextMenu({
           key={i.label}
           role="menuitem"
           className={i.danger ? "danger" : ""}
+          title={i.hint}
           onClick={() => {
             onClose();
             i.run();

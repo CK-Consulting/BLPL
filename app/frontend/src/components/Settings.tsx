@@ -32,15 +32,15 @@ type SectionId = "endpoints" | "routing" | "git" | "identity" | "security" | "ad
 // security" rather than "Passkeys" because you go looking for where the lock
 // lives, and "AI model providers/endpoints" because "Endpoints" alone stopped
 // meaning one thing the day git endpoints arrived.
-const SECTIONS: { id: SectionId; label: string }[] = [
-  { id: "endpoints", label: "AI model providers/endpoints" },
-  { id: "routing", label: "Task routing" },
-  { id: "git", label: "Git endpoints/accounts" },
-  { id: "identity", label: "Commit identity" },
-  { id: "security", label: "Data security" },
+const SECTIONS: { id: SectionId; label: string; hint?: string }[] = [
+  { id: "endpoints", label: "AI model providers/endpoints", hint: "Named model connections, with their keys" },
+  { id: "routing", label: "Task routing", hint: "Which endpoints handle each task, in order of preference" },
+  { id: "git", label: "Git endpoints/accounts", hint: "Saved tokens and SSH keys for your git hosts" },
+  { id: "identity", label: "Commit identity", hint: "The name and email your commits carry by default" },
+  { id: "security", label: "Data security", hint: "Passkeys that unlock your data instead of the passphrase" },
 ];
 
-const ADMIN_SECTION: { id: SectionId; label: string } = {
+const ADMIN_SECTION: { id: SectionId; label: string; hint?: string } = {
   id: "admin",
   label: "Admin — Network access",
 };
@@ -78,6 +78,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
                 key={s.id}
                 className={tab === s.id ? "on" : ""}
                 onClick={() => setTab(s.id)}
+                title={s.hint}
               >
                 {s.label}
               </button>
@@ -227,7 +228,7 @@ function Endpoints({
           }}
         />
       ) : (
-        <button className="link" onClick={() => setAdding(true)}>
+        <button className="link" onClick={() => setAdding(true)} title="Add a named model connection; tasks are routed to endpoints by name">
           + Endpoint
         </button>
       )}
@@ -311,6 +312,7 @@ function EndpointRow({
         </span>
         {models.length ? (
           <select
+            title="The model this endpoint uses"
             value={models.includes(endpoint.model) ? endpoint.model : ""}
             onChange={(e) => onModel(endpoint.name, e.target.value)}
           >
@@ -330,7 +332,7 @@ function EndpointRow({
         ) : (
           <span className="muted mono small">{endpoint.model}</span>
         )}
-        <button className="link" onClick={listModels} disabled={probing}>
+        <button className="link" onClick={listModels} disabled={probing} title="Ask this endpoint which models it offers">
           {probing ? "asking…" : models.length ? "refresh" : "list models"}
         </button>
         <label className="muted small" title="whether this endpoint's model can read images and PDF pages">
@@ -342,7 +344,11 @@ function EndpointRow({
           reads images
         </label>
         <span className="spacer" />
-        <button className="link" onClick={onRemove}>
+        <button
+          className="link"
+          onClick={onRemove}
+          title="Remove this endpoint and its stored key. Tasks routed only to it will need another."
+        >
           Remove
         </button>
       </div>
@@ -388,10 +394,12 @@ function EndpointRow({
           <input
             type="password"
             placeholder={keyedAt ? `key set ${keyedAt} — replace` : "paste your API key"}
+            aria-label={`API key for ${endpoint.name}`}
+            title="Stored encrypted under your passphrase; never shown again"
             value={value}
             onChange={(e) => setValue(e.target.value)}
           />
-          <button disabled={busy || !value} onClick={setKey}>
+          <button disabled={busy || !value} onClick={setKey} title="Save this key for the endpoint">
             {keyedAt ? "Replace" : "Set"}
           </button>
           {keyedAt && <span className="badge ok">set</span>}
@@ -471,8 +479,19 @@ function NewEndpoint({
   return (
     <div className="endpoint-row new">
       <div className="row wrap">
-        <input placeholder="name (e.g. local-qwen)" value={name} onChange={(e) => setName(e.target.value)} />
-        <select value={kind} onChange={(e) => setKind(e.target.value)}>
+        <input
+          placeholder="name (e.g. local-qwen)"
+          aria-label="Endpoint name"
+          title="A name of your choosing; task routing refers to it"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+        <select
+          value={kind}
+          onChange={(e) => setKind(e.target.value)}
+          aria-label="Endpoint kind"
+          title="The API this endpoint speaks"
+        >
           {kinds.map((k) => (
             <option key={k} value={k}>
               {k}
@@ -480,7 +499,7 @@ function NewEndpoint({
           ))}
         </select>
         {models.length ? (
-          <select value={model} onChange={(e) => setModel(e.target.value)}>
+          <select value={model} onChange={(e) => setModel(e.target.value)} aria-label="Model" title="The model this endpoint uses">
             <option value="">choose a model…</option>
             {models.map((m) => (
               <option key={m} value={m}>
@@ -489,9 +508,20 @@ function NewEndpoint({
             ))}
           </select>
         ) : (
-          <input placeholder="model" value={model} onChange={(e) => setModel(e.target.value)} />
+          <input
+            placeholder="model"
+            aria-label="Model"
+            title="A model id the endpoint offers; list models fills this in"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+          />
         )}
-        <button className="link" onClick={probe} disabled={probing || (compatible && !baseUrl)}>
+        <button
+          className="link"
+          onClick={probe}
+          disabled={probing || (compatible && !baseUrl)}
+          title={compatible && !baseUrl ? "Give the base URL first" : "Ask the endpoint which models it offers"}
+        >
           {probing ? "asking…" : models.length ? "refresh list" : "list models"}
         </button>
       </div>
@@ -501,6 +531,7 @@ function NewEndpoint({
           <input
             type="password"
             placeholder="API key — needed to list models, and saved with the endpoint"
+            aria-label="API key"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
           />
@@ -514,20 +545,26 @@ function NewEndpoint({
                 ? "base URL (required, e.g. http://127.0.0.1:8080/v1)"
                 : "base URL — leave blank to use OLLAMA_HOST (http://ollama:11434)"
             }
+            aria-label="Base URL"
             value={baseUrl}
             onChange={(e) => setBaseUrl(e.target.value)}
           />
           {keyless ? (
             <span className="muted small">no key — Ollama does not authenticate</span>
           ) : (
-            <select value={auth} onChange={(e) => setAuth(e.target.value)}>
+            <select
+              value={auth}
+              onChange={(e) => setAuth(e.target.value)}
+              aria-label="Authentication"
+              title="Whether this server wants an API key"
+            >
               <option value="vault">needs a key</option>
               <option value="none">no auth</option>
             </select>
           )}
         </div>
       )}
-      <label className="muted small">
+      <label className="muted small" title="Tasks that read images or scanned PDFs skip endpoints that cannot">
         <input type="checkbox" checked={vision} onChange={(e) => setVision(e.target.checked)} /> can read
         images and PDF pages
       </label>
@@ -535,6 +572,7 @@ function NewEndpoint({
       <div className="row">
         <button
           disabled={!ok}
+          title={ok ? "Save this endpoint" : "Give it a unique name, a model, and whatever key or URL its kind needs"}
           onClick={() =>
             onAdd(
               {
@@ -727,7 +765,7 @@ function Routing({
               )}
             </div>
             {stored && (
-              <button className="link" onClick={() => reset(task)}>
+              <button className="link" onClick={() => reset(task)} title="Restore this task's endpoint order to the default">
                 reset to default
               </button>
             )}
@@ -827,10 +865,16 @@ function Passkeys({ onError }: { onError: (msg: string | null) => void }) {
       <div className="row">
         <input
           placeholder="Name this device (optional)"
+          aria-label="Passkey name"
+          title="A label for this passkey, so you can tell devices apart when removing one"
           value={label}
           onChange={(e) => setLabel(e.target.value)}
         />
-        <button disabled={busy} onClick={add}>
+        <button
+          disabled={busy}
+          onClick={add}
+          title="Unlock with Touch ID, Windows Hello or a security key; a second way in if you forget your passphrase"
+        >
           {busy ? "Waiting for your key…" : "Add a passkey"}
         </button>
       </div>
@@ -933,6 +977,7 @@ function GitEndpoints({ onError }: { onError: (m: string) => void }) {
                 <td>
                   <button
                     className="link"
+                    title="Remove this saved credential; pushes to its host need another"
                     onClick={() =>
                       del(`/api/settings/git/${encodeURIComponent(e.name)}`).then(refresh)
                     }
@@ -948,21 +993,32 @@ function GitEndpoints({ onError }: { onError: (m: string) => void }) {
       <h4>Add an endpoint</h4>
       <div className="row">
         {data.presets.map((p) => (
-          <button key={p.name} className="link" onClick={() => preset(p)}>
+          <button key={p.name} className="link" onClick={() => preset(p)} title="Fill in the host for this service">
             {p.name === "github" ? "GitHub" : p.name === "gitlab" ? "GitLab" : p.name}
           </button>
         ))}
         <span className="muted">— or define your own below</span>
       </div>
-      <input placeholder="name (e.g. github, work-gitlab)" value={name} onChange={(e) => setName(e.target.value)} />
-      <input placeholder="host, :port if not the default (e.g. github.com)" value={host} onChange={(e) => setHost(e.target.value)} />
-      <select value={method} onChange={(e) => setMethod(e.target.value)}>
+      <input
+        placeholder="name (e.g. github, work-gitlab)"
+        aria-label="Git endpoint name"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+      />
+      <input
+        placeholder="host, :port if not the default (e.g. github.com)"
+        aria-label="Git host"
+        value={host}
+        onChange={(e) => setHost(e.target.value)}
+      />
+      <select value={method} onChange={(e) => setMethod(e.target.value)} aria-label="Authentication method">
         <option value="https_token">HTTPS with access token</option>
         <option value="ssh_key">SSH with private key</option>
       </select>
       {method === "https_token" && (
         <input
           placeholder="username the token belongs to (GitLab tokens use oauth2)"
+          aria-label="Token username"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
         />
@@ -971,6 +1027,7 @@ function GitEndpoints({ onError }: { onError: (m: string) => void }) {
         <input
           type="password"
           placeholder="access token"
+          aria-label="Access token"
           value={secret}
           onChange={(e) => setSecret(e.target.value)}
         />
@@ -978,11 +1035,16 @@ function GitEndpoints({ onError }: { onError: (m: string) => void }) {
         <textarea
           placeholder="private key (PEM/OpenSSH). Use a deploy key scoped to the repositories this server should reach."
           rows={5}
+          aria-label="Private key"
           value={secret}
           onChange={(e) => setSecret(e.target.value)}
         />
       )}
-      <button onClick={save} disabled={busy || !name || !host || !secret}>
+      <button
+        onClick={save}
+        disabled={busy || !name || !host || !secret}
+        title="Stored encrypted under your passphrase"
+      >
         {busy ? "…" : "Save endpoint"}
       </button>
     </section>

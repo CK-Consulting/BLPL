@@ -96,7 +96,13 @@ export function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
             burying the recovery path. */}
         {hasPasskey && (
           <>
-            <button type="button" className="gate-passkey" disabled={busy} onClick={() => void withPasskey()}>
+            <button
+              type="button"
+              className="gate-passkey"
+              disabled={busy}
+              onClick={() => void withPasskey()}
+              title="Use the passkey you added on this device: Touch ID, Windows Hello or a security key"
+            >
               🔑 Unlock with a passkey
             </button>
             <div className="gate-or">or</div>
@@ -106,11 +112,17 @@ export function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
           type="password"
           autoFocus={!hasPasskey}
           placeholder="Encryption passphrase"
+          aria-label="Encryption passphrase"
+          title="The passphrase you chose at setup, not your sign-in password"
           value={passphrase}
           onChange={(e) => setPassphrase(e.target.value)}
         />
         {error && <div className="gate-error">{error}</div>}
-        <button type="submit" disabled={busy || !passphrase}>
+        <button
+          type="submit"
+          disabled={busy || !passphrase}
+          title={passphrase ? "Unlock your data for this session" : "Type your passphrase first"}
+        >
           {busy ? "…" : "Unlock"}
         </button>
         <div className="gate-hint">

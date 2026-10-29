@@ -95,6 +95,7 @@ export function ProjectRoutingPanel({ projectId }: { projectId: string }) {
                 <td>
                   <select
                     aria-label={`${task} override`}
+                    title={`Which endpoint handles ${task} in this project. "use account default" follows your Settings.`}
                     value={overridden ? over[0] : ""}
                     onChange={(e) => {
                       const next = { ...draft };
@@ -121,7 +122,7 @@ export function ProjectRoutingPanel({ projectId }: { projectId: string }) {
       </table>
       {note && <p className="muted small">{note}</p>}
       <div className="field-row">
-        <button className="btn" onClick={save} disabled={busy}>
+        <button className="btn" onClick={save} disabled={busy} title="Applies to runs and chats started from now on, in this project">
           {busy ? "Saving…" : "Save routing"}
         </button>
       </div>

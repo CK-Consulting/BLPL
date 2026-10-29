@@ -95,16 +95,28 @@ export function ReleasePanel({
   return (
     <div className="release">
       <div className="row">
-        <button onClick={build} disabled={running}>
+        <button
+          onClick={build}
+          disabled={running}
+          title="Run the fab gate over the Stage 8 analysis, then export gerbers, drill, placement, BOMs and the KiCad project into one zip"
+        >
           {running ? "Building…" : "Build release package"}
         </button>
-        {running && <button onClick={stop}>Stop</button>}
+        {running && (
+          <button onClick={stop} title="Stop the build on the server">
+            Stop
+          </button>
+        )}
         <label title="Fill the assembly BOM's LCSC column from JLCPCB's catalogue, for an order assembled there">
           <input type="checkbox" checked={lcsc} disabled={running} onChange={(e) => setLcsc(e.target.checked)} />{" "}
           Look up LCSC part numbers
         </label>
         {manifest?.exists && (
-          <a className="link" href={withBoard(`/api/projects/${projectId}/release/latest.zip`, board)}>
+          <a
+            className="link"
+            href={withBoard(`/api/projects/${projectId}/release/latest.zip`, board)}
+            title="The newest package for this board. If the gate refused it, READ-ME-FIRST.txt inside says why."
+          >
             Download latest.zip
           </a>
         )}

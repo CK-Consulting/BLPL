@@ -311,11 +311,22 @@ export function UnsavedChangesDialog({
                   onClose();
                 }}
                 disabled={busy}
+                title={
+                  saving
+                    ? "Go on without waiting to learn whether the save worked"
+                    : "Throw away the edits in the open file and continue"
+                }
               >
                 {saving ? "Leave anyway" : "Discard"}
               </button>
               {!saving && (
-                <button type="button" className="primary" onClick={() => void save()} disabled={busy}>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => void save()}
+                  disabled={busy}
+                  title="Save and commit the open file, then continue"
+                >
                   Save
                 </button>
               )}
@@ -412,7 +423,13 @@ export function RemoveSymbolDialog({
               <button type="button" onClick={onClose} disabled={busy}>
                 Cancel
               </button>
-              <button type="button" className="danger" onClick={() => void run()} disabled={busy || !chosen}>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => void run()}
+                disabled={busy || !chosen}
+                title={chosen ? "Remove this symbol and commit the change" : "Choose a symbol first"}
+              >
                 Remove
               </button>
             </div>

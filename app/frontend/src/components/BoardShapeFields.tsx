@@ -164,6 +164,7 @@ export function ShapeFields({
                 className="btn"
                 type="button"
                 aria-label={`${prefix} remove point ${i + 1}`}
+                title="Remove this corner"
                 onClick={() => setPts(pts.filter((_, k) => k !== i))}
               >
                 Remove
@@ -174,6 +175,7 @@ export function ShapeFields({
             <button
               className="btn"
               type="button"
+              title="Add a corner midway along the closing edge"
               onClick={() => {
                 // A new point midway along the closing edge, so the polygon
                 // stays simple rather than doubling back on itself.

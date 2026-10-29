@@ -89,7 +89,13 @@ export function BomTable({
   return (
     <div className="bom">
       <div className="bom-bar">
-        <input placeholder="Filter parts…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <input
+          placeholder="Filter parts…"
+          aria-label="Filter parts"
+          title="Filter by ref, MPN, manufacturer or package"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
         <span className="muted">{rows.length} of {bom.rows.length} parts</span>
         <span className="bom-exports">
           <button type="button" disabled={exporting !== null} onClick={() => exportCsv("all")}

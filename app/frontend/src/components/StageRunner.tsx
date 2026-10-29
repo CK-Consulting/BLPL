@@ -155,13 +155,28 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
         </div>
       )}
       <div className="seg">
-        <button className={mode === "single" ? "on" : ""} disabled={running} onClick={() => setMode("single")}>
+        <button
+          className={mode === "single" ? "on" : ""}
+          disabled={running}
+          onClick={() => setMode("single")}
+          title="Run one stage and inspect its artifact. Best for narrowing down a problem."
+        >
           Single stage
         </button>
-        <button className={mode === "pipeline" ? "on" : ""} disabled={running} onClick={() => setMode("pipeline")}>
+        <button
+          className={mode === "pipeline" ? "on" : ""}
+          disabled={running}
+          onClick={() => setMode("pipeline")}
+          title="Run a range of stages in order"
+        >
           Pipeline
         </button>
-        <button className={mode === "panel" ? "on" : ""} disabled={running} onClick={() => setMode("panel")}>
+        <button
+          className={mode === "panel" ? "on" : ""}
+          disabled={running}
+          onClick={() => setMode("panel")}
+          title="Every endpoint routed to review_panel reviews the board. Uses your model quota."
+        >
           Review panel
         </button>
       </div>
@@ -174,19 +189,29 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
             finding only one of them raised is kept and labelled — never dropped.
           </p>
           <div className="row">
-            <button onClick={run} disabled={running}>{running ? "Reviewing…" : "Run panel"}</button>
-            {running && <button onClick={stop}>Stop</button>}
+            <button onClick={run} disabled={running} title={running ? "A run is already going on this project. Stop it or wait." : "Run every reviewer over the current board"}>
+              {running ? "Reviewing…" : "Run panel"}
+            </button>
+            {running && <button onClick={stop} title="Stop the run on the server">Stop</button>}
           </div>
         </div>
       ) : mode === "single" ? (
         <div className="row">
-          <select value={stage} onChange={(e) => setStage(e.target.value)} disabled={running}>
+          <select
+            value={stage}
+            onChange={(e) => setStage(e.target.value)}
+            disabled={running}
+            aria-label="Stage"
+            title="Which stage to run. Start with doctor after any markdown edit."
+          >
             {STAGES.map((s) => (
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
-          <button onClick={run} disabled={running}>{running ? "Running…" : "Run"}</button>
-          {running && <button onClick={stop}>Stop</button>}
+          <button onClick={run} disabled={running} title={running ? "A run is already going on this project. Stop it or wait." : `Run ${stage} on its own`}>
+            {running ? "Running…" : "Run"}
+          </button>
+          {running && <button onClick={stop} title="Stop the run on the server">Stop</button>}
         </div>
       ) : (
         <div className="panel">
@@ -215,6 +240,8 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
                 value={scope}
                 onChange={(e) => setScope(e.target.value as "board" | "all")}
                 disabled={running}
+                aria-label="Boards to run"
+                title="One board, or every board in turn followed by the cross-board check"
               >
                 <option value="board">{board}</option>
                 <option value="all">all boards, then cross-board check</option>
@@ -222,19 +249,33 @@ export function StageRunner({ projectId, board, onFinished }: Props) {
             </>
           )}
           <label className="muted">from</label>
-          <select value={from} onChange={(e) => setFrom(e.target.value)} disabled={running}>
+          <select
+            value={from}
+            onChange={(e) => setFrom(e.target.value)}
+            disabled={running}
+            aria-label="From stage"
+            title="First stage of the run; stage0 to stage8 is the whole pipeline"
+          >
             {PIPELINE_STAGES.map((s) => (
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
           <label className="muted">to</label>
-          <select value={to} onChange={(e) => setTo(e.target.value)} disabled={running}>
+          <select
+            value={to}
+            onChange={(e) => setTo(e.target.value)}
+            disabled={running}
+            aria-label="To stage"
+            title="Last stage of the run"
+          >
             {PIPELINE_STAGES.map((s) => (
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
-          <button onClick={run} disabled={running}>{running ? "Running…" : "Run pipeline"}</button>
-          {running && <button onClick={stop}>Stop</button>}
+          <button onClick={run} disabled={running} title={running ? "A run is already going on this project. Stop it or wait." : `Run ${from} to ${to}`}>
+            {running ? "Running…" : "Run pipeline"}
+          </button>
+          {running && <button onClick={stop} title="Stop the run on the server">Stop</button>}
         </div>
         </div>
       )}

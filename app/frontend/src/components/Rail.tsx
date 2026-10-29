@@ -40,7 +40,12 @@ export function Section({
   };
   return (
     <div className={open ? "rail-section open" : "rail-section"}>
-      <button className="rail-head" onClick={toggle} aria-expanded={open}>
+      <button
+        className="rail-head"
+        onClick={toggle}
+        aria-expanded={open}
+        title={open ? "Hide this section; a hidden section stops refreshing" : "Show this section"}
+      >
         <span className="rail-caret">{open ? "▾" : "▸"}</span>
         <span className="rail-title">{title}</span>
         <span className="spacer" />

@@ -386,7 +386,11 @@ function IssueGroup({ rule, items }: { rule: string; items: Finding[] }) {
   const worst = items.reduce<Sev>((w, f) => (rank(f.severity) < rank(w) ? f.severity : w), "info");
   return (
     <div className="issue-group">
-      <button className="issue-head" onClick={() => setOpen((o) => !o)}>
+      <button
+        className="issue-head"
+        onClick={() => setOpen((o) => !o)}
+        title={open ? "Hide these findings" : `Show all ${items.length} findings for ${rule}, with where and why`}
+      >
         <span className={`sev ${worst}`} />
         <code>{rule}</code>
         <span className="issue-count">{items.length}</span>

@@ -124,6 +124,7 @@ export function SlashPopover({
         <button
           key={c.name}
           className={i === active % list.length ? "on" : ""}
+          title={`Insert /${c.name}; you can edit it before sending`}
           // mousedown, not click: the textarea must not lose focus first, or
           // the composer's blur handling closes this before the click lands.
           onMouseDown={(e) => {

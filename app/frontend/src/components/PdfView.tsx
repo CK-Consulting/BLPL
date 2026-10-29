@@ -126,12 +126,21 @@ function Body({
   onInspect: () => void;
 }) {
   const download = (label: string) => (
-    <a className="link" href={href} download>
+    <a
+      className="link"
+      href={href}
+      download
+      title={
+        label === "Download"
+          ? "Save the file to your computer"
+          : "Save the file without opening it here. Open it only if you trust where it came from."
+      }
+    >
       {label}
     </a>
   );
   const inspectButton = (label: string) => (
-    <button onClick={onInspect} disabled={busy}>
+    <button onClick={onInspect} disabled={busy} title="Check the PDF for anything that acts when it is opened">
       {busy ? "Inspecting…" : label}
     </button>
   );
@@ -152,7 +161,7 @@ function Body({
           {v.scanner ? `, and the ${v.scanner} scanner passed them` : ""}.
         </p>
         <p>
-          <a className="link" href={href} target="_blank" rel="noreferrer">
+          <a className="link" href={href} target="_blank" rel="noreferrer" title="Open in a new tab">
             Open PDF
           </a>
         </p>

@@ -91,8 +91,14 @@ export function LifecycleTable({
   return (
     <div className="bom">
       <div className="bom-bar">
-        <input placeholder="Filter parts…" value={q} onChange={(e) => setQ(e.target.value)} />
-        <label className="small">
+        <input
+          placeholder="Filter parts…"
+          aria-label="Filter parts"
+          title="Filter by MPN or ref"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
+        <label className="small" title="Show only parts whose lifecycle could not be established and that nobody has accepted">
           <input
             type="checkbox"
             checked={onlyWork}
@@ -151,7 +157,11 @@ export function LifecycleTable({
                     {r.Acknowledged || (r["Ack?"] === "YES" ? <b>required</b> : "")}
                   </td>
                   <td>
-                    <button className="small" onClick={() => setOpen(editing ? null : r.MPN)}>
+                    <button
+                      className="small"
+                      onClick={() => setOpen(editing ? null : r.MPN)}
+                      title={editing ? "Close without saving" : "Record what you found for this part"}
+                    >
                       {editing ? "cancel" : "edit"}
                     </button>
                   </td>
@@ -213,12 +223,18 @@ function RowForm({
       </label>
       <label>
         Checked on
-        <input type="date" value={checked} onChange={(e) => setChecked(e.target.value)} />
+        <input
+          type="date"
+          value={checked}
+          onChange={(e) => setChecked(e.target.value)}
+          title="When you checked the part's status"
+        />
       </label>
       <label>
         Reference
         <input
           placeholder="URL or document someone else can check"
+          title="Without a reference, the finding is not counted"
           value={reference}
           onChange={(e) => setReference(e.target.value)}
         />
@@ -253,6 +269,7 @@ function RowForm({
               notes,
             })
           }
+          title="Save your finding for this part"
         >
           {busy ? "Saving…" : "Save"}
         </button>
@@ -265,7 +282,7 @@ function RowForm({
             Acknowledge
           </button>
         )}
-        <button disabled={busy} onClick={onCancel}>
+        <button disabled={busy} onClick={onCancel} title="Close without saving">
           Cancel
         </button>
       </div>
