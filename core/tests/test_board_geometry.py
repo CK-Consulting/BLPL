@@ -61,8 +61,9 @@ def test_a_trapezoid_puts_its_short_edge_on_top():
                  default="origin")
     top = sorted(p for p in s.polygon if abs(p[1]) < 1e-9)
     bottom = sorted(p for p in s.polygon if abs(p[1] - 30) < 1e-9)
-    assert top == pytest.approx([(10, 0), (50, 0)])
-    assert bottom == pytest.approx([(0, 30), (60, 30)])
+    # pytest 9.2 refuses approx over nested sequences, so compare flat ones.
+    assert [c for p in top for c in p] == pytest.approx([10, 0, 50, 0])
+    assert [c for p in bottom for c in p] == pytest.approx([0, 30, 60, 30])
 
 
 @pytest.mark.parametrize("spec, says", [
