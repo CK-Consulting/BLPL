@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BLPL User Guide</title>
+<meta name="description" content="How to use BLPL to turn Markdown hardware design documents into KiCad projects and fab-ready release packages.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #fbfbfa;
+  --surface: #ffffff;
+  --text: #1c1d1f;
+  --muted: #5d6168;
+  --border: #e3e4e6;
+  --accent: #0f766e;
+  --accent-soft: #e6f4f2;
+  --code-bg: #f3f4f5;
+  --nav-w: 280px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121314;
+    --surface: #1a1b1d;
+    --text: #e6e7e9;
+    --muted: #9ca0a7;
+    --border: #2c2e31;
+    --accent: #5eead4;
+    --accent-soft: #15302d;
+    --code-bg: #202225;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121314;
+  --surface: #1a1b1d;
+  --text: #e6e7e9;
+  --muted: #9ca0a7;
+  --border: #2c2e31;
+  --accent: #5eead4;
+  --accent-soft: #15302d;
+  --code-bg: #202225;
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 72px; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.65 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+a { color: var(--accent); text-underline-offset: 2px; }
+header.top {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+header.top .mark {
+  display: grid; grid-template-columns: 1fr 1fr; width: 28px; height: 28px;
+  border: 1.5px solid var(--text); border-radius: 4px; font: 600 10px/1 "JetBrains Mono", monospace;
+}
+header.top .mark span { display: grid; place-items: center; border: .5px solid var(--text); }
+header.top strong { font-weight: 600; }
+header.top .spacer { flex: 1; }
+header.top a.gh { font-size: 14px; color: var(--muted); text-decoration: none; }
+header.top a.gh:hover { color: var(--accent); }
+#navToggle {
+  display: none; font: inherit; font-size: 14px; padding: 6px 10px;
+  background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+}
+.layout { display: grid; grid-template-columns: var(--nav-w) minmax(0, 1fr); max-width: 1240px; margin: 0 auto; }
+nav.toc {
+  position: sticky; top: 57px; align-self: start; height: calc(100vh - 57px); overflow: auto;
+  padding: 24px 16px 40px; border-right: 1px solid var(--border); font-size: 14px;
+}
+nav.toc p { margin: 0 0 8px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+nav.toc ol { list-style: none; margin: 0; padding: 0; counter-reset: s; }
+nav.toc li { counter-increment: s; }
+nav.toc a {
+  display: block; padding: 5px 10px; border-radius: 6px; color: var(--muted); text-decoration: none;
+}
+nav.toc a::before { content: counter(s) ". "; opacity: .6; }
+nav.toc a:hover { color: var(--text); background: var(--code-bg); }
+nav.toc a.active { color: var(--accent); background: var(--accent-soft); font-weight: 500; }
+main { min-width: 0; padding: 32px 48px 80px; max-width: 900px; }
+main h1 { font-size: 2.2rem; line-height: 1.2; margin: 0 0 8px; letter-spacing: -.01em; }
+main h2 {
+  font-size: 1.5rem; margin: 56px 0 12px; padding-top: 8px; letter-spacing: -.005em;
+}
+main h3 { font-size: 1.15rem; margin: 32px 0 8px; }
+main hr { display: none; }
+main h1 + p { color: var(--muted); font-size: 14px; }
+/* The guide's own contents list duplicates the sidebar on wide screens. */
+#contents + ol { columns: 2; column-gap: 32px; }
+code {
+  font: 0.88em/1.5 "JetBrains Mono", ui-monospace, monospace;
+  background: var(--code-bg); padding: .1em .35em; border-radius: 4px;
+}
+pre {
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px; overflow-x: auto; line-height: 1.5;
+}
+pre code { background: none; padding: 0; font-size: 13.5px; }
+pre.mermaid { background: var(--surface); text-align: center; }
+.table-wrap { overflow-x: auto; margin: 16px 0; border: 1px solid var(--border); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+th, td { text-align: left; vertical-align: top; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+th { background: var(--code-bg); font-weight: 600; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+blockquote { margin: 16px 0; padding: 4px 16px; border-left: 3px solid var(--accent); color: var(--muted); }
+footer { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  #navToggle { display: inline-block; }
+  header.top a.gh { display: none; }
+  nav.toc {
+    display: none; position: fixed; inset: 57px 0 0 0; height: auto; z-index: 9;
+    background: var(--bg); border-right: 0;
+  }
+  nav.toc.open { display: block; }
+  main { padding: 24px 16px 64px; }
+  main h1 { font-size: 1.75rem; }
+  #contents + ol { columns: 1; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="mark" aria-hidden="true"><span>B</span><span>L</span><span>P</span><span>L</span></div>
+  <strong>BLPL User Guide</strong>
+  <span class="spacer"></span>
+  <a class="gh" href="{{source}}">Edit on GitHub</a>
+  <button id="navToggle" aria-expanded="false" aria-controls="toc">Contents</button>
+</header>
+<div class="layout">
+  <nav class="toc" id="toc" aria-label="Sections">
+    <p>Sections</p>
+    <ol>
+{{nav}}
+    </ol>
+  </nav>
+  <main>
+{{body}}
+    <footer>Built {{built}} from commit <code>{{commit}}</code>. The source is <a href="{{source}}">docs/user-guide.md</a>; change it there, not here.</footer>
+  </main>
+</div>
+<script>
+// Tables scroll on their own on a phone instead of widening the page.
+document.querySelectorAll("main table").forEach(function (t) {
+  var w = document.createElement("div"); w.className = "table-wrap";
+  t.parentNode.insertBefore(w, t); w.appendChild(t);
+});
+var toggle = document.getElementById("navToggle"), toc = document.getElementById("toc");
+toggle.addEventListener("click", function () {
+  var open = toc.classList.toggle("open"); toggle.setAttribute("aria-expanded", String(open));
+});
+toc.addEventListener("click", function (e) {
+  if (e.target.tagName === "A") { toc.classList.remove("open"); toggle.setAttribute("aria-expanded", "false"); }
+});
+// Mark the section being read.
+var links = Array.prototype.slice.call(toc.querySelectorAll("a"));
+var byId = {}; links.forEach(function (a) { byId[a.getAttribute("href").slice(1)] = a; });
+var obs = new IntersectionObserver(function (entries) {
+  entries.forEach(function (en) {
+    if (en.isIntersecting && byId[en.target.id]) {
+      links.forEach(function (a) { a.classList.remove("active"); });
+      byId[en.target.id].classList.add("active");
+    }
+  });
+}, { rootMargin: "-60px 0px -70% 0px" });
+document.querySelectorAll("main h2[id]").forEach(function (h) { obs.observe(h); });
+</script>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+var dark = matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({ startOnLoad: true, theme: dark ? "dark" : "neutral" });
+</script>
+</body>
+</html>

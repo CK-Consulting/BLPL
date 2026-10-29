@@ -389,7 +389,7 @@ Every part without a pinout table (resistors, capacitors, inductors, ferrites, d
 
 ### Block diagrams
 
-Draw the architecture as a Mermaid `flowchart TB` (or `LR`) inside a ```mermaid fence, or as a separate `*.mmd` file. The app renders it in place with BLPL's own palette. Tag nodes with a class and do not write `classDef` or theme lines; the app adds them.
+Draw the architecture as a Mermaid `flowchart TB` (or `LR`) in a fenced code block tagged `mermaid`, or as a separate `*.mmd` file. The app renders it in place with BLPL's own palette. Tag nodes with a class and do not write `classDef` or theme lines; the app adds them.
 
 ```mermaid
 flowchart TB

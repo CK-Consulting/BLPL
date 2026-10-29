@@ -1,0 +1,65 @@
+name: User guide site
+
+# Renders docs/user-guide.md into a single page and publishes it with GitHub
+# Pages. Pull requests that touch the guide only build it, so a page that does
+# not render fails review rather than the deploy; main builds and deploys.
+# Pages must be set to "GitHub Actions" as its source in the repository
+# settings before the first deploy can succeed.
+
+on:
+  pull_request:
+    paths:
+      - docs/user-guide.md
+      - docs/site/**
+      - .github/workflows/pages.yml
+  push:
+    branches: [main]
+    paths:
+      - docs/user-guide.md
+      - docs/site/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Render the guide
+        run: |
+          python -m pip install -r docs/site/requirements.txt
+          python docs/site/build.py --out _site
+
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
