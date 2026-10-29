@@ -98,3 +98,6 @@ app/certs/*
 .claude/
 CLAUDE.local.md
 AGENTS.local.md
+
+# The user guide site, built by docs/site/build.py
+_site/
