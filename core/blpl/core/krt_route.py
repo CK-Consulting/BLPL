@@ -235,14 +235,64 @@ def _diff_pairs(nets: list[str]) -> list[tuple[str, str]]:
     return sorted(pairs) if pairs and paired == names else []
 
 
+#: project.yaml's routing.search keys, and the flag each becomes on every
+#: route.py and route_diff.py call. All of them steer the search and none
+#: sets a size, a clearance or a layer, so no setting here can lay copper
+#: below the project's own rules. The router's answer turns on them: on the
+#: ear tag a hole added at one corner left a net open at the other, and
+#: until these were settings the only lever was moving parts until it routed.
+SEARCH_FLAGS = {
+    "ordering": "--ordering",
+    "direction": "--direction",
+    "mps_reverse_rounds": "--mps-reverse-rounds",
+    "max_ripup": "--max-ripup",
+    "ripup_blocker_select": "--ripup-blocker-select",
+    "max_iterations": "--max-iterations",
+    "heuristic_weight": "--heuristic-weight",
+}
+_SEARCH_SCRIPTS = ("route.py", "route_diff.py")
+
+
+def search_args(search: dict | None) -> list[str]:
+    """The router flags for one routing.search mapping. A key the router does
+    not take is an error, not a skip: a misspelt setting quietly ignored would
+    route the board the default way while the project says otherwise."""
+    unknown = sorted(set(search or {}) - set(SEARCH_FLAGS))
+    if unknown:
+        raise ValueError(f"routing.search: unknown setting(s) {', '.join(unknown)}; "
+                         f"known: {', '.join(SEARCH_FLAGS)}")
+    out: list[str] = []
+    for key, flag in SEARCH_FLAGS.items():
+        value = (search or {}).get(key)
+        # A switch is its flag alone; false is the router's own default.
+        if value is None or value is False:
+            continue
+        out += [flag] if value is True else [flag, f"{value:g}" if isinstance(value, float) else str(value)]
+    return out
+
+
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
          copper_layers: list[str] | None = None, refused: list[dict] | None = None,
-         band: bool | None = None, class_layers: dict[str, list[str]] | None = None) -> list[dict]:
+         band: bool | None = None, class_layers: dict[str, list[str]] | None = None,
+         search: dict | None = None) -> list[dict]:
     """The calls, in order: planes, each special class, then everything else.
 
     Pure, so the order and the rules each call carries can be tested without a
     router. Each step is {"script", "args"}; paths are filled in by ``route``.
+    ``search`` (routing.search) goes on every track-laying call; the plane
+    calls only stitch and pour, and take none of it.
     """
+    extra = search_args(search)
+    steps = _plan(pcb, pro, planes, copper_layers, refused, band, class_layers)
+    for step in steps:
+        if step["script"] in _SEARCH_SCRIPTS:
+            step["args"] = [*step["args"], *extra]
+    return steps
+
+
+def _plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
+          copper_layers: list[str] | None, refused: list[dict] | None,
+          band: bool | None, class_layers: dict[str, list[str]] | None) -> list[dict]:
     groups, classes = nets_by_class(pcb, pro)
     default = classes.get("Default", {})
     copper_layers = copper_layers or board_copper(pcb)
@@ -1064,8 +1114,61 @@ def _fill(python: str, pcb: Path) -> subprocess.CompletedProcess:
 
 
 def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
-          class_layers: dict[str, list[str]] | None = None):
-    """Route ``pcb`` in place with KiCad Routing Tools; the board's own measure."""
+          class_layers: dict[str, list[str]] | None = None,
+          search: dict | None = None, retry: list[dict] | None = None):
+    """Route ``pcb`` in place with KiCad Routing Tools; the board's own measure.
+
+    ``search`` is routing.search, on every attempt. ``retry`` is
+    routing.retry: when a route leaves connections open, the board goes back
+    to how it was before routing and is routed again with each entry laid over
+    ``search`` in turn, until one leaves nothing open. The first such route is
+    kept, or failing that the one with the fewest open, the earliest on a tie.
+    Every attempt is in ``extra["attempts"]``, so the report says which
+    settings the kept board came from and what the others left.
+    """
+    if not retry:
+        return _route_once(pcb, work_dir=work_dir, timeout=timeout,
+                           class_layers=class_layers, search=search)
+    pcb = Path(pcb)
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    # Every attempt starts from this, not from the last attempt's copper:
+    # routed over, a retry would be finishing someone else's board.
+    start = work / f"{pcb.stem}.unrouted.kicad_pcb"
+    shutil.copyfile(pcb, start)
+    attempts: list[dict] = []
+    best = None
+    result = None
+    for i, extra in enumerate([{}, *retry]):
+        settings = {**(search or {}), **extra}
+        if i:
+            shutil.copyfile(start, pcb)
+        result = _route_once(pcb, work_dir=work, timeout=timeout,
+                             class_layers=class_layers, search=settings)
+        if not result.attempted:
+            return result  # not installed: no setting changes that
+        attempts.append({"search": settings, "ok": result.ok, "unrouted": result.unrouted,
+                         **({} if result.ok else {"reason": result.reason})})
+        if result.ok and (best is None or (result.unrouted or 0) < (best[1].unrouted or 0)):
+            kept = work / f"{pcb.stem}.attempt{i}.kicad_pcb"
+            shutil.copyfile(pcb, kept)
+            best = (kept, result, i)
+        if result.ok and not result.unrouted:
+            break
+    if best is None:
+        # Nothing routed at all: the last failure, with every attempt's reason.
+        result.extra["attempts"] = attempts
+        return result
+    kept, result, i = best
+    shutil.copyfile(kept, pcb)
+    result.extra["attempts"] = attempts
+    result.extra["kept_attempt"] = i
+    return result
+
+
+def _route_once(pcb: Path, *, work_dir: Path, timeout: int = 3600,
+                class_layers: dict[str, list[str]] | None = None,
+                search: dict | None = None):
     from . import autoroute
 
     ok, why = available()
@@ -1113,7 +1216,7 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
             return result
     refused: list[dict] = []
     steps = plan(pcb, pro, autoroute.plane_layers(pcb), refused=refused, band=band,
-                 class_layers=class_layers)
+                 class_layers=class_layers, search=search)
     if refused:
         result.extra["refused"] = refused
     result.extra["steps"] = [" ".join([s["script"], *s["args"]]) for s in steps]

@@ -281,6 +281,15 @@
         "router": {
           "enum": ["freerouting", "kicad-routing-tools"],
           "description": "kicad-routing-tools (KiCad Routing Tools, routed class by class at the project's own rules; the default when it is installed) or freerouting (the default otherwise)."
+        },
+        "search": {
+          "description": "KiCad Routing Tools search settings, on every call that lays track (core/blpl/core/krt_route.py SEARCH_FLAGS). They steer the search only: no size, clearance or layer. Omitted, the router's own defaults.",
+          "$ref": "#/$defs/krt_search"
+        },
+        "retry": {
+          "description": "When a route leaves connections open, route again from the unrouted board with each of these laid over 'search', in order, until one leaves none open; the first such is kept, else the one with the fewest open. Example: [{ordering: inside_out}, {direction: backward}].",
+          "type": "array",
+          "items": { "$ref": "#/$defs/krt_search" }
         }
       }
     },
@@ -345,6 +354,19 @@
     }
   },
   "$defs": {
+    "krt_search": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ordering": { "enum": ["mps", "inside_out", "original", "bus"], "description": "Net order (router default mps)." },
+        "direction": { "enum": ["forward", "backward"], "description": "Which end of each net the search starts from." },
+        "mps_reverse_rounds": { "type": "boolean", "description": "Route the most-conflicting net groups first instead of last." },
+        "max_ripup": { "type": "integer", "minimum": 0, "description": "Most blockers ripped up at once in rip-up and retry (router default 3)." },
+        "ripup_blocker_select": { "enum": ["count", "near-target", "bidir", "mincut", "cost"], "description": "How the blockers to rip up are chosen (router default count)." },
+        "max_iterations": { "type": "integer", "minimum": 1, "description": "A* iterations per net before giving up (router default 200000)." },
+        "heuristic_weight": { "type": "number", "exclusiveMinimum": 0, "description": "A* heuristic weight: higher is faster and less thorough (router default 2.3)." }
+      }
+    },
     "impedance": {
       "description": "This class is impedance-controlled, and its widths are for this target. true means 50 ohms single-ended; a number is ohms.",
       "oneOf": [
