@@ -1,32 +1,59 @@
 # BLPL user guide
 
-Version: v1, 2026-10-29. Covers `main` as of commit `f79f664` (2026-10-24).
+Version: v2, 2026-10-30. Covers `main` as of commit `933ce00` (2026-10-29).
 
 This guide is for a person who wants to **use** BLPL to get from a hardware idea to a board a fab can quote, in the web app or on the command line. It does not assume you have read the rest of `docs/`. Where a topic has a deeper page, this guide says what you need to know and links to it.
 
-If you only read one section, read [The five rules that save the most time](#the-five-rules-that-save-the-most-time).
+New here? Start with the [Quick start](#quick-start). If you only read one section after that, read [The five rules that save the most time](#the-five-rules-that-save-the-most-time).
+
+## Quick start
+
+From nothing to a reviewed board in the web app. Each step links to the full section.
+
+1. **Get in.** Open the invitation link you were sent and sign up with that email, or [host your own server](#hosting-your-own-server).
+2. **Set up your account.** Choose an encryption passphrase (it cannot be reset, so store it) and one model provider with its key. Add a passkey under Settings > Data security later, as a second way in. [More](#1-set-up-your-account-once)
+3. **Create a project.** **+ Project** > **New** needs an empty git repository and an access token; **Import files** needs neither. [More](#3-create-or-open-a-project)
+4. **Write the design** in a `.md` file: a BOM table, one pinout table per IC and connector with the refdes in its heading, and a Connections table for the passives. The chat can draft it with you, starting from a block diagram. [Template](#start-from-this-template)
+5. **Check it.** Open **Preflight** and fix every error. Read every warning.
+6. **Describe the board.** Wrench > **Board**: outline, layers, net classes. **Save board config** writes `project.yaml`. [More](#projectyaml-everything-that-is-not-markdown)
+7. **Run it.** Rail > **Pipeline** > **Pipeline**, `stage0` to `stage8`, **Run pipeline**. If Stage 3 stops, give the named IC a pinout. [More](#running-the-pipeline)
+8. **Read the result.** **Board** shows the board; **Reports** shows the review. Fix `design` findings in your markdown, report `emitter` findings, and enable whatever an `expected` finding says is missing. [More](#reading-the-results)
+9. **Release.** When Reports says no blockers, **Release** > **Build release package** (tick **Look up LCSC part numbers** for JLCPCB) and download the zip. [More](#from-a-reviewed-board-to-a-fab-order)
+
+On the command line instead:
+
+```bash
+uv venv --python 3.13 .venv && uv pip install -e "./core[dev,all-llm]"
+git submodule update --init --depth 1 core/kicad-symbols core/kicad-footprints core/kicad-library-utils core/kicad-happy
+export ANTHROPIC_API_KEY=...            # or OPENAI_API_KEY, or OLLAMA_HOST
+blpl doctor --project-dir myboard       # fix every error first
+blpl init   --project-dir myboard       # writes project.yaml from your markdown
+blpl run    --project-dir myboard       # stages 0 to 8
+# open myboard/kicad/*.kicad_pro in KiCad; read myboard/.pipeline/review.md
+```
 
 ## Contents
 
-1. [What BLPL is, in one page](#what-blpl-is-in-one-page)
-2. [The five rules that save the most time](#the-five-rules-that-save-the-most-time)
-3. [Vocabulary](#vocabulary)
-4. [Getting access](#getting-access)
-5. [First session in the web app](#first-session-in-the-web-app)
-6. [A tour of the web app](#a-tour-of-the-web-app)
-7. [Writing design markdown that the pipeline reads](#writing-design-markdown-that-the-pipeline-reads)
-8. [project.yaml: everything that is not markdown](#projectyaml-everything-that-is-not-markdown)
-9. [Running the pipeline](#running-the-pipeline)
-10. [Reading the results](#reading-the-results)
-11. [From a reviewed board to a fab order](#from-a-reviewed-board-to-a-fab-order)
-12. [Working with the design chat](#working-with-the-design-chat)
-13. [Multi-board projects](#multi-board-projects)
-14. [Modules, the component library and references](#modules-the-component-library-and-references)
-15. [Security and sharing, from the user's side](#security-and-sharing-from-the-users-side)
-16. [The command line](#the-command-line)
-17. [Troubleshooting](#troubleshooting)
-18. [Message and code reference](#message-and-code-reference)
-19. [Where to go next](#where-to-go-next)
+1. [Quick start](#quick-start)
+2. [What BLPL is, in one page](#what-blpl-is-in-one-page)
+3. [The five rules that save the most time](#the-five-rules-that-save-the-most-time)
+4. [Vocabulary](#vocabulary)
+5. [Getting access](#getting-access)
+6. [First session in the web app](#first-session-in-the-web-app)
+7. [A tour of the web app](#a-tour-of-the-web-app)
+8. [Writing design markdown that the pipeline reads](#writing-design-markdown-that-the-pipeline-reads)
+9. [project.yaml: everything that is not markdown](#projectyaml-everything-that-is-not-markdown)
+10. [Running the pipeline](#running-the-pipeline)
+11. [Reading the results](#reading-the-results)
+12. [From a reviewed board to a fab order](#from-a-reviewed-board-to-a-fab-order)
+13. [Working with the design chat](#working-with-the-design-chat)
+14. [Multi-board projects](#multi-board-projects)
+15. [Modules, the component library and references](#modules-the-component-library-and-references)
+16. [Security and sharing, from the user's side](#security-and-sharing-from-the-users-side)
+17. [The command line](#the-command-line)
+18. [Troubleshooting](#troubleshooting)
+19. [Message and code reference](#message-and-code-reference)
+20. [Where to go next](#where-to-go-next)
 
 ---
 
@@ -107,14 +134,58 @@ There are two ways to drive it:
 
 ## Getting access
 
-You need four things before you start:
+There are two ways in. Most people join a server someone else runs; the rest host their own. Either way you then need the same two things to work: a model to use, and a git repository for each new project (see [What you need for any server](#what-you-need-for-any-server)).
 
-1. **The address**, usually `http://<host>:1800` (or `https://<host>:1443`).
-2. **An account.** Sign-in is Clerk: sign up with your email, or use the invitation link you were sent. An invitation link works once and expires after 24 hours; sign up with the same address it was sent to.
-3. **An empty git repository and an access token** for each new project (GitHub, GitLab, Gitea, Forgejo or Codeberg). Importing files needs neither.
-4. **A model to use.** Either your own API key (Anthropic, OpenAI or an OpenAI-compatible service) or the address of a local model server (Ollama, or an OpenAI-compatible server that needs no key). There is no shared server key.
+### Joining an existing server
 
-If the page says "The server is not answering", the backend is down or still starting; that is not a sign-in problem and the page retries by itself. If you can sign in but then see "this server rejected the session", the server's configuration is wrong; tell the operator.
+You need an **invitation**, or an account on that server and someone who will share a project with you.
+
+1. **Get the address** from whoever runs the server, usually `http://<host>:1800`, `https://<host>:1443`, or a domain they have put in front of it.
+2. **Open the invitation link** if you were sent one. It works once and expires after 24 hours. Sign up with the same email address it was sent to; a different address will not accept it. If it has expired, ask for a new one: re-inviting sends a fresh link.
+3. **No link?** Sign up at the address anyway, then tell a project owner the email you signed in with. Once you have signed in at least once, they can share a project with you directly; it appears on your dashboard under **Waiting for you**, with **Accept** and **Decline**.
+4. **Set up your account** (passphrase and a model provider) and you are in. See [First session in the web app](#first-session-in-the-web-app).
+
+The operator runs the server and can read any project while it is open on that server; see [Security and sharing](#security-and-sharing-from-the-users-side). If the page says "The server is not answering", the backend is down or still starting; that is not a sign-in problem and the page retries by itself. If you can sign in but then see "this server rejected the session", the server's configuration is wrong; tell the operator.
+
+### Hosting your own server
+
+The hosted app is a Docker Compose stack: Postgres, the backend and a worker, the web frontend, a KiCad desktop, and a ClamAV scanner for downloaded datasheets. KiCad lives in the image, so nobody needs it installed locally. The full reference is [app/README.md](../app/README.md); the short version:
+
+1. **A machine.** A Linux VM with Docker and Docker Compose, git, and room for the KiCad 3D models (the `app/kicad-packages3D` submodule alone is several gigabytes).
+2. **A Clerk instance** for sign-in. Create one at [clerk.com](https://clerk.com) and note its **publishable key** and **issuer URL**. They must come from the same instance: if they do not match, people can sign in but every page then fails with "this server rejected the session".
+3. **The code**, with the app's submodules: `git clone` the repository, then `git submodule update --init --depth 1` for `core/` and `app/`.
+4. **`app/.env`**, copied from `.env.example` at the repository root. The settings that matter:
+
+   | Setting | Why |
+   |---|---|
+   | `BLPL_UID`, `BLPL_GID` | **Required.** The owner of `app/data` on the host (`id -u`, `id -g`). Compose refuses to start without them. |
+   | `BLPL_CLERK_ISSUER`, `VITE_CLERK_PUBLISHABLE_KEY` | Sign-in. The publishable key is baked in at build time, so changing it needs a rebuild. |
+   | `BLPL_ADMIN_EMAILS` | Who sees Settings > Admin (network access). Nobody when empty. |
+   | `BLPL_WEBAUTHN_RP_ID`, `BLPL_WEBAUTHN_ORIGIN` | Passkeys. Set them to your domain, once: changing the RP ID later breaks every enrolled passkey. |
+   | `POSTGRES_PASSWORD` | Change it on anything reachable from outside. |
+   | `BLPL_SERVER_KEY` | Optional; generated into `app/data/server.key` on first boot if empty. |
+   | `SMTP_RELAY`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_SENDER_ADDR`, `SMTP_SENDER_NAME` | Mail, for invitations. Without a relay and a sender address, no invitation email is sent at all. Not in `.env.example`; the compose file reads them. |
+   | `BLPL_PUBLIC_URL` | The address people reach the server at, such as `https://blpl.example.com`. Invitation emails build their links from it; unset, the link reads "your BLPL server/invite/…" and goes nowhere. |
+
+   Provider API keys do **not** go here. Each user adds their own in Settings, and the app deliberately ignores `ANTHROPIC_API_KEY` and its kind.
+5. **TLS.** The frontend serves `1800` (http) and `1443` (https), and its nginx expects a certificate at `app/certs/cloudflare_origin.crt` and `.key` (a Cloudflare Origin CA pair in the reference setup). It refuses to start without them rather than quietly serving http only.
+6. **Create the Docker network** the stack joins, once: `docker network create blpl`. The compose file declares it `external`, so compose will not create it and refuses to start without it.
+7. **Start it:** run `app/fix-data-ownership.sh` once, then `docker compose -f app/docker-compose.yml up -d --build`. Open the address and sign up; the first person in is you.
+8. **Invite people** from a project's **Share** button. Anyone who has signed in once can be added by email and accepts on their dashboard; that works with or without mail. Someone with no account yet gets a 24-hour invitation link, but **only by email**: the link is not shown anywhere in the app, so without the SMTP settings and `BLPL_PUBLIC_URL` it never arrives. Without mail, ask them to sign up first (your Clerk allowlist must let them), then share by email.
+
+Worth doing before anyone relies on it:
+
+- **Back up both `app/blpl-db` (the database) and `app/data` (the files).** Neither is useful without the other. Keep `server.key` in a **different** backup from the database: together they are the lock and its key.
+- **Decide who can sign up.** BLPL keeps no allowlist of its own: anyone your Clerk instance lets sign up gets an account. A new account sees no projects it was not shared, but it can still run models on its own keys on your hardware. On a server reachable from the internet, restrict sign-ups in the Clerk dashboard. A Clerk application set up in testing (development) mode, the kind whose publishable key starts `pk_test_`, has an allowlist under its restrictions settings: list the email addresses or domains allowed to sign up, and nobody else can create an account.
+- Encrypt the disk the deployment sits on (LUKS or your host's equivalent).
+- Optional extras: a local model server with `docker compose --profile local-models up -d`; an SSH deploy key in `app/data/ssh/` for SSH git remotes; a kicad-ai-assistant server (`BLPL_KICAD_MCP`) so the chat can route and place on real boards.
+
+Just for yourself, on one machine? `blpl serve` runs the same backend on `127.0.0.1:7878` with KiCad from your own PATH; see [install.md](install.md).
+
+### What you need for any server
+
+- **A model to use.** Your own API key (Anthropic, OpenAI or an OpenAI-compatible service), or the address of a local model server (Ollama, or an OpenAI-compatible server that needs no key). There is no shared server key.
+- **An empty git repository and an access token** for each new project (GitHub, GitLab, Gitea, Forgejo or Codeberg). Importing files needs neither.
 
 ---
 
