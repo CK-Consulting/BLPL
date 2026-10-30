@@ -107,14 +107,55 @@ There are two ways to drive it:
 
 ## Getting access
 
-You need four things before you start:
+There are two ways in. Most people join a server someone else runs; the rest host their own. Either way you then need the same two things to work: a model to use, and a git repository for each new project (see [What you need for any server](#what-you-need-for-any-server)).
 
-1. **The address**, usually `http://<host>:1800` (or `https://<host>:1443`).
-2. **An account.** Sign-in is Clerk: sign up with your email, or use the invitation link you were sent. An invitation link works once and expires after 24 hours; sign up with the same address it was sent to.
-3. **An empty git repository and an access token** for each new project (GitHub, GitLab, Gitea, Forgejo or Codeberg). Importing files needs neither.
-4. **A model to use.** Either your own API key (Anthropic, OpenAI or an OpenAI-compatible service) or the address of a local model server (Ollama, or an OpenAI-compatible server that needs no key). There is no shared server key.
+### Joining an existing server
 
-If the page says "The server is not answering", the backend is down or still starting; that is not a sign-in problem and the page retries by itself. If you can sign in but then see "this server rejected the session", the server's configuration is wrong; tell the operator.
+You need an **invitation**, or an account on that server and someone who will share a project with you.
+
+1. **Get the address** from whoever runs the server, usually `http://<host>:1800`, `https://<host>:1443`, or a domain they have put in front of it.
+2. **Open the invitation link** if you were sent one. It works once and expires after 24 hours. Sign up with the same email address it was sent to; a different address will not accept it. If it has expired, ask for a new one: re-inviting sends a fresh link.
+3. **No link?** Sign up at the address anyway, then tell a project owner the email you signed in with. Once you have signed in at least once, they can share a project with you directly; it appears on your dashboard under **Waiting for you**, with **Accept** and **Decline**.
+4. **Set up your account** (passphrase and a model provider) and you are in. See [First session in the web app](#first-session-in-the-web-app).
+
+The operator runs the server and can read any project while it is open on that server; see [Security and sharing](#security-and-sharing-from-the-users-side). If the page says "The server is not answering", the backend is down or still starting; that is not a sign-in problem and the page retries by itself. If you can sign in but then see "this server rejected the session", the server's configuration is wrong; tell the operator.
+
+### Hosting your own server
+
+The hosted app is a Docker Compose stack: Postgres, the backend and a worker, the web frontend, a KiCad desktop, and a ClamAV scanner for downloaded datasheets. KiCad lives in the image, so nobody needs it installed locally. The full reference is [app/README.md](../app/README.md); the short version:
+
+1. **A machine.** A Linux VM with Docker and Docker Compose, git, and room for the KiCad 3D models (the `app/kicad-packages3D` submodule alone is several gigabytes).
+2. **A Clerk instance** for sign-in. Create one at [clerk.com](https://clerk.com) and note its **publishable key** and **issuer URL**. They must come from the same instance: if they do not match, people can sign in but every page then fails with "this server rejected the session".
+3. **The code**, with the app's submodules: `git clone` the repository, then `git submodule update --init --depth 1` for `core/` and `app/`.
+4. **`app/.env`**, copied from `.env.example` at the repository root. The settings that matter:
+
+   | Setting | Why |
+   |---|---|
+   | `BLPL_UID`, `BLPL_GID` | **Required.** The owner of `app/data` on the host (`id -u`, `id -g`). Compose refuses to start without them. |
+   | `BLPL_CLERK_ISSUER`, `VITE_CLERK_PUBLISHABLE_KEY` | Sign-in. The publishable key is baked in at build time, so changing it needs a rebuild. |
+   | `BLPL_ADMIN_EMAILS` | Who sees Settings > Admin (network access). Nobody when empty. |
+   | `BLPL_WEBAUTHN_RP_ID`, `BLPL_WEBAUTHN_ORIGIN` | Passkeys. Set them to your domain, once: changing the RP ID later breaks every enrolled passkey. |
+   | `POSTGRES_PASSWORD` | Change it on anything reachable from outside. |
+   | `BLPL_SERVER_KEY` | Optional; generated into `app/data/server.key` on first boot if empty. |
+
+   Provider API keys do **not** go here. Each user adds their own in Settings, and the app deliberately ignores `ANTHROPIC_API_KEY` and its kind.
+5. **TLS.** The frontend serves `1800` (http) and `1443` (https), and its nginx expects a certificate at `app/certs/cloudflare_origin.crt` and `.key` (a Cloudflare Origin CA pair in the reference setup). It refuses to start without them rather than quietly serving http only.
+6. **Start it:** run `app/fix-data-ownership.sh` once, then `docker compose -f app/docker-compose.yml up -d --build`. Open the address and sign up; the first person in is you.
+7. **Invite people** from a project's **Share** button: anyone who has signed in once can be added by email, anyone else gets a 24-hour link.
+
+Worth doing before anyone relies on it:
+
+- **Back up both `app/blpl-db` (the database) and `app/data` (the files).** Neither is useful without the other. Keep `server.key` in a **different** backup from the database: together they are the lock and its key.
+- **Decide who can sign up.** BLPL keeps no allowlist of its own: anyone your Clerk instance lets sign up gets an account. A new account sees no projects it was not shared, but it can still run models on its own keys on your hardware. On a server reachable from the internet, restrict sign-ups in the Clerk dashboard (an allowlist, or invitation-only).
+- Encrypt the disk the deployment sits on (LUKS or your host's equivalent).
+- Optional extras: a local model server with `docker compose --profile local-models up -d`; an SSH deploy key in `app/data/ssh/` for SSH git remotes; a kicad-ai-assistant server (`BLPL_KICAD_MCP`) so the chat can route and place on real boards.
+
+Just for yourself, on one machine? `blpl serve` runs the same backend on `127.0.0.1:7878` with KiCad from your own PATH; see [install.md](install.md).
+
+### What you need for any server
+
+- **A model to use.** Your own API key (Anthropic, OpenAI or an OpenAI-compatible service), or the address of a local model server (Ollama, or an OpenAI-compatible server that needs no key). There is no shared server key.
+- **An empty git repository and an access token** for each new project (GitHub, GitLab, Gitea, Forgejo or Codeberg). Importing files needs neither.
 
 ---
 
