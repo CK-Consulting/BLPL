@@ -7,7 +7,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 // itself rather than the window: the sidebar is resizable, so this pane gets
 // narrow while the viewport does not move at all.
 
-export type TabItem<T extends string> = { id: T; label: string };
+export type TabItem<T extends string> = { id: T; label: string; hint?: string };
 
 export function TabBar<T extends string>({
   items,
@@ -94,6 +94,7 @@ export function TabBar<T extends string>({
             key={i.id}
             className={active === i.id ? "on" : ""}
             onClick={() => onSelect(i.id)}
+            title={i.hint}
           >
             {i.label}
           </button>
@@ -116,6 +117,7 @@ export function TabBar<T extends string>({
                     key={i.id}
                     role="menuitem"
                     className={active === i.id ? "on" : ""}
+                    title={i.hint}
                     onClick={() => {
                       onSelect(i.id);
                       setOpen(false);

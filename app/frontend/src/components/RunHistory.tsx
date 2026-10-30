@@ -113,7 +113,11 @@ export function RunHistory({ projectId, reloadToken }: Props) {
       <ul className="runs">
         {runs.map((r) => (
           <li key={r.id}>
-            <button className={`runrow ${open === r.id ? "on" : ""}`} onClick={() => view(r)}>
+            <button
+              className={`runrow ${open === r.id ? "on" : ""}`}
+              onClick={() => view(r)}
+              title={r.running ? "Show this run's log, following it live" : "Show or hide this run's log"}
+            >
               <span className="run-kind">{splitBoard(r.kind).kind}</span>
               {splitBoard(r.kind).board && (
                 <span className="chip" title="the board this run was about">
@@ -125,7 +129,11 @@ export function RunHistory({ projectId, reloadToken }: Props) {
               {statusBadge(r)}
             </button>
             {r.running && (
-              <button className="link" onClick={() => del(`/api/runs/${r.id}`).then(refresh)}>
+              <button
+                className="link"
+                title="Stop this run on the server"
+                onClick={() => del(`/api/runs/${r.id}`).then(refresh)}
+              >
                 Stop
               </button>
             )}

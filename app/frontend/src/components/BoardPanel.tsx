@@ -84,7 +84,7 @@ export function BoardPanel({
               <button
                 className={b.name === board ? "board-item on" : "board-item"}
                 onClick={() => onBoard(b.name)}
-                title={b.note || undefined}
+                title={b.note || "Make this the active board"}
               >
                 <span className="mono">{b.name}</span>
                 {/* Optional is the load-bearing fact about a board in a modular

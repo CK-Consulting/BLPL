@@ -112,7 +112,7 @@ export function InviteLanding({
           </p>
         ) : (
           <>
-            <button onClick={redeem} disabled={busy}>
+            <button onClick={redeem} disabled={busy} title="Join the project and open it. The link cannot be used again.">
               {busy ? "Joining…" : `Accept and open ${preview.project}`}
             </button>
             {error && <div className="gate-error">{error}</div>}

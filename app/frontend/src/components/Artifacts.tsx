@@ -61,6 +61,7 @@ export function Artifacts({
             <button
               className={`artifact-row ${selected === m.name ? "on" : ""}`}
               onClick={() => setSelected(m.name)}
+              title="Open this pipeline output"
             >
               <span className="mono">{m.name}</span>
               <span className="muted">{human(m.size)}</span>
@@ -104,7 +105,7 @@ function ArtifactView({ projectId, meta }: { projectId: string; meta: Meta }) {
     return (
       <div className="muted pad">
         {meta.name} is {human(meta.size)} — too large to render inline.{" "}
-        <a className="link" href={url} target="_blank" rel="noreferrer">
+        <a className="link" href={url} target="_blank" rel="noreferrer" title="The file as written, in a new tab">
           Open raw
         </a>
       </div>
@@ -249,7 +250,7 @@ function Connector({ c }: { c: any }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="issue-group">
-      <button className="issue-head" onClick={() => setOpen((o) => !o)}>
+      <button className="issue-head" onClick={() => setOpen((o) => !o)} title={open ? "Hide the pins" : "Show every pin Stage 0 read"}>
         <code>{c.local_id}</code>
         <span className="issue-count">{c.pin_count ?? c.pins?.length ?? 0} pins</span>
         <span className="issue-preview">{c.description ?? ""}</span>
@@ -303,7 +304,12 @@ function NetsView({ d }: { d: any }) {
       <Chips items={[["nets", nets.length], ...classes]} />
       <WarningsList warnings={d.warnings} />
       <div className="bom-bar">
-        <input placeholder="Filter by net, class, or refdes…" value={filter} onChange={(e) => setFilter(e.target.value)} />
+        <input
+          placeholder="Filter by net, class, or refdes…"
+          aria-label="Filter nets"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
         <span className="muted">
           {shown.length} of {nets.length} nets
         </span>

@@ -46,13 +46,14 @@ export function Invitations({ onChanged }: { onChanged: () => void }) {
             {stamp(inv.expires_at)}
           </span>
           <span className="spacer" />
-          <button disabled={busy === inv.id} onClick={() => respond(inv.id, "accept")}>
+          <button disabled={busy === inv.id} onClick={() => respond(inv.id, "accept")} title="Join this project; it appears in your list">
             Accept
           </button>
           <button
             className="link"
             disabled={busy === inv.id}
             onClick={() => respond(inv.id, "decline")}
+            title="Refuse this invitation. The owner can send another."
           >
             Decline
           </button>

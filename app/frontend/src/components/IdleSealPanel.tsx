@@ -74,17 +74,29 @@ export function IdleSealPanel({ projectId }: { projectId: string }) {
           }}
           disabled={busy}
           aria-label="Minutes idle before locking"
+          title="Between 5 and 1440. The project is encrypted again after this long untouched, never during a run."
         />
       </label>
       {!valid && <p className="gate-error small">Between 5 and 1440 minutes.</p>}
       {error && <p className="gate-error small">{error}</p>}
       {saved && <p className="muted small">Saved.</p>}
       <div className="row">
-        <button type="button" onClick={() => save(parsed)} disabled={busy || !valid || parsed === current}>
+        <button
+          type="button"
+          onClick={() => save(parsed)}
+          disabled={busy || !valid || parsed === current}
+          title="Use this idle time for this project"
+        >
           Save auto-lock
         </button>
         {current !== null && (
-          <button type="button" className="link" onClick={() => save(null)} disabled={busy}>
+          <button
+            type="button"
+            className="link"
+            onClick={() => save(null)}
+            disabled={busy}
+            title="Drop this project's own setting and follow the server default"
+          >
             Use the default ({fallback} min)
           </button>
         )}

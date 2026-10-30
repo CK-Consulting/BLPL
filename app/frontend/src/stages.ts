@@ -25,6 +25,11 @@ export const STAGE_INFO: Record<string, StageInfo> = {
     detail:
       "Reports whether the pipeline is about to silently ignore half your design — missing inputs, unreadable Markdown, absent libraries. Run it first when something downstream looks wrong for no reason.",
   },
+  init: {
+    summary: "Writes project.yaml from your markdown",
+    detail:
+      "Reads the identity, stackup and net-class tables already in your design documents and writes project.yaml, which Stage 5 needs. If project.yaml already exists it stops rather than overwrite it; edit that one in Project settings, Board.",
+  },
   "stage0-det": {
     summary: "Markdown → design_artifact (deterministic)",
     detail:
@@ -71,14 +76,14 @@ export const STAGE_INFO: Record<string, StageInfo> = {
       "Compiles the manifest into a real KiCad project, timestamped into .pipeline/. This is the stage whose output you can open in KiCad.",
   },
   stage6a: {
-    summary: "Autoroutes the emitted board with Freerouting",
+    summary: "Autoroutes the emitted board (KiCad Routing Tools or Freerouting)",
     detail:
       "Routes the board Stage 6 just wrote, so Stage 7's DRC and Stage 8's review see a routed board. Always writes autoroute_report.json; with no router available it records why and the run carries on. The result is reviewed, not trusted: DRC decides whether it stays.",
   },
   stage7: {
     summary: "Validates the generated KiCad project",
     detail:
-      "Runs KLC, DRC and coverage checks into validation_report.json. The question it answers is narrow: is this a legal KiCad project?",
+      "Runs KLC, ERC, DRC and coverage checks into validation_report.json. The question it answers is narrow: is this a legal KiCad project?",
   },
   stage8: {
     summary: "Reviews the board as a design",

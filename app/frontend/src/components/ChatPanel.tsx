@@ -1071,7 +1071,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
       {commitWarning && (
         <div className="gate-error" role="alert">
           {commitWarning}{" "}
-          <button className="link" onClick={() => setCommitWarning(null)}>
+          <button className="link" onClick={() => setCommitWarning(null)} title="Hide this warning">
             Dismiss
           </button>
         </div>
@@ -1098,10 +1098,10 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             </div>
           </div>
           <span className="spacer" />
-          <button onClick={() => void retryLost()} disabled={streaming}>
+          <button onClick={() => void retryLost()} disabled={streaming} title="Send the same question again">
             Ask again
           </button>
-          <button className="link" onClick={() => setLost(null)}>
+          <button className="link" onClick={() => setLost(null)} title="Hide this notice">
             Dismiss
           </button>
         </div>
@@ -1166,6 +1166,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             <select
               value={filename ?? ""}
               disabled={conversations.length === 0}
+              title="Switch to another conversation in this project"
               onChange={(e) => void openConversation(e.target.value)}
             >
               {conversations.map((c) => (
@@ -1176,7 +1177,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
               ))}
             </select>
           </label>
-          <label className="menu-check">
+          <label className="menu-check" title="List archived conversations too">
             <input
               type="checkbox"
               checked={showArchived}
@@ -1196,6 +1197,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             <span>Message order</span>
             <select
               value={order}
+              title="Where the newest message sits; whole turns move, not single lines"
               onChange={(e) => {
                 const next = e.target.value as Order;
                 setOrder(next);
@@ -1221,7 +1223,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
               {here?.archived ? "Unarchive this session" : "Archive this session"}
             </button>
           )}
-          <button className="menu-item" onClick={newConversation}>
+          <button className="menu-item" onClick={newConversation} title="Start an empty conversation. The current one is kept.">
             New session
           </button>
           {/* The one thing still held back, and why. A disabled control with no
@@ -1280,6 +1282,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
             .filter(Boolean)
             .join(" ")}
           onClick={toAnchor}
+          title={approvals.length ? "Scroll to the approval waiting for you" : "Scroll to the newest message"}
         >
           {approvals.length
             ? `Waiting for your approval ${newestFirst ? "↑" : "↓"}`
@@ -1375,10 +1378,10 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
               {waiting.held && (
                 <>
                   <span className="spacer" />
-                  <button onClick={sendQueuedNow} disabled={streaming}>
+                  <button onClick={sendQueuedNow} disabled={streaming} title="Send the held messages now, one per answer">
                     Send now
                   </button>
-                  <button className="link" onClick={() => queue.clear(openKey)}>
+                  <button className="link" onClick={() => queue.clear(openKey)} title="Drop every held message">
                     Discard
                   </button>
                 </>
@@ -1424,6 +1427,8 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
         )}
         <textarea
           ref={textarea}
+          aria-label="Message"
+          title="Enter sends; Shift+Enter for a new line; / at the start for commands"
           style={{ height: box.height }}
           value={input}
           placeholder={
@@ -1511,7 +1516,12 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
                 Queue
               </button>
             )}
-            <button className="stop" onClick={() => void stop()} disabled={!turnId}>
+            <button
+              className="stop"
+              onClick={() => void stop()}
+              disabled={!turnId}
+              title="Stop this answer. Queued messages are held, not sent."
+            >
               Stop
             </button>
           </>
@@ -1519,6 +1529,7 @@ export function ChatPanel({ projectId, onApplied, onHighlight }: Props) {
           <button
             onClick={() => void send()}
             disabled={(!input.trim() && attached.length === 0) || !filename}
+            title="Send this message (Enter)"
           >
             Send
           </button>
@@ -1658,7 +1669,7 @@ function Foldable({ text }: { text: string }) {
   return (
     <>
       {open ? text : text.slice(0, COLLAPSE_CHARS).trimEnd() + "…"}
-      <button className="link fold" onClick={() => setOpen((v) => !v)}>
+      <button className="link fold" onClick={() => setOpen((v) => !v)} title={open ? "Fold this message" : "Show the whole message"}>
         {open ? "Show less" : `Show all ${text.length.toLocaleString()} characters`}
       </button>
     </>
@@ -1683,10 +1694,20 @@ function ApprovalCard({
         <span className="status-tag renamed">{approval.kind}</span>
         <span className="mono">{approval.tool}</span>
         <span className="spacer" />
-        <button className="link" disabled={busy} onClick={() => decide(true)}>
+        <button
+          className="link"
+          disabled={busy}
+          onClick={() => decide(true)}
+          title="Let the assistant run this tool call. Some tools then stay allowed for the rest of this conversation; others ask every time."
+        >
           Allow
         </button>
-        <button className="link" disabled={busy} onClick={() => decide(false)}>
+        <button
+          className="link"
+          disabled={busy}
+          onClick={() => decide(false)}
+          title="Refuse this tool call. The assistant is told, and carries on without it."
+        >
           Deny
         </button>
       </div>

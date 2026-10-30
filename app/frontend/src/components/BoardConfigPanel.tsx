@@ -283,6 +283,7 @@ export function BoardConfigPanel({
           <span>Outline</span>
           <select
             aria-label="Outline shape"
+            title="The board edge. Anything but a plain rectangle is drawn from the fields below and sets width and height."
             value={shaped ? String(outline?.shape) : ""}
             onChange={(e) =>
               setOutline(
@@ -308,7 +309,9 @@ export function BoardConfigPanel({
             min="0"
             value={dims[0] ?? ""}
             readOnly={shaped}
-            title={shaped ? "The outline's bounding box; change the outline to change it." : undefined}
+            title={
+              shaped ? "The outline's bounding box; change the outline to change it." : "Board width in mm"
+            }
             onChange={(e) => setDim(0, e.target.value)}
           />
         </label>
@@ -320,7 +323,9 @@ export function BoardConfigPanel({
             min="0"
             value={dims[1] ?? ""}
             readOnly={shaped}
-            title={shaped ? "The outline's bounding box; change the outline to change it." : undefined}
+            title={
+              shaped ? "The outline's bounding box; change the outline to change it." : "Board height in mm"
+            }
             onChange={(e) => setDim(1, e.target.value)}
           />
         </label>
@@ -373,7 +378,11 @@ export function BoardConfigPanel({
           <span>Copper layers</span>
           {/* A list, not a number box: odd counts are not manufacturable, so
               there is nothing to be gained by letting someone type 3. */}
-          <select value={stackup.layers ?? 4} onChange={(e) => setStack("layers", e.target.value)}>
+          <select
+            value={stackup.layers ?? 4}
+            onChange={(e) => setStack("layers", e.target.value)}
+            title="Copper layers of the board you will order. Decides which layers keepouts and planes may use."
+          >
             {LAYERS.map((n) => (
               <option key={n} value={n}>
                 {n}
@@ -389,11 +398,16 @@ export function BoardConfigPanel({
             min="0"
             value={stackup.thickness ?? ""}
             onChange={(e) => setStack("thickness", e.target.value)}
+            title="Finished board thickness; 1.6 is the standard"
           />
         </label>
         <label>
           <span>Finish</span>
-          <select value={stackup.finish ?? "ENIG"} onChange={(e) => setStack("finish", e.target.value)}>
+          <select
+            value={stackup.finish ?? "ENIG"}
+            onChange={(e) => setStack("finish", e.target.value)}
+            title="Surface finish. ENIG suits fine-pitch parts; HASL is cheapest."
+          >
             {FINISHES.map((f) => (
               <option key={f} value={f}>
                 {f}
@@ -430,7 +444,12 @@ export function BoardConfigPanel({
       {note && <p className="muted small">{note}</p>}
 
       <div className="field-row">
-        <button className="btn primary" onClick={save} disabled={busy}>
+        <button
+          className="btn primary"
+          onClick={save}
+          disabled={busy}
+          title="Write project.yaml. Re-run Stage 5 to rebuild the board with it."
+        >
           {busy ? "Saving…" : "Save board config"}
         </button>
         {dirty && !busy && (
@@ -549,6 +568,7 @@ function FeatureList({
                 <span>Name</span>
                 <input
                   aria-label={`${prefix} name`}
+                  title="Optional; shown in findings that name this shape"
                   value={f.name ?? ""}
                   onChange={(e) => {
                     const next: BoardFeature = { ...f, name: e.target.value };
@@ -562,6 +582,7 @@ function FeatureList({
                 <input
                   aria-label={`${prefix} anchor`}
                   placeholder="fixed on the board"
+                  title="A refdes fixes this shape to that part, so it moves with it, as an antenna keepout should. Empty keeps it fixed on the board."
                   value={f.anchor ?? ""}
                   onChange={(e) => {
                     let next: BoardFeature = { ...f, anchor: e.target.value.trim() };
@@ -582,6 +603,7 @@ function FeatureList({
                 className="btn"
                 type="button"
                 onClick={() => onChange(list.filter((_, k) => k !== i))}
+                title={`Remove this ${kind}; nothing changes on the board until you save and re-run Stage 5`}
               >
                 Remove {kind}
               </button>
@@ -600,6 +622,7 @@ function FeatureList({
                   <input
                     aria-label={`${prefix} layers`}
                     placeholder="*.Cu"
+                    title="Comma-separated layer names as a .kicad_pcb writes them: *.Cu is every copper layer, F&B.Cu the outer two"
                     value={layerList.join(", ")}
                     onChange={(e) => {
                       const layers = e.target.value.split(",").map((x) => x.trim()).filter(Boolean);
@@ -611,7 +634,7 @@ function FeatureList({
                 </label>
                 <span className="board-forbid" role="group" aria-label={`${prefix} forbids`}>
                   {FORBIDDABLE.map((what) => (
-                    <label key={what} className="inline">
+                    <label key={what} className="inline" title={`Forbid ${what} inside this area`}>
                       <input
                         type="checkbox"
                         checked={forbid.includes(what)}
@@ -636,7 +659,12 @@ function FeatureList({
           </div>
         );
       })}
-      <button className="btn" type="button" onClick={() => onChange([...list, fresh()])}>
+      <button
+        className="btn"
+        type="button"
+        onClick={() => onChange([...list, fresh()])}
+        title={kind === "cutout" ? "Add a hole or slot through the board" : "Add a rule area: what may not go where"}
+      >
         Add {kind}
       </button>
     </fieldset>

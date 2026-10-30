@@ -364,6 +364,7 @@ export function FileView({
         <div className="seg small">
           <button
             className={!editing && !source ? "on" : ""}
+            title="The document rendered: Markdown, diagrams, tables"
             onClick={() => {
               setEditing(false);
               setSource(false);
@@ -388,7 +389,7 @@ export function FileView({
               !savable
                 ? "This file is not one the workbench edits"
                 : loaded
-                  ? undefined
+                  ? "Edit this design document. Ctrl/⌘+S saves and commits it."
                   : "Still loading"
             }
             onClick={() => {
@@ -402,7 +403,11 @@ export function FileView({
           </button>
         </div>
         {editing && (
-          <button onClick={() => void save()} disabled={!dirty || !loaded || saving}>
+          <button
+            onClick={() => void save()}
+            disabled={!dirty || !loaded || saving}
+            title={dirty ? "Save and commit this file (Ctrl/⌘+S)" : "No unsaved changes"}
+          >
             Save
           </button>
         )}

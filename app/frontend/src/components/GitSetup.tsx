@@ -40,7 +40,7 @@ export function PushPolicyChoice({
     <fieldset className="policy-fields push-policy">
       <legend>Pushing</legend>
       <div className="policy-group" role="radiogroup" aria-label="Push policy">
-        <label className="policy-option">
+        <label className="policy-option" title="Every commit is pushed straight away, so a copy always exists off this server">
           <input
             type="radio"
             name="push_policy"
@@ -50,7 +50,7 @@ export function PushPolicyChoice({
           />
           <span>Push automatically after every commit</span>
         </label>
-        <label className="policy-option">
+        <label className="policy-option" title="Commits stay on this server until you press Commit + Push">
           <input
             type="radio"
             name="push_policy"
@@ -82,7 +82,7 @@ export function IdentityFields({
 }) {
   return (
     <>
-      <label className="dialog-field">
+      <label className="dialog-field" title="The author name your commits carry">
         <span>Commit name</span>
         <input
           value={value.name}
@@ -91,7 +91,7 @@ export function IdentityFields({
           onChange={(e) => onChange({ ...value, name: e.target.value })}
         />
       </label>
-      <label className="dialog-field">
+      <label className="dialog-field" title="The author email your commits carry; use the one your git host knows you by">
         <span>Commit email</span>
         <input
           type="email"
@@ -282,7 +282,12 @@ export function CommitIdentitySettings({ onError }: { onError: (m: string) => vo
       <IdentityFields value={value} onChange={setValue} disabled={busy} />
       <div className="dialog-actions">
         {saved && (
-          <button type="button" onClick={clear} disabled={busy}>
+          <button
+            type="button"
+            onClick={clear}
+            disabled={busy}
+            title="Remove the default. Projects without their own identity can then not commit for you."
+          >
             Clear
           </button>
         )}
@@ -291,6 +296,7 @@ export function CommitIdentitySettings({ onError }: { onError: (m: string) => vo
           className="primary"
           onClick={save}
           disabled={busy || !value.name.trim() || !value.email.trim()}
+          title="Your default commit identity, for every project that has none of its own"
         >
           Save identity
         </button>
