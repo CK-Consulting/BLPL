@@ -164,11 +164,14 @@ The hosted app is a Docker Compose stack: Postgres, the backend and a worker, th
    | `BLPL_WEBAUTHN_RP_ID`, `BLPL_WEBAUTHN_ORIGIN` | Passkeys. Set them to your domain, once: changing the RP ID later breaks every enrolled passkey. |
    | `POSTGRES_PASSWORD` | Change it on anything reachable from outside. |
    | `BLPL_SERVER_KEY` | Optional; generated into `app/data/server.key` on first boot if empty. |
+   | `SMTP_RELAY`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_SENDER_ADDR`, `SMTP_SENDER_NAME` | Mail, for invitations. Without a relay and a sender address, no invitation email is sent at all. Not in `.env.example`; the compose file reads them. |
+   | `BLPL_PUBLIC_URL` | The address people reach the server at, such as `https://blpl.example.com`. Invitation emails build their links from it; unset, the link reads "your BLPL server/invite/…" and goes nowhere. |
 
    Provider API keys do **not** go here. Each user adds their own in Settings, and the app deliberately ignores `ANTHROPIC_API_KEY` and its kind.
 5. **TLS.** The frontend serves `1800` (http) and `1443` (https), and its nginx expects a certificate at `app/certs/cloudflare_origin.crt` and `.key` (a Cloudflare Origin CA pair in the reference setup). It refuses to start without them rather than quietly serving http only.
-6. **Start it:** run `app/fix-data-ownership.sh` once, then `docker compose -f app/docker-compose.yml up -d --build`. Open the address and sign up; the first person in is you.
-7. **Invite people** from a project's **Share** button: anyone who has signed in once can be added by email, anyone else gets a 24-hour link.
+6. **Create the Docker network** the stack joins, once: `docker network create blpl`. The compose file declares it `external`, so compose will not create it and refuses to start without it.
+7. **Start it:** run `app/fix-data-ownership.sh` once, then `docker compose -f app/docker-compose.yml up -d --build`. Open the address and sign up; the first person in is you.
+8. **Invite people** from a project's **Share** button. Anyone who has signed in once can be added by email and accepts on their dashboard; that works with or without mail. Someone with no account yet gets a 24-hour invitation link, but **only by email**: the link is not shown anywhere in the app, so without the SMTP settings and `BLPL_PUBLIC_URL` it never arrives. Without mail, ask them to sign up first (your Clerk allowlist must let them), then share by email.
 
 Worth doing before anyone relies on it:
 
