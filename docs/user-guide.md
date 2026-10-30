@@ -1,32 +1,59 @@
 # BLPL user guide
 
-Version: v1, 2026-10-29. Covers `main` as of commit `f79f664` (2026-10-24).
+Version: v2, 2026-10-30. Covers `main` as of commit `933ce00` (2026-10-29).
 
 This guide is for a person who wants to **use** BLPL to get from a hardware idea to a board a fab can quote, in the web app or on the command line. It does not assume you have read the rest of `docs/`. Where a topic has a deeper page, this guide says what you need to know and links to it.
 
-If you only read one section, read [The five rules that save the most time](#the-five-rules-that-save-the-most-time).
+New here? Start with the [Quick start](#quick-start). If you only read one section after that, read [The five rules that save the most time](#the-five-rules-that-save-the-most-time).
+
+## Quick start
+
+From nothing to a reviewed board in the web app. Each step links to the full section.
+
+1. **Get in.** Open the invitation link you were sent and sign up with that email, or [host your own server](#hosting-your-own-server).
+2. **Set up your account.** Choose an encryption passphrase (it cannot be reset, so store it) and one model provider with its key. Add a passkey under Settings > Data security later, as a second way in. [More](#1-set-up-your-account-once)
+3. **Create a project.** **+ Project** > **New** needs an empty git repository and an access token; **Import files** needs neither. [More](#3-create-or-open-a-project)
+4. **Write the design** in a `.md` file: a BOM table, one pinout table per IC and connector with the refdes in its heading, and a Connections table for the passives. The chat can draft it with you, starting from a block diagram. [Template](#start-from-this-template)
+5. **Check it.** Open **Preflight** and fix every error. Read every warning.
+6. **Describe the board.** Wrench > **Board**: outline, layers, net classes. **Save board config** writes `project.yaml`. [More](#projectyaml-everything-that-is-not-markdown)
+7. **Run it.** Rail > **Pipeline** > **Pipeline**, `stage0` to `stage8`, **Run pipeline**. If Stage 3 stops, give the named IC a pinout. [More](#running-the-pipeline)
+8. **Read the result.** **Board** shows the board; **Reports** shows the review. Fix `design` findings in your markdown, report `emitter` findings, and enable whatever an `expected` finding says is missing. [More](#reading-the-results)
+9. **Release.** When Reports says no blockers, **Release** > **Build release package** (tick **Look up LCSC part numbers** for JLCPCB) and download the zip. [More](#from-a-reviewed-board-to-a-fab-order)
+
+On the command line instead:
+
+```bash
+uv venv --python 3.13 .venv && uv pip install -e "./core[dev,all-llm]"
+git submodule update --init --depth 1 core/kicad-symbols core/kicad-footprints core/kicad-library-utils core/kicad-happy
+export ANTHROPIC_API_KEY=...            # or OPENAI_API_KEY, or OLLAMA_HOST
+blpl doctor --project-dir myboard       # fix every error first
+blpl init   --project-dir myboard       # writes project.yaml from your markdown
+blpl run    --project-dir myboard       # stages 0 to 8
+# open myboard/kicad/*.kicad_pro in KiCad; read myboard/.pipeline/review.md
+```
 
 ## Contents
 
-1. [What BLPL is, in one page](#what-blpl-is-in-one-page)
-2. [The five rules that save the most time](#the-five-rules-that-save-the-most-time)
-3. [Vocabulary](#vocabulary)
-4. [Getting access](#getting-access)
-5. [First session in the web app](#first-session-in-the-web-app)
-6. [A tour of the web app](#a-tour-of-the-web-app)
-7. [Writing design markdown that the pipeline reads](#writing-design-markdown-that-the-pipeline-reads)
-8. [project.yaml: everything that is not markdown](#projectyaml-everything-that-is-not-markdown)
-9. [Running the pipeline](#running-the-pipeline)
-10. [Reading the results](#reading-the-results)
-11. [From a reviewed board to a fab order](#from-a-reviewed-board-to-a-fab-order)
-12. [Working with the design chat](#working-with-the-design-chat)
-13. [Multi-board projects](#multi-board-projects)
-14. [Modules, the component library and references](#modules-the-component-library-and-references)
-15. [Security and sharing, from the user's side](#security-and-sharing-from-the-users-side)
-16. [The command line](#the-command-line)
-17. [Troubleshooting](#troubleshooting)
-18. [Message and code reference](#message-and-code-reference)
-19. [Where to go next](#where-to-go-next)
+1. [Quick start](#quick-start)
+2. [What BLPL is, in one page](#what-blpl-is-in-one-page)
+3. [The five rules that save the most time](#the-five-rules-that-save-the-most-time)
+4. [Vocabulary](#vocabulary)
+5. [Getting access](#getting-access)
+6. [First session in the web app](#first-session-in-the-web-app)
+7. [A tour of the web app](#a-tour-of-the-web-app)
+8. [Writing design markdown that the pipeline reads](#writing-design-markdown-that-the-pipeline-reads)
+9. [project.yaml: everything that is not markdown](#projectyaml-everything-that-is-not-markdown)
+10. [Running the pipeline](#running-the-pipeline)
+11. [Reading the results](#reading-the-results)
+12. [From a reviewed board to a fab order](#from-a-reviewed-board-to-a-fab-order)
+13. [Working with the design chat](#working-with-the-design-chat)
+14. [Multi-board projects](#multi-board-projects)
+15. [Modules, the component library and references](#modules-the-component-library-and-references)
+16. [Security and sharing, from the user's side](#security-and-sharing-from-the-users-side)
+17. [The command line](#the-command-line)
+18. [Troubleshooting](#troubleshooting)
+19. [Message and code reference](#message-and-code-reference)
+20. [Where to go next](#where-to-go-next)
 
 ---
 
