@@ -19,10 +19,7 @@ directories (`.pipeline/`, `.blpl/`) and non-design files cannot. If
 that file changed since, accepting is refused rather than merged, because the
 alternative is an assistant quietly overwriting an edit you were in the middle of.
 
-Tool calls are policed by kind. Reads are automatic; anything touching the
-network asks once per session; anything that spends money or changes a board asks
-every time. Paths are checked against the project's sandbox *before* you are asked
-to approve, so a refusal never depends on you noticing a bad path in a dialog.
+Each tool carries its own approval rule (`approval` in `app/backend/app/agent/registry.py` and `kicad_bridge.py`), and most run without asking: reads, part searches, datasheet fetches, and datasheet extraction, which spends money on a vision model. Some ask once and are then allowed for the rest of the conversation: writing assembly files, running simulations, and routing or moving footprints on a board. A few ask every time: extracting a module, bulk autorouting, changing the board outline and adding a zone. Paths are checked against the project's sandbox *before* you are asked to approve, so a refusal never depends on you noticing a bad path in a dialog.
 
 ## Endpoints and per-task routing
 

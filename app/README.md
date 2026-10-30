@@ -23,14 +23,19 @@ On any VM with Docker:
 
 ```sh
 # first, in app/.env: BLPL_UID=<id -u> and BLPL_GID=<id -g> (see .env.example)
+docker network create blpl       # once per host; see below
 app/fix-data-ownership.sh        # before the first up; see below
 docker compose -f app/docker-compose.yml up -d --build
 ```
+
+The `blpl` network is declared `external` in the compose file, so compose neither creates it nor starts without it. Create it once per host; it survives `docker compose down`.
 
 The backend and worker run as `BLPL_UID`, not root. `fix-data-ownership.sh`
 creates `app/data` and every bind source under it owned by that user before
 anything starts: left to itself, Docker creates a missing bind source as root,
 and a non-root backend cannot write its own `server.key` into it.
+
+To invite someone who has no account yet, the server has to send mail. The invitation link exists only in that email, never in the app, so without `SMTP_RELAY` and `SMTP_SENDER_ADDR` it reaches nobody, and without `BLPL_PUBLIC_URL` it points nowhere. Both are described in `.env.example`. Without mail, sharing still works with anyone who has signed in once: they find the invitation on their dashboard.
 
 Then open `http://<host>:1800` and sign in. Sign-in is [Clerk][clerk]; provider
 API keys are per user and added under Settings after you are in.
