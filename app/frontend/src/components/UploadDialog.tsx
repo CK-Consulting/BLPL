@@ -276,6 +276,7 @@ export function UploadDialog({
                         <input
                           type="text"
                           aria-label={`MPN for ${r.file.name}`}
+                          title="The part number; the datasheet is filed and named after it"
                           placeholder="optional"
                           value={r.mpn}
                           onChange={(e) => update(i, { mpn: e.target.value })}
@@ -350,7 +351,11 @@ export function UploadDialog({
 
           {rows.length > 0 && (
             <div>
-              <button onClick={() => void submit()} disabled={!ready || busy}>
+              <button
+                onClick={() => void submit()}
+                disabled={!ready || busy}
+                title={ready ? "Add these files to the project" : "Choose a kind for every file, and fix any library name, first"}
+              >
                 {busy ? "Uploading…" : `Upload ${rows.length} file${rows.length === 1 ? "" : "s"}`}
               </button>
               {!ready && (

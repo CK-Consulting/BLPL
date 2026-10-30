@@ -154,11 +154,11 @@ export function NetworkAccess({ onError }: { onError: (m: string) => void }) {
           }}
           onKeyDown={(e) => e.key === "Enter" && add()}
         />
-        <label className="small">
+        <label className="small" title="Allow git over SSH (port 22) to this host as well as HTTPS">
           <input type="checkbox" checked={ssh} onChange={(e) => setSsh(e.target.checked)} /> Also git
           over ssh (port 22)
         </label>
-        <button onClick={add} disabled={busy}>
+        <button onClick={add} disabled={busy} title="Let pipeline runs reach this host">
           Add
         </button>
       </div>

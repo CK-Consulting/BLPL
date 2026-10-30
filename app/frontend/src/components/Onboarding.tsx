@@ -101,7 +101,9 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                   route different work to different ones.
                 </p>
               </section>
-              <button onClick={() => setExplained(true)}>Get started</button>
+              <button onClick={() => setExplained(true)} title="Go to the setup form: a passphrase and one model provider">
+                Get started
+              </button>
             </div>
           </div>
         </div>
@@ -118,19 +120,23 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
           <h3>Encryption passphrase</h3>
           <p className="muted">
             This is not for logging in; it is used to unlock your encryption key so that you and
-            only you can access your data. (If you want to set a login password for this account,
-            that is on the <strong>Account and Auth</strong> page.)
+            only you can access your data. (A login password for this account is set in your
+            account menu: your avatar, top right, once you are in.)
           </p>
           <input
             type="password"
             autoFocus
             placeholder="Passphrase (at least 10 characters)"
+            aria-label="Encryption passphrase"
+            title="Encrypts your API keys, git credentials and the keys to your projects. Not your sign-in password. The server keeps no copy and cannot reset it, so store it safely."
             value={passphrase}
             onChange={(e) => setPassphrase(e.target.value)}
           />
           <input
             type="password"
             placeholder="Confirm passphrase"
+            aria-label="Confirm passphrase"
+            title="Type the passphrase again; a mistyped one that is then forgotten cannot be reset."
             value={confirm}
             onChange={(e) => setConfirm(e.target.value)}
           />
@@ -144,7 +150,12 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
 
         <section className="card">
           <h3>Primary LLM Provider</h3>
-          <select value={chosen} onChange={(e) => pick(e.target.value)}>
+          <select
+            value={chosen}
+            onChange={(e) => pick(e.target.value)}
+            aria-label="LLM provider"
+            title="The service that answers chat and resolves parts in Stage 1. You can add more later under Settings."
+          >
             <option value="">Choose a provider…</option>
             {providers.map((p) => (
               <option key={p.id} value={p.id}>
@@ -164,6 +175,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                   </span>
                   <input
                     placeholder={provider.base_url || "https://…/v1"}
+                    title="Where the model server listens. Needed for local and OpenAI-compatible servers; hosted Anthropic and OpenAI need none."
                     value={baseUrl}
                     onChange={(e) => setBaseUrl(e.target.value)}
                   />
@@ -176,6 +188,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                   <input
                     type="password"
                     placeholder={provider.key_hint || "paste your API key"}
+                    title="Your own key; usage is billed to your account. Stored encrypted under your passphrase."
                     value={apiKey}
                     onChange={(e) => setApiKey(e.target.value)}
                   />
@@ -188,6 +201,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                   <input
                     list="suggested-models"
                     placeholder={provider.default_model || "model id"}
+                    title="The model this provider uses. Pick a suggestion or type a model id the provider offers."
                     value={model}
                     onChange={(e) => setModel(e.target.value)}
                   />
@@ -212,7 +226,15 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         </section>
 
         {error && <div className="gate-error">{error}</div>}
-        <button type="submit" disabled={!ready || busy}>
+        <button
+          type="submit"
+          disabled={!ready || busy}
+          title={
+            ready
+              ? "Save your passphrase and provider, and open the app"
+              : "Fill in every field, with a passphrase of at least 10 characters typed the same twice"
+          }
+        >
           {busy ? "Setting up…" : "Finish setup"}
         </button>
       </form>

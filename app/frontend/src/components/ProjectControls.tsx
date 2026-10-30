@@ -261,7 +261,12 @@ export function ProjectSync({
       )}
       <span className="spacer" />
       {st.has_remote && (
-        <button className="link" disabled={busy} onClick={() => act(() => postJSON(`/api/projects/${projectId}/git/pull`, {}), "pull")}>
+        <button
+          className="link"
+          disabled={busy}
+          title="Fetch and merge what others pushed to the remote"
+          onClick={() => act(() => postJSON(`/api/projects/${projectId}/git/pull`, {}), "pull")}
+        >
           Pull
         </button>
       )}
@@ -272,6 +277,13 @@ export function ProjectSync({
       <button
         className="link"
         disabled={busy || (!st.dirty && st.ahead === 0 && !(st.has_remote && st.unpublished))}
+        title={
+          !st.dirty && st.ahead === 0 && !(st.has_remote && st.unpublished)
+            ? "Nothing to commit or push"
+            : st.has_remote
+              ? "Commit every changed file with your message, then push to the remote"
+              : "Commit every changed file. With no remote, history stays on this server only."
+        }
         onClick={() => setCommitting(projectId)}
       >
         {st.has_remote ? "Commit + Push" : "Commit"}
@@ -303,7 +315,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (id: string) => voi
   const [open, setOpen] = useState(false);
   return (
     <>
-      <button className="link" onClick={() => setOpen(true)}>
+      <button className="link" title="Start a project, clone one from git, or import files" onClick={() => setOpen(true)}>
         + Project
       </button>
       {open && <NewProject onClose={() => setOpen(false)} onCreated={onCreated} />}
@@ -520,13 +532,25 @@ export function NewProject({
           </header>
           <div className="modal-body">
             <div className="seg">
-              <button className={mode === "init" ? "on" : ""} onClick={() => setMode("init")}>
+              <button
+                className={mode === "init" ? "on" : ""}
+                onClick={() => setMode("init")}
+                title="Start a new design, backed by an empty remote repository you have created"
+              >
                 New
               </button>
-              <button className={mode === "clone" ? "on" : ""} onClick={() => setMode("clone")}>
+              <button
+                className={mode === "clone" ? "on" : ""}
+                onClick={() => setMode("clone")}
+                title="Copy a design that already lives in a git repository"
+              >
                 Clone git remote
               </button>
-              <button className={mode === "import" ? "on" : ""} onClick={() => setMode("import")}>
+              <button
+                className={mode === "import" ? "on" : ""}
+                onClick={() => setMode("import")}
+                title="Upload design files or one .zip of a project. No remote needed."
+              >
                 Import files
               </button>
             </div>
@@ -609,6 +633,7 @@ export function NewProject({
                     type="button"
                     onClick={testConnection}
                     disabled={checking || !remote.trim() || (wantsToken && !token.trim())}
+                    title="Check that this URL and token reach an empty repository, before anything is created"
                   >
                     {checking ? "Testing…" : "Test connection"}
                   </button>
@@ -636,7 +661,13 @@ export function NewProject({
                   value={remote}
                   onChange={(e) => setRemote(e.target.value)}
                 />
-                <input placeholder="branch" value={branch} onChange={(e) => setBranch(e.target.value)} />
+                <input
+                  placeholder="branch"
+                  aria-label="Branch"
+                  title="Branch to clone. Leave empty for the remote's default."
+                  value={branch}
+                  onChange={(e) => setBranch(e.target.value)}
+                />
                 {cloneWarning && (
                   <div className="gate-error" role="status">
                     Cloned. {cloneWarning}
@@ -678,6 +709,8 @@ export function NewProject({
                 <input
                   type="file"
                   multiple
+                  aria-label="Files to import"
+                  title="Design files, or one .zip of the project folder"
                   onChange={(e) => {
                     setPicked(Array.from(e.target.files ?? []));
                     setSkipped([]);
@@ -718,6 +751,13 @@ export function NewProject({
             )}
             <button
               onClick={create}
+              title={
+                mode === "clone"
+                  ? "Clone the repository into a new project on this server"
+                  : mode === "import"
+                    ? "Create a project from the chosen files"
+                    : "Create the project and push its first commit to the remote"
+              }
               disabled={
                 busy ||
                 !name ||
@@ -755,12 +795,12 @@ export function NewProject({
  */
 type ProjectSettingsTab = "board" | "routing" | "git" | "policy" | "lock";
 
-const PROJECT_SETTINGS_TABS: { id: ProjectSettingsTab; label: string }[] = [
-  { id: "board", label: "Board" },
-  { id: "routing", label: "Task routing" },
-  { id: "git", label: "Git" },
-  { id: "policy", label: "Library policy" },
-  { id: "lock", label: "Auto-lock" },
+const PROJECT_SETTINGS_TABS: { id: ProjectSettingsTab; label: string; hint: string }[] = [
+  { id: "board", label: "Board", hint: "Board outline, stackup and net classes; saved as project.yaml" },
+  { id: "routing", label: "Task routing", hint: "Which model handles each task, for this project only" },
+  { id: "git", label: "Git", hint: "Remote, your token for it, commit identity and push policy" },
+  { id: "policy", label: "Library policy", hint: "Whether this project shares parts with your component library" },
+  { id: "lock", label: "Auto-lock", hint: "How long the project stays open while nobody touches it" },
 ];
 
 export function ProjectSettings({
@@ -827,6 +867,7 @@ export function ProjectSettings({
                 role="tab"
                 aria-selected={tab === t.id}
                 className={tab === t.id ? "on" : ""}
+                title={t.hint}
                 onClick={() => setTab(t.id)}
               >
                 {t.label}
@@ -1063,7 +1104,11 @@ export function CredentialPanel({ projectId, remoteUrl }: { projectId: string; r
         </p>
       )}
       {info.https && !open && (
-        <button className="link" onClick={() => setOpen(true)}>
+        <button
+          className="link"
+          title="Save an access token for this host; your pushes to it use it"
+          onClick={() => setOpen(true)}
+        >
           {info.credential ? "Replace the token…" : "Add a token…"}
         </button>
       )}
@@ -1089,7 +1134,7 @@ export function CredentialPanel({ projectId, remoteUrl }: { projectId: string; r
             />
           </label>
           {error && <p className="gate-error small">{error}</p>}
-          <button type="submit" disabled={busy || !token.trim()}>
+          <button type="submit" disabled={busy || !token.trim()} title="Stored encrypted under your passphrase">
             {busy ? "Saving…" : "Save token"}
           </button>{" "}
           <button type="button" className="link" onClick={() => setOpen(false)}>
@@ -1156,7 +1201,12 @@ export function ProjectIdentityPanel({ projectId, onSaved }: { projectId: string
       {error && <p className="gate-error small">{error}</p>}
       <div className="dialog-actions">
         {state.project && (
-          <button type="button" onClick={() => save({ name: "", email: "" })} disabled={busy}>
+          <button
+            type="button"
+            onClick={() => save({ name: "", email: "" })}
+            disabled={busy}
+            title="Commit in this project as your account-wide identity"
+          >
             Use my default
           </button>
         )}
@@ -1164,6 +1214,7 @@ export function ProjectIdentityPanel({ projectId, onSaved }: { projectId: string
           type="button"
           onClick={() => save(value)}
           disabled={busy || !value.name.trim() || !value.email.trim()}
+          title="The name and email your commits in this project carry"
         >
           Save identity
         </button>
@@ -1206,7 +1257,12 @@ export function PushPolicyPanel({
     <div className="proj-git-policy">
       <PushPolicyChoice value={value} onChange={setValue} disabled={busy} />
       {error && <p className="gate-error small">{error}</p>}
-      <button type="button" onClick={save} disabled={busy || !value || value === current}>
+      <button
+        type="button"
+        onClick={save}
+        disabled={busy || !value || value === current}
+        title="Whether commits in this project push to the remote by themselves"
+      >
         Save push policy
       </button>
     </div>
@@ -1238,7 +1294,11 @@ export function RemoteForm({
 
   if (!open) {
     return (
-      <button className="link" onClick={() => setOpen(true)}>
+      <button
+        className="link"
+        title="The repository this project pushes to and pulls from"
+        onClick={() => setOpen(true)}
+      >
         {hasRemote ? "Change remote…" : "Add a remote…"}
       </button>
     );
@@ -1280,7 +1340,7 @@ export function RemoteForm({
         Credentials for a private remote go in Account &amp; app settings → Git endpoints/accounts, per user — not in this URL.
       </p>
       {error && <p className="gate-error small">{error}</p>}
-      <button type="submit" disabled={busy || !url.trim()}>
+      <button type="submit" disabled={busy || !url.trim()} title="Use this URL as the project's remote">
         {busy ? "Saving…" : "Save remote"}
       </button>{" "}
       <button type="button" className="link" onClick={() => setOpen(false)}>

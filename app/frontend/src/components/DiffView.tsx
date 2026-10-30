@@ -60,7 +60,11 @@ function DiffFileBlock({ file }: { file: DiffFile }) {
   const canExpand = file.diff !== null;
   return (
     <div className="diff-file">
-      <button className="diff-file-head" onClick={() => canExpand && setOpen((o) => !o)}>
+      <button
+        className="diff-file-head"
+        onClick={() => canExpand && setOpen((o) => !o)}
+        title={canExpand ? (open ? "Hide this file's diff" : "Show this file's diff") : undefined}
+      >
         <span className={`status-tag ${file.status}`}>{file.status}</span>
         <code className="diff-path">{file.path}</code>
         <span className="spacer" />

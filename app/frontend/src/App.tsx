@@ -168,6 +168,7 @@ export function Workspace({ projectId, onLeave }: { projectId: string; onLeave: 
   const projectPicker = (
     <select
       aria-label="Project"
+      title="Switch project. ⚠ marks one with a problem."
       value={selected ?? ""}
       onChange={(e) => {
         // Controlled, so the select shows the old project until the
@@ -306,23 +307,27 @@ export function Workspace({ projectId, onLeave }: { projectId: string; onLeave: 
     <>
       <TabBar
         items={[
-          { id: "board", label: "Board" },
-          { id: "preflight", label: "Preflight" },
+          { id: "board", label: "Board", hint: "The emitted schematic, board and 3D view" },
+          {
+            id: "preflight",
+            label: "Preflight",
+            hint: "What the pipeline would lose or misread in your markdown. Check it after every edit.",
+          },
           // Only while a KiCad file is open. A tab that is empty most
           // of the time is a tab people learn to skip past, and the
           // Board tab already answers "show me this project's board" —
           // this one answers "show me the file I just clicked".
           ...(openFile && destinationFor(openFile) === "kicad"
-            ? [{ id: "kicad" as const, label: "KiCad" }]
+            ? [{ id: "kicad" as const, label: "KiCad", hint: "The KiCad file you opened from the tree" }]
             : []),
-          { id: "edit", label: "View/Edit" },
-          { id: "bom", label: "BOM" },
-          { id: "lifecycle", label: "Lifecycle" },
-          { id: "modules", label: "Modules" },
-          { id: "reports", label: "Reports" },
-          { id: "release", label: "Release" },
-          { id: "artifacts", label: "Artifacts" },
-          { id: "changes", label: "Changes" },
+          { id: "edit", label: "View/Edit", hint: "The open file, rendered; design documents can be edited here" },
+          { id: "bom", label: "BOM", hint: "The parts Stage 1 resolved, with CSV and purchasing exports" },
+          { id: "lifecycle", label: "Lifecycle", hint: "Each part's lifecycle status, and what you found when you checked" },
+          { id: "modules", label: "Modules", hint: "Reusable blocks lifted from finished boards, and their ports" },
+          { id: "reports", label: "Reports", hint: "Stage 7 checks, the Stage 8 review, simulation and the review panel" },
+          { id: "release", label: "Release", hint: "Build the package a fab quotes from: gerbers, drill, placement, BOMs" },
+          { id: "artifacts", label: "Artifacts", hint: "Every pipeline output in .pipeline/" },
+          { id: "changes", label: "Changes", hint: "Everything changed since the last commit, as diffs" },
         ]}
         active={tab}
         onSelect={setTab}
@@ -413,7 +418,7 @@ export function Workspace({ projectId, onLeave }: { projectId: string; onLeave: 
           <div className="modal small" onClick={(e) => e.stopPropagation()}>
             <header className="modal-head">
               <h2>Share {selected}</h2>
-              <button className="link" onClick={() => setShowSharing(false)}>
+              <button className="link" onClick={() => setShowSharing(false)} title="Close sharing">
                 Close
               </button>
             </header>

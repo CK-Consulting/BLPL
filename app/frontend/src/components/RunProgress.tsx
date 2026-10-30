@@ -57,7 +57,7 @@ export function RunProgress({ states, running, finished, exitCode, explain, onEx
         </ol>
       )}
 
-      <label className="muted small run-explain-toggle">
+      <label className="muted small run-explain-toggle" title="Show what the running stage does and what it writes">
         <input type="checkbox" checked={explain} onChange={(e) => onExplainChange(e.target.checked)} />
         Explain the active stage
       </label>

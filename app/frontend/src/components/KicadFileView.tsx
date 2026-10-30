@@ -51,6 +51,7 @@ export function KicadFileView({ projectId, path }: { projectId: string; path: st
           href={`/api/projects/${projectId}/blob?path=${encodeURIComponent(path)}`}
           target="_blank"
           rel="noreferrer"
+          title="The KiCad file as text, in a new tab"
         >
           Open the raw file
         </a>

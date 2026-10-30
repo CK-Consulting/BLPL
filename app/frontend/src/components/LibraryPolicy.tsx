@@ -53,13 +53,20 @@ export function PolicyFields({
 }) {
   const shares = value.contribute !== "never";
   const set = (patch: Partial<LibraryPolicyValues>) => onChange({ ...value, ...patch });
+  // The radiogroups were named by their field ("contribute"), which is what a
+  // screen reader announced.
+  const GROUP_LABELS: Partial<Record<keyof LibraryPolicyValues, string>> = {
+    contribute: "Contributing to the component library",
+    unique_components: "Unique components",
+    consume: "Using the component library",
+  };
 
   const radios = (
     name: keyof LibraryPolicyValues,
     options: string[],
     labels: Record<string, string>,
   ) => (
-    <div className="policy-group" role="radiogroup" aria-label={String(name)}>
+    <div className="policy-group" role="radiogroup" aria-label={GROUP_LABELS[name] ?? String(name)}>
       {options.map((opt) => (
         <label key={opt} className="policy-option">
           <input
@@ -84,7 +91,7 @@ export function PolicyFields({
       <h4>Consuming</h4>
       {radios("consume", choices.consume, CONSUME_LABELS)}
       {shares && (
-        <label className="policy-consent">
+        <label className="policy-consent" title="Contribution stays off until this is ticked">
           <input
             type="checkbox"
             checked={value.consented}
@@ -199,7 +206,7 @@ export function ProjectPolicyPanel({ projectId }: { projectId: string }) {
       <div className="row">
         {/* Named for what it saves. A bare "Save" at the foot of project
             settings was taken for the whole dialog's. */}
-        <button onClick={save} disabled={busy}>
+        <button onClick={save} disabled={busy} title="Save these library permissions for this project">
           {busy ? "…" : "Save library policy"}
         </button>
         {note && <span className="muted note">{note}</span>}

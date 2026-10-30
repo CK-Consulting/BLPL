@@ -156,10 +156,20 @@ export function ProposalCard({ projectId, proposal, onDecided }: Props) {
         <span className="spacer" />
         {status === "pending" ? (
           <>
-            <button className="link" disabled={busy} onClick={() => decide("accept")}>
+            <button
+              className="link"
+              disabled={busy}
+              onClick={() => decide("accept")}
+              title="Write this change to the file and commit it. Refused if the file changed since the proposal was made."
+            >
               Accept
             </button>
-            <button className="link" disabled={busy} onClick={() => decide("reject")}>
+            <button
+              className="link"
+              disabled={busy}
+              onClick={() => decide("reject")}
+              title="Discard this proposal. The file is not touched."
+            >
               Reject
             </button>
           </>

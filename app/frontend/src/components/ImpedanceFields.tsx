@@ -148,6 +148,18 @@ export function routeErrors(errors: string[], classNames: string[], tagCount: nu
 
 const num = (v: string): number | undefined => (v === "" ? undefined : Number(v));
 
+/** What each number means, shown on hover. Widths and gaps come from the
+ *  fab's impedance calculator for the stackup being ordered, never a guess. */
+const NUM_HINTS: Record<string, string> = {
+  "Trace width": "Track width in mm. For a controlled class, from the fab's impedance calculator for this stackup.",
+  Clearance: "Minimum gap in mm to copper of other nets",
+  "Pair width": "Width in mm of each track of a differential pair",
+  "Pair gap": "Gap in mm between the two tracks of a pair; no more than the clearance",
+  "Coplanar gap": "Gap in mm to the ground pour beside the track, which sets its impedance with the width",
+  Ohms: "Target impedance in ohms",
+  "Tolerance %": "How far the fab may miss the target, in percent",
+};
+
 function NumField({
   label: text,
   aria,
@@ -166,7 +178,7 @@ function NumField({
   onChange: (v: number | undefined) => void;
 }) {
   return (
-    <label>
+    <label title={NUM_HINTS[text]}>
       <span>{text}</span>
       <input
         type="number"
@@ -363,6 +375,7 @@ export function ImpedanceFields({
                   <button
                     className="btn"
                     type="button"
+                    title="Remove this class; its nets fall back to Default unless a rule or tag places them"
                     onClick={() => {
                       const next = { ...netClasses };
                       delete next[name];
@@ -374,7 +387,7 @@ export function ImpedanceFields({
                 )}
               </div>
               <div className="field-row">
-                <label className="inline">
+                <label className="inline" title="This class is for nets that need a set impedance; Stage 8 and the release check it">
                   <input
                     type="checkbox"
                     aria-label={`${name} controlled impedance`}
@@ -390,6 +403,7 @@ export function ImpedanceFields({
                     <label>
                       <span>Mode</span>
                       <select aria-label={`${name} mode`} value={modeOf(spec)}
+                        title="Single-ended, a differential pair, or coplanar (ground pour beside the track)"
                         onChange={(e) => set({ mode: e.target.value as ImpedanceMode })}>
                         {MODES.map((m) => (
                           <option key={m} value={m}>{MODE_LABELS[m]}</option>
@@ -421,12 +435,14 @@ export function ImpedanceFields({
           <label>
             <span>New class</span>
             <input aria-label="New net class name" placeholder="RF_50Ohm" value={newName}
+              title="Name of the class to add"
               onChange={(e) => setNewName(e.target.value)} />
           </label>
           <button
             className="btn"
             type="button"
             disabled={!trimmed || !!nameProblem}
+            title="Add a class with its own trace width and clearance. Nets join it by name rule or impedance tag."
             onClick={() => {
               // A file with no net_classes has no Default either, and the
               // schema wants Default whenever the section exists (Codex, PR #34).
@@ -475,12 +491,14 @@ export function ImpedanceFields({
                 <label>
                   <span>{prefix} nets</span>
                   <input aria-label={`${prefix} nets`} placeholder="^ANT_|_RF_(IN|OUT)$" value={tag.nets ?? ""}
+                    title="A regular expression over net names; every net it matches needs this impedance"
                     onChange={(e) => setTag(i, { ...tag, nets: e.target.value })} />
                 </label>
                 <label>
                   <span>Class</span>
                   <select
                     aria-label={`${prefix} class`}
+                    title="The class these nets go on, or By impedance to use the class declaring the same target"
                     value={tag.class ?? ""}
                     onChange={(e) => {
                       // A tag that names a class takes its target from it;
@@ -520,7 +538,7 @@ export function ImpedanceFields({
                 <NumField label="Tolerance %" aria={`${prefix} tolerance`} value={shown.tolerance_pct} step="1"
                   placeholder={String(DEFAULT_TOLERANCE)} readOnly={!!chosen}
                   onChange={(v) => setOwn("tolerance_pct", v)} />
-                <button className="btn" type="button"
+                <button className="btn" type="button" title="Remove this tag; its nets lose their impedance requirement"
                   onClick={() => onChange(netClasses, tags.filter((_, k) => k !== i))}>
                   Remove tag
                 </button>
@@ -531,11 +549,12 @@ export function ImpedanceFields({
             </div>
           );
         })}
-        <button className="btn" type="button" onClick={() => onChange(netClasses, [...tags, { nets: "" }])}>
+        <button className="btn" type="button" title="Mark nets, by name pattern, as needing a controlled impedance"
+          onClick={() => onChange(netClasses, [...tags, { nets: "" }])}>
           Add impedance tag
         </button>
         <div className="field-row">
-          <label className="inline">
+          <label className="inline" title="Off by default: a test pad on a controlled line is a stub">
             <input
               type="checkbox"
               aria-label="Test points on controlled-impedance nets"

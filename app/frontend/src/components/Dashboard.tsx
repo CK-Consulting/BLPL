@@ -107,13 +107,14 @@ export function Dashboard({ onOpen }: { onOpen: (projectId: string) => void }) {
                 </div>
               </div>
               <span className="spacer" />
-              <button disabled={busy === inv.id} onClick={() => respond(inv.id, "accept")}>
+              <button disabled={busy === inv.id} onClick={() => respond(inv.id, "accept")} title="Join this project; it appears in your list">
                 Accept
               </button>
               <button
                 className="link"
                 disabled={busy === inv.id}
                 onClick={() => respond(inv.id, "decline")}
+                title="Refuse this invitation. The owner can send another."
               >
                 Decline
               </button>
@@ -139,7 +140,11 @@ export function Dashboard({ onOpen }: { onOpen: (projectId: string) => void }) {
             <ul className="project-cards">
               {projects.map((p) => (
                 <li key={p.id}>
-                  <button className="project-card" onClick={() => onOpen(p.id)}>
+                  <button
+                    className="project-card"
+                    onClick={() => onOpen(p.id)}
+                    title={p.sealed ? "Open this project; it is unsealed as it opens" : "Open this project"}
+                  >
                     <div className="project-card-top">
                       <strong className="mono">{p.id}</strong>
                       {!p.owned && <span className="chip">shared with you</span>}
