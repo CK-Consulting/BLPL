@@ -168,7 +168,8 @@ def observed_exit(state: dict) -> int:
 
 
 def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig,
-                      image_id: str | None = None) -> dict[str, Any]:
+                      image_id: str | None = None,
+                      network_id: str | None = None) -> dict[str, Any]:
     """The exact ``POST /containers/create`` body for a workspace.
 
     Every confinement property is stated here rather than left to a daemon
@@ -178,6 +179,12 @@ def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig,
     spec digest, not the body: a rebuild keeps the tag, so with the tag alone a
     container from the old build matched the new spec and was restarted on the
     old code after every redeploy.
+
+    ``network_id`` is the same thing for the network. A restart that removes
+    and recreates it keeps the name and changes the id, and a stopped container
+    still names the old id: started, it fails with "network ... not found", and
+    the project's workspace stays unavailable until the container is removed by
+    hand.
     """
     labels = labels_for(spec.key, cfg)
     clash = set(spec.extra_labels) & (set(labels) | {LABEL_SPEC})
@@ -228,8 +235,9 @@ def build_create_body(spec: WorkspaceSpec, cfg: DockerConfig,
     }
     if spec.command:
         body["Cmd"] = list(spec.command)
-    digest = hashlib.sha256(json.dumps({**body, "_image_id": image_id or ""},
-                                       sort_keys=True).encode()).hexdigest()
+    digest = hashlib.sha256(json.dumps(
+        {**body, "_image_id": image_id or "", "_network_id": network_id or ""},
+        sort_keys=True).encode()).hexdigest()
     body["Labels"] = {**labels, LABEL_SPEC: digest[:16]}
     return body
 
@@ -375,9 +383,28 @@ class DockerDriver:
             return None
         return ident if isinstance(ident, str) and ident else None
 
+    async def _network_id(self, network: str) -> str | None:
+        """What ``network`` resolves to now, or None when the daemon cannot say.
+
+        None, like an image the daemon cannot resolve, leaves the digest as it
+        was: a missing network is for the create to report, not this lookup.
+        """
+        try:
+            resp = await self._req("GET", f"/networks/{network}", ok=(200, 404))
+        except DriverError:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            ident = resp.json().get("Id")
+        except ValueError:
+            return None
+        return ident if isinstance(ident, str) and ident else None
+
     async def ensure(self, spec: WorkspaceSpec) -> WorkspaceStatus:
         key = spec.key
-        body = build_create_body(spec, self.cfg, await self._image_id(spec.image))
+        body = build_create_body(spec, self.cfg, await self._image_id(spec.image),
+                                 await self._network_id(self.cfg.network))
         want = body["Labels"][LABEL_SPEC]
         info = await self._inspect(key)
         status = self._status_from(key, info, want)

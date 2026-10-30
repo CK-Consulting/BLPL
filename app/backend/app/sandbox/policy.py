@@ -691,6 +691,10 @@ _ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     # An image's id, for the driver to tell a rebuilt image from the one a
     # container was created from. Only images the policy lets it create.
     ("GET", re.compile(r"/images/(?P<id>[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,255})/json"), "image_inspect"),
+    # A network's id, likewise: a restart recreates the workspace network under
+    # a new id, and a stopped container still names the old one. Only the
+    # networks the policy lets a workspace join.
+    ("GET", re.compile(rf"/networks/{_ID}"), "network_inspect"),
 ]
 _VERSION = re.compile(r"^/v1\.(?P<minor>\d{1,3})(?P<rest>/.*)$")
 
