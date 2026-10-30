@@ -1126,6 +1126,17 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     Every attempt is in ``extra["attempts"]``, so the report says which
     settings the kept board came from and what the others left.
     """
+    from . import autoroute
+
+    # Every attempt's settings checked before anything touches the board. A
+    # misspelt key found in plan() came after the edge band was drawn, so the
+    # error left the band on the board and skipped run_for's report (Codex,
+    # PR #95); refused here, the board is as it was and the report says why.
+    try:
+        for extra in [{}, *(retry or [])]:
+            search_args({**(search or {}), **extra})
+    except ValueError as exc:
+        return autoroute.RouteResult(False, str(exc), pcb=str(pcb), extra={"router": "kicad-routing-tools"})
     if not retry:
         return _route_once(pcb, work_dir=work_dir, timeout=timeout,
                            class_layers=class_layers, search=search)

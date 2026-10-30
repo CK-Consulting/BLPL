@@ -1476,3 +1476,17 @@ def test_stage6a_hands_krt_the_projects_search_and_retries(tmp_path, monkeypatch
         # Freerouting takes none of it, and the run says so.
         assert seen["search"] is None and seen["retry"] is None
         assert "freerouting does not take them" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("search, retry", [({"orderring": "mps"}, None), (None, [{"ordering": "bus"}, {"seed": 3}])])
+def test_a_misspelt_setting_is_refused_before_the_board_is_touched(board, tmp_path, monkeypatch, search, retry):
+    before = board.read_text()
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    touched = []
+    monkeypatch.setattr(krt_route, "_resave", lambda *a: touched.append("resave"))
+    monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: touched.append("band"))
+    r = autoroute.run_for(board, tmp_path / "r.json", router="kicad-routing-tools", search=search, retry=retry)
+    assert not r.ok and r.attempted and "unknown setting" in r.reason
+    assert touched == [] and board.read_text() == before
+    # And the report is written, saying why.
+    assert "unknown setting" in json.loads((tmp_path / "r.json").read_text())["reason"]
