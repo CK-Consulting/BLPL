@@ -391,6 +391,13 @@ def test_image_inspect_is_limited_to_the_images_we_may_create():
     refused("GET", f"/images/{IMAGE}/json", query={"x": "1"}, match="not permitted")
 
 
+def test_network_inspect_is_limited_to_the_networks_we_may_join():
+    fwd = decide("GET", "/networks/blpl-egress")
+    assert fwd.method == "GET" and fwd.path.endswith("/networks/blpl-egress")
+    refused("GET", "/networks/bridge", match="not permitted")
+    refused("GET", "/networks/host", match="not permitted")
+
+
 def test_listing_is_narrowed_to_this_deployment():
     fwd = decide("GET", "/containers/json", query={
         "all": "1", "filters": json.dumps({"label": ["blpl.instance=staging"], "status": ["running"]})})

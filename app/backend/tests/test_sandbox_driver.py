@@ -185,6 +185,7 @@ class MockDaemon:
         self.containers: dict[str, dict] = {}
         self.volumes: dict[str, dict] = {}
         self.images: dict[str, str] = {}  # tag -> the id it resolves to now
+        self.networks: dict[str, str] = {}  # name -> the id it resolves to now
         self.calls: list[tuple[str, str]] = []
         self.owner_labels = owner_labels
 
@@ -192,6 +193,10 @@ class MockDaemon:
         path = request.url.path.split("/", 2)[2]  # strip /v1.44
         self.calls.append((request.method, "/" + path))
         parts = path.split("/")
+        if parts[0] == "networks":
+            ident = self.networks.get(parts[1])
+            return httpx.Response(200, json={"Id": ident}) if ident else httpx.Response(
+                404, json={"message": "no such network"})
         if parts[0] == "images":
             ident = self.images.get(parts[1])
             return httpx.Response(200, json={"Id": ident}) if ident else httpx.Response(
@@ -273,6 +278,25 @@ def test_a_rebuilt_image_under_the_same_tag_makes_the_workspace_stale():
     daemon.calls.clear()
     st = run(d.ensure(spec()))
     assert st.state is State.RUNNING and not st.stale   # stopped: recreated on the new build
+    assert ("DELETE", f"/containers/{'c' * 64}") in daemon.calls
+
+
+def test_a_recreated_network_makes_the_workspace_stale():
+    """A restart recreates blpl-egress under the same name and a new id. A
+    stopped workspace still named the old id, and starting it failed with
+    "network ... not found" until it was removed by hand."""
+    daemon = MockDaemon()
+    daemon.networks["blpl-egress"] = "a" * 64
+    d = driver_for(daemon)
+    run(d.ensure(spec()))
+    assert not run(d.ensure(spec())).stale              # same network: current
+    daemon.networks["blpl-egress"] = "b" * 64
+    st = run(d.ensure(spec()))
+    assert st.state is State.RUNNING and st.stale       # recreated, running: left alone
+    run(d.stop(KEY))
+    daemon.calls.clear()
+    st = run(d.ensure(spec()))
+    assert st.state is State.RUNNING and not st.stale   # stopped: recreated on the new network
     assert ("DELETE", f"/containers/{'c' * 64}") in daemon.calls
 
 
