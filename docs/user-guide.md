@@ -173,7 +173,7 @@ The hosted app is a Docker Compose stack: Postgres, the backend and a worker, th
 Worth doing before anyone relies on it:
 
 - **Back up both `app/blpl-db` (the database) and `app/data` (the files).** Neither is useful without the other. Keep `server.key` in a **different** backup from the database: together they are the lock and its key.
-- **Decide who can sign up.** BLPL keeps no allowlist of its own: anyone your Clerk instance lets sign up gets an account. A new account sees no projects it was not shared, but it can still run models on its own keys on your hardware. On a server reachable from the internet, restrict sign-ups in the Clerk dashboard (an allowlist, or invitation-only).
+- **Decide who can sign up.** BLPL keeps no allowlist of its own: anyone your Clerk instance lets sign up gets an account. A new account sees no projects it was not shared, but it can still run models on its own keys on your hardware. On a server reachable from the internet, restrict sign-ups in the Clerk dashboard. A Clerk application set up in testing (development) mode, the kind whose publishable key starts `pk_test_`, has an allowlist under its restrictions settings: list the email addresses or domains allowed to sign up, and nobody else can create an account.
 - Encrypt the disk the deployment sits on (LUKS or your host's equivalent).
 - Optional extras: a local model server with `docker compose --profile local-models up -d`; an SSH deploy key in `app/data/ssh/` for SSH git remotes; a kicad-ai-assistant server (`BLPL_KICAD_MCP`) so the chat can route and place on real boards.
 
