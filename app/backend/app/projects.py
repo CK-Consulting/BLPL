@@ -254,6 +254,17 @@ def allowed_protocols() -> list[str]:
     return [p.strip().lower() for p in raw.split(":") if p.strip()]
 
 
+#: What git prints when the remote's server failed rather than refusing the
+#: push. GitHub answered one from the app with "! [remote rejected] ...
+#: (Internal Server Error)", and the same commit went through a minute later
+#: (2026-10-30). Only these are retried: a rejection on the merits (not a
+#: fast-forward, no permission, a protected branch) comes back the same.
+_SERVER_FAILURE = re.compile(
+    r"Internal Server Error|Bad Gateway|Service Unavailable|Gateway Time-?out"
+    r"|HTTP 5\d\d|returned error: 5\d\d")
+PUSH_RETRY_PAUSE_S = 5.0
+
+
 def _net_env(env: dict[str, str] | None) -> dict[str, str]:
     """Environment for a git command that talks to a remote."""
     return {**(env or {}), "GIT_ALLOW_PROTOCOL": ":".join(allowed_protocols())}
@@ -912,7 +923,21 @@ class Projects:
         # argument-less push, whose destination pushRemote, pushDefault and a
         # branch's upstream can all redirect (see REMOTE), and not origin by
         # name either, which git would re-read (see _destination).
-        out = self._git(d, "push", "--", dest, f"{sha}:refs/heads/{branch}", env=_net_env(env))
+        args = ("push", "--", dest, f"{sha}:refs/heads/{branch}")
+        try:
+            out = self._git(d, *args, env=_net_env(env))
+        except ProjectError as exc:
+            if not _SERVER_FAILURE.search(str(exc)):
+                raise
+            # Once more, after a pause. The same commit to the same branch, so
+            # a first try that landed after all only reads as up to date.
+            time.sleep(PUSH_RETRY_PAUSE_S)
+            try:
+                out = self._git(d, *args, env=_net_env(env))
+            except ProjectError as again:
+                raise ProjectError(
+                    "the remote's server failed this push twice, which is a fault on its side, "
+                    f"not in the push; try again later. {again}") from again
         # What --set-upstream origin would have recorded, done by hand because
         # the push named a URL: origin's tracking ref, which status measures
         # publication against, and the branch's upstream.
