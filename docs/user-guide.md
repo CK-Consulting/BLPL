@@ -533,6 +533,8 @@ boundaries:
 | `silkscreen.labels` | Readable labels by part (`{BT_POS: '+'}`). | |
 | `silkscreen.marking` | The board's name and revision text, and where. | Fabs' release checks look for it. |
 | `routing.router` | `kicad-routing-tools` (default when installed) or `freerouting`. | |
+| `routing.search` | KiCad Routing Tools search settings: `ordering`, `direction`, `mps_reverse_rounds`, `max_ripup`, `ripup_blocker_select`, `max_iterations`, `heuristic_weight`. | Steer the search only, never a size, clearance or layer. Freerouting ignores them and says so. |
+| `routing.retry` | Settings to try in turn when a route leaves connections open, each from the unrouted board. | The first clean route is kept, else the one with fewest open. The report lists every attempt. |
 | `review.accept` | Findings that are true and intended, each with a reason. | Moves them to an accepted list; never hides them. |
 
 ### Placement hints
@@ -547,6 +549,21 @@ placement:
 ```
 
 Coordinates are board millimetres, origin top-left, y pointing down. A part the placer cannot fit is left unplaced and named in `hdm.yaml` (`synthesis.placement`) instead of being squeezed in.
+
+### Routing retries
+
+A dense board can route clean, then leave a net open after a change somewhere else, because the router's choices depend on everything already on the board. Rather than moving parts until it routes again, give it other ways to search:
+
+```yaml
+routing:
+  retry:
+  - {ordering: inside_out}
+  - {direction: backward}
+  - {mps_reverse_rounds: true}
+  - {ripup_blocker_select: near-target}
+```
+
+If the first route leaves anything open, the board goes back to how it was before routing and is routed again with each entry in turn. The first route with nothing open is kept, or else the one with the fewest open. Each attempt is a full route, so a long list makes a failing run slower. `autoroute_report.json` records each attempt's settings and result under `attempts`, and which one was kept.
 
 ### Controlled impedance
 

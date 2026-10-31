@@ -561,6 +561,8 @@ def run_for(
     carry: bool = True,
     router: str = "freerouting",
     class_layers: dict[str, list[str]] | None = None,
+    search: dict | None = None,
+    retry: list[dict] | None = None,
 ) -> RouteResult:
     """The pipeline step: snapshot, route, and always leave a report.
 
@@ -624,7 +626,8 @@ def run_for(
         elif router == "kicad-routing-tools":
             from . import krt_route
 
-            result = krt_route.route(pcb, work_dir=work, class_layers=class_layers)
+            result = krt_route.route(pcb, work_dir=work, class_layers=class_layers,
+                                     search=search, retry=retry)
         else:
             result = route(pcb, work_dir=work, passes=passes)
         result.snapshot = str(snapshot)

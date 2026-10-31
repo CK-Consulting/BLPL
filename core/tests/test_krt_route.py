@@ -1361,3 +1361,132 @@ def test_a_stitching_via_partway_along_a_ground_track_is_kept(tmp_path):
     assert proc.stdout.strip().splitlines()[-1] == "1 0"
     after = pcbnew.LoadBoard(str(pcb))
     assert sorted(t.GetNetname() for t in after.GetTracks() if t.Type() == pcbnew.PCB_VIA_T) == ["GND", "SIG"]
+
+
+def test_search_settings_go_on_every_track_call_and_never_the_planes(board):
+    search = {"ordering": "inside_out", "mps_reverse_rounds": True, "max_ripup": 5,
+              "heuristic_weight": 1.5, "direction": None}
+    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["In1.Cu"]},
+                           ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"], search=search)
+    tail = ["--ordering", "inside_out", "--mps-reverse-rounds", "--max-ripup", "5", "--heuristic-weight", "1.5"]
+    for s in steps:
+        if s["script"] == "route_planes.py":
+            assert "--ordering" not in s["args"]
+        else:
+            assert s["args"][-len(tail):] == tail, s
+    # Without settings the calls are exactly what they were.
+    plain = krt_route.plan(board, board.with_suffix(".kicad_pro"), {"GND": ["In1.Cu"]},
+                           ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+    assert [s["args"] for s in plain] == [s["args"][:len(s["args"]) - (0 if s["script"] == "route_planes.py" else len(tail))]
+                                          for s in steps]
+
+
+def test_a_misspelt_search_setting_is_an_error_not_a_default_route(board):
+    with pytest.raises(ValueError, match="unknown setting.*orderring"):
+        krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, ["F.Cu", "B.Cu"], search={"orderring": "mps"})
+
+
+def test_the_schema_and_the_router_flags_name_the_same_settings():
+    from blpl.core import schema
+
+    defs = json.loads((Path(krt_route.__file__).parents[2] / "schemas" / "project_config.v1.json").read_text())
+    assert set(defs["$defs"]["krt_search"]["properties"]) == set(krt_route.SEARCH_FLAGS)
+    base = {"project": {"name": "p", "dimensions": [10, 10]}}
+    schema.validate("project_config", {**base, "routing": {
+        "search": {"ordering": "bus", "max_ripup": 4},
+        "retry": [{"ordering": "inside_out"}, {"direction": "backward", "mps_reverse_rounds": True}]}})
+    for bad in ({"search": {"ordering": "random"}}, {"retry": [{"seed": 3}]}, {"search": {"track_width": 0.1}}):
+        with pytest.raises(Exception):
+            schema.validate("project_config", {**base, "routing": bad})
+
+
+def _attempts(monkeypatch, board, opens):
+    """_route_once stubbed: attempt i finds the board as it was before routing,
+    writes its own copper, and leaves opens[i] connections open (None: fails)."""
+    original = board.read_text()
+    calls = []
+
+    def once(pcb, *, work_dir, timeout, class_layers, search):
+        i = len(calls)
+        calls.append((search, pcb.read_text() == original))
+        pcb.write_text(f"routed by attempt {i}")
+        if opens[i] is None:
+            return autoroute.RouteResult(False, f"route.py exited 1 on attempt {i}", pcb=str(pcb))
+        return autoroute.RouteResult(True, "", pcb=str(pcb), unrouted=opens[i], extra={"router": "kicad-routing-tools"})
+
+    monkeypatch.setattr(krt_route, "_route_once", once)
+    return calls
+
+
+def test_retries_start_from_the_unrouted_board_and_stop_at_the_first_clean_route(board, tmp_path, monkeypatch):
+    calls = _attempts(monkeypatch, board, [2, None, 0, 0])
+    r = krt_route.route(board, work_dir=tmp_path / "w", search={"max_ripup": 4},
+                        retry=[{"ordering": "inside_out"}, {"direction": "backward"}, {"ordering": "bus"}])
+    assert r.ok and r.unrouted == 0 and r.extra["kept_attempt"] == 2
+    assert board.read_text() == "routed by attempt 2"
+    # Each retry is laid over the base settings, on the board as it was.
+    assert calls == [({"max_ripup": 4}, True), ({"max_ripup": 4, "ordering": "inside_out"}, True),
+                     ({"max_ripup": 4, "direction": "backward"}, True)]
+    assert [(a["ok"], a["unrouted"]) for a in r.extra["attempts"]] == [(True, 2), (False, None), (True, 0)]
+    assert "exited 1" in r.extra["attempts"][1]["reason"]
+
+
+def test_with_no_clean_route_the_fewest_open_is_kept_the_earliest_on_a_tie(board, tmp_path, monkeypatch):
+    _attempts(monkeypatch, board, [3, 1, 2, 1])
+    r = krt_route.route(board, work_dir=tmp_path / "w", retry=[{"ordering": "bus"}, {"ordering": "original"},
+                                                              {"direction": "backward"}])
+    assert r.ok and r.unrouted == 1 and r.extra["kept_attempt"] == 1
+    assert board.read_text() == "routed by attempt 1" and len(r.extra["attempts"]) == 4
+
+
+def test_without_retries_the_board_is_routed_once(board, tmp_path, monkeypatch):
+    calls = _attempts(monkeypatch, board, [2])
+    r = krt_route.route(board, work_dir=tmp_path / "w", search={"ordering": "bus"})
+    assert r.unrouted == 2 and "attempts" not in r.extra and calls == [({"ordering": "bus"}, True)]
+
+
+def test_retries_stop_when_the_router_is_not_there_to_try(board, tmp_path, monkeypatch):
+    monkeypatch.setattr(krt_route, "available", lambda: (False, "KiCad Routing Tools is not installed"))
+    r = krt_route.route(board, work_dir=tmp_path / "w", retry=[{"ordering": "bus"}, {"ordering": "original"}])
+    assert not r.attempted and "not installed" in r.reason
+
+
+@pytest.mark.parametrize("router, handed", [("kicad-routing-tools", True), ("freerouting", False)])
+def test_stage6a_hands_krt_the_projects_search_and_retries(tmp_path, monkeypatch, capsys, router, handed):
+    import argparse
+
+    from blpl.core import cli
+
+    (tmp_path / "project.yaml").write_text(
+        "project: {name: p, dimensions: [10, 10]}\n"
+        f"routing: {{router: {router}, search: {{ordering: bus}}, retry: [{{direction: backward}}]}}\n")
+    pipe = tmp_path / ".pipeline"
+    pipe.mkdir()
+    pcb = pipe / "p.kicad_pcb"
+    pcb.write_text("(kicad_pcb)")
+    seen = {}
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(cli, "_newest_emitted", lambda *a: pcb)
+    monkeypatch.setattr(autoroute, "run_for", lambda *a, **k: seen.update(k) or autoroute.RouteResult(
+        False, "stub", attempted=False, pcb=str(pcb)))
+    assert cli._cmd_autoroute(argparse.Namespace(project_dir=str(tmp_path), board=None, passes=1)) == 0
+    if handed:
+        assert seen["search"] == {"ordering": "bus"} and seen["retry"] == [{"direction": "backward"}]
+    else:
+        # Freerouting takes none of it, and the run says so.
+        assert seen["search"] is None and seen["retry"] is None
+        assert "freerouting does not take them" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("search, retry", [({"orderring": "mps"}, None), (None, [{"ordering": "bus"}, {"seed": 3}])])
+def test_a_misspelt_setting_is_refused_before_the_board_is_touched(board, tmp_path, monkeypatch, search, retry):
+    before = board.read_text()
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    touched = []
+    monkeypatch.setattr(krt_route, "_resave", lambda *a: touched.append("resave"))
+    monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: touched.append("band"))
+    r = autoroute.run_for(board, tmp_path / "r.json", router="kicad-routing-tools", search=search, retry=retry)
+    assert not r.ok and r.attempted and "unknown setting" in r.reason
+    assert touched == [] and board.read_text() == before
+    # And the report is written, saying why.
+    assert "unknown setting" in json.loads((tmp_path / "r.json").read_text())["reason"]

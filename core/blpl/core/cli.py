@@ -1180,9 +1180,17 @@ def _router(args: argparse.Namespace, proj: Path) -> str:
     where Freerouting stalled at 53 open; Freerouting stays as the backup and
     can still be named outright.
     """
-    import yaml
-
     from . import krt_route
+
+    named = _routing(args, proj).get("router")
+    if named:
+        return str(named)
+    return "kicad-routing-tools" if krt_route.available()[0] else "freerouting"
+
+
+def _routing(args: argparse.Namespace, proj: Path) -> dict:
+    """project.yaml's routing section, {} when it has none or cannot be read."""
+    import yaml
 
     path = _project_config(args, proj)
     try:
@@ -1190,10 +1198,7 @@ def _router(args: argparse.Namespace, proj: Path) -> str:
     except (OSError, yaml.YAMLError):
         cfg = {}
     routing = cfg.get("routing") if isinstance(cfg, dict) else None
-    named = (routing or {}).get("router")
-    if named:
-        return str(named)
-    return "kicad-routing-tools" if krt_route.available()[0] else "freerouting"
+    return routing if isinstance(routing, dict) else {}
 
 
 def _cmd_autoroute(args: argparse.Namespace) -> int:
@@ -1227,8 +1232,16 @@ def _cmd_autoroute(args: argparse.Namespace) -> int:
         from . import krt_route
 
         class_layers = krt_route.impedance_layers(yaml.safe_load(hdm_path.read_text(encoding="utf-8")))
+    # The search settings and retries are KRT's flags. Freerouting has its
+    # passes and nothing else, so for it they are said, not silently dropped.
+    routing = _routing(args, proj)
+    search, retry = routing.get("search"), routing.get("retry")
+    if router != "kicad-routing-tools" and (search or retry):
+        print("autoroute: routing.search and routing.retry are KiCad Routing Tools settings; "
+              f"{router} does not take them")
+        search = retry = None
     result = autoroute.run_for(pcb, report_path, passes=args.passes, work_dir=work, router=router,
-                               class_layers=class_layers)
+                               class_layers=class_layers, search=search, retry=retry)
     if not result.attempted:
         print(f"autoroute: skipped — {result.reason}")
         print(f"           wrote {report_path}")
@@ -1243,6 +1256,12 @@ def _cmd_autoroute(args: argparse.Namespace) -> int:
     left = f", {result.unrouted} connection(s) still open" if result.unrouted is not None else ""
     how = "with KiCad Routing Tools" if router == "kicad-routing-tools" else f"in {result.passes} passes"
     print(f"autoroute: routed {pcb.name} {how}{left}")
+    attempts = (result.extra or {}).get("attempts")
+    if attempts:
+        kept = result.extra.get("kept_attempt", 0)
+        tried = ", ".join("failed" if not a["ok"] else str(a["unrouted"]) for a in attempts)
+        print(f"           kept attempt {kept + 1} of {len(attempts)} ({attempts[kept]['search'] or 'defaults'}); "
+              f"open per attempt: {tried}")
     print(f"           snapshot {result.snapshot}")
     print(f"           wrote {report_path}")
     # The route changed the board in place; the tracked copy follows it.
