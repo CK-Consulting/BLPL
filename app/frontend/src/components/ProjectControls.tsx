@@ -259,7 +259,10 @@ export function ProjectSync({
           local only
         </span>
       )}
-      <span className="spacer" />
+      {/* No spacer before the buttons: it pushed Pull and Commit + Push to the
+          far edge of the strip, away from the statuses they act on ("1 commit
+          not pushed", "push failed"), with the note about their result back at
+          the far edge too. */}
       {st.has_remote && (
         <button
           className="link"

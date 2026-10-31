@@ -206,3 +206,52 @@ def test_diff_is_clean_on_a_fresh_clone(tmp_path: Path, projects: Projects) -> N
     remote = _make_remote(tmp_path)
     projects.clone("dev04", f"file://{remote}", "main")
     assert projects.diff("dev04") == {"clean": True, "files": []}
+
+
+def _hooked_clone(tmp_path: Path, projects: Projects, hook: str) -> tuple[Path, Path]:
+    """A clone one commit ahead of a remote whose pre-receive hook is ``hook``,
+    and the file the hook counts its runs in."""
+    remote = _make_remote(tmp_path)
+    runs = tmp_path / "hook-runs"
+    script = remote / "hooks" / "pre-receive"
+    script.write_text(f"#!/bin/sh\necho run >> '{runs}'\n{hook}\n")
+    script.chmod(0o755)
+    d = projects.clone("dev04", f"file://{remote}", "main")
+    (d / "design.md").write_text("# design\npushed change\n")
+    projects.commit_all("dev04", "to push", identity=IDENT)
+    return d, runs
+
+
+def test_a_push_the_server_fails_is_tried_once_more(tmp_path: Path, projects: Projects, monkeypatch) -> None:
+    # What GitHub said to a push from the app on 2026-10-30; the same commit
+    # went through on the next try.
+    import app.projects as mod
+
+    monkeypatch.setattr(mod, "PUSH_RETRY_PAUSE_S", 0)
+    _, runs = _hooked_clone(tmp_path, projects, (
+        f"if [ $(wc -l < '{tmp_path / 'hook-runs'}') -eq 1 ]; then "
+        "echo 'Internal Server Error' >&2; exit 1; fi; exit 0"))
+    projects.push("dev04")
+    assert len(runs.read_text().splitlines()) == 2
+    assert projects.status("dev04").ahead == 0
+
+
+def test_a_server_that_fails_twice_is_named_as_the_fault(tmp_path: Path, projects: Projects, monkeypatch) -> None:
+    import app.projects as mod
+
+    monkeypatch.setattr(mod, "PUSH_RETRY_PAUSE_S", 0)
+    _, runs = _hooked_clone(tmp_path, projects, "echo 'Internal Server Error' >&2; exit 1")
+    with pytest.raises(ProjectError, match="server failed this push twice.*Internal Server Error"):
+        projects.push("dev04")
+    assert len(runs.read_text().splitlines()) == 2
+
+
+def test_a_push_refused_on_its_merits_is_not_retried(tmp_path: Path, projects: Projects, monkeypatch) -> None:
+    import app.projects as mod
+
+    monkeypatch.setattr(mod, "PUSH_RETRY_PAUSE_S", 0)
+    _, runs = _hooked_clone(tmp_path, projects, "echo 'protected branch: pushes are not allowed' >&2; exit 1")
+    with pytest.raises(ProjectError, match="protected branch") as caught:
+        projects.push("dev04")
+    assert "twice" not in str(caught.value)
+    assert len(runs.read_text().splitlines()) == 1
