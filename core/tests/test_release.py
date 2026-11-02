@@ -659,3 +659,35 @@ def test_the_release_reads_the_colours_from_the_boards_hdm(tmp_path) -> None:
     hdm.write_text("project: {name: p}\n", encoding="utf-8")
     assert release._fabrication(hdm) == {}
     assert release._fabrication(tmp_path / "missing.yaml") == {}
+
+
+@pytest.mark.parametrize("text", ["- item\n", "project: [1, 2]\n",
+                                  "project: {stackup: {layers: four}}\n",
+                                  "fabrication: [mask]\n", "net_classes: {Default: {clearance: wide}}\n"])
+def test_a_malformed_hdm_fails_board_specs_without_raising(tmp_path, text) -> None:
+    """A hand-edited hdm.yaml that YAML parses but this cannot read raised out
+    of build(), so no manifest, refusal notice or zip was written; it fails
+    this one step instead (Codex, PR #98)."""
+    hdm = tmp_path / "hdm.yaml"
+    hdm.write_text(text, encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    step = release.write_board_specs(None, hdm, out, board="b", impedance_sheet=False)
+    assert not step.ok and "hdm.yaml" in step.detail
+    assert not (out / "board-specs.md").exists()
+
+
+def test_a_malformed_hdm_still_gets_a_package(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    from blpl.core import project_manifest
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    hdm = project_manifest.artifact_path(proj, "hdm", board=None, suffix="yaml")
+    hdm.parent.mkdir(parents=True, exist_ok=True)
+    hdm.write_text("- item\n", encoding="utf-8")
+    manifest = release.build(proj, now="2026-08-12_120000Z")
+    assert "board-specs" in manifest["incomplete"]
+    assert any(s["step"] == "board-specs" and "not a mapping" in s["detail"]
+               for s in manifest["steps"])
+    assert (proj / "release" / "latest.zip").is_file()
