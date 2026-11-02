@@ -276,12 +276,14 @@ def test_footprints_still_naming_a_removed_layer_load_and_export(tmp_path):
     import zipfile
 
     fixture = Path(__file__).parent / "fixtures" / "footprint_flip" / "kicad_placed.kicad_pcb"
-    text = fixture.read_text(encoding="utf-8")
-    assert '"F.Mask"' in text and "F.SilkS" in text
-    for name in ("F.Mask", "B.Mask", "F.SilkS", "B.SilkS"):
-        rows = [ln for ln in text.splitlines() if f'"{name}" user' in ln and ln.strip().startswith("(")]
-        assert len(rows) == 1, name
-        text = text.replace(rows[0] + "\n", "")
+    node = sexpr.parse(fixture.read_text(encoding="utf-8"))
+    table = sexpr.find(node, "layers")
+    gone = {"F.Mask", "B.Mask", "F.SilkS", "B.SilkS"}
+    kept = [row for row in table[1:] if sexpr.unquote(row[1]) not in gone]
+    assert len(table) - 1 - len(kept) == len(gone)
+    table[1:] = kept
+    text = sexpr.dump_top(node)
+    assert '"F.Mask"' in text, "the pads should still name the removed layer"
     board = tmp_path / "b.kicad_pcb"
     board.write_text(text, encoding="utf-8")
     odb = tmp_path / "b-odb.zip"
@@ -291,3 +293,19 @@ def test_footprints_still_naming_a_removed_layer_load_and_export(tmp_path):
     names = [n.lower() for n in zipfile.ZipFile(odb).namelist()]
     assert any("/layers/f.cu/" in n for n in names)
     assert not [n for n in names if "/layers/" in n and ("mask" in n or "silk" in n)]
+
+
+@pytest.mark.parametrize("copper", [2, 4])
+def test_a_board_with_no_mask_still_adds_up_to_its_thickness(tmp_path, copper):
+    """The mask's 0.01 mm a side went unused when the mask did: a 1.6 mm board
+    emitted 1.58 mm of layers (Codex, PR #99)."""
+    layers, _ = _layers(pcb.build(_fab({"mask_color": "none"}, {"layers": copper, "thickness": 1.6}),
+                                  footprints_root=tmp_path))
+    assert "F.Mask" not in [n for n, _, _ in layers]
+    assert sum(th for _, _, th in layers) == pytest.approx(1.6, abs=1e-3)
+
+
+def test_a_given_core_is_checked_against_the_board_with_no_mask(tmp_path):
+    """1.6 mm less two 1 oz layers is 1.53 mm of core when there is no mask."""
+    _layers(pcb.build(_fab({"mask_color": "none"}, {"layers": 2, "thickness": 1.6, "core": 1.53}),
+                      footprints_root=tmp_path))

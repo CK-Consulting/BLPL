@@ -1404,7 +1404,10 @@ def _stackup(project: dict, copper: int, thickness: float,
         kinds = ["prepreg" if i % 2 == 0 else "core" for i in range(gaps)]
         cores = kinds.count("core")
     n_pp = kinds.count("prepreg")
-    room = thickness - 2 * _MASK - copper_mm
+    # A board ordered without mask has none to take thickness from: the
+    # dielectric gets it, or the layers would no longer add up (Codex, PR #99).
+    masks = 0 if mask == "none" else 2
+    room = thickness - masks * _MASK - copper_mm
     given_pp, given_core = st.get("prepreg"), st.get("core")
 
     def refuse(why: str) -> ValueError:
