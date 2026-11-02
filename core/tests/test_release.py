@@ -497,3 +497,23 @@ def test_circuithub_takes_one_design_and_a_second_board_is_refused(project, monk
 def test_circuithub_without_a_published_project_says_what_to_run(tmp_path) -> None:
     step = release.export_circuithub(None, tmp_path / "bom.json", tmp_path, "x")
     assert not step.ok and "Stage 6" in step.detail
+
+
+def test_one_mpn_from_two_manufacturers_stays_two_circuithub_lines(tmp_path) -> None:
+    """Grouped on MPN and value alone, U2 was ordered from U1's maker."""
+    import csv as _csv
+    import io
+    kicad = tmp_path / "kicad"
+    kicad.mkdir()
+    for ext in ("kicad_pro", "kicad_pcb", "kicad_sch"):
+        (kicad / f"b.{ext}").write_text("x\n", encoding="utf-8")
+    bom = tmp_path / "bom.json"
+    bom.write_text(json.dumps([
+        {"refdes": "U1", "mpn": "LM358", "value": "LM358", "manufacturer": "Texas Instruments"},
+        {"refdes": "U2", "mpn": "LM358", "value": "LM358", "manufacturer": "STMicroelectronics"},
+    ]), encoding="utf-8")
+    assert release.export_circuithub(kicad, bom, tmp_path / "out", "b").ok
+    with zipfile.ZipFile(tmp_path / "out" / "circuithub" / "b-circuithub.zip") as zf:
+        rows = list(_csv.DictReader(io.StringIO(zf.read("b-bom.csv").decode())))
+    assert {(r["Reference Designators"], r["Manufacturer"]) for r in rows} == {
+        ("U1", "Texas Instruments"), ("U2", "STMicroelectronics")}

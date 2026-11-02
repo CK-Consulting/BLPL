@@ -297,10 +297,12 @@ def export_circuithub(kicad_dir: Path | None, bom_json: Path, out_dir: Path, nam
         mpn = str(row.get("mpn") or row.get("part_hint") or "").strip()
         value = str(row.get("value") or "").strip()
         dnp = "dnp" if ref in (not_fitted or set()) else ""
-        entry = grouped.setdefault((mpn, value, dnp), {
+        maker = str(row.get("manufacturer") or row.get("manufacturer_hint") or "").strip()
+        # The manufacturer is part of what is ordered: one MPN from two makers
+        # is two lines, or one of them silently becomes the other (Codex, PR #97).
+        entry = grouped.setdefault((mpn, value, maker, dnp), {
             "refs": [], "Manufacturer Part Number": mpn, "Value": value, "DNP": dnp,
-            "Manufacturer": str(row.get("manufacturer") or row.get("manufacturer_hint") or ""),
-            "Description": str(row.get("description") or ""),
+            "Manufacturer": maker, "Description": str(row.get("description") or ""),
         })
         entry["refs"].append(ref)
 
@@ -317,7 +319,7 @@ def export_circuithub(kicad_dir: Path | None, bom_json: Path, out_dir: Path, nam
             zf.write(path, path.name)
         zf.writestr(f"{name}-bom.csv", buf.getvalue())
 
-    missing = sum(1 for (mpn, _v, dnp) in grouped if not mpn and not dnp)
+    missing = sum(1 for (mpn, _v, _m, dnp) in grouped if not mpn and not dnp)
     detail = (f"{missing} fitted line item(s) have no MPN; CircuitHub will ask about them"
               if missing else "")
     return Step("circuithub", True, detail, [archive.name])
