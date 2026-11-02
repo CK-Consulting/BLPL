@@ -657,6 +657,20 @@ export type ImpedanceTag = {
   class?: string;
 };
 
+/** The `fabrication:` block of project.yaml. Every key is optional: one left
+ *  out is printed in board-specs.md as not specified, so the fab's standard
+ *  applies. `false` is an answer ("no gold fingers"), not an absence. */
+export type Fabrication = {
+  copper_oz?: { outer?: number; inner?: number };
+  material?: string;
+  tg_c?: number;
+  mask_color?: string;
+  silk_color?: string;
+  gold_fingers?: false | { bevel_deg?: number };
+  via_protection?: string;
+  castellated?: boolean;
+};
+
 export type BoardConfig = {
   board: string;
   exists: boolean;
@@ -680,6 +694,8 @@ export type BoardConfig = {
     net_classes?: Record<string, NetClass>;
     /** Which nets need controlled impedance, by name. */
     controlled_impedance?: ImpedanceTag[];
+    /** What the fab builds the bare board from; printed in board-specs.md. */
+    fabrication?: Fabrication;
     [k: string]: unknown;
   };
   /** The pipeline's own schema, so the form's fields cannot drift from it. */
