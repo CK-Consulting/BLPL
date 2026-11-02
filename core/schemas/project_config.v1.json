@@ -233,6 +233,100 @@
         }
       }
     },
+    "fabrication": {
+      "description": "What the fab builds the bare board from, beyond what the gerbers show: written into the board's KiCad stackup where KiCad has a place for it, and into board-specs.md at the root of every release package for the quoting sites that read none of it from a KiCad file. Every key is optional; one left out is printed as not specified, so the fab's standard applies.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "copper_oz": {
+          "description": "Finished copper weight in ounces per square foot. Default 1 outer, 0.5 inner.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outer": {
+              "type": "number",
+              "minimum": 0.25,
+              "maximum": 6
+            },
+            "inner": {
+              "type": "number",
+              "minimum": 0.25,
+              "maximum": 6
+            }
+          }
+        },
+        "material": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Laminate, e.g. FR-4, FR-4 High Tg, Rogers RO4350B, polyimide, aluminium. Default FR-4."
+        },
+        "tg_c": {
+          "type": "number",
+          "minimum": 100,
+          "maximum": 400,
+          "description": "Minimum glass transition temperature of the laminate, in degrees C (e.g. 130, 150, 170)."
+        },
+        "mask_color": {
+          "enum": [
+            "green",
+            "red",
+            "blue",
+            "purple",
+            "black",
+            "white",
+            "yellow",
+            "none"
+          ],
+          "description": "Solder mask colour; none for no mask."
+        },
+        "silk_color": {
+          "enum": [
+            "white",
+            "black",
+            "yellow",
+            "none"
+          ],
+          "description": "Silkscreen colour; none for no silkscreen."
+        },
+        "gold_fingers": {
+          "description": "Hard gold edge-connector fingers. false (the default) for none; an object when the board has them.",
+          "oneOf": [
+            {
+              "const": false
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "bevel_deg": {
+                  "enum": [
+                    0,
+                    20,
+                    30,
+                    45
+                  ],
+                  "description": "Bevel angle on the connector edge; 0 for none."
+                }
+              }
+            }
+          ]
+        },
+        "via_protection": {
+          "enum": [
+            "none",
+            "tented",
+            "plugged",
+            "filled",
+            "filled_capped"
+          ],
+          "description": "How vias are protected, as IPC-4761 types: tented (Type I), plugged (Type III), filled (Type V, non-conductive fill), filled_capped (Type VII, filled and plated over, for via-in-pad)."
+        },
+        "castellated": {
+          "type": "boolean",
+          "description": "Plated half-holes along the board edge, for mounting it as a module."
+        }
+      }
+    },
     "silkscreen": {
       "description": "What the board's silkscreen carries (core/blpl/emitter/silk.py).",
       "type": "object",

@@ -132,3 +132,91 @@ def test_the_stackup_always_adds_up_to_the_declared_thickness(tmp_path, copper):
 def test_a_stackup_that_cannot_fit_is_refused(tmp_path):
     with pytest.raises(ValueError, match="per dielectric"):
         pcb.build(_hdm({"layers": 12, "thickness": 0.6}), footprints_root=tmp_path)
+
+
+
+# -- fabrication ---------------------------------------------------------------
+
+
+def _fab(fabrication: dict, stackup: dict | None = None):
+    h = _hdm(stackup or {"layers": 4, "thickness": 1.6, "finish": "ENIG"})
+    h["fabrication"] = fabrication
+    return h
+
+
+def test_no_fabrication_section_emits_the_board_exactly_as_before(tmp_path):
+    """Every existing project has no fabrication: its board must not change."""
+    plain = pcb.emit(_hdm({"layers": 4, "thickness": 1.6, "finish": "ENIG"}), footprints_root=tmp_path)
+    assert pcb.emit(_fab({}), footprints_root=tmp_path) == plain
+    assert "(color" not in plain and "edge_connector" not in plain and '"FR4"' in plain
+
+
+def test_copper_weight_laminate_and_colours_reach_the_stackup(tmp_path):
+    layers, st = _layers(pcb.build(_fab({"copper_oz": {"outer": 2, "inner": 1},
+                                         "material": "FR-4 High Tg", "mask_color": "black",
+                                         "silk_color": "white"}), footprints_root=tmp_path))
+    cu = {n: th for n, t, th in layers if t == "copper"}
+    assert cu["F.Cu"] == pytest.approx(0.07) and cu["In1.Cu"] == pytest.approx(0.035)
+    # Heavier copper still adds up to the declared thickness: the dielectric gives way.
+    assert sum(th for _, _, th in layers) == pytest.approx(1.6, abs=1e-3)
+    text = sexpr.dump(st)
+    assert '"FR-4 High Tg"' in text and '"FR4"' not in text
+    assert text.count('(color "Black")') == 2 and text.count('(color "White")') == 2
+
+
+def test_gold_fingers_and_castellation_become_kicads_edge_flags(tmp_path):
+    _layers_, st = _layers(pcb.build(_fab({"gold_fingers": {"bevel_deg": 30}, "castellated": True}),
+                                     footprints_root=tmp_path))
+    assert sexpr.find(st, "edge_connector")[1] == "bevelled"
+    assert sexpr.find(st, "edge_plating")[1] == "yes"
+    _l, flat = _layers(pcb.build(_fab({"gold_fingers": {"bevel_deg": 0}}), footprints_root=tmp_path))
+    assert sexpr.find(flat, "edge_connector")[1] == "yes"
+
+
+@pytest.mark.parametrize("protection, want", [
+    ("none", {"tenting": ["no", "no"]}),
+    ("plugged", {"tenting": ["yes", "yes"], "plugging": ["yes", "yes"]}),
+    ("filled_capped", {"filling": "yes", "capping": "yes"}),
+])
+def test_via_protection_is_kicads_ipc_4761_setting(tmp_path, protection, want):
+    setup = sexpr.find(pcb.build(_fab({"via_protection": protection}), footprints_root=tmp_path), "setup")
+    for key, value in want.items():
+        node = sexpr.find(setup, key)
+        if isinstance(value, list):
+            assert [sexpr.find(node, side)[1] for side in ("front", "back")] == value
+        else:
+            assert node[1] == value
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None, reason="needs kicad-cli")
+def test_kicad_keeps_every_fabrication_setting(tmp_path):
+    """Written in a form KiCad reads: a board it loads and saves again still
+    says the same thing (a castellated_pads flag did not survive this)."""
+    board = tmp_path / "b.kicad_pcb"
+    board.write_text(pcb.emit(_fab({"copper_oz": {"outer": 2}, "material": "FR-4 High Tg",
+                                    "mask_color": "black", "silk_color": "white",
+                                    "gold_fingers": {"bevel_deg": 30}, "castellated": True,
+                                    "via_protection": "filled_capped"}), footprints_root=tmp_path))
+    proc = subprocess.run(["kicad-cli", "pcb", "upgrade", "--force", str(board)],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    text = " ".join(board.read_text().split())
+    for want in ('(color "Black")', '(color "White")', '(material "FR-4 High Tg")', "(thickness 0.07)",
+                 "(edge_connector bevelled)", "(edge_plating yes)", "(capping yes)", "(filling yes)"):
+        assert want in text, want
+
+
+def test_the_schema_takes_fabrication_and_refuses_what_a_fab_cannot_read():
+    from blpl.core import schema
+
+    def cfg(**fab):
+        return {"project": {"name": "p", "dimensions": [10, 10]}, "fabrication": fab}
+
+    schema.validate("project_config", cfg(copper_oz={"outer": 1, "inner": 0.5}, tg_c=170,
+                                          mask_color="black", gold_fingers=False,
+                                          via_protection="plugged", castellated=True))
+    schema.validate("project_config", cfg(gold_fingers={"bevel_deg": 20}))
+    for bad in ({"mask_color": "pink"}, {"via_protection": "glued"}, {"copper_oz": {"outer": 9}},
+                {"gold_fingers": True}, {"tg_c": 20}, {"colour": "green"}):
+        with pytest.raises(Exception):
+            schema.validate("project_config", cfg(**bad))

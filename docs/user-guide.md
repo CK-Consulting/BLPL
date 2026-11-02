@@ -358,7 +358,7 @@ Mermaid diagrams (in files and in chat) can be panned by dragging and zoomed wit
 
 | Tab | What you set |
 |---|---|
-| **Board** | Outline (rectangle, circle, polygon, trapezoid) with a live preview, cutouts and keepouts (optionally following a part), stackup, net classes with optional controlled impedance, impedance tags, test points on controlled nets. Saves `project.yaml`; re-run Stage 5 afterwards. |
+| **Board** | Outline (rectangle, circle, polygon, trapezoid) with a live preview, cutouts and keepouts (optionally following a part), stackup, net classes with optional controlled impedance, impedance tags, test points on controlled nets, and fabrication details (copper weight, laminate, Tg, mask and silk colour, via protection, gold fingers, castellation). Saves `project.yaml`; re-run Stage 5 afterwards. |
 | **Task routing** | Per-project overrides of which endpoint handles chat, stage0, stage1, vision and the review panel. |
 | **Git** | Remote, your token for its host, commit identity, push policy. |
 | **Library policy** | Contribute to and consume from your component library. |
@@ -491,6 +491,16 @@ project:
     thickness: 1.6
     finish: ENIG
 
+fabrication:                    # optional; every key left out is "not specified" in board-specs.md
+  copper_oz: {outer: 1, inner: 0.5}
+  material: FR-4
+  tg_c: 150
+  mask_color: green             # green, red, blue, purple, black, white, yellow, none
+  silk_color: white             # white, black, yellow, none
+  gold_fingers: false           # or {bevel_deg: 30}; 0, 20, 30 or 45
+  via_protection: tented        # none, tented, plugged, filled, filled_capped
+  castellated: false
+
 net_classes:
   Default:                      # must exist
     trace_width: 0.2
@@ -515,6 +525,7 @@ boundaries:
 | Section | What it controls | Notes |
 |---|---|---|
 | `project` | Name, board ID, dimensions, stackup (`layers`, `thickness`, `finish`, optional `prepreg`, `core`, `er`). | Prepreg and dielectric constant set outer-layer impedance; take them from the fab's stackup. |
+| `fabrication` | What the fab builds the bare board from: copper weight (`copper_oz.outer`, `.inner`), laminate (`material`), `tg_c`, `mask_color`, `silk_color`, `gold_fingers` (with bevel), `via_protection` (IPC-4761), `castellated`. | Written into the KiCad stackup where KiCad has a place for it, and into `board-specs.md` in every release package. Leave a key out and it is listed as not specified, so the fab's standard applies; `false` means no. |
 | `net_classes` | Width, clearance, via size per class; optional `impedance`, `diff_pair_gap`, `coplanar_gap`. | `Default` is mandatory. |
 | `net_class_rules` | Name patterns that override Stage 4's guess. First match wins. | Use when a net lands in the wrong class. |
 | `controlled_impedance` | Which nets need controlled impedance and at what target. | Regex over net names. 50 ohm single-ended by default. See below. |
@@ -682,7 +693,9 @@ If several endpoints are routed to `review_panel`, each reviews the same evidenc
 
 ### Release package
 
-The Release tab (or `python -m blpl.core.release`) builds one zip per board with gerbers for every copper layer, drill files, placement, a BOM grouped by part, the native KiCad project, `fab/impedance.md` when nets are controlled, and a checksum for every file.
+The Release tab (or `python -m blpl.core.release`) builds one zip per board with gerbers for every copper layer, drill files, placement, a BOM grouped by part, the native KiCad project, `fab/impedance.md` when nets are controlled, `board-specs.md`, and a checksum for every file.
+
+`board-specs.md` sits at the root of the package and lists, in one table, what a quote form asks for and none of the quoting sites read from KiCad files: copper layers, board size, finished thickness, laminate and Tg, inner and outer copper weight, surface finish, mask and silkscreen colour, gold fingers and bevel, via protection, castellated edges, whether impedance is controlled, and the board's minimum trace, spacing and drill. The minimum trace and drill are measured on the routed board (vias, plated and unplated holes, the short side of a slot); on a board with no tracks yet they come from the net classes, and the table says so. Spacing is the smallest net-class clearance. Everything `project.yaml` leaves unset is listed again under **Not specified**, so you can see which boxes on the form are the fab's choice rather than yours. Set them in `fabrication:` or on the Board tab.
 
 Tick **Include ODB++ package as a .zip file** (or pass `--odb`) and the package also holds `odb/<project>-odb.zip`: the whole board as one ODB++ job (layer matrix, stackup, copper, drill, components and nets), which many fabs' CAM reads in place of gerbers, drill and placement. It is exported by `kicad-cli` (KiCad 9 or later) at six decimal places of a millimetre, and the release opens it to check it holds a layer matrix and a step with layers in it before calling the step done.
 

@@ -325,6 +325,183 @@ def export_circuithub(kicad_dir: Path | None, bom_json: Path, out_dir: Path, nam
     return Step("circuithub", True, detail, [archive.name])
 
 
+# -- board-specs.md ----------------------------------------------------------
+
+_MIL = 0.0254
+_VIA_TYPES = {
+    "none": "untented: vias left open both sides",
+    "tented": "tented, IPC-4761 Type I",
+    "plugged": "plugged, IPC-4761 Type III",
+    "filled": "filled with non-conductive paste, IPC-4761 Type V",
+    "filled_capped": "filled and capped (plated over), IPC-4761 Type VII, for via-in-pad",
+}
+
+
+def _walk(node):
+    """Every list under ``node``, depth first."""
+    if isinstance(node, list):
+        yield node
+        for child in node:
+            yield from _walk(child)
+
+
+def _board_minimums(pcb: Path | None) -> dict:
+    """The smallest track width and hole the board actually has, in mm.
+
+    Measured on the board rather than taken from the net classes, because the
+    fab quotes what it is asked to make: a 0.1 mm neck-down in a footprint is
+    0.1 mm, whatever the Default class says. A board not routed yet has no
+    tracks, and that is said rather than reported as no minimum.
+    """
+    out: dict = {"trace": None, "drill": None, "drill_kind": None}
+    if pcb is None or not pcb.is_file():
+        return out
+    try:
+        tree = sexpr.parse(pcb.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    for n in _walk(tree):
+        head = n[0] if n else None
+        if head in ("segment", "arc"):
+            w = sexpr.find(n, "width")
+            if w and len(w) > 1:
+                width = float(w[1])
+                out["trace"] = width if out["trace"] is None else min(out["trace"], width)
+        elif head in ("via", "pad"):
+            d = sexpr.find(n, "drill")
+            if not d or len(d) < 2:
+                continue
+            sizes = [float(x) for x in d[1:] if isinstance(x, str) and _is_number(x)]
+            if not sizes or min(sizes) <= 0:
+                continue
+            hole = min(sizes)
+            if out["drill"] is None or hole < out["drill"]:
+                out["drill"], out["drill_kind"] = hole, head
+    return out
+
+
+def _is_number(x: str) -> bool:
+    try:
+        float(x)
+    except ValueError:
+        return False
+    return True
+
+
+def _mm(v: float) -> str:
+    return f"{v:.3f} mm ({v / _MIL:.1f} mil)"
+
+
+def write_board_specs(pcb: Path | None, hdm_path: Path | None, out_dir: Path, *,
+                      board: str, impedance_sheet: bool) -> Step:
+    """board-specs.md at the package root: what the bare board is built from.
+
+    The quoting sites take gerbers, or a KiCad project they mostly do not read
+    the stackup of, and ask for the rest in a form: layers, thickness, copper
+    weight, laminate, Tg, finish, colours, gold fingers, via protection,
+    castellation, and the smallest trace, space and drill. This is that form,
+    filled in once, from project.yaml (project.stackup, fabrication and the
+    net classes) and from the board itself. Whatever project.yaml leaves out
+    is said to be left out: "not specified" means the fab's standard applies,
+    and "(default)" marks the value BLPL assumed and wrote into the board.
+    """
+    import yaml
+
+    if hdm_path is None or not hdm_path.is_file():
+        return Step("board-specs", False, "no hdm.yaml for this board: run the pipeline through "
+                                          "Stage 5 so the board's stackup and fabrication are known")
+    try:
+        hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        return Step("board-specs", False, f"could not read {hdm_path.name}: {exc}")
+    project = hdm.get("project") or {}
+    st = project.get("stackup") or {}
+    fab = hdm.get("fabrication") or {}
+    classes = hdm.get("net_classes") or {}
+    layers = int(st.get("layers") or 2)
+    unset: list[str] = []
+
+    def given(key: str, label: str, text) -> str:
+        if key in fab:
+            return text
+        unset.append(label)
+        return "not specified"
+
+    oz = fab.get("copper_oz") or {}
+    outer = f"{oz['outer']:g} oz" if oz.get("outer") else "1 oz (default)"
+    inner = f"{oz['inner']:g} oz" if oz.get("inner") else "0.5 oz (default)"
+    dims = project.get("dimensions") or []
+    fingers = fab.get("gold_fingers")
+    if isinstance(fingers, dict):
+        bevel = fingers.get("bevel_deg") or 0
+        fingers_text = f"yes, hard gold, bevelled {bevel} degrees" if bevel else "yes, hard gold, no bevel"
+    else:
+        fingers_text = given("gold_fingers", "gold fingers", "none")
+    rows = [
+        ("Board", project.get("board_id") or project.get("name") or board),
+        ("Copper layers", str(layers)),
+        ("Board size", f"{float(dims[0]):.2f} x {float(dims[1]):.2f} mm" if len(dims) == 2 else "not specified"),
+        ("Finished thickness", f"{float(st['thickness']):g} mm" if st.get("thickness") else "1.6 mm (default)"),
+        ("Laminate", fab.get("material") or "FR-4 (default)"),
+        ("Glass transition (Tg)", given("tg_c", "Tg", f"{fab.get('tg_c', 0):g} C minimum")),
+        ("Copper weight, outer layers", outer),
+    ]
+    if layers > 2:
+        rows.append(("Copper weight, inner layers", inner))
+    rows += [
+        ("Surface finish", st.get("finish") or "not specified"),
+        ("Solder mask colour", given("mask_color", "solder mask colour", str(fab.get("mask_color", "")))),
+        ("Silkscreen colour", given("silk_color", "silkscreen colour", str(fab.get("silk_color", "")))),
+        ("Gold fingers", fingers_text),
+        ("Via protection", given("via_protection", "via protection",
+                                 _VIA_TYPES.get(str(fab.get("via_protection")), ""))),
+        ("Castellated edges", given("castellated", "castellated edges",
+                                    "yes, plated half-holes on the board edge" if fab.get("castellated") else "no")),
+        ("Impedance control", "yes: see fab/impedance.md" if impedance_sheet else "no"),
+    ]
+    if not st.get("finish"):
+        unset.append("surface finish")
+
+    measured = _board_minimums(pcb)
+    trace_classes = [float(c["trace_width"]) for c in classes.values()
+                     if isinstance(c, dict) and c.get("trace_width")]
+    if measured["trace"] is not None:
+        rows.append(("Minimum trace width", _mm(measured["trace"]) + ", measured on the board"))
+    elif trace_classes:
+        rows.append(("Minimum trace width", _mm(min(trace_classes)) +
+                     ", from the net classes: the board has no tracks yet"))
+    else:
+        rows.append(("Minimum trace width", "not known: no tracks and no net class widths"))
+    clear = [float(c["clearance"]) for c in classes.values()
+             if isinstance(c, dict) and c.get("clearance")]
+    rows.append(("Minimum spacing", _mm(min(clear)) + ", the smallest net class clearance"
+                 if clear else "not known: no net class clearances"))
+    if measured["drill"] is not None:
+        kind = "a via" if measured["drill_kind"] == "via" else "a pad hole"
+        rows.append(("Minimum drill", _mm(measured["drill"]) + f", measured on the board ({kind})"))
+    else:
+        vias = [float(c["via_drill"]) for c in classes.values()
+                if isinstance(c, dict) and c.get("via_drill")]
+        rows.append(("Minimum drill", _mm(min(vias)) + ", from the net classes: the board has no holes yet"
+                     if vias else "not known: no holes and no net class via drills"))
+
+    lines = [f"# Board specifications: {rows[0][1]}", "",
+             "What this board is to be built from, for the quote form. Taken from the "
+             "project's project.yaml and measured on the board in kicad/.", "",
+             "| Item | Specification |", "|---|---|"]
+    lines += [f"| {k} | {v} |" for k, v in rows]
+    if unset:
+        lines += ["", "## Not specified", "",
+                  "project.yaml does not state these, so the fab's standard applies: "
+                  + ", ".join(unset) + ". Set them under fabrication in project.yaml "
+                  "(Project settings, Board) when they matter."]
+    path = out_dir / "board-specs.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return Step("board-specs", True,
+                f"{len(unset)} item(s) not specified, left to the fab's standard" if unset else "",
+                [path.name])
+
+
 def _not_bought(pipeline: Path, hdm: Path | None = None) -> set[str]:
     """Parts the HDM marks DNP or footprint-only (project.yaml assembly)."""
     return _assembled_as(pipeline, hdm, ("dnp", "footprint_only"))
@@ -796,6 +973,8 @@ def build(
             _assembled_as(pipeline, src["hdm"], ("dnp", "footprint_only", "hand_fit"))))
     z_step = export_impedance(pipeline, pcb, out_dir, src["hdm"])
     steps.append(z_step)
+    steps.append(write_board_specs(pcb, src["hdm"], out_dir, board=name,
+                                   impedance_sheet=(out_dir / "fab" / "impedance.md").is_file()))
 
     gate = run_gate(pipeline, out_dir, qual)
     gate_ok = bool(gate.get("ok")) and not gate.get("skipped")

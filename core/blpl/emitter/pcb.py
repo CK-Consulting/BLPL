@@ -1148,7 +1148,9 @@ def _build(
         ["general", ["thickness", f"{thickness}"], ["legacy_teardrops", "no"]],
         ["paper", '"A4"'],
         ["layers", *copper_rows, *_NON_COPPER_LAYERS],
-        _default_setup(_stackup(project, _copper_count(project), float(thickness))),
+        _default_setup(_stackup(project, _copper_count(project), float(thickness),
+                                hdm.get("fabrication") or {}),
+                       hdm.get("fabrication") or {}),
     ]
 
     # Nets.
@@ -1305,12 +1307,28 @@ _PREPREG, _ER_PREPREG, _ER_CORE, _LOSS = 0.2104, 4.4, 4.5, 0.02
 _MIN_DIELECTRIC = 0.05
 
 
-def _dielectric(name: str, kind: str, mm: float, er: float) -> sexpr.Node:
+#: One ounce of copper per square foot is 35 um thick.
+_MM_PER_OZ = 0.035
+#: fabrication.mask_color / silk_color as KiCad's stackup names them.
+_KICAD_COLOURS = {"green": "Green", "red": "Red", "blue": "Blue", "purple": "Purple",
+                  "black": "Black", "white": "White", "yellow": "Yellow"}
+
+
+def _dielectric(name: str, kind: str, mm: float, er: float, material: str = "FR4") -> sexpr.Node:
     return ["layer", sexpr.quote(name), ["type", sexpr.quote(kind)], ["thickness", f"{mm:.4g}"],
-            ["material", '"FR4"'], ["epsilon_r", f"{er:g}"], ["loss_tangent", f"{_LOSS:g}"]]
+            ["material", sexpr.quote(material)], ["epsilon_r", f"{er:g}"],
+            ["loss_tangent", f"{_LOSS:g}"]]
 
 
-def _stackup(project: dict, copper: int, thickness: float) -> sexpr.Node | None:
+def _coloured(name: str, kind: str, colour: str | None, *rest: sexpr.Node) -> sexpr.Node:
+    """A mask or silk row, with its colour when project.yaml gives one."""
+    named = _KICAD_COLOURS.get(colour or "")
+    return ["layer", sexpr.quote(name), ["type", sexpr.quote(kind)],
+            *([["color", sexpr.quote(named)]] if named else []), *rest]
+
+
+def _stackup(project: dict, copper: int, thickness: float,
+             fab: dict | None = None) -> sexpr.Node | None:
     """The board's physical stackup, for the fab and for every tool that reads it.
 
     None was written, and a board without one has no reference planes as far
@@ -1328,21 +1346,33 @@ def _stackup(project: dict, copper: int, thickness: float) -> sexpr.Node | None:
     the format still lists B.Cu, and a stackup would tell the fab and the
     review there is bottom copper (Codex, PR #61). ``copper_finish`` is the
     project's ``finish``.
+
+    ``fab`` is project.yaml's ``fabrication``: copper weight sets each copper
+    layer's thickness, ``material`` the dielectrics', the colours go on the
+    mask and silk rows, and gold fingers and castellation become the
+    stackup's edge-connector and castellated-pads flags. Without it the
+    stackup is exactly what it was: 1 oz outer, 0.5 oz inner, FR4, no colours.
     """
     if copper < 2:
         return None
     st = project.get("stackup") or {}
+    fab = fab or {}
+    oz = fab.get("copper_oz") or {}
+    outer_cu = float(oz["outer"]) * _MM_PER_OZ if oz.get("outer") else _OUTER_CU
+    inner_cu = float(oz["inner"]) * _MM_PER_OZ if oz.get("inner") else _INNER_CU
+    material = str(fab.get("material") or "FR4")
+    mask, silk = fab.get("mask_color"), fab.get("silk_color")
     prepreg = float(st.get("prepreg") or _PREPREG)
     er_pp = float(st.get("er") or _ER_PREPREG)
     er_core = float(st.get("er") or _ER_CORE)
     names = [row[1].strip('"') for row in _copper_layers(copper)]
     rows: list[sexpr.Node] = [
-        ["layer", '"F.SilkS"', ["type", '"Top Silk Screen"']],
+        _coloured("F.SilkS", "Top Silk Screen", silk),
         ["layer", '"F.Paste"', ["type", '"Top Solder Paste"']],
-        ["layer", '"F.Mask"', ["type", '"Top Solder Mask"'], ["thickness", f"{_MASK:g}"]],
+        _coloured("F.Mask", "Top Solder Mask", mask, ["thickness", f"{_MASK:g}"]),
     ]
     gaps = len(names) - 1
-    copper_mm = sum(_OUTER_CU if n in ("F.Cu", "B.Cu") else _INNER_CU for n in names)
+    copper_mm = sum(outer_cu if n in ("F.Cu", "B.Cu") else inner_cu for n in names)
     if gaps == 1:
         kinds = ["core"]
         cores = 1
@@ -1388,31 +1418,63 @@ def _stackup(project: dict, copper: int, thickness: float) -> sexpr.Node | None:
                      "give a thicker board, fewer layers, or prepreg and core from the fab's stackup")
     for i, name in enumerate(names):
         rows.append(["layer", sexpr.quote(name), ["type", '"copper"'],
-                     ["thickness", f"{_OUTER_CU if name in ('F.Cu', 'B.Cu') else _INNER_CU:g}"]])
+                     ["thickness", f"{outer_cu if name in ('F.Cu', 'B.Cu') else inner_cu:g}"]])
         if i < gaps:
             kind = kinds[i]
             rows.append(_dielectric(f"dielectric {i + 1}", kind,
                                     prepreg if kind == "prepreg" else core,
-                                    er_pp if kind == "prepreg" else er_core))
+                                    er_pp if kind == "prepreg" else er_core, material))
     rows += [
-        ["layer", '"B.Mask"', ["type", '"Bottom Solder Mask"'], ["thickness", f"{_MASK:g}"]],
+        _coloured("B.Mask", "Bottom Solder Mask", mask, ["thickness", f"{_MASK:g}"]),
         ["layer", '"B.Paste"', ["type", '"Bottom Solder Paste"']],
-        ["layer", '"B.SilkS"', ["type", '"Bottom Silk Screen"']],
+        _coloured("B.SilkS", "Bottom Silk Screen", silk),
     ]
     finish = (project.get("stackup") or {}).get("finish")
-    return ["stackup", *rows, ["copper_finish", sexpr.quote(finish or "None")],
-            ["dielectric_constraints", "no"]]
+    tail: list[sexpr.Node] = [["copper_finish", sexpr.quote(finish or "None")],
+                              ["dielectric_constraints", "no"]]
+    fingers = fab.get("gold_fingers")
+    if isinstance(fingers, dict):
+        tail.append(["edge_connector", "bevelled" if fingers.get("bevel_deg") else "yes"])
+    if fab.get("castellated"):
+        # KiCad 10 keeps castellation as plating on the board edge; a
+        # castellated_pads flag is dropped the first time it saves the board.
+        tail.append(["edge_plating", "yes"])
+    return ["stackup", *rows, *tail]
 
 
-def _default_setup(stackup: sexpr.Node | None = None) -> sexpr.Node:
-    """Minimal v10 (setup ...) block. KiCad fills in defaults for anything we omit."""
-    return [
+#: fabrication.via_protection as the board-wide IPC-4761 settings KiCad 10
+#: keeps in (setup): tenting, plugging, filling and capping, front and back.
+_VIA_PROTECTION = {
+    "none": {"tenting": "no"},
+    "tented": {},                                         # Type I, KiCad's default
+    "plugged": {"plugging": "yes"},                       # Type III
+    "filled": {"filling": "yes"},                         # Type V, non-conductive fill
+    "filled_capped": {"filling": "yes", "capping": "yes"},  # Type VII, via-in-pad
+}
+
+
+def _default_setup(stackup: sexpr.Node | None = None, fab: dict | None = None) -> sexpr.Node:
+    """Minimal v10 (setup ...) block. KiCad fills in defaults for anything we omit.
+
+    Vias are tented both sides, as before, unless project.yaml's
+    ``fabrication.via_protection`` says otherwise.
+    """
+    via = _VIA_PROTECTION.get((fab or {}).get("via_protection") or "tented", {})
+    sides = lambda v: [["front", v], ["back", v]]
+    node: sexpr.Node = [
         "setup",
         *([stackup] if stackup else []),
         ["pad_to_mask_clearance", "0"],
         ["allow_soldermask_bridges_in_footprints", "no"],
-        ["tenting", ["front", "yes"], ["back", "yes"]],
+        ["tenting", *sides(via.get("tenting", "yes"))],
     ]
+    if "plugging" in via:
+        node.append(["plugging", *sides(via["plugging"])])
+    if "capping" in via:
+        node.append(["capping", via["capping"]])
+    if "filling" in via:
+        node.append(["filling", via["filling"]])
+    return node
 
 
 def emit(hdm: dict, *, footprints_root: Path | str | Sequence[Path | str]) -> str:
