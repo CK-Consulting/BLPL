@@ -17,7 +17,7 @@ import { withBoard } from "../board";
  * re-run it that way — from a shell nobody using the app has.
  */
 
-type Manifest = {
+export type Manifest = {
   exists: boolean;
   release?: string;
   created?: string;
@@ -27,9 +27,29 @@ type Manifest = {
   files?: { path: string; bytes: number; sha256: string }[];
   incomplete?: string[];
   tools?: { kicad_cli?: string };
+  // Absent from packages built before the options were recorded.
+  options?: { lcsc?: boolean; odb?: boolean };
 };
 
 type GateCheck = { category?: string; check_id?: string; status?: string; message?: string };
+
+/**
+ * What the newest package was built with, in one line under its download.
+ * A package built before the options were recorded says so rather than
+ * guessing; an ODB++ job that was asked for and not produced says that too,
+ * since "requested" and "inside the zip" are different claims.
+ */
+export function builtWith(m: Manifest): string {
+  if (!m.options) return "Built before its options were recorded: LCSC lookup and ODB++ unknown.";
+  const odbStep = m.steps?.find((s) => s.step === "odb");
+  const odb = !m.options.odb
+    ? "no ODB++ package"
+    : odbStep && !odbStep.ok
+      ? "ODB++ package requested but not produced (see below)"
+      : "ODB++ package included";
+  const lcsc = m.options.lcsc ? "LCSC part numbers looked up" : "no LCSC part number lookup";
+  return `Built with ${lcsc}, ${odb}.`;
+}
 
 function human(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -50,6 +70,7 @@ export function ReleasePanel({
   const [lines, setLines] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
   const [lcsc, setLcsc] = useState(false);
+  const [odb, setOdb] = useState(false);
   const runIdRef = useRef<string | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
@@ -69,7 +90,8 @@ export function ReleasePanel({
     setLines([]);
     setRunning(true);
     try {
-      const url = withBoard(`/api/projects/${projectId}/release${lcsc ? "?lcsc=true" : ""}`, board);
+      const query = [lcsc && "lcsc=true", odb && "odb=true"].filter(Boolean).join("&");
+      const url = withBoard(`/api/projects/${projectId}/release${query ? `?${query}` : ""}`, board);
       await readSSE(url, { method: "POST" }, (event, payload) => {
         if (event === "start") runIdRef.current = payload.run_id ?? null;
         else if (event === "log") setLines((l) => [...l, payload.line]);
@@ -111,16 +133,23 @@ export function ReleasePanel({
           <input type="checkbox" checked={lcsc} disabled={running} onChange={(e) => setLcsc(e.target.checked)} />{" "}
           Look up LCSC part numbers
         </label>
-        {manifest?.exists && (
+        <label title="Also export the board as an ODB++ job, a single archive many fabs' CAM reads in place of gerbers, drill and placement, and put it in the package as odb/<project>-odb.zip">
+          <input type="checkbox" checked={odb} disabled={running} onChange={(e) => setOdb(e.target.checked)} />{" "}
+          Include ODB++ package as a .zip file
+        </label>
+      </div>
+      {manifest?.exists && (
+        <div className="release-download">
           <a
             className="link"
             href={withBoard(`/api/projects/${projectId}/release/latest.zip`, board)}
             title="The newest package for this board. If the gate refused it, READ-ME-FIRST.txt inside says why."
           >
-            Download latest.zip
+            Download latest package: release_{manifest.created}.zip
           </a>
-        )}
-      </div>
+          <div className="muted small">{builtWith(manifest)}</div>
+        </div>
+      )}
 
       {manifest?.exists && (
         <div className={`fab-banner ${manifest.quotable ? "ok" : "danger"}`}>
@@ -204,8 +233,8 @@ export function ReleasePanel({
       {!manifest?.exists && !running && (
         <p className="muted pad">
           No release yet{board ? ` for ${board}` : ""}. Building one runs the fabrication gate over the Stage 8 analysis, then
-          exports gerbers, drill files, placement, a grouped BOM, and the native KiCad project —
-          checksummed, in one zip.
+          exports gerbers, drill files, placement, a grouped BOM, and the native KiCad project, with
+          an ODB++ job if you ask for one, checksummed, in one zip.
         </p>
       )}
 
