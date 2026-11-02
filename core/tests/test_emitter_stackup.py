@@ -220,3 +220,92 @@ def test_the_schema_takes_fabrication_and_refuses_what_a_fab_cannot_read():
                 {"gold_fingers": True}, {"tg_c": 20}, {"colour": "green"}):
         with pytest.raises(Exception):
             schema.validate("project_config", cfg(**bad))
+
+
+def _table(node) -> list[str]:
+    return [sexpr.unquote(row[1]) for row in sexpr.find(node, "layers")[1:]]
+
+
+def test_a_none_colour_takes_its_layers_off_the_board(tmp_path):
+    """No mask ordered, no mask on the board: the layer table and the stackup
+    both lose it, so every export agrees with board-specs.md (Codex, PR #98)."""
+    node = pcb.build(_fab({"mask_color": "none", "silk_color": "white"}), footprints_root=tmp_path)
+    table = _table(node)
+    assert "F.Mask" not in table and "B.Mask" not in table
+    assert {"F.SilkS", "B.SilkS", "F.Paste", "Edge.Cuts", "F.Cu", "B.Cu"} <= set(table)
+    names = [n for n, _, _ in _layers(node)[0]]
+    assert "F.Mask" not in names and "B.Mask" not in names and "F.SilkS" in names
+
+    node = pcb.build(_fab({"silk_color": "none"}), footprints_root=tmp_path)
+    assert not {"F.SilkS", "B.SilkS"} & set(_table(node))
+    assert {"F.Mask", "B.Mask"} <= set(_table(node))
+
+
+def test_a_coloured_or_unset_mask_keeps_every_layer(tmp_path):
+    plain = _table(pcb.build(_hdm({"layers": 2, "thickness": 1.6}), footprints_root=tmp_path))
+    assert _table(pcb.build(_fab({"mask_color": "green", "silk_color": "black"},
+                                 {"layers": 2, "thickness": 1.6}), footprints_root=tmp_path)) == plain
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None, reason="needs kicad-cli")
+def test_kicad_keeps_the_layers_off_and_odb_leaves_them_out(tmp_path):
+    """ODB++ takes no layer selection, so the board itself must not have the
+    layer; and KiCad must not put it back when it saves the board."""
+    import zipfile
+
+    board = tmp_path / "b.kicad_pcb"
+    board.write_text(pcb.emit(_fab({"mask_color": "none", "silk_color": "none"}), footprints_root=tmp_path))
+    proc = subprocess.run(["kicad-cli", "pcb", "upgrade", "--force", str(board)],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    saved = board.read_text()
+    assert '"F.Mask" user' not in saved and '"F.SilkS" user' not in saved
+    odb = tmp_path / "b-odb.zip"
+    proc = subprocess.run(["kicad-cli", "pcb", "export", "odb", "--output", str(odb), str(board)],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    layer_dirs = {n.lower() for n in zipfile.ZipFile(odb).namelist() if "/layers/" in n.lower()}
+    assert layer_dirs, "the ODB++ job has no layers at all"
+    assert not [n for n in layer_dirs if "mask" in n or "silk" in n]
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None, reason="needs kicad-cli")
+def test_footprints_still_naming_a_removed_layer_load_and_export(tmp_path):
+    """Pads keep naming F.Mask and footprints keep their silk; a board with
+    those layers disabled must still load, save and export."""
+    import zipfile
+
+    fixture = Path(__file__).parent / "fixtures" / "footprint_flip" / "kicad_placed.kicad_pcb"
+    node = sexpr.parse(fixture.read_text(encoding="utf-8"))
+    table = sexpr.find(node, "layers")
+    gone = {"F.Mask", "B.Mask", "F.SilkS", "B.SilkS"}
+    kept = [row for row in table[1:] if sexpr.unquote(row[1]) not in gone]
+    assert len(table) - 1 - len(kept) == len(gone)
+    table[1:] = kept
+    text = sexpr.dump_top(node)
+    assert '"F.Mask"' in text, "the pads should still name the removed layer"
+    board = tmp_path / "b.kicad_pcb"
+    board.write_text(text, encoding="utf-8")
+    odb = tmp_path / "b-odb.zip"
+    proc = subprocess.run(["kicad-cli", "pcb", "export", "odb", "--output", str(odb), str(board)],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    names = [n.lower() for n in zipfile.ZipFile(odb).namelist()]
+    assert any("/layers/f.cu/" in n for n in names)
+    assert not [n for n in names if "/layers/" in n and ("mask" in n or "silk" in n)]
+
+
+@pytest.mark.parametrize("copper", [2, 4])
+def test_a_board_with_no_mask_still_adds_up_to_its_thickness(tmp_path, copper):
+    """The mask's 0.01 mm a side went unused when the mask did: a 1.6 mm board
+    emitted 1.58 mm of layers (Codex, PR #99)."""
+    layers, _ = _layers(pcb.build(_fab({"mask_color": "none"}, {"layers": copper, "thickness": 1.6}),
+                                  footprints_root=tmp_path))
+    assert "F.Mask" not in [n for n, _, _ in layers]
+    assert sum(th for _, _, th in layers) == pytest.approx(1.6, abs=1e-3)
+
+
+def test_a_given_core_is_checked_against_the_board_with_no_mask(tmp_path):
+    """1.6 mm less two 1 oz layers is 1.53 mm of core when there is no mask."""
+    _layers(pcb.build(_fab({"mask_color": "none"}, {"layers": 2, "thickness": 1.6, "core": 1.53}),
+                      footprints_root=tmp_path))
