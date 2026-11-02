@@ -35,6 +35,9 @@ def test_the_release_route_serves_the_package_even_when_it_was_refused(client) -
     zip_response = client.get("/api/projects/scratch/release/latest.zip")
     assert zip_response.status_code == 200
     assert zip_response.headers["content-type"] == "application/zip"
+    # Named for the build it is, so two downloads side by side can be told apart.
+    assert zip_response.headers["content-disposition"] == (
+        'attachment; filename="release_2026-08-12_120000Z.zip"')
 
 
 def test_building_a_release_from_the_app_carries_the_board_and_the_lcsc_choice(client, monkeypatch) -> None:
@@ -55,5 +58,26 @@ def test_building_a_release_from_the_app_carries_the_board_and_the_lcsc_choice(c
     assert client.post("/api/projects/scratch/release?lcsc=true").status_code == 200
     assert "--lcsc" in seen["cmd"] and "--board" not in seen["cmd"]
     assert client.post("/api/projects/scratch/release").status_code == 200
-    assert "--lcsc" not in seen["cmd"]
+    assert "--lcsc" not in seen["cmd"] and "--odb" not in seen["cmd"]
+    assert client.post("/api/projects/scratch/release?odb=true&lcsc=true").status_code == 200
+    assert "--odb" in seen["cmd"] and "--lcsc" in seen["cmd"] and "--circuithub" not in seen["cmd"]
+    assert client.post("/api/projects/scratch/release?circuithub=true").status_code == 200
+    assert "--circuithub" in seen["cmd"] and "--odb" not in seen["cmd"]
     assert client.post("/api/projects/scratch/release?board=ghost").status_code == 400
+
+
+def test_a_download_is_named_for_its_build_even_without_a_manifest(tmp_path) -> None:
+    """latest.json is what says when the package was built. Without it the
+    name still carries a time, from the archive itself, never none at all."""
+    import os
+
+    from app.main import release_filename
+
+    archive = tmp_path / "latest.zip"
+    archive.write_bytes(b"PK")
+    os.utime(archive, (1786536000, 1786536000))  # 2026-08-12 12:00:00 UTC
+    assert release_filename(archive) == "release_2026-08-12_120000Z.zip"
+    (tmp_path / "latest.json").write_text('{"created": "2026-08-12_131500Z"}')
+    assert release_filename(archive) == "release_2026-08-12_131500Z.zip"
+    (tmp_path / "latest.json").write_text('{"created": "../../etc"}')
+    assert release_filename(archive) == "release_2026-08-12_120000Z.zip"

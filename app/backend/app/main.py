@@ -7695,6 +7695,7 @@ async def run_stage(
 
 @app.post("/api/projects/{project_id}/release")
 async def build_release(project_id: str, board: str | None = None, lcsc: bool = False,
+    odb: bool = False, circuithub: bool = False,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> StreamingResponse:
     """Build the package a contract fab quotes from, gate included.
@@ -7713,6 +7714,14 @@ async def build_release(project_id: str, board: str | None = None, lcsc: bool = 
         # JLCPCB orders by LCSC number. Looking them up needs the network, so
         # it is the user's choice, from the Release tab rather than a command line.
         cmd.append("--lcsc")
+    if odb:
+        # The board as an ODB++ job, zipped inside the package, for a fab
+        # whose CAM takes ODB++ instead of gerbers.
+        cmd.append("--odb")
+    if circuithub:
+        # CircuitHub imports the native KiCad project, with a BOM it
+        # reconciles against; the package carries both, zipped.
+        cmd.append("--circuithub")
     return _start_run(session, user, project_id,
                       "release" if resolved is None else f"release ({resolved})", cmd, dict(os.environ))
 
@@ -7817,12 +7826,34 @@ def download_release(project_id: str, board: str | None = None,
     archive = release_dir(proj, resolved) / "latest.zip"
     if not archive.is_file():
         raise HTTPException(status_code=404, detail="no release has been built for this project")
-    name = project_id if resolved is None else f"{project_id}-{resolved}"
     return Response(
         content=archive.read_bytes(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{name}-release.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{release_filename(archive)}"'},
     )
+
+
+_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}Z")
+
+
+def release_filename(archive: Path) -> str:
+    """``release_<when it was built>.zip``, so a downloaded package says which
+    build it is. Every download used to be "<project>-release.zip", and two of
+    them side by side could not be told apart.
+
+    The stamp is the build's own, from latest.json beside the archive; a
+    manifest that is missing or unreadable falls back to the archive's mtime
+    in the same format, never to a name without a time in it."""
+    stamp = ""
+    try:
+        stamp = str(json.loads((archive.parent / "latest.json").read_text(encoding="utf-8"))
+                    .get("created", ""))
+    except (OSError, ValueError):
+        pass
+    if not _STAMP.fullmatch(stamp):
+        stamp = datetime.fromtimestamp(archive.stat().st_mtime, timezone.utc).strftime(
+            "%Y-%m-%d_%H%M%SZ")
+    return f"release_{stamp}.zip"
 
 
 @app.post("/api/projects/{project_id}/review-panel")

@@ -317,3 +317,203 @@ def test_the_manifest_records_what_was_left_for_fitting_by_hand(project, monkeyp
     assert manifest["hand_fit"] == ["C9"]
     on_disk = json.loads((Path(manifest["archive"]).parent / "2026-08-12_120000Z" / "manifest.json").read_text())
     assert on_disk["hand_fit"] == ["C9"]
+
+
+# -- ODB++ ------------------------------------------------------------------
+
+
+def _odb_zip(path: Path, names: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as zf:
+        for n in names:
+            zf.writestr(n, "x\n")
+
+
+_ODB_JOB = ["matrix/matrix", "misc/info", "steps/pcb/profile", "steps/pcb/eda/data",
+            "steps/pcb/layers/f.cu/features"]
+
+
+def _fake_odb(monkeypatch, names: list[str] | None, ok: bool = True):
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, name, expect_dir=None):
+        seen.append(cmd)
+        if names is not None and cmd[1:4] == ["pcb", "export", "odb"]:
+            _odb_zip(Path(cmd[cmd.index("--output") + 1]), names)
+        return release.Step(name, ok, "" if ok else "boom")
+
+    monkeypatch.setattr(release, "_run", fake_run)
+    return seen
+
+
+def test_an_odb_job_is_exported_at_full_precision(tmp_path, monkeypatch) -> None:
+    """kicad-cli's default precision is two decimal places of a millimetre,
+    which rounds every coordinate to 10 um. The fab builds what the file says."""
+    seen = _fake_odb(monkeypatch, _ODB_JOB)
+    step = release.export_odb(tmp_path / "b.kicad_pcb", tmp_path / "out", "dev04",
+                              kicad_cli="kicad-cli")
+    assert step.ok and step.outputs == ["dev04-odb.zip"]
+    (cmd,) = seen
+    assert cmd[1:4] == ["pcb", "export", "odb"]
+    assert cmd[cmd.index("--precision") + 1] == "6"
+    assert cmd[cmd.index("--units") + 1] == "mm"
+    assert cmd[cmd.index("--output") + 1].endswith("odb/dev04-odb.zip")
+
+
+def test_an_odb_zip_without_a_layer_matrix_is_a_failed_step(tmp_path, monkeypatch) -> None:
+    """kicad-cli exits 0 on boards it could not make sense of; an archive with
+    no matrix is not a job any CAM will open, so it must not read as done."""
+    _fake_odb(monkeypatch, [n for n in _ODB_JOB if n != "matrix/matrix"])
+    step = release.export_odb(tmp_path / "b.kicad_pcb", tmp_path / "out", "dev04",
+                              kicad_cli="kicad-cli")
+    assert not step.ok and "matrix/matrix" in step.detail
+
+
+def test_an_odb_zip_whose_steps_hold_no_layers_is_a_failed_step(tmp_path, monkeypatch) -> None:
+    _fake_odb(monkeypatch, ["matrix/matrix", "misc/info", "steps/pcb/profile"])
+    step = release.export_odb(tmp_path / "b.kicad_pcb", tmp_path / "out", "dev04",
+                              kicad_cli="kicad-cli")
+    assert not step.ok and "a step with" in step.detail
+
+
+def test_an_odb_export_that_failed_says_why(tmp_path, monkeypatch) -> None:
+    _fake_odb(monkeypatch, None, ok=False)
+    step = release.export_odb(tmp_path / "b.kicad_pcb", tmp_path / "out", "dev04",
+                              kicad_cli="kicad-cli")
+    assert not step.ok and step.detail == "boom"
+
+
+def test_the_manifest_says_which_options_the_package_was_built_with(project, monkeypatch) -> None:
+    """The download says what is in it; nobody should have to open the zip to
+    find out whether LCSC numbers were looked up or an ODB++ job is inside."""
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    plain = release.build(project, now="2026-08-12_120000Z")
+    assert plain["options"] == {"lcsc": False, "odb": False, "circuithub": False}
+    assert not any(s["step"] == "odb" for s in plain["steps"])
+
+    asked = release.build(project, now="2026-08-12_130000Z", odb=True)
+    assert asked["options"] == {"lcsc": False, "odb": True, "circuithub": False}
+    odb = next(s for s in asked["steps"] if s["step"] == "odb")
+    assert not odb["ok"] and "odb" in asked["incomplete"]
+
+
+def test_the_odb_job_travels_inside_the_package(project, monkeypatch) -> None:
+    _fake_odb(monkeypatch, _ODB_JOB)
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: "kicad-cli")
+    monkeypatch.setattr(release, "_tool_version", lambda cli: "test")
+    manifest = release.build(project, now="2026-08-12_120000Z", odb=True)
+    with zipfile.ZipFile(manifest["archive"]) as zf:
+        assert "odb/dev04-odb.zip" in zf.namelist()
+    assert any(f["path"] == "odb/dev04-odb.zip" for f in manifest["files"])
+
+
+_KICAD_CLI = release.find_kicad_cli()
+
+
+def _exports_odb(cli: str | None) -> bool:
+    import subprocess
+    if cli is None:
+        return False
+    out = subprocess.run([cli, "pcb", "export", "odb", "--help"], capture_output=True, text=True)
+    return out.returncode == 0
+
+
+@pytest.mark.skipif(not _exports_odb(_KICAD_CLI), reason="needs kicad-cli 9+ (pcb export odb)")
+def test_kicad_cli_writes_an_odb_job_a_cam_can_read(tmp_path) -> None:
+    """Against the real kicad-cli: the archive holds a matrix, the job record,
+    and a step with its outline, EDA data and component layers."""
+    fixture = Path(__file__).parent / "fixtures" / "footprint_flip" / "kicad_placed.kicad_pcb"
+    pcb = tmp_path / "board.kicad_pcb"
+    pcb.write_bytes(fixture.read_bytes())
+    step = release.export_odb(pcb, tmp_path / "out", "board", kicad_cli=_KICAD_CLI)
+    assert step.ok, step.detail
+    with zipfile.ZipFile(tmp_path / "out" / "odb" / "board-odb.zip") as zf:
+        names = zf.namelist()
+        info = zf.read("misc/info").decode()
+    assert "ODB_VERSION_MAJOR=8" in info and "UNITS=MM" in info
+    assert any(n.endswith("layers/comp_+_top/components") for n in names)
+
+
+# -- CircuitHub -------------------------------------------------------------
+
+
+def _circuithub(project, monkeypatch, **kw) -> tuple[dict, zipfile.ZipFile]:
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    manifest = release.build(project, now="2026-08-12_120000Z", circuithub=True, **kw)
+    with zipfile.ZipFile(manifest["archive"]) as outer:
+        inner = outer.read("circuithub/dev04-circuithub.zip")
+    import io
+    return manifest, zipfile.ZipFile(io.BytesIO(inner))
+
+
+def test_a_circuithub_package_is_the_native_project_and_a_bom(project, monkeypatch) -> None:
+    """CircuitHub imports KiCad natively and turns gerbers down: one
+    .kicad_pro, one .kicad_pcb, the schematics, and a BOM it reconciles."""
+    manifest, zf = _circuithub(project, monkeypatch)
+    assert manifest["options"]["circuithub"] is True
+    step = next(s for s in manifest["steps"] if s["step"] == "circuithub")
+    assert step["ok"]
+    assert sorted(zf.namelist()) == ["dev04-bom.csv", "dev04.kicad_pcb", "dev04.kicad_pro",
+                                     "dev04.kicad_sch"]
+
+
+def test_the_circuithub_bom_uses_columns_its_import_recognises(project, monkeypatch) -> None:
+    """At least Reference Designators and Manufacturer Part Number, under
+    names from CircuitHub's list, or nothing reconciles."""
+    import csv as _csv
+    import io
+    _m, zf = _circuithub(project, monkeypatch)
+    rows = list(_csv.DictReader(io.StringIO(zf.read("dev04-bom.csv").decode())))
+    assert list(rows[0]) == ["Reference Designators", "Manufacturer Part Number", "Manufacturer",
+                             "Description", "Value", "DNP"]
+    caps = next(r for r in rows if r["Manufacturer Part Number"] == "CL10B104KB8NNNC")
+    assert caps["Reference Designators"] == "C1,C2" and caps["DNP"] == ""
+
+
+def test_parts_the_assembler_does_not_fit_are_dnp_for_circuithub(project, monkeypatch) -> None:
+    """dnp, footprint_only and hand_fit parts are neither bought nor placed by
+    the house, as the JLCPCB and PCBWay files leave them out."""
+    import csv as _csv
+    import io
+    (project / ".pipeline" / "hdm.yaml").write_text(
+        "components:\n  U1: {assembly: hand_fit}\n  C2: {assembly: dnp}\n", encoding="utf-8")
+    _m, zf = _circuithub(project, monkeypatch)
+    rows = list(_csv.DictReader(io.StringIO(zf.read("dev04-bom.csv").decode())))
+    dnp = {r["Reference Designators"] for r in rows if r["DNP"] == "dnp"}
+    fitted = {r["Reference Designators"] for r in rows if r["DNP"] == ""}
+    assert dnp == {"C2", "U1"} and fitted == {"C1"}
+
+
+def test_circuithub_takes_one_design_and_a_second_board_is_refused(project, monkeypatch) -> None:
+    """Guessing which of two boards is meant would ship the wrong one."""
+    (project / "kicad" / "other.kicad_pcb").write_text("(kicad_pcb)\n", encoding="utf-8")
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    manifest = release.build(project, now="2026-08-12_120000Z", circuithub=True)
+    step = next(s for s in manifest["steps"] if s["step"] == "circuithub")
+    assert not step["ok"] and "2 .kicad_pcb" in step["detail"]
+    assert "circuithub" in manifest["incomplete"]
+
+
+def test_circuithub_without_a_published_project_says_what_to_run(tmp_path) -> None:
+    step = release.export_circuithub(None, tmp_path / "bom.json", tmp_path, "x")
+    assert not step.ok and "Stage 6" in step.detail
+
+
+def test_one_mpn_from_two_manufacturers_stays_two_circuithub_lines(tmp_path) -> None:
+    """Grouped on MPN and value alone, U2 was ordered from U1's maker."""
+    import csv as _csv
+    import io
+    kicad = tmp_path / "kicad"
+    kicad.mkdir()
+    for ext in ("kicad_pro", "kicad_pcb", "kicad_sch"):
+        (kicad / f"b.{ext}").write_text("x\n", encoding="utf-8")
+    bom = tmp_path / "bom.json"
+    bom.write_text(json.dumps([
+        {"refdes": "U1", "mpn": "LM358", "value": "LM358", "manufacturer": "Texas Instruments"},
+        {"refdes": "U2", "mpn": "LM358", "value": "LM358", "manufacturer": "STMicroelectronics"},
+    ]), encoding="utf-8")
+    assert release.export_circuithub(kicad, bom, tmp_path / "out", "b").ok
+    with zipfile.ZipFile(tmp_path / "out" / "circuithub" / "b-circuithub.zip") as zf:
+        rows = list(_csv.DictReader(io.StringIO(zf.read("b-bom.csv").decode())))
+    assert {(r["Reference Designators"], r["Manufacturer"]) for r in rows} == {
+        ("U1", "Texas Instruments"), ("U2", "STMicroelectronics")}
