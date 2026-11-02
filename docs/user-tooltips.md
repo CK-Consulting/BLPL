@@ -45,7 +45,8 @@ These are the places a new user is most likely to lose data or get stuck.
 | `ProposalCard.tsx:151` | Accept | Write this change to the file and commit it. Refused if the file changed since the proposal was made. |
 | `ProposalCard.tsx:151` | Reject | Discard this proposal. The file is not touched. |
 | `ReleasePanel.tsx:98` | Build release package | Runs the fab gate over the Stage 8 analysis, then exports gerbers, drill, placement, BOMs and the KiCad project into one zip. |
-| `ReleasePanel.tsx:110` | Download latest.zip | The newest package for this board. If the gate refused it, READ-ME-FIRST.txt inside says why. |
+| `ReleasePanel.tsx` | Download latest package: release_<date-time>.zip | The newest package for this board. If the gate refused it, READ-ME-FIRST.txt inside says why. |
+| `ReleasePanel.tsx` | Include ODB++ package as a .zip file | Also export the board as an ODB++ job, a single archive many fabs' CAM reads in place of gerbers, drill and placement, and put it in the package as odb/<project>-odb.zip. |
 
 ## Priority 2: running the pipeline and reading results
 

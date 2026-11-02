@@ -155,6 +155,8 @@ The Release tab builds the package a contract fab quotes from: gerbers, drill
 files, placement, a BOM grouped by part, and the native KiCad project — every
 file checksummed in one zip.
 
+Asked for, it also holds the board as an ODB++ job, `odb/<project>-odb.zip`, from `kicad-cli pcb export odb`. That is one file a fab's CAM can read instead of reassembling gerbers, drill and placement. It is exported at six decimal places of a millimetre: `kicad-cli`'s default of two rounds every coordinate to 10 um. And it is opened and checked for a layer matrix and a populated step before the step counts as done, because `kicad-cli` exits 0 on boards it could not make sense of.
+
 The gate runs **before** the export. kicad-happy's `fab_release_gate` reads the
 Stage 8 analysis and decides whether the board may be sent; a gate that could not
 run is reported as unknown, never as a pass. A refused board still gets its

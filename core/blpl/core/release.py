@@ -192,6 +192,59 @@ def export_fabrication(pcb: Path, out_dir: Path, *, kicad_cli: str | None = None
     return steps
 
 
+# What an ODB++ job has to hold for a fab's CAM to read it: the layer matrix,
+# the job's own record, and at least one step with an outline, its EDA data and
+# a layer with features in it. kicad-cli exits 0 on a board it could not make
+# sense of, so the archive is opened and looked at rather than trusted.
+_ODB_REQUIRED = ("matrix/matrix", "misc/info")
+
+
+def _odb_problem(archive: Path) -> str | None:
+    """Why ``archive`` is not a usable ODB++ job, or None when it is."""
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            names = set(zf.namelist())
+    except (OSError, zipfile.BadZipFile) as exc:
+        return f"kicad-cli wrote {archive.name}, but it is not a readable zip: {exc}"
+    missing = [n for n in _ODB_REQUIRED if not any(x.endswith(n) for x in names)]
+    steps = {x.split("/")[x.split("/").index("steps") + 1]
+             for x in names if "steps" in x.split("/")[:-1]}
+    for step in sorted(steps):
+        has = lambda tail: any(f"steps/{step}/{tail}" in x for x in names)
+        if has("profile") and has("eda/data") and any(
+                f"steps/{step}/layers/" in x and x.endswith("/features") for x in names):
+            break
+    else:
+        missing.append("a step with a profile, EDA data and layer features")
+    return f"{archive.name} is missing " + ", ".join(missing) if missing else None
+
+
+def export_odb(pcb: Path, out_dir: Path, name: str, *, kicad_cli: str | None = None) -> Step:
+    """The board as an ODB++ job, zipped, for a fab whose CAM takes ODB++.
+
+    One file instead of a folder of gerbers, drill and placement that the fab
+    has to reassemble: layers, stackup, components and nets travel together.
+    Precision is six decimal places of a millimetre. kicad-cli's default is
+    two, which rounds every coordinate to 10 um and moved a pad of the test
+    board by a micron; a fab will build exactly what this says.
+    """
+    cli = kicad_cli or find_kicad_cli()
+    if cli is None:
+        return Step("odb", False, "kicad-cli not found; ODB++ needs KiCad 9 or later")
+    dest = out_dir / "odb" / f"{name}-odb.zip"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    step = _run([cli, "pcb", "export", "odb", "--output", str(dest), "--compression", "zip",
+                 "--units", "mm", "--precision", "6", str(pcb)], "odb")
+    if not step.ok:
+        return step
+    if not dest.is_file():
+        return Step("odb", False, f"kicad-cli reported success but wrote no {dest.name}")
+    problem = _odb_problem(dest)
+    if problem:
+        return Step("odb", False, problem)
+    return Step("odb", True, "", [dest.name])
+
+
 def _not_bought(pipeline: Path, hdm: Path | None = None) -> set[str]:
     """Parts the HDM marks DNP or footprint-only (project.yaml assembly)."""
     return _assembled_as(pipeline, hdm, ("dnp", "footprint_only"))
@@ -610,6 +663,7 @@ def build(
     now: str = "",
     kicad_cli: str | None = None,
     lcsc: bool = False,
+    odb: bool = False,
     board: str | None = None,
 ) -> dict:
     """Build the release package. Returns the manifest.
@@ -634,9 +688,13 @@ def build(
     pcb = src["pcb"]
     if pcb is not None:
         steps.extend(export_fabrication(pcb, out_dir, kicad_cli=kicad_cli))
+        if odb:
+            steps.append(export_odb(pcb, out_dir, name, kicad_cli=kicad_cli))
     else:
         steps.append(Step("fabrication", False, "no board for this project yet: run the pipeline "
                                                 "through Stage 6 (Build PCB), and Stage 6a to route it"))
+        if odb:
+            steps.append(Step("odb", False, "no board to export as ODB++"))
 
     bom_json = src["bom"]
     bom_csv = out_dir / "bom" / f"{name}-bom.csv"
@@ -683,6 +741,9 @@ def build(
         "tools": {"kicad_cli": _tool_version(cli) if cli else "not found"},
         "files": files,
         "incomplete": [s.name for s in steps if not s.ok],
+        # Which of the optional outputs this build was asked for, so the
+        # download can say what is in it without anyone opening the zip.
+        "options": {"lcsc": lcsc, "odb": odb},
         # What the assembly files left for fitting by hand, so regenerating
         # them from this package (blpl bom-assembly) leaves out the same parts.
         "hand_fit": sorted(hand_fit),
@@ -757,10 +818,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Look up LCSC part numbers for the JLCPCB BOM (needs network).",
     )
+    parser.add_argument(
+        "--odb",
+        action="store_true",
+        help="Also export the board as an ODB++ job, zipped inside the package.",
+    )
     args = parser.parse_args(argv)
 
     try:
-        manifest = build(Path(args.project_dir), lcsc=args.lcsc, board=args.board)
+        manifest = build(Path(args.project_dir), lcsc=args.lcsc, odb=args.odb, board=args.board)
     except ValueError as exc:
         print(f"release: {exc}", file=sys.stderr, flush=True)
         return 2

@@ -317,3 +317,118 @@ def test_the_manifest_records_what_was_left_for_fitting_by_hand(project, monkeyp
     assert manifest["hand_fit"] == ["C9"]
     on_disk = json.loads((Path(manifest["archive"]).parent / "2026-08-12_120000Z" / "manifest.json").read_text())
     assert on_disk["hand_fit"] == ["C9"]
+
+
+# -- ODB++ ------------------------------------------------------------------
+
+
+def _odb_zip(path: Path, names: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as zf:
+        for n in names:
+            zf.writestr(n, "x\n")
+
+
+_ODB_JOB = ["matrix/matrix", "misc/info", "steps/pcb/profile", "steps/pcb/eda/data",
+            "steps/pcb/layers/f.cu/features"]
+
+
+def _fake_odb(monkeypatch, names: list[str] | None, ok: bool = True):
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, name, expect_dir=None):
+        seen.append(cmd)
+        if names is not None and cmd[1:4] == ["pcb", "export", "odb"]:
+            _odb_zip(Path(cmd[cmd.index("--output") + 1]), names)
+        return release.Step(name, ok, "" if ok else "boom")
+
+    monkeypatch.setattr(release, "_run", fake_run)
+    return seen
+
+
+def test_an_odb_job_is_exported_at_full_precision(tmp_path, monkeypatch) -> None:
+    """kicad-cli's default precision is two decimal places of a millimetre,
+    which rounds every coordinate to 10 um. The fab builds what the file says."""
+    seen = _fake_odb(monkeypatch, _ODB_JOB)
+    step = release.export_odb(tmp_path / "b.kicad_pcb", tmp_path / "out", "dev04",
+                              kicad_cli="kicad-cli")
+    assert step.ok and step.outputs == ["dev04-odb.zip"]
+    (cmd,) = seen
+    assert cmd[1:4] == ["pcb", "export", "odb"]
+    assert cmd[cmd.index("--precision") + 1] == "6"
+    assert cmd[cmd.index("--units") + 1] == "mm"
+    assert cmd[cmd.index("--output") + 1].endswith("odb/dev04-odb.zip")
+
+
+def test_an_odb_zip_without_a_layer_matrix_is_a_failed_step(tmp_path, monkeypatch) -> None:
+    """kicad-cli exits 0 on boards it could not make sense of; an archive with
+    no matrix is not a job any CAM will open, so it must not read as done."""
+    _fake_odb(monkeypatch, [n for n in _ODB_JOB if n != "matrix/matrix"])
+    step = release.export_odb(tmp_path / "b.kicad_pcb", tmp_path / "out", "dev04",
+                              kicad_cli="kicad-cli")
+    assert not step.ok and "matrix/matrix" in step.detail
+
+
+def test_an_odb_zip_whose_steps_hold_no_layers_is_a_failed_step(tmp_path, monkeypatch) -> None:
+    _fake_odb(monkeypatch, ["matrix/matrix", "misc/info", "steps/pcb/profile"])
+    step = release.export_odb(tmp_path / "b.kicad_pcb", tmp_path / "out", "dev04",
+                              kicad_cli="kicad-cli")
+    assert not step.ok and "a step with" in step.detail
+
+
+def test_an_odb_export_that_failed_says_why(tmp_path, monkeypatch) -> None:
+    _fake_odb(monkeypatch, None, ok=False)
+    step = release.export_odb(tmp_path / "b.kicad_pcb", tmp_path / "out", "dev04",
+                              kicad_cli="kicad-cli")
+    assert not step.ok and step.detail == "boom"
+
+
+def test_the_manifest_says_which_options_the_package_was_built_with(project, monkeypatch) -> None:
+    """The download says what is in it; nobody should have to open the zip to
+    find out whether LCSC numbers were looked up or an ODB++ job is inside."""
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    plain = release.build(project, now="2026-08-12_120000Z")
+    assert plain["options"] == {"lcsc": False, "odb": False}
+    assert not any(s["step"] == "odb" for s in plain["steps"])
+
+    asked = release.build(project, now="2026-08-12_130000Z", odb=True)
+    assert asked["options"] == {"lcsc": False, "odb": True}
+    odb = next(s for s in asked["steps"] if s["step"] == "odb")
+    assert not odb["ok"] and "odb" in asked["incomplete"]
+
+
+def test_the_odb_job_travels_inside_the_package(project, monkeypatch) -> None:
+    _fake_odb(monkeypatch, _ODB_JOB)
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: "kicad-cli")
+    monkeypatch.setattr(release, "_tool_version", lambda cli: "test")
+    manifest = release.build(project, now="2026-08-12_120000Z", odb=True)
+    with zipfile.ZipFile(manifest["archive"]) as zf:
+        assert "odb/dev04-odb.zip" in zf.namelist()
+    assert any(f["path"] == "odb/dev04-odb.zip" for f in manifest["files"])
+
+
+_KICAD_CLI = release.find_kicad_cli()
+
+
+def _exports_odb(cli: str | None) -> bool:
+    import subprocess
+    if cli is None:
+        return False
+    out = subprocess.run([cli, "pcb", "export", "odb", "--help"], capture_output=True, text=True)
+    return out.returncode == 0
+
+
+@pytest.mark.skipif(not _exports_odb(_KICAD_CLI), reason="needs kicad-cli 9+ (pcb export odb)")
+def test_kicad_cli_writes_an_odb_job_a_cam_can_read(tmp_path) -> None:
+    """Against the real kicad-cli: the archive holds a matrix, the job record,
+    and a step with its outline, EDA data and component layers."""
+    fixture = Path(__file__).parent / "fixtures" / "footprint_flip" / "kicad_placed.kicad_pcb"
+    pcb = tmp_path / "board.kicad_pcb"
+    pcb.write_bytes(fixture.read_bytes())
+    step = release.export_odb(pcb, tmp_path / "out", "board", kicad_cli=_KICAD_CLI)
+    assert step.ok, step.detail
+    with zipfile.ZipFile(tmp_path / "out" / "odb" / "board-odb.zip") as zf:
+        names = zf.namelist()
+        info = zf.read("misc/info").decode()
+    assert "ODB_VERSION_MAJOR=8" in info and "UNITS=MM" in info
+    assert any(n.endswith("layers/comp_+_top/components") for n in names)

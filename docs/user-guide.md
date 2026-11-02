@@ -18,7 +18,7 @@ From nothing to a reviewed board in the web app. Each step links to the full sec
 6. **Describe the board.** Wrench > **Board**: outline, layers, net classes. **Save board config** writes `project.yaml`. [More](#projectyaml-everything-that-is-not-markdown)
 7. **Run it.** Rail > **Pipeline** > **Pipeline**, `stage0` to `stage8`, **Run pipeline**. If Stage 3 stops, give the named IC a pinout. [More](#running-the-pipeline)
 8. **Read the result.** **Board** shows the board; **Reports** shows the review. Fix `design` findings in your markdown, report `emitter` findings, and enable whatever an `expected` finding says is missing. [More](#reading-the-results)
-9. **Release.** When Reports says no blockers, **Release** > **Build release package** (tick **Look up LCSC part numbers** for JLCPCB) and download the zip. [More](#from-a-reviewed-board-to-a-fab-order)
+9. **Release.** When Reports says no blockers, **Release** > **Build release package** (tick **Look up LCSC part numbers** for JLCPCB, and **Include ODB++ package as a .zip file** if your fab takes ODB++) and download `release_<date-time>.zip`. [More](#from-a-reviewed-board-to-a-fab-order)
 
 On the command line instead:
 
@@ -336,7 +336,7 @@ Every run, newest first, with board, start time, duration and status (`running`,
 | **Lifecycle** | Each part's lifecycle status from distributor data, and your own finding. | **edit** a row: what you found, when, a reference someone else can check, notes. **Acknowledge** accepts a part whose lifecycle could not be established. A finding without a reference is not counted. |
 | **Modules** | Modules available to this project, with their ports. | Ask the chat to read a KiCad design and plan an extraction. |
 | **Reports** | Fab banner, Stage 7 pills (KLC, ERC, DRC, coverage), simulation, Stage 8 findings by provenance, and the review panel. | Expand a design-issue group to read it. |
-| **Release** | The release builder and the latest package. | **Build release package**, **Look up LCSC part numbers**, **Download latest.zip**. |
+| **Release** | The release builder and the latest package. | **Build release package**, **Look up LCSC part numbers**, **Include ODB++ package as a .zip file**, and **Download latest package: release_<date-time>.zip**, with a line under it saying which of the two options that package was built with. |
 | **Artifacts** | Every file in `.pipeline/`, with a readable view for the main ones (design artifact, nets with a filter, coverage). | Files over 1.5 MB open raw. |
 | **Changes** | Everything changed since the last commit, as diffs. | Click a file to expand it. |
 
@@ -683,6 +683,10 @@ If several endpoints are routed to `review_panel`, each reviews the same evidenc
 ### Release package
 
 The Release tab (or `python -m blpl.core.release`) builds one zip per board with gerbers for every copper layer, drill files, placement, a BOM grouped by part, the native KiCad project, `fab/impedance.md` when nets are controlled, and a checksum for every file.
+
+Tick **Include ODB++ package as a .zip file** (or pass `--odb`) and the package also holds `odb/<project>-odb.zip`: the whole board as one ODB++ job (layer matrix, stackup, copper, drill, components and nets), which many fabs' CAM reads in place of gerbers, drill and placement. It is exported by `kicad-cli` (KiCad 9 or later) at six decimal places of a millimetre, and the release opens it to check it holds a layer matrix and a step with layers in it before calling the step done.
+
+The download is named `release_<date-time>.zip`, using the time the package was built (UTC, `YYYY-MM-DD_HHMMSSZ`), and the line under it says whether LCSC numbers were looked up and whether an ODB++ job is inside. Each build is also kept on the server under that time.
 
 The **fab release gate** runs first. A gate that could not run is reported as unknown, never as a pass. A board the gate refuses still gets a package, with `READ-ME-FIRST.txt` inside the zip, because the zip is what gets emailed and the refusal has to travel with it.
 
