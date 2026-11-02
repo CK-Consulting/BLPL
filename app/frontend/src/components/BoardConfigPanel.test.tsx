@@ -771,3 +771,88 @@ describe("controlled impedance, as fields", () => {
     expect(box.sent.config.net_classes.Power).toEqual({ trace_width: 0.5 });
   });
 });
+
+describe("fabrication, as fields", () => {
+  /**
+   * The quote forms ask for copper weight, laminate, colours, gold fingers and
+   * via protection, and read none of it from KiCad files. board-specs.md says
+   * which were never chosen, so "not specified" must stay distinguishable
+   * from "no" all the way into the file.
+   */
+  const saved = async (edit: () => void, over: Partial<typeof CONFIG> = {}) => {
+    let sent: any = null;
+    stub(over, (body) => {
+      sent = body;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    await screen.findByLabelText("Outer copper (oz)");
+    edit();
+    fireEvent.click(screen.getByText("Save board config"));
+    await waitFor(() => expect(sent).not.toBeNull());
+    return sent.config;
+  };
+
+  it("writes what is chosen, as the schema spells it", async () => {
+    const config = await saved(() => {
+      fireEvent.change(screen.getByLabelText("Outer copper (oz)"), { target: { value: "2" } });
+      fireEvent.change(screen.getByLabelText("Inner copper (oz)"), { target: { value: "1" } });
+      fireEvent.change(screen.getByLabelText("Laminate"), { target: { value: "FR-4 High Tg" } });
+      fireEvent.change(screen.getByLabelText("Tg (°C)"), { target: { value: "170" } });
+      fireEvent.change(screen.getByLabelText("Solder mask"), { target: { value: "black" } });
+      fireEvent.change(screen.getByLabelText("Silkscreen"), { target: { value: "white" } });
+      fireEvent.change(screen.getByLabelText("Via protection"), { target: { value: "filled_capped" } });
+      fireEvent.change(screen.getByLabelText("Gold fingers"), { target: { value: "30" } });
+      fireEvent.change(screen.getByLabelText("Castellated edges"), { target: { value: "yes" } });
+    });
+    expect(config.fabrication).toEqual({
+      copper_oz: { outer: 2, inner: 1 },
+      material: "FR-4 High Tg",
+      tg_c: 170,
+      mask_color: "black",
+      silk_color: "white",
+      via_protection: "filled_capped",
+      gold_fingers: { bevel_deg: 30 },
+      castellated: true,
+    });
+  });
+
+  it("keeps no apart from not specified", async () => {
+    const config = await saved(() => {
+      fireEvent.change(screen.getByLabelText("Gold fingers"), { target: { value: "no" } });
+      fireEvent.change(screen.getByLabelText("Castellated edges"), { target: { value: "no" } });
+    });
+    expect(config.fabrication).toEqual({ gold_fingers: false, castellated: false });
+  });
+
+  it("removes a cleared field, and the block when nothing is left", async () => {
+    const config = await saved(
+      () => {
+        fireEvent.change(screen.getByLabelText("Solder mask"), { target: { value: "" } });
+        fireEvent.change(screen.getByLabelText("Outer copper (oz)"), { target: { value: "" } });
+      },
+      { config: { ...CONFIG.config, fabrication: { mask_color: "red", copper_oz: { outer: 2 } } } },
+    );
+    expect(config).not.toHaveProperty("fabrication");
+  });
+
+  it("does not add a fabrication block to a file that has none", async () => {
+    const config = await saved(() =>
+      fireEvent.change(screen.getByLabelText("Width (mm)"), { target: { value: "90" } }),
+    );
+    expect(config).not.toHaveProperty("fabrication");
+  });
+
+  it("shows a value from the file that the list does not offer", async () => {
+    stub({ config: { ...CONFIG.config, fabrication: { copper_oz: { outer: 1.5 } } } });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    expect(await screen.findByLabelText("Outer copper (oz)")).toHaveValue("1.5");
+  });
+
+  it("asks about inner copper only on a board that has some", async () => {
+    stub({ config: { ...CONFIG.config, project: { dimensions: [10, 10], stackup: { layers: 2 } } } });
+    render(<BoardConfigPanel projectId="p" board="core" />);
+    await screen.findByLabelText("Outer copper (oz)");
+    expect(screen.queryByLabelText("Inner copper (oz)")).toBeNull();
+  });
+});

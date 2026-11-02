@@ -21,15 +21,18 @@
  * only report it.
  *
  * Net classes and controlled impedance are edited in ImpedanceFields, with
- * the last Stage 8 run's ZC findings beside the class they are about.
+ * the last Stage 8 run's ZC findings beside the class they are about; the
+ * bare-board order details (copper weight, laminate, colours and so on) in
+ * FabricationFields.
  */
 
 import { useEffect, useState } from "react";
 
-import { encodePath, getJSON, putJSON, type BoardConfig, type BoardFeature, type NetClass } from "../api";
+import { encodePath, getJSON, putJSON, type BoardConfig, type BoardFeature, type Fabrication, type NetClass } from "../api";
 import { boardArtifact } from "../board";
 import { bbox, outlineSize, SHAPE_KINDS, seedShape, type ShapeKind, type ShapeSpec } from "../boardShape";
 import { BoardPreview, ShapeFields, tryBuild } from "./BoardShapeFields";
+import { FabricationFields } from "./FabricationFields";
 import { ImpedanceFields, routeErrors, type ZcFinding } from "./ImpedanceFields";
 
 const FINISHES = ["ENIG", "HASL", "LF-HASL", "OSP", "Immersion Silver", "Immersion Tin", "Hard Gold"];
@@ -229,6 +232,16 @@ export function BoardConfigPanel({
     setDraft(next);
   };
 
+  // An empty block is removed rather than saved as `fabrication: {}`: it says
+  // nothing, and a file that never had the key should not grow one.
+  const fabrication: Fabrication = isMap(draft.fabrication) ? (draft.fabrication as Fabrication) : {};
+  const setFabrication = (fab: Fabrication) => {
+    const next = structuredClone(draft);
+    if (Object.keys(fab).length) next.fabrication = fab;
+    else delete next.fabrication;
+    setDraft(next);
+  };
+
   const setFeatures = (key: "cutouts" | "keepouts", list: BoardFeature[]) =>
     setBoundaries({ ...boundaries, [key]: list });
 
@@ -416,6 +429,12 @@ export function BoardConfigPanel({
           </select>
         </label>
       </div>
+
+      <FabricationFields
+        fab={fabrication}
+        copper={Number(stackup.layers ?? 4)}
+        onChange={setFabrication}
+      />
 
       <ImpedanceFields
         netClasses={netClasses}

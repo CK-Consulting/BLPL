@@ -985,8 +985,8 @@ header .kicad-launch { margin-left: .4rem; }
 .board-preview-cutout { fill: #0d1117; stroke: #7ee2a8; stroke-width: 1; }
 .board-preview-keepout { fill: rgba(255, 123, 114, .18); stroke: #ff7b72; stroke-width: 1;
   stroke-dasharray: 4 3; }
-.board-features { margin: .8rem 0; padding: .4rem .8rem; border: 1px solid #30363d; border-radius: 6px; }
-.board-features legend { color: #b9c3d0; font-size: 13px; padding: 0 .3rem; }
+.board-features, .board-fabrication { margin: .8rem 0; padding: .4rem .8rem; border: 1px solid #30363d; border-radius: 6px; }
+.board-features legend, .board-fabrication legend { color: #b9c3d0; font-size: 13px; padding: 0 .3rem; }
 .board-feature { padding: .3rem 0; border-bottom: 1px dashed #30363d; }
 .board-forbid { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; font-size: 12px; }
 .board-config label.inline { flex-direction: row; align-items: center; gap: .25rem; }
