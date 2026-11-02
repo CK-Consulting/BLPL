@@ -431,6 +431,24 @@ def _colour(value, layers: str) -> str:
 
 def write_board_specs(pcb: Path | None, hdm_path: Path | None, out_dir: Path, *,
                       board: str, impedance_sheet: bool) -> Step:
+    """board-specs.md at the package root, or a failed step saying why not.
+
+    A hand-edited hdm.yaml can hold anything YAML parses: a list where the
+    project should be, a word where a number should be. The release must
+    still be written, refusal notice and all, so a value this cannot read
+    fails this one step rather than the whole build (Codex, PR #98).
+    """
+    try:
+        return _write_board_specs(pcb, hdm_path, out_dir, board=board,
+                                  impedance_sheet=impedance_sheet)
+    except (AttributeError, TypeError, ValueError, KeyError, IndexError) as exc:
+        name = hdm_path.name if hdm_path is not None else "hdm.yaml"
+        return Step("board-specs", False,
+                    f"{name} has board or fabrication settings that do not read: {exc!r}")
+
+
+def _write_board_specs(pcb: Path | None, hdm_path: Path | None, out_dir: Path, *,
+                       board: str, impedance_sheet: bool) -> Step:
     """board-specs.md at the package root: what the bare board is built from.
 
     The quoting sites take gerbers, or a KiCad project they mostly do not read
@@ -451,6 +469,8 @@ def write_board_specs(pcb: Path | None, hdm_path: Path | None, out_dir: Path, *,
         hdm = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError) as exc:
         return Step("board-specs", False, f"could not read {hdm_path.name}: {exc}")
+    if not isinstance(hdm, dict):
+        return Step("board-specs", False, f"{hdm_path.name} is not a mapping")
     project = hdm.get("project") or {}
     st = project.get("stackup") or {}
     fab = hdm.get("fabrication") or {}
