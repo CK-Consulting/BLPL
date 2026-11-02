@@ -65,6 +65,27 @@ _NON_COPPER_LAYERS: list[sexpr.Sexp] = [
 ]
 
 
+# Layers a `fabrication:` colour of `none` takes off the board. Disabled in
+# the layer table, a layer is gone from every export KiCad makes, ODB++
+# included, which takes no layer selection; left enabled, a board ordered
+# with no mask still carried mask in its ODB++ job and native project
+# (Codex, PR #98). Footprint pads keep naming F.Mask; KiCad loads them and
+# keeps the layer disabled when it saves.
+_NONE_LAYERS = {"mask_color": ("F.Mask", "B.Mask"), "silk_color": ("F.SilkS", "B.SilkS")}
+
+
+def _absent_layers(fab: dict | None) -> set[str]:
+    """The mask or silk layers ``fab`` says the board has none of."""
+    fab = fab or {}
+    return {lay for key, lays in _NONE_LAYERS.items() if fab.get(key) == "none" for lay in lays}
+
+
+def _non_copper_layers(fab: dict | None = None) -> list[sexpr.Sexp]:
+    """_NON_COPPER_LAYERS, less the layers a `none` colour takes off the board."""
+    absent = _absent_layers(fab)
+    return [row for row in _NON_COPPER_LAYERS if row[1].strip('"') not in absent]
+
+
 # The counts schemas/project_config.v1.json allows.
 _COPPER_COUNTS = frozenset({1, 2, 4, 6, 8, 10, 12})
 
@@ -1147,7 +1168,7 @@ def _build(
         ["generator_version", f'"{_GENERATOR_VERSION}"'],
         ["general", ["thickness", f"{thickness}"], ["legacy_teardrops", "no"]],
         ["paper", '"A4"'],
-        ["layers", *copper_rows, *_NON_COPPER_LAYERS],
+        ["layers", *copper_rows, *_non_copper_layers(hdm.get("fabrication"))],
         _default_setup(_stackup(project, _copper_count(project), float(thickness),
                                 hdm.get("fabrication") or {}),
                        hdm.get("fabrication") or {}),
@@ -1349,7 +1370,8 @@ def _stackup(project: dict, copper: int, thickness: float,
 
     ``fab`` is project.yaml's ``fabrication``: copper weight sets each copper
     layer's thickness, ``material`` the dielectrics', the colours go on the
-    mask and silk rows, and gold fingers and castellation become the
+    mask and silk rows (a colour of ``none`` drops the row, as the layer table
+    drops the layer), and gold fingers and castellation become the
     stackup's edge-connector and castellated-pads flags. Without it the
     stackup is exactly what it was: 1 oz outer, 0.5 oz inner, FR4, no colours.
     """
@@ -1371,6 +1393,7 @@ def _stackup(project: dict, copper: int, thickness: float,
         ["layer", '"F.Paste"', ["type", '"Top Solder Paste"']],
         _coloured("F.Mask", "Top Solder Mask", mask, ["thickness", f"{_MASK:g}"]),
     ]
+    absent = _absent_layers(fab)
     gaps = len(names) - 1
     copper_mm = sum(outer_cu if n in ("F.Cu", "B.Cu") else inner_cu for n in names)
     if gaps == 1:
@@ -1429,6 +1452,9 @@ def _stackup(project: dict, copper: int, thickness: float,
         ["layer", '"B.Paste"', ["type", '"Bottom Solder Paste"']],
         _coloured("B.SilkS", "Bottom Silk Screen", silk),
     ]
+    # A layer the board does not have has no row: the stackup lists what the
+    # fab builds, and a mask row on a board ordered without mask says it has.
+    rows = [r for r in rows if r[1].strip('"') not in absent]
     finish = (project.get("stackup") or {}).get("finish")
     tail: list[sexpr.Node] = [["copper_finish", sexpr.quote(finish or "None")],
                               ["dielectric_constraints", "no"]]
