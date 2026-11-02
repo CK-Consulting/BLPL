@@ -109,6 +109,14 @@ These are the places a new user is most likely to lose data or get stuck.
 | `BoardConfigPanel.tsx:371` | Copper layers | Layer count of the board you will order. Changes which layers keepouts and planes may use. |
 | `BoardConfigPanel.tsx:371` | Thickness (mm) | Finished board thickness; 1.6 is standard. |
 | `BoardConfigPanel.tsx:371` | Finish | Surface finish. ENIG suits fine-pitch parts; HASL is cheapest. |
+| `FabricationFields.tsx` | Outer copper (oz) | Finished copper weight on the outer layers. 1 oz is the standard; 2 oz for high current. |
+| `FabricationFields.tsx` | Inner copper (oz) (4+ layers only) | Finished copper weight on the inner layers. 0.5 oz is the standard. |
+| `FabricationFields.tsx` | Laminate | Board material, e.g. FR-4, FR-4 High Tg, Rogers RO4350B, polyimide, aluminium. |
+| `FabricationFields.tsx` | Tg (°C) | Minimum glass transition temperature of the laminate: 130 is standard FR-4, 170 is high Tg. |
+| `FabricationFields.tsx` | Solder mask / Silkscreen | Solder mask colour (green is cheapest and quickest at most fabs) / legend colour. |
+| `FabricationFields.tsx` | Via protection | How vias are covered, per IPC-4761. Filled and capped is what via-in-pad needs. |
+| `FabricationFields.tsx` | Gold fingers | Hard gold edge connector contacts, and the bevel angle on the edge they plug in by. |
+| `FabricationFields.tsx` | Castellated edges | Plated half-holes on the board edge, for a module soldered onto another board. |
 | `BoardConfigPanel.tsx:303` | Width / Height (editable) | Board size in mm. Must match the outline. |
 | `BoardConfigPanel.tsx` | Follows part (refdes) | Fix this shape to a part so it moves with it, as an antenna keepout should. Empty keeps it fixed on the board. |
 | `BoardConfigPanel.tsx` | Forbid checkboxes | What may not enter this area: tracks, vias, pads, copper pours, footprints. |

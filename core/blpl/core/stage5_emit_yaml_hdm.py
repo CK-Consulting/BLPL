@@ -876,7 +876,9 @@ def emit(
     )
 
     hdm: dict[str, Any] = {}
-    for key in ("project", "net_classes", "boundaries", "review"):
+    # fabrication: what the bare board is built from, for the emitter's
+    # stackup and the release's board-specs.md.
+    for key in ("project", "net_classes", "boundaries", "review", "fabrication"):
         if key in project_config:
             hdm[key] = project_config[key]
     if z.synthesized:

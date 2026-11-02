@@ -175,7 +175,7 @@ def test_a_project_with_no_board_still_produces_a_package_that_explains_itself(
     empty.mkdir()
     manifest = release.build(empty, now="2026-08-12_120000Z")
     assert not manifest["quotable"]
-    assert sorted(manifest["incomplete"]) == ["bom", "fabrication", "native"]
+    assert sorted(manifest["incomplete"]) == ["board-specs", "bom", "fabrication", "native"]
     readme = (empty / "release" / "2026-08-12_120000Z" / "READ-ME-FIRST.txt").read_text()
     # In the app's terms: a pipeline stage to run, not a command to type.
     assert "Stage 6" in readme and "Stage 1" in readme
@@ -517,3 +517,103 @@ def test_one_mpn_from_two_manufacturers_stays_two_circuithub_lines(tmp_path) -> 
         rows = list(_csv.DictReader(io.StringIO(zf.read("b-bom.csv").decode())))
     assert {(r["Reference Designators"], r["Manufacturer"]) for r in rows} == {
         ("U1", "Texas Instruments"), ("U2", "STMicroelectronics")}
+
+
+# -- board-specs.md ------------------------------------------------------------
+
+
+_ROUTED = """(kicad_pcb
+  (segment (start 0 0) (end 1 0) (width 0.2) (layer "F.Cu") (net 1))
+  (arc (start 0 0) (mid 1 1) (end 2 0) (width 0.127) (layer "F.Cu") (net 1))
+  (via (at 1 1) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))
+  (footprint "R" (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu"))
+                 (pad "2" thru_hole oval (at 2 0) (size 1.7 2) (drill oval 0.8 1.2) (layers "*.Cu")))
+)
+"""
+
+
+def _specs_hdm(tmp_path: Path, fabrication: dict | None, layers: int = 4) -> Path:
+    import yaml
+    doc = {"project": {"name": "dev04", "board_id": "DV-4", "dimensions": [40, 30],
+                       "stackup": {"layers": layers, "thickness": 1.6, "finish": "ENIG"}},
+           "net_classes": {"Default": {"trace_width": 0.2, "clearance": 0.15, "via_drill": 0.3},
+                           "Fine": {"trace_width": 0.1, "clearance": 0.1, "via_drill": 0.2}}}
+    if fabrication is not None:
+        doc["fabrication"] = fabrication
+    path = tmp_path / "hdm.yaml"
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    return path
+
+
+def _specs(tmp_path: Path, fabrication: dict | None, pcb_text: str | None = _ROUTED, **kw) -> tuple:
+    pcb = None
+    if pcb_text is not None:
+        pcb = tmp_path / "b.kicad_pcb"
+        pcb.write_text(pcb_text, encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    step = release.write_board_specs(pcb, _specs_hdm(tmp_path, fabrication, **kw), out,
+                                     board="dev04", impedance_sheet=False)
+    return step, (out / "board-specs.md").read_text(encoding="utf-8") if step.ok else ""
+
+
+def test_board_specs_carry_every_fabrication_item_for_the_quote_form(tmp_path) -> None:
+    """The quoting sites read none of this from a KiCad project, so it is
+    written out at the package root, once, as the form asks for it."""
+    step, text = _specs(tmp_path, {
+        "copper_oz": {"outer": 2, "inner": 1}, "material": "FR-4 High Tg", "tg_c": 170,
+        "mask_color": "black", "silk_color": "white", "gold_fingers": {"bevel_deg": 30},
+        "via_protection": "filled_capped", "castellated": True})
+    assert step.ok and step.detail == "" and step.outputs == ["board-specs.md"]
+    for want in ("| Board | DV-4 |", "| Copper layers | 4 |", "| Board size | 40.00 x 30.00 mm |",
+                 "| Finished thickness | 1.6 mm |", "| Laminate | FR-4 High Tg |",
+                 "| Glass transition (Tg) | 170 C minimum |", "| Copper weight, outer layers | 2 oz |",
+                 "| Copper weight, inner layers | 1 oz |", "| Surface finish | ENIG |",
+                 "| Solder mask colour | black |", "| Silkscreen colour | white |",
+                 "bevelled 30 degrees", "IPC-4761 Type VII", "| Castellated edges | yes",
+                 "| Impedance control | no |"):
+        assert want in text, want
+    assert "Not specified" not in text
+
+
+def test_board_specs_measure_the_smallest_trace_and_hole_on_the_board(tmp_path) -> None:
+    """The fab quotes what it is asked to make: the 0.127 mm arc and the
+    0.3 mm via, not the Default class."""
+    _step, text = _specs(tmp_path, {})
+    assert "| Minimum trace width | 0.127 mm (5.0 mil), measured on the board |" in text
+    assert "| Minimum drill | 0.300 mm (11.8 mil), measured on the board (a via) |" in text
+    assert "| Minimum spacing | 0.100 mm (3.9 mil), the smallest net class clearance |" in text
+
+
+def test_an_unrouted_board_takes_its_minimums_from_the_net_classes_and_says_so(tmp_path) -> None:
+    _step, text = _specs(tmp_path, {}, pcb_text="(kicad_pcb)\n")
+    assert "0.100 mm (3.9 mil), from the net classes: the board has no tracks yet" in text
+    assert "0.200 mm (7.9 mil), from the net classes: the board has no holes yet" in text
+
+
+def test_what_project_yaml_leaves_out_is_said_to_be_left_out(tmp_path) -> None:
+    """"Not specified" and "(default)" are different claims: one leaves it to
+    the fab, the other is what BLPL assumed and wrote into the board."""
+    step, text = _specs(tmp_path, None, layers=2)
+    assert "| Laminate | FR-4 (default) |" in text
+    assert "| Copper weight, outer layers | 1 oz (default) |" in text
+    assert "inner layers" not in text  # a two-layer board has none
+    assert "| Solder mask colour | not specified |" in text
+    assert "## Not specified" in text and "Tg, solder mask colour" in text
+    assert "not specified" in step.detail
+
+
+def test_board_specs_without_a_stage5_hdm_say_what_to_run(tmp_path) -> None:
+    step = release.write_board_specs(None, tmp_path / "missing.yaml", tmp_path, board="x",
+                                     impedance_sheet=False)
+    assert not step.ok and "Stage 5" in step.detail
+
+
+def test_board_specs_sit_at_the_root_of_every_package(project, monkeypatch) -> None:
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    (project / ".pipeline" / "hdm.yaml").write_text(
+        "project: {name: dev04, stackup: {layers: 2}}\n", encoding="utf-8")
+    manifest = release.build(project, now="2026-08-12_120000Z")
+    with zipfile.ZipFile(manifest["archive"]) as zf:
+        assert "board-specs.md" in zf.namelist()
+    assert next(s for s in manifest["steps"] if s["step"] == "board-specs")["ok"]
