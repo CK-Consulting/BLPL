@@ -525,7 +525,7 @@ boundaries:
 | Section | What it controls | Notes |
 |---|---|---|
 | `project` | Name, board ID, dimensions, stackup (`layers`, `thickness`, `finish`, optional `prepreg`, `core`, `er`). | Prepreg and dielectric constant set outer-layer impedance; take them from the fab's stackup. |
-| `fabrication` | What the fab builds the bare board from: copper weight (`copper_oz.outer`, `.inner`), laminate (`material`), `tg_c`, `mask_color`, `silk_color`, `gold_fingers` (with bevel), `via_protection` (IPC-4761), `castellated`. | Written into the KiCad stackup where KiCad has a place for it, and into `board-specs.md` in every release package. Leave a key out and it is listed as not specified, so the fab's standard applies; `false` means no. |
+| `fabrication` | What the fab builds the bare board from: copper weight (`copper_oz.outer`, `.inner`), laminate (`material`), `tg_c`, `mask_color`, `silk_color`, `gold_fingers` (with bevel), `via_protection` (IPC-4761), `castellated`. | Written into the KiCad stackup where KiCad has a place for it, and into `board-specs.md` in every release package. Leave a key out and it is listed as not specified, so the fab's standard applies; `false` means no. A colour of `none` also leaves that layer's gerbers out of the package. |
 | `net_classes` | Width, clearance, via size per class; optional `impedance`, `diff_pair_gap`, `coplanar_gap`. | `Default` is mandatory. |
 | `net_class_rules` | Name patterns that override Stage 4's guess. First match wins. | Use when a net lands in the wrong class. |
 | `controlled_impedance` | Which nets need controlled impedance and at what target. | Regex over net names. 50 ohm single-ended by default. See below. |
