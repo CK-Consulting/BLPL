@@ -617,3 +617,45 @@ def test_board_specs_sit_at_the_root_of_every_package(project, monkeypatch) -> N
     with zipfile.ZipFile(manifest["archive"]) as zf:
         assert "board-specs.md" in zf.namelist()
     assert next(s for s in manifest["steps"] if s["step"] == "board-specs")["ok"]
+
+
+def test_no_mask_or_silk_leaves_those_layers_out_of_the_gerbers(tmp_path, monkeypatch) -> None:
+    """board-specs.md said "no solder mask" while the gerbers carried F.Mask
+    and B.Mask, and a fab's CAM believes the gerbers (Codex, PR #98)."""
+    pcb = _board_with_layers(tmp_path / "b.kicad_pcb", '(0 "F.Cu" signal) (2 "B.Cu" signal)')
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, name, expect_dir=None):
+        seen.append(cmd)
+        return release.Step(name, True)
+
+    monkeypatch.setattr(release, "_run", fake_run)
+    release.export_fabrication(pcb, tmp_path / "out", kicad_cli="kicad-cli",
+                               fab={"mask_color": "none", "silk_color": "none"})
+    gerbers = next(c for c in seen if c[3] == "gerbers")
+    layers = gerbers[gerbers.index("--layers") + 1].split(",")
+    assert not {"F.Mask", "B.Mask", "F.Silkscreen", "B.Silkscreen"} & set(layers)
+    assert {"F.Cu", "B.Cu", "F.Paste", "B.Paste", "Edge.Cuts"} <= set(layers)
+
+
+def test_a_coloured_mask_keeps_its_layers() -> None:
+    assert release.fab_layers({"mask_color": "black", "silk_color": "white"}) == release.FAB_LAYERS
+    assert release.fab_layers({"mask_color": "none"}).split(",") == [
+        "F.Paste", "B.Paste", "F.Silkscreen", "B.Silkscreen", "Edge.Cuts"]
+
+
+def test_board_specs_say_a_none_colour_left_its_gerbers_out(tmp_path) -> None:
+    _, text = _specs(tmp_path, {"mask_color": "none", "silk_color": "white"})
+    assert "no mask gerbers in this package" in text
+    assert "| Silkscreen colour | white |" in text
+
+
+def test_the_release_reads_the_colours_from_the_boards_hdm(tmp_path) -> None:
+    """build() passes hdm.yaml's fabrication to the gerber export; an hdm.yaml
+    without one, or none at all, exports every layer as before."""
+    hdm = tmp_path / "hdm.yaml"
+    hdm.write_text("fabrication: {mask_color: none}\n", encoding="utf-8")
+    assert release._fabrication(hdm) == {"mask_color": "none"}
+    hdm.write_text("project: {name: p}\n", encoding="utf-8")
+    assert release._fabrication(hdm) == {}
+    assert release._fabrication(tmp_path / "missing.yaml") == {}

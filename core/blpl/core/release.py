@@ -52,6 +52,32 @@ from blpl.emitter import sexpr
 # layers, and nothing about the package said so.
 FAB_LAYERS = "F.Paste,B.Paste,F.Silkscreen,B.Silkscreen,F.Mask,B.Mask,Edge.Cuts"
 
+# Layers a `fabrication:` colour of `none` takes out of the gerbers. A board
+# ordered with no mask but shipped with mask gerbers contradicts itself, and
+# the fab's CAM believes the gerbers over board-specs.md (Codex, PR #98).
+_NONE_DROPS = {"mask_color": ("F.Mask", "B.Mask"), "silk_color": ("F.Silkscreen", "B.Silkscreen")}
+
+
+def fab_layers(fab: dict | None = None) -> str:
+    """FAB_LAYERS, less the mask or silk layers project.yaml says the board has none of."""
+    fab = fab or {}
+    drop = {lay for key, lays in _NONE_DROPS.items() if fab.get(key) == "none" for lay in lays}
+    return ",".join(lay for lay in FAB_LAYERS.split(",") if lay not in drop)
+
+
+def _fabrication(hdm_path: Path | None) -> dict:
+    """hdm.yaml's `fabrication`, or nothing when there is no readable one."""
+    import yaml
+
+    if hdm_path is None or not hdm_path.is_file():
+        return {}
+    try:
+        doc = yaml.safe_load(hdm_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    fab = doc.get("fabrication") if isinstance(doc, dict) else None
+    return fab if isinstance(fab, dict) else {}
+
 _COPPER_TYPES = {"signal", "power", "mixed", "jumper"}
 
 _TIMEOUT = 300
@@ -138,8 +164,12 @@ def _run(cmd: list[str], name: str, expect_dir: Path | None = None) -> Step:
 # ---------------------------------------------------------------------------
 
 
-def export_fabrication(pcb: Path, out_dir: Path, *, kicad_cli: str | None = None) -> list[Step]:
+def export_fabrication(pcb: Path, out_dir: Path, *, kicad_cli: str | None = None,
+                       fab: dict | None = None) -> list[Step]:
     """Gerbers, drill files and a placement file, via kicad-cli.
+
+    ``fab`` is the board's `fabrication:`; a mask or silk colour of ``none``
+    leaves those layers out of the gerbers.
 
     Each is its own step so a failure in one does not hide the others: a board
     whose drill export failed still has gerbers worth looking at, and the
@@ -162,7 +192,7 @@ def export_fabrication(pcb: Path, out_dir: Path, *, kicad_cli: str | None = None
     if copper:
         gerber_step = _run(
             [cli, "pcb", "export", "gerbers", "--output", str(gerbers),
-             "--layers", ",".join([*copper, FAB_LAYERS]), str(pcb)],
+             "--layers", ",".join([*copper, fab_layers(fab)]), str(pcb)],
             "gerbers",
             gerbers,
         )
@@ -392,6 +422,13 @@ def _mm(v: float) -> str:
     return f"{v:.3f} mm ({v / _MIL:.1f} mil)"
 
 
+def _colour(value, layers: str) -> str:
+    """A mask or silk colour, saying for `none` that its gerbers were left out."""
+    if value == "none":
+        return f"none: no {layers}, and no {layers} gerbers in this package"
+    return str(value or "")
+
+
 def write_board_specs(pcb: Path | None, hdm_path: Path | None, out_dir: Path, *,
                       board: str, impedance_sheet: bool) -> Step:
     """board-specs.md at the package root: what the bare board is built from.
@@ -450,8 +487,8 @@ def write_board_specs(pcb: Path | None, hdm_path: Path | None, out_dir: Path, *,
         rows.append(("Copper weight, inner layers", inner))
     rows += [
         ("Surface finish", st.get("finish") or "not specified"),
-        ("Solder mask colour", given("mask_color", "solder mask colour", str(fab.get("mask_color", "")))),
-        ("Silkscreen colour", given("silk_color", "silkscreen colour", str(fab.get("silk_color", "")))),
+        ("Solder mask colour", given("mask_color", "solder mask colour", _colour(fab.get("mask_color"), "mask"))),
+        ("Silkscreen colour", given("silk_color", "silkscreen colour", _colour(fab.get("silk_color"), "silkscreen"))),
         ("Gold fingers", fingers_text),
         ("Via protection", given("via_protection", "via protection",
                                  _VIA_TYPES.get(str(fab.get("via_protection")), ""))),
@@ -945,7 +982,8 @@ def build(
     steps: list[Step] = []
     pcb = src["pcb"]
     if pcb is not None:
-        steps.extend(export_fabrication(pcb, out_dir, kicad_cli=kicad_cli))
+        steps.extend(export_fabrication(pcb, out_dir, kicad_cli=kicad_cli,
+                                        fab=_fabrication(src["hdm"])))
         if odb:
             steps.append(export_odb(pcb, out_dir, name, kicad_cli=kicad_cli))
     else:
