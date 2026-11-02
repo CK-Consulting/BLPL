@@ -388,11 +388,11 @@ def test_the_manifest_says_which_options_the_package_was_built_with(project, mon
     find out whether LCSC numbers were looked up or an ODB++ job is inside."""
     monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
     plain = release.build(project, now="2026-08-12_120000Z")
-    assert plain["options"] == {"lcsc": False, "odb": False}
+    assert plain["options"] == {"lcsc": False, "odb": False, "circuithub": False}
     assert not any(s["step"] == "odb" for s in plain["steps"])
 
     asked = release.build(project, now="2026-08-12_130000Z", odb=True)
-    assert asked["options"] == {"lcsc": False, "odb": True}
+    assert asked["options"] == {"lcsc": False, "odb": True, "circuithub": False}
     odb = next(s for s in asked["steps"] if s["step"] == "odb")
     assert not odb["ok"] and "odb" in asked["incomplete"]
 
@@ -432,3 +432,68 @@ def test_kicad_cli_writes_an_odb_job_a_cam_can_read(tmp_path) -> None:
         info = zf.read("misc/info").decode()
     assert "ODB_VERSION_MAJOR=8" in info and "UNITS=MM" in info
     assert any(n.endswith("layers/comp_+_top/components") for n in names)
+
+
+# -- CircuitHub -------------------------------------------------------------
+
+
+def _circuithub(project, monkeypatch, **kw) -> tuple[dict, zipfile.ZipFile]:
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    manifest = release.build(project, now="2026-08-12_120000Z", circuithub=True, **kw)
+    with zipfile.ZipFile(manifest["archive"]) as outer:
+        inner = outer.read("circuithub/dev04-circuithub.zip")
+    import io
+    return manifest, zipfile.ZipFile(io.BytesIO(inner))
+
+
+def test_a_circuithub_package_is_the_native_project_and_a_bom(project, monkeypatch) -> None:
+    """CircuitHub imports KiCad natively and turns gerbers down: one
+    .kicad_pro, one .kicad_pcb, the schematics, and a BOM it reconciles."""
+    manifest, zf = _circuithub(project, monkeypatch)
+    assert manifest["options"]["circuithub"] is True
+    step = next(s for s in manifest["steps"] if s["step"] == "circuithub")
+    assert step["ok"]
+    assert sorted(zf.namelist()) == ["dev04-bom.csv", "dev04.kicad_pcb", "dev04.kicad_pro",
+                                     "dev04.kicad_sch"]
+
+
+def test_the_circuithub_bom_uses_columns_its_import_recognises(project, monkeypatch) -> None:
+    """At least Reference Designators and Manufacturer Part Number, under
+    names from CircuitHub's list, or nothing reconciles."""
+    import csv as _csv
+    import io
+    _m, zf = _circuithub(project, monkeypatch)
+    rows = list(_csv.DictReader(io.StringIO(zf.read("dev04-bom.csv").decode())))
+    assert list(rows[0]) == ["Reference Designators", "Manufacturer Part Number", "Manufacturer",
+                             "Description", "Value", "DNP"]
+    caps = next(r for r in rows if r["Manufacturer Part Number"] == "CL10B104KB8NNNC")
+    assert caps["Reference Designators"] == "C1,C2" and caps["DNP"] == ""
+
+
+def test_parts_the_assembler_does_not_fit_are_dnp_for_circuithub(project, monkeypatch) -> None:
+    """dnp, footprint_only and hand_fit parts are neither bought nor placed by
+    the house, as the JLCPCB and PCBWay files leave them out."""
+    import csv as _csv
+    import io
+    (project / ".pipeline" / "hdm.yaml").write_text(
+        "components:\n  U1: {assembly: hand_fit}\n  C2: {assembly: dnp}\n", encoding="utf-8")
+    _m, zf = _circuithub(project, monkeypatch)
+    rows = list(_csv.DictReader(io.StringIO(zf.read("dev04-bom.csv").decode())))
+    dnp = {r["Reference Designators"] for r in rows if r["DNP"] == "dnp"}
+    fitted = {r["Reference Designators"] for r in rows if r["DNP"] == ""}
+    assert dnp == {"C2", "U1"} and fitted == {"C1"}
+
+
+def test_circuithub_takes_one_design_and_a_second_board_is_refused(project, monkeypatch) -> None:
+    """Guessing which of two boards is meant would ship the wrong one."""
+    (project / "kicad" / "other.kicad_pcb").write_text("(kicad_pcb)\n", encoding="utf-8")
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    manifest = release.build(project, now="2026-08-12_120000Z", circuithub=True)
+    step = next(s for s in manifest["steps"] if s["step"] == "circuithub")
+    assert not step["ok"] and "2 .kicad_pcb" in step["detail"]
+    assert "circuithub" in manifest["incomplete"]
+
+
+def test_circuithub_without_a_published_project_says_what_to_run(tmp_path) -> None:
+    step = release.export_circuithub(None, tmp_path / "bom.json", tmp_path, "x")
+    assert not step.ok and "Stage 6" in step.detail

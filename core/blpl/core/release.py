@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import re
 import shutil
@@ -243,6 +244,83 @@ def export_odb(pcb: Path, out_dir: Path, name: str, *, kicad_cli: str | None = N
     if problem:
         return Step("odb", False, problem)
     return Step("odb", True, "", [dest.name])
+
+
+# The column names CircuitHub's BOM import recognises
+# (docs.circuithub.com, "Supplying a BOM as a CSV spreadsheet"). It needs the
+# first two; the rest help it reconcile, and DNP keeps a part off the order.
+_CIRCUITHUB_BOM = ("Reference Designators", "Manufacturer Part Number", "Manufacturer",
+                   "Description", "Value", "DNP")
+
+
+def export_circuithub(kicad_dir: Path | None, bom_json: Path, out_dir: Path, name: str,
+                      not_fitted: "set[str] | None" = None) -> Step:
+    """A design package for CircuitHub: the native project and a BOM, zipped.
+
+    CircuitHub imports a KiCad project natively (KiCad 6 to 10) and turns down
+    gerbers, which lose the part numbers and polarity it reads from the
+    schematic. What it asks for is one .kicad_pro, one .kicad_pcb and the
+    .kicad_sch files, from one design only, and optionally a BOM it reconciles
+    against; so this is those, from the project Stage 6 published, and no
+    library folders. A part not fitted by the assembler (dnp, footprint_only
+    or hand_fit in project.yaml) is marked DNP so it is neither bought nor
+    placed, as the JLCPCB and PCBWay files leave it out.
+    """
+    src = Path(kicad_dir) if kicad_dir is not None else None
+    if src is None or not src.is_dir():
+        return Step("circuithub", False, "no published KiCad project for this board yet: run the "
+                                         "pipeline through Stage 6 (it publishes to kicad/)")
+    found = {ext: sorted(p for p in src.iterdir() if p.is_file() and p.suffix == ext)
+             for ext in (".kicad_pro", ".kicad_pcb", ".kicad_sch")}
+    wrong = [f"{len(found[e])} {e} files" for e in (".kicad_pro", ".kicad_pcb") if len(found[e]) != 1]
+    if not found[".kicad_sch"]:
+        wrong.append("no .kicad_sch")
+    if wrong:
+        # CircuitHub takes one design per upload; guessing which board is
+        # meant would be shipping the wrong one.
+        return Step("circuithub", False, f"{src.name}/ holds {', '.join(wrong)}; CircuitHub needs "
+                                         "exactly one project and board, and its schematics")
+
+    try:
+        rows = json.loads(Path(bom_json).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return Step("circuithub", False, f"could not read {Path(bom_json).name}: {exc}")
+    if isinstance(rows, dict):
+        rows = rows.get("components") or rows.get("rows") or []
+    grouped: dict[tuple, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ref = str(row.get("refdes") or row.get("local_id") or "").strip()
+        if not ref:
+            continue
+        mpn = str(row.get("mpn") or row.get("part_hint") or "").strip()
+        value = str(row.get("value") or "").strip()
+        dnp = "dnp" if ref in (not_fitted or set()) else ""
+        entry = grouped.setdefault((mpn, value, dnp), {
+            "refs": [], "Manufacturer Part Number": mpn, "Value": value, "DNP": dnp,
+            "Manufacturer": str(row.get("manufacturer") or row.get("manufacturer_hint") or ""),
+            "Description": str(row.get("description") or ""),
+        })
+        entry["refs"].append(ref)
+
+    pkg = out_dir / "circuithub"
+    pkg.mkdir(parents=True, exist_ok=True)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_CIRCUITHUB_BOM, extrasaction="ignore")
+    writer.writeheader()
+    for e in sorted(grouped.values(), key=lambda e: (e["DNP"], e["Manufacturer Part Number"], e["Value"])):
+        writer.writerow({**e, "Reference Designators": ",".join(sorted(e["refs"]))})
+    archive = pkg / f"{name}-circuithub.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in found[".kicad_pro"] + found[".kicad_pcb"] + found[".kicad_sch"]:
+            zf.write(path, path.name)
+        zf.writestr(f"{name}-bom.csv", buf.getvalue())
+
+    missing = sum(1 for (mpn, _v, dnp) in grouped if not mpn and not dnp)
+    detail = (f"{missing} fitted line item(s) have no MPN; CircuitHub will ask about them"
+              if missing else "")
+    return Step("circuithub", True, detail, [archive.name])
 
 
 def _not_bought(pipeline: Path, hdm: Path | None = None) -> set[str]:
@@ -664,6 +742,7 @@ def build(
     kicad_cli: str | None = None,
     lcsc: bool = False,
     odb: bool = False,
+    circuithub: bool = False,
     board: str | None = None,
 ) -> dict:
     """Build the release package. Returns the manifest.
@@ -709,6 +788,10 @@ def build(
         steps.append(Step("bom", False, "no BOM yet: run the pipeline through Stage 1"))
 
     steps.append(copy_native_project(src["kicad_dir"], out_dir))
+    if circuithub:
+        steps.append(export_circuithub(
+            src["kicad_dir"], bom_json, out_dir, name,
+            _assembled_as(pipeline, src["hdm"], ("dnp", "footprint_only", "hand_fit"))))
     z_step = export_impedance(pipeline, pcb, out_dir, src["hdm"])
     steps.append(z_step)
 
@@ -743,7 +826,7 @@ def build(
         "incomplete": [s.name for s in steps if not s.ok],
         # Which of the optional outputs this build was asked for, so the
         # download can say what is in it without anyone opening the zip.
-        "options": {"lcsc": lcsc, "odb": odb},
+        "options": {"lcsc": lcsc, "odb": odb, "circuithub": circuithub},
         # What the assembly files left for fitting by hand, so regenerating
         # them from this package (blpl bom-assembly) leaves out the same parts.
         "hand_fit": sorted(hand_fit),
@@ -823,10 +906,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also export the board as an ODB++ job, zipped inside the package.",
     )
+    parser.add_argument(
+        "--circuithub",
+        action="store_true",
+        help="Also write a CircuitHub design package (the native project and a BOM, zipped).",
+    )
     args = parser.parse_args(argv)
 
     try:
-        manifest = build(Path(args.project_dir), lcsc=args.lcsc, odb=args.odb, board=args.board)
+        manifest = build(Path(args.project_dir), lcsc=args.lcsc, odb=args.odb,
+                         circuithub=args.circuithub, board=args.board)
     except ValueError as exc:
         print(f"release: {exc}", file=sys.stderr, flush=True)
         return 2
