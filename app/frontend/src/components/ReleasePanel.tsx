@@ -28,7 +28,7 @@ export type Manifest = {
   incomplete?: string[];
   tools?: { kicad_cli?: string };
   // Absent from packages built before the options were recorded.
-  options?: { lcsc?: boolean; odb?: boolean };
+  options?: { lcsc?: boolean; odb?: boolean; circuithub?: boolean };
 };
 
 type GateCheck = { category?: string; check_id?: string; status?: string; message?: string };
@@ -41,14 +41,19 @@ type GateCheck = { category?: string; check_id?: string; status?: string; messag
  */
 export function builtWith(m: Manifest): string {
   if (!m.options) return "Built before its options were recorded: LCSC lookup and ODB++ unknown.";
-  const odbStep = m.steps?.find((s) => s.step === "odb");
-  const odb = !m.options.odb
-    ? "no ODB++ package"
-    : odbStep && !odbStep.ok
-      ? "ODB++ package requested but not produced (see below)"
-      : "ODB++ package included";
+  const optional = (asked: boolean | undefined, step: string, what: string) => {
+    if (!asked) return `no ${what}`;
+    const ran = m.steps?.find((s) => s.step === step);
+    return ran && !ran.ok ? `${what} requested but not produced (see below)` : `${what} included`;
+  };
   const lcsc = m.options.lcsc ? "LCSC part numbers looked up" : "no LCSC part number lookup";
-  return `Built with ${lcsc}, ${odb}.`;
+  // Packages from before the CircuitHub option record only lcsc and odb, and
+  // say nothing about it rather than "no CircuitHub package".
+  const parts = [lcsc, optional(m.options.odb, "odb", "ODB++ package")];
+  if (m.options.circuithub !== undefined) {
+    parts.push(optional(m.options.circuithub, "circuithub", "CircuitHub design package"));
+  }
+  return `Built with ${parts.join(", ")}.`;
 }
 
 function human(bytes: number): string {
@@ -71,6 +76,7 @@ export function ReleasePanel({
   const [running, setRunning] = useState(false);
   const [lcsc, setLcsc] = useState(false);
   const [odb, setOdb] = useState(false);
+  const [circuithub, setCircuithub] = useState(false);
   const runIdRef = useRef<string | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
@@ -90,7 +96,8 @@ export function ReleasePanel({
     setLines([]);
     setRunning(true);
     try {
-      const query = [lcsc && "lcsc=true", odb && "odb=true"].filter(Boolean).join("&");
+      const query = [lcsc && "lcsc=true", odb && "odb=true", circuithub && "circuithub=true"]
+        .filter(Boolean).join("&");
       const url = withBoard(`/api/projects/${projectId}/release${query ? `?${query}` : ""}`, board);
       await readSSE(url, { method: "POST" }, (event, payload) => {
         if (event === "start") runIdRef.current = payload.run_id ?? null;
@@ -136,6 +143,11 @@ export function ReleasePanel({
         <label title="Also export the board as an ODB++ job, a single archive many fabs' CAM reads in place of gerbers, drill and placement, and put it in the package as odb/<project>-odb.zip">
           <input type="checkbox" checked={odb} disabled={running} onChange={(e) => setOdb(e.target.checked)} />{" "}
           Include ODB++ package as a .zip file
+        </label>
+        <label title="Also write a design package for CircuitHub's quote: the native KiCad project (project, board, schematics) and a BOM in columns its import reads, zipped as circuithub/<project>-circuithub.zip. Parts not fitted by the assembler are marked DNP.">
+          <input type="checkbox" checked={circuithub} disabled={running}
+            onChange={(e) => setCircuithub(e.target.checked)} />{" "}
+          Export CircuitHub design package
         </label>
       </div>
       {manifest?.exists && (

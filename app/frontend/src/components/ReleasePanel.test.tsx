@@ -49,6 +49,10 @@ describe("the Release tab", () => {
     await userEvent.click(screen.getByLabelText("Look up LCSC part numbers"));
     await userEvent.click(screen.getByRole("button", { name: "Build release package" }));
     expect(readSSE.mock.calls[1][0]).toBe("/api/projects/p/release?lcsc=true&odb=true&board=base");
+    await userEvent.click(screen.getByLabelText("Export CircuitHub design package"));
+    await userEvent.click(screen.getByRole("button", { name: "Build release package" }));
+    expect(readSSE.mock.calls[2][0])
+      .toBe("/api/projects/p/release?lcsc=true&odb=true&circuithub=true&board=base");
   });
 
   it("says what the package was built with, and never claims an ODB++ job that failed", () => {
@@ -58,6 +62,9 @@ describe("the Release tab", () => {
     expect(builtWith({ exists: true, options: { lcsc: true, odb: true },
       steps: [{ step: "odb", ok: false, detail: "boom", outputs: [] }] }))
       .toBe("Built with LCSC part numbers looked up, ODB++ package requested but not produced (see below).");
+    expect(builtWith({ exists: true, options: { lcsc: false, odb: false, circuithub: true },
+      steps: [{ step: "circuithub", ok: true, detail: "", outputs: ["p-circuithub.zip"] }] }))
+      .toBe("Built with no LCSC part number lookup, no ODB++ package, CircuitHub design package included.");
     // A package from before the options were recorded is not guessed about.
     expect(builtWith({ exists: true })).toMatch(/before its options were recorded/);
   });

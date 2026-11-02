@@ -7695,7 +7695,7 @@ async def run_stage(
 
 @app.post("/api/projects/{project_id}/release")
 async def build_release(project_id: str, board: str | None = None, lcsc: bool = False,
-    odb: bool = False,
+    odb: bool = False, circuithub: bool = False,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> StreamingResponse:
     """Build the package a contract fab quotes from, gate included.
@@ -7718,6 +7718,10 @@ async def build_release(project_id: str, board: str | None = None, lcsc: bool = 
         # The board as an ODB++ job, zipped inside the package, for a fab
         # whose CAM takes ODB++ instead of gerbers.
         cmd.append("--odb")
+    if circuithub:
+        # CircuitHub imports the native KiCad project, with a BOM it
+        # reconciles against; the package carries both, zipped.
+        cmd.append("--circuithub")
     return _start_run(session, user, project_id,
                       "release" if resolved is None else f"release ({resolved})", cmd, dict(os.environ))
 
