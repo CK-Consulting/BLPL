@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import threading
 from contextlib import contextmanager
@@ -42,6 +43,7 @@ from .projects import ProjectError
 from .sandbox import workspaces
 from .sandbox.agentclient import AgentCallError, AgentClient
 
+logger = logging.getLogger("blpl.workspace_files")
 enabled = workspaces.enabled
 
 
@@ -224,6 +226,18 @@ def _connect(checkout: Path) -> AgentClient:
                             detail=f"the project's workspace is not available: {exc}") from exc
 
 
+def retire_stale(project: str) -> None:
+    """Replace the project's workspace if it is from an older spec and unused.
+
+    Best effort: the operation that asked goes ahead either way, on whichever
+    workspace ensure() then gives it, so a failure here is logged, not raised.
+    """
+    try:
+        _run(_access().retire_if_stale(project))
+    except Exception:  # noqa: BLE001 - never fails the operation that asked
+        logger.warning("could not check %s's workspace for an older spec", project, exc_info=True)
+
+
 @contextmanager
 def gated(checkout: Path) -> Iterator[None]:
     """The project's gate (sandbox/gate.py), shared, for one whole operation
@@ -242,8 +256,12 @@ def gated(checkout: Path) -> Iterator[None]:
     from . import main as m
     from .sandbox import gate
 
+    project = project_of(checkout)
+    # Before the gate, not under it: a workspace from before a redeploy is
+    # replaced only when nobody holds the gate, and this operation would.
+    retire_stale(project)
     try:
-        with gate.held(m.PROJECTS_ROOT, project_of(checkout), exclusive=False,
+        with gate.held(m.PROJECTS_ROOT, project, exclusive=False,
                        wait_s=gate.START_WAIT_S):
             yield
     except gate.GateBusy as exc:

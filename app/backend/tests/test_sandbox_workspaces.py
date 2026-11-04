@@ -474,3 +474,31 @@ def test_a_current_workspace_is_never_stopped_by_a_start(setup):
     asyncio.run(access.ensure("board")).close()
     asyncio.run(access.ensure("board")).close()
     assert ("stop", access.spec("board").key) not in driver.ops
+
+
+def test_the_gated_callers_order_replaces_a_stale_workspace(setup, monkeypatch):
+    """What the routes and the run path do: retire first, holding nothing,
+    then take the gate shared and ensure under it."""
+    from app.sandbox import gate
+
+    access, driver, projects = setup
+    asyncio.run(access.ensure("board")).close()
+    _redeploy(monkeypatch)
+    asyncio.run(access.retire_if_stale("board"))
+    with gate.held(projects, "board", exclusive=False, wait_s=1):
+        c = asyncio.run(access.ensure("board"))
+    assert c.health()["ok"]
+    c.close()
+    key = access.spec("board").key
+    assert ("stop", key) in driver.ops and driver.boxes[key].spec == access.spec("board")
+
+
+def test_retire_leaves_a_workspace_another_operation_holds(setup, monkeypatch):
+    from app.sandbox import gate
+
+    access, driver, projects = setup
+    asyncio.run(access.ensure("board")).close()
+    _redeploy(monkeypatch)
+    with gate.held(projects, "board", exclusive=False, wait_s=1):
+        asyncio.run(access.retire_if_stale("board"))
+    assert ("stop", access.spec("board").key) not in driver.ops

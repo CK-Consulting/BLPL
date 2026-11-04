@@ -277,6 +277,14 @@ class _Workspaces:
                         return await asyncio.to_thread(
                             storage.snapshot, job.project_name, label)
 
+                if access is not None:
+                    # Before the run takes the project's gate: a workspace from
+                    # before a redeploy is replaced only while nobody holds it.
+                    try:
+                        await access.retire_if_stale(job.project_name)
+                    except Exception:  # noqa: BLE001 - the run goes ahead either way
+                        logger.warning("could not check %s's workspace for an older spec",
+                                       job.project_name, exc_info=True)
                 exit_code = await sandbox_jobs.run_job_in_container(
                     self.driver, self.cfg, project_name=job.project_name,
                     run_id=job.run_id, cmd=job.cmd, env=job.env, log=stages.write,

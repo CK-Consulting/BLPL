@@ -86,6 +86,9 @@ class Access:
     async def ensure(self, project: str) -> agentclient.AgentClient:
         driver = self.driver_factory()
         try:
+            # Only effective for a caller that holds no gate; the routes and
+            # the run path hold it shared by now, and call retire_if_stale
+            # before they take it.
             await self._retire_if_stale(driver, project)
             # The project's gate, shared: a seal or unseal in progress holds it
             # exclusively from before it stops the workspace until the files
@@ -107,6 +110,23 @@ class Access:
                 # Still under the gate: a seal waits until the agent answers,
                 # rather than stopping a workspace it is still starting.
                 return await self._connect_agent(d, name)
+        finally:
+            close = getattr(driver, "aclose", None)
+            if close is not None:
+                await close()
+
+    async def retire_if_stale(self, project: str) -> None:
+        """_retire_if_stale, for a caller about to take the project's gate.
+
+        Every operation through the agent and every run takes the gate shared
+        before it reaches ensure(), and a held gate is what keeps a workspace
+        in use from being replaced. Asked from inside ensure() it therefore
+        always found its own caller's lock and gave up (Codex, PR #101), so
+        the gated callers ask here first, holding nothing.
+        """
+        driver = self.driver_factory()
+        try:
+            await self._retire_if_stale(driver, project)
         finally:
             close = getattr(driver, "aclose", None)
             if close is not None:

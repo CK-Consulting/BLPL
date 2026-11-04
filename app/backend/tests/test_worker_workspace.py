@@ -228,3 +228,38 @@ def test_a_never_started_first_attempt_is_recreated_with_a_grant(monkeypatch, tm
     # the run goes when it ends.
     assert events == [("revoke", "run_cr"), ("issue", "run_cr"), ("revoke", "run_cr")]
 
+
+
+def test_a_run_checks_for_a_stale_workspace_before_it_takes_the_gate(monkeypatch, tmp_path):
+    """Codex, PR #101: run_job_in_container holds the project's gate shared,
+    so a stale workspace can be replaced only before it, never under it."""
+    from app.sandbox import gate
+
+    monkeypatch.setattr(worker_mod, "_LOGS", tmp_path / "runs")
+    monkeypatch.setattr(worker_mod, "SessionFactory", _S)
+    monkeypatch.setattr(worker_mod.runqueue, "heartbeat", lambda s, r: runqueue.RUNNING)
+    seen: list[str] = []
+
+    class _Client:
+        def run_mark(self, *a):
+            pass
+
+        def close(self):
+            pass
+
+    class _Access:
+        async def retire_if_stale(self, project):
+            try:
+                with gate.held(tmp_path / "projects", project, exclusive=True, wait_s=0):
+                    seen.append("free")
+            except gate.GateBusy:
+                seen.append("held")
+
+        async def ensure(self, project):
+            return _Client()
+
+    ws = _workspaces(tmp_path, FakeDriver())
+    ws.access = _Access()
+    job = runqueue.Claimed(run_id="run_retire", project_name="pathfinder", cmd=["x"], env={})
+    assert asyncio.run(ws.run(job)) == 0
+    assert seen == ["free"]
