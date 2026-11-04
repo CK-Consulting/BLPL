@@ -617,3 +617,19 @@ def test_sweep_takes_each_projects_own_idle_limit():
     assert run(idle.sweep(d, tracker, idle_after_s=by_key)) == [short]
     clock.t += 600
     assert run(idle.sweep(d, tracker, idle_after_s=by_key)) == [long_]
+
+
+def test_is_stale_reads_without_changing_anything():
+    """What Access asks before deciding to replace a running workspace: the
+    same answer ensure() would give, with no create, start or delete."""
+    daemon = MockDaemon()
+    daemon.images["blpl-workspace:dev"] = "sha256:" + "1" * 64
+    d = driver_for(daemon)
+    assert run(d.is_stale(spec())) is False             # no container: nothing stale
+    run(d.ensure(spec()))
+    assert run(d.is_stale(spec())) is False
+    daemon.images["blpl-workspace:dev"] = "sha256:" + "2" * 64
+    daemon.calls.clear()
+    assert run(d.is_stale(spec())) is True
+    assert [c for c in daemon.calls if c[0] != "GET"] == []
+    assert run(d.status(KEY)).state is State.RUNNING

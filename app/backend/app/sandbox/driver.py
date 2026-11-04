@@ -247,6 +247,12 @@ class WorkspaceDriver(Protocol):
         """Its current state; ABSENT when no container exists."""
         ...
 
+    async def is_stale(self, spec: WorkspaceSpec) -> bool:
+        """Whether the container under spec's key was made from another spec
+        (or an older build of its image) than ``spec`` would make now. False
+        when there is no container. Changes nothing."""
+        ...
+
     async def stop(self, key: WorkspaceKey, *, timeout_s: int = 30) -> WorkspaceStatus:
         """Stop it, keeping the container and its storage."""
         ...

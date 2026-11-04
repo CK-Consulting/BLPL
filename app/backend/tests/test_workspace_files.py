@@ -1194,3 +1194,62 @@ def test_a_streamed_blob_holds_no_agent_connection_between_blocks(unlocked, via_
     finally:
         fh.close()
     assert got == data
+
+
+def test_a_stale_workspace_is_checked_before_the_operation_takes_the_gate(client, via_agent):
+    """Codex, PR #101: the replacement needs the gate free, and every route
+    takes it shared before it reaches Access.ensure, so asked from there it
+    always found the route's own lock and never replaced anything."""
+    import app.main as main
+    from app.sandbox import gate
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    seen: list[str] = []
+
+    async def retire_if_stale(project):
+        try:
+            with gate.held(main.PROJECTS_ROOT, project, exclusive=True, wait_s=0):
+                seen.append("free")
+        except gate.GateBusy:
+            seen.append("held")
+
+    via_agent.retire_if_stale = retire_if_stale
+    assert client.get("/api/projects/scratch/tree").status_code == 200
+    assert seen and set(seen) == {"free"}
+
+
+def test_a_failed_staleness_check_does_not_fail_the_operation(client, via_agent):
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+
+    async def retire_if_stale(project):
+        raise RuntimeError("the daemon did not answer")
+
+    via_agent.retire_if_stale = retire_if_stale
+    assert client.get("/api/projects/scratch/tree").status_code == 200
+
+
+def test_a_streamed_download_is_not_cut_off_by_a_replacement_between_blocks(client, via_agent,
+                                                                             monkeypatch):
+    """Codex, PR #101: _AgentFile reuses the client it connected with, so a
+    workspace replaced between blocks left it reading from a stopped agent.
+    Only the connect checks for an older spec; the blocks do not."""
+    import app.main as main
+    import app.workspace_files as wf
+
+    sign_in(client)
+    client.post("/api/projects/init", json=init_body("scratch"))
+    (main.PROJECTS_ROOT / "scratch" / "big.bin").write_bytes(b"x" * (wf._AgentFile.BLOCK + 10))
+    asked: list[str] = []
+    monkeypatch.setattr(wf, "retire_stale", lambda project: asked.append(project))
+    f = wf._AgentFile(main.PROJECTS_ROOT / "scratch", "big.bin")
+    try:
+        assert asked == ["scratch"]          # once, before the connect
+        got = b""
+        while chunk := f.read():
+            got += chunk
+        assert len(got) == wf._AgentFile.BLOCK + 10   # two blocks, so a second fetch
+        assert asked == ["scratch"]          # and never for the later blocks
+    finally:
+        f.close()

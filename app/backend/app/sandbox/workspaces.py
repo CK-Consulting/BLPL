@@ -86,6 +86,10 @@ class Access:
     async def ensure(self, project: str) -> agentclient.AgentClient:
         driver = self.driver_factory()
         try:
+            # Only effective for a caller that holds no gate; the routes and
+            # the run path hold it shared by now, and call retire_if_stale
+            # before they take it.
+            await self._retire_if_stale(driver, project)
             # The project's gate, shared: a seal or unseal in progress holds it
             # exclusively from before it stops the workspace until the files
             # are archived or restored, so a start waits for it rather than
@@ -111,6 +115,66 @@ class Access:
             if close is not None:
                 await close()
 
+    async def retire_if_stale(self, project: str) -> None:
+        """_retire_if_stale, for a caller about to take the project's gate.
+
+        Every operation through the agent and every run takes the gate shared
+        before it reaches ensure(), and a held gate is what keeps a workspace
+        in use from being replaced. Asked from inside ensure() it therefore
+        always found its own caller's lock and gave up (Codex, PR #101), so
+        the gated callers ask here first, holding nothing.
+        """
+        driver = self.driver_factory()
+        try:
+            await self._retire_if_stale(driver, project)
+        finally:
+            close = getattr(driver, "aclose", None)
+            if close is not None:
+                await close()
+
+    async def _retire_if_stale(self, driver, project: str) -> None:
+        """Stop a running workspace made from an older spec, if nothing is using it.
+
+        A workspace from before a redeploy kept serving files, git and the
+        terminal on the old agent and image until it sat idle for the whole
+        idle limit, and one in daily use never did: it ran pre-deploy code
+        indefinitely, and nothing said so. So the next start replaces it, but
+        only when it is unused, as the idle sweep would have, just sooner:
+
+        - the gate is taken exclusively without waiting. An operation through
+          the agent holds it shared for as long as it lasts, so a held gate is
+          a workspace in use, and it is left for the sweep (Codex, PR #20);
+        - its agent must answer and say nothing is in progress: no run marked
+          active and no request open. An agent that cannot be asked is not
+          taken as idle.
+
+        Stopped here, it is recreated from the current spec by the ensure that
+        follows. Its storage is a separate volume and is not touched.
+        """
+        from .. import workspace as _ws
+        from . import gate
+
+        try:
+            async with gate.held_async(self.run_cfg.projects_root, project, exclusive=True,
+                                       wait_s=0):
+                if _ws.is_sealed(self.run_cfg.projects_root, project):
+                    return
+                spec = self.spec(project)
+                if (await driver.status(spec.key)).state is not State.RUNNING:
+                    return
+                if not await driver.is_stale(spec):
+                    return
+                name = spec.key.container_name()
+                idle = await self.agent_idle(name)
+                if idle is None or idle == 0.0:
+                    logger.info("%s runs an older spec but is %s; it is replaced once idle", name,
+                                "in use" if idle == 0.0 else "not answering")
+                    return
+                await driver.stop(spec.key)
+                logger.info("stopped %s, idle and from an older spec, to recreate it", name)
+        except gate.GateBusy:
+            return
+
     async def _start(self, driver, spec, d, key, name) -> None:
         with agentclient.locked(d):
             st = await driver.status(key)
@@ -128,12 +192,12 @@ class Access:
                 agentclient.prepare(d, self.server_key, name)
             st = await driver.ensure(spec)
             if st.stale and st.state is State.RUNNING:
-                # Running from an older spec. Not stopped here: other
-                # operations may be using its agent under the shared gate
-                # (Codex, PR #20). It keeps serving, and the idle sweep, which
-                # stops under the exclusive gate, retires it; the next start
-                # then creates it from the current spec.
-                logger.info("%s runs an older spec; it is replaced once idle", name)
+                # Running from an older spec and in use (_retire_if_stale left
+                # it). Not stopped here: other operations may be using its
+                # agent under the shared gate (Codex, PR #20). It keeps
+                # serving until a start finds it unused, or the idle sweep
+                # retires it.
+                logger.info("%s runs an older spec and is in use; it is replaced once unused", name)
 
     async def _connect_agent(self, d, name) -> agentclient.AgentClient:
         token = agentclient.current_token(d, self.server_key, name)

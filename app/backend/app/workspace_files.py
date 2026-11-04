@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import threading
 from contextlib import contextmanager
@@ -42,6 +43,7 @@ from .projects import ProjectError
 from .sandbox import workspaces
 from .sandbox.agentclient import AgentCallError, AgentClient
 
+logger = logging.getLogger("blpl.workspace_files")
 enabled = workspaces.enabled
 
 
@@ -224,8 +226,20 @@ def _connect(checkout: Path) -> AgentClient:
                             detail=f"the project's workspace is not available: {exc}") from exc
 
 
+def retire_stale(project: str) -> None:
+    """Replace the project's workspace if it is from an older spec and unused.
+
+    Best effort: the operation that asked goes ahead either way, on whichever
+    workspace ensure() then gives it, so a failure here is logged, not raised.
+    """
+    try:
+        _run(_access().retire_if_stale(project))
+    except Exception:  # noqa: BLE001 - never fails the operation that asked
+        logger.warning("could not check %s's workspace for an older spec", project, exc_info=True)
+
+
 @contextmanager
-def gated(checkout: Path) -> Iterator[None]:
+def gated(checkout: Path, *, retire: bool = True) -> Iterator[None]:
     """The project's gate (sandbox/gate.py), shared, for one whole operation
     through the agent: the start, the call, and anything done under it.
 
@@ -242,8 +256,16 @@ def gated(checkout: Path) -> Iterator[None]:
     from . import main as m
     from .sandbox import gate
 
+    project = project_of(checkout)
+    # Before the gate, not under it: a workspace from before a redeploy is
+    # replaced only when nobody holds the gate, and this operation would.
+    # Not for a caller that keeps a client from an earlier connect (retire
+    # False): replacing the workspace would leave it talking to a stopped
+    # agent with a token the new one never issued (Codex, PR #101).
+    if retire:
+        retire_stale(project)
     try:
-        with gate.held(m.PROJECTS_ROOT, project_of(checkout), exclusive=False,
+        with gate.held(m.PROJECTS_ROOT, project, exclusive=False,
                        wait_s=gate.START_WAIT_S):
             yield
     except gate.GateBusy as exc:
@@ -410,7 +432,9 @@ class _AgentFile:
 
     def _fetch(self, offset: int, expect: str | None) -> tuple[bytes, int, str]:
         try:
-            with gated(self.checkout):
+            # The client from __init__ is reused, so no retirement here: the
+            # stream finishes on the workspace it started on.
+            with gated(self.checkout, retire=False):
                 if self._client.version() < 2:
                     # A workspace an older backend started, not yet replaced
                     # (agentclient.PROTOCOL): its agent has no ranged read, so

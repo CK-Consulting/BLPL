@@ -805,6 +805,26 @@ services:
       # (BLPL_PROXY_VERIFY_PATHS) rather than only by its spelling.
       - ..:${BLPL_HOST_REPO_DIR:-/blpl-host-repo-dir-unset}:ro
 
+  # The image every run starts from (a fresh container per run) and every
+  # project's workspace runs, with the pipeline, KiCad and the agent in it.
+  # Built here so `docker compose build` in app/ rebuilds it with everything
+  # else: built by hand, it was the one image a redeploy forgot, and runs kept
+  # the pipeline from before the redeploy (a release refused --odb with the
+  # backend already sending it). Never started: the control plane starts its
+  # containers itself, so `up` creates none (replicas: 0).
+  workspace-image:
+    platform: linux/amd64
+    image: blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}
+    build:
+      context: ..
+      dockerfile: app/workspace/Dockerfile
+      args:
+        - BLPL_UID=${BLPL_UID:?set BLPL_UID in app/.env to the owner of app/data (id -u)}
+        - BLPL_GID=${BLPL_GID:?set BLPL_GID in app/.env to the owner of app/data (id -g)}
+    network_mode: none
+    deploy:
+      replicas: 0
+
   # Per-project btrfs storage (phase 4, step 4): subvolumes, quotas and
   # snapshots. The one container with CAP_SYS_ADMIN, because btrfs needs it for
   # exactly those operations; nothing else is given to it. No network, no
