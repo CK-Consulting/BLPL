@@ -119,7 +119,7 @@ blpl stage6 --project-dir <proj>
 ```
 
 ### `stage6-plugin`
-Alternative PCB emission via pcbnew Python API. Requires KiCad installed.
+Alternative PCB emission via pcbnew Python API. Requires KiCad installed. The board pcbnew saves is then given stage6's stackup, via protection and layer table, from `project.stackup` and `fabrication`.
 ```
 blpl stage6-plugin --project-dir <proj>
     [--kicad-python <path>]        # default: discover via HDM_KICAD_PYTHON + platform paths

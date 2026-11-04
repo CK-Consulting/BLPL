@@ -414,12 +414,19 @@ def test_stage6_publishes_a_single_board_project_at_its_root(tmp_path, monkeypat
     assert (tmp_path / "kicad" / "solo.kicad_pcb").read_text() == "(pcb)\n"
 
 
+# What pcbnew saves for a fresh two-layer board, cut to what stage6-plugin
+# reads: a layer table and a setup with no stackup in it.
+_PLUGIN_BOARD = ('(kicad_pcb (version 20260206) (generator "pcbnew") (general (thickness 1.6)) '
+                 '(layers (0 "F.Cu" signal) (2 "B.Cu" signal) (1 "F.Mask" user) (25 "Edge.Cuts" user)) '
+                 '(setup (pad_to_mask_clearance 0) (tenting (front yes) (back yes))) (plugin))\n')
+
+
 def _fake_plugin(project, monkeypatch):
     monkeypatch.setattr(cli, "_resolve_kicad_python", lambda v: Path("/usr/bin/true"))
     monkeypatch.setattr(cli, "_resolve_plugin_dir", lambda: project)
 
     def fake_run(cmd, env=None):
-        Path(cmd[cmd.index("--out") + 1]).write_text("(kicad_pcb (plugin))\n")
+        Path(cmd[cmd.index("--out") + 1]).write_text(_PLUGIN_BOARD)
         return argparse.Namespace(returncode=0)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
@@ -439,7 +446,8 @@ def test_stage6_plugin_publishes_when_it_completes_stage6s_project(project, monk
                    "--stamp", "2026-10-16_124325Z"])
     assert rc == 0
     published = project / "base" / "kicad" / "Ear_Tag.kicad_pcb"
-    assert published.read_text() == "(kicad_pcb (plugin))\n"
+    assert published.read_text() == (project / ".pipeline" / f"{stem}.kicad_pcb").read_text()
+    assert "(plugin)" in published.read_text() and "(stackup" in published.read_text()
 
 
 def test_stage6_plugin_alone_does_not_pair_its_board_with_an_old_schematic(project, monkeypatch, capsys):

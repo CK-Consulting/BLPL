@@ -434,6 +434,18 @@ def _cmd_stage6_plugin(args: argparse.Namespace) -> int:
     result = subprocess.run(cmd, env=env)
     if result.returncode != 0:
         return result.returncode
+    # pcbnew writes no stackup and knows nothing of `fabrication`; the board
+    # is finished with stage6's own stackup, via protection and layer table,
+    # so the two Stage 6s describe the same physical board.
+    from blpl.emitter import pcb as _pcb, sexpr as _sexpr
+
+    try:
+        board = _pcb.finish_plugin_board(_sexpr.parse(out_path.read_text(encoding="utf-8")), hdm_data)
+    except (OSError, ValueError) as exc:
+        print(f"error: stage6-plugin: {out_path.name} could not be given its stackup: {exc}",
+              file=sys.stderr)
+        return 2
+    out_path.write_text(_sexpr.dump_top(board), encoding="utf-8")
     print(f"stage6-plugin: wrote {out_path}", file=sys.stderr)
     # The other Stage 6, so the same tracked copy — when it is a whole project.
     # Alone it writes only a board, and publish refuses a board without its

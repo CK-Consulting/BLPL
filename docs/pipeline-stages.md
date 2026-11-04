@@ -374,7 +374,7 @@ Three things Stage 5 adds that no BOM row asked for:
 Two implementations, same output shape:
 
 - **`blpl stage6`** — hand-rolled S-expression emitter. Pure Python stdlib; runs without KiCad installed. Good for CI and headless flows.
-- **`blpl stage6-plugin`** — invokes KiCad's bundled Python interpreter to call the native `pcbnew` API. Produces `.kicad_pcb` via KiCad's own writer (reliable v10 format, real `PCB_SHAPE` Edge.Cuts, native net objects). Schematic side still uses the emitter (v10 has no eeschema Python API).
+- **`blpl stage6-plugin`** — invokes KiCad's bundled Python interpreter to call the native `pcbnew` API. Produces `.kicad_pcb` via KiCad's own writer (reliable v10 format, real `PCB_SHAPE` Edge.Cuts, native net objects). Schematic side still uses the emitter (v10 has no eeschema Python API). pcbnew writes no stackup, so core finishes the saved board with stage6's own stackup, via protection (`fabrication.via_protection`) and layer table (a mask or silk colour of `none` removes that layer): both Stage 6s describe the same physical board. A board whose copper layers are not `project.stackup.layers` is refused.
 
 ### How the schematic is drawn
 
