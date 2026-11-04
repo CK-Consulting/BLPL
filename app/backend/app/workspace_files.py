@@ -239,7 +239,7 @@ def retire_stale(project: str) -> None:
 
 
 @contextmanager
-def gated(checkout: Path) -> Iterator[None]:
+def gated(checkout: Path, *, retire: bool = True) -> Iterator[None]:
     """The project's gate (sandbox/gate.py), shared, for one whole operation
     through the agent: the start, the call, and anything done under it.
 
@@ -259,7 +259,11 @@ def gated(checkout: Path) -> Iterator[None]:
     project = project_of(checkout)
     # Before the gate, not under it: a workspace from before a redeploy is
     # replaced only when nobody holds the gate, and this operation would.
-    retire_stale(project)
+    # Not for a caller that keeps a client from an earlier connect (retire
+    # False): replacing the workspace would leave it talking to a stopped
+    # agent with a token the new one never issued (Codex, PR #101).
+    if retire:
+        retire_stale(project)
     try:
         with gate.held(m.PROJECTS_ROOT, project, exclusive=False,
                        wait_s=gate.START_WAIT_S):
@@ -428,7 +432,9 @@ class _AgentFile:
 
     def _fetch(self, offset: int, expect: str | None) -> tuple[bytes, int, str]:
         try:
-            with gated(self.checkout):
+            # The client from __init__ is reused, so no retirement here: the
+            # stream finishes on the workspace it started on.
+            with gated(self.checkout, retire=False):
                 if self._client.version() < 2:
                     # A workspace an older backend started, not yet replaced
                     # (agentclient.PROTOCOL): its agent has no ranged read, so
