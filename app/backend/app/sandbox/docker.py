@@ -401,6 +401,14 @@ class DockerDriver:
             return None
         return ident if isinstance(ident, str) and ident else None
 
+    async def is_stale(self, spec: WorkspaceSpec) -> bool:
+        info = await self._inspect(spec.key)
+        if info is None:
+            return False
+        body = build_create_body(spec, self.cfg, await self._image_id(spec.image),
+                                 await self._network_id(self.cfg.network))
+        return self._status_from(spec.key, info, body["Labels"][LABEL_SPEC]).stale
+
     async def ensure(self, spec: WorkspaceSpec) -> WorkspaceStatus:
         key = spec.key
         body = build_create_body(spec, self.cfg, await self._image_id(spec.image),

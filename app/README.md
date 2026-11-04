@@ -28,6 +28,16 @@ app/fix-data-ownership.sh        # before the first up; see below
 docker compose -f app/docker-compose.yml up -d --build
 ```
 
+To update a running server, from `app/`:
+
+```sh
+git pull
+docker compose build             # every image, including blpl-workspace
+docker compose up -d
+```
+
+`blpl-workspace` is the image every pipeline run starts from, and each project's workspace runs in. It is the `workspace-image` service, which `docker compose build` builds and `up` never starts. Skip it and runs keep the pipeline from before the update. A workspace still running the old image is replaced on its next use once nothing is running in it.
+
 The `blpl` network is declared `external` in the compose file, so compose neither creates it nor starts without it. Create it once per host; it survives `docker compose down`.
 
 The backend and worker run as `BLPL_UID`, not root. `fix-data-ownership.sh`

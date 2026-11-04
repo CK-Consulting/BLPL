@@ -415,3 +415,62 @@ def test_the_idle_sweep_does_not_stop_a_workspace_under_a_long_operation(setup, 
                                   gate_root=projects, on_stopped=on_stopped)) == [key]
     assert stopped_with == [key]
     assert (projects / "board" / "design.md").read_bytes() == b"# long\n"
+
+
+def _redeploy(monkeypatch):
+    """What a redeploy does to a running workspace's spec: the backend now
+    speaks a newer agent protocol (a rebuilt image does the same through
+    the image id, in DockerDriver)."""
+    monkeypatch.setattr(agentclient, "PROTOCOL", agentclient.PROTOCOL + 1)
+    monkeypatch.setattr(agent_mod, "VERSION", agent_mod.VERSION + 1)
+
+
+def test_an_idle_workspace_from_before_a_redeploy_is_replaced_on_the_next_start(setup, monkeypatch):
+    """It served files, git and the terminal on the old agent until it sat
+    idle for the whole idle limit, and a project in daily use never did."""
+    access, driver, projects = setup
+    asyncio.run(access.ensure("board")).close()
+    first = nonce(access, "board")
+    _redeploy(monkeypatch)
+    key = access.spec("board").key
+    assert asyncio.run(driver.is_stale(access.spec("board")))
+    c = asyncio.run(access.ensure("board"))
+    assert c.health()["ok"]
+    c.close()
+    assert ("stop", key) in driver.ops
+    assert driver.boxes[key].spec == access.spec("board")  # recreated from the current spec
+    assert not asyncio.run(driver.is_stale(access.spec("board")))
+    assert nonce(access, "board") != first
+
+
+def test_a_workspace_with_a_run_in_progress_is_not_replaced(setup, monkeypatch):
+    access, driver, projects = setup
+    c = asyncio.run(access.ensure("board"))
+    rid = c.run_start(["sleep", "30"], {}, str(projects / "board"))
+    _redeploy(monkeypatch)
+    asyncio.run(access.ensure("board")).close()
+    key = access.spec("board").key
+    assert ("stop", key) not in driver.ops
+    assert asyncio.run(driver.is_stale(access.spec("board")))  # still the old one, still running
+    c.run_cancel(rid)
+    c.close()
+
+
+def test_a_workspace_whose_gate_is_held_is_not_replaced(setup, monkeypatch):
+    """An operation through the agent holds the gate shared for as long as it
+    lasts (Codex, PR #20); a held gate is a workspace in use."""
+    from app.sandbox import gate
+
+    access, driver, projects = setup
+    asyncio.run(access.ensure("board")).close()
+    _redeploy(monkeypatch)
+    with gate.held(projects, "board", exclusive=False, wait_s=1):
+        asyncio.run(access.ensure("board")).close()
+    assert ("stop", access.spec("board").key) not in driver.ops
+
+
+def test_a_current_workspace_is_never_stopped_by_a_start(setup):
+    access, driver, _ = setup
+    asyncio.run(access.ensure("board")).close()
+    asyncio.run(access.ensure("board")).close()
+    assert ("stop", access.spec("board").key) not in driver.ops

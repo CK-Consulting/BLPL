@@ -84,6 +84,10 @@ class FakeDriver:
     async def ensure(self, spec: WorkspaceSpec) -> WorkspaceStatus:
         self.ops.append(("ensure", spec.key))
         box = self.boxes.get(spec.key)
+        if box is not None and box.state is State.STOPPED and box.spec != spec:
+            # Stopped and from another spec: replaced, as DockerDriver does.
+            del self.boxes[spec.key]
+            box = None
         if box is None:
             self._n += 1
             box = self.boxes[spec.key] = _Box(spec, State.RUNNING, f"fake{self._n}")
@@ -92,6 +96,10 @@ class FakeDriver:
 
     async def status(self, key: WorkspaceKey) -> WorkspaceStatus:
         return self._status(key)
+
+    async def is_stale(self, spec: WorkspaceSpec) -> bool:
+        box = self.boxes.get(spec.key)
+        return box is not None and box.spec != spec
 
     async def stop(self, key: WorkspaceKey, *, timeout_s: int = 30) -> WorkspaceStatus:
         self.ops.append(("stop", key))

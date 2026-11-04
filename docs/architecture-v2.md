@@ -184,7 +184,7 @@ request can race safely. `ensure` uses the container name as its lock: a second
 concurrent create gets a 409 and adopts the first one's container. A container
 built from an older spec (a new image, changed limits) carries a different
 `blpl.spec` digest. It is reported `stale`, left alone while it runs, and
-recreated the next time `ensure` finds it stopped. Its storage is a separate
+recreated the next time `ensure` finds it stopped. A start (`Access`) stops a stale running workspace first when nothing is using it, so after a redeploy the next operation gets the new image instead of the old one serving until it sits idle. Its storage is a separate
 volume, so recreating it loses nothing. A container under our name without our
 labels raises `NotOurs`, and is never adopted or removed.
 
@@ -746,8 +746,7 @@ behaviour.
     for logs. Those leave in phase 3. What it stops doing is handing its
     environment and filesystem to the stages.
 - **Turning it on:**
-  1. Build the workspace image (`docker build -f app/workspace/Dockerfile -t
-     blpl-workspace:dev .` from the repo root, with the same `BLPL_UID`).
+  1. Build the workspace image: `docker compose build workspace-image` in `app/` (the `workspace-image` service tags it `blpl-workspace:${BLPL_WORKSPACE_TAG:-dev}` with `BLPL_UID` and `BLPL_GID` from `app/.env`).
   2. Set `BLPL_HOST_REPO_DIR` (the umbrella checkout's absolute host path),
      `DOCKER_GID` (`getent group docker`) and `BLPL_RUNS_IN_WORKSPACE=1` in
      `app/.env`. Optionally set `BLPL_SANDBOX_RUNTIME=runsc`.
@@ -986,9 +985,7 @@ workspace).
   - **Idle sweep:** gated, as above, in the backend and in the worker.
   - **Sealer:** stops and removes the workspace under the exclusive gate.
   - **A start (`Access._start`):**
-    - It no longer stops a running workspace built from an older spec, since
-      other operations may be using its agent. It keeps serving, and the
-      sweep retires it when idle.
+    - It stops a running workspace built from an older spec only when nothing is using it: the project's gate taken exclusively without waiting (an operation through the agent holds it shared), and the agent answering with no run and no request in progress. Otherwise it keeps serving, and the next start or the sweep retires it when idle.
     - It still replaces a running workspace that has no agent (one from
       before phase 3). There is no agent in it to interrupt, and no run
       executes in a workspace container.
