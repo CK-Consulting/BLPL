@@ -71,7 +71,7 @@ blpl-app ──────► blpl-core ◄────── (launches) ──
   the directory holding the package on `PYTHONPATH`. Core finds it from
   `BLPL_KICAD_PLUGIN_DIR`, else wherever the package is installed in the
   current interpreter, else `plugin/` beside `core/`. The HDM file the pipeline
-  writes is the interface between them.
+  writes is the interface between them. Core then finishes the board the plugin saved (stackup, via protection, layer table) by rewriting it through `sexpr`, so the plugin never needs core's stackup code.
 - **app → core.** The backend imports `blpl` and shells out to `blpl.core.cli`
   for every stage. Today the image copies `core/blpl`, `core/schemas` and
   `core/kicad-happy` to `/app` and installs them editable; CI installs

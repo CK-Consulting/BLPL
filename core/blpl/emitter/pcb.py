@@ -1506,6 +1506,75 @@ def _default_setup(stackup: sexpr.Node | None = None, fab: dict | None = None) -
     return node
 
 
+# The setup entries the HDM decides. Everything else in a board's setup (plot
+# parameters, mask clearance, what KiCad itself chose) is left as it is.
+_HDM_SETUP = ("stackup", "tenting", "plugging", "capping", "filling")
+
+
+def finish_plugin_board(board: sexpr.Node, hdm: dict) -> sexpr.Node:
+    """Give a board the KiCad plugin built the stackup this emitter writes.
+
+    stage6-plugin builds its board through pcbnew, which wrote no stackup at
+    all: no layer thicknesses, no dielectric, no copper weight, no mask or silk
+    colour, and KiCad's default via tenting whatever ``fabrication`` said. A
+    board without a stackup also has no reference planes as far as the design
+    review knows (see _stackup). So the board the plugin saves is finished
+    here, from the same functions stage6 uses, rather than taught twice:
+
+    - ``general.thickness`` is the project's;
+    - ``setup`` gets this emitter's stackup and via protection, in place of
+      any it had, keeping every other setup entry KiCad wrote;
+    - the layer table loses the mask or silk layers a ``none`` colour says the
+      board does not have.
+
+    The copper rows are the plugin's own, and must be the stackup's: a board
+    whose copper count differs from ``project.stackup.layers`` is refused
+    rather than given a stackup that describes some other board.
+    """
+    project = hdm.get("project") or {}
+    fab = hdm.get("fabrication") or {}
+    copper = _copper_count(project)
+    thickness = float((project.get("stackup") or {}).get("thickness", 1.6))
+
+    table = sexpr.find(board, "layers")
+    if table is None:
+        raise ValueError("the board has no layer table")
+    have = [sexpr.unquote(row[1]) for row in table[1:] if isinstance(row, list) and len(row) > 1]
+    want = [sexpr.unquote(row[1]) for row in _copper_layers(copper)]
+    if [n for n in have if n.endswith(".Cu")] != want:
+        raise ValueError(f"the board's copper layers ({', '.join(n for n in have if n.endswith('.Cu'))}) "
+                         f"are not the {copper}-layer stackup's ({', '.join(want)})")
+    absent = _absent_layers(fab)
+    table[1:] = [row for row in table[1:]
+                 if not (isinstance(row, list) and len(row) > 1 and sexpr.unquote(row[1]) in absent)]
+
+    general = sexpr.find(board, "general")
+    if general is not None:
+        general[1:] = [n for n in general[1:] if not (isinstance(n, list) and n[:1] == ["thickness"])]
+        general.insert(1, ["thickness", f"{thickness}"])
+
+    fresh = _default_setup(_stackup(project, copper, thickness, fab), fab)
+    ours = {n[0]: n for n in fresh[1:] if isinstance(n, list) and n[0] in _HDM_SETUP}
+    setup = sexpr.find(board, "setup")
+    if setup is None:
+        setup = ["setup"]
+        board.insert(board.index(table) + 1, setup)
+    kept: list[sexpr.Sexp] = []
+    for node in setup[1:]:
+        tag = node[0] if isinstance(node, list) and node else None
+        if tag == "stackup":
+            continue
+        # An entry this emitter writes replaces KiCad's; one it does not
+        # write (a plugging "no" under plain tenting) stays as KiCad has it.
+        kept.append(ours.pop(tag) if tag in ours else node)
+    stackup = ours.pop("stackup", None)
+    # What KiCad did not write goes after tenting, where KiCad keeps it.
+    at = next((i + 1 for i, n in enumerate(kept) if isinstance(n, list) and n[:1] == ["tenting"]), 0)
+    kept[at:at] = [ours[t] for t in _HDM_SETUP if t in ours]
+    setup[1:] = ([stackup] if stackup else []) + kept
+    return board
+
+
 def emit(hdm: dict, *, footprints_root: Path | str | Sequence[Path | str]) -> str:
     """Render a full .kicad_pcb file content from an HDM."""
     return sexpr.dump_top(build(hdm, footprints_root=footprints_root))
