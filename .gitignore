@@ -101,3 +101,6 @@ AGENTS.local.md
 
 # The user guide site, built by docs/site/build.py
 _site/
+
+# temporary holding location to extract info
+xiao-nrf54lm20a/
