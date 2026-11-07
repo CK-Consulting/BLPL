@@ -98,12 +98,10 @@ _UNANCHORED = "UNKNOWN"
 
 def _heading_text_above(text: str, line_start: int) -> str | None:
     """The nearest heading line above a table, stripped of its '#' marks."""
-    lines = text.splitlines()
-    for i in range(min(line_start, len(lines)) - 1, -1, -1):
-        stripped = lines[i].lstrip()
-        if stripped.startswith("#"):
-            return stripped.lstrip("# ").strip() or None
-    return None
+    heading, _ = _md.heading_above(text, line_start)
+    if heading is None:
+        return None
+    return heading.lstrip().lstrip("# ").strip() or None
 
 
 def _find_connector_for_table(

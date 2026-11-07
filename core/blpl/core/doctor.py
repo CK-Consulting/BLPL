@@ -105,13 +105,8 @@ class Report:
         }
 
 
-def _heading_above(text: str, line_start: int) -> tuple[str | None, int | None]:
-    """Return the nearest heading line at or above a 1-based line number."""
-    lines = text.splitlines()
-    for i in range(min(line_start, len(lines)) - 1, -1, -1):
-        if lines[i].lstrip().startswith("#"):
-            return lines[i], i + 1
-    return None, None
+# Stage 0 reads the same heading, so doctor must: one function, not a copy.
+_heading_above = _md.heading_above
 
 
 def _is_pin_range(cell: str) -> bool:
