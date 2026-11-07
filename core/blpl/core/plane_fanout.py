@@ -83,8 +83,10 @@ via_clr = {{}}
 for item in b.GetTracks():
     if item.GetClass() == "PCB_VIA":
         via_clr[pt(item.GetPosition())] = own_clr(item)
-keepouts = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowVias()]
-track_keepouts = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowTracks()]
+# A footprint's rule areas are not in b.Zones(): its keep-outs are its own.
+rule_areas = list(b.Zones()) + [z for fp in b.GetFootprints() for z in fp.Zones()]
+keepouts = [z for z in rule_areas if z.GetIsRuleArea() and z.GetDoNotAllowVias()]
+track_keepouts = [z for z in rule_areas if z.GetIsRuleArea() and z.GetDoNotAllowTracks()]
 r = VIA_D / 2.0
 
 

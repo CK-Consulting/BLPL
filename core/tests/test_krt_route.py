@@ -1495,6 +1495,83 @@ def test_a_misspelt_setting_is_refused_before_the_board_is_touched(board, tmp_pa
     assert "unknown setting" in json.loads((tmp_path / "r.json").read_text())["reason"]
 
 
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_no_stitching_via_lands_in_a_keepout_a_footprint_carries(tmp_path):
+    """A module's antenna keep-out is a rule area in its footprint, not in
+    b.Zones(), and a ground via went into the BM20BC's (verdacor-ear-tag-bm20)."""
+    import pcbnew
+
+    from blpl.emitter import sexpr
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    board.SetCopperLayerCount(4)
+    for name in ("GND", "SIG"):
+        board.Add(pcbnew.NETINFO_ITEM(board, name))
+    edge = pcbnew.PCB_SHAPE(board)
+    edge.SetShape(pcbnew.SHAPE_T_RECTANGLE)
+    edge.SetStart(pcbnew.VECTOR2I(0, 0))
+    edge.SetEnd(pcbnew.VECTOR2I(mm(40), mm(30)))
+    edge.SetLayer(pcbnew.Edge_Cuts)
+    edge.SetWidth(mm(0.1))
+    board.Add(edge)
+    zone = pcbnew.ZONE(board)                      # GND over both inner layers
+    board.Add(zone)
+    layers = pcbnew.LSET()
+    layers.AddLayer(pcbnew.In1_Cu)
+    layers.AddLayer(pcbnew.In2_Cu)
+    zone.SetLayerSet(layers)
+    zone.Outline().NewOutline()
+    for x, y in ((1, 1), (39, 1), (39, 29), (1, 29)):
+        zone.Outline().Append(mm(x), mm(y))
+    fp = pcbnew.FOOTPRINT(board)                   # a module whose keep-out
+    fp.SetReference("U1")                          # covers the signal via
+    board.Add(fp)
+    keepout = pcbnew.ZONE(fp)
+    keepout.SetIsRuleArea(True)
+    keepout.SetDoNotAllowVias(True)
+    keepout.SetDoNotAllowTracks(True)
+    keepout.SetDoNotAllowPads(False)
+    keepout.SetDoNotAllowFootprints(False)
+    keepout.SetDoNotAllowZoneFills(False)          # vias out, the plane still poured
+    keepout.SetLayerSet(pcbnew.LSET.AllCuMask())
+    keepout.Outline().NewOutline()
+    for x, y in ((14, 9), (26, 9), (26, 21), (14, 21)):
+        keepout.Outline().Append(mm(x), mm(y))
+    fp.Add(keepout)
+    via = pcbnew.PCB_VIA(board)                    # a signal via just left of the keep-out:
+    # the stitcher tries the +x spot first, which is inside it
+    board.Add(via)
+    via.SetPosition(pcbnew.VECTOR2I(mm(13.4), mm(15)))
+    via.SetWidth(mm(0.6))
+    via.SetDrill(mm(0.3))
+    via.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+
+    tree = sexpr.parse(pcb.read_text())
+    top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
+    for node in top:
+        if isinstance(node, list) and sexpr.head(node) in ("via", "zone") and sexpr.find(node, "keepout") is None:
+            name = "SIG" if sexpr.head(node) == "via" else "GND"
+            node[:] = [c for c in node if not (isinstance(c, list) and sexpr.head(c) == "net")] + [["net", sexpr.quote(name)]]
+    pcb.write_text(sexpr.dump_top(tree))
+    assert pcbnew.LoadBoard(str(pcb)).GetFootprints()[0].Zones(), "the keep-out must be the footprint's"
+
+    proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
+                             edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
+    assert proc.returncode == 0, proc.stderr
+    # One placed, so the check below is about where, not whether.
+    assert proc.stdout.strip().splitlines()[-1] == "1 0"
+    after = pcbnew.LoadBoard(str(pcb))
+    area = after.GetFootprints()[0].Zones()[0].Outline()
+    inside = [v for v in after.GetTracks() if v.Type() == pcbnew.PCB_VIA_T
+              and v.GetNetname() == "GND" and area.Contains(v.GetPosition())]
+    assert not inside
+
+
 def _with_parts(board, *refs):
     """The board with a footprint for each reference designator."""
     parts = " ".join(f'(footprint "X" (property "Reference" "{r}"))' for r in refs)
@@ -1583,3 +1660,110 @@ def test_a_malformed_fanout_is_refused_before_the_board_is_touched(board, tmp_pa
     before = board.read_text()
     r = krt_route.route(board, work_dir=tmp_path / "w", fanout=fanout)
     assert not r.ok and "routing.fanout" in r.reason and not touched and board.read_text() == before
+
+
+def _footprint_keepout(pcbnew, fp, box, *, vias, tracks):
+    """A rule area on every copper layer, owned by ``fp`` (not the board)."""
+    mm = pcbnew.FromMM
+    z = pcbnew.ZONE(fp)
+    z.SetIsRuleArea(True)
+    z.SetDoNotAllowVias(vias)
+    z.SetDoNotAllowTracks(tracks)
+    z.SetDoNotAllowPads(False)
+    z.SetDoNotAllowFootprints(False)
+    z.SetDoNotAllowZoneFills(False)
+    z.SetLayerSet(pcbnew.LSET.AllCuMask())
+    z.Outline().NewOutline()
+    (x0, y0), (x1, y1) = box
+    for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+        z.Outline().Append(mm(x), mm(y))
+    fp.Add(z)
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_a_near_miss_is_not_joined_across_a_track_keepout_a_footprint_carries(tmp_path):
+    """_snap_terminals read only b.Zones(), so a footprint's track keep-out
+    over the join was not seen (Codex, PR #105)."""
+    import pcbnew
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    net = pcbnew.NETINFO_ITEM(board, "SIG", 1)
+    board.Add(net)
+    fp = pcbnew.FOOTPRINT(board)
+    board.Add(fp)
+    pad = pcbnew.PAD(fp)                           # pad 1 of the chamfered-corner test
+    pad.SetNumber("1")
+    pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+    pad.SetLayerSet(pad.SMDMask())
+    pad.SetShape(pcbnew.F_Cu, pcbnew.PAD_SHAPE_CHAMFERED_RECT)
+    pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(1.232), mm(0.95)))
+    pad.SetChamferRectRatio(pcbnew.F_Cu, 0.45)
+    pad.SetChamferPositions(pcbnew.F_Cu, 4)
+    pad.SetPosition(pcbnew.VECTOR2I(mm(10.0), mm(10.0)))
+    pad.SetNet(net)
+    fp.Add(pad)
+    # The stub the snap would draw runs from (9.445, 10.35) to the pad centre.
+    _footprint_keepout(pcbnew, fp, ((9.3, 9.8), (10.2, 10.6)), vias=False, tracks=True)
+    t = pcbnew.PCB_TRACK(board)
+    t.SetStart(pcbnew.VECTOR2I(mm(5.0), mm(12.0)))
+    t.SetEnd(pcbnew.VECTOR2I(mm(9.445), mm(10.35)))
+    t.SetWidth(mm(0.2))
+    t.SetLayer(pcbnew.F_Cu)
+    board.Add(t)
+    t.SetNet(net)
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+    assert pcbnew.LoadBoard(str(pcb)).GetFootprints()[0].Zones(), "the keep-out must be the footprint's"
+
+    proc = krt_route._snap_terminals(sys.executable, pcb, 0.2)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "0"
+    assert len([t for t in pcbnew.LoadBoard(str(pcb)).GetTracks() if t.Type() == pcbnew.PCB_TRACE_T]) == 1
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_freeroutings_plane_fanout_keeps_its_via_out_of_a_footprints_keepout(tmp_path):
+    """plane_fanout.py, Freerouting's path, read only b.Zones() too (Codex, PR #105)."""
+    import pcbnew
+
+    from blpl.core import plane_fanout
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    board.SetCopperLayerCount(4)
+    net = pcbnew.NETINFO_ITEM(board, "GND", 1)
+    board.Add(net)
+    edge = pcbnew.PCB_SHAPE(board)
+    edge.SetShape(pcbnew.SHAPE_T_RECTANGLE)
+    edge.SetStart(pcbnew.VECTOR2I(0, 0))
+    edge.SetEnd(pcbnew.VECTOR2I(mm(20), mm(20)))
+    edge.SetLayer(pcbnew.Edge_Cuts)
+    edge.SetWidth(mm(0.1))
+    board.Add(edge)
+    fp = pcbnew.FOOTPRINT(board)
+    fp.SetReference("U1")
+    board.Add(fp)
+    pad = pcbnew.PAD(fp)
+    pad.SetNumber("1")
+    pad.SetAttribute(pcbnew.PAD_ATTRIB_SMD)
+    pad.SetLayerSet(pad.SMDMask())
+    pad.SetSize(pcbnew.F_Cu, pcbnew.VECTOR2I(mm(0.6), mm(0.6)))
+    pad.SetPosition(pcbnew.VECTOR2I(mm(10.0), mm(10.0)))
+    pad.SetNet(net)
+    fp.Add(pad)
+    # Below the pad, the first spot the fan-out tries.
+    _footprint_keepout(pcbnew, fp, ((8.0, 10.4), (12.0, 13.0)), vias=True, tracks=False)
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+    assert pcbnew.LoadBoard(str(pcb)).GetFootprints()[0].Zones(), "the keep-out must be the footprint's"
+
+    proc = autoroute._pcbnew(sys.executable, plane_fanout.script(str(pcb), {"GND": ["In1.Cu"]}))
+    assert proc.returncode == 0, proc.stderr
+    assert plane_fanout.parse(proc.stdout)["placed"] == [["U1", "1", "GND"]]
+    vias = [v for v in pcbnew.LoadBoard(str(pcb)).GetTracks() if v.Type() == pcbnew.PCB_VIA_T]
+    assert len(vias) == 1 and pcbnew.ToMM(vias[0].GetPosition().y) < 10.4
