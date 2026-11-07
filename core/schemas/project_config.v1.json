@@ -377,7 +377,7 @@
           "description": "kicad-routing-tools (KiCad Routing Tools, routed class by class at the project's own rules; the default when it is installed) or freerouting (the default otherwise)."
         },
         "fanout": {
-          "description": "Parts to fan out before anything is routed, with KiCad Routing Tools' bga_fanout.py: every signal pad of each gets a short escape and a via at the Default class's track, clearance and via, so the router starts from outside the part. For a grid of pads too dense for the router to leave from, such as a BGA or an LGA module. KiCad Routing Tools only.",
+          "description": "Parts to fan out before anything is routed, with KiCad Routing Tools' bga_fanout.py: every signal pad of each gets a short escape and a via at the Default class's track, clearance and via, so the router starts from outside the part. Not set: every part whose reference starts with U and whose pads fill a grid (some pad inside the others: a BGA, an LGA module), each skipped and reported if the fan-out cannot handle it. An empty list: none. A list: exactly those, and a failure fails the route. No pad on an impedance-controlled net is ever fanned out. KiCad Routing Tools only.",
           "type": "array",
           "items": {
             "type": "object",

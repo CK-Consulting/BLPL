@@ -275,8 +275,9 @@ FANOUT = "bga_fanout.py"
 FANOUT_ESCAPES = ("dogbone", "channel", "underpad", "auto")
 
 
-def check_fanout(fanout) -> list[dict]:
-    """routing.fanout, checked: a list of {ref, escape?} mappings.
+def check_fanout(fanout) -> list[dict] | None:
+    """routing.fanout, checked: a list of {ref, escape?} mappings, or None
+    when the project does not set it.
 
     Stage 6a reads project.yaml without the schema, so a malformed entry
     reaches here as it was written. Refused before the board is touched, it
@@ -284,7 +285,7 @@ def check_fanout(fanout) -> list[dict]:
     edge band still on the board and no report at all (Codex, PR #104).
     """
     if fanout is None:
-        return []
+        return None  # not set: the default, every U part (see _fanout_steps)
     if not isinstance(fanout, list):
         # ValueError, as every settings refusal here: route() turns those
         # into a failed result rather than a crash.
@@ -302,6 +303,92 @@ def check_fanout(fanout) -> list[dict]:
 _REF = re.compile(r'\(property "Reference" "([^"]+)"')
 
 
+def footprint_pads(pcb_text: str) -> dict[str, list[tuple[float, float, str, float, float, bool]]]:
+    """Each footprint's pads as (x, y, net, width, height, smd), in the
+    footprint's own frame, so a part's grid reads the same at any rotation.
+    ``smd`` is a surface pad with copper; a paste-only aperture is left out."""
+    from ..emitter import sexpr
+
+    tree = sexpr.parse(pcb_text)
+    top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
+    out: dict[str, list[tuple[float, float, str, float, float, bool]]] = {}
+    for fp in sexpr.find_all(top, "footprint"):
+        ref = next((sexpr.unquote(c[2]) for c in fp if isinstance(c, list) and sexpr.head(c) == "property"
+                    and len(c) > 2 and sexpr.unquote(c[1]) == "Reference"), None)
+        if ref is None:
+            continue
+        pads = []
+        for pad in sexpr.find_all(fp, "pad"):
+            at = sexpr.find(pad, "at")
+            if at is None or len(at) < 3:
+                continue
+            layers = sexpr.find(pad, "layers")
+            names = [sexpr.unquote(x) for x in (layers[1:] if layers is not None else [])]
+            if names and not any(n.endswith(".Cu") for n in names):
+                continue  # a paste or mask aperture, not a pad
+            size = sexpr.find(pad, "size")
+            w, h = (float(size[1]), float(size[2])) if size is not None and len(size) > 2 else (0.0, 0.0)
+            net = sexpr.find(pad, "net")
+            name = sexpr.unquote(net[-1]) if net is not None and len(net) > 1 else ""
+            smd = len(pad) > 2 and pad[2] == "smd"
+            pads.append((float(at[1]), float(at[2]), name, w, h, smd))
+        out[ref] = pads
+    return out
+
+
+def is_grid(pads: list[tuple[float, float, str, float, float, bool]]) -> bool:
+    """Whether a part's pads fill a grid: some pad is surrounded by others.
+
+    A BGA or an LGA module has pads with neighbours on every side, which is
+    what the router cannot leave. A part whose pads all sit on its outline (a
+    SOIC, a module's castellations, a 2 x 3 WCSP) is reached from outside
+    already, and fanning it out only spends a via on every pin: on
+    verdacor-ear-tag-bm20, fanning out every U part took the board from 6
+    open connections to 15, with a short.
+
+    So a pad counts as inside only with a pad on each of its four sides at
+    about the part's own pitch, the way a ball in a BGA has. A QFN's exposed
+    pad, its thermal vias and any paste split of it lie inside the ring too,
+    but the ring is far from them, not a pitch away (Codex, PR #106; checked
+    against KiCad's Package_DFN_QFN and Package_BGA libraries).
+    """
+    smd = [p for p in pads if p[5]]
+    if len(smd) < 9:
+        return False
+    import math
+
+    def dist(a, b) -> float:
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    nearest = sorted(min(dist(p, q) for q in smd if q is not p) for p in smd)
+    pitch = nearest[len(nearest) // 2]
+    if pitch <= 0:
+        return False
+    reach = 1.5 * pitch
+    sizes = sorted(max(p[3], p[4]) for p in smd)
+    typical = sizes[len(sizes) // 2]
+
+    def under_bigger(p) -> bool:
+        return any(q is not p and max(q[3], q[4]) > max(p[3], p[4])
+                   and abs(q[0] - p[0]) < q[3] / 2 and abs(q[1] - p[1]) < q[4] / 2 for q in pads)
+
+    def surrounded(p) -> bool:
+        if max(p[3], p[4]) > 1.5 * typical or under_bigger(p):
+            return False  # an exposed pad, or a piece of one, not a ball
+        sides = set()
+        for q in smd:
+            if q is p:
+                continue
+            dx, dy = q[0] - p[0], q[1] - p[1]
+            if abs(dx) <= reach and abs(dy) <= 0.5 * pitch and abs(dx) > 0.5 * pitch:
+                sides.add("+x" if dx > 0 else "-x")
+            if abs(dy) <= reach and abs(dx) <= 0.5 * pitch and abs(dy) > 0.5 * pitch:
+                sides.add("+y" if dy > 0 else "-y")
+        return len(sides) == 4
+
+    return any(surrounded(p) for p in smd)
+
+
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
          copper_layers: list[str] | None = None, refused: list[dict] | None = None,
          band: bool | None = None, class_layers: dict[str, list[str]] | None = None,
@@ -316,7 +403,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
     already laid and routes on from their vias.
     """
     extra = search_args(search)
-    steps = _fanout_steps(pcb, pro, planes, copper_layers, refused, fanout)
+    steps = _fanout_steps(pcb, pro, planes, copper_layers, refused, fanout, class_layers)
     steps += _plan(pcb, pro, planes, copper_layers, refused, band, class_layers)
     for step in steps:
         if step["script"] in _SEARCH_SCRIPTS:
@@ -326,7 +413,8 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
 
 def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
                   copper_layers: list[str] | None, refused: list[dict] | None,
-                  fanout: list[dict] | None) -> list[dict]:
+                  fanout: list[dict] | None,
+                  class_layers: dict[str, list[str]] | None = None) -> list[dict]:
     """One bga_fanout.py call per routing.fanout entry, at the Default class.
 
     The router alone could not leave a dense grid of pads. On the BM20BC's
@@ -337,11 +425,25 @@ def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
     The escapes stay off the plane layers, as every signal does.
     """
     fanout = check_fanout(fanout)
+    text = Path(pcb).read_text(encoding="utf-8")
+    on_board = set(_REF.findall(text))
+    pads = footprint_pads(text)
+    if fanout is None:
+        # Not set: every IC (U1, U2, U_MCU) whose pads fill a grid, the part
+        # the router cannot leave and nobody thought to name. Parts with
+        # their pads on the outline are left alone (is_grid). An empty list
+        # turns it off. Each part is optional here: one the fan-out cannot
+        # handle is reported, and the route goes on.
+        fanout = [{"ref": r, "optional": True} for r in sorted(on_board)
+                  if r.startswith("U") and is_grid(pads.get(r, []))]
     if not fanout:
         return []
-    classes, _ = _classes(pro)
+    groups, classes = nets_by_class(pcb, pro)
     default = classes.get("Default", {})
-    on_board = set(_REF.findall(Path(pcb).read_text(encoding="utf-8")))
+    # Never an escape on an impedance-controlled net: a stub and a via on a
+    # 50 ohm feed is the discontinuity the class exists to avoid, and on
+    # verdacor-ear-tag-bm20 both of U2's RF feeds were left open by it.
+    controlled = {n for name in (class_layers or {}) for n in groups.get(name, [])}
     plane_layers = {l for ls in planes.values() for l in ls}
     signal_layers = [l for l in (copper_layers or board_copper(pcb)) if l not in plane_layers]
     steps = []
@@ -352,14 +454,21 @@ def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
             if refused is not None:
                 refused.append({"fanout": ref, "reason": "no footprint with this reference on the board"})
             continue
-        steps.append({"script": FANOUT, "args": [
+        nets = sorted({p[2] for p in pads.get(ref, []) if p[2]})
+        only: list[str] = []
+        if controlled & set(nets):
+            keep = [n for n in nets if n not in controlled]
+            if not keep:
+                continue
+            only = ["--nets", *map(_glob, keep)]
+        steps.append({"script": FANOUT, "optional": bool(entry.get("optional")), "args": [
             "--component", ref,
             "--escape-method", entry.get("escape", "dogbone"),
             "--track-width", f"{default.get('track_width', 0.2):g}",
             "--clearance", f"{default.get('clearance', 0.2):g}",
             "--via-size", f"{default.get('via_diameter', 0.6):g}",
             "--via-drill", f"{default.get('via_drill', 0.3):g}",
-            "--layers", *signal_layers,
+            "--layers", *signal_layers, *only,
             # As every other call: the project's rules, never relaxed.
             "--escalation", "off", "--no-fix-drc-settings"]})
     return steps
@@ -1345,9 +1454,20 @@ def _route_once(pcb: Path, *, work_dir: Path, timeout: int = 3600,
         target = ([str(pcb), str(pcb)] if step["script"] == "route_planes.py"
                   else [str(pcb), "--output", str(pcb)] if step["script"] == FANOUT
                   else [str(pcb), "-O"])
+        if step.get("optional"):
+            # A defaulted fan-out (every U part) may meet a part it cannot
+            # handle; the board goes back to how it was and the route goes on.
+            before = work / f"{pcb.stem}.pre-fanout.kicad_pcb"
+            shutil.copyfile(pcb, before)
         proc = _run([sys.executable, script, *target, *step["args"]], timeout)
         restore_pro()
         log.append(f"$ {step['script']} {' '.join(step['args'])}\n{(proc.stdout or '')[-4000:]}{(proc.stderr or '')[-2000:]}")
+        if proc.returncode != 0 and step.get("optional"):
+            shutil.copyfile(before, pcb)
+            ref = step["args"][step["args"].index("--component") + 1]
+            result.extra.setdefault("fanout_skipped", []).append(
+                {"ref": ref, "reason": f"exited {proc.returncode}: {autoroute._msg(proc)[-300:]}"})
+            continue
         if proc.returncode != 0:
             left = unband()
             result.reason = f"{step['script']} exited {proc.returncode}: {autoroute._msg(proc)[-800:]}" + (f"; and {left}" if left else "")

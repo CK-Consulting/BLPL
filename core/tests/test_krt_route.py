@@ -1575,7 +1575,8 @@ def test_no_stitching_via_lands_in_a_keepout_a_footprint_carries(tmp_path):
 def _with_parts(board, *refs):
     """The board with a footprint for each reference designator."""
     parts = " ".join(f'(footprint "X" (property "Reference" "{r}"))' for r in refs)
-    board.write_text(board.read_text().rstrip(")") + f" {parts})")
+    text = board.read_text().rstrip()
+    board.write_text(text[:-1] + f" {parts})")  # inside the board's own closing paren
     return board
 
 
@@ -1607,8 +1608,9 @@ def test_a_fanout_for_a_part_not_on_the_board_is_refused_and_the_rest_routes(lay
                            fanout=[{"ref": "U9"}, {"ref": "U1"}])
     assert [s["args"][1] for s in steps if s["script"] == "bga_fanout.py"] == ["U1"]
     assert refused == [{"fanout": "U9", "reason": "no footprint with this reference on the board"}]
-    assert krt_route.plan(board, board.with_suffix(".kicad_pro"), {}) == krt_route.plan(
-        board, board.with_suffix(".kicad_pro"), {}, fanout=[])
+    # An empty list is no fan-out at all.
+    assert not [s for s in krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, fanout=[])
+                if s["script"] == "bga_fanout.py"]
 
 
 def test_the_fanout_writes_back_to_the_board_it_reads(layered, tmp_path, monkeypatch):
@@ -1767,3 +1769,110 @@ def test_freeroutings_plane_fanout_keeps_its_via_out_of_a_footprints_keepout(tmp
     assert plane_fanout.parse(proc.stdout)["placed"] == [["U1", "1", "GND"]]
     vias = [v for v in pcbnew.LoadBoard(str(pcb)).GetTracks() if v.Type() == pcbnew.PCB_VIA_T]
     assert len(vias) == 1 and pcbnew.ToMM(vias[0].GetPosition().y) < 10.4
+
+
+
+def _with_pads(board, parts):
+    """The board with footprints that have pads: {ref: (rows, cols, net_of)}.
+
+    ``net_of(r, c)`` names each pad's net; rows x cols pads on a 1 mm grid."""
+    fps = []
+    for ref, (rows, cols, net_of) in parts.items():
+        pads = " ".join(f'(pad "{r * cols + c + 1}" smd circle (at {c} {r}) (size 0.4 0.4) (net "{net_of(r, c)}"))'
+                        for r in range(rows) for c in range(cols))
+        fps.append(f'(footprint "X" (at 10 10 90) (property "Reference" "{ref}") {pads})')
+    text = board.read_text().rstrip()
+    board.write_text(text[:-1] + " " + " ".join(fps) + ")")
+    return board
+
+
+def test_with_no_fanout_set_every_u_part_whose_pads_fill_a_grid_is_fanned_out(layered):
+    """The default: ICs with pads inside the grid, each optional. A part with
+    its pads on its outline is left alone (verdacor-ear-tag-bm20: every U
+    part fanned out went from 6 open to 15, with a short)."""
+    sig = lambda r, c: "SPI_SCK"
+    board = _with_pads(layered, {"U1": (3, 3, sig), "U_MCU": (4, 4, sig),
+                                 "U2": (2, 5, sig),       # two rows: a SOIC, a module's edge
+                                 "R1": (3, 3, sig)})      # a grid, but not a U part
+    steps = [s for s in krt_route.plan(board, board.with_suffix(".kicad_pro"), {}) if s["script"] == "bga_fanout.py"]
+    refs = [s["args"][s["args"].index("--component") + 1] for s in steps]
+    assert refs == ["U1", "U_MCU"]
+    assert all(s["optional"] for s in steps)
+    assert all(s["args"][s["args"].index("--escape-method") + 1] == "dogbone" for s in steps)
+    # Named in project.yaml, a part is fanned out grid or not, and not optional.
+    named = [s for s in krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, fanout=[{"ref": "U2"}])
+             if s["script"] == "bga_fanout.py"]
+    assert len(named) == 1 and not named[0]["optional"]
+
+
+def test_no_fanout_escapes_an_impedance_controlled_net(layered):
+    """A stub and a via on a 50 ohm feed is what the class exists to avoid."""
+    board = _with_pads(layered, {"U1": (3, 3, lambda r, c: "RF_ANT" if (r, c) == (0, 0) else "SPI_SCK"),
+                                 "U9": (3, 3, lambda r, c: "RF_ANT")})
+    pro = board.with_suffix(".kicad_pro")
+    steps = [s for s in krt_route.plan(board, pro, {}, class_layers={"RF_50R": ["F.Cu"]})
+             if s["script"] == "bga_fanout.py"]
+    # U1 fans out its other nets only; U9, all RF, not at all.
+    assert [s["args"][s["args"].index("--component") + 1] for s in steps] == ["U1"]
+    args = steps[0]["args"]
+    assert args[args.index("--nets") + 1:args.index("--escalation")] == ["SPI_SCK"]
+    # Without a controlled class on the part, no --nets: every pad escapes.
+    plain = [s for s in krt_route.plan(board, pro, {}) if s["script"] == "bga_fanout.py"]
+    assert all("--nets" not in s["args"] for s in plain)
+
+
+def test_a_defaulted_fanout_that_fails_leaves_the_board_as_it_was_and_the_route_goes_on(layered, tmp_path, monkeypatch):
+    board = _with_pads(layered, {"U1": (3, 3, lambda r, c: "SPI_SCK"), "U2": (3, 3, lambda r, c: "SPI_SCK")})
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    for name in ("_resave", "_snap_terminals", "_fill", "_trim_dangling"):
+        monkeypatch.setattr(krt_route, name, lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: ok)
+    monkeypatch.setattr(krt_route, "_stitch", lambda *a, **k: ok)
+    monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
+    before = board.read_text()
+    ran = []
+
+    def run(cmd, timeout):
+        ran.append(Path(cmd[1]).name)
+        if Path(cmd[1]).name == "bga_fanout.py" and "U1" in cmd:
+            board.write_text("half-written by a fan-out that then failed")
+            return subprocess.CompletedProcess(cmd, 2, "", "not a grid")
+        return ok
+
+    monkeypatch.setattr(krt_route, "_run", run)
+    result = krt_route.route(board, work_dir=tmp_path / "w")
+    assert result.ok
+    assert result.extra["fanout_skipped"][0]["ref"] == "U1" and "not a grid" in result.extra["fanout_skipped"][0]["reason"]
+    # U1's half-done work is gone; U2 still fanned out, and the routing ran.
+    assert ran.count("bga_fanout.py") == 2 and "route.py" in ran
+    assert "half-written" not in board.read_text() and board.read_text() == before
+
+
+def test_a_qfns_exposed_pad_and_its_thermal_vias_do_not_make_it_a_grid():
+    """Eight pins round a big centre pad is a QFN, not a grid (Codex, PR #106)."""
+    ring = [(x, y, "SIG", 0.3, 0.8, True) for x, y in
+            ((-1, -2), (0, -2), (1, -2), (-1, 2), (0, 2), (1, 2), (-2, 0), (2, 0))]
+    ep = [(0, 0, "GND", 2.0, 2.0, True)]
+    assert not krt_route.is_grid(ring + ep)
+    # Thermal vias in the exposed pad: small, inside it, and through-hole.
+    vias = [(x, y, "GND", 0.4, 0.4, False) for x in (-0.5, 0.5) for y in (-0.5, 0.5)]
+    assert not krt_route.is_grid(ring + ep + vias)
+    # Even small surface pads, if they sit inside the exposed pad.
+    paste_split = [(x, y, "GND", 0.4, 0.4, True) for x in (-0.5, 0.5) for y in (-0.5, 0.5)]
+    assert not krt_route.is_grid(ring + ep + paste_split)
+    # A 3 x 3 BGA: its middle ball is a pad like the others, so it is a grid.
+    bga = [(x, y, "SIG", 0.4, 0.4, True) for x in (-1, 0, 1) for y in (-1, 0, 1)]
+    assert krt_route.is_grid(bga)
+
+
+def test_footprint_pads_reads_size_kind_and_skips_paste_apertures():
+    text = ('(kicad_pcb (footprint "X" (at 0 0) (property "Reference" "U1")'
+            ' (pad "1" smd rect (at 1 2) (size 0.3 0.8) (layers "F.Cu" "F.Paste") (net "A"))'
+            ' (pad "" smd rect (at 0 0) (size 1 1) (layers "F.Paste"))'
+            ' (pad "2" thru_hole circle (at 0 0) (size 0.5 0.5) (drill 0.3) (layers "*.Cu") (net "GND"))))')
+    assert krt_route.footprint_pads(text) == {"U1": [(1.0, 2.0, "A", 0.3, 0.8, True),
+                                                     (0.0, 0.0, "GND", 0.5, 0.5, False)]}
