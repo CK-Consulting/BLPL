@@ -1490,3 +1490,80 @@ def test_a_misspelt_setting_is_refused_before_the_board_is_touched(board, tmp_pa
     assert touched == [] and board.read_text() == before
     # And the report is written, saying why.
     assert "unknown setting" in json.loads((tmp_path / "r.json").read_text())["reason"]
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None or subprocess.run(
+    [sys.executable, "-c", "import pcbnew"], capture_output=True).returncode != 0,
+    reason="needs KiCad's pcbnew")
+def test_no_stitching_via_lands_in_a_keepout_a_footprint_carries(tmp_path):
+    """A module's antenna keep-out is a rule area in its footprint, not in
+    b.Zones(), and a ground via went into the BM20BC's (verdacor-ear-tag-bm20)."""
+    import pcbnew
+
+    from blpl.emitter import sexpr
+
+    mm = pcbnew.FromMM
+    board = pcbnew.BOARD()
+    board.SetCopperLayerCount(4)
+    for name in ("GND", "SIG"):
+        board.Add(pcbnew.NETINFO_ITEM(board, name))
+    edge = pcbnew.PCB_SHAPE(board)
+    edge.SetShape(pcbnew.SHAPE_T_RECTANGLE)
+    edge.SetStart(pcbnew.VECTOR2I(0, 0))
+    edge.SetEnd(pcbnew.VECTOR2I(mm(40), mm(30)))
+    edge.SetLayer(pcbnew.Edge_Cuts)
+    edge.SetWidth(mm(0.1))
+    board.Add(edge)
+    zone = pcbnew.ZONE(board)                      # GND over both inner layers
+    board.Add(zone)
+    layers = pcbnew.LSET()
+    layers.AddLayer(pcbnew.In1_Cu)
+    layers.AddLayer(pcbnew.In2_Cu)
+    zone.SetLayerSet(layers)
+    zone.Outline().NewOutline()
+    for x, y in ((1, 1), (39, 1), (39, 29), (1, 29)):
+        zone.Outline().Append(mm(x), mm(y))
+    fp = pcbnew.FOOTPRINT(board)                   # a module whose keep-out
+    fp.SetReference("U1")                          # covers the signal via
+    board.Add(fp)
+    keepout = pcbnew.ZONE(fp)
+    keepout.SetIsRuleArea(True)
+    keepout.SetDoNotAllowVias(True)
+    keepout.SetDoNotAllowTracks(True)
+    keepout.SetDoNotAllowPads(False)
+    keepout.SetDoNotAllowFootprints(False)
+    keepout.SetDoNotAllowZoneFills(False)          # vias out, the plane still poured
+    keepout.SetLayerSet(pcbnew.LSET.AllCuMask())
+    keepout.Outline().NewOutline()
+    for x, y in ((14, 9), (26, 9), (26, 21), (14, 21)):
+        keepout.Outline().Append(mm(x), mm(y))
+    fp.Add(keepout)
+    via = pcbnew.PCB_VIA(board)                    # a signal via just left of the keep-out:
+    # the stitcher tries the +x spot first, which is inside it
+    board.Add(via)
+    via.SetPosition(pcbnew.VECTOR2I(mm(13.4), mm(15)))
+    via.SetWidth(mm(0.6))
+    via.SetDrill(mm(0.3))
+    via.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
+    pcb = tmp_path / "b.kicad_pcb"
+    pcbnew.SaveBoard(str(pcb), board)
+
+    tree = sexpr.parse(pcb.read_text())
+    top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
+    for node in top:
+        if isinstance(node, list) and sexpr.head(node) in ("via", "zone") and sexpr.find(node, "keepout") is None:
+            name = "SIG" if sexpr.head(node) == "via" else "GND"
+            node[:] = [c for c in node if not (isinstance(c, list) and sexpr.head(c) == "net")] + [["net", sexpr.quote(name)]]
+    pcb.write_text(sexpr.dump_top(tree))
+    assert pcbnew.LoadBoard(str(pcb)).GetFootprints()[0].Zones(), "the keep-out must be the footprint's"
+
+    proc = krt_route._stitch(sys.executable, pcb, via_mm=0.6, drill_mm=0.3, clearance_mm=0.2,
+                             edge_mm=0.5, hole_mm=0.25, hole_to_hole_mm=0.25)
+    assert proc.returncode == 0, proc.stderr
+    # One placed, so the check below is about where, not whether.
+    assert proc.stdout.strip().splitlines()[-1] == "1 0"
+    after = pcbnew.LoadBoard(str(pcb))
+    area = after.GetFootprints()[0].Zones()[0].Outline()
+    inside = [v for v in after.GetTracks() if v.Type() == pcbnew.PCB_VIA_T
+              and v.GetNetname() == "GND" and area.Contains(v.GetPosition())]
+    assert not inside

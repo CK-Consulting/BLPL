@@ -735,7 +735,9 @@ def _snap_terminals(python: str, pcb: Path, clearance_mm: float = 0.0) -> subpro
         "vias = {(v.GetPosition().x, v.GetPosition().y) for v in b.GetTracks() if v.Type() == pcbnew.PCB_VIA_T}\n"
         "others = [t for t in b.GetTracks() if t.Type() in (pcbnew.PCB_TRACE_T, pcbnew.PCB_VIA_T, pcbnew.PCB_ARC_T)]\n"
         "pads = [p for fp in b.GetFootprints() for p in fp.Pads()]\n"
-        "areas = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowTracks()]\n"
+        # Footprint rule areas too: a module's antenna keep-out lives in its
+        # footprint, not in b.Zones().
+        "areas = [z for z in (list(b.Zones()) + [z for fp in b.GetFootprints() for z in fp.Zones()]) if z.GetIsRuleArea() and z.GetDoNotAllowTracks()]\n"
         f"reach = pcbnew.FromMM({_SNAP_REACH_MM})\n"
         f"floor = pcbnew.FromMM({float(clearance_mm)!r})\n"
         "def clear(stub, layer, net, gap):\n"
@@ -938,8 +940,14 @@ def _stitch(python: str, pcb: Path, *, via_mm: float, drill_mm: float, clearance
         "        d = math.hypot(at.x - a.x - t * dx, at.y - a.y - t * dy)\n"
         "        best = d if best is None or d < best else best\n"
         "    return best if best is not None else 0\n"
-        "keepouts = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowVias()]\n"
-        "no_tracks = [z for z in b.Zones() if z.GetIsRuleArea() and z.GetDoNotAllowTracks()]\n"
+        # The footprints' rule areas as well as the board's: b.Zones() holds
+        # only board-level zones, so a keep-out a footprint carries (the
+        # BM20BC's antenna area, ANT_LRHF's body) was invisible here and a
+        # ground via went into it (verdacor-ear-tag-bm20, DRC
+        # items_not_allowed).
+        "rule_areas = (list(b.Zones()) + [z for fp in b.GetFootprints() for z in fp.Zones()])\n"
+        "keepouts = [z for z in rule_areas if z.GetIsRuleArea() and z.GetDoNotAllowVias()]\n"
+        "no_tracks = [z for z in rule_areas if z.GetIsRuleArea() and z.GetDoNotAllowTracks()]\n"
         "plane_zones = [z for z in b.Zones() if not z.GetIsRuleArea() and z.GetNetCode() in planes]\n"
         "def in_plane(at, net):\n"
         "    # Inside one of the net's own inner-layer zones: a partial plane is\n"
