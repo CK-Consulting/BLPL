@@ -44,10 +44,15 @@ def _split_row(line: str) -> list[str]:
     return [_clean_cell(c) for c in _UNESCAPED_PIPE.split(stripped)]
 
 
-# A fenced code block, as CommonMark has it: up to three spaces of indent, then
-# three or more backticks or tildes. It closes on a line of the same character,
-# at least as long, with nothing after it; one never closed runs to the end.
-_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+# A fenced code block: three or more backticks or tildes. It closes on a line
+# of the same character, at least as long, with nothing after it; one never
+# closed runs to the end. The fence may sit inside a list item or a block
+# quote (`- ```text`, `> ~~~`), at any indent. Matching only CommonMark's
+# top-level form missed a fence opened on a list item's line, so its indented
+# closer read as an opener and hid every table and heading after it.
+_FENCE_RE = re.compile(
+    r"^(?:[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+|[ \t]*>[ \t]?)*[ \t]*(`{3,}|~{3,})(.*)$"
+)
 
 
 def fenced_lines(lines: list[str]) -> list[bool]:

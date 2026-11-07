@@ -107,3 +107,12 @@ def test_heading_above_skips_comments_in_a_fence() -> None:
     doc = "## U3 pinout\n\n```bash\n# flash it\n```\n\n" + _TABLE
     (t,) = mdt.extract_tables(doc, "s.md")
     assert mdt.heading_above(doc, t.line_start) == ("## U3 pinout", 1)
+
+
+def test_fence_opened_in_a_list_item_closes_and_later_tables_are_read() -> None:
+    # The opener sits after a list marker and the closer is indented under
+    # it; missing the opener made the closer open a fence to the end.
+    for opener, closer in (("- ```text", "  ```"), ("1. ~~~", "   ~~~"), ("> ```", "> ```")):
+        doc = f"{opener}\n{_TABLE}{closer}\n\n## U3 pinout\n\n{_TABLE}"
+        (t,) = mdt.extract_tables(doc, "s.md")
+        assert mdt.heading_above(doc, t.line_start)[0] == "## U3 pinout", opener
