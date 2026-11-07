@@ -44,15 +44,76 @@ def _split_row(line: str) -> list[str]:
     return [_clean_cell(c) for c in _UNESCAPED_PIPE.split(stripped)]
 
 
-def extract_tables(text: str, source_file: str) -> list[ParsedTable]:
-    """Extract all pipe-delimited Markdown tables with 1-based line refs."""
+# A fenced code block, as CommonMark has it: up to three spaces of indent, then
+# three or more backticks or tildes. It closes on a line of the same character,
+# at least as long, with nothing after it; one never closed runs to the end.
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def fenced_lines(lines: list[str]) -> list[bool]:
+    """For each line, whether it is part of a fenced code block, fences included.
+
+    A table or a heading shown as an example inside a fence is text, not part
+    of the design. Reading it anyway made a decision log's quoted pin table a
+    pinout of nothing, and a ``# comment`` in a shell snippet the heading that
+    anchored the table below it, so wrapping something in a fence, the one way
+    Markdown has to say "this is not the document", changed nothing.
+    """
+    out: list[bool] = []
+    fence: str | None = None
+    for line in lines:
+        m = _FENCE_RE.match(line)
+        if fence is None:
+            # A backtick fence's info string may not itself hold a backtick.
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                fence = m.group(1)
+                out.append(True)
+                continue
+            out.append(False)
+        else:
+            out.append(True)
+            if (
+                m
+                and m.group(1)[0] == fence[0]
+                and len(m.group(1)) >= len(fence)
+                and not m.group(2).strip()
+            ):
+                fence = None
+    return out
+
+
+def heading_above(text: str, line_start: int) -> tuple[str | None, int | None]:
+    """The nearest heading at or above a 1-based line, and its line number.
+
+    Lines inside a fenced code block are skipped: a ``#`` there is a comment.
+    """
     lines = text.splitlines()
+    fenced = fenced_lines(lines)
+    for i in range(min(line_start, len(lines)) - 1, -1, -1):
+        if not fenced[i] and lines[i].lstrip().startswith("#"):
+            return lines[i], i + 1
+    return None, None
+
+
+def extract_tables(text: str, source_file: str) -> list[ParsedTable]:
+    """Extract all pipe-delimited Markdown tables with 1-based line refs.
+
+    Tables inside fenced code blocks are not tables; see ``fenced_lines``.
+    """
+    lines = text.splitlines()
+    fenced = fenced_lines(lines)
     tables: list[ParsedTable] = []
     i = 0
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
-        if stripped.startswith("|") and i + 1 < len(lines) and _SEPARATOR_RE.match(lines[i + 1].strip()):
+        if (
+            not fenced[i]
+            and stripped.startswith("|")
+            and i + 1 < len(lines)
+            and not fenced[i + 1]
+            and _SEPARATOR_RE.match(lines[i + 1].strip())
+        ):
             headers = _split_row(line)
             header_line = i + 1  # 1-based
             rows: list[dict[str, str]] = []
@@ -60,7 +121,7 @@ def extract_tables(text: str, source_file: str) -> list[ParsedTable]:
             last_data_line = header_line
             while j < len(lines):
                 row_stripped = lines[j].strip()
-                if not row_stripped.startswith("|"):
+                if fenced[j] or not row_stripped.startswith("|"):
                     break
                 cells = _split_row(lines[j])
                 # Pad or truncate cells to header length.

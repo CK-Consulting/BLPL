@@ -69,3 +69,41 @@ def test_ragged_rows_are_padded_or_truncated() -> None:
     (t,) = mdt.extract_tables(doc, "s.md")
     assert t.rows[0] == {"A": "1", "B": "2", "C": ""}
     assert t.rows[1] == {"A": "1", "B": "2", "C": "3"}
+
+
+_TABLE = "| Pin | Signal Name |\n|-----|-------------|\n| 1   | VDD_IO      |\n"
+
+
+def test_table_inside_a_fence_is_not_a_table() -> None:
+    # A decision log quoting an old pin table in a fence made that table a
+    # pinout with no part, which doctor flagged and Stage 0 read.
+    for fence in ("```", "~~~", "````", "```markdown"):
+        close = fence.rstrip("markdown")
+        doc = f"## Old pinout\n\n{fence}\n{_TABLE}{close}\n"
+        assert mdt.extract_tables(doc, "s.md") == [], fence
+
+
+def test_table_after_a_closed_fence_is_read_with_its_own_line() -> None:
+    doc = "```\n" + _TABLE + "```\n\n" + _TABLE
+    (t,) = mdt.extract_tables(doc, "s.md")
+    assert t.line_start == 7
+    assert t.rows == [{"Pin": "1", "Signal Name": "VDD_IO"}]
+
+
+def test_fence_closes_only_on_a_matching_bare_fence() -> None:
+    # A shorter run, the other character, or a fence with text after it is
+    # content of the block; an unclosed fence runs to the end.
+    doc = "````\n```\n~~~~\n```` not a close\n" + _TABLE
+    assert mdt.extract_tables(doc, "s.md") == []
+    assert mdt.extract_tables("```\n" + _TABLE, "s.md") == []
+
+
+def test_backtick_info_string_with_a_backtick_is_not_a_fence() -> None:
+    doc = "```inline` code\n" + _TABLE
+    assert len(mdt.extract_tables(doc, "s.md")) == 1
+
+
+def test_heading_above_skips_comments_in_a_fence() -> None:
+    doc = "## U3 pinout\n\n```bash\n# flash it\n```\n\n" + _TABLE
+    (t,) = mdt.extract_tables(doc, "s.md")
+    assert mdt.heading_above(doc, t.line_start) == ("## U3 pinout", 1)
