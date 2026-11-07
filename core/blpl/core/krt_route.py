@@ -303,6 +303,52 @@ def check_fanout(fanout) -> list[dict] | None:
 _REF = re.compile(r'\(property "Reference" "([^"]+)"')
 
 
+def footprint_pads(pcb_text: str) -> dict[str, list[tuple[float, float, str]]]:
+    """Each footprint's pads as (x, y, net), in the footprint's own frame.
+
+    The frame is the footprint's, not the board's, so a part's grid reads the
+    same at any rotation."""
+    from ..emitter import sexpr
+
+    tree = sexpr.parse(pcb_text)
+    top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
+    out: dict[str, list[tuple[float, float, str]]] = {}
+    for fp in sexpr.find_all(top, "footprint"):
+        ref = next((sexpr.unquote(c[2]) for c in fp if isinstance(c, list) and sexpr.head(c) == "property"
+                    and len(c) > 2 and sexpr.unquote(c[1]) == "Reference"), None)
+        if ref is None:
+            continue
+        pads = []
+        for pad in sexpr.find_all(fp, "pad"):
+            at = sexpr.find(pad, "at")
+            net = sexpr.find(pad, "net")
+            if at is None or len(at) < 3:
+                continue
+            name = sexpr.unquote(net[-1]) if net is not None and len(net) > 1 else ""
+            pads.append((float(at[1]), float(at[2]), name))
+        out[ref] = pads
+    return out
+
+
+def is_grid(pads: list[tuple[float, float, str]]) -> bool:
+    """Whether a part's pads fill a grid: some pad lies inside the others.
+
+    A BGA or an LGA module has pads with neighbours on every side, which is
+    what the router cannot leave. A part whose pads all sit on its outline (a
+    SOIC, a QFN's ring, a module's castellations, a 2 x 3 WCSP) is reached
+    from outside already, and fanning it out only spends a via on every pin:
+    on verdacor-ear-tag-bm20, fanning out every U part took the board from 6
+    open connections to 15, with a short.
+    """
+    if len(pads) < 9:
+        return False
+    xs = [x for x, _, _ in pads]
+    ys = [y for _, y, _ in pads]
+    tol = 0.01
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    return any(x0 + tol < x < x1 - tol and y0 + tol < y < y1 - tol for x, y, _ in pads)
+
+
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
          copper_layers: list[str] | None = None, refused: list[dict] | None = None,
          band: bool | None = None, class_layers: dict[str, list[str]] | None = None,
@@ -317,7 +363,7 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
     already laid and routes on from their vias.
     """
     extra = search_args(search)
-    steps = _fanout_steps(pcb, pro, planes, copper_layers, refused, fanout)
+    steps = _fanout_steps(pcb, pro, planes, copper_layers, refused, fanout, class_layers)
     steps += _plan(pcb, pro, planes, copper_layers, refused, band, class_layers)
     for step in steps:
         if step["script"] in _SEARCH_SCRIPTS:
@@ -327,7 +373,8 @@ def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
 
 def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
                   copper_layers: list[str] | None, refused: list[dict] | None,
-                  fanout: list[dict] | None) -> list[dict]:
+                  fanout: list[dict] | None,
+                  class_layers: dict[str, list[str]] | None = None) -> list[dict]:
     """One bga_fanout.py call per routing.fanout entry, at the Default class.
 
     The router alone could not leave a dense grid of pads. On the BM20BC's
@@ -338,18 +385,25 @@ def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
     The escapes stay off the plane layers, as every signal does.
     """
     fanout = check_fanout(fanout)
-    on_board = set(_REF.findall(Path(pcb).read_text(encoding="utf-8")))
+    text = Path(pcb).read_text(encoding="utf-8")
+    on_board = set(_REF.findall(text))
+    pads = footprint_pads(text)
     if fanout is None:
-        # Not set: every IC by refdes, U1, U2, U_MCU. Fanning out costs a
-        # part nothing it would not have needed, a short stub and a via per
-        # pin, and the part that needs it is the one nobody thought to name.
-        # An empty list turns it off. Each part is optional here: one the
-        # fan-out cannot handle is reported, and the route goes on.
-        fanout = [{"ref": r, "optional": True} for r in sorted(on_board) if r.startswith("U")]
+        # Not set: every IC (U1, U2, U_MCU) whose pads fill a grid, the part
+        # the router cannot leave and nobody thought to name. Parts with
+        # their pads on the outline are left alone (is_grid). An empty list
+        # turns it off. Each part is optional here: one the fan-out cannot
+        # handle is reported, and the route goes on.
+        fanout = [{"ref": r, "optional": True} for r in sorted(on_board)
+                  if r.startswith("U") and is_grid(pads.get(r, []))]
     if not fanout:
         return []
-    classes, _ = _classes(pro)
+    groups, classes = nets_by_class(pcb, pro)
     default = classes.get("Default", {})
+    # Never an escape on an impedance-controlled net: a stub and a via on a
+    # 50 ohm feed is the discontinuity the class exists to avoid, and on
+    # verdacor-ear-tag-bm20 both of U2's RF feeds were left open by it.
+    controlled = {n for name in (class_layers or {}) for n in groups.get(name, [])}
     plane_layers = {l for ls in planes.values() for l in ls}
     signal_layers = [l for l in (copper_layers or board_copper(pcb)) if l not in plane_layers]
     steps = []
@@ -360,6 +414,13 @@ def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
             if refused is not None:
                 refused.append({"fanout": ref, "reason": "no footprint with this reference on the board"})
             continue
+        nets = sorted({n for _, _, n in pads.get(ref, []) if n})
+        only: list[str] = []
+        if controlled & set(nets):
+            keep = [n for n in nets if n not in controlled]
+            if not keep:
+                continue
+            only = ["--nets", *map(_glob, keep)]
         steps.append({"script": FANOUT, "optional": bool(entry.get("optional")), "args": [
             "--component", ref,
             "--escape-method", entry.get("escape", "dogbone"),
@@ -367,7 +428,7 @@ def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
             "--clearance", f"{default.get('clearance', 0.2):g}",
             "--via-size", f"{default.get('via_diameter', 0.6):g}",
             "--via-drill", f"{default.get('via_drill', 0.3):g}",
-            "--layers", *signal_layers,
+            "--layers", *signal_layers, *only,
             # As every other call: the project's rules, never relaxed.
             "--escalation", "off", "--no-fix-drc-settings"]})
     return steps

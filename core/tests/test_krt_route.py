@@ -1575,7 +1575,8 @@ def test_no_stitching_via_lands_in_a_keepout_a_footprint_carries(tmp_path):
 def _with_parts(board, *refs):
     """The board with a footprint for each reference designator."""
     parts = " ".join(f'(footprint "X" (property "Reference" "{r}"))' for r in refs)
-    board.write_text(board.read_text().rstrip(")") + f" {parts})")
+    text = board.read_text().rstrip()
+    board.write_text(text[:-1] + f" {parts})")  # inside the board's own closing paren
     return board
 
 
@@ -1771,22 +1772,57 @@ def test_freeroutings_plane_fanout_keeps_its_via_out_of_a_footprints_keepout(tmp
 
 
 
-def test_with_no_fanout_set_every_u_part_is_fanned_out_and_may_fail(layered):
-    """The default: every IC by refdes, each optional, nothing else."""
-    board = _with_parts(layered, "U1", "U_MCU", "R1", "J1", "TP1")
+def _with_pads(board, parts):
+    """The board with footprints that have pads: {ref: (rows, cols, net_of)}.
+
+    ``net_of(r, c)`` names each pad's net; rows x cols pads on a 1 mm grid."""
+    fps = []
+    for ref, (rows, cols, net_of) in parts.items():
+        pads = " ".join(f'(pad "{r * cols + c + 1}" smd circle (at {c} {r}) (size 0.4 0.4) (net "{net_of(r, c)}"))'
+                        for r in range(rows) for c in range(cols))
+        fps.append(f'(footprint "X" (at 10 10 90) (property "Reference" "{ref}") {pads})')
+    text = board.read_text().rstrip()
+    board.write_text(text[:-1] + " " + " ".join(fps) + ")")
+    return board
+
+
+def test_with_no_fanout_set_every_u_part_whose_pads_fill_a_grid_is_fanned_out(layered):
+    """The default: ICs with pads inside the grid, each optional. A part with
+    its pads on its outline is left alone (verdacor-ear-tag-bm20: every U
+    part fanned out went from 6 open to 15, with a short)."""
+    sig = lambda r, c: "SPI_SCK"
+    board = _with_pads(layered, {"U1": (3, 3, sig), "U_MCU": (4, 4, sig),
+                                 "U2": (2, 5, sig),       # two rows: a SOIC, a module's edge
+                                 "R1": (3, 3, sig)})      # a grid, but not a U part
     steps = [s for s in krt_route.plan(board, board.with_suffix(".kicad_pro"), {}) if s["script"] == "bga_fanout.py"]
     refs = [s["args"][s["args"].index("--component") + 1] for s in steps]
     assert refs == ["U1", "U_MCU"]
     assert all(s["optional"] for s in steps)
     assert all(s["args"][s["args"].index("--escape-method") + 1] == "dogbone" for s in steps)
-    # Named in project.yaml, a part is not optional: its failure fails the route.
-    named = [s for s in krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, fanout=[{"ref": "U1"}])
+    # Named in project.yaml, a part is fanned out grid or not, and not optional.
+    named = [s for s in krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, fanout=[{"ref": "U2"}])
              if s["script"] == "bga_fanout.py"]
     assert len(named) == 1 and not named[0]["optional"]
 
 
+def test_no_fanout_escapes_an_impedance_controlled_net(layered):
+    """A stub and a via on a 50 ohm feed is what the class exists to avoid."""
+    board = _with_pads(layered, {"U1": (3, 3, lambda r, c: "RF_ANT" if (r, c) == (0, 0) else "SPI_SCK"),
+                                 "U9": (3, 3, lambda r, c: "RF_ANT")})
+    pro = board.with_suffix(".kicad_pro")
+    steps = [s for s in krt_route.plan(board, pro, {}, class_layers={"RF_50R": ["F.Cu"]})
+             if s["script"] == "bga_fanout.py"]
+    # U1 fans out its other nets only; U9, all RF, not at all.
+    assert [s["args"][s["args"].index("--component") + 1] for s in steps] == ["U1"]
+    args = steps[0]["args"]
+    assert args[args.index("--nets") + 1:args.index("--escalation")] == ["SPI_SCK"]
+    # Without a controlled class on the part, no --nets: every pad escapes.
+    plain = [s for s in krt_route.plan(board, pro, {}) if s["script"] == "bga_fanout.py"]
+    assert all("--nets" not in s["args"] for s in plain)
+
+
 def test_a_defaulted_fanout_that_fails_leaves_the_board_as_it_was_and_the_route_goes_on(layered, tmp_path, monkeypatch):
-    board = _with_parts(layered, "U1", "U2")
+    board = _with_pads(layered, {"U1": (3, 3, lambda r, c: "SPI_SCK"), "U2": (3, 3, lambda r, c: "SPI_SCK")})
     monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
     monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
     monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
