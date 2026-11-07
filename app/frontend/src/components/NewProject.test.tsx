@@ -256,6 +256,17 @@ describe("the push policy in project settings", () => {
 });
 
 describe("the clone tab", () => {
+  it("shows an HTTPS URL as the example, the form that works with no setup", async () => {
+    const user = userEvent.setup();
+    server();
+    render(<NewProject onCreated={vi.fn()} onClose={() => {}} />);
+    await screen.findByDisplayValue("Ada Lovelace");
+    await user.click(screen.getByRole("button", { name: "Clone git remote" }));
+    const url = screen.getByLabelText("Clone URL");
+    expect(url).toHaveAttribute("placeholder", "https://github.com/owner/repo");
+    expect(url.getAttribute("title")).toMatch(/SSH key saved for that host/);
+  });
+
   it("asks for the same push policy and identity, and sends them", async () => {
     const user = userEvent.setup();
     const calls = server();
