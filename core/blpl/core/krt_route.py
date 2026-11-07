@@ -275,8 +275,9 @@ FANOUT = "bga_fanout.py"
 FANOUT_ESCAPES = ("dogbone", "channel", "underpad", "auto")
 
 
-def check_fanout(fanout) -> list[dict]:
-    """routing.fanout, checked: a list of {ref, escape?} mappings.
+def check_fanout(fanout) -> list[dict] | None:
+    """routing.fanout, checked: a list of {ref, escape?} mappings, or None
+    when the project does not set it.
 
     Stage 6a reads project.yaml without the schema, so a malformed entry
     reaches here as it was written. Refused before the board is touched, it
@@ -284,7 +285,7 @@ def check_fanout(fanout) -> list[dict]:
     edge band still on the board and no report at all (Codex, PR #104).
     """
     if fanout is None:
-        return []
+        return None  # not set: the default, every U part (see _fanout_steps)
     if not isinstance(fanout, list):
         # ValueError, as every settings refusal here: route() turns those
         # into a failed result rather than a crash.
@@ -337,11 +338,18 @@ def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
     The escapes stay off the plane layers, as every signal does.
     """
     fanout = check_fanout(fanout)
+    on_board = set(_REF.findall(Path(pcb).read_text(encoding="utf-8")))
+    if fanout is None:
+        # Not set: every IC by refdes, U1, U2, U_MCU. Fanning out costs a
+        # part nothing it would not have needed, a short stub and a via per
+        # pin, and the part that needs it is the one nobody thought to name.
+        # An empty list turns it off. Each part is optional here: one the
+        # fan-out cannot handle is reported, and the route goes on.
+        fanout = [{"ref": r, "optional": True} for r in sorted(on_board) if r.startswith("U")]
     if not fanout:
         return []
     classes, _ = _classes(pro)
     default = classes.get("Default", {})
-    on_board = set(_REF.findall(Path(pcb).read_text(encoding="utf-8")))
     plane_layers = {l for ls in planes.values() for l in ls}
     signal_layers = [l for l in (copper_layers or board_copper(pcb)) if l not in plane_layers]
     steps = []
@@ -352,7 +360,7 @@ def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
             if refused is not None:
                 refused.append({"fanout": ref, "reason": "no footprint with this reference on the board"})
             continue
-        steps.append({"script": FANOUT, "args": [
+        steps.append({"script": FANOUT, "optional": bool(entry.get("optional")), "args": [
             "--component", ref,
             "--escape-method", entry.get("escape", "dogbone"),
             "--track-width", f"{default.get('track_width', 0.2):g}",
@@ -1345,9 +1353,20 @@ def _route_once(pcb: Path, *, work_dir: Path, timeout: int = 3600,
         target = ([str(pcb), str(pcb)] if step["script"] == "route_planes.py"
                   else [str(pcb), "--output", str(pcb)] if step["script"] == FANOUT
                   else [str(pcb), "-O"])
+        if step.get("optional"):
+            # A defaulted fan-out (every U part) may meet a part it cannot
+            # handle; the board goes back to how it was and the route goes on.
+            before = work / f"{pcb.stem}.pre-fanout.kicad_pcb"
+            shutil.copyfile(pcb, before)
         proc = _run([sys.executable, script, *target, *step["args"]], timeout)
         restore_pro()
         log.append(f"$ {step['script']} {' '.join(step['args'])}\n{(proc.stdout or '')[-4000:]}{(proc.stderr or '')[-2000:]}")
+        if proc.returncode != 0 and step.get("optional"):
+            shutil.copyfile(before, pcb)
+            ref = step["args"][step["args"].index("--component") + 1]
+            result.extra.setdefault("fanout_skipped", []).append(
+                {"ref": ref, "reason": f"exited {proc.returncode}: {autoroute._msg(proc)[-300:]}"})
+            continue
         if proc.returncode != 0:
             left = unband()
             result.reason = f"{step['script']} exited {proc.returncode}: {autoroute._msg(proc)[-800:]}" + (f"; and {left}" if left else "")

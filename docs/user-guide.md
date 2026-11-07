@@ -546,7 +546,7 @@ boundaries:
 | `routing.router` | `kicad-routing-tools` (default when installed) or `freerouting`. | |
 | `routing.search` | KiCad Routing Tools search settings: `ordering`, `direction`, `mps_reverse_rounds`, `max_ripup`, `ripup_blocker_select`, `max_iterations`, `heuristic_weight`. | Steer the search only, never a size, clearance or layer. Freerouting ignores them and says so. |
 | `routing.retry` | Settings to try in turn when a route leaves connections open, each from the unrouted board. | The first clean route is kept, else the one with fewest open. The report lists every attempt. |
-| `routing.fanout` | Parts to fan out before routing: `{ref, escape}`, escape `dogbone` (default), `channel`, `underpad` or `auto`. | For a BGA or LGA module the router cannot leave on its own. KiCad Routing Tools only. |
+| `routing.fanout` | Parts to fan out before routing: `{ref, escape}`, escape `dogbone` (default), `channel`, `underpad` or `auto`. | Not set: every `U` part. `[]`: none. KiCad Routing Tools only. |
 | `review.accept` | Findings that are true and intended, each with a reason. | Moves them to an accepted list; never hides them. |
 
 ### Placement hints
@@ -587,6 +587,8 @@ routing:
   - {ref: U1}                    # escape: dogbone, the default
   - {ref: U4, escape: channel}
 ```
+
+Left out of `project.yaml`, every part whose reference starts with `U` is fanned out, with `dogbone` escapes. A part the fan-out cannot handle is put back as it was, named under `fanout_skipped` in `autoroute_report.json`, and the route goes on. A part you name yourself is held to it: if its fan-out fails, the route fails. `fanout: []` turns fanning out off.
 
 The escapes use the Default net class's track, clearance and via, and stay off the plane layers. `dogbone` puts each via in the gap between pads. `underpad` and `auto` may put a via in a pad, which the fab then has to fill and cap (IPC-4761 Type VII, stated on the order), or solder wicks into the barrel. A ref that is not on the board is named under `refused` in `autoroute_report.json`, and the rest of the board still routes. Every retry fans out again, since each starts from the unrouted board.
 
