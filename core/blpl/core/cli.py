@@ -1247,13 +1247,13 @@ def _cmd_autoroute(args: argparse.Namespace) -> int:
     # The search settings and retries are KRT's flags. Freerouting has its
     # passes and nothing else, so for it they are said, not silently dropped.
     routing = _routing(args, proj)
-    search, retry = routing.get("search"), routing.get("retry")
-    if router != "kicad-routing-tools" and (search or retry):
-        print("autoroute: routing.search and routing.retry are KiCad Routing Tools settings; "
-              f"{router} does not take them")
-        search = retry = None
+    search, retry, fanout = routing.get("search"), routing.get("retry"), routing.get("fanout")
+    if router != "kicad-routing-tools" and (search or retry or fanout):
+        print("autoroute: routing.search, routing.retry and routing.fanout are KiCad Routing Tools "
+              f"settings; {router} does not take them")
+        search = retry = fanout = None
     result = autoroute.run_for(pcb, report_path, passes=args.passes, work_dir=work, router=router,
-                               class_layers=class_layers, search=search, retry=retry)
+                               class_layers=class_layers, search=search, retry=retry, fanout=fanout)
     if not result.attempted:
         print(f"autoroute: skipped — {result.reason}")
         print(f"           wrote {report_path}")
