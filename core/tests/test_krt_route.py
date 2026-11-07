@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import jsonschema
 import pytest
 
 from blpl.core import autoroute, krt_route
@@ -1405,10 +1406,12 @@ def _attempts(monkeypatch, board, opens):
     writes its own copper, and leaves opens[i] connections open (None: fails)."""
     original = board.read_text()
     calls = []
+    fanouts = monkeypatch.fanouts = []
 
-    def once(pcb, *, work_dir, timeout, class_layers, search):
+    def once(pcb, *, work_dir, timeout, class_layers, search, fanout=None):
         i = len(calls)
         calls.append((search, pcb.read_text() == original))
+        fanouts.append(fanout)
         pcb.write_text(f"routed by attempt {i}")
         if opens[i] is None:
             return autoroute.RouteResult(False, f"route.py exited 1 on attempt {i}", pcb=str(pcb))
@@ -1567,3 +1570,93 @@ def test_no_stitching_via_lands_in_a_keepout_a_footprint_carries(tmp_path):
     inside = [v for v in after.GetTracks() if v.Type() == pcbnew.PCB_VIA_T
               and v.GetNetname() == "GND" and area.Contains(v.GetPosition())]
     assert not inside
+
+
+def _with_parts(board, *refs):
+    """The board with a footprint for each reference designator."""
+    parts = " ".join(f'(footprint "X" (property "Reference" "{r}"))' for r in refs)
+    board.write_text(board.read_text().rstrip(")") + f" {parts})")
+    return board
+
+
+def test_a_fanout_comes_first_at_the_default_class_and_off_the_planes(layered):
+    board = _with_parts(layered, "U1", "U2")
+    pro = board.with_suffix(".kicad_pro")
+    steps = krt_route.plan(board, pro, {"GND": ["In1.Cu"]},
+                           fanout=[{"ref": "U1"}, {"ref": "U2", "escape": "channel"}])
+    assert [s["script"] for s in steps[:3]] == ["bga_fanout.py", "bga_fanout.py", "route_planes.py"]
+    u1, u2 = steps[0]["args"], steps[1]["args"]
+    arg = lambda a, flag: a[a.index(flag) + 1]
+    assert arg(u1, "--component") == "U1" and arg(u2, "--component") == "U2"
+    # Between the pads unless the project says otherwise: a via in a pad is
+    # a fab process (filled and capped), not a default.
+    assert arg(u1, "--escape-method") == "dogbone" and arg(u2, "--escape-method") == "channel"
+    # Default's sizes, not GND's Power_Bulk: a 0.75 mm track does not fit
+    # between the pads it is escaping from.
+    assert (arg(u1, "--track-width"), arg(u1, "--clearance"),
+            arg(u1, "--via-size"), arg(u1, "--via-drill")) == ("0.2", "0.15", "0.6", "0.3")
+    layers = u1[u1.index("--layers") + 1:u1.index("--escalation")]
+    assert layers == ["F.Cu", "In2.Cu", "B.Cu"]
+    assert arg(u1, "--escalation") == "off" and "--no-fix-drc-settings" in u1
+
+
+def test_a_fanout_for_a_part_not_on_the_board_is_refused_and_the_rest_routes(layered):
+    board = _with_parts(layered, "U1")
+    refused = []
+    steps = krt_route.plan(board, board.with_suffix(".kicad_pro"), {}, refused=refused,
+                           fanout=[{"ref": "U9"}, {"ref": "U1"}])
+    assert [s["args"][1] for s in steps if s["script"] == "bga_fanout.py"] == ["U1"]
+    assert refused == [{"fanout": "U9", "reason": "no footprint with this reference on the board"}]
+    assert krt_route.plan(board, board.with_suffix(".kicad_pro"), {}) == krt_route.plan(
+        board, board.with_suffix(".kicad_pro"), {}, fanout=[])
+
+
+def test_the_fanout_writes_back_to_the_board_it_reads(layered, tmp_path, monkeypatch):
+    board = _with_parts(layered, "U1")
+    monkeypatch.setattr(krt_route, "available", lambda: (True, ""))
+    monkeypatch.setattr(krt_route, "find_home", lambda: tmp_path)
+    monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(autoroute, "plane_layers", lambda pcb: {})
+    cmds = []
+    ok = subprocess.CompletedProcess([], 0, "", "")
+    monkeypatch.setattr(krt_route, "_resave", lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_edge_band", lambda *a, **k: ok)
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: cmds.append(cmd) or ok)
+    for name in ("_snap_terminals", "_fill", "_trim_dangling"):
+        monkeypatch.setattr(krt_route, name, lambda *a: ok)
+    monkeypatch.setattr(krt_route, "_stitch", lambda *a, **k: ok)
+    monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 0, "segments": 1})
+    krt_route.route(board, work_dir=tmp_path / "w", fanout=[{"ref": "U1"}])
+    fan = next(c for c in cmds if Path(c[1]).name == "bga_fanout.py")
+    # bga_fanout.py takes -o/--output; route.py's -O is not one of its flags.
+    assert fan[2:5] == [str(board), "--output", str(board)]
+    assert Path(cmds[0][1]).name == "bga_fanout.py"
+
+
+def test_every_retry_fans_out_again(board, tmp_path, monkeypatch):
+    """Each retry starts from the unrouted board, so it has no escapes on it."""
+    _attempts(monkeypatch, board, [2, 1, 0])
+    fan = [{"ref": "U1"}]
+    krt_route.route(board, work_dir=tmp_path / "w", fanout=fan, retry=[{"ordering": "bus"}, {"ordering": "original"}])
+    assert monkeypatch.fanouts == [fan, fan, fan]
+
+
+def test_the_schema_takes_a_fanout_list_and_nothing_else_in_it():
+    from blpl.core import schema
+
+    base = {"project": {"name": "p", "dimensions": [10, 10]}}
+    schema.validate("project_config", {**base, "routing": {"fanout": [{"ref": "U1"}, {"ref": "U2", "escape": "channel"}]}})
+    for bad in ([{"escape": "dogbone"}], [{"ref": "U1", "escape": "sideways"}], [{"ref": "U1", "width": 0.1}], {"ref": "U1"}):
+        with pytest.raises(jsonschema.ValidationError):
+            schema.validate("project_config", {**base, "routing": {"fanout": bad}})
+
+
+@pytest.mark.parametrize("fanout", [{"ref": "U1"}, [{"escape": "dogbone"}], [{"ref": ""}], ["U1"],
+                                    [{"ref": "U1", "escape": "sideways"}], [{"ref": "U1", "width": 0.1}]])
+def test_a_malformed_fanout_is_refused_before_the_board_is_touched(board, tmp_path, monkeypatch, fanout):
+    """project.yaml reaches Stage 6a unvalidated (Codex, PR #104)."""
+    touched = []
+    monkeypatch.setattr(krt_route, "_route_once", lambda *a, **k: touched.append(1))
+    before = board.read_text()
+    r = krt_route.route(board, work_dir=tmp_path / "w", fanout=fanout)
+    assert not r.ok and "routing.fanout" in r.reason and not touched and board.read_text() == before

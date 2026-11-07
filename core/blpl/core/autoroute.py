@@ -563,6 +563,7 @@ def run_for(
     class_layers: dict[str, list[str]] | None = None,
     search: dict | None = None,
     retry: list[dict] | None = None,
+    fanout: list[dict] | None = None,
 ) -> RouteResult:
     """The pipeline step: snapshot, route, and always leave a report.
 
@@ -627,7 +628,7 @@ def run_for(
             from . import krt_route
 
             result = krt_route.route(pcb, work_dir=work, class_layers=class_layers,
-                                     search=search, retry=retry)
+                                     search=search, retry=retry, fanout=fanout)
         else:
             result = route(pcb, work_dir=work, passes=passes)
         result.snapshot = str(snapshot)
