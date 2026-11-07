@@ -376,6 +376,23 @@
           "enum": ["freerouting", "kicad-routing-tools"],
           "description": "kicad-routing-tools (KiCad Routing Tools, routed class by class at the project's own rules; the default when it is installed) or freerouting (the default otherwise)."
         },
+        "fanout": {
+          "description": "Parts to fan out before anything is routed, with KiCad Routing Tools' bga_fanout.py: every signal pad of each gets a short escape and a via at the Default class's track, clearance and via, so the router starts from outside the part. For a grid of pads too dense for the router to leave from, such as a BGA or an LGA module. KiCad Routing Tools only.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["ref"],
+            "additionalProperties": false,
+            "properties": {
+              "ref": {"type": "string", "minLength": 1, "description": "The part's reference designator, e.g. U1."},
+              "escape": {
+                "enum": ["dogbone", "channel", "underpad", "auto"],
+                "default": "dogbone",
+                "description": "bga_fanout.py --escape-method. dogbone (the default) puts each via between pads; underpad and auto may put vias in pads, which the fab must fill and cap (IPC-4761 Type VII)."
+              }
+            }
+          }
+        },
         "search": {
           "description": "KiCad Routing Tools search settings, on every call that lays track (core/blpl/core/krt_route.py SEARCH_FLAGS). They steer the search only: no size, clearance or layer. Omitted, the router's own defaults.",
           "$ref": "#/$defs/krt_search"

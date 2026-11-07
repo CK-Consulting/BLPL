@@ -546,6 +546,7 @@ boundaries:
 | `routing.router` | `kicad-routing-tools` (default when installed) or `freerouting`. | |
 | `routing.search` | KiCad Routing Tools search settings: `ordering`, `direction`, `mps_reverse_rounds`, `max_ripup`, `ripup_blocker_select`, `max_iterations`, `heuristic_weight`. | Steer the search only, never a size, clearance or layer. Freerouting ignores them and says so. |
 | `routing.retry` | Settings to try in turn when a route leaves connections open, each from the unrouted board. | The first clean route is kept, else the one with fewest open. The report lists every attempt. |
+| `routing.fanout` | Parts to fan out before routing: `{ref, escape}`, escape `dogbone` (default), `channel`, `underpad` or `auto`. | For a BGA or LGA module the router cannot leave on its own. KiCad Routing Tools only. |
 | `review.accept` | Findings that are true and intended, each with a reason. | Moves them to an accepted list; never hides them. |
 
 ### Placement hints
@@ -575,6 +576,21 @@ routing:
 ```
 
 If the first route leaves anything open, the board goes back to how it was before routing and is routed again with each entry in turn. The first route with nothing open is kept, or else the one with the fewest open. Each attempt is a full route, so a long list makes a failing run slower. `autoroute_report.json` records each attempt's settings and result under `attempts`, and which one was kept.
+
+### Fanning out a dense part
+
+The router lays track from pad to pad, and from the middle of a grid of pads, such as a BGA or an LGA module, there is often no way out: every gap is narrower than a track and its clearance, and no via fits. Name such a part under `routing.fanout` and each of its signal pads gets a short escape and a via first, with KiCad Routing Tools' `bga_fanout.py`, so the router starts from outside the grid:
+
+```yaml
+routing:
+  fanout:
+  - {ref: U1}                    # escape: dogbone, the default
+  - {ref: U4, escape: channel}
+```
+
+The escapes use the Default net class's track, clearance and via, and stay off the plane layers. `dogbone` puts each via in the gap between pads. `underpad` and `auto` may put a via in a pad, which the fab then has to fill and cap (IPC-4761 Type VII, stated on the order), or solder wicks into the barrel. A ref that is not on the board is named under `refused` in `autoroute_report.json`, and the rest of the board still routes. Every retry fans out again, since each starts from the unrouted board.
+
+The Default via has to fit between the pads: on a 0.9 mm grid of 0.4 mm pads, a 0.5 mm via clears its four neighbours by 0.19 mm, and a 0.6 mm one by 0.14.
 
 ### Controlled impedance
 

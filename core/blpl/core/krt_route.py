@@ -271,22 +271,70 @@ def search_args(search: dict | None) -> list[str]:
     return out
 
 
+FANOUT = "bga_fanout.py"
+
+_REF = re.compile(r'\(property "Reference" "([^"]+)"')
+
+
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
          copper_layers: list[str] | None = None, refused: list[dict] | None = None,
          band: bool | None = None, class_layers: dict[str, list[str]] | None = None,
-         search: dict | None = None) -> list[dict]:
-    """The calls, in order: planes, each special class, then everything else.
+         search: dict | None = None, fanout: list[dict] | None = None) -> list[dict]:
+    """The calls, in order: fan-outs, planes, each special class, then the rest.
 
     Pure, so the order and the rules each call carries can be tested without a
     router. Each step is {"script", "args"}; paths are filled in by ``route``.
     ``search`` (routing.search) goes on every track-laying call; the plane
-    calls only stitch and pour, and take none of it.
+    calls only stitch and pour, and take none of it. ``fanout``
+    (routing.fanout) comes first: the router reads the escapes as copper
+    already laid and routes on from their vias.
     """
     extra = search_args(search)
-    steps = _plan(pcb, pro, planes, copper_layers, refused, band, class_layers)
+    steps = _fanout_steps(pcb, pro, planes, copper_layers, refused, fanout)
+    steps += _plan(pcb, pro, planes, copper_layers, refused, band, class_layers)
     for step in steps:
         if step["script"] in _SEARCH_SCRIPTS:
             step["args"] = [*step["args"], *extra]
+    return steps
+
+
+def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
+                  copper_layers: list[str] | None, refused: list[dict] | None,
+                  fanout: list[dict] | None) -> list[dict]:
+    """One bga_fanout.py call per routing.fanout entry, at the Default class.
+
+    The router alone could not leave a dense grid of pads. On the BM20BC's
+    0.9 mm LGA (verdacor-ear-tag-bm20) it left 18 of the module's
+    connections open; fanned out first, between the pads, the whole board
+    went to 10. Default's sizes because an escape is a short stub between
+    pads whatever the net: a power class's width is what does not fit there.
+    The escapes stay off the plane layers, as every signal does.
+    """
+    if not fanout:
+        return []
+    classes, _ = _classes(pro)
+    default = classes.get("Default", {})
+    on_board = set(_REF.findall(Path(pcb).read_text(encoding="utf-8")))
+    plane_layers = {l for ls in planes.values() for l in ls}
+    signal_layers = [l for l in (copper_layers or board_copper(pcb)) if l not in plane_layers]
+    steps = []
+    for entry in fanout:
+        ref = entry["ref"]
+        if ref not in on_board:
+            # A misspelt or removed part: said, and the rest still routes.
+            if refused is not None:
+                refused.append({"fanout": ref, "reason": "no footprint with this reference on the board"})
+            continue
+        steps.append({"script": FANOUT, "args": [
+            "--component", ref,
+            "--escape-method", entry.get("escape", "dogbone"),
+            "--track-width", f"{default.get('track_width', 0.2):g}",
+            "--clearance", f"{default.get('clearance', 0.2):g}",
+            "--via-size", f"{default.get('via_diameter', 0.6):g}",
+            "--via-drill", f"{default.get('via_drill', 0.3):g}",
+            "--layers", *signal_layers,
+            # As every other call: the project's rules, never relaxed.
+            "--escalation", "off", "--no-fix-drc-settings"]})
     return steps
 
 
@@ -1115,7 +1163,8 @@ def _fill(python: str, pcb: Path) -> subprocess.CompletedProcess:
 
 def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
           class_layers: dict[str, list[str]] | None = None,
-          search: dict | None = None, retry: list[dict] | None = None):
+          search: dict | None = None, retry: list[dict] | None = None,
+          fanout: list[dict] | None = None):
     """Route ``pcb`` in place with KiCad Routing Tools; the board's own measure.
 
     ``search`` is routing.search, on every attempt. ``retry`` is
@@ -1139,7 +1188,7 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
         return autoroute.RouteResult(False, str(exc), pcb=str(pcb), extra={"router": "kicad-routing-tools"})
     if not retry:
         return _route_once(pcb, work_dir=work_dir, timeout=timeout,
-                           class_layers=class_layers, search=search)
+                           class_layers=class_layers, search=search, fanout=fanout)
     pcb = Path(pcb)
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
@@ -1155,7 +1204,7 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
         if i:
             shutil.copyfile(start, pcb)
         result = _route_once(pcb, work_dir=work, timeout=timeout,
-                             class_layers=class_layers, search=settings)
+                             class_layers=class_layers, search=settings, fanout=fanout)
         if not result.attempted:
             return result  # not installed: no setting changes that
         attempts.append({"search": settings, "ok": result.ok, "unrouted": result.unrouted,
@@ -1179,7 +1228,7 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
 
 def _route_once(pcb: Path, *, work_dir: Path, timeout: int = 3600,
                 class_layers: dict[str, list[str]] | None = None,
-                search: dict | None = None):
+                search: dict | None = None, fanout: list[dict] | None = None):
     from . import autoroute
 
     ok, why = available()
@@ -1227,7 +1276,7 @@ def _route_once(pcb: Path, *, work_dir: Path, timeout: int = 3600,
             return result
     refused: list[dict] = []
     steps = plan(pcb, pro, autoroute.plane_layers(pcb), refused=refused, band=band,
-                 class_layers=class_layers, search=search)
+                 class_layers=class_layers, search=search, fanout=fanout)
     if refused:
         result.extra["refused"] = refused
     result.extra["steps"] = [" ".join([s["script"], *s["args"]]) for s in steps]
@@ -1257,7 +1306,9 @@ def _route_once(pcb: Path, *, work_dir: Path, timeout: int = 3600,
             log.append(f"$ via bands beside {', '.join(step['args'])}: {len(rects)} area(s)")
             continue
         script = str(home / "py_router" / step["script"])
-        target = [str(pcb), str(pcb)] if step["script"] == "route_planes.py" else [str(pcb), "-O"]
+        target = ([str(pcb), str(pcb)] if step["script"] == "route_planes.py"
+                  else [str(pcb), "--output", str(pcb)] if step["script"] == FANOUT
+                  else [str(pcb), "-O"])
         proc = _run([sys.executable, script, *target, *step["args"]], timeout)
         restore_pro()
         log.append(f"$ {step['script']} {' '.join(step['args'])}\n{(proc.stdout or '')[-4000:]}{(proc.stderr or '')[-2000:]}")
