@@ -303,16 +303,15 @@ def check_fanout(fanout) -> list[dict] | None:
 _REF = re.compile(r'\(property "Reference" "([^"]+)"')
 
 
-def footprint_pads(pcb_text: str) -> dict[str, list[tuple[float, float, str]]]:
-    """Each footprint's pads as (x, y, net), in the footprint's own frame.
-
-    The frame is the footprint's, not the board's, so a part's grid reads the
-    same at any rotation."""
+def footprint_pads(pcb_text: str) -> dict[str, list[tuple[float, float, str, float, float, bool]]]:
+    """Each footprint's pads as (x, y, net, width, height, smd), in the
+    footprint's own frame, so a part's grid reads the same at any rotation.
+    ``smd`` is a surface pad with copper; a paste-only aperture is left out."""
     from ..emitter import sexpr
 
     tree = sexpr.parse(pcb_text)
     top = tree if sexpr.head(tree) == "kicad_pcb" else tree[0]
-    out: dict[str, list[tuple[float, float, str]]] = {}
+    out: dict[str, list[tuple[float, float, str, float, float, bool]]] = {}
     for fp in sexpr.find_all(top, "footprint"):
         ref = next((sexpr.unquote(c[2]) for c in fp if isinstance(c, list) and sexpr.head(c) == "property"
                     and len(c) > 2 and sexpr.unquote(c[1]) == "Reference"), None)
@@ -321,32 +320,73 @@ def footprint_pads(pcb_text: str) -> dict[str, list[tuple[float, float, str]]]:
         pads = []
         for pad in sexpr.find_all(fp, "pad"):
             at = sexpr.find(pad, "at")
-            net = sexpr.find(pad, "net")
             if at is None or len(at) < 3:
                 continue
+            layers = sexpr.find(pad, "layers")
+            names = [sexpr.unquote(x) for x in (layers[1:] if layers is not None else [])]
+            if names and not any(n.endswith(".Cu") for n in names):
+                continue  # a paste or mask aperture, not a pad
+            size = sexpr.find(pad, "size")
+            w, h = (float(size[1]), float(size[2])) if size is not None and len(size) > 2 else (0.0, 0.0)
+            net = sexpr.find(pad, "net")
             name = sexpr.unquote(net[-1]) if net is not None and len(net) > 1 else ""
-            pads.append((float(at[1]), float(at[2]), name))
+            smd = len(pad) > 2 and pad[2] == "smd"
+            pads.append((float(at[1]), float(at[2]), name, w, h, smd))
         out[ref] = pads
     return out
 
 
-def is_grid(pads: list[tuple[float, float, str]]) -> bool:
-    """Whether a part's pads fill a grid: some pad lies inside the others.
+def is_grid(pads: list[tuple[float, float, str, float, float, bool]]) -> bool:
+    """Whether a part's pads fill a grid: some pad is surrounded by others.
 
     A BGA or an LGA module has pads with neighbours on every side, which is
     what the router cannot leave. A part whose pads all sit on its outline (a
-    SOIC, a QFN's ring, a module's castellations, a 2 x 3 WCSP) is reached
-    from outside already, and fanning it out only spends a via on every pin:
-    on verdacor-ear-tag-bm20, fanning out every U part took the board from 6
+    SOIC, a module's castellations, a 2 x 3 WCSP) is reached from outside
+    already, and fanning it out only spends a via on every pin: on
+    verdacor-ear-tag-bm20, fanning out every U part took the board from 6
     open connections to 15, with a short.
+
+    So a pad counts as inside only with a pad on each of its four sides at
+    about the part's own pitch, the way a ball in a BGA has. A QFN's exposed
+    pad, its thermal vias and any paste split of it lie inside the ring too,
+    but the ring is far from them, not a pitch away (Codex, PR #106; checked
+    against KiCad's Package_DFN_QFN and Package_BGA libraries).
     """
-    if len(pads) < 9:
+    smd = [p for p in pads if p[5]]
+    if len(smd) < 9:
         return False
-    xs = [x for x, _, _ in pads]
-    ys = [y for _, y, _ in pads]
-    tol = 0.01
-    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-    return any(x0 + tol < x < x1 - tol and y0 + tol < y < y1 - tol for x, y, _ in pads)
+    import math
+
+    def dist(a, b) -> float:
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    nearest = sorted(min(dist(p, q) for q in smd if q is not p) for p in smd)
+    pitch = nearest[len(nearest) // 2]
+    if pitch <= 0:
+        return False
+    reach = 1.5 * pitch
+    sizes = sorted(max(p[3], p[4]) for p in smd)
+    typical = sizes[len(sizes) // 2]
+
+    def under_bigger(p) -> bool:
+        return any(q is not p and max(q[3], q[4]) > max(p[3], p[4])
+                   and abs(q[0] - p[0]) < q[3] / 2 and abs(q[1] - p[1]) < q[4] / 2 for q in pads)
+
+    def surrounded(p) -> bool:
+        if max(p[3], p[4]) > 1.5 * typical or under_bigger(p):
+            return False  # an exposed pad, or a piece of one, not a ball
+        sides = set()
+        for q in smd:
+            if q is p:
+                continue
+            dx, dy = q[0] - p[0], q[1] - p[1]
+            if abs(dx) <= reach and abs(dy) <= 0.5 * pitch and abs(dx) > 0.5 * pitch:
+                sides.add("+x" if dx > 0 else "-x")
+            if abs(dy) <= reach and abs(dx) <= 0.5 * pitch and abs(dy) > 0.5 * pitch:
+                sides.add("+y" if dy > 0 else "-y")
+        return len(sides) == 4
+
+    return any(surrounded(p) for p in smd)
 
 
 def plan(pcb: Path, pro: Path, planes: dict[str, list[str]],
@@ -414,7 +454,7 @@ def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
             if refused is not None:
                 refused.append({"fanout": ref, "reason": "no footprint with this reference on the board"})
             continue
-        nets = sorted({n for _, _, n in pads.get(ref, []) if n})
+        nets = sorted({p[2] for p in pads.get(ref, []) if p[2]})
         only: list[str] = []
         if controlled & set(nets):
             keep = [n for n in nets if n not in controlled]

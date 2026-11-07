@@ -1850,3 +1850,29 @@ def test_a_defaulted_fanout_that_fails_leaves_the_board_as_it_was_and_the_route_
     # U1's half-done work is gone; U2 still fanned out, and the routing ran.
     assert ran.count("bga_fanout.py") == 2 and "route.py" in ran
     assert "half-written" not in board.read_text() and board.read_text() == before
+
+
+def test_a_qfns_exposed_pad_and_its_thermal_vias_do_not_make_it_a_grid():
+    """Eight pins round a big centre pad is a QFN, not a grid (Codex, PR #106)."""
+    ring = [(x, y, "SIG", 0.3, 0.8, True) for x, y in
+            ((-1, -2), (0, -2), (1, -2), (-1, 2), (0, 2), (1, 2), (-2, 0), (2, 0))]
+    ep = [(0, 0, "GND", 2.0, 2.0, True)]
+    assert not krt_route.is_grid(ring + ep)
+    # Thermal vias in the exposed pad: small, inside it, and through-hole.
+    vias = [(x, y, "GND", 0.4, 0.4, False) for x in (-0.5, 0.5) for y in (-0.5, 0.5)]
+    assert not krt_route.is_grid(ring + ep + vias)
+    # Even small surface pads, if they sit inside the exposed pad.
+    paste_split = [(x, y, "GND", 0.4, 0.4, True) for x in (-0.5, 0.5) for y in (-0.5, 0.5)]
+    assert not krt_route.is_grid(ring + ep + paste_split)
+    # A 3 x 3 BGA: its middle ball is a pad like the others, so it is a grid.
+    bga = [(x, y, "SIG", 0.4, 0.4, True) for x in (-1, 0, 1) for y in (-1, 0, 1)]
+    assert krt_route.is_grid(bga)
+
+
+def test_footprint_pads_reads_size_kind_and_skips_paste_apertures():
+    text = ('(kicad_pcb (footprint "X" (at 0 0) (property "Reference" "U1")'
+            ' (pad "1" smd rect (at 1 2) (size 0.3 0.8) (layers "F.Cu" "F.Paste") (net "A"))'
+            ' (pad "" smd rect (at 0 0) (size 1 1) (layers "F.Paste"))'
+            ' (pad "2" thru_hole circle (at 0 0) (size 0.5 0.5) (drill 0.3) (layers "*.Cu") (net "GND"))))')
+    assert krt_route.footprint_pads(text) == {"U1": [(1.0, 2.0, "A", 0.3, 0.8, True),
+                                                     (0.0, 0.0, "GND", 0.5, 0.5, False)]}
