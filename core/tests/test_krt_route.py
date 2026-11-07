@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import jsonschema
 import pytest
 
 from blpl.core import autoroute, krt_route
@@ -1569,5 +1570,16 @@ def test_the_schema_takes_a_fanout_list_and_nothing_else_in_it():
     base = {"project": {"name": "p", "dimensions": [10, 10]}}
     schema.validate("project_config", {**base, "routing": {"fanout": [{"ref": "U1"}, {"ref": "U2", "escape": "channel"}]}})
     for bad in ([{"escape": "dogbone"}], [{"ref": "U1", "escape": "sideways"}], [{"ref": "U1", "width": 0.1}], {"ref": "U1"}):
-        with pytest.raises(Exception):
+        with pytest.raises(jsonschema.ValidationError):
             schema.validate("project_config", {**base, "routing": {"fanout": bad}})
+
+
+@pytest.mark.parametrize("fanout", [{"ref": "U1"}, [{"escape": "dogbone"}], [{"ref": ""}], ["U1"],
+                                    [{"ref": "U1", "escape": "sideways"}], [{"ref": "U1", "width": 0.1}]])
+def test_a_malformed_fanout_is_refused_before_the_board_is_touched(board, tmp_path, monkeypatch, fanout):
+    """project.yaml reaches Stage 6a unvalidated (Codex, PR #104)."""
+    touched = []
+    monkeypatch.setattr(krt_route, "_route_once", lambda *a, **k: touched.append(1))
+    before = board.read_text()
+    r = krt_route.route(board, work_dir=tmp_path / "w", fanout=fanout)
+    assert not r.ok and "routing.fanout" in r.reason and not touched and board.read_text() == before

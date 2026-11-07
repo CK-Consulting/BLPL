@@ -272,6 +272,32 @@ def search_args(search: dict | None) -> list[str]:
 
 
 FANOUT = "bga_fanout.py"
+FANOUT_ESCAPES = ("dogbone", "channel", "underpad", "auto")
+
+
+def check_fanout(fanout) -> list[dict]:
+    """routing.fanout, checked: a list of {ref, escape?} mappings.
+
+    Stage 6a reads project.yaml without the schema, so a malformed entry
+    reaches here as it was written. Refused before the board is touched, it
+    is a reason in the report; found mid-route, it was a KeyError with the
+    edge band still on the board and no report at all (Codex, PR #104).
+    """
+    if fanout is None:
+        return []
+    if not isinstance(fanout, list):
+        # ValueError, as every settings refusal here: route() turns those
+        # into a failed result rather than a crash.
+        raise ValueError("routing.fanout: a list of {ref, escape} entries")  # noqa: TRY004
+    for i, entry in enumerate(fanout):
+        if not isinstance(entry, dict) or not isinstance(entry.get("ref"), str) or not entry["ref"]:
+            raise ValueError(f"routing.fanout[{i}]: each entry needs a ref, e.g. {{ref: U1}}")
+        unknown = sorted(set(entry) - {"ref", "escape"})
+        if unknown:
+            raise ValueError(f"routing.fanout[{i}]: unknown setting(s) {', '.join(unknown)}; known: ref, escape")
+        if entry.get("escape", "dogbone") not in FANOUT_ESCAPES:
+            raise ValueError(f"routing.fanout[{i}]: escape {entry['escape']!r}; one of {', '.join(FANOUT_ESCAPES)}")
+    return fanout
 
 _REF = re.compile(r'\(property "Reference" "([^"]+)"')
 
@@ -310,6 +336,7 @@ def _fanout_steps(pcb: Path, pro: Path, planes: dict[str, list[str]],
     pads whatever the net: a power class's width is what does not fit there.
     The escapes stay off the plane layers, as every signal does.
     """
+    fanout = check_fanout(fanout)
     if not fanout:
         return []
     classes, _ = _classes(pro)
@@ -1184,6 +1211,7 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     try:
         for extra in [{}, *(retry or [])]:
             search_args({**(search or {}), **extra})
+        check_fanout(fanout)
     except ValueError as exc:
         return autoroute.RouteResult(False, str(exc), pcb=str(pcb), extra={"router": "kicad-routing-tools"})
     if not retry:
