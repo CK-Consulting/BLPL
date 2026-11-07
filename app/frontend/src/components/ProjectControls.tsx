@@ -658,9 +658,14 @@ export function NewProject({
             )}
             {mode === "clone" && (
               <>
+                {/* The example is an HTTPS URL because that is the one that works
+                    with nothing set up: a public repository needs no credential.
+                    The git@host: example it replaced fails until an SSH key is
+                    saved for the host, which is not where anyone starts. */}
                 <input
-                  placeholder="git@github.com:you/board.git"
+                  placeholder="https://github.com/owner/repo"
                   aria-label="Clone URL"
+                  title="The repository's URL, as in its browser address bar, e.g. https://github.com/owner/repo. An SSH address (git@host:owner/repo.git) works only with an SSH key saved for that host under Settings → Git endpoints/accounts."
                   value={remote}
                   onChange={(e) => setRemote(e.target.value)}
                 />
