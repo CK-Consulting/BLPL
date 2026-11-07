@@ -66,20 +66,18 @@ def _cell(row: dict[str, str], *names: str) -> str:
 
 
 def _heading_for(text: str, line_start: int) -> str:
-    lines = text.splitlines()
-    for i in range(min(line_start, len(lines)) - 1, -1, -1):
-        if lines[i].lstrip().startswith("#"):
-            return lines[i].lstrip("# ").strip().lower()
-    return ""
+    heading, _ = _md.heading_above(text, line_start)
+    return (heading or "").lstrip().lstrip("# ").strip().lower()
 
 
 def _section_text(text: str, heading_contains: str) -> str:
     """Return the prose under the first heading matching a keyword."""
     lines = text.splitlines()
+    fenced = _md.fenced_lines(lines)
     out: list[str] = []
     capturing = False
-    for line in lines:
-        if line.lstrip().startswith("#"):
+    for line, in_fence in zip(lines, fenced, strict=True):
+        if not in_fence and line.lstrip().startswith("#"):
             if capturing:
                 break
             capturing = heading_contains in line.lower()
