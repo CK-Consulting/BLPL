@@ -1274,6 +1274,11 @@ def _cmd_autoroute(args: argparse.Namespace) -> int:
         tried = ", ".join("failed" if not a["ok"] else str(a["unrouted"]) for a in attempts)
         print(f"           kept attempt {kept + 1} of {len(attempts)} ({attempts[kept]['search'] or 'defaults'}); "
               f"open per attempt: {tried}")
+    # Said on the summary line's own terms, not left in the JSON: a board whose
+    # open count improved can still be the one with an RF net on the wrong layer.
+    warning = (result.extra or {}).get("layer_warning")
+    if warning:
+        print(f"autoroute: {warning}", file=sys.stderr)
     print(f"           snapshot {result.snapshot}")
     print(f"           wrote {report_path}")
     # The route changed the board in place; the tracked copy follows it.

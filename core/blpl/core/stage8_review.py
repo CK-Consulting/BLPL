@@ -833,6 +833,10 @@ def _render_markdown(report: dict) -> str:
             ran = ("KiCad Routing Tools ran" if routing.get("router") == "kicad-routing-tools"
                    else f"Freerouting ran ({routing.get('passes', '?')} passes)")
             lines.append(ran + (f"; {left} net(s) left unrouted." if left is not None else "."))
+            # The open count above includes nets stripped for leaving their
+            # class's layers; without this line they read as ordinary opens.
+            if routing.get("layer_warning"):
+                lines += ["", f"**{routing['layer_warning']}.**"]
         else:
             lines.append(f"Not routed: {routing.get('reason', 'autorouting was not attempted')}.")
         lines.append("")
