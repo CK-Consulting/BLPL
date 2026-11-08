@@ -220,6 +220,120 @@ def _run_erc(sch_path: Path, output_json: Path) -> dict:
     return result
 
 
+# --- project.yaml review.accept ---------------------------------------------
+#
+# ERC and DRC run with --severity-all and fail on anything, warnings included,
+# so a finding that is true *and intended* failed the stage on every run. The
+# case that forced this: a PWR_FLAG the schematic emitter adds to an undriven
+# rail (emitter/sch.py, _undriven_power_nets) meeting a bidirectional pin that
+# is tied to that rail on purpose, such as an IMU's SDO strapped to GND to pick
+# its address. ERC calls that pin_to_pin, correctly, and nothing in the design
+# is wrong. accept.py is the record of such waivers; Stage 7 now reads it too.
+
+#: Entries whose rule starts with one of these apply here, and only those, so
+#: a glob written for Stage 8 or the placement audit (``*``, ``*off_board``)
+#: cannot waive an ERC or DRC violation by accident.
+_RULE_PREFIXES = ("erc:", "drc:")
+
+# "Symbol U6 Pin 1 [SDO, Bidirectional, Line]": ERC names a symbol per item.
+_ERC_REF = re.compile(r"\bSymbol\s+(\S+)")
+# "Pad A2 [VDD_3V3] of U5 on F.Cu", "Footprint U5": DRC names a footprint.
+_DRC_REF = re.compile(r"\bof\s+(\S+)\s+on\b|^Footprint\s+(\S+)")
+# "Track [VDD_3V3] on B.Cu": the net, on copper items. ERC's brackets hold a
+# pin's name and type, not a net, so nets are read from DRC items only.
+_DRC_NET = re.compile(r"^(?:Pad\s+\S+|Track|Via|Arc|Zone)\b[^\[]*\[([^\]]+)\]")
+
+
+def _refs(descriptions: list[str], kind: str) -> list[str]:
+    """The real parts a violation's items name, emitter-generated ones left out.
+
+    ``#FLGnn`` and ``#PWRnn`` are symbols the schematic emitter adds and numbers
+    itself, in whatever order it meets the rails, so the same flag is #FLG01 on
+    one run and #FLG02 on the next. An entry that had to list them would stop
+    matching as soon as an unrelated rail was added. Dropping them leaves the
+    part the designer chose to wire that way, which is what the waiver is
+    about. A violation that names *only* generated symbols has no parts, so
+    only an entry without ``parts`` covers it.
+    """
+    out: list[str] = []
+    for d in descriptions:
+        if kind == "erc":
+            m = _ERC_REF.search(d)
+            ref = m.group(1) if m else None
+        else:
+            m = _DRC_REF.search(d)
+            ref = (m.group(1) or m.group(2)) if m else None
+        if ref and not ref.startswith("#") and ref not in out:
+            out.append(ref)
+    return out
+
+
+def _nets(descriptions: list[str]) -> list[str]:
+    out: list[str] = []
+    for d in descriptions:
+        m = _DRC_NET.search(d)
+        # "<no net>" is KiCad saying there is none, not a net called that.
+        if m and not m.group(1).startswith("<") and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def _findings(violations: list[dict], kind: str) -> list[dict]:
+    """kicad-cli violations as accept.py findings, each violation kept whole."""
+    out = []
+    for v in violations:
+        descs = [str(i.get("description") or "") for i in v.get("items") or []]
+        out.append({
+            **v,
+            "rule_id": f"{kind}:{v.get('type') or ''}",
+            "components": _refs(descs, kind),
+            "nets": _nets(descs) if kind == "drc" else [],
+        })
+    return out
+
+
+def _apply_accept(result: dict, report_path: Path, kind: str, entries: list[dict]) -> None:
+    """Move the violations ``entries`` accept into ``result["accepted"]``.
+
+    ``violation_count`` stays what kicad-cli found and ``accepted_count`` says
+    how many of those are waived, so the record still shows every finding.
+    Only the verdict moves: when every violation is accepted, the check passes.
+
+    DRC's ``unconnected_items`` and ``schematic_parity`` are never waived. An
+    open connection is a board that does not work, and a parity finding is a
+    board that does not match its schematic; neither is a design choice, and a
+    waiver that hid one would ship it. They keep failing the check.
+    """
+    entries = [e for e in entries if e["rule"].startswith(_RULE_PREFIXES)]
+    if not entries or result.get("skipped") or not report_path.exists():
+        return
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    violations = list(data.get("violations") or [])
+    if kind == "erc":
+        # Per sheet in KiCad 10, top level before it (erc_violation_count).
+        for sheet in data.get("sheets") or []:
+            violations += sheet.get("violations") or []
+        unwaivable = 0
+    else:
+        unwaivable = len(data.get("unconnected_items") or []) + len(data.get("schematic_parity") or [])
+
+    from . import accept
+
+    open_, waived = accept.split(_findings(violations, kind), entries)
+    if not waived:
+        return
+    result["accepted"] = waived
+    result["accepted_count"] = len(waived)
+    # Exit 5 is kicad-cli's "violations found" (--exit-code-violations). Any
+    # other non-zero code means the run itself went wrong, and a report that
+    # happens to be on disk does not turn that into a pass.
+    if not open_ and not unwaivable and result.get("exit_code") in (0, 5):
+        result["ok"] = True
+
+
 def _coverage_summary(coverage_path: Path) -> dict:
     if not coverage_path.exists():
         return {"ok": True, "skipped": True, "reason": "no coverage_report.json"}
@@ -243,8 +357,13 @@ def run(
     generated_symbols_dir: Path | None = None,
     coverage_path: Path | None = None,
     board: str | None = None,
+    project_config: dict | None = None,
 ) -> dict:
     """Run all Stage 7 checks and write validation_report.json into .pipeline/.
+
+    ``project_config`` is the board's project.yaml. Its ``review.accept``
+    entries with an ``erc:<type>`` or ``drc:<type>`` rule waive the ERC and
+    DRC violations they cover (_apply_accept); without it nothing is waived.
 
     ``board`` qualifies every file this stage reads or writes, the way the
     rest of the pipeline does (``validation_report.sensor.json``). Without it
@@ -277,6 +396,12 @@ def run(
         drc_result = _run_drc(pcb_path, _p("drc_report"))
     else:
         drc_result = {"ok": True, "skipped": True, "reason": "no .kicad_pcb supplied"}
+
+    from . import accept
+
+    entries = accept.entries(project_config)
+    _apply_accept(erc_result, _p("erc_report"), "erc", entries)
+    _apply_accept(drc_result, _p("drc_report"), "drc", entries)
 
     cov_result = _coverage_summary(cov)
 

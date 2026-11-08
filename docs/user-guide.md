@@ -547,7 +547,7 @@ boundaries:
 | `routing.search` | KiCad Routing Tools search settings: `ordering`, `direction`, `mps_reverse_rounds`, `max_ripup`, `ripup_blocker_select`, `max_iterations`, `heuristic_weight`. | Steer the search only, never a size, clearance or layer. Freerouting ignores them and says so. |
 | `routing.retry` | Settings to try in turn when a route leaves connections open, each from the unrouted board. | The first clean route is kept, else the one with fewest open. The report lists every attempt. |
 | `routing.fanout` | Parts to fan out before routing: `{ref, escape}`, escape `dogbone` (default), `channel`, `underpad` or `auto`. | Not set: every `U` part whose pads fill a grid. `[]`: none. KiCad Routing Tools only. |
-| `review.accept` | Findings that are true and intended, each with a reason. | Moves them to an accepted list; never hides them. |
+| `review.accept` | Findings that are true and intended, each with a reason. | Moves them to an accepted list; never hides them. Stage 7 ERC/DRC violations are named `erc:<type>` / `drc:<type>` (`erc:pin_to_pin`); DRC unconnected items cannot be accepted. |
 
 ### Placement hints
 

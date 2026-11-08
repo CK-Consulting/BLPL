@@ -411,14 +411,14 @@
       "properties": {
         "accept": {
           "type": "array",
-          "description": "Findings that are true and intended. Each moves to an accepted list with its reason, in the Stage 5 placement audit and in Stage 8; none is hidden.",
+          "description": "Findings that are true and intended. Each moves to an accepted list with its reason, in the Stage 5 placement audit, Stage 7 (ERC/DRC) and Stage 8; none is hidden. Stage 7 applies only entries whose rule starts with erc: or drc:, and never waives DRC unconnected items or schematic parity.",
           "items": {
             "type": "object",
             "required": ["rule", "reason"],
             "additionalProperties": false,
             "properties": {
-              "rule": { "type": "string", "minLength": 1, "description": "A placement-audit finding (off_board, in_edge_margin, in_keepout, in_cutout, overlap) or a Stage 8 rule id; a glob." },
-              "parts": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Covers a finding only when every part it names is listed." },
+              "rule": { "type": "string", "minLength": 1, "description": "A placement-audit finding (off_board, in_edge_margin, in_keepout, in_cutout, overlap), a Stage 8 rule id, or erc:<type> / drc:<type> for a kicad-cli ERC or DRC violation type (erc:pin_to_pin, drc:clearance); a glob." },
+              "parts": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Covers a finding only when every part it names is listed. For ERC, the emitter's #FLG/#PWR symbols are not counted and need not be listed." },
               "nets": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Covers a finding only when every net it names is listed." },
               "reason": { "type": "string", "minLength": 8, "description": "Why it is intended. Shown beside the finding in every report." }
             }

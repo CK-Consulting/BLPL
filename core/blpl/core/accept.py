@@ -20,6 +20,25 @@ reason, in the placement audit and in Stage 8, so the record says what was
 waived, by which entry, and why. ``rule`` is a glob (``PM-*``). With ``parts``
 the entry covers a finding only when every part the finding names is listed;
 with ``nets`` likewise for nets; with neither it covers the rule outright.
+
+Stage 7 applies the same entries to kicad-cli's ERC and DRC violations, named
+``erc:<type>`` and ``drc:<type>`` after the violation's ``type``
+(``erc:pin_to_pin``, ``drc:clearance``; ``erc:*`` is a glob like any other).
+The prefix keeps them apart from Stage 8 ids and placement findings, and
+Stage 7 considers *only* entries whose rule starts with it, so a broad glob
+meant for another stage cannot waive an ERC or DRC finding::
+
+    review:
+      accept:
+        - rule: erc:pin_to_pin
+          parts: [U6]
+          reason: BMI323 SDO is strapped to GND on purpose to set its I2C address.
+
+An ERC finding's parts are the symbols its items name, less the ``#FLG`` and
+``#PWR`` symbols the emitter generates (their numbering moves between runs,
+so ``parts`` never needs them). It has no nets. A DRC finding's parts are the
+footprints its items name and its nets the nets on its copper items. DRC
+unconnected items and schematic-parity findings are never waivable.
 """
 
 from __future__ import annotations
