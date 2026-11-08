@@ -1497,6 +1497,14 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     below every attempt that does not, and when every attempt did, the kept
     board has that copper stripped and the report says so loudly
     (``_enforce_layers``).
+
+    When the board has restricted nets, each setting is routed twice: with
+    them on KRT's protection list, then without. Protection stops the plane
+    finalize carrying RF onto B.Cu, but it also stops every rip-up that would
+    have moved RF to make room, and on ear-tag-bm20 that cost two nets: 3
+    open protected against 1 unprotected, whose kept route had RF on F.Cu
+    anyway. Neither wins everywhere, so both are tried and the guard above
+    ranks them; a clean protected route skips its unprotected twin.
     """
     from . import autoroute
 
@@ -1512,7 +1520,9 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
         return autoroute.RouteResult(False, str(exc), pcb=str(pcb), extra={"router": "kicad-routing-tools"})
     pcb = Path(pcb)
     work = Path(work_dir)
-    if not retry:
+    protects = (True, False) if _restricted_nets(pcb, class_layers) else (True,)
+    runs = [(extra, protect) for extra in [{}, *(retry or [])] for protect in protects]
+    if len(runs) == 1:
         result = _route_once(pcb, work_dir=work, timeout=timeout,
                              class_layers=class_layers, search=search, fanout=fanout)
         return _enforce_layers(pcb, result, class_layers, work)
@@ -1524,12 +1534,12 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     attempts: list[dict] = []
     best = None
     result = None
-    for i, extra in enumerate([{}, *retry]):
+    for i, (extra, protect) in enumerate(runs):
         settings = {**(search or {}), **extra}
         if i:
             shutil.copyfile(start, pcb)
-        result = _route_once(pcb, work_dir=work, timeout=timeout,
-                             class_layers=class_layers, search=settings, fanout=fanout)
+        result = _route_once(pcb, work_dir=work, timeout=timeout, class_layers=class_layers,
+                             search=settings, fanout=fanout, protect=protect)
         if not result.attempted:
             return result  # not installed: no setting changes that
         # Measured on the board this attempt left, before anything ranks it:
@@ -1539,6 +1549,7 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
         # left 10, and the 9 was the one with RF_LRHF on B.Cu.
         strays = layer_violations(pcb, class_layers) if result.ok else []
         attempts.append({"search": settings, "ok": result.ok, "unrouted": result.unrouted,
+                         **({"protected": protect} if len(protects) > 1 else {}),
                          **({"layer_violations": [e["net"] for e in strays]} if strays else {}),
                          **({} if result.ok else {"reason": result.reason})})
         rank = (bool(strays), result.unrouted or 0)
@@ -1607,11 +1618,13 @@ def _protect_restricted(pcb: Path, class_layers: dict[str, list[str]] | None) ->
 
 def _route_once(pcb: Path, *, work_dir: Path, timeout: int = 3600,
                 class_layers: dict[str, list[str]] | None = None,
-                search: dict | None = None, fanout: list[dict] | None = None):
+                search: dict | None = None, fanout: list[dict] | None = None,
+                protect: bool = True):
     """One route of the board, with its layer-restricted nets protected from
-    KRT's rip-up while it runs and the project file put back after."""
+    KRT's rip-up while it runs (unless ``protect`` is False) and the project
+    file put back after."""
     pcb = Path(pcb)
-    original = _protect_restricted(pcb, class_layers)
+    original = _protect_restricted(pcb, class_layers) if protect else None
     try:
         return _route_steps(pcb, work_dir=work_dir, timeout=timeout,
                             class_layers=class_layers, search=search, fanout=fanout)

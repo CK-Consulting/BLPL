@@ -1205,9 +1205,13 @@ def test_a_failed_route_still_takes_its_via_bands_off(layered, tmp_path, monkeyp
     monkeypatch.setattr(krt_route, "via_bands", lambda text, nets, **k: [[(0, 0), (1, 0), (1, 1)]])
     monkeypatch.setattr(krt_route, "_via_band_areas",
                         lambda py, pcb, rects: calls.append(("bands", rects is not None)) or ok)
-    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: next(runs, ok))
+    monkeypatch.setattr(krt_route, "_run", lambda cmd, t: next(runs, runs_fail))
+    runs_fail = subprocess.CompletedProcess([], 1, "", "boom")
     result = krt_route.route(board, work_dir=tmp_path / "w", class_layers={"RF_50R": ["F.Cu"]})
+    # Routed protected and then not (the board has an RF net): both fail, and
+    # the bands the first put on come off; the second fails before any go on.
     assert not result.ok and calls == [("bands", True), ("bands", False)]
+    assert [a["protected"] for a in result.extra["attempts"]] == [True, False]
 
 
 def test_the_via_band_geometry_goes_in_a_file_not_the_command_line(tmp_path, monkeypatch):
@@ -1408,7 +1412,7 @@ def _attempts(monkeypatch, board, opens):
     calls = []
     fanouts = monkeypatch.fanouts = []
 
-    def once(pcb, *, work_dir, timeout, class_layers, search, fanout=None):
+    def once(pcb, *, work_dir, timeout, class_layers, search, fanout=None, protect=True):
         i = len(calls)
         calls.append((search, pcb.read_text() == original))
         fanouts.append(fanout)
@@ -1920,13 +1924,15 @@ def test_a_via_is_judged_by_both_its_ends(board):
 
 def _layered_attempts(monkeypatch, boards: list[str], opens: list[int]):
     """_route_once stubbed: attempt i writes boards[i] and leaves opens[i] open."""
-    def once(pcb, *, work_dir, timeout, class_layers, search, fanout=None):
+    def once(pcb, *, work_dir, timeout, class_layers, search, fanout=None, protect=True):
         i = once.calls
         once.calls += 1
+        once.protects.append(protect)
         pcb.write_text(boards[i])
         return autoroute.RouteResult(True, "", pcb=str(pcb), unrouted=opens[i], extra={"router": "kicad-routing-tools"})
 
     once.calls = 0
+    once.protects = []
     monkeypatch.setattr(krt_route, "_route_once", once)
     return once
 
@@ -1936,17 +1942,17 @@ def test_an_attempt_with_a_restricted_net_off_its_layer_loses_to_a_clean_one_wit
     had its 2.4 GHz feed on B.Cu. Opens are compared only among the clean."""
     clean = _routed(_seg("RF_ANT", "F.Cu"))
     stray = _routed(_seg("RF_ANT", "F.Cu"), _seg("RF_ANT", "B.Cu"), _via("RF_ANT"))
-    once = _layered_attempts(monkeypatch, [clean, stray, stray], [3, 1, 0])
+    once = _layered_attempts(monkeypatch, [clean, stray, stray, stray], [3, 1, 0, 0])
     r = krt_route.route(board, work_dir=tmp_path / "w", class_layers=RF_ONLY_F,
-                        retry=[{"direction": "backward"}, {"ordering": "inside_out"}])
+                        retry=[{"direction": "backward"}])
     # A violating route with nothing open does not end the retries early...
-    assert once.calls == 3
+    assert once.calls == 4
     # ...and does not win: the clean attempt is kept, as routed.
     assert r.ok and r.extra["kept_attempt"] == 0 and r.unrouted == 3
     assert board.read_text() == clean
     assert r.extra["layer_violations"] == [] and r.extra["layer_checked_nets"] == 1
     assert "layer_warning" not in r.extra
-    assert [a.get("layer_violations") for a in r.extra["attempts"]] == [None, ["RF_ANT"], ["RF_ANT"]]
+    assert [a.get("layer_violations") for a in r.extra["attempts"]] == [None, ["RF_ANT"], ["RF_ANT"], ["RF_ANT"]]
 
 
 def test_when_every_attempt_strays_the_copper_is_stripped_and_the_report_says_so(board, tmp_path, monkeypatch):
@@ -1955,7 +1961,7 @@ def test_when_every_attempt_strays_the_copper_is_stripped_and_the_report_says_so
                        _seg("SPI_SCK", "B.Cu"), extra)
 
     worse, better = stray(_seg("GND", "F.Cu")), stray(_seg("VBAT", "F.Cu"))
-    _layered_attempts(monkeypatch, [worse, better], [5, 2])
+    _layered_attempts(monkeypatch, [worse, better, worse, worse], [5, 2, 5, 5])
     monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
     ok = subprocess.CompletedProcess([], 0, "", "")
     filled = []
@@ -1982,7 +1988,7 @@ def test_when_every_attempt_strays_the_copper_is_stripped_and_the_report_says_so
 
 
 def test_a_single_route_is_held_to_its_layers_too(board, tmp_path, monkeypatch):
-    _layered_attempts(monkeypatch, [_routed(_seg("RF_ANT", "B.Cu"))], [0])
+    _layered_attempts(monkeypatch, [_routed(_seg("RF_ANT", "B.Cu"))] * 2, [0, 0])
     monkeypatch.setattr(autoroute, "find_pcbnew_python", lambda: "/usr/bin/python3")
     monkeypatch.setattr(krt_route, "_fill", lambda py, pcb: subprocess.CompletedProcess([], 0, "", ""))
     monkeypatch.setattr(autoroute, "_measure_board", lambda py, pcb: {"unconnected": 1, "segments": 0})
@@ -2030,3 +2036,42 @@ def test_restricted_nets_are_protected_from_krts_rip_up_while_it_routes(board, t
     seen.clear()
     krt_route._route_once(board, work_dir=tmp_path / "w", class_layers=None)
     assert "kicad_routing_tools" not in seen
+
+
+def test_each_setting_is_routed_protected_then_not_and_the_best_clean_one_kept(board, tmp_path, monkeypatch):
+    """Protection keeps KRT's plane finalize off RF, but also every rip-up that
+    would have moved RF for room: ear-tag-bm20 left 3 open protected and 1
+    not, with RF on F.Cu either way. Both are tried; the guard ranks them."""
+    clean = _routed(_seg("RF_ANT", "F.Cu"))
+    stray = _routed(_seg("RF_ANT", "B.Cu"))
+    once = _layered_attempts(monkeypatch, [clean, clean, stray, clean], [3, 1, 0, 2])
+    r = krt_route.route(board, work_dir=tmp_path / "w", class_layers=RF_ONLY_F,
+                        retry=[{"direction": "backward"}])
+    assert once.protects == [True, False, True, False]
+    assert [(a["search"], a["protected"]) for a in r.extra["attempts"]] == [
+        ({}, True), ({}, False), ({"direction": "backward"}, True), ({"direction": "backward"}, False)]
+    # The unprotected default left fewest open and kept RF on its layer.
+    assert r.extra["kept_attempt"] == 1 and r.unrouted == 1 and "layer_warning" not in r.extra
+
+
+def test_a_clean_protected_route_skips_its_unprotected_twin(board, tmp_path, monkeypatch):
+    once = _layered_attempts(monkeypatch, [_routed(_seg("RF_ANT", "F.Cu"))], [0])
+    r = krt_route.route(board, work_dir=tmp_path / "w", class_layers=RF_ONLY_F)
+    assert once.protects == [True] and r.unrouted == 0 and r.extra["kept_attempt"] == 0
+
+
+def test_with_nothing_restricted_each_setting_is_routed_once(board, tmp_path, monkeypatch):
+    once = _layered_attempts(monkeypatch, [_routed(_seg("RF_ANT", "B.Cu"))] * 2, [2, 1])
+    r = krt_route.route(board, work_dir=tmp_path / "w", class_layers=None, retry=[{"direction": "backward"}])
+    assert once.protects == [True, True]
+    assert all("protected" not in a for a in r.extra["attempts"])
+
+
+def test_an_unprotected_route_leaves_the_project_file_alone(board, tmp_path, monkeypatch):
+    pro = board.with_suffix(".kicad_pro")
+    seen = []
+    monkeypatch.setattr(krt_route, "_route_steps",
+                        lambda pcb, **kw: seen.append(json.loads(pro.read_text()))
+                        or autoroute.RouteResult(True, "", pcb=str(pcb), unrouted=0))
+    krt_route._route_once(board, work_dir=tmp_path / "w", class_layers=RF_ONLY_F, protect=False)
+    assert "kicad_routing_tools" not in seen[0]
