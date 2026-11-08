@@ -1323,19 +1323,58 @@ def _off_layer(node, allowed: list[str]) -> list[str]:
     return [] if name in allowed else [name]
 
 
-def _restricted_nets(pcb: Path, class_layers: dict[str, list[str]] | None) -> dict[str, tuple[str, list[str]]]:
-    """Each net whose class ``class_layers`` holds to layers: net -> (class, layers)."""
+#: How far a routed width may sit from its class's before it is another width.
+WIDTH_SLACK_MM = 0.001
+
+
+def _class_widths(cls: dict) -> list[float]:
+    """The widths a class's own pass lays: its track width, and its pair width
+    when it is a pair class -- what route.py and route_diff.py are handed."""
+    return sorted({float(cls[k]) for k in ("track_width", "diff_pair_width") if cls.get(k) is not None}) or [0.2]
+
+
+def _restricted_nets(pcb: Path, class_layers: dict[str, list[str]] | None
+                     ) -> dict[str, tuple[str, list[str], list[float]]]:
+    """Each net whose class ``class_layers`` holds to layers:
+    net -> (class, layers, the widths that class is routed at)."""
     if not class_layers:
         return {}
-    groups, _ = nets_by_class(pcb, pcb.with_suffix(".kicad_pro"))
-    return {net: (name, list(layers)) for name, layers in class_layers.items() if layers
-            for net in groups.get(name, [])}
+    groups, classes = nets_by_class(pcb, pcb.with_suffix(".kicad_pro"))
+    return {net: (name, list(layers), _class_widths(classes.get(name, {})))
+            for name, layers in class_layers.items() if layers for net in groups.get(name, [])}
+
+
+def _off_width(node, widths: list[float]) -> str | None:
+    """``"<layer> at <w> mm"`` for a track laid at none of ``widths``; None
+    for a via, or a track at its class's width.
+
+    Unprotected, KRT's plane finalize repairs a restricted net with the final
+    pass's layers *and* its width: kept on F.Cu, RF_LRHF would still be laid
+    at the Default 0.2 mm, which is not 50 ohm and passes a layer check
+    (Codex, PR #109). Release refuses that copper (impedance.width_violations);
+    the guard has to see it first, or such a route outranks a correct one.
+    """
+    from ..emitter import sexpr
+
+    if sexpr.head(node) == "via":
+        return None
+    w = sexpr.find(node, "width")
+    if w is None or len(w) < 2:
+        return None
+    width = float(w[1])
+    if any(abs(width - want) <= WIDTH_SLACK_MM for want in widths):
+        return None
+    layer = sexpr.find(node, "layer")
+    name = sexpr.unquote(str(layer[1])) if layer is not None and len(layer) > 1 else "?"
+    return f"{name} at {width:g} mm"
 
 
 def _strays(pcb: Path, class_layers: dict[str, list[str]] | None):
     """The parsed board, and each track or via on a layer-restricted net that
-    leaves its class's layers, as (index in the board, net, class, allowed,
-    off-layers). (None, []) when nothing is restricted."""
+    leaves its class's layers or is laid at a width its class is not, as
+    (index in the board, net, class, allowed, off-layers). A wrong width is
+    reported as an off-layer of the form ``"F.Cu at 0.2 mm"``. (None, [])
+    when nothing is restricted."""
     from ..emitter import sexpr
 
     restricted = _restricted_nets(pcb, class_layers)
@@ -1357,8 +1396,11 @@ def _strays(pcb: Path, class_layers: dict[str, list[str]] | None):
         net = sexpr.unquote(value) if value.startswith('"') else numbered.get(value)
         if net not in restricted:
             continue
-        name, allowed = restricted[net]
+        name, allowed, widths = restricted[net]
         off = _off_layer(node, allowed)
+        if not off:
+            narrow = _off_width(node, widths)
+            off = [narrow] if narrow else []
         if off:
             out.append((i, net, name, allowed, off))
     return board, out
@@ -1497,6 +1539,14 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     below every attempt that does not, and when every attempt did, the kept
     board has that copper stripped and the report says so loudly
     (``_enforce_layers``).
+
+    When the board has restricted nets, each setting is routed twice: with
+    them on KRT's protection list, then without. Protection stops the plane
+    finalize carrying RF onto B.Cu, but it also stops every rip-up that would
+    have moved RF to make room, and on ear-tag-bm20 that cost two nets: 3
+    open protected against 1 unprotected, whose kept route had RF on F.Cu
+    anyway. Neither wins everywhere, so both are tried and the guard above
+    ranks them; a clean protected route skips its unprotected twin.
     """
     from . import autoroute
 
@@ -1512,7 +1562,9 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
         return autoroute.RouteResult(False, str(exc), pcb=str(pcb), extra={"router": "kicad-routing-tools"})
     pcb = Path(pcb)
     work = Path(work_dir)
-    if not retry:
+    protects = (True, False) if _restricted_nets(pcb, class_layers) else (True,)
+    runs = [(extra, protect) for extra in [{}, *(retry or [])] for protect in protects]
+    if len(runs) == 1:
         result = _route_once(pcb, work_dir=work, timeout=timeout,
                              class_layers=class_layers, search=search, fanout=fanout)
         return _enforce_layers(pcb, result, class_layers, work)
@@ -1524,12 +1576,12 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     attempts: list[dict] = []
     best = None
     result = None
-    for i, extra in enumerate([{}, *retry]):
+    for i, (extra, protect) in enumerate(runs):
         settings = {**(search or {}), **extra}
         if i:
             shutil.copyfile(start, pcb)
-        result = _route_once(pcb, work_dir=work, timeout=timeout,
-                             class_layers=class_layers, search=settings, fanout=fanout)
+        result = _route_once(pcb, work_dir=work, timeout=timeout, class_layers=class_layers,
+                             search=settings, fanout=fanout, protect=protect)
         if not result.attempted:
             return result  # not installed: no setting changes that
         # Measured on the board this attempt left, before anything ranks it:
@@ -1539,6 +1591,7 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
         # left 10, and the 9 was the one with RF_LRHF on B.Cu.
         strays = layer_violations(pcb, class_layers) if result.ok else []
         attempts.append({"search": settings, "ok": result.ok, "unrouted": result.unrouted,
+                         **({"protected": protect} if len(protects) > 1 else {}),
                          **({"layer_violations": [e["net"] for e in strays]} if strays else {}),
                          **({} if result.ok else {"reason": result.reason})})
         rank = (bool(strays), result.unrouted or 0)
@@ -1607,11 +1660,13 @@ def _protect_restricted(pcb: Path, class_layers: dict[str, list[str]] | None) ->
 
 def _route_once(pcb: Path, *, work_dir: Path, timeout: int = 3600,
                 class_layers: dict[str, list[str]] | None = None,
-                search: dict | None = None, fanout: list[dict] | None = None):
+                search: dict | None = None, fanout: list[dict] | None = None,
+                protect: bool = True):
     """One route of the board, with its layer-restricted nets protected from
-    KRT's rip-up while it runs and the project file put back after."""
+    KRT's rip-up while it runs (unless ``protect`` is False) and the project
+    file put back after."""
     pcb = Path(pcb)
-    original = _protect_restricted(pcb, class_layers)
+    original = _protect_restricted(pcb, class_layers) if protect else None
     try:
         return _route_steps(pcb, work_dir=work_dir, timeout=timeout,
                             class_layers=class_layers, search=search, fanout=fanout)
