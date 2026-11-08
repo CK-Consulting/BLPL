@@ -1005,17 +1005,21 @@ def _cmd_stage7(args: argparse.Namespace) -> int:
         generated_symbols_dir=proj / "generated" / "symbols",
         coverage_path=_artifact(args, proj, "coverage_report"),
         board=board,
+        project_config=_project_yaml(args, proj),
     )
     status = "PASS" if report["ok"] else "FAIL"
 
     def _label(r: dict) -> str:
         if r.get("skipped"):
             return "skipped"
+        accepted = r.get("accepted_count") or 0
         if r["ok"]:
-            return "ok"
+            return f"ok ({accepted} accepted)" if accepted else "ok"
         count = r.get("violation_count")
-        return (f"fail ({count} violations, exit={r.get('exit_code')})" if count is not None
-                else f"fail (exit={r.get('exit_code')})")
+        if count is None:
+            return f"fail (exit={r.get('exit_code')})"
+        waived = f", {accepted} accepted" if accepted else ""
+        return f"fail ({count - accepted} violations{waived}, exit={r.get('exit_code')})"
 
     klc_label = _label(report["klc_symbols"])
     erc_label = _label(report["erc"])
@@ -1023,6 +1027,10 @@ def _cmd_stage7(args: argparse.Namespace) -> int:
     cov = report["coverage"]
     cov_label = "skipped" if cov.get("skipped") else f"{cov.get('hit',0)} hit / {cov.get('miss',0)} miss"
     print(f"stage7: {status}  klc={klc_label}  erc={erc_label}  drc={drc_label}  coverage={cov_label}")
+    for check in ("erc", "drc"):
+        for v in report[check].get("accepted") or []:
+            parts = ", ".join(v.get("components") or []) or "-"
+            print(f"        {v['rule_id']} ({parts}) accepted: {v['accepted_reason']}")
     print(f"        wrote {_artifact(args, proj, 'validation_report')}")
     return 0 if report["ok"] else 1
 
@@ -1200,8 +1208,8 @@ def _router(args: argparse.Namespace, proj: Path) -> str:
     return "kicad-routing-tools" if krt_route.available()[0] else "freerouting"
 
 
-def _routing(args: argparse.Namespace, proj: Path) -> dict:
-    """project.yaml's routing section, {} when it has none or cannot be read."""
+def _project_yaml(args: argparse.Namespace, proj: Path) -> dict:
+    """This board's project.yaml, {} when it has none or it cannot be read."""
     import yaml
 
     path = _project_config(args, proj)
@@ -1209,7 +1217,13 @@ def _routing(args: argparse.Namespace, proj: Path) -> dict:
         cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         cfg = {}
-    routing = cfg.get("routing") if isinstance(cfg, dict) else None
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _routing(args: argparse.Namespace, proj: Path) -> dict:
+    """project.yaml's routing section, {} when it has none or cannot be read."""
+    cfg = _project_yaml(args, proj)
+    routing = cfg.get("routing")
     return routing if isinstance(routing, dict) else {}
 
 
