@@ -1305,6 +1305,179 @@ def _fill(python: str, pcb: Path) -> subprocess.CompletedProcess:
     ))
 
 
+def _off_layer(node, allowed: list[str]) -> list[str]:
+    """The layers a track or via puts copper on that ``allowed`` does not include.
+
+    A via is judged by both its ends, and on a net held to one layer any via
+    at all is off it: a via exists only to leave the layer it starts on.
+    """
+    from ..emitter import sexpr
+
+    if sexpr.head(node) == "via":
+        layers = sexpr.find(node, "layers")
+        ends = [sexpr.unquote(str(l)) for l in (layers or [])[1:]] or ["F.Cu", "B.Cu"]
+        off = [l for l in ends if l not in allowed]
+        return off or (ends if len(allowed) < 2 else [])
+    layer = sexpr.find(node, "layer")
+    name = sexpr.unquote(str(layer[1])) if layer is not None and len(layer) > 1 else "?"
+    return [] if name in allowed else [name]
+
+
+def _restricted_nets(pcb: Path, class_layers: dict[str, list[str]] | None) -> dict[str, tuple[str, list[str]]]:
+    """Each net whose class ``class_layers`` holds to layers: net -> (class, layers)."""
+    if not class_layers:
+        return {}
+    groups, _ = nets_by_class(pcb, pcb.with_suffix(".kicad_pro"))
+    return {net: (name, list(layers)) for name, layers in class_layers.items() if layers
+            for net in groups.get(name, [])}
+
+
+def _strays(pcb: Path, class_layers: dict[str, list[str]] | None):
+    """The parsed board, and each track or via on a layer-restricted net that
+    leaves its class's layers, as (index in the board, net, class, allowed,
+    off-layers). (None, []) when nothing is restricted."""
+    from ..emitter import sexpr
+
+    restricted = _restricted_nets(pcb, class_layers)
+    if not restricted:
+        return None, []
+    board = sexpr.parse(pcb.read_text(encoding="utf-8", errors="replace"))
+    # Both spellings of an item's net: KiCad 10's (net "NAME") and the older
+    # (net 5), read through the top-level table. Matching one form only is how
+    # a routed board was once reported to have no netlist at all.
+    numbered = {str(n[1]): sexpr.unquote(str(n[2])) for n in sexpr.find_all(board, "net") if len(n) >= 3}
+    out = []
+    for i, node in enumerate(board):
+        if sexpr.head(node) not in ("segment", "arc", "via"):
+            continue
+        tag = sexpr.find(node, "net")
+        if tag is None or len(tag) < 2:
+            continue
+        value = str(tag[-1])
+        net = sexpr.unquote(value) if value.startswith('"') else numbered.get(value)
+        if net not in restricted:
+            continue
+        name, allowed = restricted[net]
+        off = _off_layer(node, allowed)
+        if off:
+            out.append((i, net, name, allowed, off))
+    return board, out
+
+
+def layer_violations(pcb: Path, class_layers: dict[str, list[str]] | None) -> list[dict]:
+    """Copper on a layer-restricted net that is off the layers its class allows.
+
+    One entry per offending net: its class, the allowed layers, the length of
+    track on each layer it should not be on, and how many of its vias leave
+    the allowed layers. Empty when nothing strays -- and when nothing is
+    restricted, so an empty list is a pass only where ``class_layers`` named
+    a class with nets.
+
+    Read from the board file after the router and every BLPL pass after it,
+    because that is what ships. verdacor-ear-tag-bm20 shipped its 2.4 GHz
+    RF_LRHF, of a class held to F.Cu over the In1.Cu ground, with 22 mm of
+    it on B.Cu and four vias, and the one number anyone looked at -- open
+    connections -- had improved.
+    """
+    from ..emitter import sexpr
+
+    board, strays = _strays(pcb, class_layers)
+    found: dict[str, dict] = {}
+    for i, net, name, allowed, off in strays:
+        entry = found.setdefault(net, {"net": net, "class": name, "allowed": allowed, "tracks_mm": {}, "vias": 0})
+        node = board[i]
+        if sexpr.head(node) == "via":
+            entry["vias"] += 1
+            continue
+        # Chords through start, mid and end: a figure for the report, not geometry.
+        pts = [p for p in (sexpr.find(node, k) for k in ("start", "mid", "end")) if p is not None and len(p) >= 3]
+        pts = [(float(p[1]), float(p[2])) for p in pts]
+        mm = sum(((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5 for a, b in zip(pts, pts[1:]))
+        entry["tracks_mm"][off[0]] = entry["tracks_mm"].get(off[0], 0.0) + mm
+    for entry in found.values():
+        entry["tracks_mm"] = {k: round(v, 2) for k, v in sorted(entry["tracks_mm"].items())}
+    return [found[n] for n in sorted(found)]
+
+
+def _enforce_layers(pcb: Path, result, class_layers: dict[str, list[str]] | None, work: Path):
+    """Hold the kept board to its classes' layers, and say so loudly when it is not.
+
+    Attempts are ranked clean-first before this runs, so violations here mean
+    no attempt kept the restricted nets on their layers. The off-layer copper
+    is then **stripped** and those nets read as open, rather than shipped.
+    Deliberately: copper on the wrong layer is connected copper. The open
+    count, Stage 7's DRC (which knows nothing of an impedance plan) and
+    Stage 8 all read such a net as done, and a 50 ohm trace that is not
+    50 ohm is invisible to every one of them -- exactly how RF_LRHF went out
+    on B.Cu. An open is the one failure every later stage already reports,
+    and twenty millimetres of RF is quicker to route by hand on the right
+    layer than to find on the wrong one. The board as routed is kept beside
+    the attempts as ``<board>.layer-violations.kicad_pcb``.
+    """
+    from ..emitter import sexpr
+    from . import autoroute
+
+    if not result.ok or not class_layers:
+        return result
+    found = layer_violations(pcb, class_layers)
+    # How many nets were held to their layers, beside the verdict: an empty
+    # violation list over no nets at all would read as a pass.
+    result.extra["layer_checked_nets"] = len(_restricted_nets(pcb, class_layers))
+    result.extra["layer_violations"] = found
+    if not found:
+        return result
+    work.mkdir(parents=True, exist_ok=True)
+    routed = work / f"{pcb.stem}.layer-violations.kicad_pcb"
+    shutil.copyfile(pcb, routed)
+    board, strays = _strays(pcb, class_layers)
+    # Through the s-expression parser, as _trim_dangling removes its stubs and
+    # for its reason: removing a track through KiCad 10's binding leaves the
+    # process unable to walk the board again.
+    drop = {i for i, *_ in strays}
+    pcb.write_text(sexpr.dump_top([n for i, n in enumerate(board) if i not in drop]), encoding="utf-8")
+    left = layer_violations(pcb, class_layers)
+    nets = "; ".join(
+        f"{e['net']} (class {e['class']}, allowed {'/'.join(e['allowed'])}: "
+        + ", ".join([f"{mm} mm on {layer}" for layer, mm in e["tracks_mm"].items()]
+                    + ([f"{e['vias']} via(s)"] if e["vias"] else []))
+        + ")" for e in found)
+    result.extra["layer_violations_stripped"] = len(drop)
+    result.extra["layer_violations_board"] = str(routed)
+    result.extra["layer_warning"] = (
+        f"LAYER RESTRICTION BROKEN on every attempt: {nets}. The {len(drop)} off-layer track(s) "
+        f"and via(s) were removed, so these nets read as open instead of shipping on the wrong "
+        f"layer; the board as routed is {routed.name}")
+    # A count that drops to zero is checked for what it counts: re-read from
+    # disk, nothing the check finds may be left.
+    if left:
+        result.ok = False
+        result.reason = (f"{result.extra['layer_warning']}; but {len(left)} net(s) still stray after "
+                         "the strip, so the board is not trusted")
+        return result
+    # The pour is refilled into the space the stripped copper left, and the
+    # board measured again: its open count is now the true one.
+    pro = pcb.with_suffix(".kicad_pro")
+    kept_pro = work / f"{pcb.stem}.kicad_pro.layer-guard"
+    if pro.is_file():
+        shutil.copyfile(pro, kept_pro)
+    python = autoroute.find_pcbnew_python()
+    filled = _fill(python, pcb)
+    if kept_pro.is_file():
+        shutil.copyfile(kept_pro, pro)  # pcbnew's save rewrites it; see the module docstring
+    if filled.returncode != 0:
+        result.ok = False
+        result.reason = f"{result.extra['layer_warning']}; and pcbnew could not refill the zones: {autoroute._msg(filled)}"
+        return result
+    measured = autoroute._measure_board(python, pcb)
+    if measured is None:
+        result.ok = False
+        result.reason = f"{result.extra['layer_warning']}; and the stripped board could not be measured"
+        return result
+    result.unrouted = measured.get("unconnected")
+    result.segments = measured.get("segments")
+    return result
+
+
 def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
           class_layers: dict[str, list[str]] | None = None,
           search: dict | None = None, retry: list[dict] | None = None,
@@ -1318,6 +1491,12 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
     kept, or failing that the one with the fewest open, the earliest on a tie.
     Every attempt is in ``extra["attempts"]``, so the report says which
     settings the kept board came from and what the others left.
+
+    ``class_layers`` is checked on the result, not only handed to the router
+    as a flag: an attempt that leaves a restricted net off its layers ranks
+    below every attempt that does not, and when every attempt did, the kept
+    board has that copper stripped and the report says so loudly
+    (``_enforce_layers``).
     """
     from . import autoroute
 
@@ -1331,11 +1510,12 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
         check_fanout(fanout)
     except ValueError as exc:
         return autoroute.RouteResult(False, str(exc), pcb=str(pcb), extra={"router": "kicad-routing-tools"})
-    if not retry:
-        return _route_once(pcb, work_dir=work_dir, timeout=timeout,
-                           class_layers=class_layers, search=search, fanout=fanout)
     pcb = Path(pcb)
     work = Path(work_dir)
+    if not retry:
+        result = _route_once(pcb, work_dir=work, timeout=timeout,
+                             class_layers=class_layers, search=search, fanout=fanout)
+        return _enforce_layers(pcb, result, class_layers, work)
     work.mkdir(parents=True, exist_ok=True)
     # Every attempt starts from this, not from the last attempt's copper:
     # routed over, a retry would be finishing someone else's board.
@@ -1352,28 +1532,97 @@ def route(pcb: Path, *, work_dir: Path, timeout: int = 3600,
                              class_layers=class_layers, search=settings, fanout=fanout)
         if not result.attempted:
             return result  # not installed: no setting changes that
+        # Measured on the board this attempt left, before anything ranks it:
+        # an attempt with a restricted net off its layers loses to every
+        # attempt without, however many fewer connections it left open.
+        # ear-tag-bm20 kept the attempt that left 9 open over the one that
+        # left 10, and the 9 was the one with RF_LRHF on B.Cu.
+        strays = layer_violations(pcb, class_layers) if result.ok else []
         attempts.append({"search": settings, "ok": result.ok, "unrouted": result.unrouted,
+                         **({"layer_violations": [e["net"] for e in strays]} if strays else {}),
                          **({} if result.ok else {"reason": result.reason})})
-        if result.ok and (best is None or (result.unrouted or 0) < (best[1].unrouted or 0)):
+        rank = (bool(strays), result.unrouted or 0)
+        if result.ok and (best is None or rank < best[3]):
             kept = work / f"{pcb.stem}.attempt{i}.kicad_pcb"
             shutil.copyfile(pcb, kept)
-            best = (kept, result, i)
-        if result.ok and not result.unrouted:
+            best = (kept, result, i, rank)
+        if result.ok and not result.unrouted and not strays:
             break
     if best is None:
         # Nothing routed at all: the last failure, with every attempt's reason.
         result.extra["attempts"] = attempts
         return result
-    kept, result, i = best
+    kept, result, i, _ = best
     shutil.copyfile(kept, pcb)
     result.extra["attempts"] = attempts
     result.extra["kept_attempt"] = i
-    return result
+    return _enforce_layers(pcb, result, class_layers, work)
+
+
+#: KRT's own record of nets its rip machinery must leave alone, in the
+#: ``.kicad_pro`` beside the board (its protected_nets.py, issue #521).
+KRT_NAMESPACE = "kicad_routing_tools"
+KRT_PROTECTED = "protected_nets"
+LAYER_PROTECTION = "layer-restricted (BLPL)"
+
+
+def _protect_restricted(pcb: Path, class_layers: dict[str, list[str]] | None) -> str | None:
+    """Mark every layer-restricted net protected in the project file KRT reads;
+    the file's text as it was, to put back, or None when nothing was marked.
+
+    The ``!`` that keeps an RF net out of a later pass does not keep KRT's
+    hands off it. On ear-tag-bm20 the final signal pass, which also carries
+    GND, ran KRT's in-run plane finalize (#562); its pad repair for C12.2
+    ripped the blockers in its way -- VBAT_RAW, LR_NRESET and RF_LRHF, all
+    three excluded from that pass -- and reconnected RF_LRHF with that
+    pass's layers (F.Cu and B.Cu) and its 0.2 mm width: 22 mm on B.Cu and
+    four vias, on a 50 ohm net held to F.Cu. That rip honours KRT's
+    protection list and nothing else, so the list is where BLPL says it.
+    Protection only stops ripping: a net named exactly in --nets still
+    routes in its own pass, which is how every restricted class is routed.
+    The guard in ``route`` remains the check; this keeps it from firing.
+    """
+    restricted = _restricted_nets(pcb, class_layers)
+    pro = pcb.with_suffix(".kicad_pro")
+    if not restricted or not pro.is_file():
+        return None
+    text = pro.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    ns = data.setdefault(KRT_NAMESPACE, {})
+    marked = ns.setdefault(KRT_PROTECTED, {})
+    for net in restricted:
+        marked.setdefault(net, LAYER_PROTECTION)
+    # KRT reads the newer of the project's copy and one on the board by this
+    # revision; one past whatever is here keeps the project's copy the winner.
+    try:
+        ns["records_rev"] = int(ns.get("records_rev") or 0) + 1
+    except (TypeError, ValueError):
+        ns["records_rev"] = 1
+    pro.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return text
 
 
 def _route_once(pcb: Path, *, work_dir: Path, timeout: int = 3600,
                 class_layers: dict[str, list[str]] | None = None,
                 search: dict | None = None, fanout: list[dict] | None = None):
+    """One route of the board, with its layer-restricted nets protected from
+    KRT's rip-up while it runs and the project file put back after."""
+    pcb = Path(pcb)
+    original = _protect_restricted(pcb, class_layers)
+    try:
+        return _route_steps(pcb, work_dir=work_dir, timeout=timeout,
+                            class_layers=class_layers, search=search, fanout=fanout)
+    finally:
+        if original is not None:
+            pcb.with_suffix(".kicad_pro").write_text(original, encoding="utf-8")
+
+
+def _route_steps(pcb: Path, *, work_dir: Path, timeout: int = 3600,
+                 class_layers: dict[str, list[str]] | None = None,
+                 search: dict | None = None, fanout: list[dict] | None = None):
     from . import autoroute
 
     ok, why = available()
