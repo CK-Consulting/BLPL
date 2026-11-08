@@ -652,7 +652,7 @@ export function askReference(tab: string, openPath: string | null, board: string
     case "bom":
       return art(".pipeline/bom.json");
     case "lifecycle":
-      return "`lifecycle.md`";
+      return "`docs/lifecycle.md` (`lifecycle.md` in projects from before it moved)";
     case "modules":
       return "the module library";
     case "reports":

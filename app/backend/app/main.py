@@ -4193,7 +4193,10 @@ def _lifecycle_module():
 
 
 def _lifecycle_path(proj: Path) -> Path:
-    return proj / "lifecycle.md"
+    # docs/lifecycle.md, or the root one a project made before the audit moved
+    # there — the same file Stage 8 hands the audit, so the pane and the run
+    # can never be editing two different tables.
+    return project_manifest.lifecycle_table(proj)
 
 
 @app.get("/api/projects/{project_id}/lifecycle")

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { getJSON, postJSON } from "../api";
 
 // The lifecycle table as a table, rather than as a markdown file in the edit
-// pane. The content is identical — this reads and writes the same lifecycle.md
+// pane. The content is identical — this reads and writes the same docs/lifecycle.md
 // the audit writes — but a monospace grid of pipes is a poor place to tell 57
 // from 85, and worse to type a date into. The columns the script owns are read
 // only here; the five a person owns are the form.
