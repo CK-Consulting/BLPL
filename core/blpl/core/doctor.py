@@ -645,6 +645,67 @@ def _design_files(directory: Path) -> list[Path]:
     return found
 
 
+# Markdown a repository keeps at its root by convention, whoever reads it. Not
+# design documents, but not something to move into docs/ either: a README that
+# is not at the top of the repository is not a README.
+_REPO_MARKDOWN = frozenset({"README", "CLAUDE", "AGENTS", "CONTRIBUTING", "CHANGELOG", "LICENSE"})
+
+
+def _check_ancillary_markdown(
+    report: Report, per_file: list[tuple[Path, int, int, bool]]
+) -> None:
+    """DOC-017: a design-directory Markdown file the pipeline takes nothing from.
+
+    Every ``*.md`` beside the design is Stage 0 input. The deterministic variant
+    keeps only the tables it recognises; the LLM variant reads the prose too, as
+    design intent. A decision log there is therefore not inert: its rejected
+    candidates and superseded pinouts are one recognisable table, or one
+    LLM-read paragraph, away from becoming parts. ear-tag-bm20's decisions.md
+    held four comparison tables, each its own DOC-001, and the real advice was
+    never about the tables — the file belonged in docs/, which nothing reads.
+
+    Only said when another file here *is* used, so a new project whose design
+    document has no tables yet is not told to move it away. The file's DOC-001s
+    are folded into this one finding: moving the file answers all of them.
+    """
+    from . import project_manifest
+
+    if not any(used or modules for _, used, _, modules in per_file):
+        return
+    for md_path, used, start, modules in reversed(per_file):
+        if used or modules:
+            continue
+        if md_path.stem.upper() in _REPO_MARKDOWN or md_path.name == project_manifest.MANIFEST_NAME:
+            continue
+        rel = md_path.name
+        mine = [
+            i
+            for i, f in enumerate(report.findings)
+            if i >= start and f.code == "DOC-001" and f.file == rel
+        ]
+        for i in reversed(mine):
+            del report.findings[i]
+        tables = f", and its {len(mine)} table(s) are all discarded" if mine else ""
+        report.findings.append(
+            Finding(
+                code="DOC-017",
+                severity="warning",
+                summary=(
+                    f"{rel} holds nothing the pipeline builds from{tables} — "
+                    "it belongs in docs/."
+                ),
+                fix=(
+                    "Stage 0 reads every *.md in this directory as design input, "
+                    "and the LLM variant reads the prose as well as the tables. "
+                    "Decision logs, notes and reports belong in docs/, which no "
+                    "stage reads: a rejected part in a decision log should never "
+                    "be one recognised table away from the BOM."
+                ),
+                file=rel,
+            )
+        )
+
+
 def _manifest_or_finding(report: Report, project_dir: Path):
     """The project's manifest, or None after recording why it cannot be used."""
     from . import project_manifest
@@ -902,9 +963,16 @@ def run(
     # anchors here exactly as it does there.
     known = _s0_known_refs(md_files)
 
+    # Per file: how many of its tables were used, where its findings start, and
+    # whether it has a '## Modules' list — for DOC-017 once every file is read.
+    per_file: list[tuple[Path, int, int, bool]] = []
+
     for md_path in md_files:
         text = md_path.read_text(encoding="utf-8")
         rel = md_path.name
+        used_before = report.tables_used
+        findings_before = len(report.findings)
+        has_modules = bool(_modules_remix.parse_modules_section(text))
 
         for table in _md.extract_tables(text, rel):
             report.tables_seen += 1
@@ -958,7 +1026,7 @@ def run(
                             "(Ref/MPN/Package/Description), both a pin-ish and a signal-ish "
                             "column, or a GPIO column plus a signal column (a GPIO assignment "
                             "map). Anything else is dropped without warning. If this table is "
-                            "reference material, that's fine — if it's meant to be consumed "
+                            "reference material, it belongs in docs/, which no stage reads — if it's meant to be consumed "
                             "(stackup, net classes, project identity), it currently isn't: "
                             "put that in project.yaml instead."
                         ),
@@ -1075,6 +1143,12 @@ def run(
                     # DOC-004 below still wants to say so out loud.
                     if up and (up == "RESERVED" or not _stage4.is_no_connect(sig)):
                         signal_owners.setdefault(sig, []).append((ref, rel))
+
+        per_file.append(
+            (md_path, report.tables_used - used_before, findings_before, has_modules)
+        )
+
+    _check_ancillary_markdown(report, per_file)
 
     # Signal name IS net name, so a name on two components becomes ONE net. Whether
     # that's correct depends entirely on intent, and we cannot read intent — so be

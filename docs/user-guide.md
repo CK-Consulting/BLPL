@@ -670,7 +670,7 @@ Missing tools never fail silently; they produce a named skip.
 
 ### Preflight (doctor)
 
-Seventeen checks, `DOC-000` to `DOC-016`. Errors mean data will be lost or misread; warnings mean a later stage will stop or guess. The full list is in [Message and code reference](#message-and-code-reference). Preflight only reads; it never changes a file.
+Eighteen checks, `DOC-000` to `DOC-017`. Errors mean data will be lost or misread; warnings mean a later stage will stop or guess. The full list is in [Message and code reference](#message-and-code-reference). Preflight only reads; it never changes a file.
 
 ### Stage 7: is it a legal KiCad project?
 
@@ -910,6 +910,7 @@ Exit codes: `0` success; `1` a functional stop that is often expected during ite
 | `DOC-014` | error | A package value naming one footprint without its library prefix. |
 | `DOC-015` | error | A symbol that does not exist in the library. |
 | `DOC-016` | usually error | Design tables that no board owns, in a multi-board project. |
+| `DOC-017` | warning | A Markdown file beside the design that the pipeline takes nothing from. Move it to `docs/`. |
 
 The tool prints the authoritative severity for each finding; only errors make `doctor` exit non-zero.
 
