@@ -2075,3 +2075,26 @@ def test_an_unprotected_route_leaves_the_project_file_alone(board, tmp_path, mon
                         or autoroute.RouteResult(True, "", pcb=str(pcb), unrouted=0))
     krt_route._route_once(board, work_dir=tmp_path / "w", class_layers=RF_ONLY_F, protect=False)
     assert "kicad_routing_tools" not in seen[0]
+
+
+def _narrow(net: str, layer: str = "F.Cu", width: float = 0.2) -> str:
+    return f'(segment (start 0 0) (end 4 0) (width {width}) (layer "{layer}") (net "{net}"))'
+
+
+def test_a_restricted_net_on_its_layer_at_another_width_is_a_stray_too(board):
+    """Unprotected, KRT's finalize repairs RF with the last pass's layers and
+    width: on F.Cu at the Default 0.2 mm it passes a layer check, and is not
+    50 ohm (Codex, PR #109)."""
+    board.write_text(_routed(_seg("RF_ANT", "F.Cu"), _narrow("RF_ANT"), _narrow("SPI_SCK")))
+    assert krt_route.layer_violations(board, RF_ONLY_F) == [
+        {"net": "RF_ANT", "class": "RF_50R", "allowed": ["F.Cu"], "tracks_mm": {"F.Cu at 0.2 mm": 4.0}, "vias": 0}]
+
+
+def test_a_narrow_unprotected_route_loses_to_a_correct_one_with_more_open(board, tmp_path, monkeypatch):
+    right = _routed(_seg("RF_ANT", "F.Cu"))
+    narrow = _routed(_narrow("RF_ANT"))
+    once = _layered_attempts(monkeypatch, [right, narrow], [1, 0])
+    r = krt_route.route(board, work_dir=tmp_path / "w", class_layers=RF_ONLY_F)
+    assert once.protects == [True, False]
+    assert r.extra["kept_attempt"] == 0 and r.unrouted == 1 and board.read_text() == right
+    assert r.extra["attempts"][1]["layer_violations"] == ["RF_ANT"]
