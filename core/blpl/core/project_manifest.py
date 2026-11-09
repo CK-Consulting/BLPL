@@ -517,6 +517,29 @@ PIPELINE_DIRNAME = ".pipeline"
 GENERATED_MARKDOWN = frozenset({"lifecycle.md"})
 
 
+# Where a project keeps what the pipeline does not read: decision logs, notes,
+# reports, and BLPL's own lifecycle table. No stage globs it.
+DOCS_DIRNAME = "docs"
+LIFECYCLE_TABLE = "lifecycle.md"
+
+
+def lifecycle_table(project_dir: Path) -> Path:
+    """The distributor lifecycle table: ``docs/lifecycle.md``.
+
+    It used to be written beside the design documents, where only
+    GENERATED_MARKDOWN kept Stage 0 from reading it as a BOM. A project that
+    still has one there and none in docs/ keeps using it — its person-owned
+    columns (what you found when you checked) are not regenerated, so the file
+    is moved by whoever owns the repository, never silently by a run.
+    """
+    project_dir = Path(project_dir)
+    legacy = project_dir / LIFECYCLE_TABLE
+    current = project_dir / DOCS_DIRNAME / LIFECYCLE_TABLE
+    if legacy.is_file() and not current.exists():
+        return legacy
+    return current
+
+
 def design_markdown(directory: Path) -> list[Path]:
     """The design documents directly in ``directory``: its ``*.md``, less BLPL's own."""
     return [p for p in sorted(Path(directory).glob("*.md")) if p.name not in GENERATED_MARKDOWN]

@@ -44,7 +44,7 @@ from pathlib import Path
 
 import yaml
 
-from . import board_geometry, impedance, schema
+from . import board_geometry, impedance, project_manifest, schema
 from .project_manifest import artifact_path
 
 _PIPELINE_ROOT = Path(__file__).resolve().parent.parent
@@ -959,7 +959,11 @@ def run(
     else:
         env, why = lifecycle_env()
         if env is not None or lifecycle is True:
-            lifecycle_args = ["--lifecycle"]
+            # Named rather than left to kicad-happy's default, which is
+            # <project>/lifecycle.md — beside the design, where Stage 0 reads.
+            table = project_manifest.lifecycle_table(project_dir)
+            table.parent.mkdir(parents=True, exist_ok=True)
+            lifecycle_args = ["--lifecycle", "--lifecycle-table", str(table)]
             analyzer_env = env
         else:
             lifecycle_reason = why

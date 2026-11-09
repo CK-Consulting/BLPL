@@ -1237,3 +1237,84 @@ def test_a_modules_list_counts_as_design_content(tmp_path: Path) -> None:
         "# Power\n\n## Modules\n\n- ltc4015-charger — the charger\n", encoding="utf-8"
     )
     assert "DOC-016" in _codes(doctor.layout(proj))
+
+
+# --- DOC-017: markdown beside the design that the pipeline takes nothing from --
+
+_BOARD = """
+## BOM
+
+| Ref | MPN | Package | Description |
+|-----|-----|---------|-------------|
+| U1  | STM32G0 | LQFP-32 | MCU |
+"""
+
+_DECISIONS = """
+# Decisions
+
+## D-010: flash
+
+| Part | Lowest power-down | Verdict |
+|------|-------------------|---------|
+| AT25XE161D | 0.1 uA | superseded by D-011 |
+
+## D-011: GNSS currents
+
+| Mode | GPS | Default |
+|------|-----|---------|
+| Tracking | 25 mA | 30 mA |
+"""
+
+
+def test_a_decision_log_beside_the_design_is_told_to_move_to_docs(tmp_path: Path) -> None:
+    """ear-tag-bm20's decisions.md produced one DOC-001 per comparison table,
+    and the advice that mattered was never about the tables: the file is Stage 0
+    input where it stands, and belongs in docs/. One finding, not four."""
+    _project(tmp_path, board__md=_BOARD, decisions__md=_DECISIONS)
+    report = doctor.run(tmp_path)
+    mine = [f for f in report.findings if f.file == "decisions.md"]
+    assert [f.code for f in mine] == ["DOC-017"]
+    assert "docs/" in mine[0].summary
+    # Prose-only design input is legitimate under --stage0 llm, and doctor
+    # cannot tell it from notes: the finding offers both answers (Codex, #110).
+    assert "deterministic Stage 0" in mine[0].summary
+    assert "keep it here" in mine[0].fix
+    assert "2 table(s)" in mine[0].summary
+    # The tables are still counted as seen and discarded; only the advice changes.
+    assert report.tables_seen == 3
+    assert report.tables_used == 1
+
+
+def test_a_prose_only_notes_file_is_told_to_move_too(tmp_path: Path) -> None:
+    """The LLM Stage 0 reads prose as design intent, so a notes file with no
+    tables at all is not inert either."""
+    _project(tmp_path, board__md=_BOARD, notes__md="# Notes\n\nTried the LDO; too hot.\n")
+    report = doctor.run(tmp_path)
+    assert [f.code for f in report.findings if f.file == "notes.md"] == ["DOC-017"]
+    assert "table" not in next(f for f in report.findings if f.file == "notes.md").summary
+
+
+def test_a_readme_and_agent_instructions_stay_at_the_repository_root(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        board__md=_BOARD,
+        README__md="# Tag\n\nThe ear tag.\n",
+        CLAUDE__md="# Notes for agents\n",
+    )
+    assert "DOC-017" not in _codes(doctor.run(tmp_path))
+
+
+def test_a_design_with_no_tables_yet_is_not_told_to_move_away(tmp_path: Path) -> None:
+    """A new project's only document has no tables yet. Telling it the file
+    belongs in docs/ would send the design itself out of Stage 0's reach."""
+    _project(tmp_path, board__md="# Board\n\nAn ear tag. Parts to follow.\n")
+    assert "DOC-017" not in _codes(doctor.run(tmp_path))
+
+
+def test_a_modules_list_counts_as_something_the_pipeline_builds_from(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        board__md=_BOARD,
+        power__md="# Power\n\n## Modules\n\n- ltc4015-charger — the charger\n",
+    )
+    assert "DOC-017" not in _codes(doctor.run(tmp_path))

@@ -30,6 +30,7 @@ blpl doctor --project-dir <proj> [--json]
 | `DOC-014` | A package value naming one footprint without its library prefix |
 | `DOC-015` | A symbol that does not exist in the library |
 | `DOC-016` | Design tables no board owns: board folders with no `project.md`, a board `project.md` does not list, or BOM/pinout tables at the root of a multi-board project |
+| `DOC-017` | A Markdown file beside the design that deterministic Stage 0 takes nothing from. A decision log, notes or a report belongs in `docs/`; prose written as design input for `--stage0 llm` stays. Replaces that file's `DOC-001`s; `README.md`, `CLAUDE.md`, `AGENTS.md` and the like are exempt |
 
 Exit is 0 unless a `DOC-*` **error** was found; warnings do not fail.
 
