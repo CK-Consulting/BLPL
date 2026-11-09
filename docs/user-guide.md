@@ -910,7 +910,7 @@ Exit codes: `0` success; `1` a functional stop that is often expected during ite
 | `DOC-014` | error | A package value naming one footprint without its library prefix. |
 | `DOC-015` | error | A symbol that does not exist in the library. |
 | `DOC-016` | usually error | Design tables that no board owns, in a multi-board project. |
-| `DOC-017` | warning | A Markdown file beside the design that the pipeline takes nothing from. Move it to `docs/`. |
+| `DOC-017` | warning | A Markdown file beside the design that deterministic Stage 0 takes nothing from. A decision log or notes goes in `docs/`; design prose for `--stage0 llm` stays. |
 
 The tool prints the authoritative severity for each finding; only errors make `doctor` exit non-zero.
 

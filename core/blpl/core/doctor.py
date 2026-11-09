@@ -664,6 +664,12 @@ def _check_ancillary_markdown(
     held four comparison tables, each its own DOC-001, and the real advice was
     never about the tables — the file belonged in docs/, which nothing reads.
 
+    What doctor cannot tell is which of those it is. Prose-only design input is
+    legitimate under ``--stage0 llm``, which hands the whole document to the
+    model to extract parts and nets, so "nothing" here means nothing the
+    deterministic Stage 0 builds from, and the finding says so and offers both
+    answers rather than ordering the file out (Codex, PR #110).
+
     Only said when another file here *is* used, so a new project whose design
     document has no tables yet is not told to move it away. The file's DOC-001s
     are folded into this one finding: moving the file answers all of them.
@@ -691,15 +697,17 @@ def _check_ancillary_markdown(
                 code="DOC-017",
                 severity="warning",
                 summary=(
-                    f"{rel} holds nothing the pipeline builds from{tables} — "
-                    "it belongs in docs/."
+                    f"{rel} holds nothing deterministic Stage 0 builds from{tables} — "
+                    "if it is a decision log, notes or a report, it belongs in docs/."
                 ),
                 fix=(
                     "Stage 0 reads every *.md in this directory as design input, "
-                    "and the LLM variant reads the prose as well as the tables. "
-                    "Decision logs, notes and reports belong in docs/, which no "
-                    "stage reads: a rejected part in a decision log should never "
-                    "be one recognised table away from the BOM."
+                    "and `--stage0 llm` reads the prose as well as the tables. "
+                    "If this file's prose describes the design for the LLM "
+                    "variant, keep it here. If it is a decision log, notes or a "
+                    "report, move it to docs/, which no stage reads: a rejected "
+                    "part in a decision log should never be one recognised table, "
+                    "or one LLM-read paragraph, away from the BOM."
                 ),
                 file=rel,
             )

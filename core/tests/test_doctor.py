@@ -1275,6 +1275,10 @@ def test_a_decision_log_beside_the_design_is_told_to_move_to_docs(tmp_path: Path
     mine = [f for f in report.findings if f.file == "decisions.md"]
     assert [f.code for f in mine] == ["DOC-017"]
     assert "docs/" in mine[0].summary
+    # Prose-only design input is legitimate under --stage0 llm, and doctor
+    # cannot tell it from notes: the finding offers both answers (Codex, #110).
+    assert "deterministic Stage 0" in mine[0].summary
+    assert "keep it here" in mine[0].fix
     assert "2 table(s)" in mine[0].summary
     # The tables are still counted as seen and discarded; only the advice changes.
     assert report.tables_seen == 3
