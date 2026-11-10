@@ -63,6 +63,10 @@ def test_building_a_release_from_the_app_carries_the_board_and_the_lcsc_choice(c
     assert "--odb" in seen["cmd"] and "--lcsc" in seen["cmd"] and "--circuithub" not in seen["cmd"]
     assert client.post("/api/projects/scratch/release?circuithub=true").status_code == 200
     assert "--circuithub" in seen["cmd"] and "--odb" not in seen["cmd"]
+    assert client.post("/api/projects/scratch/release?gerber_zip=true").status_code == 200
+    assert "--gerber-zip" in seen["cmd"] and "--seeed" not in seen["cmd"]
+    assert client.post("/api/projects/scratch/release?seeed=true").status_code == 200
+    assert "--seeed" in seen["cmd"] and "--gerber-zip" not in seen["cmd"]
     assert client.post("/api/projects/scratch/release?board=ghost").status_code == 400
 
 

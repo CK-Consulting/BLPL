@@ -7698,7 +7698,8 @@ async def run_stage(
 
 @app.post("/api/projects/{project_id}/release")
 async def build_release(project_id: str, board: str | None = None, lcsc: bool = False,
-    odb: bool = False, circuithub: bool = False,
+    odb: bool = False, circuithub: bool = False, gerber_zip: bool = False,
+    seeed: bool = False,
     user: User = Depends(require_onboarded),
     session: Session = Depends(session_scope)) -> StreamingResponse:
     """Build the package a contract fab quotes from, gate included.
@@ -7725,6 +7726,14 @@ async def build_release(project_id: str, board: str | None = None, lcsc: bool = 
         # CircuitHub imports the native KiCad project, with a BOM it
         # reconciles against; the package carries both, zipped.
         cmd.append("--circuithub")
+    if gerber_zip:
+        # The gerbers and drill files as one zip, which is what most fabs'
+        # upload fields take.
+        cmd.append("--gerber-zip")
+    if seeed:
+        # Seeed Fusion's PCBA order: its BOM template, the assembly files
+        # zipped, and the gerber zip; the SKUs come from project.yaml.
+        cmd.append("--seeed")
     return _start_run(session, user, project_id,
                       "release" if resolved is None else f"release ({resolved})", cmd, dict(os.environ))
 

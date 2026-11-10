@@ -28,7 +28,7 @@ export type Manifest = {
   incomplete?: string[];
   tools?: { kicad_cli?: string };
   // Absent from packages built before the options were recorded.
-  options?: { lcsc?: boolean; odb?: boolean; circuithub?: boolean };
+  options?: { lcsc?: boolean; odb?: boolean; circuithub?: boolean; gerber_zip?: boolean; seeed?: boolean };
 };
 
 type GateCheck = { category?: string; check_id?: string; status?: string; message?: string };
@@ -52,6 +52,13 @@ export function builtWith(m: Manifest): string {
   const parts = [lcsc, optional(m.options.odb, "odb", "ODB++ package")];
   if (m.options.circuithub !== undefined) {
     parts.push(optional(m.options.circuithub, "circuithub", "CircuitHub design package"));
+  }
+  // Likewise the gerber zip and Seeed Fusion options, added later still.
+  if (m.options.gerber_zip !== undefined) {
+    parts.push(optional(m.options.gerber_zip, "gerber-zip", "gerber zip"));
+  }
+  if (m.options.seeed !== undefined) {
+    parts.push(optional(m.options.seeed, "seeed-bom", "Seeed Fusion package"));
   }
   return `Built with ${parts.join(", ")}.`;
 }
@@ -77,6 +84,8 @@ export function ReleasePanel({
   const [lcsc, setLcsc] = useState(false);
   const [odb, setOdb] = useState(false);
   const [circuithub, setCircuithub] = useState(false);
+  const [gerberZip, setGerberZip] = useState(false);
+  const [seeed, setSeeed] = useState(false);
   const runIdRef = useRef<string | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
@@ -96,7 +105,8 @@ export function ReleasePanel({
     setLines([]);
     setRunning(true);
     try {
-      const query = [lcsc && "lcsc=true", odb && "odb=true", circuithub && "circuithub=true"]
+      const query = [lcsc && "lcsc=true", odb && "odb=true", circuithub && "circuithub=true",
+        gerberZip && "gerber_zip=true", seeed && "seeed=true"]
         .filter(Boolean).join("&");
       const url = withBoard(`/api/projects/${projectId}/release${query ? `?${query}` : ""}`, board);
       await readSSE(url, { method: "POST" }, (event, payload) => {
@@ -148,6 +158,15 @@ export function ReleasePanel({
           <input type="checkbox" checked={circuithub} disabled={running}
             onChange={(e) => setCircuithub(e.target.checked)} />{" "}
           Export CircuitHub design package
+        </label>
+        <label title="Also zip the gerbers and drill files into one <project>-gerbers.zip at the top of the package, which is what most fabs' upload fields take">
+          <input type="checkbox" checked={gerberZip || seeed} disabled={running || seeed}
+            onChange={(e) => setGerberZip(e.target.checked)} />{" "}
+          Include gerbers as a .zip file
+        </label>
+        <label title="Also write seeed/ for a Seeed Fusion PCB/PCBA order: the BOM in Seeed's template (Seeed SKUs from project.yaml assembly.seeed_fusion.sku), the pick-and-place file, top and bottom assembly drawings and a 3D model zipped for the assembly upload, and ORDER-NOTES.txt with the MCU model. Includes the gerber zip.">
+          <input type="checkbox" checked={seeed} disabled={running} onChange={(e) => setSeeed(e.target.checked)} />{" "}
+          Build for Seeed Studio Fusion PCB/PCBA
         </label>
       </div>
       {manifest?.exists && (

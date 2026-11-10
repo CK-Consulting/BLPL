@@ -55,6 +55,33 @@ describe("the Release tab", () => {
       .toBe("/api/projects/p/release?lcsc=true&odb=true&circuithub=true&board=base");
   });
 
+  it("asks for a gerber zip and a Seeed Fusion package from their own checkboxes", async () => {
+    vi.spyOn(api, "getJSON").mockResolvedValue({ exists: false });
+    const readSSE = vi.spyOn(api, "readSSE").mockResolvedValue();
+    render(<ReleasePanel projectId="p" board={null} reloadToken={0} />);
+
+    await userEvent.click(screen.getByLabelText("Include gerbers as a .zip file"));
+    await userEvent.click(screen.getByRole("button", { name: "Build release package" }));
+    expect(readSSE.mock.calls[0][0]).toBe("/api/projects/p/release?gerber_zip=true");
+    await userEvent.click(screen.getByLabelText("Include gerbers as a .zip file"));
+    await userEvent.click(screen.getByLabelText("Build for Seeed Studio Fusion PCB/PCBA"));
+    // Seeed's PCB upload is the gerber zip, so its box shows ticked and fixed.
+    const gerbers = screen.getByLabelText("Include gerbers as a .zip file") as HTMLInputElement;
+    expect(gerbers.checked).toBe(true);
+    expect(gerbers.disabled).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Build release package" }));
+    expect(readSSE.mock.calls[1][0]).toBe("/api/projects/p/release?seeed=true");
+  });
+
+  it("names the Seeed Fusion package and the gerber zip in what the package was built with", () => {
+    expect(builtWith({ exists: true,
+      options: { lcsc: false, odb: false, circuithub: false, gerber_zip: true, seeed: true },
+      steps: [{ step: "gerber-zip", ok: true, detail: "", outputs: [] },
+        { step: "seeed-bom", ok: true, detail: "", outputs: [] }] }))
+      .toBe("Built with no LCSC part number lookup, no ODB++ package, no CircuitHub design package, "
+        + "gerber zip included, Seeed Fusion package included.");
+  });
+
   it("says what the package was built with, and never claims an ODB++ job that failed", () => {
     expect(builtWith({ exists: true, options: { lcsc: false, odb: true },
       steps: [{ step: "odb", ok: true, detail: "", outputs: ["p-odb.zip"] }] }))
