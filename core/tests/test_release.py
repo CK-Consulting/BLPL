@@ -388,11 +388,13 @@ def test_the_manifest_says_which_options_the_package_was_built_with(project, mon
     find out whether LCSC numbers were looked up or an ODB++ job is inside."""
     monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
     plain = release.build(project, now="2026-08-12_120000Z")
-    assert plain["options"] == {"lcsc": False, "odb": False, "circuithub": False}
+    assert plain["options"] == {"lcsc": False, "odb": False, "circuithub": False,
+                                "gerber_zip": False, "seeed": False}
     assert not any(s["step"] == "odb" for s in plain["steps"])
 
     asked = release.build(project, now="2026-08-12_130000Z", odb=True)
-    assert asked["options"] == {"lcsc": False, "odb": True, "circuithub": False}
+    assert asked["options"] == {"lcsc": False, "odb": True, "circuithub": False,
+                                "gerber_zip": False, "seeed": False}
     odb = next(s for s in asked["steps"] if s["step"] == "odb")
     assert not odb["ok"] and "odb" in asked["incomplete"]
 
@@ -691,3 +693,219 @@ def test_a_malformed_hdm_still_gets_a_package(tmp_path, monkeypatch) -> None:
     assert any(s["step"] == "board-specs" and "not a mapping" in s["detail"]
                for s in manifest["steps"])
     assert (proj / "release" / "latest.zip").is_file()
+
+
+# -- the gerber zip and Seeed Fusion ----------------------------------------
+
+
+def _xlsx_rows(path: Path) -> list[list[str]]:
+    """The cell text of sheet 1, by row, read the way an importer reads it."""
+    import re as _re
+    with zipfile.ZipFile(path) as zf:
+        xml = zf.read("xl/worksheets/sheet1.xml").decode()
+    rows = []
+    for row in _re.findall(r"<row [^>]*>(.*?)</row>", xml):
+        cells = _re.findall(r'<c r="([A-Z]+)\d+"[^>]*>(?:<is><t[^>]*>(.*?)</t></is>|<v>(.*?)</v>)</c>', row)
+        by_col = {c: (t or v) for c, t, v in cells}
+        width = max((ord(c) - 64 for c in by_col), default=0)
+        rows.append([by_col.get(chr(65 + i), "") for i in range(width)])
+    return rows
+
+
+def test_the_gerber_zip_is_flat_and_holds_the_drill_files(tmp_path) -> None:
+    """A fab's upload unpacks the zip expecting layers, not one folder."""
+    from blpl.core import seeed_fusion
+    (tmp_path / "gerbers").mkdir()
+    for n in ("b-F_Cu.gtl", "b-Edge_Cuts.gm1", "b-PTH.drl"):
+        (tmp_path / "gerbers" / n).write_text("x")
+    step = seeed_fusion.zip_gerbers(tmp_path, "b")
+    assert step.ok and step.outputs == ["b-gerbers.zip"] and step.detail == ""
+    with zipfile.ZipFile(tmp_path / "b-gerbers.zip") as zf:
+        assert sorted(zf.namelist()) == ["b-Edge_Cuts.gm1", "b-F_Cu.gtl", "b-PTH.drl"]
+
+
+def test_no_gerbers_is_a_failed_gerber_zip_step_not_an_empty_zip(tmp_path) -> None:
+    from blpl.core import seeed_fusion
+    step = seeed_fusion.zip_gerbers(tmp_path, "b")
+    assert not step.ok and not (tmp_path / "b-gerbers.zip").exists()
+
+
+def test_the_seeed_bom_uses_seeeds_template_columns(tmp_path) -> None:
+    """Seeed's system reads its own template: these columns, in this order,
+    designators separated by commas only."""
+    from blpl.core import seeed_fusion
+    bom = tmp_path / "bom.json"
+    bom.write_text(json.dumps({"rows": [
+        {"local_id": "C2", "mpn": "CL10B104KB8NNNC", "manufacturer": "Samsung", "package": "0402"},
+        {"local_id": "C10", "mpn": "CL10B104KB8NNNC", "manufacturer": "Samsung", "package": "0402"},
+        {"local_id": "C1", "mpn": "CL10B104KB8NNNC", "manufacturer": "Samsung", "package": "0402"},
+    ]}))
+    step, _ = seeed_fusion.export_bom(bom, tmp_path / "b.xlsx", not_bought=set(), hand_fit=set(), sku={})
+    assert step.ok
+    rows = _xlsx_rows(tmp_path / "b.xlsx")
+    assert rows[0] == list(seeed_fusion.BOM_COLUMNS)
+    assert rows[1][:4] == ["1", "C1,C2,C10", "3", "CL10B104KB8NNNC"]
+
+
+def test_one_part_described_two_ways_is_one_seeed_line(tmp_path) -> None:
+    """Seeed buys by part number; the ear tag's 470 Ohm resistors came out as
+    two lines because the BOM described them two ways."""
+    from blpl.core import seeed_fusion
+    bom = tmp_path / "bom.json"
+    bom.write_text(json.dumps([
+        {"refdes": "R1", "mpn": "RC0402FR-07470RL", "manufacturer": "Yageo", "value": "470R"},
+        {"refdes": "R4", "mpn": "RC0402FR-07470RL", "manufacturer": "Yageo",
+         "description": "Thick film chip resistor, 470 Ohm"},
+        {"refdes": "R9", "mpn": "RC0402FR-07470RL", "manufacturer": "Other"},
+    ]))
+    lines = seeed_fusion.bom_lines(bom, not_bought=set(), hand_fit=set(), sku={})
+    by_refs = {ln["Reference Designator *"]: ln["Quantity *"] for ln in lines}
+    assert by_refs == {"R1,R4": 2, "R9": 1}
+
+
+def test_a_seeed_product_is_ordered_by_its_sku_not_its_name(tmp_path) -> None:
+    """Seeed's note: for a Seeed Studio product, the SKU goes in the MPN
+    column. project.yaml assembly.seeed_fusion.sku says which."""
+    from blpl.core import seeed_fusion
+    bom = tmp_path / "bom.json"
+    bom.write_text(json.dumps([
+        {"refdes": "U1", "mpn": "XIAO-nRF54L15-SMD", "manufacturer": "Seeed Studio"},
+        {"refdes": "R1", "mpn": "RC0402FR-07100KL", "manufacturer": "Yageo"},
+    ]))
+    lines = seeed_fusion.bom_lines(bom, not_bought=set(), hand_fit=set(),
+                                   sku={"XIAO-nRF54L15-SMD": "101991422"})
+    part = seeed_fusion.BOM_COLUMNS[3]
+    u1 = next(ln for ln in lines if ln["Reference Designator *"] == "U1")
+    r1 = next(ln for ln in lines if ln["Reference Designator *"] == "R1")
+    assert u1[part] == "101991422" and "XIAO-nRF54L15-SMD" in u1["Remarks"]
+    assert r1[part] == "RC0402FR-07100KL"
+
+
+def test_seeed_buys_a_hand_fit_part_as_dnp_and_never_an_unbought_one(tmp_path) -> None:
+    """Only what Seeed is to buy is in its BOM; a part bought and not
+    assembled is marked DNP, as its notes ask."""
+    from blpl.core import seeed_fusion
+    bom = tmp_path / "bom.json"
+    bom.write_text(json.dumps([
+        {"refdes": "C9", "mpn": "HSH0814"}, {"refdes": "J1", "mpn": "TC2030"},
+        {"refdes": "R1", "mpn": "RC0402"},
+    ]))
+    lines = seeed_fusion.bom_lines(bom, not_bought={"J1"}, hand_fit={"C9"}, sku={})
+    refs = {ln["Reference Designator *"]: ln["Remarks"] for ln in lines}
+    assert set(refs) == {"C9", "R1"}
+    assert refs["C9"].startswith("DNP") and refs["R1"] == ""
+
+
+def test_a_part_that_never_lands_on_the_board_is_bought_as_dnp(tmp_path) -> None:
+    """An antenna on a cable is bought with the board and fitted at final
+    assembly; Seeed buys it and places nothing (the ear tag's four FPC
+    antennas)."""
+    from blpl.core import seeed_fusion
+    bom = tmp_path / "bom.json"
+    bom.write_text(json.dumps([{"refdes": "ANT_GNSS", "mpn": "ANT-GNFPC", "package": "not_placed"}]))
+    lines = seeed_fusion.bom_lines(bom, not_bought=set(), hand_fit=set(), sku={})
+    assert "not on the board" in lines[0]["Remarks"] and lines[0]["Remarks"].startswith("DNP")
+    assert lines[0]["Package / Footprint"] == ""
+
+
+def test_dnp_lines_are_not_expected_in_the_pick_and_place_file(tmp_path) -> None:
+    from blpl.core import seeed_fusion
+    staging = tmp_path / "assembly"
+    staging.mkdir()
+    (staging / "b-pick-and-place.csv").write_text("Ref,Val,Package,PosX,PosY,Rot,Side\nR1,1k,R,0,0,0,top\n")
+    lines = [{"Reference Designator *": "R1", "Remarks": ""},
+             {"Reference Designator *": "ANT1", "Remarks": "DNP: purchase only, not on the board"}]
+    assert seeed_fusion.check(tmp_path, staging, lines, "b").ok
+
+
+def test_the_pick_and_place_file_is_kicads_csv_less_what_seeed_does_not_place(tmp_path) -> None:
+    from blpl.core import seeed_fusion
+    pos = tmp_path / "positions.csv"
+    pos.write_text('Ref,Val,Package,PosX,PosY,Rot,Side\n'
+                   '"C9","25F","CP",1,2,0,top\n"R1","100k","R_0402",3,4,90,bottom\n'
+                   '"U1","x","QFN",5,6,0,top\n')
+    step, bottom = seeed_fusion.pick_and_place(pos, tmp_path / "out.csv", {"C9"})
+    assert step.ok and bottom
+    text = (tmp_path / "out.csv").read_text()
+    assert text.splitlines()[0] == "Ref,Val,Package,PosX,PosY,Rot,Side"
+    assert "C9" not in text and "R1" in text and "U1" in text
+
+
+def test_a_top_only_board_has_no_bottom_side(tmp_path) -> None:
+    from blpl.core import seeed_fusion
+    pos = tmp_path / "positions.csv"
+    pos.write_text('Ref,Val,Package,PosX,PosY,Rot,Side\n"U1","x","QFN",5,6,0,top\n')
+    _step, bottom = seeed_fusion.pick_and_place(pos, tmp_path / "out.csv", set())
+    assert not bottom
+
+
+def test_a_bom_and_placement_that_disagree_fail_seeeds_check(tmp_path) -> None:
+    """Seeed's checklist: the BOM and the pick-and-place file from the same
+    revision, with matching designators."""
+    from blpl.core import seeed_fusion
+    staging = tmp_path / "assembly"
+    staging.mkdir()
+    (staging / "b-pick-and-place.csv").write_text(
+        "Ref,Val,Package,PosX,PosY,Rot,Side\nR1,1k,R,0,0,0,top\nR2,1k,R,0,0,0,top\n")
+    lines = [{"Reference Designator *": "R1,R3", "Remarks": ""}]
+    step = seeed_fusion.check(tmp_path, staging, lines, "b")
+    assert not step.ok
+    assert "not the pick-and-place file: R3" in step.detail
+    assert "not the BOM: R2" in step.detail
+
+
+def test_a_file_that_does_not_open_fails_seeeds_check(tmp_path) -> None:
+    from blpl.core import seeed_fusion
+    staging = tmp_path / "assembly"
+    staging.mkdir()
+    (staging / "b-assembly-top.pdf").write_bytes(b"%PDF-1.5 truncated")
+    step = seeed_fusion.check(tmp_path, staging, [], "b")
+    assert not step.ok and "b-assembly-top.pdf: not a complete PDF" in step.detail
+
+
+def test_parts_with_no_3d_model_are_named_not_silently_left_out(tmp_path, monkeypatch) -> None:
+    """kicad-cli succeeds with the model missing; the STEP would look whole."""
+    from blpl.core import seeed_fusion
+
+    def fake(cmd):
+        Path(cmd[cmd.index("--output") + 1]).write_text("ISO-10303-21;")
+        return True, ("Could not add 3D model for U3.\nFile not found: x.stp\n"
+                      "Could not add 3D model for BT_POS.\n")
+    monkeypatch.setattr(seeed_fusion, "_cli", fake)
+    step = seeed_fusion.step_model("kicad-cli", tmp_path / "b.kicad_pcb", tmp_path / "b.step")
+    assert step.ok and "BT_POS, U3" in step.detail
+
+
+def test_a_seeed_build_writes_its_bom_notes_and_the_gerber_zip_step(project, monkeypatch) -> None:
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    (project / "project.yaml").write_text(
+        "assembly:\n  seeed_fusion:\n    mcu: nRF54L15\n    sku:\n      CL10B104KB8NNNC: 100000001\n",
+        encoding="utf-8")
+    manifest = release.build(project, now="2026-08-12_120000Z", seeed=True)
+    assert manifest["options"]["seeed"] is True
+    # Seeed's PCB upload is the gerber zip, so it is asked for too.
+    assert manifest["options"]["gerber_zip"] is True
+    names = {s["step"] for s in manifest["steps"]}
+    assert {"gerber-zip", "seeed-bom", "seeed-pick-and-place", "seeed-drawing-top"} <= names
+    drawing = next(s for s in manifest["steps"] if s["step"] == "seeed-drawing-top")
+    assert not drawing["ok"] and "kicad-cli" in drawing["detail"]
+    out = Path(manifest["archive"]).parent / "2026-08-12_120000Z" / "seeed"
+    rows = _xlsx_rows(out / "dev04-seeed-bom.xlsx")
+    assert ["C1,C2", "2", "100000001"] == rows[1][1:4]
+    notes = (out / "ORDER-NOTES.txt").read_text()
+    assert "MCU model used in the project: nRF54L15" in notes
+    assert "dev04-gerbers.zip" in notes
+
+
+def test_the_mcu_model_left_unset_is_said_in_the_notes(project, monkeypatch) -> None:
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    manifest = release.build(project, now="2026-08-12_120000Z", seeed=True)
+    notes = (Path(manifest["archive"]).parent / "2026-08-12_120000Z" / "seeed" / "ORDER-NOTES.txt").read_text()
+    assert "MCU model used in the project: NOT SET" in notes
+
+
+def test_a_plain_build_writes_no_seeed_package_or_gerber_zip(project, monkeypatch) -> None:
+    monkeypatch.setattr(release, "find_kicad_cli", lambda: None)
+    manifest = release.build(project, now="2026-08-12_120000Z")
+    assert manifest["options"]["seeed"] is False and manifest["options"]["gerber_zip"] is False
+    assert not any(f["path"].startswith("seeed/") for f in manifest["files"])

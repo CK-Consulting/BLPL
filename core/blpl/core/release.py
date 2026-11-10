@@ -968,7 +968,10 @@ def board_files(project_dir: Path, board: str | None = None) -> dict:
     bom = art("bom_resolved") if art("bom_resolved").is_file() else art("bom")
     return {"board": qual, "pipeline": pipeline, "pcb": pcb,
             "kicad_dir": kicad_dir if kicad_dir.is_dir() else None,
-            "bom": bom, "hdm": art("hdm", "yaml")}
+            "bom": bom, "hdm": art("hdm", "yaml"),
+            # The board's project.yaml beside its markdown, for ordering data
+            # read at release time (assembly.seeed_fusion).
+            "config": project_manifest.board_dir(project_dir, man, name) / "project.yaml"}
 
 
 def build(
@@ -979,6 +982,8 @@ def build(
     lcsc: bool = False,
     odb: bool = False,
     circuithub: bool = False,
+    gerber_zip: bool = False,
+    seeed: bool = False,
     board: str | None = None,
 ) -> dict:
     """Build the release package. Returns the manifest.
@@ -1029,6 +1034,17 @@ def build(
         steps.append(export_circuithub(
             src["kicad_dir"], bom_json, out_dir, name,
             _assembled_as(pipeline, src["hdm"], ("dnp", "footprint_only", "hand_fit"))))
+    # Seeed Fusion's PCB upload is the gerber zip, so asking for its package
+    # asks for that too.
+    gerber_zip = gerber_zip or seeed
+    if gerber_zip:
+        from . import seeed_fusion
+        steps.append(seeed_fusion.zip_gerbers(out_dir, name))
+    if seeed:
+        from . import seeed_fusion
+        steps.extend(seeed_fusion.export(
+            out_dir=out_dir, name=name, pcb=pcb, bom_json=bom_json, config_path=src["config"],
+            not_bought=_not_bought(pipeline, src["hdm"]), hand_fit=hand_fit, kicad_cli=kicad_cli))
     z_step = export_impedance(pipeline, pcb, out_dir, src["hdm"])
     steps.append(z_step)
     steps.append(write_board_specs(pcb, src["hdm"], out_dir, board=name,
@@ -1065,7 +1081,8 @@ def build(
         "incomplete": [s.name for s in steps if not s.ok],
         # Which of the optional outputs this build was asked for, so the
         # download can say what is in it without anyone opening the zip.
-        "options": {"lcsc": lcsc, "odb": odb, "circuithub": circuithub},
+        "options": {"lcsc": lcsc, "odb": odb, "circuithub": circuithub,
+                    "gerber_zip": gerber_zip, "seeed": seeed},
         # What the assembly files left for fitting by hand, so regenerating
         # them from this package (blpl bom-assembly) leaves out the same parts.
         "hand_fit": sorted(hand_fit),
@@ -1150,11 +1167,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also write a CircuitHub design package (the native project and a BOM, zipped).",
     )
+    parser.add_argument(
+        "--gerber-zip",
+        action="store_true",
+        help="Also zip the gerbers and drill files into <project>-gerbers.zip, for a fab's upload.",
+    )
+    parser.add_argument(
+        "--seeed",
+        action="store_true",
+        help="Also write a Seeed Fusion PCB/PCBA package: its BOM template, the assembly files "
+             "(pick-and-place, assembly drawing, 3D) zipped, and the gerber zip.",
+    )
     args = parser.parse_args(argv)
 
     try:
         manifest = build(Path(args.project_dir), lcsc=args.lcsc, odb=args.odb,
-                         circuithub=args.circuithub, board=args.board)
+                         circuithub=args.circuithub, gerber_zip=args.gerber_zip,
+                         seeed=args.seeed, board=args.board)
     except ValueError as exc:
         print(f"release: {exc}", file=sys.stderr, flush=True)
         return 2

@@ -214,6 +214,18 @@
         "dnp": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
         "footprint_only": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
         "hand_fit": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "seeed_fusion": {
+          "description": "What a Seeed Fusion PCBA order needs that the design does not say, read when the release is built with the Seeed Fusion option. sku: Seeed SKUs by MPN; Seeed's BOM wants the SKU, not the product name, in its part number column for a Seeed Studio product. Example: {XIAO-nRF54L15-SMD: '101991422'}. mcu: the MCU model, for the order form's text box (written to the package's ORDER-NOTES.txt).",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sku": {
+              "type": "object",
+              "additionalProperties": { "type": ["string", "integer"] }
+            },
+            "mcu": { "type": "string", "minLength": 1 }
+          }
+        },
         "attrition": {
           "description": "Extra parts to order for assembly losses, by MPN, where a part's package class default (blpl.core.bom_export.ATTRITION) is wrong for it. A number is a percent of the placed quantity; an object gives the percent and a minimum number of extra parts, and the larger applies. Example: {GRM155R60J475ME47D: 10, 102010: {percent: 0, min_extra: 1}}.",
           "type": "object",
