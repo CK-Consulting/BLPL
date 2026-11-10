@@ -930,6 +930,21 @@ def export_impedance(pipeline: Path, pcb: Path | None, out_dir: Path,
     return Step("impedance", True, "", [str(dest.relative_to(out_dir))])
 
 
+def _project_config(project_dir: Path, man, name: str, qual: str | None) -> Path:
+    """The board's project.yaml in the order ``cli._project_config`` looks:
+    beside the board's markdown, then the project root, then the legacy
+    artifact. A multi-board project may keep one shared file at its root, and
+    reading only the board's would drop its settings without a word."""
+    from . import project_manifest
+
+    board_cfg = project_manifest.board_dir(project_dir, man, name) / "project.yaml"
+    for c in (board_cfg, project_dir / "project.yaml",
+              project_manifest.artifact_path(project_dir, "project", board=qual, suffix="yaml")):
+        if c.is_file():
+            return c
+    return board_cfg
+
+
 def board_files(project_dir: Path, board: str | None = None) -> dict:
     """Where this board's released files come from, as the pipeline leaves them.
 
@@ -969,9 +984,9 @@ def board_files(project_dir: Path, board: str | None = None) -> dict:
     return {"board": qual, "pipeline": pipeline, "pcb": pcb,
             "kicad_dir": kicad_dir if kicad_dir.is_dir() else None,
             "bom": bom, "hdm": art("hdm", "yaml"),
-            # The board's project.yaml beside its markdown, for ordering data
-            # read at release time (assembly.seeed_fusion).
-            "config": project_manifest.board_dir(project_dir, man, name) / "project.yaml"}
+            # The project.yaml the pipeline read, for ordering data read at
+            # release time (assembly.seeed_fusion).
+            "config": _project_config(project_dir, man, name, qual)}
 
 
 def build(

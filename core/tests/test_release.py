@@ -294,6 +294,20 @@ def test_each_board_of_a_multi_board_project_releases_its_own_files(tmp_path, mo
     assert (proj / "release" / "sensor" / "latest.zip").is_file()
 
 
+def test_a_multi_board_projects_shared_project_yaml_is_the_release_config(tmp_path) -> None:
+    """The pipeline reads a root project.yaml when a board has none of its own;
+    the release read only the board's, so configured Seeed SKUs vanished."""
+    proj = tmp_path / "shield"
+    (proj / ".pipeline").mkdir(parents=True)
+    (proj / "project.md").write_text("# shield\n\n## Boards\n\n- base\n- sensor\n", encoding="utf-8")
+    for board in ("base", "sensor"):
+        (proj / board).mkdir()
+    (proj / "project.yaml").write_text("project: {name: shield}\n", encoding="utf-8")
+    assert release.board_files(proj, "sensor")["config"] == proj / "project.yaml"
+    (proj / "sensor" / "project.yaml").write_text("project: {name: sensor}\n", encoding="utf-8")
+    assert release.board_files(proj, "sensor")["config"] == proj / "sensor" / "project.yaml"
+
+
 def test_the_gate_reads_stage8s_output_for_the_board_asked_about(tmp_path, monkeypatch) -> None:
     from blpl.agent import kicad_happy
 
@@ -852,6 +866,16 @@ def test_a_bom_and_placement_that_disagree_fail_seeeds_check(tmp_path) -> None:
     assert not step.ok
     assert "not the pick-and-place file: R3" in step.detail
     assert "not the BOM: R2" in step.detail
+
+
+def test_no_pick_and_place_file_fails_seeeds_check_rather_than_agreeing_on_none(tmp_path) -> None:
+    """A missing placement file is not zero placements: nothing was compared."""
+    from blpl.core import seeed_fusion
+    staging = tmp_path / "assembly"
+    staging.mkdir()
+    lines = [{"Reference Designator *": "U1", "Remarks": ""}]
+    step = seeed_fusion.check(tmp_path, staging, lines, "b")
+    assert not step.ok and "no pick-and-place file" in step.detail
 
 
 def test_a_file_that_does_not_open_fails_seeeds_check(tmp_path) -> None:

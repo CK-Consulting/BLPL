@@ -482,6 +482,10 @@ def check(seeed: Path, staging: Path, lines: list[dict], name: str) -> Step:
         if placed - bought:
             problems.append("in the pick-and-place file but not the BOM: "
                             + ", ".join(sorted(placed - bought, key=_natural)))
+    else:
+        # No placement file is not zero placements: nothing was compared, so
+        # the check cannot say the two agree.
+        problems.append(f"no pick-and-place file ({pnp.name}) to compare with the BOM")
     files = [p for p in (*seeed.iterdir(), *staging.iterdir()) if p.is_file()
              and p.suffix.lower() in (".zip", ".xlsx", ".pdf", ".csv")]
     problems += [why for why in map(_readable, sorted(files)) if why]
