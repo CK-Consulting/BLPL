@@ -13,7 +13,8 @@ says what the board should carry instead:
   only when it fits on its own part.
 - ``labels: {REF: text}`` — the markings a person must read on the finished
   board (a battery's polarity, an antenna connector's band), in silk where the
-  part's reference would have been, at ``label_size``.
+  part's reference would have been, at ``label_size``. They are written on the
+  board, not inside the footprint (see ``to_board_text``).
 - ``clip_to_copper: true`` — a footprint's silk graphics are trimmed where
   they cross that footprint's own pads. The fab clips silk at mask openings
   anyway; trimming it here makes the board match what will be printed, and
@@ -384,8 +385,12 @@ def _hide(prop) -> None:
     prop.append(["hide", "yes"])
 
 
-def apply(fp: list, *, policy: dict | None, label: str | None) -> None:
-    """Apply project.yaml's silkscreen policy to one library-local footprint."""
+def apply(fp: list, *, policy: dict | None, label: str | None) -> list | None:
+    """Apply project.yaml's silkscreen policy to one library-local footprint.
+
+    Returns the label's ``fp_text``, if there is one, for the caller to move
+    onto the board with ``to_board_text`` once the footprint is placed.
+    """
     policy = policy or {}
     hidden = policy.get("references") == "hidden"
     size = max(MIN_TEXT, float(policy.get("label_size") or MIN_TEXT))
@@ -400,16 +405,50 @@ def apply(fp: list, *, policy: dict | None, label: str | None) -> None:
         # stays (Codex, PR #64).
         if name == "Reference" and (hidden or label):
             _hide(prop)
+    text = None
     if label:
         at, side = anchor if anchor and anchor[0] is not None else (["at", "0", "0"], "F")
         layer = "F.SilkS" if side == "F" else "B.SilkS"
         effects = ["effects", ["font", ["size", f"{size:g}", f"{size:g}"], ["thickness", f"{max(0.1, size * 0.15):.3g}"]]]
         if side == "B":
             effects.append(["justify", "mirror"])
-        fp.append(["fp_text", "user", sexpr.quote(label), [*at], ["layer", sexpr.quote(layer)],
-                   ["uuid", sexpr.quote(ids.new())], effects])
+        text = ["fp_text", "user", sexpr.quote(label), [*at], ["layer", sexpr.quote(layer)],
+                ["uuid", sexpr.quote(ids.new())], effects]
+        fp.append(text)
     if policy.get("clip_to_copper"):
         clip_to_copper(fp)
+    return text
+
+
+def to_board_text(fp: list, text: list) -> list:
+    """Take a placed footprint's label out of it, as a board ``gr_text``.
+
+    A label is one part's marking, but inside the footprint it rides on the
+    footprint's definition, and importers that keep one package per footprint
+    name keep one label too. Fusion did exactly that: both U.FLs on
+    verdacor-ear-tag are ``U.FL_Hirose_U.FL-R-SMT-1_Vertical``, and three
+    releases in a row imported with "LRLF" on the GNSS connector, the label of
+    whichever instance came first in the file. KiCad was right throughout,
+    because it keeps footprints per instance. On the board the text belongs to
+    no footprint, so nothing can share it.
+
+    ``text`` must already be oriented with ``fp`` (pcb._orient_footprint): its
+    angle is then the board angle, and its offset is in the footprint's frame,
+    which is turned here by the footprint's own angle the way KiCad does.
+    """
+    fp.remove(text)
+    fat = sexpr.find(fp, "at")
+    fx, fy = _num(fat, 1), _num(fat, 2)
+    o = math.radians(_num(fat, 3))
+    tat = sexpr.find(text, "at")
+    lx, ly = _num(tat, 1), _num(tat, 2)
+    x = fx + lx * math.cos(o) + ly * math.sin(o)
+    y = fy - lx * math.sin(o) + ly * math.cos(o)
+    at = ["at", f"{round(x, 4):g}", f"{round(y, 4):g}"]
+    if _num(tat, 3):
+        at.append(f"{_num(tat, 3):g}")
+    rest = [n for n in text[3:] if not (isinstance(n, list) and n and n[0] == "at")]
+    return ["gr_text", text[2], at, *rest]
 
 
 def marking(policy: dict | None, *, origin: tuple[float, float]) -> list | None:

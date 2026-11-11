@@ -1230,7 +1230,7 @@ def _build(
         _set_part_fields(fp_node, comp)
         # project.yaml's silkscreen: which references show, the labels a
         # person must read, and outlines trimmed off their own pads (silk.py).
-        silk.apply(fp_node, policy=hdm.get("silkscreen"), label=comp.get("silk_label"))
+        label = silk.apply(fp_node, policy=hdm.get("silkscreen"), label=comp.get("silk_label"))
         _replace_uuid(fp_node)
         _set_assembly(fp_node, comp.get("assembly"))
 
@@ -1274,6 +1274,10 @@ def _build(
         # again would put them back on the wrong side.
         fp_node.extend(_anchored_keepouts(hdm, refdes))
         node.append(fp_node)
+        if label is not None:
+            # On the board, not in the footprint, so an importer that keeps
+            # one package per footprint name cannot share it (silk.py).
+            node.append(silk.to_board_text(fp_node, label))
 
     # Each part's silk was trimmed off its own pads as it was emitted; only
     # now are its neighbours placed, and an outline reaching across one of
