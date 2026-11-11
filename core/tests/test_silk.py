@@ -170,3 +170,37 @@ def test_a_long_neighbouring_pad_with_no_corner_near_the_silk_still_trims_it():
     for n in sexpr.find_all(a, "fp_line"):
         ys = (float(sexpr.find(n, "start")[2]), float(sexpr.find(n, "end")[2]))
         assert all(abs(y) > 0.5 for y in ys)
+
+
+def test_labels_are_board_text_so_parts_sharing_a_footprint_keep_their_own():
+    """Inside the footprint, a label rode on the footprint's definition: Fusion
+    keeps one package per footprint name, and three releases of the ear tag
+    imported with "LRLF" on both U.FLs, the GNSS one included."""
+    from pathlib import Path
+
+    from blpl.emitter import pcb
+
+    fp = "Connector_Coaxial:U.FL_Hirose_U.FL-R-SMT-1_Vertical"
+    hdm = {"project": {"dimensions": [60, 40]}, "nets": {},
+           "silkscreen": {"references": "hidden", "label_size": 0.8},
+           "components": {
+               "J_RF_LRLF": {"value": "U.FL", "footprint": fp, "silk_label": "LRLF",
+                             "placement": {"x": 10, "y": 10, "rot": 0, "side": "top"}},
+               "J_RF_GNSS": {"value": "U.FL", "footprint": fp, "silk_label": "GNSS",
+                             "placement": {"x": 30, "y": 10, "rot": 90, "side": "top"}},
+               "J_BACK": {"value": "U.FL", "footprint": fp, "silk_label": "B",
+                          "placement": {"x": 50, "y": 20, "rot": 0, "side": "bottom"}}}}
+    root = Path(__file__).resolve().parent.parent / "kicad-footprints"
+    board = sexpr.parse(pcb.emit(hdm, footprints_root=root))
+    for part in sexpr.find_all(board, "footprint"):
+        assert not [t for t in sexpr.find_all(part, "fp_text")
+                    if sexpr.unquote(t[2]) in ("LRLF", "GNSS", "B")]
+    texts = {sexpr.unquote(t[1]): t for t in sexpr.find_all(board, "gr_text")}
+    at = {k: [float(v) for v in sexpr.find(t, "at")[1:3]] for k, t in texts.items()}
+    # The footprint's reference sits at local (0, -3.2), where the label goes;
+    # the board origin is (12.5, 12.5). Turned 90, "above" becomes "left of".
+    assert at["LRLF"] == pytest.approx([22.5, 19.3])
+    assert at["GNSS"] == pytest.approx([39.3, 22.5])
+    assert sexpr.find(texts["GNSS"], "at")[3] == "90"
+    assert sexpr.unquote(sexpr.find(texts["B"], "layer")[1]) == "B.SilkS"
+    assert sexpr.find(sexpr.find(texts["B"], "effects"), "justify")[1:] == ["mirror"]
